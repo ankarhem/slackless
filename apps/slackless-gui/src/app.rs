@@ -1016,8 +1016,13 @@ impl App {
             let history = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
                 if app.history_generation == generation && app.channel == channel {
-                    app.messages
-                        .update(cx, |list, cx| list.set_history(channel, history, cx));
+                    let newest = history.last().map(|message| message.ts.clone());
+                    app.messages.update(cx, |list, cx| {
+                        list.set_history(channel.clone(), history, cx)
+                    });
+                    if let Some(newest) = newest {
+                        app.mark_read(&channel, newest, cx);
+                    }
                 }
             })
         })
@@ -1045,6 +1050,26 @@ impl App {
             })
         })
         .detach();
+    }
+
+    /// Like Slack, viewing a conversation with unreads marks it read up to its newest message:
+    /// Slack is told (`conversations.mark`) and the sidebar un-bolds it at once.
+    fn mark_read(&mut self, channel: &ChannelId, newest: Ts, cx: &mut Context<Self>) {
+        let Some(counts) = self.counts.get_mut(channel) else {
+            return;
+        };
+        if !counts.has_unreads && counts.mention_count == 0 {
+            return;
+        }
+        counts.has_unreads = false;
+        counts.mention_count = 0;
+        counts.last_read = Some(newest.clone());
+        self.bridge.send(Command::MarkRead {
+            channel: channel.clone(),
+            ts: newest,
+        });
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.mark_read(channel.clone(), cx));
     }
 
     /// Put `views` on screen as the workspace views; returns the ones they replace.

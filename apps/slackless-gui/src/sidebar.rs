@@ -126,6 +126,8 @@ pub struct Sidebar {
     active_nav: NavItem,
     /// Keys of the collapsed sidebar sections.
     collapsed: HashSet<SharedString>,
+    /// Conversations read in this session since Slack's counts were taken.
+    read: HashSet<ChannelId>,
     /// The "Find a conversation…" field above the sections.
     find: Entity<TextareaState>,
     /// Channels joined from the channel browser this session, listed after the fixtures'.
@@ -187,6 +189,7 @@ impl Sidebar {
                 active_workspace: 0,
                 active_nav: NavItem::Home,
                 collapsed,
+                read: HashSet::new(),
                 find,
                 joined: Vec::new(),
                 huddle: None,
@@ -224,6 +227,12 @@ impl Sidebar {
 
     pub fn set_later_count(&mut self, count: usize, cx: &mut Context<Self>) {
         self.later_count = count;
+        cx.notify();
+    }
+
+    /// Show `channel` as read (the root just marked it read in Slack).
+    pub fn mark_read(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        self.read.insert(channel);
         cx.notify();
     }
 
@@ -297,7 +306,7 @@ impl Sidebar {
     fn unread_in(&self, conversation: &Conversation, watermark: Option<&Ts>) -> Unread {
         // Live: Slack's own unread state. A DM's unread messages all count as mentions.
         if let Some(counts) = self.fixtures.counts.get(&conversation.id) {
-            if conversation.id == self.selected {
+            if conversation.id == self.selected || self.read.contains(&conversation.id) {
                 return Unread::default();
             }
             return Unread {
