@@ -1,0 +1,666 @@
+//! Right-hand thread panel: the root message, its replies and a dedicated reply composer.
+//!
+//! Messages render through [`crate::messages::message_row`] (the shared card renderer), so the
+//! thread column and the transcript column render identically; the interactive layer comes from
+//! [`crate::actions`], shared with the transcript (gpui-kit-guide section 6):
+//!
+//! - reaction chips that toggle the signed-in user's reaction on click, plus an add-reaction
+//!   control; picking from the emoji picker goes through the root
+//!   ([`ThreadPanelEvent::PickReaction`], then [`ThreadPanel::add_reaction`]);
+//! - the hover action bar and a right-click `ContextMenu` sharing one action set: Add
+//!   reaction, Reply in thread, Copy link (clipboard + toast), Forward, Save for later and
+//!   Remind me (handed to the root's Later list), Mark unread (New divider above the chosen message), and Edit (inline draft in place of the
+//!   row) / Delete for the signed-in user's messages;
+//! - a "Replying in thread" hint above the composer while the reply box is summoned.
+//!
+//! Design tokens: colors and fonts come from the active gpui-kit theme via `cx.theme()`.
+//! Spacing rides the 4px utility scale; the only layout constants are the avatar metrics
+//! copied from `messages.rs`. Typography: body at `text_sm`, meta text at `text_xs`.
+
+use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{InputEvent, TextareaState};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
+use gpui_kit::gpui::{
+    AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+};
+use slackless_core::types::{ChannelId, Message, Ts};
+
+use crate::actions::{self, ActionHandler, ActionSet, MessageAction};
+use crate::composer::{Composer, ComposerEvent};
+use crate::fixtures::Fixtures;
+use crate::later::{Remind, SaveRequest};
+use crate::messages::message_row;
+use crate::slash::{Invocation, SHRUG, SlashKind};
+
+pub enum ThreadPanelEvent {
+    Close,
+    /// The user replied; the panel has already shown the reply locally.
+    Reply {
+        channel: ChannelId,
+        thread_ts: Ts,
+        text: String,
+    },
+    /// An add-reaction control asked for the emoji picker at `position`; the root routes the
+    /// pick back through [`ThreadPanel::add_reaction`].
+    PickReaction {
+        ts: Ts,
+        position: Point<Pixels>,
+    },
+    /// The reply composer's emoji button asked for the picker; picks come back through
+    /// [`ThreadPanel::insert_emoji`].
+    PickEmoji(Point<Pixels>),
+    /// A slash command other than /shrug (which replies in the thread) was sent from the
+    /// reply composer; the root dispatches it.
+    SlashCommand(Invocation),
+    /// Save for later / Remind me / unsave; the root keeps the Later list.
+    Later(SaveRequest),
+}
+
+/// Avatar chip size and the text-column inset (avatar plus its gap), mirroring `messages.rs`
+/// so reaction chips align with the message text column.
+const AVATAR_SIZE: f32 = 36.;
+const AVATAR_GAP: f32 = 12.;
+const TEXT_INSET: f32 = AVATAR_SIZE + AVATAR_GAP;
+
+pub struct ThreadPanel {
+    fixtures: Arc<Fixtures>,
+    /// `(channel, root ts)` of the open thread.
+    thread: Option<(ChannelId, Ts)>,
+    root: Option<Message>,
+    replies: Vec<Message>,
+    /// Whether the "Replying in thread" hint above the composer shows (Reply in thread action).
+    reply_hint: bool,
+    /// Message currently edited in place; its draft lives in `edit_draft`.
+    editing: Option<Ts>,
+    edit_draft: Entity<TextareaState>,
+    /// Fixture-mode unread marker: the New divider renders above this message.
+    unread_after: Option<Ts>,
+    /// Messages saved for later (fixture mode: in memory).
+    saved: HashSet<Ts>,
+    composer: Entity<Composer>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<ThreadPanelEvent> for ThreadPanel {}
+
+impl ThreadPanel {
+    pub fn new(
+        fixtures: Arc<Fixtures>,
+        window: &mut Window,
+        cx: &mut gpui_kit::gpui::App,
+    ) -> Entity<ThreadPanel> {
+        cx.new(|cx| {
+            let composer = Composer::new("Reply...".into(), window, cx);
+            composer.update(cx, |composer, cx| composer.set_scheduling(false, cx));
+            let edit_draft = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Edit message")
+                    .auto_grow(1, 8)
+            });
+            let subscriptions = vec![
+                cx.subscribe(
+                    &composer,
+                    |this: &mut ThreadPanel, _, event: &ComposerEvent, cx| match event {
+                        ComposerEvent::Submit(text) => this.reply(text.clone(), cx),
+                        ComposerEvent::OpenEmojiPicker(position) => {
+                            cx.emit(ThreadPanelEvent::PickEmoji(*position));
+                        }
+                        ComposerEvent::SlashCommand(invocation) => {
+                            match invocation.command.map(|command| command.kind) {
+                                Some(SlashKind::Shrug) if invocation.args.is_empty() => {
+                                    this.reply(SHRUG.to_owned(), cx);
+                                }
+                                Some(SlashKind::Shrug) => {
+                                    this.reply(format!("{} {SHRUG}", invocation.args), cx);
+                                }
+                                _ => cx.emit(ThreadPanelEvent::SlashCommand(invocation.clone())),
+                            }
+                        }
+                        // Scheduling is turned off in the reply composer.
+                        ComposerEvent::Schedule { .. } => {}
+                    },
+                ),
+                // The edit box's Save button tracks whether the draft is empty.
+                cx.subscribe(&edit_draft, |_: &mut ThreadPanel, _, _: &InputEvent, cx| {
+                    cx.notify()
+                }),
+            ];
+            ThreadPanel {
+                fixtures,
+                thread: None,
+                root: None,
+                replies: Vec::new(),
+                reply_hint: false,
+                editing: None,
+                edit_draft,
+                unread_after: None,
+                saved: HashSet::new(),
+                composer,
+                _subscriptions: subscriptions,
+            }
+        })
+    }
+
+    /// Forward the Enter-to-send preference to the reply composer.
+    pub fn set_enter_sends(&mut self, enter_sends: bool, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+    }
+
+    pub fn open(&mut self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
+        self.root = self
+            .fixtures
+            .messages
+            .get(&channel)
+            .and_then(|history| history.iter().find(|m| m.ts == thread_ts))
+            .cloned();
+        let key = (channel, thread_ts);
+        self.replies = self.fixtures.threads.get(&key).cloned().unwrap_or_default();
+        self.thread = Some(key);
+        self.reply_hint = false;
+        self.editing = None;
+        self.unread_after = None;
+        cx.notify();
+    }
+
+    /// `(channel, root ts)` of the open thread.
+    pub fn open_thread(&self) -> Option<(ChannelId, Ts)> {
+        self.thread.clone()
+    }
+
+    /// Replace the open thread's messages (live mode: re-read from the store after it
+    /// changed; the read is oldest first, so the root leads). A read for another thread, or
+    /// one landing after the panel closed, is ignored.
+    pub fn set_thread(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        messages: Vec<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread.as_ref() != Some(&(channel, thread_ts.clone())) {
+            return;
+        }
+        self.root = messages
+            .first()
+            .filter(|message| message.ts == thread_ts)
+            .cloned();
+        self.replies = match self.root.is_some() {
+            true => messages.into_iter().skip(1).collect(),
+            false => messages,
+        };
+        cx.notify();
+    }
+
+    /// Mark or unmark `ts` saved (the Later list changed elsewhere).
+    pub fn set_saved(&mut self, ts: &Ts, saved: bool, cx: &mut Context<Self>) {
+        if saved {
+            self.saved.insert(ts.clone());
+        } else {
+            self.saved.remove(ts);
+        }
+        cx.notify();
+    }
+
+    /// Save (or unsave) `ts` of the open thread, optionally with a reminder, and hand the
+    /// request to the root's Later list.
+    fn save_for_later(
+        &mut self,
+        ts: &Ts,
+        saved: bool,
+        remind: Option<Remind>,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(channel) = self.thread.as_ref().map(|(channel, _)| channel.clone()) else {
+            return;
+        };
+        let fixtures = self.fixtures.clone();
+        let Some(message) = self.message_at_mut(ts) else {
+            return;
+        };
+        let request = SaveRequest {
+            channel,
+            ts: ts.clone(),
+            author: message
+                .user
+                .as_ref()
+                .map(|user| fixtures.user_name(user).to_owned())
+                .unwrap_or_default(),
+            text: fixtures.preview(message),
+            saved,
+            due: remind.map(|remind| remind.at(crate::drafts::now_secs())),
+        };
+        actions::notify(title, request.text.clone(), window, cx);
+        cx.emit(ThreadPanelEvent::Later(request));
+        self.set_saved(ts, saved, cx);
+    }
+
+    /// Insert an emoji pick into the reply composer.
+    pub fn insert_emoji(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.insert(text, window, cx));
+    }
+
+    /// Add the signed-in user's `name` reaction if they have not already reacted with it.
+    pub fn add_reaction(&mut self, ts: &Ts, name: &str, cx: &mut Context<Self>) {
+        let me = self.fixtures.self_user.clone();
+        if let Some(message) = self.message_at_mut(ts) {
+            actions::add_reaction(message, &me, name);
+        }
+        cx.notify();
+    }
+
+    fn reply(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some((channel, thread_ts)) = self.thread.clone() else {
+            return;
+        };
+        self.replies.push(self.fixtures.local_message(
+            &channel,
+            text.clone(),
+            Some(thread_ts.clone()),
+        ));
+        self.reply_hint = false;
+        cx.emit(ThreadPanelEvent::Reply {
+            channel,
+            thread_ts,
+            text,
+        });
+        cx.notify();
+    }
+
+    fn message_at_mut(&mut self, ts: &Ts) -> Option<&mut Message> {
+        if self.root.as_ref().is_some_and(|root| &root.ts == ts) {
+            return self.root.as_mut();
+        }
+        self.replies.iter_mut().find(|message| &message.ts == ts)
+    }
+
+    fn run_action(
+        &mut self,
+        ts: &Ts,
+        action: MessageAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let me = self.fixtures.self_user.clone();
+        match action {
+            MessageAction::React(name) => self.add_reaction(ts, &name, cx),
+            MessageAction::ToggleReaction(name) => {
+                if let Some(message) = self.message_at_mut(ts) {
+                    actions::toggle_reaction(message, &me, &name);
+                }
+                cx.notify();
+            }
+            MessageAction::PickReaction(position) => {
+                cx.emit(ThreadPanelEvent::PickReaction {
+                    ts: ts.clone(),
+                    position,
+                });
+            }
+            MessageAction::ReplyInThread => self.prompt_reply(cx),
+            MessageAction::CopyLink => {
+                if let Some((channel, _)) = &self.thread {
+                    actions::copy_link(&self.fixtures, channel, ts, window, cx);
+                }
+            }
+            MessageAction::Forward => {
+                eprintln!("slackless: forward thread message {ts} (needs a live workspace)");
+                actions::notify(
+                    "Forward message",
+                    "Forwarding needs a live workspace.",
+                    window,
+                    cx,
+                );
+            }
+            MessageAction::SaveForLater => {
+                let saved = !self.saved.contains(ts);
+                let title = if saved {
+                    "Saved for later"
+                } else {
+                    "Removed from Later"
+                };
+                self.save_for_later(ts, saved, None, title, window, cx);
+            }
+            MessageAction::RemindMe(remind) => {
+                let title = format!("Reminder set: {}", remind.label().to_lowercase());
+                self.save_for_later(ts, true, Some(remind), &title, window, cx);
+            }
+            MessageAction::MarkUnread => self.mark_unread(ts.clone(), cx),
+            MessageAction::Edit => self.begin_edit(ts.clone(), window, cx),
+            MessageAction::Delete => self.delete_message(ts, cx),
+        }
+    }
+
+    /// Edit `ts` in place: swap the row body for the shared edit draft, focused with the caret
+    /// at the end.
+    fn begin_edit(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message) = self.message_at_mut(&ts) else {
+            return;
+        };
+        let text = message.text.clone();
+        self.reply_hint = false;
+        self.editing = Some(ts);
+        let caret = text.len();
+        self.edit_draft.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.set_selected_range(caret..caret, cx);
+        });
+        self.edit_draft.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(ts) = self.editing.clone() else {
+            return;
+        };
+        let text = self.edit_draft.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let me = self.fixtures.self_user.clone();
+        if let Some(message) = self.message_at_mut(&ts) {
+            actions::apply_edit(message, &me, text);
+        }
+        self.editing = None;
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        cx.notify();
+    }
+
+    /// Summon the reply box: dismiss any inline edit and show the hint above the composer.
+    fn prompt_reply(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.reply_hint = true;
+        cx.notify();
+    }
+
+    fn mark_unread(&mut self, ts: Ts, cx: &mut Context<Self>) {
+        self.unread_after = Some(ts);
+        cx.notify();
+    }
+
+    fn delete_message(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        if self.root.as_ref().is_some_and(|root| &root.ts == ts) {
+            // Deleting the root discards the whole thread and closes the panel.
+            self.root = None;
+            self.replies.clear();
+            self.thread = None;
+            self.editing = None;
+            self.unread_after = None;
+            self.reply_hint = false;
+            cx.emit(ThreadPanelEvent::Close);
+            cx.notify();
+            return;
+        }
+        self.replies.retain(|message| &message.ts != ts);
+        if self.editing.as_ref() == Some(ts) {
+            self.editing = None;
+        }
+        if self.unread_after.as_ref() == Some(ts) {
+            self.unread_after = None;
+        }
+        self.saved.remove(ts);
+        cx.notify();
+    }
+
+    /// Replies at or after the unread marker: the fixture-mode "N new" hint.
+    fn unread_new_count(&self) -> usize {
+        match &self.unread_after {
+            Some(mark) => self
+                .replies
+                .iter()
+                .filter(|message| message.ts >= *mark)
+                .count(),
+            None => 0,
+        }
+    }
+
+    fn empty_state(&self, cx: &App) -> Div {
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .px_6()
+            .child(
+                Icon::new(IconName::MessageSquareText)
+                    .text_color(muted)
+                    .size(px(24.)),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("No thread selected"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Pick Reply in thread on a message to open one here."),
+            )
+    }
+
+    /// One thread message: the shared card renderer (reactions stripped and re-rendered as
+    /// interactive chips), the hover action bar and the right-click menu. While the row is
+    /// being edited, the card is replaced by the inline edit draft.
+    fn thread_message_row(
+        &self,
+        message: &Message,
+        is_root: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ts = message.ts.clone();
+        let key = format!("thread-row-{}", ts.as_str());
+        let this = cx.entity();
+        if self.editing.as_ref() == Some(&ts) {
+            let (cancel, save) = (this.clone(), this);
+            return div()
+                .px_2()
+                .child(actions::edit_box(
+                    &key,
+                    &self.edit_draft,
+                    move |_, cx| cancel.update(cx, ThreadPanel::cancel_edit),
+                    move |_, cx| save.update(cx, ThreadPanel::save_edit),
+                    cx,
+                ))
+                .into_any_element();
+        }
+
+        let handler: ActionHandler = {
+            let ts = ts.clone();
+            Rc::new(move |action, window, cx| {
+                this.update(cx, |panel, cx| panel.run_action(&ts, action, window, cx));
+            })
+        };
+        let saved = self.saved.contains(&ts);
+        let set = ActionSet {
+            own: message.user.as_ref() == Some(&self.fixtures.self_user),
+            reply: !is_root,
+            saved,
+        };
+        let row_group = SharedString::from(format!("thread-row-group-{}", ts.as_str()));
+        let hover_bg = cx.theme().secondary.opacity(0.5);
+
+        // `message_row` renders its own static chips; strip them here and render the
+        // interactive chips (toggle + add control) below the card instead.
+        let mut display = message.clone();
+        let reactions = std::mem::take(&mut display.reactions);
+        let card = message_row(&self.fixtures, &display, cx);
+        let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
+            .map(|chips| chips.pl(px(TEXT_INSET)));
+
+        let toolbar = actions::hover_toolbar(&key, set, &handler, row_group.clone(), cx);
+        let menu_handler = handler;
+        div()
+            .id(SharedString::from(key))
+            .group(row_group)
+            .relative()
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .hover(|row| row.bg(hover_bg))
+            .when(saved, |row| row.child(actions::saved_banner(cx)))
+            .child(v_flex().min_w_0().child(card).children(chips))
+            .child(toolbar)
+            .context_menu(move |menu, window, cx| {
+                actions::actions_menu(menu, set, &menu_handler, window, cx)
+            })
+            .into_any_element()
+    }
+}
+
+impl Render for ThreadPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let border = theme.border;
+        let muted = theme.muted_foreground;
+        let background = theme.background;
+        let danger = theme.danger;
+        let subtitle = self
+            .thread
+            .as_ref()
+            .and_then(|(channel, _)| self.fixtures.conversation(channel))
+            .map(|conversation| self.fixtures.conversation_label(conversation));
+
+        let header = h_flex()
+            .justify_between()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(div().font_weight(FontWeight::BOLD).child("Thread"))
+                    .when_some(subtitle, |column, label| {
+                        column.child(div().text_xs().text_color(muted).child(label))
+                    }),
+            )
+            .child(
+                Button::new("close-thread")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .icon(IconName::X)
+                    .tooltip("Close")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadPanelEvent::Close))),
+            );
+
+        let mut body = v_flex()
+            .id("thread-body")
+            .flex_1()
+            .min_h_0()
+            .gap_1()
+            .overflow_y_scroll();
+        match self.root.as_ref() {
+            Some(root) => {
+                if self.unread_after.as_ref() == Some(&root.ts) {
+                    body = body.child(new_messages_divider(cx));
+                }
+                body = body.child(self.thread_message_row(root, true, cx));
+                let new_count = self.unread_new_count();
+                body = body.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(format!("{} replies", self.replies.len())),
+                        )
+                        .when(new_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(danger)
+                                    .child(format!("{new_count} new")),
+                            )
+                        }),
+                );
+                for message in &self.replies {
+                    if self.unread_after.as_ref() == Some(&message.ts) {
+                        body = body.child(new_messages_divider(cx));
+                    }
+                    body = body.child(self.thread_message_row(message, false, cx));
+                }
+            }
+            None => body = body.child(self.empty_state(cx)),
+        }
+
+        let composer_area = v_flex()
+            .flex_none()
+            .when(self.reply_hint, |column| {
+                column.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .px_4()
+                        .pt_1()
+                        .child(
+                            Icon::new(IconName::CornerUpLeft)
+                                .text_color(muted)
+                                .size(px(14.)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Replying in thread"),
+                        ),
+                )
+            })
+            .child(self.composer.clone());
+
+        v_flex()
+            .size_full()
+            .bg(background)
+            .border_l_1()
+            .border_color(border)
+            .child(header)
+            .child(body)
+            .child(composer_area)
+    }
+}
+
+/// The fixture-mode unread divider, styled like the transcript's in `messages.rs`.
+fn new_messages_divider(cx: &App) -> Div {
+    let danger = cx.theme().danger;
+    h_flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .child(div().flex_1().h(px(1.)).bg(danger))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(danger)
+                .child("New"),
+        )
+        .child(div().flex_1().h(px(1.)).bg(danger))
+}

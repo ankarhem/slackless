@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+exclude = ["spikes/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# GPUI renders every frame through its dependencies: optimize them even in dev builds, and
+# our own crates lightly, so `cargo run` stays smooth while rebuilds stay quick.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+
+[workspace.dependencies]
+slackless-types = { path = "crates/slackless-types" }
+slackless-api = { path = "crates/slackless-api" }
+slackless-rtm = { path = "crates/slackless-rtm" }
+slackless-store = { path = "crates/slackless-store" }
+slackless-auth = { path = "crates/slackless-auth" }
+slackless-platform = { path = "crates/slackless-platform" }
+slackless-core = { path = "crates/slackless-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"

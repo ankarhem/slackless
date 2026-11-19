@@ -1,0 +1,16 @@
+[package]
+name = "slackless-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slackless-core.workspace = true
+# `HttpClient::send`'s error type (GPUI's image loader).
+anyhow.workspace = true
+# The sign-in window (`--sign-in` helper process).
+slackless-auth = { workspace = true, features = ["webview"] }
+gpui-kit = "0.10.0"
+# Nightly aarch64 ICE workaround (docs/research/gpui-kit-guide.md section 15).
+pathfinder_simd = { version = "0.5", features = ["pf-no-simd"] }
+emojis = "0.9"

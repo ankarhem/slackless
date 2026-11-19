@@ -1,0 +1,14 @@
+# Rust build output (shared target dir; disk is tight)
+/target
+**/target
+
+# Local credentials / environment (never commit a Slack session)
+.env
+.env.*
+!.env.example
+
+# direnv local state
+.direnv/
+
+# Agent scratch / research fetches
+.omo/

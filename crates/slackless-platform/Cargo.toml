@@ -1,0 +1,22 @@
+[package]
+name = "slackless-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+# Deep-link parsing (slack://, https://app.slack.com/client) — pure, tested.
+url = "2.5.8"
+percent-encoding = "2.3.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Dock badge + bundle Info.plist URL types. GPUI has no dock-tile API
+# (gpui-kit guide §14), so the badge goes through objc2.
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSBundle", "NSDictionary", "NSEnumerator", "NSString"] }
+# Main-queue hop for badge calls made off the main thread.
+dispatch2 = "0.3.1"
+# Keychain generic passwords.
+security-framework = "3.7.0"

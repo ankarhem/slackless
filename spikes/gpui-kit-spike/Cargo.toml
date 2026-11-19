@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "gpui-kit-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui-kit = "0.10.0"
+# Tokio-based "network" worker: gpui's async runtime is smol-based, not tokio,
+# so a tokio client must run on its own runtime on a dedicated thread.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+futures = "0.3"
+# Work around a nightly rustc ICE (mono_checks/abi_check.rs) in
+# pathfinder_simd's nightly-only aarch64 SIMD module (a transitive dep of
+# gpui-pre-apple). Feature unification makes the whole graph use the scalar
+# fallback instead of std::intrinsics::simd.
+pathfinder_simd = { version = "0.5", features = ["pf-no-simd"] }

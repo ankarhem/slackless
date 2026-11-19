@@ -1,0 +1,22 @@
+[package]
+name = "slackless-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "slackless"
+path = "src/main.rs"
+
+[dependencies]
+slackless-core.workspace = true
+slackless-auth = { workspace = true, features = ["webview"] }
+slackless-store.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# slackless-store keeps its connection private (no conversation/user listing API), so the
+# CLI reads those tables straight from the archive with the same bundled rusqlite pin.
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,0 +1,106 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "subtype": "brand_new_subtype_2027",
+      "ts": "1700000500.000600",
+      "text": "something Slack added later",
+      "sparkles": { "level": 9 }
+    },
+    {
+      "type": "message",
+      "user": "U0AAAAAAA",
+      "text": "hey <@U0BBBBBBB> :wave:",
+      "ts": "1700000400.000500",
+      "client_msg_id": "1a2b3c4d-1111-4222-8333-944445555666",
+      "team": "T0TTTTTTT",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "aB1c",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                { "type": "text", "text": "hey " },
+                { "type": "user", "user_id": "U0BBBBBBB" },
+                { "type": "text", "text": " " },
+                { "type": "emoji", "name": "wave", "unicode": "1f44b" }
+              ]
+            }
+          ]
+        }
+      ],
+      "reactions": [{ "name": "eyes", "users": ["U0BBBBBBB"], "count": 1 }],
+      "edited": { "user": "U0AAAAAAA", "ts": "1700000410.000000" }
+    },
+    {
+      "type": "message",
+      "user": "U0BBBBBBB",
+      "text": "thread root",
+      "ts": "1700000300.000400",
+      "thread_ts": "1700000300.000400",
+      "reply_count": 2,
+      "reply_users_count": 1,
+      "latest_reply": "1700000350.000450",
+      "reply_users": ["U0AAAAAAA"],
+      "is_locked": false,
+      "subscribed": true,
+      "last_read": "1700000350.000450"
+    },
+    {
+      "type": "message",
+      "subtype": "bot_message",
+      "bot_id": "B0CCCCCCC",
+      "username": "deploy-bot",
+      "text": "",
+      "ts": "1700000200.000300",
+      "attachments": [
+        {
+          "id": 1,
+          "color": "36a64f",
+          "fallback": "Deployed v1.2.3",
+          "title": "Deployed v1.2.3",
+          "fields": [{ "title": "env", "value": "prod", "short": true }]
+        }
+      ],
+      "bot_profile": {
+        "id": "B0CCCCCCC",
+        "name": "deploy-bot",
+        "deleted": false,
+        "updated": 1690000000
+      }
+    },
+    {
+      "type": "message",
+      "subtype": "channel_join",
+      "user": "U0DDDDDDD",
+      "text": "<@U0DDDDDDD> has joined the channel",
+      "ts": "1700000100.000200"
+    },
+    {
+      "type": "message",
+      "user": "U0AAAAAAA",
+      "text": "",
+      "ts": "1700000000.000100",
+      "upload": true,
+      "files": [
+        {
+          "id": "F0EEEEEEE",
+          "name": "screenshot.png",
+          "mimetype": "image/png",
+          "filetype": "png",
+          "mode": "hosted",
+          "size": 12345,
+          "url_private": "https://files.slack.com/files-pri/T0TTTTTTT-F0EEEEEEE/screenshot.png"
+        }
+      ]
+    }
+  ],
+  "has_more": true,
+  "pin_count": 0,
+  "channel_actions_ts": null,
+  "channel_actions_count": 0,
+  "response_metadata": { "next_cursor": "bmV4dF90czoxNzAwMDAwMDAwMDAwMTAw" }
+}
