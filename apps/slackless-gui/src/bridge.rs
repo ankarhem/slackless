@@ -137,11 +137,13 @@ impl CoreBridge {
         Some(fixtures::live(session, &store, counts))
     }
 
-    /// Live mode: a read of `channel`'s newest stored history (oldest first, without deleted
-    /// messages) to run off the UI thread. `None` offline.
+    /// Live mode: a read of `channel`'s stored history (oldest first, without deleted
+    /// messages) to run off the UI thread: the newest `HISTORY_LIMIT` messages, or the
+    /// `HISTORY_LIMIT` before `before` when paging older on scroll-back. `None` offline.
     pub fn history(
         &self,
         channel: ChannelId,
+        before: Option<Ts>,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.store.clone()?;
@@ -149,7 +151,7 @@ impl CoreBridge {
             let Ok(store) = store.lock() else {
                 return Vec::new();
             };
-            match store.channel_history(&team, &channel, None, HISTORY_LIMIT) {
+            match store.channel_history(&team, &channel, before.as_ref(), HISTORY_LIMIT) {
                 Ok(rows) => rows
                     .into_iter()
                     .filter(|row| !row.deleted)

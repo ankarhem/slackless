@@ -16,8 +16,8 @@ use crate::pagination::{Page, paginate};
 use crate::types::endpoints::method;
 use crate::types::{
     ApiResponse, Attachment, Block, BotId, ChannelId, ChannelSection, Conversation,
-    ConversationKind, Empty, File, Message, RichTextBlock, SectionKind, Team, TeamId, Ts, User,
-    UserId,
+    ConversationKind, DndStatus, Empty, File, Message, RichTextBlock, SectionKind, Team, TeamId,
+    Ts, User, UserId, UserPresence,
 };
 use crate::{Result, SlackApi};
 
@@ -689,6 +689,18 @@ impl SlackApi {
             .await?
             .data
             .user)
+    }
+
+    /// `dnd.info`: one user's do-not-disturb schedule and snooze state. Read-only.
+    pub async fn dnd_info(&self, user: &UserId) -> Result<DndStatus> {
+        let params = vec![("user", user.to_string())];
+        Ok(self.call(method::DND_INFO, params).await?.data)
+    }
+
+    /// `users.getPresence`: one user's current presence. Read-only.
+    pub async fn users_get_presence(&self, user: &UserId) -> Result<UserPresence> {
+        let params = vec![("user", user.to_string())];
+        Ok(self.call(method::USERS_GET_PRESENCE, params).await?.data)
     }
 
     /// One page of `users.list` (`limit` max 1000).

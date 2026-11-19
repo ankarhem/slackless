@@ -100,6 +100,66 @@ impl Conversation {
             ConversationKind::PublicChannel
         }
     }
+
+    /// Overlays a fresher copy from Slack on this stored one. Endpoints return partial
+    /// conversation objects (`client.userBoot` IMs carry unread counts that
+    /// `conversations.info` omits; only `conversations.info` carries `num_members`), so a
+    /// field moves only when the fresh copy actually carries it: `Option`s when `Some`,
+    /// `members` when non-empty, flags when `true` (an omitted flag deserializes as `false`
+    /// and must not erase a stored `true`).
+    pub fn merge(&mut self, fresh: &Conversation) {
+        macro_rules! carried {
+            ($($field:ident),* $(,)?) => {$(
+                if fresh.$field.is_some() {
+                    self.$field = fresh.$field.clone();
+                }
+            )*};
+        }
+        carried!(
+            name,
+            name_normalized,
+            topic,
+            purpose,
+            user,
+            latest,
+            last_read,
+            unread_count,
+            unread_count_display,
+            num_members,
+            creator,
+            created,
+            updated,
+            context_team_id,
+            priority,
+        );
+        macro_rules! flagged {
+            ($($field:ident),* $(,)?) => {$(
+                if fresh.$field {
+                    self.$field = true;
+                }
+            )*};
+        }
+        flagged!(
+            is_channel,
+            is_group,
+            is_im,
+            is_mpim,
+            is_private,
+            is_archived,
+            is_general,
+            is_member,
+            is_open,
+            is_shared,
+            is_ext_shared,
+            is_org_shared,
+        );
+        if !fresh.members.is_empty() {
+            self.members = fresh.members.clone();
+        }
+        for (key, value) in &fresh.extra {
+            self.extra.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 /// `topic` / `purpose`.
@@ -128,5 +188,78 @@ impl Latest {
             Latest::Ts(ts) => ts,
             Latest::Message(m) => &m.ts,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::UserId;
+
+    #[test]
+    fn merge_takes_carried_fields_and_keeps_absent_ones() {
+        let stored = Conversation {
+            id: ChannelId::from("C1"),
+            name: Some("general".into()),
+            is_channel: true,
+            is_member: true,
+            unread_count_display: Some(7),
+            priority: Some(0.5),
+            topic: Some(TopicPurpose {
+                value: "kept".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let fresh = Conversation {
+            id: ChannelId::from("C1"),
+            num_members: Some(42),
+            is_channel: true,
+            // Omitted by the endpoint that produced `fresh`:
+            name: None,
+            is_member: false,
+            unread_count_display: None,
+            priority: None,
+            topic: None,
+            ..Default::default()
+        };
+
+        let mut merged = stored;
+        merged.merge(&fresh);
+
+        assert_eq!(merged.num_members, Some(42), "newly carried fields land");
+        assert_eq!(merged.name.as_deref(), Some("general"));
+        assert_eq!(merged.unread_count_display, Some(7));
+        assert_eq!(merged.priority, Some(0.5));
+        assert_eq!(
+            merged.topic.as_ref().map(|t| t.value.as_str()),
+            Some("kept")
+        );
+        assert!(
+            merged.is_member,
+            "an omitted flag must not erase a stored true"
+        );
+    }
+
+    #[test]
+    fn merge_replaces_carried_values_and_flags_turning_true() {
+        let mut merged = Conversation {
+            id: ChannelId::from("C1"),
+            name: Some("old".into()),
+            is_archived: false,
+            members: Vec::new(),
+            ..Default::default()
+        };
+        merged.merge(&Conversation {
+            id: ChannelId::from("C1"),
+            name: Some("renamed".into()),
+            is_archived: true,
+            members: vec![UserId::from("U1"), UserId::from("U2")],
+            ..Default::default()
+        });
+
+        assert_eq!(merged.name.as_deref(), Some("renamed"));
+        assert!(merged.is_archived);
+        assert_eq!(merged.members.len(), 2);
     }
 }

@@ -171,6 +171,19 @@ pub struct DndStatus {
     pub snooze_remaining: Option<i64>,
 }
 
+impl DndStatus {
+    /// True while notifications are silenced: during an active snooze, or inside the enabled
+    /// do-not-disturb window. `now` is unix seconds.
+    pub fn paused(&self, now: i64) -> bool {
+        (self.snooze_enabled && self.snooze_endtime.is_some_and(|end| end > now))
+            || (self.dnd_enabled
+                && matches!(
+                    (self.next_dnd_start_ts, self.next_dnd_end_ts),
+                    (Some(start), Some(end)) if now >= start && now < end
+                ))
+    }
+}
+
 /// A workspace (`auth.test`, `client.userBoot.team`, `rtm.connect.team`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Team {
@@ -186,4 +199,48 @@ pub struct Team {
     pub icon: Option<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DndStatus;
+
+    #[test]
+    fn paused_follows_snooze_and_dnd_window() {
+        let off = DndStatus::default();
+        assert!(!off.paused(1000));
+
+        let snoozing = DndStatus {
+            snooze_enabled: true,
+            snooze_endtime: Some(1200),
+            ..Default::default()
+        };
+        assert!(snoozing.paused(1000));
+        assert!(
+            !snoozing.paused(1200),
+            "a snooze that ended no longer pauses"
+        );
+
+        let scheduled = DndStatus {
+            dnd_enabled: true,
+            next_dnd_start_ts: Some(1000),
+            next_dnd_end_ts: Some(2000),
+            ..Default::default()
+        };
+        assert!(
+            scheduled.paused(1000),
+            "the window is inclusive of its start"
+        );
+        assert!(scheduled.paused(1999));
+        assert!(!scheduled.paused(2000), "the window end no longer pauses");
+        assert!(!scheduled.paused(999), "before the window nothing pauses");
+
+        // A schedule without the do-not-disturb preference on never pauses.
+        let disabled = DndStatus {
+            next_dnd_start_ts: Some(1000),
+            next_dnd_end_ts: Some(2000),
+            ..Default::default()
+        };
+        assert!(!disabled.paused(1500));
+    }
 }

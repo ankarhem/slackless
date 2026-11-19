@@ -104,6 +104,12 @@ pub enum Event {
     HistoryComplete { channel: ChannelId },
     /// These conversations were added or updated in the store.
     Conversations(Vec<ChannelId>),
+    /// An opened channel's `conversations.info` refresh (already merged into the store).
+    /// Details only, so front-ends update the header without rebuilding conversation lists.
+    ConversationInfo {
+        channel: ChannelId,
+        num_members: Option<u32>,
+    },
     /// These users were added or updated in the store.
     UsersChanged(Vec<UserId>),
     /// Sidebar inputs (team, sections, custom emoji, prefs) changed in the store; re-read them.
@@ -122,6 +128,9 @@ pub enum Event {
         users: Vec<UserId>,
         presence: Presence,
     },
+    /// A user's notifications are paused (snooze or their do-not-disturb window); fetched
+    /// when their DM opens. Ephemeral: front-ends keep it in memory, it is never stored.
+    DndPaused { user: UserId, paused: bool },
     /// Local store matches for a [`Command::Search`], newest first.
     SearchResults {
         query: String,

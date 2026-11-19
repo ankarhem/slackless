@@ -146,7 +146,7 @@ fn text_of(object: &Json) -> Option<&str> {
 fn text_object(object: &Json, kcx: &KitCx, muted: bool, cx: &App) -> Option<AnyElement> {
     let text = text_of(object)?;
     if object["type"].as_str() == Some("mrkdwn") {
-        return Some(messages::mrkdwn(text, kcx.fixtures, muted, cx).into_any_element());
+        return Some(messages::mrkdwn(text, kcx.fixtures, muted, false, cx).into_any_element());
     }
     Some(
         div()
@@ -726,7 +726,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         });
     }
     if let Some(text) = &attachment.text {
-        body = body.child(messages::mrkdwn(text, fixtures, false, cx));
+        body = body.child(messages::mrkdwn(text, fixtures, false, false, cx));
     }
     // Short fields pair up in two columns; long fields take a full row.
     let mut fields = attachment.fields.iter().peekable();
@@ -744,7 +744,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                     )
                 })
                 .when_some(field.value.as_deref(), |cell, value| {
-                    cell.child(messages::mrkdwn(value, fixtures, false, cx))
+                    cell.child(messages::mrkdwn(value, fixtures, false, false, cx))
                 })
         };
         let mut row = h_flex().items_start().gap_4().child(cell(field));
@@ -762,7 +762,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         ts: &block_ts,
     };
     for (ix, nested_block) in attachment.blocks.iter().enumerate() {
-        body = body.children(messages::render_block(nested_block, ix, &nested, cx));
+        body = body.children(messages::render_block(nested_block, ix, &nested, false, cx));
     }
     if let Some(url) = attachment.image_url.as_deref() {
         body = body.child(picture(Some(url), "attachment image", 360., 160., kcx, cx));
@@ -790,7 +790,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         .gap_1()
         .min_w_0()
         .when_some(attachment.pretext.as_deref(), |card, pretext| {
-            card.child(messages::mrkdwn(pretext, fixtures, false, cx))
+            card.child(messages::mrkdwn(pretext, fixtures, false, false, cx))
         })
         .child(
             h_flex()

@@ -10,6 +10,11 @@
 //! channel browser. [`Sidebar::badge_count`] is the dock badge: unread activity plus unread
 //! DMs.
 //!
+//! Slack's floating "More unreads" pill rides the list's bottom (or top) edge whenever
+//! unread rows sit outside the scrolled view: the sidebar's primary colors while any hidden
+//! row carries mentions, otherwise a neutral raised chip; a click scrolls the next hidden
+//! unread row into view.
+//!
 //! Everything visual comes from the theme's sidebar palette (`sidebar*` tokens); selected
 //! rows use `sidebar_accent`, hover rows the theme's neutral hover wash (`accent`). The only
 //! derived colors are opacity steps of `sidebar_foreground` for idle rows and icons.
@@ -23,8 +28,8 @@ use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img, px,
 };
 use slackless_core::types::{
     ChannelId, ChannelSection, Conversation, ConversationKind, Message, SectionKind, Team, Ts,
@@ -138,6 +143,9 @@ pub struct Sidebar {
     draft_count: usize,
     /// In-progress Later items, shown on the "Later" row.
     later_count: usize,
+    /// Tracks the sidebar list's scroll state; the "More unreads" pills read which unread
+    /// rows the scroll offset carries out of view.
+    scroll: ScrollHandle,
     /// The rail's Activity destination.
     activity: Entity<ActivityFeed>,
     /// The signed-in user's status and presence, for the rail avatar.
@@ -195,6 +203,7 @@ impl Sidebar {
                 huddle: None,
                 draft_count: 0,
                 later_count: 0,
+                scroll: ScrollHandle::new(),
                 activity,
                 self_state: SelfState::default(),
                 _subscriptions: subscriptions,
@@ -615,6 +624,8 @@ impl Sidebar {
     /// A sidebar section: a dim header row (section emoji or icon + name; click collapses)
     /// over its conversation rows. Like Slack, a collapsed section still lists its unread and
     /// open conversations. An expanded Channels section ends with the "Add channels" row.
+    /// The section flattens into direct children of the scroll list (each carrying the
+    /// section's own padding) so its scroll handle can track every row.
     fn section(
         &self,
         key: SharedString,
@@ -623,7 +634,7 @@ impl Sidebar {
         conversations: &[Conversation],
         watermark: Option<&Ts>,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Vec<(AnyElement, ListChild)> {
         let add_channels =
             key.as_ref() == "channels"
                 || self.fixtures.sections.iter().any(|section| {
@@ -634,42 +645,56 @@ impl Sidebar {
         let hover = theme.sidebar_foreground.opacity(0.08);
         let open = !self.collapsed.contains(&key);
         let toggle = key.clone();
-        v_flex()
+        let header = h_flex()
+            .id(SharedString::from(format!("section-{key}")))
+            .h(px(28.))
             .px_2()
-            .pt_2()
-            .child(
-                h_flex()
-                    .id(SharedString::from(format!("section-{key}")))
-                    .h(px(28.))
+            .gap_2()
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(dim)
+            .hover(|row| row.bg(hover))
+            .child(div().w(px(18.)).flex().justify_center().children(leading))
+            .child(div().flex_1().truncate().child(title.to_owned()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.collapsed.remove(&toggle) {
+                    this.collapsed.insert(toggle.clone());
+                }
+                cx.notify();
+            }));
+        let mut children = vec![(
+            v_flex().px_2().pt_2().child(header).into_any_element(),
+            ListChild::Plain,
+        )];
+        for conversation in conversations.iter().filter(|conversation| {
+            open || conversation.id == self.selected
+                || self.unread_in(conversation, watermark).count > 0
+        }) {
+            let unread = self.unread_in(conversation, watermark);
+            let kind = if unread.count > 0 {
+                ListChild::Unread(unread.mentions > 0)
+            } else {
+                ListChild::Plain
+            };
+            children.push((
+                v_flex()
                     .px_2()
-                    .gap_2()
-                    .items_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(dim)
-                    .hover(|row| row.bg(hover))
-                    .child(div().w(px(18.)).flex().justify_center().children(leading))
-                    .child(div().flex_1().truncate().child(title.to_owned()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.collapsed.remove(&toggle) {
-                            this.collapsed.insert(toggle.clone());
-                        }
-                        cx.notify();
-                    })),
-            )
-            .children(
-                conversations
-                    .iter()
-                    .filter(|conversation| {
-                        open || conversation.id == self.selected
-                            || self.unread_in(conversation, watermark).count > 0
-                    })
-                    .map(|conversation| self.conversation_row(conversation, watermark, cx))
-                    .collect::<Vec<_>>(),
-            )
-            .when(open && add_channels, |section| {
-                section.child(self.add_channels_row(cx))
-            })
+                    .child(self.conversation_row(conversation, watermark, cx))
+                    .into_any_element(),
+                kind,
+            ));
+        }
+        if open && add_channels {
+            children.push((
+                v_flex()
+                    .px_2()
+                    .child(self.add_channels_row(cx))
+                    .into_any_element(),
+                ListChild::Plain,
+            ));
+        }
+        children
     }
 
     /// The sections under the nav rows. Live: the user's own sidebar sections in their order,
@@ -680,26 +705,25 @@ impl Sidebar {
         channels: &[Conversation],
         watermark: Option<&Ts>,
         cx: &mut Context<Self>,
-    ) -> Vec<Div> {
+    ) -> Vec<(AnyElement, ListChild)> {
         if self.fixtures.sections.is_empty() {
-            return vec![
-                self.section(
-                    "channels".into(),
-                    Some(caret()),
-                    "Channels",
-                    channels,
-                    watermark,
-                    cx,
-                ),
-                self.section(
-                    "dms".into(),
-                    Some(caret()),
-                    "Direct messages",
-                    &self.fixtures.dms,
-                    watermark,
-                    cx,
-                ),
-            ];
+            let mut children = self.section(
+                "channels".into(),
+                Some(caret()),
+                "Channels",
+                channels,
+                watermark,
+                cx,
+            );
+            children.extend(self.section(
+                "dms".into(),
+                Some(caret()),
+                "Direct messages",
+                &self.fixtures.dms,
+                watermark,
+                cx,
+            ));
+            return children;
         }
         // Slack fills External connections itself, from the externally shared channels.
         let connect = self
@@ -784,7 +808,7 @@ impl Sidebar {
                 });
             }
             let (title, leading) = section_title(section, &self.fixtures);
-            list.push(self.section(
+            list.extend(self.section(
                 section.id.clone().into(),
                 leading,
                 &title,
@@ -1089,6 +1113,63 @@ impl Sidebar {
         }
         row.on_click(cx.listener(move |this, _, _, cx| this.select_row(id.clone(), cx)))
     }
+
+    /// Slack's floating "More unreads" chip for one edge of the list: it points at hidden
+    /// unread rows, takes the sidebar's primary colors while any of them carries mentions,
+    /// and otherwise reads as a neutral raised chip.
+    fn unreads_pill(&self, target: HiddenUnreads, cx: &Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (bg, hover, fg) = if target.mentions {
+            (
+                theme.sidebar_primary,
+                theme.sidebar_primary,
+                theme.sidebar_primary_foreground,
+            )
+        } else {
+            // Opaque like Slack's chip: the rows it floats over must not show through.
+            (
+                theme.secondary,
+                theme.secondary_hover,
+                theme.secondary_foreground,
+            )
+        };
+        let row = target.row;
+        h_flex()
+            .id(if target.below {
+                "unreads-below"
+            } else {
+                "unreads-above"
+            })
+            .gap_1()
+            .px_2()
+            .py_0p5()
+            .rounded_full()
+            .border_1()
+            .border_color(theme.sidebar_border)
+            .bg(bg)
+            .hover(|pill| pill.bg(hover))
+            .shadow_sm()
+            .text_sm()
+            .text_color(fg)
+            .font_weight(FontWeight::SEMIBOLD)
+            .cursor_pointer()
+            .child(
+                Icon::new(if target.below {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronUp
+                })
+                .text_color(fg)
+                .size(px(14.)),
+            )
+            .child("More unreads")
+            // The pill floats over sidebar rows: a click must not also open the row beneath.
+            .occlude()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.scroll.scroll_to_item(row);
+                cx.notify();
+            }))
+    }
 }
 
 /// Slack-style inline count pill: red for mentions (and DM messages), the sidebar's primary
@@ -1113,6 +1194,62 @@ fn count_pill(count: u32, mentions: bool, cx: &gpui_kit::gpui::App) -> Div {
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .child(count.to_string())
+}
+
+/// One flattened child of the sidebar's scroll list: unread conversation rows are the ones
+/// the "More unreads" pills track.
+enum ListChild {
+    /// An unread conversation row; the flag says it carries mentions.
+    Unread(bool),
+    /// Headers, read rows and dividers.
+    Plain,
+}
+
+/// One edge of the list's hidden unreads: the unread row the pill scrolls to next, and
+/// whether any unread row hidden past that edge carries mentions. `below` picks the pill's
+/// arrow and the list edge it rides.
+#[derive(Clone, Copy)]
+struct HiddenUnreads {
+    row: usize,
+    mentions: bool,
+    below: bool,
+}
+
+/// The "More unreads" pills for `unread_rows` (child indices with mention flags, in list
+/// order): the first unread row below the fold and the last one scrolled above it. Rows are
+/// placed with the scroll handle's recorded child bounds; `None` on an edge whose unread
+/// rows are in view (or before the list has laid out).
+fn hidden_unreads(
+    scroll: &ScrollHandle,
+    unread_rows: &[(usize, bool)],
+) -> (Option<HiddenUnreads>, Option<HiddenUnreads>) {
+    let viewport = scroll.bounds();
+    // Child bounds live in the layout's unscrolled space; scrolling down drives the offset
+    // negative (`ScrollHandle::set_offset`), so subtracting it maps the viewport's edges
+    // into that space.
+    let top = viewport.top() - scroll.offset().y;
+    let bottom = viewport.bottom() - scroll.offset().y;
+    let mut below = Option::<HiddenUnreads>::None;
+    let mut above = Option::<HiddenUnreads>::None;
+    for &(row, mentions) in unread_rows {
+        if let Some(bounds) = scroll.bounds_for_item(row) {
+            if bounds.bottom() > bottom {
+                let pill = below.get_or_insert(HiddenUnreads {
+                    row,
+                    mentions: false,
+                    below: true,
+                });
+                pill.mentions |= mentions;
+            } else if bounds.top() < top {
+                above = Some(HiddenUnreads {
+                    row,
+                    mentions: above.is_some_and(|pill| pill.mentions) || mentions,
+                    below: false,
+                });
+            }
+        }
+    }
+    (below, above)
 }
 
 /// The chevron leading a section header that has no emoji or icon of its own.
@@ -1235,78 +1372,99 @@ impl Render for Sidebar {
             .min_w(px(0.))
             .h_full()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
             .border_l_1()
             .border_color(sidebar_border)
             .pb_2();
+        let (mut below, mut above) = (None, None);
         let list = match self.active_nav {
             NavItem::Dms => list.child(self.dm_list(watermark.as_ref(), cx)),
             NavItem::Activity => list.child(self.activity.clone()),
             NavItem::Home | NavItem::Files | NavItem::Todos | NavItem::Agents | NavItem::Admin => {
-                list.child(self.workspace_header(cx))
-                    .child(self.find_field(cx))
-                    .child(div().mx_2().my_2().h(px(1.)).bg(sidebar_border))
-                    .child(
-                        self.nav_row(
-                            "unreads",
-                            IconName::Inbox,
-                            "Unreads",
-                            total.count > 0,
-                            None,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.active_nav = NavItem::Activity;
-                            cx.notify();
-                        })),
+                let mut children = vec![
+                    self.workspace_header(cx).into_any_element(),
+                    self.find_field(cx).into_any_element(),
+                    div()
+                        .mx_2()
+                        .my_2()
+                        .h(px(1.))
+                        .bg(sidebar_border)
+                        .into_any_element(),
+                ];
+                for row in [
+                    self.nav_row(
+                        "unreads",
+                        IconName::Inbox,
+                        "Unreads",
+                        total.count > 0,
+                        None,
+                        cx,
                     )
-                    .child(self.nav_row(
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.active_nav = NavItem::Activity;
+                        cx.notify();
+                    })),
+                    self.nav_row(
                         "threads",
                         IconName::MessageSquareText,
                         "Threads",
                         false,
                         None,
                         cx,
-                    ))
-                    .child(self.nav_row(
-                        "huddles",
-                        IconName::Headphones,
-                        "Huddles",
+                    ),
+                    self.nav_row("huddles", IconName::Headphones, "Huddles", false, None, cx),
+                    self.nav_row(
+                        "drafts",
+                        IconName::Send,
+                        "Drafts & sent",
                         false,
-                        None,
+                        (self.draft_count > 0).then(|| self.draft_count.to_string()),
                         cx,
-                    ))
-                    .child(
-                        self.nav_row(
-                            "drafts",
-                            IconName::Send,
-                            "Drafts & sent",
-                            false,
-                            (self.draft_count > 0).then(|| self.draft_count.to_string()),
-                            cx,
-                        )
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenDrafts))),
                     )
-                    .child(
-                        self.nav_row(
-                            "saved",
-                            IconName::Bookmark,
-                            "Saved",
-                            false,
-                            (self.later_count > 0).then(|| self.later_count.to_string()),
-                            cx,
-                        )
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenLater))),
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenDrafts))),
+                    self.nav_row(
+                        "saved",
+                        IconName::Bookmark,
+                        "Saved",
+                        false,
+                        (self.later_count > 0).then(|| self.later_count.to_string()),
+                        cx,
                     )
-                    .child(self.nav_row(
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenLater))),
+                    self.nav_row(
                         "directories",
                         IconName::BookUser,
                         "Directories",
                         false,
                         None,
                         cx,
-                    ))
-                    .child(div().mx_4().my_2().h(px(1.)).bg(sidebar_border))
-                    .children(self.section_list(&channels, watermark.as_ref(), cx))
+                    ),
+                ] {
+                    children.push(row.into_any_element());
+                }
+                children.push(
+                    div()
+                        .mx_4()
+                        .my_2()
+                        .h(px(1.))
+                        .bg(sidebar_border)
+                        .into_any_element(),
+                );
+                let mut unread_rows = Vec::new();
+                for (child, kind) in self.section_list(&channels, watermark.as_ref(), cx) {
+                    if let ListChild::Unread(mentions) = kind {
+                        unread_rows.push((children.len(), mentions));
+                    }
+                    children.push(child);
+                }
+                // The handle records the list's child bounds during prepaint, one frame
+                // behind this render; ask for that frame before the pills can trust it.
+                if self.scroll.bounds_for_item(children.len() - 1).is_none() {
+                    cx.notify();
+                }
+                (below, above) = hidden_unreads(&self.scroll, &unread_rows);
+                list.children(children)
             }
         };
 
@@ -1321,6 +1479,38 @@ impl Render for Sidebar {
                 self.activity.read(cx).unread_count(),
                 cx,
             ))
-            .child(list)
+            .child(
+                // A relative wrapper, so the pills can float over the list's edges.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .child(list)
+                    .when_some(below, |list, pill| {
+                        list.child(
+                            div()
+                                .absolute()
+                                .bottom_2()
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(self.unreads_pill(pill, cx)),
+                        )
+                    })
+                    .when_some(above, |list, pill| {
+                        list.child(
+                            div()
+                                .absolute()
+                                .top_2()
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(self.unreads_pill(pill, cx)),
+                        )
+                    }),
+            )
     }
 }

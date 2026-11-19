@@ -7,7 +7,9 @@ use crate::api::{
     self, ClientCounts, HistoryOpts, MessageContent, Page, PostedMessage, SearchMessages,
     SearchOpts, SlackApi, UserBoot,
 };
-use crate::types::{ChannelId, ChannelSection, Conversation, Message, Ts, User};
+use crate::types::{
+    ChannelId, ChannelSection, Conversation, DndStatus, Message, Ts, User, UserId, UserPresence,
+};
 
 /// `conversations.history` page size the core requests (Slack max 999).
 pub(crate) const HISTORY_PAGE_LIMIT: u32 = 200;
@@ -41,6 +43,11 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// A user's do-not-disturb state (`dnd.info`). Read-only.
+    fn dnd_info(&self, user: UserId) -> impl Future<Output = api::Result<DndStatus>> + Send;
+    /// A user's current presence (`users.getPresence`). Read-only.
+    fn user_presence(&self, user: UserId)
+    -> impl Future<Output = api::Result<UserPresence>> + Send;
     fn post_message(
         &self,
         channel: ChannelId,
@@ -126,6 +133,14 @@ impl Backend for SlackApi {
 
     async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
         self.conversations_info(&channel).await
+    }
+
+    async fn dnd_info(&self, user: UserId) -> api::Result<DndStatus> {
+        SlackApi::dnd_info(self, &user).await
+    }
+
+    async fn user_presence(&self, user: UserId) -> api::Result<UserPresence> {
+        self.users_get_presence(&user).await
     }
 
     async fn post_message(

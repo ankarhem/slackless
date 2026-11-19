@@ -2,7 +2,7 @@
 
 use futures::TryStreamExt;
 use serde_json::json;
-use slackless_api::types::{Block, ChannelId, MessageSubtype, SectionKind, Ts};
+use slackless_api::types::{Block, ChannelId, MessageSubtype, SectionKind, Ts, UserId};
 use slackless_api::{ApiError, HistoryOpts, MessageContent, SlackApi, paginate};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -380,4 +380,44 @@ async fn download_file_sends_only_the_cookie() {
         .await
         .unwrap_err();
     assert!(matches!(err, ApiError::UntrustedUrl(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn fetches_a_users_dnd_and_presence() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dnd.info"))
+        .and(body_string_contains("user=U2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "dnd_enabled": true,
+            "next_dnd_start_ts": 1700000000,
+            "next_dnd_end_ts": 1700003600,
+            "snooze_enabled": false,
+            "snooze_endtime": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.getPresence"))
+        .and(body_string_contains("user=U2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "presence": "active",
+            "online": true,
+            "connection_count": 1,
+            "last_activity": 1700000100
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dnd = api.dnd_info(&UserId::from("U2")).await.unwrap();
+    assert!(dnd.paused(1700000000));
+    assert!(!dnd.paused(1700003600));
+
+    let presence = api.users_get_presence(&UserId::from("U2")).await.unwrap();
+    assert_eq!(presence.presence, slackless_api::types::Presence::Active);
+    assert_eq!(presence.online, Some(true));
 }

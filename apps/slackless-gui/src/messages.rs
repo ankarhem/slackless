@@ -58,6 +58,9 @@ const ROW_GAP: f32 = 2.;
 const GROUP_WINDOW_SECS: i64 = 300;
 /// Inline custom-emoji image size in a text line (px).
 const INLINE_EMOJI: f32 = 18.;
+/// Rows from the top within which scrolling asks for the next older page: close enough that
+/// the page lands before the reader reaches the edge.
+const NEAR_TOP_ROWS: usize = 2;
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -101,6 +104,13 @@ pub enum MessageListEvent {
     },
     /// Save for later / Remind me / unsave; the root keeps the Later list.
     Later(SaveRequest),
+    /// The transcript scrolled to (near) the top of `channel`; the root reads the next older
+    /// page from the store, strictly older than `before` (the oldest message shown). Emitted
+    /// at most once per oldest message until the window refreshes.
+    NeedOlder {
+        channel: ChannelId,
+        before: Ts,
+    },
 }
 
 /// Snapshot the `'static` virtual-list row renderer reads: the current conversation's history
@@ -130,6 +140,9 @@ pub struct MessageList {
     /// Projection of the current conversation that the row renderer reads.
     data: Entity<MessageData>,
     scroller: Entity<MessageScrollerState>,
+    /// Oldest message a [`MessageListEvent::NeedOlder`] covered (in flight or landed); a
+    /// window refresh forgets it so the top of the list re-asks.
+    requested_older: Option<Ts>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -152,11 +165,18 @@ impl MessageList {
                     .placeholder("Edit message")
                     .auto_grow(1, 8)
             });
+            // Constructor enables FollowMode::Tail: the transcript starts at the bottom and
+            // follows new content.
+            let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
             // Control state and the edit draft live in their own entities: repaint the rows
-            // that show them when either changes.
+            // that show them when either changes; the scroller is watched to page older
+            // history in when the reader reaches the top.
             let subscriptions = vec![
                 cx.observe(&kit, |_, _, cx| cx.notify()),
                 cx.subscribe(&edit_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+                cx.observe(&scroller, |list: &mut MessageList, scroller, cx| {
+                    list.request_older_near_top(&scroller, cx)
+                }),
             ];
             let data = cx.new(|_| MessageData {
                 fixtures: fixtures.clone(),
@@ -170,15 +190,13 @@ impl MessageList {
                 editing: None,
                 edit_draft,
             });
-            // Constructor enables FollowMode::Tail: the transcript starts at the bottom and
-            // follows new content.
-            let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
             MessageList {
                 fixtures,
                 channel,
                 messages,
                 data,
                 scroller,
+                requested_older: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -207,17 +225,37 @@ impl MessageList {
     }
 
     /// Replace `channel`'s history (live mode: re-read from the store after it changed). An
-    /// unchanged history is a no-op; one that only grew keeps the scroll position.
+    /// unchanged history is a no-op; one that only grew keeps the scroll position. Pages
+    /// older than the refreshed window (loaded by [`MessageList::prepend_history`]) survive
+    /// the refresh, so scrolling back does not reload what the reader already paged in.
     pub fn set_history(
         &mut self,
         channel: ChannelId,
         history: Vec<Message>,
         cx: &mut Context<Self>,
     ) {
+        // A refresh may overtake an in-flight older-page read; forget the request so the top
+        // of the list re-asks.
+        self.requested_older = None;
         // Live history lives in the store: keep only the open conversation's in memory.
         self.messages.retain(|kept, _| *kept == channel);
+        let merged = match (
+            self.messages.remove(&channel),
+            history.first().map(|message| message.ts.clone()),
+        ) {
+            (Some(mut stored), Some(oldest)) => {
+                let pages = stored
+                    .iter()
+                    .take_while(|message| message.ts < oldest)
+                    .count();
+                stored.truncate(pages);
+                stored.extend(history);
+                stored
+            }
+            _ => history,
+        };
         let visible = channel == self.channel;
-        self.messages.insert(channel, history);
+        self.messages.insert(channel, merged);
         if !visible {
             return;
         }
@@ -248,6 +286,41 @@ impl MessageList {
         cx.notify();
     }
 
+    /// Prepend a page of `older` history to `channel` (a [`MessageListEvent::NeedOlder`]
+    /// read, oldest first), keeping the reader's place: the scroller anchors to its top row,
+    /// which shifts down by the rows added above it. Messages already stored are skipped, so
+    /// a repeated or out-of-order page cannot reorder the list.
+    pub fn prepend_history(
+        &mut self,
+        channel: ChannelId,
+        older: Vec<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(history) = self.messages.get_mut(&channel) else {
+            return;
+        };
+        for message in older {
+            let at = history.partition_point(|shown| shown.ts < message.ts);
+            if history.get(at).is_some_and(|shown| shown.ts == message.ts) {
+                continue;
+            }
+            history.insert(at, message);
+        }
+        if channel != self.channel {
+            return;
+        }
+        let shown = self.data.read(cx).messages.len();
+        let history = history_of(&self.messages, &self.channel);
+        let added = history.len().saturating_sub(shown);
+        if added == 0 {
+            return;
+        }
+        self.data.update(cx, |data, _| data.messages = history);
+        self.scroller
+            .update(cx, |scroller, cx| scroller.prepend(added, cx));
+        cx.notify();
+    }
+
     /// Add the signed-in user's `name` reaction to `ts` in `channel` (emoji picker pick).
     pub fn add_reaction(
         &mut self,
@@ -271,6 +344,7 @@ impl MessageList {
 
     /// Rebuild the render snapshot for the current conversation and reset the list onto it.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.requested_older = None;
         let history = history_of(&self.messages, &self.channel);
         let last_read = self
             .fixtures
@@ -296,6 +370,34 @@ impl MessageList {
         self.scroller
             .update(cx, |scroller, cx| scroller.remeasure(cx));
         cx.notify();
+    }
+
+    /// The scroller moved: away from the live tail and near the top, ask the root for the
+    /// next older page, once per oldest message. A list still following its tail (freshly
+    /// reset, or shorter than the viewport) never asks.
+    fn request_older_near_top(
+        &mut self,
+        scroller: &Entity<MessageScrollerState>,
+        cx: &mut Context<Self>,
+    ) {
+        let near_top = {
+            let state = scroller.read(cx);
+            !state.is_following_tail() && state.logical_scroll_top().item_ix <= NEAR_TOP_ROWS
+        };
+        if !near_top {
+            return;
+        }
+        let Some(before) = self.data.read(cx).messages.first().map(|m| m.ts.clone()) else {
+            return;
+        };
+        if self.requested_older.as_ref() == Some(&before) {
+            return;
+        }
+        self.requested_older = Some(before.clone());
+        cx.emit(MessageListEvent::NeedOlder {
+            channel: self.channel.clone(),
+            before,
+        });
     }
 
     fn current_mut(&mut self, ts: &Ts) -> Option<&mut Message> {
@@ -605,7 +707,7 @@ fn transcript_row(
 
     let mut body = v_flex().flex_1().min_w_0().gap_0p5().text_sm();
     if !grouped || editing {
-        body = body.child(message_header(message, &author, cx));
+        body = body.child(message_header(message, &author, fixtures, cx));
     }
     if editing {
         let (cancel, save) = (this.clone(), this.clone());
@@ -804,7 +906,7 @@ pub fn message_row(fixtures: &Fixtures, message: &Message, cx: &App) -> Div {
         .min_w_0()
         .gap_0p5()
         .text_sm()
-        .child(message_header(message, &author, cx))
+        .child(message_header(message, &author, fixtures, cx))
         .child(message_body(message, &kcx, cx));
     if let Some(files) = crate::files::attachments(fixtures, message, cx) {
         body = body.child(files);
@@ -831,15 +933,41 @@ pub fn message_row(fixtures: &Fixtures, message: &Message, cx: &App) -> Div {
         .child(body)
 }
 
-fn message_header(message: &Message, author: &str, cx: &App) -> Div {
+fn message_header(message: &Message, author: &str, fixtures: &Fixtures, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
+    // Like Slack, the author's current (unexpired) status emoji follows their name.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    let status = message
+        .user
+        .as_ref()
+        .and_then(|user| fixtures.user(user))
+        .map(|user| &user.profile)
+        .filter(|profile| {
+            profile
+                .status_expiration
+                .is_none_or(|end| end == 0 || end > now)
+        })
+        .and_then(|profile| profile.status_emoji.as_deref())
+        .map(|code| code.trim_matches(':'))
+        .filter(|code| !code.is_empty())
+        .map(|code| crate::emoji::emoji_element(code, fixtures, px(14.)));
     h_flex()
         .items_baseline()
         .gap_2()
         .child(
-            div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(author.to_owned()),
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(author.to_owned()),
+                )
+                .children(status),
         )
         .child(
             div()
@@ -847,9 +975,6 @@ fn message_header(message: &Message, author: &str, cx: &App) -> Div {
                 .text_color(muted)
                 .child(format_clock(&message.ts)),
         )
-        .when(message.edited.is_some(), |header| {
-            header.child(div().text_xs().text_color(muted).child("(edited)"))
-        })
 }
 
 /// Slack's day divider: a full-width rule with the day's pill (label, then a chevron) on it.
@@ -1108,6 +1233,19 @@ impl ParagraphBuilder {
         self.text.push_str(text);
     }
 
+    /// Slack's edit marker: a muted run at the paragraph's end that flows and wraps with the
+    /// text. (A per-run font size is not expressible: one `StyledText` carries a single text
+    /// size from its element, so the marker is muted at body size.)
+    fn push_edited(&mut self, theme: &RunTheme) {
+        self.push_text(
+            " (edited)",
+            theme,
+            RunFlags::default(),
+            Some(theme.muted),
+            None,
+        );
+    }
+
     /// A link inside the paragraph's text: a link-colored run, clickable through its range.
     /// A bare URL (label equal to the URL) gets Slack's chip look: no scheme, tinted wash.
     fn push_link(&mut self, url: String, label: String, theme: &RunTheme) {
@@ -1191,10 +1329,18 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
     row
 }
 
-fn paragraph(elements: &[RichTextElement], fixtures: &Fixtures, theme: &RunTheme) -> Option<Div> {
+fn paragraph(
+    elements: &[RichTextElement],
+    fixtures: &Fixtures,
+    theme: &RunTheme,
+    edited: bool,
+) -> Option<Div> {
     let mut builder = ParagraphBuilder::new();
     for element in elements {
         push_element(&mut builder, element, fixtures, theme);
+    }
+    if edited {
+        builder.push_edited(theme);
     }
     let segments = builder.finish();
     if segments.is_empty() {
@@ -1315,40 +1461,49 @@ fn push_element(
     }
 }
 
-/// Block-level rich text containers: paragraphs, lists, quotes and code blocks.
+/// Block-level rich text containers: paragraphs, lists, quotes and code blocks. With
+/// `edited`, the final container's plain text (a section, or a list's last item) carries the
+/// edit marker inline at its end; boxed text (quotes) and code blocks leave it to the body's
+/// own trailing line.
 fn render_containers(
     containers: &[RichTextContainer],
     fixtures: &Fixtures,
     theme: &RunTheme,
+    edited: bool,
 ) -> Vec<AnyElement> {
     containers
         .iter()
-        .filter_map(|container| match container {
-            RichTextContainer::Section(section) => {
-                paragraph(&section.elements, fixtures, theme).map(IntoElement::into_any_element)
+        .enumerate()
+        .filter_map(|(n, container)| {
+            let edited = edited && n + 1 == containers.len();
+            match container {
+                RichTextContainer::Section(section) => {
+                    paragraph(&section.elements, fixtures, theme, edited)
+                        .map(IntoElement::into_any_element)
+                }
+                RichTextContainer::List(list) if !list.elements.is_empty() => {
+                    Some(render_list(list, fixtures, theme, edited).into_any_element())
+                }
+                RichTextContainer::Quote(quote) => {
+                    paragraph(&quote.elements, fixtures, theme, false).map(|paragraph| {
+                        div()
+                            .border_l_2()
+                            .border_color(theme.border)
+                            .pl_3()
+                            .child(paragraph)
+                            .into_any_element()
+                    })
+                }
+                RichTextContainer::Preformatted(preformatted) => {
+                    Some(render_code(preformatted, theme).into_any_element())
+                }
+                _ => None,
             }
-            RichTextContainer::List(list) if !list.elements.is_empty() => {
-                Some(render_list(list, fixtures, theme).into_any_element())
-            }
-            RichTextContainer::Quote(quote) => {
-                paragraph(&quote.elements, fixtures, theme).map(|paragraph| {
-                    div()
-                        .border_l_2()
-                        .border_color(theme.border)
-                        .pl_3()
-                        .child(paragraph)
-                        .into_any_element()
-                })
-            }
-            RichTextContainer::Preformatted(preformatted) => {
-                Some(render_code(preformatted, theme).into_any_element())
-            }
-            _ => None,
         })
         .collect()
 }
 
-fn render_list(list: &RichTextList, fixtures: &Fixtures, theme: &RunTheme) -> Div {
+fn render_list(list: &RichTextList, fixtures: &Fixtures, theme: &RunTheme, edited: bool) -> Div {
     let depth = list
         .indent
         .unwrap_or(0)
@@ -1367,7 +1522,8 @@ fn render_list(list: &RichTextList, fixtures: &Fixtures, theme: &RunTheme) -> Di
             ListStyle::Ordered => format!("{}.", n + 1),
             _ => "•".to_owned(),
         };
-        if let Some(item_row) = paragraph(elements, fixtures, theme) {
+        let last = n + 1 == list.elements.len();
+        if let Some(item_row) = paragraph(elements, fixtures, theme, edited && last) {
             column = column.child(
                 h_flex()
                     .items_start()
@@ -1426,6 +1582,30 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
         )
 }
 
+/// Whether the body's final rendered paragraph is plain text: a rich-text section or list
+/// at the end of the blocks, or the mrkdwn fallback when no block renders anything. Slack's
+/// edit marker rides inline at that paragraph's end; any other body (Block Kit block,
+/// attachment, image) puts the marker on its own line after the body.
+fn body_ends_in_text(message: &Message) -> bool {
+    if !message.attachments.is_empty() {
+        return false;
+    }
+    let fallback_text = message
+        .blocks
+        .iter()
+        .all(|block| matches!(block, Block::RichText(rich) if rich.elements.is_empty()))
+        && !message.text.trim().is_empty();
+    let ends_in_paragraph = matches!(
+        message.blocks.last(),
+        Some(Block::RichText(rich))
+            if matches!(
+                rich.elements.last(),
+                Some(RichTextContainer::Section(_) | RichTextContainer::List(_))
+            )
+    );
+    fallback_text || ends_in_paragraph
+}
+
 fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
     let has_kit = message
         .blocks
@@ -1438,25 +1618,48 @@ fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
         .when(has_kit || !message.attachments.is_empty(), |column| {
             column.gap_2()
         });
+    let edited = message.edited.is_some();
+    let inline_edited = edited && body_ends_in_text(message);
+    let attachments = blockkit::attachments(message, kcx, cx);
     let mut rendered = 0;
+    let last_block = message.blocks.len().saturating_sub(1);
     for (ix, block) in message.blocks.iter().enumerate() {
-        let elements = render_block(block, ix, kcx, cx);
+        let elements = render_block(block, ix, kcx, inline_edited && ix == last_block, cx);
         rendered += elements.len();
         column = column.children(elements);
     }
     if rendered == 0 && !message.text.is_empty() {
-        column = column.child(mrkdwn(&message.text, kcx.fixtures, false, cx));
+        column = column.child(mrkdwn(
+            &message.text,
+            kcx.fixtures,
+            false,
+            inline_edited,
+            cx,
+        ));
     }
-    column.children(blockkit::attachments(message, kcx, cx))
+    if edited && !inline_edited {
+        let muted = cx.theme().muted_foreground;
+        column = column.child(div().text_xs().text_color(muted).child("(edited)"));
+    }
+    column.children(attachments)
 }
 
 /// One block of a message (or attachment): `rich_text` here, everything else through
 /// [`blockkit::block`].
-pub(crate) fn render_block(block: &Block, ix: usize, kcx: &KitCx, cx: &App) -> Vec<AnyElement> {
+pub(crate) fn render_block(
+    block: &Block,
+    ix: usize,
+    kcx: &KitCx,
+    edited: bool,
+    cx: &App,
+) -> Vec<AnyElement> {
     match block {
-        Block::RichText(rich) => {
-            render_containers(&rich.elements, kcx.fixtures, &RunTheme::from_app(cx))
-        }
+        Block::RichText(rich) => render_containers(
+            &rich.elements,
+            kcx.fixtures,
+            &RunTheme::from_app(cx),
+            edited,
+        ),
         Block::Unknown { r#type, raw } => blockkit::block(r#type, raw, ix, kcx, cx)
             .into_iter()
             .collect(),
@@ -1468,18 +1671,23 @@ pub(crate) fn render_block(block: &Block, ix: usize, kcx: &KitCx, cx: &App) -> V
 /// `<!here>` chips, `<url|label>` links and `:emoji:` (custom emoji as images). `muted`
 /// renders plain runs in the muted color (Block Kit context blocks). Unknown markup stays
 /// literal.
-pub(crate) fn mrkdwn(text: &str, fixtures: &Fixtures, muted: bool, cx: &App) -> Div {
+pub(crate) fn mrkdwn(text: &str, fixtures: &Fixtures, muted: bool, edited: bool, cx: &App) -> Div {
     let mut theme = RunTheme::from_app(cx);
     if muted {
         theme.foreground = theme.muted;
     }
-    v_flex().min_w_0().children(
-        text.split('\n')
-            .map(|line| mrkdwn_line(line, fixtures, &theme).unwrap_or_else(|| div().h(px(6.)))),
-    )
+    // The edit marker rides inline at the end of the last line that renders text.
+    let lines: Vec<&str> = text.split('\n').collect();
+    let last_text_line = lines.iter().rposition(|line| !line.is_empty());
+    v_flex()
+        .min_w_0()
+        .children(lines.iter().enumerate().map(|(n, line)| {
+            mrkdwn_line(line, fixtures, &theme, edited && Some(n) == last_text_line)
+                .unwrap_or_else(|| div().h(px(6.)))
+        }))
 }
 
-fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme) -> Option<Div> {
+fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme, edited: bool) -> Option<Div> {
     let mut builder = ParagraphBuilder::new();
     let mut run = RunFlags::default();
     let mut rest = line;
@@ -1507,6 +1715,9 @@ fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme) -> Option<Div>
         rest = &rest[len..];
     }
     push_mrkdwn_text(&mut builder, rest, theme, run);
+    if edited {
+        builder.push_edited(theme);
+    }
     let segments = builder.finish();
     if segments.is_empty() {
         return None;
@@ -1760,17 +1971,53 @@ pub(crate) fn iso_date(secs: i64) -> String {
     format!("{:04}-{:02}-{:02}", time.year, time.month, time.day)
 }
 
-/// Divider label: `Today` / `Yesterday` / `Nov 18` / `Nov 18, 2025`.
+/// Slack's divider label: `Today` / `Yesterday` / `Tuesday, November 10th`, plus `, 2025`
+/// outside the current year.
 fn date_label(time: &CivilTime, now: &CivilTime) -> String {
-    let month = MONTHS[(time.month - 1) as usize];
+    const WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTH_NAMES: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
     if time.day_index == now.day_index {
-        "Today".to_owned()
-    } else if time.day_index + 1 == now.day_index {
-        "Yesterday".to_owned()
-    } else if time.year == now.year {
-        format!("{month} {}", time.day)
+        return "Today".to_owned();
+    }
+    if time.day_index + 1 == now.day_index {
+        return "Yesterday".to_owned();
+    }
+    // Day 0 of the Unix epoch (1970-01-01) was a Thursday.
+    let weekday = WEEKDAYS[(time.day_index + 4).rem_euclid(7) as usize];
+    let month = MONTH_NAMES[(time.month - 1) as usize];
+    let day = time.day;
+    let suffix = match (day % 10, day % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    if time.year == now.year {
+        format!("{weekday}, {month} {day}{suffix}")
     } else {
-        format!("{month} {}, {}", time.day, time.year)
+        format!("{weekday}, {month} {day}{suffix}, {}", time.year)
     }
 }
 

@@ -16,7 +16,7 @@ use crate::backfill::{Backfill, PAGE_DELAY, SyncedMap};
 use crate::fetcher::Fetcher;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
-use crate::types::{ChannelId, SlackEvent, TeamId};
+use crate::types::{ChannelId, ConversationKind, SlackEvent, TeamId, UserId};
 use crate::{Command, Event, apply_event};
 
 /// The store shared between the core (writer) and front-ends (readers).
@@ -239,6 +239,10 @@ pub(crate) struct Core<B> {
     backfill: Backfill<B>,
     backfills: HashMap<ChannelId, AbortHandle>,
     rtm: Option<RtmClient>,
+    /// DM peers whose presence is already covered: fetched once through `users.getPresence`
+    /// and subscribed on the websocket. Every `presence_sub` frame replaces the whole
+    /// subscription, so the accumulated set is resent as it grows.
+    presence_peers: Arc<Mutex<Vec<UserId>>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -259,6 +263,7 @@ impl<B: Backend> Core<B> {
             backfill,
             backfills: HashMap::new(),
             rtm: None,
+            presence_peers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -368,7 +373,12 @@ impl<B: Backend> Core<B> {
         let ws = self.workspace.clone();
         let events = self.events.clone();
         match command {
-            Command::OpenConversation(channel) => self.open(channel),
+            Command::OpenConversation(channel) => {
+                self.open(channel.clone());
+                self.merge_channel_info(channel.clone());
+                self.fetch_peer_dnd(channel.clone());
+                self.watch_peer_presence(channel);
+            }
             Command::CloseConversation(channel) => {
                 if let Some(task) = self.backfills.remove(&channel) {
                     task.abort();
@@ -488,6 +498,96 @@ impl<B: Backend> Core<B> {
         });
     }
 
+    /// Open-time `conversations.info`: metadata `client.userBoot` omits (member counts, topic)
+    /// merged into the stored copy, so richer stored fields survive the refresh.
+    fn merge_channel_info(&self, channel: ChannelId) {
+        let (backend, store, ws, events) = (
+            self.backend.clone(),
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+        );
+        self.spawn("conversations.info", async move {
+            let fresh = backend.conversation_info(channel.clone()).await?;
+            let num_members = fresh.num_members;
+            with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+            events.emit(Event::ConversationInfo {
+                channel,
+                num_members,
+            });
+            Ok(())
+        });
+    }
+
+    /// Open-time `dnd.info` for a DM peer: whether their notifications are paused. Transient
+    /// by design, so it is re-fetched every time the DM opens and never stored.
+    fn fetch_peer_dnd(&self, channel: ChannelId) {
+        let (backend, store, ws, events) = (
+            self.backend.clone(),
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+        );
+        self.spawn("dnd.info", async move {
+            let Some(peer) = im_peer(&store, &ws, &channel).await? else {
+                return Ok(());
+            };
+            let status = backend.dnd_info(peer.clone()).await?;
+            events.emit(Event::DndPaused {
+                user: peer,
+                paused: status.paused(now_secs()),
+            });
+            Ok(())
+        });
+    }
+
+    /// Presence for a DM peer: one `users.getPresence` read the first time their DM opens,
+    /// then the websocket subscription keeps it current through `presence_change` events
+    /// (each `presence_sub` frame replaces the previous subscription, so the whole
+    /// accumulated peer set is resent).
+    fn watch_peer_presence(&self, channel: ChannelId) {
+        let (backend, store, ws, events) = (
+            self.backend.clone(),
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+        );
+        let rtm = self.rtm.clone();
+        let watched = Arc::clone(&self.presence_peers);
+        self.spawn("users.getPresence", async move {
+            let Some(peer) = im_peer(&store, &ws, &channel).await? else {
+                return Ok(());
+            };
+            let newly_watched = {
+                let mut watched = watched.lock().unwrap_or_else(PoisonError::into_inner);
+                if watched.contains(&peer) {
+                    false
+                } else {
+                    watched.push(peer.clone());
+                    true
+                }
+            };
+            if !newly_watched {
+                return Ok(());
+            }
+            if let Some(rtm) = &rtm {
+                let peers = watched
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                if let Err(e) = rtm.presence_sub(peers) {
+                    events.emit(Event::Error(format!("presence_sub: {e}")));
+                }
+            }
+            let presence = backend.user_presence(peer.clone()).await?;
+            events.emit(Event::Presence {
+                users: vec![peer],
+                presence: presence.presence,
+            });
+            Ok(())
+        });
+    }
+
     fn spawn<F>(&self, context: &'static str, task: F)
     where
         F: Future<Output = Result<(), CoreError>> + Send + 'static,
@@ -520,6 +620,26 @@ fn refresh_target(event: &SlackEvent) -> Option<ChannelId> {
     }
 }
 
+/// The peer of an IM channel as stored; `None` unless the channel is an IM with a known peer.
+async fn im_peer(
+    store: &SharedStore,
+    workspace: &TeamId,
+    channel: &ChannelId,
+) -> Result<Option<UserId>, StoreError> {
+    let (ws, channel) = (workspace.clone(), channel.clone());
+    let stored = with_store(store, move |s| s.conversation(&ws, &channel)).await?;
+    Ok(stored
+        .filter(|c| c.kind() == ConversationKind::Im)
+        .and_then(|c| c.user))
+}
+
+/// Unix seconds now; 0 if the clock is somehow before the epoch.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::ops::RangeInclusive;
@@ -529,7 +649,8 @@ pub(crate) mod tests {
     use crate::api::{self, ClientCounts, Page, PostedMessage, SearchMessages, UserBoot};
     use crate::rtm::ConnectionState;
     use crate::types::{
-        ChannelSection, Conversation, Message, SectionKind, Team, Ts, User, UserId,
+        ChannelSection, Conversation, DndStatus, Message, Presence, SectionKind, Team, Ts, User,
+        UserId, UserPresence,
     };
 
     /// History page size of the fake.
@@ -550,6 +671,13 @@ pub(crate) mod tests {
         reply_calls: Vec<(Ts, Option<String>)>,
         rate_limited: u32,
         fail_replies: bool,
+        /// `conversations.info` answer; the default echoes the id with `is_archived` set.
+        info: Option<Conversation>,
+        /// `dnd.info` answers keyed by user; an unconfigured user is never paused.
+        dnd: HashMap<UserId, DndStatus>,
+        presence: HashMap<UserId, UserPresence>,
+        dnd_calls: Vec<UserId>,
+        presence_calls: Vec<UserId>,
     }
 
     impl FakeBackend {
@@ -591,6 +719,31 @@ pub(crate) mod tests {
         /// Make every `replies_page` call fail with `invalid_auth`.
         pub fn fail_replies(&self) {
             self.state.lock().unwrap().fail_replies = true;
+        }
+
+        /// The `conversations.info` answer for every channel.
+        pub fn set_info(&self, conversation: Conversation) {
+            self.state.lock().unwrap().info = Some(conversation);
+        }
+
+        /// The `dnd.info` answer for `user`.
+        pub fn set_dnd(&self, user: UserId, status: DndStatus) {
+            self.state.lock().unwrap().dnd.insert(user, status);
+        }
+
+        /// The `users.getPresence` answer for `user`.
+        pub fn set_presence(&self, user: UserId, presence: UserPresence) {
+            self.state.lock().unwrap().presence.insert(user, presence);
+        }
+
+        /// Users asked for `dnd.info`, in order.
+        pub fn dnd_calls(&self) -> Vec<UserId> {
+            self.state.lock().unwrap().dnd_calls.clone()
+        }
+
+        /// Users asked for `users.getPresence`, in order.
+        pub fn presence_calls(&self) -> Vec<UserId> {
+            self.state.lock().unwrap().presence_calls.clone()
         }
 
         pub fn messages(&self) -> Vec<Message> {
@@ -723,11 +876,37 @@ pub(crate) mod tests {
         }
 
         async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
-            Ok(Conversation {
-                id: channel,
-                is_archived: true,
-                ..Default::default()
+            let info = self.state.lock().unwrap().info.clone();
+            Ok(match info {
+                Some(mut conversation) => {
+                    conversation.id = channel;
+                    conversation
+                }
+                None => Conversation {
+                    id: channel,
+                    is_archived: true,
+                    ..Default::default()
+                },
             })
+        }
+
+        async fn dnd_info(&self, user: UserId) -> api::Result<DndStatus> {
+            let mut state = self.state.lock().unwrap();
+            state.dnd_calls.push(user.clone());
+            Ok(state.dnd.get(&user).cloned().unwrap_or_default())
+        }
+
+        async fn user_presence(&self, user: UserId) -> api::Result<UserPresence> {
+            let mut state = self.state.lock().unwrap();
+            state.presence_calls.push(user.clone());
+            Ok(state.presence.get(&user).cloned().unwrap_or(UserPresence {
+                presence: Presence::Away,
+                online: None,
+                auto_away: None,
+                manual_away: None,
+                connection_count: None,
+                last_activity: None,
+            }))
         }
 
         async fn post_message(
@@ -966,11 +1145,154 @@ pub(crate) mod tests {
         command_tx
             .unbounded_send(Command::OpenConversation(c1()))
             .unwrap();
-        assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+        // Opening also spawns the open-time `conversations.info` merge, so its
+        // `ConversationInfo` event may interleave with the backfill's `StoreChanged`.
+        loop {
+            match next(&mut rx).await {
+                Event::StoreChanged { channel: c } if c == c1() => break,
+                Event::ConversationInfo { .. }
+                | Event::HistoryComplete { .. }
+                | Event::StoreChanged { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
         command_tx.unbounded_send(Command::Shutdown).unwrap();
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_conversation_merges_member_count_without_clobbering_stored_fields() {
+        let fake = FakeBackend::default();
+        fake.set_info(Conversation {
+            num_members: Some(42),
+            ..Default::default()
+        });
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
+        let ws = TeamId::from("T1");
+        // Stored from `client.userBoot`: no member count, but richer unread and name state.
+        store
+            .lock()
+            .unwrap()
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: c1(),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    unread_count_display: Some(7),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        core.handle(Command::OpenConversation(c1()));
+
+        loop {
+            match next(&mut rx).await {
+                Event::ConversationInfo {
+                    channel,
+                    num_members,
+                } if channel == c1() => {
+                    assert_eq!(num_members, Some(42), "the event carries the count");
+                    break;
+                }
+                Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
+        let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
+        let stored = stored.expect("the conversation stays stored");
+        assert_eq!(stored.num_members, Some(42), "member count lands from info");
+        assert_eq!(stored.unread_count_display, Some(7), "boot fields survive");
+        assert_eq!(stored.name.as_deref(), Some("general"));
+    }
+
+    #[tokio::test]
+    async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
+        let fake = FakeBackend::default();
+        fake.set_dnd(
+            UserId::from("U2"),
+            DndStatus {
+                dnd_enabled: true,
+                next_dnd_start_ts: Some(0),
+                next_dnd_end_ts: Some(i64::MAX),
+                ..Default::default()
+            },
+        );
+        fake.set_presence(
+            UserId::from("U2"),
+            UserPresence {
+                presence: Presence::Active,
+                online: Some(true),
+                auto_away: None,
+                manual_away: None,
+                connection_count: None,
+                last_activity: None,
+            },
+        );
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+        let ws = TeamId::from("T1");
+        let dm = ChannelId::from("D1");
+        store
+            .lock()
+            .unwrap()
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: dm.clone(),
+                    is_im: true,
+                    is_open: true,
+                    user: Some(UserId::from("U2")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        core.handle(Command::OpenConversation(dm.clone()));
+        let (mut dnd, mut presence) = (false, false);
+        for _ in 0..8 {
+            match next(&mut rx).await {
+                Event::DndPaused { user, paused } => {
+                    assert_eq!(user.as_str(), "U2");
+                    assert!(paused, "inside the enabled window");
+                    dnd = true;
+                }
+                Event::Presence { users, presence: p } => {
+                    assert_eq!(users, vec![UserId::from("U2")]);
+                    assert_eq!(p, Presence::Active);
+                    presence = true;
+                }
+                Event::StoreChanged { .. }
+                | Event::HistoryComplete { .. }
+                | Event::Conversations(_)
+                | Event::ConversationInfo { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+            if dnd && presence {
+                break;
+            }
+        }
+        assert!(dnd && presence, "both peer states arrive");
+
+        // Re-opening re-checks DND (transient by design) but never re-polls a presence the
+        // websocket subscription already covers.
+        core.handle(Command::OpenConversation(dm));
+        loop {
+            match next(&mut rx).await {
+                Event::DndPaused { paused, .. } if paused => break,
+                Event::StoreChanged { .. }
+                | Event::HistoryComplete { .. }
+                | Event::Conversations(_)
+                | Event::ConversationInfo { .. } => {}
+                other => panic!("unexpected event after reopen: {other:?}"),
+            }
+        }
+        assert_eq!(fake.presence_calls(), vec![UserId::from("U2")]);
+        assert_eq!(fake.dnd_calls().len(), 2, "dnd re-fetched per open");
     }
 }

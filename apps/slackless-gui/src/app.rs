@@ -25,7 +25,8 @@
 //!   CoreBridge::start(Session, &mut App) -> Option<CoreBridge>
 //!   CoreBridge::send(&self, slackless_core::Command)
 //!   CoreBridge::snapshot(&self) -> Option<Fixtures>   (live: fresh store snapshot)
-//!   CoreBridge::history(&self, &ChannelId) -> Option<Vec<Message>>
+//!   CoreBridge::history(&self, &ChannelId, Option<Ts>) -> Option<Vec<Message>>
+//!       (live: stored history; `Some(ts)` pages older than `ts`)
 //!   CoreBridge::thread(&self, &ChannelId, &Ts) -> Option<Vec<Message>>   (live: stored thread)
 //!   CoreBridge::subscribe_in(&mut self, &mut Window, &mut Context<T>, handler) -> Subscription
 //!
@@ -66,8 +67,12 @@
 //!       -> Entity<MessageList>
 //!   MessageList::set_conversation(&mut self, ChannelId, &mut Context<Self>)
 //!   MessageList::append(&mut self, ChannelId, Message, &mut Context<Self>)
+//!   MessageList::set_history(&mut self, ChannelId, Vec<Message>, &mut Context<Self>)
+//!   MessageList::prepend_history(&mut self, ChannelId, Vec<Message>, &mut Context<Self>)
+//!       (an older page; the visible row keeps its screen position)
 //!   emits MessageListEvent::OpenThread { channel: ChannelId, thread_ts: Ts }
 //!   emits MessageListEvent::PickReaction { channel: ChannelId, ts: Ts, position: Point<Pixels> }
+//!   emits MessageListEvent::NeedOlder { channel: ChannelId, before: Ts }   (top of list)
 //!   MessageList::add_reaction(&mut self, &ChannelId, &Ts, name: &str, &mut Context<Self>)
 //!   pub fn message_row(&Fixtures, &Message, &App) -> Div   (shared with threads.rs)
 //!
@@ -173,7 +178,7 @@
 //!   OpenChannelBrowser (cmd-shift-l), SetStatus (cmd-shift-y), FocusSearch (cmd-g),
 //!   Workspace1..9 (cmd-1..9)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -193,7 +198,7 @@ use gpui_kit::gpui::{
 };
 use slackless_core::api::ConversationCounts;
 use slackless_core::platform::{self, BadgeSetter, Notifier};
-use slackless_core::types::{ChannelId, Conversation, ConversationKind, Ts, UserId};
+use slackless_core::types::{ChannelId, Conversation, ConversationKind, Presence, Ts, UserId};
 use slackless_core::{Command, Event, SharedStore};
 
 use crate::actions::notify;
@@ -352,10 +357,20 @@ pub struct App {
     badge: Option<u32>,
     /// Live mode: the newest history read started; an overtaken read is dropped.
     history_generation: u64,
+    /// Live mode: channels whose stored history has no older page left; the transcript
+    /// stops asking for them.
+    history_complete: HashSet<ChannelId>,
     /// Live mode: the newest thread read started; an overtaken read is dropped.
     thread_generation: u64,
     /// Live mode: Slack's latest read and unread state (`client.counts`).
     counts: HashMap<ChannelId, ConversationCounts>,
+    /// Live mode: last known presence per DM peer (`users.getPresence`, `presence_change`);
+    /// injected into every live fixtures snapshot so sidebar rows and headers render dots.
+    presence: HashMap<UserId, Presence>,
+    /// Live mode: DM peers whose notifications are paused right now (`dnd.info`).
+    peer_dnd_paused: HashMap<UserId, bool>,
+    /// Member counts from open-time `conversations.info`, newer than the snapshot's.
+    member_counts: HashMap<ChannelId, u32>,
     /// The user opened a conversation themselves; until then live reloads open the one most
     /// recently read in Slack.
     chosen: bool,
@@ -595,8 +610,12 @@ impl App {
                 os: Rc::new(platform::current()),
                 badge: None,
                 history_generation: 0,
+                history_complete: HashSet::new(),
                 thread_generation: 0,
                 counts: HashMap::new(),
+                presence: HashMap::new(),
+                peer_dnd_paused: HashMap::new(),
+                member_counts: HashMap::new(),
                 chosen: false,
                 focus,
                 workspace_subscriptions,
@@ -969,6 +988,23 @@ impl App {
                 "slackless: Slack rejected the saved session ({error}); sign in again with `slackless-gui --sign-in`"
             ),
             Event::Error(error) => eprintln!("slackless: {error}"),
+            Event::Presence { users, presence } => {
+                for user in users {
+                    self.presence.insert(user.clone(), presence.clone());
+                }
+                self.reload_live(window, cx);
+            }
+            Event::DndPaused { user, paused } => {
+                self.peer_dnd_paused.insert(user.clone(), *paused);
+                cx.notify();
+            }
+            Event::ConversationInfo {
+                channel,
+                num_members: Some(count),
+            } => {
+                self.member_counts.insert(channel.clone(), *count);
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -976,9 +1012,11 @@ impl App {
     /// Live mode: rebuild the workspace views from a fresh store snapshot after its
     /// conversations or people changed, staying on the open conversation while it exists.
     fn reload_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(snapshot) = self.bridge.snapshot(&self.counts) else {
+        let Some(mut snapshot) = self.bridge.snapshot(&self.counts) else {
             return;
         };
+        // Presence is transient (never stored), so the live map rides along every snapshot.
+        snapshot.presence = self.presence.clone();
         let fixtures = Arc::new(snapshot);
         let channel = match fixtures.conversation(&self.channel) {
             Some(_) if self.chosen => self.channel.clone(),
@@ -1006,7 +1044,7 @@ impl App {
     /// Live mode: show `channel`'s stored history, read off the UI thread. A read that a newer
     /// one overtook, or whose conversation is no longer open, is dropped.
     fn load_history(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
-        let Some(read) = self.bridge.history(channel.clone()) else {
+        let Some(read) = self.bridge.history(channel.clone(), None) else {
             return;
         };
         self.history_generation += 1;
@@ -1024,6 +1062,37 @@ impl App {
                         app.mark_read(&channel, newest, cx);
                     }
                 }
+            })
+        })
+        .detach();
+    }
+
+    /// Live mode: the transcript reached the top of `channel`; read the next older page from
+    /// the store, off the UI thread, and prepend it. A page a newer reload overtook is
+    /// dropped (the reload's `set_history` forgets the request, so the top re-asks); an empty
+    /// page marks the channel fully loaded.
+    fn load_older(&mut self, channel: &ChannelId, before: Ts, cx: &mut Context<Self>) {
+        if self.history_complete.contains(channel) {
+            return;
+        }
+        let Some(read) = self.bridge.history(channel.clone(), Some(before)) else {
+            return;
+        };
+        let generation = self.history_generation;
+        let channel = channel.clone();
+        cx.spawn(async move |this, cx| {
+            let older = cx.background_executor().spawn(read).await;
+            this.update(cx, |app, cx| {
+                if app.history_generation != generation || app.channel != channel {
+                    return;
+                }
+                if older.is_empty() {
+                    app.history_complete.insert(channel);
+                    return;
+                }
+                app.messages.update(cx, |list, cx| {
+                    list.prepend_history(channel.clone(), older, cx)
+                });
             })
         })
         .detach();
@@ -1410,6 +1479,7 @@ impl Render for App {
             match self.tab {
                 ConversationTab::Messages => column
                     .child(div().flex_1().min_h_0().child(self.messages.clone()))
+                    .children(self.dnd_banner(conversation.as_ref(), cx))
                     .child(self.composer.clone()),
                 ConversationTab::Canvas => {
                     column.child(div().flex_1().min_h_0().child(canvas_view(cx)))
@@ -1719,6 +1789,43 @@ impl App {
         )
     }
 
+    /// Slack's paused-notifications strip for a DM whose peer has do-not-disturb on: a
+    /// muted row between the message list and the composer.
+    fn dnd_banner(&self, conversation: Option<&Conversation>, cx: &Context<Self>) -> Option<Div> {
+        let peer = conversation
+            .filter(|c| c.kind() == ConversationKind::Im)
+            .and_then(|c| c.user.as_ref())?;
+        if !self.peer_dnd_paused.get(peer).copied().unwrap_or(false) {
+            return None;
+        }
+        let muted = cx.theme().muted;
+        let muted_foreground = cx.theme().muted_foreground;
+        // Slack's notice: a rounded box aligned with the composer, worded for the reader.
+        Some(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .mx_4()
+                .mb_1()
+                .px_3()
+                .py_1p5()
+                .flex_none()
+                .rounded_md()
+                .bg(muted)
+                .child(
+                    Icon::new(IconName::BellOff)
+                        .size(px(14.))
+                        .text_color(muted_foreground),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_foreground)
+                        .child("They will see your messages when they're back."),
+                ),
+        )
+    }
+
     /// The conversation header row: star, peer avatar for DMs (presence dot for IMs, stacked
     /// chips for group DMs), the conversation name, the member count for channels, and the
     /// huddle / notifications / search / details icons on the right.
@@ -1731,7 +1838,6 @@ impl App {
     ) -> Div {
         let muted_foreground = cx.theme().muted_foreground;
         let accent = cx.theme().accent;
-        let border = cx.theme().border;
         let background = cx.theme().background;
         let success = cx.theme().success;
         let huddle_here = self.huddle_here();
@@ -1747,18 +1853,13 @@ impl App {
                     ConversationKind::PublicChannel | ConversationKind::PrivateChannel
                 )
             })
-            .and_then(|c| c.num_members)
+            .and_then(|c| self.member_counts.get(&c.id).copied().or(c.num_members))
             .map(|count| {
                 h_flex()
                     .flex_none()
                     .items_center()
                     .gap_1()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .text_xs()
+                    .text_sm()
                     .text_color(muted_foreground)
                     .child(
                         Icon::new(IconName::Users)
@@ -1772,9 +1873,10 @@ impl App {
         let peer_user = conversation
             .filter(|c| c.kind() == ConversationKind::Im)
             .and_then(|c| c.user.clone());
+        // Slack keeps the whole name; the topic after it truncates instead.
         let name = h_flex()
             .id("hdr-peer")
-            .min_w_0()
+            .flex_none()
             .items_center()
             .gap_2()
             .px_1()
@@ -1808,6 +1910,7 @@ impl App {
             .when(!topic.is_empty(), |header| {
                 header.child(
                     div()
+                        .min_w_0()
                         .truncate()
                         .text_sm()
                         .text_color(muted_foreground)
@@ -1885,8 +1988,8 @@ impl App {
             ("tab-canvas", "Add canvas", IconName::LayoutTemplate, None),
             ("tab-files", "Files & links", IconName::Files, None),
         ];
-        // Channels add Slack's Bookmarks and Pins tabs.
-        const CHANNEL_TABS: [(&str, &str, IconName, Option<ConversationTab>); 5] = [
+        // Channels add Slack's Pins tab after Files & links.
+        const CHANNEL_TABS: [(&str, &str, IconName, Option<ConversationTab>); 4] = [
             (
                 "tab-messages",
                 "Messages",
@@ -1894,9 +1997,8 @@ impl App {
                 Some(ConversationTab::Messages),
             ),
             ("tab-canvas", "Add canvas", IconName::LayoutTemplate, None),
-            ("tab-bookmarks", "Bookmarks", IconName::Bookmark, None),
-            ("tab-pins", "Pins", IconName::Pin, None),
             ("tab-files", "Files & links", IconName::Files, None),
+            ("tab-pins", "Pins", IconName::Pin, None),
         ];
         let channel = self.fixtures.conversation(&self.channel).is_some_and(|c| {
             matches!(
@@ -2095,6 +2197,9 @@ fn subscribe_workspace(
                     this.open_thread(channel.clone(), thread_ts.clone(), cx);
                 }
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
+                MessageListEvent::NeedOlder { channel, before } => {
+                    this.load_older(channel, before.clone(), cx);
+                }
                 MessageListEvent::PickReaction {
                     channel,
                     ts,

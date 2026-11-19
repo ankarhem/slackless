@@ -200,6 +200,33 @@ impl Store {
         Ok(())
     }
 
+    /// One stored conversation by id, as last written.
+    pub fn conversation(&self, workspace: &TeamId, id: &ChannelId) -> Result<Option<Conversation>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT json FROM conversation WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace.as_str(), id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(json.map(|j| serde_json::from_str(&j)).transpose()?)
+    }
+
+    /// A `conversations.info` refresh of a stored conversation: overlays `fresh` without
+    /// clobbering richer stored fields ([`Conversation::merge`]). A conversation not yet
+    /// stored is inserted as-is.
+    pub fn merge_conversation(&mut self, workspace: &TeamId, fresh: &Conversation) -> Result<()> {
+        let merged = match self.conversation(workspace, &fresh.id)? {
+            Some(mut stored) => {
+                stored.merge(fresh);
+                stored
+            }
+            None => fresh.clone(),
+        };
+        self.upsert_conversation(workspace, &merged)
+    }
+
     /// Every stored conversation of `workspace`, by name, as last upserted.
     pub fn conversations(&self, workspace: &TeamId) -> Result<Vec<Conversation>> {
         self.json_column(
