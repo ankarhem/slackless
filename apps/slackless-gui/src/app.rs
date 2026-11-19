@@ -1396,12 +1396,29 @@ impl Render for App {
         };
 
         let mut panels = h_resizable("workspace")
-            .child(resizable_panel().size(px(360.)).child(self.sidebar.clone()))
+            // Like Slack, opening the thread / profile / pins panel narrows the conversation,
+            // never the sidebar.
+            .child(
+                resizable_panel()
+                    .size(px(360.))
+                    .size_range(px(360.)..px(640.))
+                    .child(self.sidebar.clone()),
+            )
             .child(resizable_panel().child(main_column));
         if self.thread_open {
-            panels = panels.child(resizable_panel().size(px(380.)).child(self.thread.clone()));
+            panels = panels.child(
+                resizable_panel()
+                    .size(px(380.))
+                    .size_range(px(340.)..px(720.))
+                    .child(self.thread.clone()),
+            );
         } else if self.profile_open {
-            panels = panels.child(resizable_panel().size(px(360.)).child(self.profile.clone()));
+            panels = panels.child(
+                resizable_panel()
+                    .size(px(360.))
+                    .size_range(px(340.)..px(720.))
+                    .child(self.profile.clone()),
+            );
         } else if self.pins_open {
             let this = cx.weak_entity();
             let close = move |_: &mut Window, cx: &mut gpui::App| {
@@ -1412,7 +1429,12 @@ impl Render for App {
                 .ok();
             };
             let panel = pins::pins_panel(&self.fixtures, &self.channel, &title, close, cx);
-            panels = panels.child(resizable_panel().size(px(380.)).child(panel));
+            panels = panels.child(
+                resizable_panel()
+                    .size(px(380.))
+                    .size_range(px(340.)..px(720.))
+                    .child(panel),
+            );
         }
 
         v_flex()
