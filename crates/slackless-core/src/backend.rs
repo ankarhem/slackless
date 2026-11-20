@@ -65,7 +65,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn post_message(
         &self,
         channel: ChannelId,
-        text: String,
+        content: MessageContent,
         thread_ts: Option<Ts>,
     ) -> impl Future<Output = api::Result<PostedMessage>> + Send;
     fn update_message(
@@ -178,16 +178,11 @@ impl Backend for SlackApi {
     async fn post_message(
         &self,
         channel: ChannelId,
-        text: String,
+        content: MessageContent,
         thread_ts: Option<Ts>,
     ) -> api::Result<PostedMessage> {
-        self.chat_post_message(
-            &channel,
-            &MessageContent::plain(text),
-            thread_ts.as_ref(),
-            false,
-        )
-        .await
+        self.chat_post_message(&channel, &content, thread_ts.as_ref(), false)
+            .await
     }
 
     async fn update_message(

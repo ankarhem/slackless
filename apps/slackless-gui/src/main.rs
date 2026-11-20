@@ -22,6 +22,7 @@ mod browser;
 mod canvas;
 mod composer;
 mod drafts;
+mod editor;
 mod emoji;
 mod files;
 mod fixtures;

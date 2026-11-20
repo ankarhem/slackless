@@ -34,6 +34,7 @@ pub use fetcher::Fetcher;
 pub use notify::{NotifyLevel, notify_levels};
 pub use reducer::apply_event;
 
+use api::MessageContent;
 use rtm::ConnectionState;
 use store::StoredMessage;
 use types::{ChannelId, Presence, Ts, UserId};
@@ -66,10 +67,11 @@ pub enum Command {
         channel: ChannelId,
         thread_ts: Ts,
     },
-    /// Post a message; `thread_ts` replies in a thread.
+    /// Post a message (its blocks, with the text as fallback); `thread_ts` replies in a
+    /// thread.
     SendMessage {
         channel: ChannelId,
-        text: String,
+        content: MessageContent,
         thread_ts: Option<Ts>,
     },
     /// Replace a message's text.

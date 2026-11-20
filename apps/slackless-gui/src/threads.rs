@@ -32,10 +32,12 @@ use gpui_kit::gpui::{
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
+use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction};
 use crate::composer::{Composer, ComposerEvent};
+use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
 use crate::messages::message_row;
@@ -49,7 +51,7 @@ pub enum ThreadPanelEvent {
     Reply {
         channel: ChannelId,
         thread_ts: Ts,
-        text: String,
+        content: MessageContent,
     },
     /// An add-reaction control asked for the emoji picker at `position`; the root routes the
     /// pick back through [`ThreadPanel::add_reaction`].
@@ -101,7 +103,7 @@ impl ThreadPanel {
         cx: &mut gpui_kit::gpui::App,
     ) -> Entity<ThreadPanel> {
         cx.new(|cx| {
-            let composer = Composer::new("Reply...".into(), window, cx);
+            let composer = Composer::new("Reply...".into(), fixtures.clone(), window, cx);
             composer.update(cx, |composer, cx| composer.set_scheduling(false, cx));
             let edit_draft = cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -109,26 +111,29 @@ impl ThreadPanel {
                     .auto_grow(1, 8)
             });
             let subscriptions = vec![
-                cx.subscribe(
+                cx.subscribe_in(
                     &composer,
-                    |this: &mut ThreadPanel, _, event: &ComposerEvent, cx| match event {
-                        ComposerEvent::Submit(text) => this.reply(text.clone(), cx),
+                    window,
+                    |this: &mut ThreadPanel, _, event: &ComposerEvent, window, cx| match event {
+                        ComposerEvent::Submit(content) => this.reply(content.clone(), cx),
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(ThreadPanelEvent::PickEmoji(*position));
                         }
                         ComposerEvent::SlashCommand(invocation) => {
                             match invocation.command.map(|command| command.kind) {
                                 Some(SlashKind::Shrug) if invocation.args.is_empty() => {
-                                    this.reply(SHRUG.to_owned(), cx);
+                                    this.reply(MessageContent::plain(SHRUG), cx);
                                 }
                                 Some(SlashKind::Shrug) => {
-                                    this.reply(format!("{} {SHRUG}", invocation.args), cx);
+                                    let text = format!("{} {SHRUG}", invocation.args);
+                                    this.reply(MessageContent::plain(text), cx);
                                 }
                                 _ => cx.emit(ThreadPanelEvent::SlashCommand(invocation.clone())),
                             }
                         }
                         // Scheduling is turned off in the reply composer.
                         ComposerEvent::Schedule { .. } => {}
+                        ComposerEvent::EditLast => this.edit_last_reply(window, cx),
                     },
                 ),
                 // The edit box's Save button tracks whether the draft is empty.
@@ -154,6 +159,9 @@ impl ThreadPanel {
 
     /// Live refresh: the open thread stays open, drawn from `fixtures`.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| {
+            composer.set_fixtures(fixtures.clone(), cx)
+        });
         self.fixtures = fixtures;
         cx.notify();
     }
@@ -255,9 +263,27 @@ impl ThreadPanel {
     }
 
     /// Insert an emoji pick into the reply composer.
-    pub fn insert_emoji(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn insert_emoji(
+        &mut self,
+        choice: &EmojiChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.composer
-            .update(cx, |composer, cx| composer.insert(text, window, cx));
+            .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
+    }
+
+    /// Up in the empty reply box: edit the signed-in user's latest reply in this thread.
+    fn edit_last_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = &self.fixtures.self_user;
+        let latest = self
+            .replies
+            .iter()
+            .rev()
+            .find(|reply| reply.user.as_ref() == Some(me));
+        if let Some(ts) = latest.map(|reply| reply.ts.clone()) {
+            self.begin_edit(ts, window, cx);
+        }
     }
 
     /// Add the signed-in user's `name` reaction if they have not already reacted with it.
@@ -269,20 +295,21 @@ impl ThreadPanel {
         cx.notify();
     }
 
-    fn reply(&mut self, text: String, cx: &mut Context<Self>) {
+    fn reply(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         let Some((channel, thread_ts)) = self.thread.clone() else {
             return;
         };
-        self.replies.push(self.fixtures.local_message(
-            &channel,
-            text.clone(),
-            Some(thread_ts.clone()),
-        ));
+        // The local echo shows the same blocks the reply posts with.
+        let mut message =
+            self.fixtures
+                .local_message(&channel, content.text.clone(), Some(thread_ts.clone()));
+        message.blocks = content.blocks.clone();
+        self.replies.push(message);
         self.reply_hint = false;
         cx.emit(ThreadPanelEvent::Reply {
             channel,
             thread_ts,
-            text,
+            content,
         });
         cx.notify();
     }

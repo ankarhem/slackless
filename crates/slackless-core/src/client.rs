@@ -430,12 +430,12 @@ impl<B: Backend> Core<B> {
             }
             Command::SendMessage {
                 channel,
-                text,
+                content,
                 thread_ts,
             } => {
                 self.spawn("chat.postMessage", async move {
                     let posted = backend
-                        .post_message(channel.clone(), text, thread_ts)
+                        .post_message(channel.clone(), content, thread_ts)
                         .await?;
                     // Store the echo now; the websocket copy of it is an idempotent re-upsert.
                     if let Some(message) = posted.message {
@@ -761,7 +761,9 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::api::{self, ClientCounts, Page, PostedMessage, SearchMessages, UserBoot};
+    use crate::api::{
+        self, ClientCounts, MessageContent, Page, PostedMessage, SearchMessages, UserBoot,
+    };
     use crate::rtm::ConnectionState;
     use crate::types::{
         ChannelSection, Conversation, DndStatus, Message, Presence, SectionKind, Team, Ts, User,
@@ -1072,13 +1074,13 @@ pub(crate) mod tests {
         async fn post_message(
             &self,
             channel: ChannelId,
-            text: String,
+            content: MessageContent,
             _thread_ts: Option<Ts>,
         ) -> api::Result<PostedMessage> {
             let ts = Ts::from("100.0");
             let message = Message {
                 ts: ts.clone(),
-                text,
+                text: content.text,
                 ..Default::default()
             };
             Ok(PostedMessage {
@@ -1191,7 +1193,7 @@ pub(crate) mod tests {
 
         core.handle(Command::SendMessage {
             channel: c1(),
-            text: "hi there".into(),
+            content: MessageContent::plain("hi there"),
             thread_ts: None,
         });
         assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });

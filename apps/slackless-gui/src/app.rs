@@ -76,11 +76,15 @@
 //!   MessageList::add_reaction(&mut self, &ChannelId, &Ts, name: &str, &mut Context<Self>)
 //!   pub fn message_row(&Fixtures, &Message, &App) -> Div   (shared with threads.rs)
 //!
-//! composer.rs
-//!   Composer::new(placeholder: SharedString, &mut Window, &mut App) -> Entity<Composer>
-//!   emits ComposerEvent::Submit(String)   (trimmed, non-empty; composer already cleared)
+//! composer.rs (WYSIWYG draft; the editing model is in editor/)
+//!   Composer::new(placeholder: SharedString, Arc<Fixtures>, &mut Window, &mut App)
+//!   emits ComposerEvent::Submit(MessageContent)   (rich_text block + mrkdwn fallback; never
+//!     blank; composer already cleared)
 //!   emits ComposerEvent::OpenEmojiPicker(Point<Pixels>)
-//!   Composer::insert(&mut self, &str, &mut Window, &mut Context<Self>)
+//!   emits ComposerEvent::EditLast   (Up in an empty draft)
+//!   Composer::insert_emoji(&mut self, &EmojiChoice, &mut Window, &mut Context<Self>)
+//!   Composer::set_fixtures(&mut self, Arc<Fixtures>, &mut Context<Self>)
+//!   pub fn content_of(draft: &str, &Fixtures) -> MessageContent   (a mrkdwn draft as posted)
 //!
 //! emoji.rs (overlay mounted by the root, anchored at the requesting click)
 //!   EmojiPicker::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<EmojiPicker>
@@ -101,7 +105,7 @@
 //!   emits ThreadPanelEvent::PickReaction { ts: Ts, position } / ThreadPanelEvent::PickEmoji(position)
 //!   emits ThreadPanelEvent::SlashCommand(Invocation)   (commands other than /shrug)
 //!   ThreadPanel::add_reaction(&mut self, &Ts, name: &str, &mut Context<Self>)
-//!   ThreadPanel::insert_emoji(&mut self, &str, &mut Window, &mut Context<Self>)
+//!   ThreadPanel::insert_emoji(&mut self, &EmojiChoice, &mut Window, &mut Context<Self>)
 //!
 //! composer.rs / threads.rs (Preferences > Messages & media)
 //!   Composer::set_enter_sends(&mut self, bool, &mut Context<Self>)
@@ -142,7 +146,7 @@
 //!   DraftsView::new(&mut App) -> Entity<DraftsView>
 //!   DraftsView::set_draft / draft / schedule / record_sent
 //!   emits DraftsEvent::Open { workspace, channel } / SendNow(Entry) / Close
-//!   Composer::text(&self, &App) -> String; Composer::load_draft(&mut self, String, cx)
+//!   Composer::text(&self) -> String; Composer::load_draft(&mut self, &str, cx)   (mrkdwn)
 //!   Composer emits ComposerEvent::Schedule { text, when: SendLater }
 //!
 //! Workspaces: fixtures::workspace(index) -> Fixtures; the sidebar emits
@@ -201,6 +205,7 @@ use gpui_kit::gpui::{
     WindowAppearance, actions, anchored, deferred, div, point, px,
 };
 use slackless_core::api::ConversationCounts;
+use slackless_core::api::MessageContent;
 use slackless_core::platform::{self, BadgeSetter, Notifier};
 use slackless_core::types::{ChannelId, Conversation, ConversationKind, Message, Ts, UserId};
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
@@ -210,7 +215,7 @@ use crate::avatars::conversation_avatar;
 use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
-use crate::composer::{Composer, ComposerEvent};
+use crate::composer::{self, Composer, ComposerEvent};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
 use crate::fixtures::{self, Fixtures};
@@ -418,7 +423,7 @@ impl App {
                 profile,
                 switcher,
             } = views;
-            let composer = Composer::new("Message".into(), window, cx);
+            let composer = Composer::new("Message".into(), fixtures.clone(), window, cx);
             let search = cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("Describe what you are looking for")
@@ -479,10 +484,13 @@ impl App {
                     &composer,
                     window,
                     |this: &mut App, _, event: &ComposerEvent, window, cx| match event {
-                        ComposerEvent::Submit(text) => this.send(text.clone(), cx),
+                        ComposerEvent::Submit(content) => this.send(content.clone(), cx),
                         ComposerEvent::OpenEmojiPicker(position) => {
                             this.open_picker(PickerTarget::Composer, *position, window, cx);
                         }
+                        // The message list has no way in to start an edit from outside yet;
+                        // the thread panel handles this for its own composer.
+                        ComposerEvent::EditLast => {}
                         ComposerEvent::SlashCommand(invocation) => {
                             this.run_slash(invocation, window, cx);
                         }
@@ -905,23 +913,19 @@ impl App {
         cx.notify();
     }
 
-    /// Route a pick: composers get the glyph (custom emoji as `:name:`), messages a reaction.
+    /// Route a pick: composers get the emoji, messages a reaction.
     fn pick_emoji(&mut self, choice: &EmojiChoice, window: &mut Window, cx: &mut Context<Self>) {
         let Some((target, _)) = self.picker.take() else {
             return;
         };
-        let text = choice
-            .glyph
-            .clone()
-            .unwrap_or_else(|| format!(":{}: ", choice.name));
         match target {
             PickerTarget::Composer => {
                 self.composer
-                    .update(cx, |composer, cx| composer.insert(&text, window, cx));
+                    .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
             }
             PickerTarget::ThreadComposer => {
                 self.thread
-                    .update(cx, |thread, cx| thread.insert_emoji(&text, window, cx));
+                    .update(cx, |thread, cx| thread.insert_emoji(choice, window, cx));
             }
             PickerTarget::Message { channel, ts } => {
                 self.messages.update(cx, |list, cx| {
@@ -1353,6 +1357,8 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.switcher
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.composer
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
         self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
@@ -1606,6 +1612,9 @@ impl App {
         let fixtures = self.fixtures.clone();
         self.later
             .update(cx, |later, cx| later.seed(index, &fixtures, cx));
+        // Before the draft is loaded: its mentions are named from this workspace.
+        self.composer
+            .update(cx, |composer, cx| composer.set_fixtures(fixtures, cx));
         self.sync_saved(cx);
         self.sync_later_count(cx);
         self.huddle_open = false;
@@ -1628,7 +1637,7 @@ impl App {
 
     /// Store the composer's text as the open conversation's draft (blank removes it).
     fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text(cx);
+        let text = self.composer.read(cx).text();
         let saved = self
             .drafts
             .read(cx)
@@ -1659,7 +1668,7 @@ impl App {
             .unwrap_or_default();
         let count = drafts.draft_count();
         self.composer
-            .update(cx, |composer, cx| composer.load_draft(text, cx));
+            .update(cx, |composer, cx| composer.load_draft(&text, cx));
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
     }
@@ -1718,17 +1727,20 @@ impl App {
     /// Deliver a scheduled message now; it shows in the transcript when its workspace is the
     /// shown one (a parked workspace's transcript is not touched).
     fn deliver(&mut self, mut entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        // A scheduled message is kept as its draft text; it posts as the draft would have.
+        let content = composer::content_of(&entry.text, &self.fixtures);
         if entry.workspace == self.workspace {
-            let message = self
-                .fixtures
-                .local_message(&entry.channel, entry.text.clone(), None);
+            let mut message =
+                self.fixtures
+                    .local_message(&entry.channel, content.text.clone(), None);
+            message.blocks = content.blocks.clone();
             let channel = entry.channel.clone();
             self.messages
                 .update(cx, |list, cx| list.append(channel, message, cx));
         }
         self.bridge.send(Command::SendMessage {
             channel: entry.channel.clone(),
-            text: entry.text.clone(),
+            content,
             thread_ts: None,
         });
         notify(
@@ -1761,7 +1773,7 @@ impl App {
                 } else {
                     format!("{} {SHRUG}", invocation.args)
                 };
-                self.send(text, cx);
+                self.send(MessageContent::plain(text), cx);
             }
             SlashKind::Away => {
                 self.self_state.away = !self.self_state.away;
@@ -1811,23 +1823,27 @@ impl App {
         });
     }
 
-    fn send(&mut self, text: String, cx: &mut Context<Self>) {
+    fn send(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         let channel = self.channel.clone();
-        let message = self.fixtures.local_message(&channel, text.clone(), None);
+        // The local echo shows the same blocks the message posts with.
+        let mut message = self
+            .fixtures
+            .local_message(&channel, content.text.clone(), None);
+        message.blocks = content.blocks.clone();
         self.messages
             .update(cx, |list, cx| list.append(channel.clone(), message, cx));
         let entry = Entry {
             workspace: self.workspace,
             channel: channel.clone(),
             label: self.label(&channel),
-            text: text.clone(),
+            text: content.text.clone(),
             at: now_secs(),
         };
         self.drafts
             .update(cx, |drafts, cx| drafts.record_sent(entry, cx));
         self.bridge.send(Command::SendMessage {
             channel,
-            text,
+            content,
             thread_ts: None,
         });
         // The composer is empty now: drop any saved draft for this conversation.
@@ -2645,11 +2661,11 @@ fn subscribe_workspace(
                 ThreadPanelEvent::Reply {
                     channel,
                     thread_ts,
-                    text,
+                    content,
                 } => {
                     this.bridge.send(Command::SendMessage {
                         channel: channel.clone(),
-                        text: text.clone(),
+                        content: content.clone(),
                         thread_ts: Some(thread_ts.clone()),
                     });
                 }
@@ -2767,7 +2783,7 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                     "side" => app.switch_workspace(1, window, cx),
                     "slash" => app
                         .composer
-                        .update(cx, |composer, cx| composer.load_draft("/".into(), cx)),
+                        .update(cx, |composer, cx| composer.load_draft("/", cx)),
                     "later" => app.open_later(cx),
                     "pins" => app.toggle_pins(cx),
                     "activity" => app.show_nav(NavItem::Activity, cx),
