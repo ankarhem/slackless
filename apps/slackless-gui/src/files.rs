@@ -132,7 +132,7 @@ fn file_name(file: &File) -> String {
 }
 
 /// Type icon and tile color: PDFs red, spreadsheets green, images and the rest blue.
-fn file_icon(file: &File, cx: &App) -> (IconName, Hsla) {
+pub(crate) fn file_icon(file: &File, cx: &App) -> (IconName, Hsla) {
     let theme = cx.theme();
     match file.filetype.as_deref().unwrap_or_default() {
         "pdf" => (IconName::FileText, theme.danger),
@@ -154,7 +154,7 @@ fn fit(width: Option<i64>, height: Option<i64>) -> (f32, f32) {
 }
 
 /// Bytes as Slack labels them: `512 B`, `52 KB`, `2.3 MB`.
-fn human_size(bytes: i64) -> String {
+pub(crate) fn human_size(bytes: i64) -> String {
     const KB: f64 = 1024.;
     let bytes = bytes.max(0) as f64;
     if bytes < KB {

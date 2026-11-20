@@ -526,3 +526,162 @@ async fn channel_section_create_sends_name_and_emoji_key() {
         .unwrap();
     assert_eq!(created.channel_section_id, "L0B12LBBCTD");
 }
+
+#[tokio::test]
+async fn pins_list_posts_channel_and_parses_message_and_file_items() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pins.list"))
+        .and(body_string_contains("channel=C1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "items": [
+                {"type": "message", "channel": "C1", "created": 1508881078,
+                 "created_by": "U1",
+                 "message": {"type": "message", "ts": "1508197641.000151", "user": "U1",
+                             "text": "pinned!",
+                             "permalink": "https://acme.slack.com/archives/C1/p1508197641000151"}},
+                {"type": "file", "created": 1508881079, "created_by": "U1",
+                 "file": {"id": "F1", "name": "spec.pdf", "mimetype": "application/pdf"}},
+                {"type": "file", "created": 1508881080, "created_by": "U1"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pins = api.pins_list(&ChannelId::from("C1")).await.unwrap();
+
+    assert_eq!(pins.items.len(), 3, "no pin may be dropped");
+    let message = pins.items[0].message.as_ref().unwrap();
+    assert_eq!(message.text, "pinned!");
+    assert_eq!(message.ts, Ts::from("1508197641.000151"));
+    assert_eq!(
+        pins.items[0].created_by.as_ref().map(|u| u.as_str()),
+        Some("U1")
+    );
+    let file = pins.items[1].file.as_ref().unwrap();
+    assert_eq!(file.id.as_str(), "F1");
+    assert!(
+        pins.items[2].file.is_none(),
+        "a file pin without its file stays lenient"
+    );
+}
+
+#[tokio::test]
+async fn bookmarks_list_and_add_use_their_distinct_param_names() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/bookmarks.list"))
+        .and(body_string_contains("channel=C1"))
+        .and(body_string_contains("include_folders=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "bookmarks": [
+                {"id": "Bk1", "channel_id": "C1", "title": "Runbook", "type": "link",
+                 "link": "https://acme.test/runbook", "emoji": ":clap:", "rank": "g",
+                 "parent_id": "", "date_created": 1644956055, "date_updated": 0},
+                {"id": "Bk2", "channel_id": "C1", "title": "Docs", "type": "folder",
+                 "link": null, "parent_id": ""},
+                {"id": "Bk3", "channel_id": "C1", "title": "Nested", "type": "link",
+                 "link": "https://acme.test/nested", "parent_id": "Bk2"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/bookmarks.add"))
+        .and(body_string_contains("channel_id=C1"))
+        .and(body_string_contains("title=Roadmap"))
+        .and(body_string_contains("type=link"))
+        .and(body_string_contains(
+            "link=https%3A%2F%2Facme.test%2Froadmap",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": true, "bookmark": {"id": "Bk9"}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let list = api.bookmarks_list(&ChannelId::from("C1")).await.unwrap();
+    assert_eq!(list.bookmarks.len(), 3);
+    assert_eq!(list.bookmarks[0].title, "Runbook");
+    assert_eq!(
+        list.bookmarks[0].link.as_deref(),
+        Some("https://acme.test/runbook")
+    );
+    assert_eq!(list.bookmarks[1].kind.as_deref(), Some("folder"));
+    assert!(
+        list.bookmarks[1].link.is_none(),
+        "a folder bookmark has no link"
+    );
+    assert_eq!(list.bookmarks[2].parent_id.as_deref(), Some("Bk2"));
+
+    api.bookmarks_add_link(
+        &ChannelId::from("C1"),
+        "Roadmap",
+        "https://acme.test/roadmap",
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn files_list_pages_by_count_and_page() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/files.list"))
+        .and(body_string_contains("channel=C1"))
+        .and(body_string_contains("count=100"))
+        .and(body_string_contains("page=1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "files": [
+                {"id": "F1", "name": "shot.png", "filetype": "png", "size": 2048,
+                 "user": "U1", "created": 1700000001,
+                 "permalink": "https://acme.slack.com/files-pri/T1-F1/shot.png"},
+                {"id": "F2", "name": "spec.pdf", "filetype": "pdf", "size": 999999,
+                 "created": 1700000000}
+            ],
+            "paging": {"count": 100, "total": 2, "page": 1, "pages": 1}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let page = api
+        .files_list(&ChannelId::from("C1"), 100, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].id.as_str(), "F1");
+    assert_eq!(page.items[0].size, Some(2048));
+    assert!(
+        page.next_cursor.is_none(),
+        "page-based paging carries no cursor"
+    );
+}
+
+#[tokio::test]
+async fn conversations_canvases_create_sends_channel_id_and_returns_canvas_id() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.canvases.create"))
+        .and(body_string_contains("channel_id=C1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"ok": true, "canvas_id": "F07NEW"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let created = api
+        .conversations_canvases_create(&ChannelId::from("C1"))
+        .await
+        .unwrap();
+    assert_eq!(created.canvas_id, "F07NEW");
+}

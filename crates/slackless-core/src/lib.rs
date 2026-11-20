@@ -37,7 +37,7 @@ pub use reducer::apply_event;
 use api::MessageContent;
 use rtm::ConnectionState;
 use store::StoredMessage;
-use types::{ChannelId, Presence, Ts, UserId};
+use types::{ChannelId, File, Presence, Ts, UserId};
 
 /// Commands a front-end sends into the core.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +122,25 @@ pub enum Command {
         channel: ChannelId,
         thread_ts: Option<Ts>,
     },
+    /// The user opened a conversation's Pins tab: fetch its pinned items (`pins.list`).
+    /// Lazy by design: one call per conversation, when the tab is first opened.
+    LoadPins(ChannelId),
+    /// The user opened a bookmarks surface of a conversation (folder tab, bookmark bar):
+    /// fetch its bookmarks (`bookmarks.list`), folders included.
+    LoadBookmarks(ChannelId),
+    /// The user opened a conversation's Files & links tab: fetch its shared files
+    /// (`files.list`).
+    LoadFiles(ChannelId),
+    /// Add a link bookmark to the conversation's bar (`bookmarks.add`), then re-fetch the
+    /// list so the bar shows the new entry.
+    AddBookmark {
+        channel: ChannelId,
+        title: String,
+        url: String,
+    },
+    /// Create the conversation's empty channel canvas (`conversations.canvases.create`),
+    /// then refresh the stored conversation (its `properties.canvas` lands in the store).
+    CreateChannelCanvas(ChannelId),
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -181,6 +200,30 @@ pub enum Event {
     ConversationOpened(ChannelId),
     /// The session was rejected; the user has to sign in again. Carries Slack's error.
     AuthExpired(String),
+    /// The answer to a [`Command::LoadPins`]: the conversation's pinned items, or the error
+    /// text the Pins tab shows instead of loading forever (the failure is also reported).
+    PinsLoaded {
+        channel: ChannelId,
+        pins: Result<Vec<api::PinnedItem>, String>,
+    },
+    /// The answer to a [`Command::LoadBookmarks`] or [`Command::AddBookmark`]: the
+    /// conversation's bookmarks, or the error text.
+    BookmarksLoaded {
+        channel: ChannelId,
+        bookmarks: Result<Vec<api::ChannelBookmark>, String>,
+    },
+    /// The answer to a [`Command::LoadFiles`]: the conversation's shared files, or the error
+    /// text.
+    FilesLoaded {
+        channel: ChannelId,
+        files: Result<Vec<File>, String>,
+    },
+    /// The conversation's channel canvas was created and the stored conversation refreshed;
+    /// `canvas_id` opens it in Slack's web client.
+    ChannelCanvasCreated {
+        channel: ChannelId,
+        canvas_id: String,
+    },
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

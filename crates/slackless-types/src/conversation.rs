@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::de::{lenient_i64, null_default, ok_or_none};
-use crate::ids::{ChannelId, TeamId, Ts, UserId};
+use crate::ids::{ChannelId, FileId, TeamId, Ts, UserId};
+use crate::macros::string_enum;
 use crate::message::Message;
 
 /// A conversation object (`conversations.info/list/view`, `client.userBoot.channels/ims`,
@@ -74,7 +75,10 @@ pub struct Conversation {
     /// IM sidebar priority.
     #[serde(default)]
     pub priority: Option<f64>,
-    /// Fields this crate does not model (`properties`, `shared_team_ids`, ...), preserved verbatim.
+    /// The conversation's `properties` object: tab configuration and the channel canvas.
+    #[serde(default)]
+    pub properties: Option<ConversationProperties>,
+    /// Fields this crate does not model (`shared_team_ids`, ...), preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -131,6 +135,7 @@ impl Conversation {
             updated,
             context_team_id,
             priority,
+            properties,
         );
         macro_rules! flagged {
             ($($field:ident),* $(,)?) => {$(
@@ -160,6 +165,86 @@ impl Conversation {
             self.extra.insert(key.clone(), value.clone());
         }
     }
+}
+
+/// `properties`: per-conversation settings. `tabs` drives the conversation tab row and
+/// `canvas` identifies the channel canvas; other keys (`posting_restricted_to`, the legacy
+/// `tabz`, ...) are preserved verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationProperties {
+    /// The tab row's configuration, in display order after the implicit Messages tab.
+    #[serde(default, deserialize_with = "null_default")]
+    pub tabs: Vec<ConversationTabSpec>,
+    /// Present once the conversation has a canvas (even one disabled as a tab).
+    #[serde(default)]
+    pub canvas: Option<ChannelCanvas>,
+    /// Keys this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+string_enum! {
+    /// `properties.tabs[].type`.
+    pub enum ConversationTabKind {
+        Files = "files",
+        /// The channel's bookmarks entry; Slack renders it as the "Pins" tab.
+        Bookmarks = "bookmarks",
+        ChannelCanvas = "channel_canvas",
+        /// A folder of bookmarks, shown under its own label.
+        Folder = "folder",
+        /// A Slack List tab (not supported by the UI yet).
+        List = "list",
+    }
+}
+
+/// One entry of `properties.tabs`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConversationTabSpec {
+    #[serde(rename = "type", default)]
+    pub kind: Option<ConversationTabKind>,
+    /// Tab label; the empty string means "the type's default label".
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Stable tab id (`"files"`, a bookmark id for folders, ...).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// A disabled `channel_canvas` tab hides the canvas without deleting it.
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_disabled: bool,
+    /// Type-specific payload (a folder tab's `folder_bookmark_id`).
+    #[serde(default)]
+    pub data: Option<TabData>,
+    /// Fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `properties.tabs[].data`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TabData {
+    /// The folder bookmark whose entries a `folder` tab lists.
+    #[serde(default)]
+    pub folder_bookmark_id: Option<String>,
+    /// Fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `properties.canvas`: the conversation's canvas, once one exists.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChannelCanvas {
+    /// The canvas document's file id (`F...`), the id every `canvases.*` method takes.
+    #[serde(default)]
+    pub file_id: Option<FileId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_empty: bool,
+    #[serde(default)]
+    pub quip_thread_id: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_migrated: bool,
+    /// Fields this crate does not model, preserved verbatim.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// `topic` / `purpose`.
@@ -261,5 +346,103 @@ mod tests {
         assert_eq!(merged.name.as_deref(), Some("renamed"));
         assert!(merged.is_archived);
         assert_eq!(merged.members.len(), 2);
+    }
+
+    /// The recorded `properties` of live conversations: default tabs, a disabled canvas tab,
+    /// a folder tab and a canvas reference must all parse typed while other keys survive.
+    #[test]
+    fn parses_recorded_properties_tabs_and_canvas() {
+        let json = serde_json::json!({
+            "id": "C1",
+            "properties": {
+                "tabs": [
+                    {"type": "folder", "label": "Bookmarks", "id": "Ct1",
+                     "data": {"folder_bookmark_id": "Bk1"}},
+                    {"type": "bookmarks", "label": "", "id": "bookmarks"},
+                    {"type": "files", "label": "", "id": "files"},
+                    {"type": "channel_canvas", "label": "Canvas", "id": "channel_canvas",
+                     "is_disabled": true},
+                    {"type": "brand_new_2027", "label": "??"}
+                ],
+                "canvas": {"file_id": "F06M7CVHPJP", "is_empty": true,
+                           "quip_thread_id": "Q1", "is_migrated": true},
+                "tabz": [{"type": "files"}],
+                "posting_restricted_to": {"type": ["ra"]}
+            }
+        });
+        let conversation: Conversation = serde_json::from_value(json).expect("parses");
+        let properties = conversation.properties.expect("properties");
+
+        let tabs = &properties.tabs;
+        assert_eq!(tabs.len(), 5, "every entry parses");
+        assert_eq!(tabs[0].kind, Some(ConversationTabKind::Folder));
+        assert_eq!(
+            tabs[0]
+                .data
+                .as_ref()
+                .and_then(|d| d.folder_bookmark_id.as_deref()),
+            Some("Bk1"),
+            "a folder tab carries its folder bookmark id"
+        );
+        assert_eq!(tabs[1].kind, Some(ConversationTabKind::Bookmarks));
+        assert_eq!(tabs[2].kind, Some(ConversationTabKind::Files));
+        let canvas_tab = &tabs[3];
+        assert_eq!(canvas_tab.kind, Some(ConversationTabKind::ChannelCanvas));
+        assert!(
+            canvas_tab.is_disabled,
+            "a disabled canvas tab stays parseable"
+        );
+        assert_eq!(
+            tabs[4].kind,
+            Some(ConversationTabKind::Other("brand_new_2027".into())),
+            "an unknown tab type lands in the catch-all"
+        );
+        assert_eq!(
+            properties.canvas.as_ref().and_then(|c| c.file_id.as_ref()),
+            Some(&FileId::from("F06M7CVHPJP"))
+        );
+        assert!(
+            properties.extra.contains_key("tabz")
+                && properties.extra.contains_key("posting_restricted_to"),
+            "unmodeled property keys survive verbatim"
+        );
+        assert!(!conversation.extra.contains_key("properties"));
+    }
+
+    #[test]
+    fn merge_carries_properties_only_when_present() {
+        let stored = Conversation {
+            id: ChannelId::from("C1"),
+            properties: Some(ConversationProperties {
+                tabs: vec![ConversationTabSpec {
+                    kind: Some(ConversationTabKind::Files),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // A response without `properties` (e.g. `client.userBoot` IMs) must not erase it.
+        let mut merged = stored.clone();
+        merged.merge(&Conversation {
+            id: ChannelId::from("C1"),
+            ..Default::default()
+        });
+        assert_eq!(merged.properties, stored.properties);
+
+        // A response with `properties` replaces the stored copy wholesale.
+        let fresh = ConversationProperties {
+            canvas: Some(ChannelCanvas {
+                file_id: Some(FileId::from("F2")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        merged.merge(&Conversation {
+            id: ChannelId::from("C1"),
+            properties: Some(fresh.clone()),
+            ..Default::default()
+        });
+        assert_eq!(merged.properties, Some(fresh));
     }
 }

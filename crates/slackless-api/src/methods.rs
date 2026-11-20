@@ -363,6 +363,79 @@ pub struct SectionCreated {
     pub channel_section_id: String,
 }
 
+/// `pins.list`: a conversation's pinned messages and files, oldest pin first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PinsList {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub items: Vec<PinnedItem>,
+}
+
+/// One `pins.list` item: a pinned message or file.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct PinnedItem {
+    /// `message` or `file`.
+    #[serde(rename = "type", default, deserialize_with = "or_default")]
+    pub kind: Option<String>,
+    /// When it was pinned; unix seconds.
+    #[serde(default, deserialize_with = "or_default")]
+    pub created: Option<i64>,
+    #[serde(default)]
+    pub created_by: Option<UserId>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub message: Option<Message>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub file: Option<File>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `bookmarks.list`: a conversation's bookmarks (links, folders, shortcuts), bar order.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct BookmarksList {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub bookmarks: Vec<ChannelBookmark>,
+}
+
+/// One channel bookmark. Folders carry no `link`; entries inside a folder carry its id in
+/// `parent_id` (the empty string at the top level).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ChannelBookmark {
+    #[serde(default, deserialize_with = "or_default")]
+    pub id: String,
+    #[serde(default)]
+    pub channel_id: ChannelId,
+    #[serde(default, deserialize_with = "or_default")]
+    pub title: String,
+    #[serde(default)]
+    pub link: Option<String>,
+    /// Bookmark icon tag, e.g. `:clap:`.
+    #[serde(default)]
+    pub emoji: Option<String>,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+    /// `link`, `folder`, ...
+    #[serde(rename = "type", default, deserialize_with = "or_default")]
+    pub kind: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub parent_id: Option<String>,
+    #[serde(default, deserialize_with = "or_default")]
+    pub entity_id: Option<String>,
+    /// Unix seconds.
+    #[serde(default, deserialize_with = "or_default")]
+    pub date_created: Option<i64>,
+    #[serde(default)]
+    pub last_updated_by_user_id: Option<UserId>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// `conversations.canvases.create`: the id of the created channel canvas.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CanvasCreated {
+    #[serde(default, deserialize_with = "or_default")]
+    pub canvas_id: String,
+}
+
 // Wire wrappers for payloads that nest the useful value under one key.
 
 #[derive(Deserialize)]
@@ -435,6 +508,12 @@ struct SectionWire {
 struct IdsPageWire {
     #[serde(default, deserialize_with = "or_default")]
     channel_ids: Vec<ChannelId>,
+}
+
+#[derive(Deserialize)]
+struct FilesWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    files: Vec<File>,
 }
 
 impl From<SectionWire> for ChannelSection {
@@ -902,5 +981,69 @@ impl SlackApi {
             .await?
             .data
             .emoji)
+    }
+
+    /// `pins.list`: a conversation's pinned messages and files, oldest pin first.
+    pub async fn pins_list(&self, channel: &ChannelId) -> Result<PinsList> {
+        let params = vec![("channel", channel.to_string())];
+        Ok(self.call(method::PINS_LIST, params).await?.data)
+    }
+
+    /// `bookmarks.list`: the conversation's bookmarks, folders included. Fetched lazily by
+    /// the tab row (once per conversation, when a bookmarks surface is opened).
+    pub async fn bookmarks_list(&self, channel: &ChannelId) -> Result<BookmarksList> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("include_folders", "true".to_owned()),
+        ];
+        Ok(self.call(method::BOOKMARKS_LIST, params).await?.data)
+    }
+
+    /// `bookmarks.add` of a `link` bookmark to the conversation's bar.
+    pub async fn bookmarks_add_link(
+        &self,
+        channel: &ChannelId,
+        title: &str,
+        link: &str,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel.to_string()),
+            ("title", title.to_owned()),
+            ("type", "link".to_owned()),
+            ("link", link.to_owned()),
+        ];
+        self.call::<Empty>(method::BOOKMARKS_ADD, params).await?;
+        Ok(())
+    }
+
+    /// One page of `files.list`: the files shared with `channel`, newest first. `files.list`
+    /// paginates by `page`, so a single large first page covers the Files & links view.
+    pub async fn files_list(
+        &self,
+        channel: &ChannelId,
+        count: u32,
+        page_no: u32,
+    ) -> Result<Page<File>> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("count", count.to_string()),
+            ("page", page_no.to_string()),
+        ];
+        let resp = self.call::<FilesWire>(method::FILES_LIST, params).await?;
+        Ok(page(resp, |w| w.files))
+    }
+
+    /// `conversations.canvases.create`: creates the conversation's empty channel canvas and
+    /// returns its file id. Fails with `channel_canvas_already_exists` when one exists
+    /// already (read the id from `conversations.info` -> `properties.canvas` then).
+    pub async fn conversations_canvases_create(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<CanvasCreated> {
+        let params = vec![("channel_id", channel.to_string())];
+        Ok(self
+            .call(method::CONVERSATIONS_CANVASES_CREATE, params)
+            .await?
+            .data)
     }
 }

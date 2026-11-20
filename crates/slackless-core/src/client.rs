@@ -508,6 +508,50 @@ impl<B: Backend> Core<B> {
                     events.emit(Event::Error(format!("typing: {e}")));
                 }
             }
+            Command::LoadPins(channel) => self.spawn("pins.list", async move {
+                let pins = backend.pins(channel.clone()).await;
+                answer_load(&events, pins, |pins| Event::PinsLoaded { channel, pins })
+            }),
+            Command::LoadBookmarks(channel) => self.spawn("bookmarks.list", async move {
+                let bookmarks = backend.bookmarks(channel.clone()).await;
+                answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
+                    channel,
+                    bookmarks,
+                })
+            }),
+            Command::LoadFiles(channel) => self.spawn("files.list", async move {
+                let files = backend.files(channel.clone()).await;
+                answer_load(&events, files, |files| Event::FilesLoaded {
+                    channel,
+                    files,
+                })
+            }),
+            Command::AddBookmark {
+                channel,
+                title,
+                url,
+            } => {
+                self.spawn("bookmarks.add", async move {
+                    backend.add_bookmark(channel.clone(), title, url).await?;
+                    let bookmarks = backend.bookmarks(channel.clone()).await;
+                    answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
+                        channel,
+                        bookmarks,
+                    })
+                });
+            }
+            Command::CreateChannelCanvas(channel) => {
+                self.spawn("conversations.canvases.create", async move {
+                    let canvas_id = backend.create_canvas(channel.clone()).await?;
+                    // Refresh the stored conversation so `properties.canvas` lands; the tab
+                    // row re-derives from the next snapshot.
+                    let fresh = backend.conversation_info(channel.clone()).await?;
+                    with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+                    events.emit(Event::Conversations(vec![channel.clone()]));
+                    events.emit(Event::ChannelCanvasCreated { channel, canvas_id });
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -749,6 +793,25 @@ impl<B: Backend> Core<B> {
     }
 }
 
+/// Answers a lazy tab load with its data, or with the error text the tab shows instead of
+/// loading forever; the failure is also returned for the usual report.
+fn answer_load<T>(
+    events: &Emitter,
+    result: Result<T, ApiError>,
+    answer: impl FnOnce(Result<T, String>) -> Event,
+) -> Result<(), CoreError> {
+    match result {
+        Ok(data) => {
+            events.emit(answer(Ok(data)));
+            Ok(())
+        }
+        Err(e) => {
+            events.emit(answer(Err(e.to_string())));
+            Err(e.into())
+        }
+    }
+}
+
 /// Conversation events without a conversation object; the store needs a fresh copy.
 fn refresh_target(event: &SlackEvent) -> Option<ChannelId> {
     match event {
@@ -786,12 +849,13 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::api::{
-        self, ClientCounts, MessageContent, Page, PostedMessage, SearchMessages, UserBoot,
+        self, ChannelBookmark, ClientCounts, MessageContent, Page, PinnedItem, PostedMessage,
+        SearchMessages, UserBoot,
     };
     use crate::rtm::ConnectionState;
     use crate::types::{
-        ChannelSection, Conversation, DndStatus, Message, Presence, SectionKind, Team, Ts, User,
-        UserId, UserPresence,
+        ChannelCanvas, ChannelSection, Conversation, ConversationProperties, DndStatus, File,
+        FileId, Message, Presence, SectionKind, Team, Ts, User, UserId, UserPresence,
     };
 
     /// History page size of the fake.
@@ -826,6 +890,16 @@ pub(crate) mod tests {
         user_info_calls: Vec<UserId>,
         leave_calls: Vec<ChannelId>,
         notification_calls: Vec<(ChannelId, &'static str, &'static str)>,
+        /// `pins.list` answer.
+        pins: Vec<PinnedItem>,
+        /// `bookmarks.list` answer; `bookmarks.add` appends to it.
+        bookmarks: Vec<ChannelBookmark>,
+        /// `files.list` answer.
+        files: Vec<File>,
+        bookmark_adds: Vec<(ChannelId, String, String)>,
+        canvas_creations: Vec<ChannelId>,
+        /// Every tab load (`pins.list`, `bookmarks.list`, `files.list`) fails.
+        fail_tab_loads: bool,
     }
 
     impl FakeBackend {
@@ -877,6 +951,48 @@ pub(crate) mod tests {
         /// The `conversations.info` answer for every channel.
         pub fn set_info(&self, conversation: Conversation) {
             self.state.lock().unwrap().info = Some(conversation);
+        }
+
+        /// The `pins.list` answer.
+        pub fn set_pins(&self, pins: Vec<PinnedItem>) {
+            self.state.lock().unwrap().pins = pins;
+        }
+
+        /// The `bookmarks.list` answer.
+        pub fn set_bookmarks(&self, bookmarks: Vec<ChannelBookmark>) {
+            self.state.lock().unwrap().bookmarks = bookmarks;
+        }
+
+        /// The `files.list` answer.
+        pub fn set_files(&self, files: Vec<File>) {
+            self.state.lock().unwrap().files = files;
+        }
+
+        /// Make every tab load (`pins.list`, `bookmarks.list`, `files.list`) fail.
+        pub fn fail_tab_loads(&self) {
+            self.state.lock().unwrap().fail_tab_loads = true;
+        }
+
+        /// One tab load's answer: `pick`'s list, or a Slack error once `fail_tab_loads`.
+        fn tab_load<T: Clone>(
+            &self,
+            pick: impl FnOnce(&FakeState) -> &Vec<T>,
+        ) -> api::Result<Vec<T>> {
+            let state = self.state.lock().unwrap();
+            if state.fail_tab_loads {
+                return Err(ApiError::Slack("channel_not_found".into()));
+            }
+            Ok(pick(&state).clone())
+        }
+
+        /// The recorded `bookmarks.add` calls.
+        pub fn bookmark_adds(&self) -> Vec<(ChannelId, String, String)> {
+            self.state.lock().unwrap().bookmark_adds.clone()
+        }
+
+        /// The recorded `conversations.canvases.create` calls.
+        pub fn canvas_creations(&self) -> Vec<ChannelId> {
+            self.state.lock().unwrap().canvas_creations.clone()
         }
 
         /// The `dnd.info` answer for `user`.
@@ -1190,6 +1306,43 @@ pub(crate) mod tests {
         async fn mark_read(&self, _: ChannelId, _: Ts) -> api::Result<()> {
             Err(ApiError::AuthExpired("invalid_auth".into()))
         }
+
+        async fn pins(&self, _: ChannelId) -> api::Result<Vec<PinnedItem>> {
+            self.tab_load(|state| &state.pins)
+        }
+
+        async fn bookmarks(&self, _: ChannelId) -> api::Result<Vec<ChannelBookmark>> {
+            self.tab_load(|state| &state.bookmarks)
+        }
+
+        async fn files(&self, _: ChannelId) -> api::Result<Vec<File>> {
+            self.tab_load(|state| &state.files)
+        }
+
+        async fn add_bookmark(
+            &self,
+            channel: ChannelId,
+            title: String,
+            url: String,
+        ) -> api::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .bookmark_adds
+                .push((channel, title.clone(), url.clone()));
+            state.bookmarks.push(ChannelBookmark {
+                id: "BkNew".to_owned(),
+                title,
+                link: Some(url),
+                kind: Some("link".to_owned()),
+                ..Default::default()
+            });
+            Ok(())
+        }
+
+        async fn create_canvas(&self, channel: ChannelId) -> api::Result<String> {
+            self.state.lock().unwrap().canvas_creations.push(channel);
+            Ok("F07NEW".to_owned())
+        }
     }
 
     pub(crate) fn fake_core_parts() -> (SharedStore, Emitter, UnboundedReceiver<Event>) {
@@ -1210,6 +1363,174 @@ pub(crate) mod tests {
             .await
             .expect("event within 5s")
             .expect("event stream open")
+    }
+
+    #[tokio::test]
+    async fn tab_loads_fetch_their_data_and_emit_it() {
+        let fake = FakeBackend::default();
+        fake.set_pins(vec![PinnedItem {
+            kind: Some("message".to_owned()),
+            message: Some(Message {
+                ts: Ts::from("9.0"),
+                text: "pinned".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        fake.set_bookmarks(vec![ChannelBookmark {
+            id: "Bk1".to_owned(),
+            title: "Runbook".to_owned(),
+            link: Some("https://acme.test/runbook".to_owned()),
+            kind: Some("link".to_owned()),
+            ..Default::default()
+        }]);
+        fake.set_files(vec![File {
+            id: FileId::from("F1"),
+            name: Some("spec.pdf".to_owned()),
+            ..Default::default()
+        }]);
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::LoadPins(c1()));
+        let Event::PinsLoaded { channel, pins } = next(&mut rx).await else {
+            panic!("expected pins");
+        };
+        assert_eq!(channel, c1());
+        let pins = pins.expect("pins load");
+        assert_eq!(
+            pins[0].message.as_ref().map(|m| m.text.as_str()),
+            Some("pinned")
+        );
+
+        core.handle(Command::LoadBookmarks(c1()));
+        let Event::BookmarksLoaded { channel, bookmarks } = next(&mut rx).await else {
+            panic!("expected bookmarks");
+        };
+        let bookmarks = bookmarks.expect("bookmarks load");
+        assert_eq!((channel, bookmarks.len()), (c1(), 1));
+        assert_eq!(bookmarks[0].title, "Runbook");
+
+        core.handle(Command::LoadFiles(c1()));
+        let Event::FilesLoaded { channel, files } = next(&mut rx).await else {
+            panic!("expected files");
+        };
+        let files = files.expect("files load");
+        assert_eq!((channel, files.len()), (c1(), 1));
+        assert_eq!(files[0].id.as_str(), "F1");
+    }
+
+    #[tokio::test]
+    async fn failed_tab_load_answers_the_tab_with_the_error_and_reports_it() {
+        let fake = FakeBackend::default();
+        fake.fail_tab_loads();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::LoadFiles(c1()));
+
+        let Event::FilesLoaded { channel, files } = next(&mut rx).await else {
+            panic!("a failed load still answers its tab");
+        };
+        assert_eq!(channel, c1());
+        assert!(
+            files.is_err_and(|error| error.contains("channel_not_found")),
+            "the tab gets Slack's error instead of loading forever"
+        );
+        assert!(
+            matches!(next(&mut rx).await, Event::Error(error) if error.starts_with("files.list")),
+            "the failure is reported as usual"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_bookmark_adds_then_refetches_the_list() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::AddBookmark {
+            channel: c1(),
+            title: "Roadmap".into(),
+            url: "https://acme.test/roadmap".into(),
+        });
+
+        let Event::BookmarksLoaded { channel, bookmarks } = next(&mut rx).await else {
+            panic!("expected the refreshed list");
+        };
+        assert_eq!(channel, c1());
+        let bookmarks = bookmarks.expect("the refreshed list");
+        assert_eq!(
+            bookmarks.last().map(|b| b.title.as_str()),
+            Some("Roadmap"),
+            "the refreshed list carries the added bookmark"
+        );
+        assert_eq!(
+            fake.bookmark_adds(),
+            vec![(
+                c1(),
+                "Roadmap".to_owned(),
+                "https://acme.test/roadmap".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_channel_canvas_refreshes_the_conversation_and_announces_the_id() {
+        let fake = FakeBackend::default();
+        // The post-create `conversations.info` refresh carries the new canvas.
+        fake.set_info(Conversation {
+            properties: Some(ConversationProperties {
+                canvas: Some(ChannelCanvas {
+                    file_id: Some(FileId::from("F07NEW")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+        let ws = TeamId::from("T1");
+        store
+            .lock()
+            .unwrap()
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: c1(),
+                    name: Some("general".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        core.handle(Command::CreateChannelCanvas(c1()));
+
+        assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+        assert_eq!(
+            next(&mut rx).await,
+            Event::ChannelCanvasCreated {
+                channel: c1(),
+                canvas_id: "F07NEW".to_owned(),
+            }
+        );
+        assert_eq!(fake.canvas_creations(), vec![c1()]);
+        let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
+        let stored = stored.expect("the conversation stays stored");
+        assert_eq!(
+            stored
+                .properties
+                .and_then(|p| p.canvas)
+                .and_then(|c| c.file_id),
+            Some(FileId::from("F07NEW")),
+            "the canvas id lands in the stored properties"
+        );
+        assert_eq!(
+            stored.name.as_deref(),
+            Some("general"),
+            "merge keeps other fields"
+        );
     }
 
     #[tokio::test]

@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::api::{
-    self, ClientCounts, HistoryOpts, MessageContent, Page, PostedMessage, SearchMessages,
-    SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
+    self, ChannelBookmark, ClientCounts, HistoryOpts, MessageContent, Page, PinnedItem,
+    PostedMessage, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
 };
 use crate::types::{
-    ChannelId, ChannelSection, Conversation, DndStatus, Message, Ts, User, UserId, UserPresence,
+    ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Ts, User, UserId,
+    UserPresence,
 };
 
 /// `conversations.history` page size the core requests (Slack max 999).
@@ -16,6 +17,8 @@ pub(crate) const HISTORY_PAGE_LIMIT: u32 = 200;
 
 /// `subscriptions.thread.getView` page size the core requests.
 pub(crate) const THREADS_PAGE_LIMIT: u32 = 50;
+/// `files.list` page size the core requests for a conversation's Files & links tab.
+pub(crate) const FILES_PAGE: u32 = 100;
 
 /// The Slack calls the core makes. [`SlackApi`] is the real implementation; tests drive the core
 /// with an in-process fake.
@@ -106,6 +109,27 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn search(&self, query: String) -> impl Future<Output = api::Result<SearchMessages>> + Send;
     fn mark_read(&self, channel: ChannelId, ts: Ts)
     -> impl Future<Output = api::Result<()>> + Send;
+    /// A conversation's pinned items (`pins.list`), oldest pin first. Read-only.
+    fn pins(&self, channel: ChannelId)
+    -> impl Future<Output = api::Result<Vec<PinnedItem>>> + Send;
+    /// A conversation's bookmarks (`bookmarks.list`), folders included. Read-only.
+    fn bookmarks(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<Vec<ChannelBookmark>>> + Send;
+    /// The files shared with a conversation (`files.list`), newest first. Read-only.
+    fn files(&self, channel: ChannelId) -> impl Future<Output = api::Result<Vec<File>>> + Send;
+    /// Add a link bookmark to a conversation's bar (`bookmarks.add`).
+    fn add_bookmark(
+        &self,
+        channel: ChannelId,
+        title: String,
+        url: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Create a conversation's empty channel canvas (`conversations.canvases.create`),
+    /// returning the canvas file id.
+    fn create_canvas(&self, channel: ChannelId)
+    -> impl Future<Output = api::Result<String>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -237,5 +261,32 @@ impl Backend for SlackApi {
 
     async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
         self.conversations_mark(&channel, &ts).await
+    }
+
+    async fn pins(&self, channel: ChannelId) -> api::Result<Vec<PinnedItem>> {
+        Ok(self.pins_list(&channel).await?.items)
+    }
+
+    async fn bookmarks(&self, channel: ChannelId) -> api::Result<Vec<ChannelBookmark>> {
+        Ok(self.bookmarks_list(&channel).await?.bookmarks)
+    }
+    async fn files(&self, channel: ChannelId) -> api::Result<Vec<File>> {
+        Ok(self.files_list(&channel, FILES_PAGE, 1).await?.items)
+    }
+
+    async fn add_bookmark(
+        &self,
+        channel: ChannelId,
+        title: String,
+        url: String,
+    ) -> api::Result<()> {
+        self.bookmarks_add_link(&channel, &title, &url).await
+    }
+
+    async fn create_canvas(&self, channel: ChannelId) -> api::Result<String> {
+        Ok(self
+            .conversations_canvases_create(&channel)
+            .await?
+            .canvas_id)
     }
 }

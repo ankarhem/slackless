@@ -165,9 +165,18 @@
 //!   ThreadPanelEvent::Later(SaveRequest); both take set_saved(&Ts, bool, cx)
 //!   SidebarEvent::OpenLater; Sidebar::set_later_count
 //!
-//! pins.rs (bookmarks bar under the tabs; pins panel in the right column)
-//!   pub fn bookmarks(&Fixtures, &ChannelId) / pinned(&Fixtures, &ChannelId)
-//!   pub fn bookmarks_bar(..) -> Div / pins_panel(..) -> Div
+//! tabs.rs (the conversation tab row, derived from `properties.tabs` in live mode)
+//!   pub fn derive(&Conversation, sample: bool) -> Vec<TabSpec> / tab(..) -> Stateful<Div>
+//!   TabAction::Switch(ConversationTab) / OpenCanvas(file id) / AddCanvas
+//! tab_views.rs (Files & links and bookmark-folder tab bodies over lazily `Loaded` data)
+//!   pub fn files_view(..) -> Div / folder_view(..) -> Div / state_line(..)
+//!
+//! bookmarks.rs (bookmarks bar under the tabs, and its add-link dialog)
+//!   pub fn fixture(&Fixtures, &ChannelId) -> Vec<Bookmark> / bar(.., BarClicks, ..) -> Div
+//!   pub fn open_add_dialog(&mut Window, &mut App, on_add(title, url, cx))
+//!
+//! pins.rs (pins panel in the right column)
+//!   pub fn pinned(&Fixtures, &ChannelId) / pins_panel(.., Option<&Loaded<Message>>, ..)
 //!
 //! activity.rs (the sidebar's Activity destination)
 //!   ActivityFeed::new(Arc<Fixtures>, &mut App) -> Entity<ActivityFeed>
@@ -204,14 +213,14 @@ use gpui_kit::gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
     WindowAppearance, actions, anchored, deferred, div, point, px,
 };
-use slackless_core::api::ConversationCounts;
-use slackless_core::api::MessageContent;
+use slackless_core::api::{ChannelBookmark, ConversationCounts, MessageContent};
 use slackless_core::platform::{self, BadgeSetter, Notifier};
-use slackless_core::types::{ChannelId, Conversation, ConversationKind, Message, Ts, UserId};
+use slackless_core::types::{ChannelId, Conversation, ConversationKind, File, Message, Ts, UserId};
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
 use crate::actions::notify;
 use crate::avatars::conversation_avatar;
+use crate::bookmarks;
 use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
@@ -235,6 +244,8 @@ use crate::sidebar::{NavItem, Sidebar, SidebarEvent};
 use crate::slash::{Invocation, SHRUG, SlashKind};
 use crate::status::{SelfState, StatusEvent, StatusPicker, UserMenu, UserMenuEvent};
 use crate::switcher::{QuickSwitcher, SwitcherEvent};
+use crate::tab_views::{self, Loaded};
+use crate::tabs::{self, ConversationTab, TabAction};
 use crate::theme::{self, Palette, SlackTheme};
 use crate::threads::{ThreadPanel, ThreadPanelEvent};
 use crate::threads_cards::{local_cards, store_cards};
@@ -293,14 +304,6 @@ struct Parked {
     channel: ChannelId,
     views: WorkspaceViews,
     subscriptions: Vec<Subscription>,
-}
-
-/// The conversation tab whose body fills the main column.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ConversationTab {
-    Messages,
-    Canvas,
-    List,
 }
 
 /// Where an emoji pick goes.
@@ -383,6 +386,17 @@ pub struct App {
     /// The pinned-messages panel of the open conversation (right column, exclusive with the
     /// thread and profile panels).
     pins_open: bool,
+    /// Live mode: per channel, its pinned messages (`pins.list`) or why they could not be
+    /// loaded; fetched each time a pins surface opens, never per channel.
+    pins: HashMap<ChannelId, Loaded<Message>>,
+    /// Live mode: per channel, its bookmarks (`bookmarks.list`), fetched each time a
+    /// bookmarks surface opens.
+    bookmarks: HashMap<ChannelId, Loaded<ChannelBookmark>>,
+    /// Live mode: per channel, its shared files (`files.list`), fetched each time Files &
+    /// links opens.
+    files: HashMap<ChannelId, Loaded<File>>,
+    /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
+    fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications (`slackless-platform`).
     os: Rc<dyn Os>,
     /// The badge count last handed to the dock, so it is only set on change.
@@ -771,6 +785,10 @@ impl App {
                 compose_open: false,
                 pending_dm: None,
                 pins_open: false,
+                pins: HashMap::new(),
+                bookmarks: HashMap::new(),
+                files: HashMap::new(),
+                fixture_bookmarks: HashMap::new(),
                 os: Rc::new(platform::current()),
                 badge: None,
                 history_generation: 0,
@@ -888,6 +906,9 @@ impl App {
         self.thread_open = true;
         self.profile_open = false;
         self.pins_open = false;
+        if self.tab == ConversationTab::Pins {
+            self.tab = ConversationTab::Messages;
+        }
         cx.notify();
     }
 
@@ -896,8 +917,181 @@ impl App {
         if self.pins_open {
             self.thread_open = false;
             self.profile_open = false;
+            self.load_tab_data(&ConversationTab::Pins);
+        } else if self.tab == ConversationTab::Pins {
+            self.tab = ConversationTab::Messages;
         }
         cx.notify();
+    }
+
+    /// A tab row entry was clicked: switch the column, open the channel canvas in Slack's
+    /// web client, or create the missing canvas.
+    fn activate_tab(&mut self, action: TabAction, cx: &mut Context<Self>) {
+        match action {
+            TabAction::Switch(target) => self.select_tab(target, cx),
+            TabAction::OpenCanvas(file) => cx.open_url(&self.canvas_link(&file)),
+            TabAction::AddCanvas => {
+                self.bridge
+                    .send(Command::CreateChannelCanvas(self.channel.clone()));
+            }
+        }
+    }
+
+    /// Show `target`'s body. The Pins tab toggles the right-hand panel over the messages
+    /// column; live mode fetches the tab's data each time it opens.
+    fn select_tab(&mut self, target: ConversationTab, cx: &mut Context<Self>) {
+        if target == ConversationTab::Pins && self.tab == ConversationTab::Pins {
+            self.pins_open = false;
+            self.tab = ConversationTab::Messages;
+            cx.notify();
+            return;
+        }
+        if target == ConversationTab::Pins {
+            self.pins_open = true;
+            self.thread_open = false;
+            self.profile_open = false;
+        }
+        self.load_tab_data(&target);
+        self.tab = target;
+        cx.notify();
+    }
+
+    /// Live mode: fetch the data of a tab that just opened - one request per open, never
+    /// per channel. A failed earlier load is dropped so the tab shows loading again.
+    fn load_tab_data(&mut self, tab: &ConversationTab) {
+        if self.fixtures.sample {
+            return;
+        }
+        let channel = self.channel.clone();
+        let command = match tab {
+            ConversationTab::Pins => {
+                forget_failure(&mut self.pins, &channel);
+                Command::LoadPins(channel)
+            }
+            ConversationTab::Files => {
+                forget_failure(&mut self.files, &channel);
+                Command::LoadFiles(channel)
+            }
+            ConversationTab::Folder { .. } => {
+                forget_failure(&mut self.bookmarks, &channel);
+                Command::LoadBookmarks(channel)
+            }
+            ConversationTab::Messages | ConversationTab::Canvas | ConversationTab::List => {
+                return;
+            }
+        };
+        self.bridge.send(command);
+    }
+
+    /// The live channel's top-level bookmarks for the bar: links open their URL, folders
+    /// open their tab; entries without a target are left out. Empty until the channel's
+    /// `bookmarks.list` has been fetched (lazy).
+    fn live_bookmarks(&self) -> Vec<bookmarks::Bookmark> {
+        let Some(Ok(list)) = self.bookmarks.get(&self.channel) else {
+            return Vec::new();
+        };
+        list.iter()
+            .filter(|bookmark| bookmark.parent_id.as_deref().unwrap_or_default().is_empty())
+            .filter_map(|bookmark| {
+                let title = bookmark.title.clone();
+                if bookmark.kind.as_deref() == Some("folder") {
+                    return Some(bookmarks::Bookmark::folder(title, bookmark.id.clone()));
+                }
+                let link = bookmark.link.as_deref().filter(|link| !link.is_empty())?;
+                Some(bookmarks::Bookmark::link(title, link.to_owned()))
+            })
+            .collect()
+    }
+
+    /// A folder bookmark in the bar: show its bookmarks under the conversation's tab for the
+    /// folder, or under the folder's own title when the row has no such tab.
+    fn open_folder_tab(&mut self, folder_id: &str, cx: &mut Context<Self>) {
+        let row_label = self
+            .fixtures
+            .conversation(&self.channel)
+            .and_then(|conversation| {
+                tabs::derive(conversation, self.fixtures.sample)
+                    .into_iter()
+                    .find_map(|spec| match spec.action {
+                        TabAction::Switch(ConversationTab::Folder { label, bookmark_id })
+                            if bookmark_id == folder_id =>
+                        {
+                            Some(label)
+                        }
+                        _ => None,
+                    })
+            });
+        let title = || {
+            let list = self.bookmarks.get(&self.channel)?.as_ref().ok()?;
+            let folder = list.iter().find(|bookmark| bookmark.id == folder_id)?;
+            Some(SharedString::from(folder.title.clone()))
+        };
+        let label = row_label
+            .or_else(title)
+            .unwrap_or_else(|| "Bookmarks".into());
+        let bookmark_id = folder_id.to_owned();
+        self.select_tab(ConversationTab::Folder { label, bookmark_id }, cx);
+    }
+
+    /// The canvas document's permalink in Slack's web client.
+    fn canvas_link(&self, canvas_id: &str) -> String {
+        match self.fixtures.workspaces.first() {
+            Some(team) if !team.domain.is_empty() => format!(
+                "https://{}.slack.com/docs/{}/{}",
+                team.domain, team.id, canvas_id
+            ),
+            Some(team) => {
+                format!("https://app.slack.com/client/{}/{}", team.id, self.channel)
+            }
+            None => format!("https://app.slack.com/client/{}", self.channel),
+        }
+    }
+
+    /// The "+" menu's Canvas item: open the conversation's canvas, creating it first when
+    /// it has none (the created canvas arrives as `Event::ChannelCanvasCreated` and opens
+    /// then).
+    fn open_or_add_canvas(&mut self, cx: &mut Context<Self>) {
+        let canvas = self
+            .fixtures
+            .conversation(&self.channel)
+            .and_then(|conversation| conversation.properties.as_ref())
+            .and_then(|properties| properties.canvas.as_ref())
+            .and_then(|canvas| canvas.file_id.as_ref())
+            .map(|file| file.to_string());
+        match canvas {
+            Some(file) => cx.open_url(&self.canvas_link(&file)),
+            None => {
+                self.bridge
+                    .send(Command::CreateChannelCanvas(self.channel.clone()));
+            }
+        }
+    }
+
+    /// The add-link dialog's Add: live mode sends `bookmarks.add`, fixture mode keeps the
+    /// bookmark in memory with the fixture bar.
+    fn add_bookmark(&mut self, title: String, url: String, cx: &mut Context<Self>) {
+        if self.fixtures.sample {
+            self.fixture_bookmarks
+                .entry(self.channel.clone())
+                .or_default()
+                .push(bookmarks::Bookmark::link(title, url));
+            cx.notify();
+        } else {
+            self.bridge.send(Command::AddBookmark {
+                channel: self.channel.clone(),
+                title,
+                url,
+            });
+        }
+    }
+
+    /// The "+" menu's Link item and the bar's "Add a bookmark": the add-link dialog for the
+    /// open conversation.
+    fn open_link_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        bookmarks::open_add_dialog(window, cx, move |title, url, cx| {
+            let _ = this.update(cx, |app, cx| app.add_bookmark(title, url, cx));
+        });
     }
 
     /// Apply what the app honors from Preferences: the theme (Light / Dark / Sync with OS,
@@ -1426,6 +1620,10 @@ impl App {
         self.channel = channel;
         self.thread_open = false;
         self.tab = ConversationTab::Messages;
+        // An open pins panel follows the conversation: fetch the new one's pins.
+        if self.pins_open {
+            self.load_tab_data(&ConversationTab::Pins);
+        }
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
         cx.notify();
@@ -1494,6 +1692,33 @@ impl App {
             } => {
                 self.member_counts.insert(channel.clone(), *count);
                 cx.notify();
+            }
+            Event::PinsLoaded { channel, pins } => {
+                // File pins are left to the Files & links tab; the panel lists messages.
+                let messages = pins.as_ref().map_err(Clone::clone).map(|pins| {
+                    pins.iter()
+                        .filter_map(|pin| pin.message.clone())
+                        .collect::<Vec<_>>()
+                });
+                if let Ok(messages) = &messages {
+                    self.resolve_named_users(messages);
+                }
+                self.pins.insert(channel.clone(), messages);
+                cx.notify();
+            }
+            Event::BookmarksLoaded { channel, bookmarks } => {
+                self.bookmarks.insert(channel.clone(), bookmarks.clone());
+                cx.notify();
+            }
+            Event::FilesLoaded { channel, files } => {
+                if let Ok(files) = files {
+                    self.resolve_users(files.iter().filter_map(|file| file.user.clone()));
+                }
+                self.files.insert(channel.clone(), files.clone());
+                cx.notify();
+            }
+            Event::ChannelCanvasCreated { channel, canvas_id } if *channel == self.channel => {
+                cx.open_url(&self.canvas_link(canvas_id));
             }
             _ => {}
         }
@@ -2186,28 +2411,53 @@ impl Render for App {
             let header = self.conversation_header(&title, &topic, conversation.as_ref(), cx);
             let tabs = self.conversation_tabs(cx);
             let this = cx.weak_entity();
-            // Like Slack, no bookmark bar for a conversation with neither bookmarks nor pins.
-            let bookmark_list = pins::bookmarks(&self.fixtures, &self.channel);
-            let pin_count = pins::pinned(&self.fixtures, &self.channel).len();
-            let bookmarks = (!bookmark_list.is_empty() || pin_count > 0).then(|| {
-                pins::bookmarks_bar(
-                    bookmark_list,
-                    pin_count,
-                    self.pins_open,
-                    move |_, cx| {
-                        this.update(cx, |app, cx| app.toggle_pins(cx)).ok();
-                    },
-                    cx,
+            // The bookmarks bar: the sample workspace's fixture set (plus links added in the
+            // dialog), or the live channel's `bookmarks.list` once fetched. Like Slack, no
+            // bar for a conversation with neither bookmarks nor pins.
+            let (mut bookmark_list, pin_count) = if self.fixtures.sample {
+                (
+                    bookmarks::fixture(&self.fixtures, &self.channel),
+                    Some(pins::pinned(&self.fixtures, &self.channel).len()),
                 )
-            });
+            } else {
+                // The pin count is unknown until the channel's pins have been fetched.
+                let pinned = self
+                    .pins
+                    .get(&self.channel)
+                    .and_then(|loaded| loaded.as_ref().ok());
+                (self.live_bookmarks(), pinned.map(Vec::len))
+            };
+            if let Some(added) = self.fixture_bookmarks.get(&self.channel) {
+                bookmark_list.extend(added.iter().cloned());
+            }
+            let clicks = bookmarks::BarClicks {
+                pins: Rc::new({
+                    let this = this.clone();
+                    move |_window, cx| {
+                        let _ = this.update(cx, |app, cx| app.toggle_pins(cx));
+                    }
+                }),
+                folder: Rc::new({
+                    let this = this.clone();
+                    move |folder, _window, cx| {
+                        let _ = this.update(cx, |app, cx| app.open_folder_tab(folder, cx));
+                    }
+                }),
+                add: Rc::new(move |window, cx| {
+                    let _ = this.update(cx, |app, cx| app.open_link_dialog(window, cx));
+                }),
+            };
+            let bookmark_bar = (!bookmark_list.is_empty() || pin_count.is_some_and(|n| n > 0))
+                .then(|| bookmarks::bar(bookmark_list, pin_count, self.pins_open, clicks, cx));
             let column = v_flex().size_full().child(header);
             let column = match (&self.huddle, self.huddle_open) {
                 (Some((_, bar)), true) => column.child(bar.clone()),
                 _ => column,
             };
-            let column = column.child(tabs).children(bookmarks);
-            match self.tab {
-                ConversationTab::Messages => column
+            let column = column.child(tabs).children(bookmark_bar);
+            match &self.tab {
+                // The Pins tab keeps the transcript under it; its panel is the right column.
+                ConversationTab::Messages | ConversationTab::Pins => column
                     .child(div().flex_1().min_h_0().child(self.messages.clone()))
                     .children(self.dnd_banner(conversation.as_ref(), cx))
                     .child(self.composer.clone()),
@@ -2216,6 +2466,28 @@ impl Render for App {
                 }
                 ConversationTab::List => {
                     column.child(div().flex_1().min_h_0().child(list_view(cx)))
+                }
+                ConversationTab::Files => {
+                    // The sample workspace lists its messages' files, newest first.
+                    let sample_files: Loaded<File>;
+                    let files = if self.fixtures.sample {
+                        let history = self.fixtures.messages.get(&self.channel);
+                        sample_files = Ok(history
+                            .into_iter()
+                            .flat_map(|history| history.iter().rev())
+                            .flat_map(|message| message.files.iter().cloned())
+                            .collect());
+                        Some(&sample_files)
+                    } else {
+                        self.files.get(&self.channel)
+                    };
+                    let view = tab_views::files_view(&self.fixtures, files, cx);
+                    column.child(div().flex_1().min_h_0().child(view))
+                }
+                ConversationTab::Folder { bookmark_id, .. } => {
+                    let bookmarks = self.bookmarks.get(&self.channel);
+                    let view = tab_views::folder_view(bookmark_id, bookmarks, cx);
+                    column.child(div().flex_1().min_h_0().child(view))
                 }
             }
         };
@@ -2249,11 +2521,24 @@ impl Render for App {
             let close = move |_: &mut Window, cx: &mut gpui::App| {
                 this.update(cx, |app, cx| {
                     app.pins_open = false;
+                    if app.tab == ConversationTab::Pins {
+                        app.tab = ConversationTab::Messages;
+                    }
                     cx.notify();
                 })
                 .ok();
             };
-            let panel = pins::pins_panel(&self.fixtures, &self.channel, &title, close, cx);
+            let sample_pins: Loaded<Message>;
+            let pinned = if self.fixtures.sample {
+                sample_pins = Ok(pins::pinned(&self.fixtures, &self.channel)
+                    .into_iter()
+                    .cloned()
+                    .collect());
+                Some(&sample_pins)
+            } else {
+                self.pins.get(&self.channel)
+            };
+            let panel = pins::pins_panel(&self.fixtures, pinned, &title, close, cx);
             panels = panels.child(
                 resizable_panel()
                     .size(px(380.))
@@ -2697,66 +2982,48 @@ impl App {
             )
     }
 
-    /// The tab row under the header: Messages / Canvas / List (the active one underlined) /
-    /// Files & links, plus a trailing new-canvas `+`. Canvas and List are read-only fixture
-    /// views; Files & links is not wired yet.
+    /// The tab row under the header, derived from the conversation's `properties.tabs` in
+    /// live mode ([`tabs`] for the rules) or the sample workspace's fixed set, with the
+    /// active tab underlined. The trailing "+" opens Slack's new-tab menu, restricted to
+    /// the actions slackless can run: Canvas (live only) and Link.
     fn conversation_tabs(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
         let link = cx.theme().link;
         let foreground = cx.theme().foreground;
         let muted_foreground = cx.theme().muted_foreground;
 
-        // Live conversations get Slack's tab row; the read-only Canvas / List fixture views
-        // exist only in the sample workspace.
-        const LIVE_TABS: [(&str, &str, IconName, Option<ConversationTab>); 3] = [
-            (
-                "tab-messages",
-                "Messages",
-                IconName::MessageSquare,
-                Some(ConversationTab::Messages),
-            ),
-            ("tab-canvas", "Add canvas", IconName::LayoutTemplate, None),
-            ("tab-files", "Files & links", IconName::Files, None),
-        ];
-        // Channels add Slack's Pins tab after Files & links.
-        const CHANNEL_TABS: [(&str, &str, IconName, Option<ConversationTab>); 4] = [
-            (
-                "tab-messages",
-                "Messages",
-                IconName::MessageSquare,
-                Some(ConversationTab::Messages),
-            ),
-            ("tab-canvas", "Add canvas", IconName::LayoutTemplate, None),
-            ("tab-files", "Files & links", IconName::Files, None),
-            ("tab-pins", "Pins", IconName::Pin, None),
-        ];
-        let channel = self.fixtures.conversation(&self.channel).is_some_and(|c| {
-            matches!(
-                c.kind(),
-                ConversationKind::PublicChannel | ConversationKind::PrivateChannel
-            )
-        });
-        const TABS: [(&str, &str, IconName, Option<ConversationTab>); 4] = [
-            (
-                "tab-messages",
-                "Messages",
-                IconName::MessageSquare,
-                Some(ConversationTab::Messages),
-            ),
-            (
-                "tab-canvas",
-                "Canvas",
-                IconName::LayoutTemplate,
-                Some(ConversationTab::Canvas),
-            ),
-            (
-                "tab-list",
-                "List",
-                IconName::ListChecks,
-                Some(ConversationTab::List),
-            ),
-            ("tab-files", "Files & links", IconName::Files, None),
-        ];
+        let fallback = Conversation::default();
+        let specs = tabs::derive(
+            self.fixtures
+                .conversation(&self.channel)
+                .unwrap_or(&fallback),
+            self.fixtures.sample,
+        );
+        let this = cx.entity().downgrade();
+        let sample = self.fixtures.sample;
+        let add_menu = Button::new("tab-add")
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::Plus)
+            .tooltip("New tab")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                if !sample {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("Canvas")
+                            .icon(IconName::LayoutTemplate)
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |app, cx| app.open_or_add_canvas(cx));
+                            }),
+                    );
+                }
+                let this = this.clone();
+                menu.item(PopupMenuItem::new("Link").icon(IconName::Link).on_click(
+                    move |_, window, cx| {
+                        let _ = this.update(cx, |app, cx| app.open_link_dialog(window, cx));
+                    },
+                ))
+            });
         h_flex()
             .items_stretch()
             .flex_none()
@@ -2765,44 +3032,35 @@ impl App {
             .h(px(38.))
             .border_b_1()
             .border_color(border)
-            .children(
-                if self.fixtures.sample {
-                    &TABS[..]
-                } else if channel {
-                    &CHANNEL_TABS[..]
-                } else {
-                    &LIVE_TABS[..]
-                }
-                .iter()
-                .map(|(id, label, icon, target)| {
-                    let active = *target == Some(self.tab);
-                    let tab = tab(id, label, *icon, active, foreground, muted_foreground, link);
-                    match *target {
-                        Some(target) => tab.on_click(cx.listener(move |this, _, _, cx| {
-                            this.tab = target;
-                            cx.notify();
-                        })),
-                        None => tab,
+            .children(specs.into_iter().map(|spec| {
+                let active = match &spec.action {
+                    TabAction::Switch(target) => {
+                        *target == self.tab
+                            && !(*target == ConversationTab::Pins && !self.pins_open)
                     }
-                }),
-            )
-            .child(
-                div()
-                    .id("tab-add")
-                    .flex_none()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .px_1()
-                    .cursor_pointer()
-                    .text_color(muted_foreground)
-                    .hover(|el| el.text_color(foreground))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .text_color(muted_foreground)
-                            .size(px(16.)),
-                    ),
-            )
+                    _ => false,
+                };
+                let entry = tab_views::tab(
+                    spec.id,
+                    spec.label,
+                    spec.icon,
+                    active,
+                    foreground,
+                    muted_foreground,
+                    link,
+                );
+                match spec.action {
+                    TabAction::Switch(target) => {
+                        entry.on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_tab(target.clone(), cx);
+                        }))
+                    }
+                    action => entry.on_click(cx.listener(move |this, _, _, cx| {
+                        this.activate_tab(action.clone(), cx);
+                    })),
+                }
+            }))
+            .child(add_menu)
     }
 }
 
@@ -3168,6 +3426,13 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
     }
 }
 
+/// Drop a failed lazy tab load so its tab shows loading again while it is re-requested.
+fn forget_failure<T>(loaded: &mut HashMap<ChannelId, Loaded<T>>, channel: &ChannelId) {
+    if loaded.get(channel).is_some_and(Result::is_err) {
+        loaded.remove(channel);
+    }
+}
+
 /// A 28px square chrome icon button.
 fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) -> Stateful<Div> {
     div()
@@ -3182,37 +3447,4 @@ fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) ->
         .text_color(color)
         .hover(|el| el.bg(hover_bg))
         .child(Icon::new(icon).text_color(color).size(px(16.)))
-}
-
-/// One conversation tab; the active tab carries the link-colored underline.
-fn tab(
-    id: &'static str,
-    label: &'static str,
-    icon: IconName,
-    active: bool,
-    foreground: Hsla,
-    muted: Hsla,
-    underline: Hsla,
-) -> Stateful<Div> {
-    let color = if active { foreground } else { muted };
-    div()
-        .id(id)
-        .flex_none()
-        .h_full()
-        .flex()
-        .items_center()
-        .gap_1p5()
-        .px_0p5()
-        .cursor_pointer()
-        .text_size(px(13.))
-        .text_color(color)
-        .font_weight(if active {
-            FontWeight::SEMIBOLD
-        } else {
-            FontWeight::NORMAL
-        })
-        .when(active, |tab| tab.border_b_2().border_color(underline))
-        .hover(|el| el.text_color(foreground))
-        .child(Icon::new(icon).text_color(color).size(px(14.)))
-        .child(label)
 }

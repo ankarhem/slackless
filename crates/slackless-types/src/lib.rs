@@ -20,7 +20,10 @@ pub mod rich_text;
 pub mod section;
 pub mod user;
 
-pub use conversation::{Conversation, ConversationKind, Latest, TopicPurpose};
+pub use conversation::{
+    ChannelCanvas, Conversation, ConversationKind, ConversationProperties, ConversationTabKind,
+    ConversationTabSpec, Latest, TabData, TopicPurpose,
+};
 pub use event::{MessageEvent, SlackEvent};
 pub use file::{File, FileMode};
 pub use ids::{BotId, ChannelId, FileId, TeamId, Ts, UserId, UsergroupId};
