@@ -49,6 +49,9 @@ pub enum Command {
     /// once per session; found profiles are stored and announced with
     /// [`Event::UsersChanged`].
     ResolveUsers(Vec<UserId>),
+    /// The user chose "Leave channel": leave it on Slack, then store it as no longer joined
+    /// and announce it with [`Event::Conversations`].
+    LeaveConversation(ChannelId),
     /// The user opened a thread: fetch its full history (root + all replies) from Slack into
     /// the store. Read-only; it never moves the user's read cursor.
     OpenThread {

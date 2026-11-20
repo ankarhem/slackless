@@ -389,6 +389,22 @@ impl<B: Backend> Core<B> {
                 }
             }
             Command::ResolveUsers(ids) => self.resolve_users(ids),
+            Command::LeaveConversation(channel) => {
+                self.spawn("conversations.leave", async move {
+                    backend.leave_conversation(channel.clone()).await?;
+                    let target = channel.clone();
+                    with_store(&store, move |s| match s.conversation(&ws, &target)? {
+                        Some(mut left) => {
+                            left.is_member = false;
+                            s.upsert_conversation(&ws, &left)
+                        }
+                        None => Ok(()),
+                    })
+                    .await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
             Command::OpenThread { channel, thread_ts } => {
                 let backfill = self.backfill.clone();
                 self.spawn("conversations.replies", async move {
@@ -761,6 +777,7 @@ pub(crate) mod tests {
         dnd_calls: Vec<UserId>,
         presence_calls: Vec<UserId>,
         user_info_calls: Vec<UserId>,
+        leave_calls: Vec<ChannelId>,
     }
 
     impl FakeBackend {
@@ -832,6 +849,11 @@ pub(crate) mod tests {
         /// Users asked for `users.info`, in order.
         pub fn user_info_calls(&self) -> Vec<UserId> {
             self.state.lock().unwrap().user_info_calls.clone()
+        }
+
+        /// Channels left through `conversations.leave`, in order.
+        pub fn leave_calls(&self) -> Vec<ChannelId> {
+            self.state.lock().unwrap().leave_calls.clone()
         }
 
         pub fn messages(&self) -> Vec<Message> {
@@ -976,6 +998,11 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             })
+        }
+
+        async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
+            self.state.lock().unwrap().leave_calls.push(channel);
+            Ok(())
         }
 
         /// Every id resolves, to a profile named `ext-<id>`.
@@ -1308,6 +1335,32 @@ pub(crate) mod tests {
         assert_eq!(stored.num_members, Some(42), "member count lands from info");
         assert_eq!(stored.unread_count_display, Some(7), "boot fields survive");
         assert_eq!(stored.name.as_deref(), Some("general"));
+    }
+
+    #[tokio::test]
+    async fn leave_conversation_stores_it_as_left_once_slack_confirms() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        store
+            .lock()
+            .unwrap()
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: c1(),
+                    is_member: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+
+        core.handle(Command::LeaveConversation(c1()));
+        assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+        let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
+        assert!(!stored.expect("stays stored").is_member, "stored as left");
+        assert_eq!(fake.leave_calls(), vec![c1()]);
     }
 
     #[tokio::test]

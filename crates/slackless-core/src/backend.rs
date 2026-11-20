@@ -47,6 +47,11 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn dnd_info(&self, user: UserId) -> impl Future<Output = api::Result<DndStatus>> + Send;
     /// One user's profile (`users.info`), reaching people `users.list` omits. Read-only.
     fn user_info(&self, user: UserId) -> impl Future<Output = api::Result<User>> + Send;
+    /// The signed-in user leaves `channel` (`conversations.leave`).
+    fn leave_conversation(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<()>> + Send;
     /// A user's current presence (`users.getPresence`). Read-only.
     fn user_presence(&self, user: UserId)
     -> impl Future<Output = api::Result<UserPresence>> + Send;
@@ -143,6 +148,10 @@ impl Backend for SlackApi {
 
     async fn user_info(&self, user: UserId) -> api::Result<User> {
         self.users_info(&user).await
+    }
+
+    async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
+        self.conversations_leave(&channel).await
     }
 
     async fn user_presence(&self, user: UserId) -> api::Result<UserPresence> {

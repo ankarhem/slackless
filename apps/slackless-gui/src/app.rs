@@ -185,16 +185,20 @@ use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, TitleBar, WindowExt as _, h_flex, h_resizable, resizable_panel, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, TitleBar, WindowExt as _, h_flex,
+    h_resizable, resizable_panel, v_flex,
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    self, Anchor, AppContext as _, Context, Div, Edges, Entity, FocusHandle, Focusable as _,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels,
-    Point, Render, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription,
-    SystemNotification, Window, WindowAppearance, actions, anchored, deferred, div, point, px,
+    self, Anchor, AppContext as _, ClipboardItem, Context, Div, Edges, Entity, FocusHandle,
+    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
+    ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
+    WindowAppearance, actions, anchored, deferred, div, point, px,
 };
 use slackless_core::api::ConversationCounts;
 use slackless_core::platform::{self, BadgeSetter, Notifier};
@@ -230,6 +234,8 @@ actions!(
     slackless,
     [
         QuickSwitch,
+        NavigateBack,
+        NavigateForward,
         OpenPreferences,
         ShowShortcuts,
         OpenDms,
@@ -371,6 +377,12 @@ pub struct App {
     peer_dnd_paused: HashMap<UserId, bool>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
     member_counts: HashMap<ChannelId, u32>,
+    /// Conversations navigated away from, newest last (Slack's back arrow, Cmd+[).
+    back: Vec<ChannelId>,
+    /// Conversations stepped back from, newest last (the forward arrow, Cmd+]).
+    forward: Vec<ChannelId>,
+    /// Recently left conversations, newest first (the history clock's "Recent" menu).
+    recent: Vec<ChannelId>,
     /// The user opened a conversation themselves; until then live reloads open the one most
     /// recently read in Slack.
     chosen: bool,
@@ -421,6 +433,8 @@ impl App {
             later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
             cx.bind_keys([
                 KeyBinding::new("cmd-k", QuickSwitch, None),
+                KeyBinding::new("cmd-[", NavigateBack, None),
+                KeyBinding::new("cmd-]", NavigateForward, None),
                 KeyBinding::new("cmd-,", OpenPreferences, None),
                 KeyBinding::new("cmd-/", ShowShortcuts, None),
                 KeyBinding::new("cmd-shift-k", OpenDms, None),
@@ -616,6 +630,9 @@ impl App {
                 presence: fixtures::PresenceMap::default(),
                 peer_dnd_paused: HashMap::new(),
                 member_counts: HashMap::new(),
+                back: Vec::new(),
+                forward: Vec::new(),
+                recent: Vec::new(),
                 chosen: false,
                 focus,
                 workspace_subscriptions,
@@ -931,6 +948,16 @@ impl App {
     }
 
     fn select(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        if channel != self.channel {
+            self.back.push(self.channel.clone());
+            self.forward.clear();
+        }
+        self.navigate(channel, cx);
+    }
+
+    /// Show `channel` as the user's choice, leaving any full-column view (search, drafts,
+    /// later). History is the caller's: [`App::select`] records it, back/forward replay it.
+    fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.chosen = true;
         self.searching = false;
         self.drafts_open = false;
@@ -939,12 +966,246 @@ impl App {
         self.show_conversation(channel, cx);
     }
 
+    /// Slack's back arrow (Cmd+[): the conversation before this one.
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(previous) = self.back.pop() {
+            self.forward.push(self.channel.clone());
+            self.navigate(previous, cx);
+        }
+    }
+
+    /// Slack's forward arrow (Cmd+]): undo the last back.
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(next) = self.forward.pop() {
+            self.back.push(self.channel.clone());
+            self.navigate(next, cx);
+        }
+    }
+
+    /// The history clock's "Recent" list: the open conversation, then the recently left
+    /// ones still in the snapshot, each with Slack's kind icon.
+    fn recent_entries(&self) -> Vec<(ChannelId, SharedString, IconName)> {
+        /// Slack lists about this many before its "Show more".
+        const SHOWN: usize = 25;
+        std::iter::once(&self.channel)
+            .chain(&self.recent)
+            .filter_map(|id| {
+                let conversation = self.fixtures.conversation(id)?;
+                let (label, icon) = match conversation.kind() {
+                    ConversationKind::PublicChannel => (
+                        conversation.name.clone().unwrap_or_else(|| id.to_string()),
+                        IconName::Hash,
+                    ),
+                    ConversationKind::PrivateChannel => (
+                        conversation.name.clone().unwrap_or_else(|| id.to_string()),
+                        IconName::Lock,
+                    ),
+                    ConversationKind::Im => (
+                        self.fixtures.conversation_label(conversation),
+                        IconName::User,
+                    ),
+                    ConversationKind::Mpim => (
+                        self.fixtures.conversation_label(conversation),
+                        IconName::Users,
+                    ),
+                };
+                Some((id.clone(), SharedString::from(label), icon))
+            })
+            .take(SHOWN)
+            .collect()
+    }
+
+    /// A link to `channel` like Slack's "Copy link": the workspace's archive URL.
+    fn conversation_link(&self, channel: &ChannelId) -> String {
+        match self.fixtures.workspaces.first() {
+            Some(team) if !team.domain.is_empty() => {
+                format!("https://{}.slack.com/archives/{channel}", team.domain)
+            }
+            Some(team) => format!("https://app.slack.com/client/{}/{channel}", team.id),
+            None => format!("https://app.slack.com/client/{channel}"),
+        }
+    }
+
+    /// Slack's huddle link for the open conversation (its web client runs the call).
+    fn huddle_link(&self) -> String {
+        let team = self
+            .fixtures
+            .workspaces
+            .first()
+            .map(|team| team.id.to_string())
+            .unwrap_or_default();
+        format!("https://app.slack.com/huddle/{team}/{}", self.channel)
+    }
+
+    /// The header's huddle button: the sample workspace toggles its huddle bar; a live
+    /// conversation starts or joins its huddle in Slack's web client (no media stack here).
+    fn start_huddle(&mut self, cx: &mut Context<Self>) {
+        if self.huddle_here() {
+            self.huddle_open = !self.huddle_open;
+            cx.notify();
+        } else {
+            cx.open_url(&self.huddle_link());
+        }
+    }
+
+    /// The header's search icon: the top search field scoped to this channel, like Slack's
+    /// "Search in #channel".
+    fn search_in_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let scope = self
+            .fixtures
+            .conversation(&self.channel)
+            .filter(|c| {
+                matches!(
+                    c.kind(),
+                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+                )
+            })
+            .and_then(|c| c.name.as_deref())
+            .map(|name| format!("in:#{name} "))
+            .unwrap_or_default();
+        self.search
+            .update(cx, |search, cx| search.set_value(scope, window, cx));
+        self.search.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// "Leave channel": it drops out of the sidebar at once and the view steps back, as in
+    /// Slack; the core leaves on Slack and stores the channel as left.
+    fn leave(&mut self, channel: ChannelId, window: &mut Window, cx: &mut Context<Self>) {
+        self.bridge
+            .send(Command::LeaveConversation(channel.clone()));
+        self.counts.remove(&channel);
+        self.back.retain(|c| *c != channel);
+        self.forward.retain(|c| *c != channel);
+        self.recent.retain(|c| *c != channel);
+        self.reload_live(window, cx);
+        if self.channel == channel {
+            let next = self
+                .back
+                .pop()
+                .unwrap_or_else(|| first_conversation(&self.fixtures));
+            self.navigate(next, cx);
+        }
+    }
+
+    /// The huddle button's chevron: Slack's huddle menu.
+    fn huddle_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let link = self.huddle_link();
+        let start = if self.huddle_here() {
+            "Show huddle"
+        } else {
+            "Start huddle"
+        };
+        Button::new("hdr-huddle-menu")
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::ChevronDown)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let this = this.clone();
+                let link = link.clone();
+                menu.item(
+                    PopupMenuItem::new(start)
+                        .icon(IconName::Headphones)
+                        .on_click(move |_, _, cx| {
+                            let _ = this.update(cx, |app, cx| app.start_huddle(cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Copy huddle link")
+                        .icon(IconName::Link)
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
+                        }),
+                )
+            })
+    }
+
+    /// The header's ⋮ menu: what slackless can do for this conversation (Slack's menu minus
+    /// the workflow, template, split-view and window items it has no backend for).
+    fn conversation_menu(
+        &self,
+        conversation: Option<&Conversation>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let channel = conversation.map(|c| c.id.clone());
+        let channel_name = conversation
+            .filter(|c| {
+                matches!(
+                    c.kind(),
+                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+                )
+            })
+            .and_then(|c| c.name.as_deref())
+            .map(|name| format!("#{name}"));
+        let peer = conversation
+            .filter(|c| c.kind() == ConversationKind::Im)
+            .and_then(|c| c.user.clone());
+        let link = channel.as_ref().map(|id| self.conversation_link(id));
+        Button::new("hdr-more")
+            .ghost()
+            .with_size(Size::Small)
+            .icon(IconName::EllipsisVertical)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                if let Some(user) = peer.clone() {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("View full profile")
+                            .icon(IconName::CircleUser)
+                            .on_click(move |_, _, cx| {
+                                let _ =
+                                    this.update(cx, |app, cx| app.open_profile(user.clone(), cx));
+                            }),
+                    );
+                }
+                if let Some(link) = link.clone() {
+                    let label = if channel_name.is_some() {
+                        "Copy link to channel"
+                    } else {
+                        "Copy link to conversation"
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Link).on_click(
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
+                        },
+                    ));
+                }
+                if let Some(name) = channel_name.clone() {
+                    menu = menu.item(
+                        PopupMenuItem::new("Copy channel name")
+                            .icon(IconName::Copy)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(name.clone()))
+                            }),
+                    );
+                }
+                if let (Some(_), Some(channel)) = (&channel_name, channel.clone()) {
+                    let this = this.clone();
+                    menu = menu.separator().item(
+                        PopupMenuItem::new("Leave channel")
+                            .icon(IconName::LogOut)
+                            .on_click(move |_, window, cx| {
+                                let _ = this
+                                    .update(cx, |app, cx| app.leave(channel.clone(), window, cx));
+                            }),
+                    );
+                }
+                menu
+            })
+    }
+
     /// Open `channel` in the transcript (a no-op when it already is): the sidebar selection,
     /// the core's open conversation, its history and its draft follow.
     fn show_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         if channel == self.channel {
             return;
         }
+        /// Recent conversations kept for the history menu.
+        const RECENT_MAX: usize = 50;
+        let left = self.channel.clone();
+        self.recent.retain(|c| *c != left && *c != channel);
+        self.recent.insert(0, left);
+        self.recent.truncate(RECENT_MAX);
         self.save_draft(cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_selected(channel.clone(), cx));
@@ -1607,6 +1868,8 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.search.read(cx).focus_handle(cx).focus(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NavigateBack, _, cx| this.go_back(cx)))
+            .on_action(cx.listener(|this, _: &NavigateForward, _, cx| this.go_forward(cx)))
             .on_action(
                 cx.listener(|this, _: &Workspace1, window, cx| {
                     this.switch_workspace(0, window, cx)
@@ -1734,27 +1997,50 @@ impl App {
         let border = cx.theme().border;
         let accent = cx.theme().accent;
 
+        let this = cx.entity().downgrade();
+        let recent = self.recent_entries();
         let nav = h_flex()
             .items_center()
             .gap_1()
-            .child(chrome_icon(
-                "nav-back",
-                IconName::ArrowLeft,
-                muted_foreground,
-                accent,
-            ))
-            .child(chrome_icon(
-                "nav-forward",
-                IconName::ArrowRight,
-                muted_foreground,
-                accent,
-            ))
-            .child(chrome_icon(
-                "nav-history",
-                IconName::Clock,
-                muted_foreground,
-                accent,
-            ));
+            .child(
+                Button::new("nav-back")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .icon(IconName::ArrowLeft)
+                    .tooltip("Back")
+                    .disabled(self.back.is_empty())
+                    .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
+            )
+            .child(
+                Button::new("nav-forward")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .icon(IconName::ArrowRight)
+                    .tooltip("Forward")
+                    .disabled(self.forward.is_empty())
+                    .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
+            )
+            .child(
+                Button::new("nav-history")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .icon(IconName::Clock)
+                    .tooltip("History")
+                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                        menu = menu.label("Recent");
+                        for (id, label, icon) in &recent {
+                            let (this, id) = (this.clone(), id.clone());
+                            menu =
+                                menu.item(PopupMenuItem::new(label.clone()).icon(*icon).on_click(
+                                    move |_, _, cx| {
+                                        let _ =
+                                            this.update(cx, |app, cx| app.select(id.clone(), cx));
+                                    },
+                                ));
+                        }
+                        menu
+                    }),
+            );
 
         let search_pill = h_flex()
             .w(px(520.))
@@ -1947,12 +2233,6 @@ impl App {
             .px_4()
             .h(px(46.))
             .flex_none()
-            .child(chrome_icon(
-                "hdr-star",
-                IconName::Star,
-                muted_foreground,
-                accent,
-            ))
             .child(name)
             .when(!topic.is_empty(), |header| {
                 header.child(
@@ -1981,36 +2261,22 @@ impl App {
                             },
                             accent,
                         )
-                        .when(huddle_here, |button| {
-                            button.on_click(cx.listener(|this, _, _, cx| {
-                                this.huddle_open = !this.huddle_open;
-                                cx.notify();
-                            }))
-                        }),
+                        .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx))),
                     )
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .text_color(muted_foreground)
-                            .size(px(12.)),
-                    )
+                    .child(self.huddle_menu(cx))
                     .child(chrome_icon(
                         "hdr-bell",
                         IconName::Bell,
                         muted_foreground,
                         accent,
                     ))
-                    .child(chrome_icon(
-                        "hdr-search",
-                        IconName::Search,
-                        muted_foreground,
-                        accent,
-                    ))
-                    .child(chrome_icon(
-                        "hdr-more",
-                        IconName::EllipsisVertical,
-                        muted_foreground,
-                        accent,
-                    )),
+                    .child(
+                        chrome_icon("hdr-search", IconName::Search, muted_foreground, accent)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.search_in_conversation(window, cx)
+                            })),
+                    )
+                    .child(self.conversation_menu(conversation, cx)),
             )
     }
 

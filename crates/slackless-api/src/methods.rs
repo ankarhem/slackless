@@ -590,6 +590,14 @@ impl SlackApi {
     }
 
     /// `conversations.mark`: moves the read cursor to `ts` (an earlier ts marks unread).
+    /// `conversations.leave`: the signed-in user leaves `channel`.
+    pub async fn conversations_leave(&self, channel: &ChannelId) -> Result<()> {
+        let params = vec![("channel", channel.to_string())];
+        self.call::<Empty>(method::CONVERSATIONS_LEAVE, params)
+            .await?;
+        Ok(())
+    }
+
     pub async fn conversations_mark(&self, channel: &ChannelId, ts: &Ts) -> Result<()> {
         let params = vec![("channel", channel.to_string()), ("ts", ts.to_string())];
         self.call::<Empty>(method::CONVERSATIONS_MARK, params)
