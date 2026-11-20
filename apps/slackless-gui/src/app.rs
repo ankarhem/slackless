@@ -1423,6 +1423,58 @@ impl App {
         .detach();
     }
 
+    /// Live mode: page older stored history into `channel` until it reaches `since` (unix
+    /// seconds), the beginning, or a page cap that bounds memory, for the date divider's
+    /// "Jump to…"; then the list scrolls to its target.
+    fn load_since(&mut self, channel: &ChannelId, since: i64, cx: &mut Context<Self>) {
+        /// Pages one jump may load; past it the list stops at the oldest page read.
+        const JUMP_PAGES: usize = 20;
+        let generation = self.history_generation;
+        let channel = channel.clone();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..JUMP_PAGES {
+                let read = this.update(cx, |app, cx| {
+                    if app.history_generation != generation
+                        || app.channel != channel
+                        || app.history_complete.contains(&channel)
+                    {
+                        return None;
+                    }
+                    let before = app.messages.read(cx).oldest_loaded(cx)?;
+                    app.bridge.history(channel.clone(), Some(before))
+                });
+                let Ok(Some(read)) = read else {
+                    break;
+                };
+                let older = cx.background_executor().spawn(read).await;
+                let reached = older
+                    .first()
+                    .and_then(|message| message.ts.secs())
+                    .is_none_or(|secs| secs <= since);
+                let landed = this.update(cx, |app, cx| {
+                    if app.history_generation != generation || app.channel != channel {
+                        return false;
+                    }
+                    if older.is_empty() {
+                        app.history_complete.insert(channel.clone());
+                    } else {
+                        app.messages.update(cx, |list, cx| {
+                            list.prepend_history(channel.clone(), older, cx)
+                        });
+                    }
+                    true
+                });
+                if reached || !matches!(landed, Ok(true)) {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.messages.update(cx, |list, cx| list.finish_jump(cx))
+            });
+        })
+        .detach();
+    }
+
     /// Live mode: show the open thread's stored history (root + replies, oldest first), read
     /// off the UI thread. A read that a newer one overtook is dropped; one whose thread is no
     /// longer open is ignored by the panel.
@@ -2555,6 +2607,9 @@ fn subscribe_workspace(
                 }
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
                 MessageListEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                MessageListEvent::NeedHistorySince { channel, since } => {
+                    this.load_since(channel, *since, cx);
+                }
                 MessageListEvent::NeedOlder { channel, before } => {
                     this.load_older(channel, before.clone(), cx);
                 }

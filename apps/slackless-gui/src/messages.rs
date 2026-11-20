@@ -25,17 +25,18 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonRounded};
 use gpui_kit::component::input::{InputEvent, TextareaState};
-use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _, Font,
-    FontStyle, FontWeight, Hsla, ImageSource, InteractiveElement as _, InteractiveText,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
+    Font, FontStyle, FontWeight, Hsla, ImageSource, InteractiveElement as _, InteractiveText,
     IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement as _, StrikethroughStyle, StyleRefinement, Styled as _, StyledText,
-    Subscription, TextRun, UnderlineStyle, Window, div, img, px, rgb,
+    Subscription, TextRun, UnderlineStyle, WeakEntity, Window, div, img, px, rgb,
 };
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList, RichTextPreformatted,
@@ -113,6 +114,12 @@ pub enum MessageListEvent {
     },
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
+    /// "Jump to…" needs history older than the loaded window: the root pages it in until it
+    /// reaches `since` (unix seconds), then calls [`MessageList::finish_jump`].
+    NeedHistorySince {
+        channel: ChannelId,
+        since: i64,
+    },
 }
 
 /// Snapshot the `'static` virtual-list row renderer reads: the current conversation's history
@@ -145,6 +152,8 @@ pub struct MessageList {
     /// Oldest message a [`MessageListEvent::NeedOlder`] covered (in flight or landed); a
     /// window refresh forgets it so the top of the list re-asks.
     requested_older: Option<Ts>,
+    /// A "Jump to…" target (unix seconds) waiting for older history to land.
+    pending_jump: Option<i64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -199,6 +208,7 @@ impl MessageList {
                 data,
                 scroller,
                 requested_older: None,
+                pending_jump: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -481,6 +491,69 @@ impl MessageList {
         }
     }
 
+    /// The date divider's "Jump to…": scroll to the newest message, or to the first message
+    /// at or after a point in time, asking the root to page older history in first when the
+    /// loaded window starts after it.
+    pub fn jump(&mut self, jump: Jump, cx: &mut Context<Self>) {
+        const DAY: i64 = 86_400;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        let since = match jump {
+            Jump::Recent => {
+                self.scroller
+                    .update(cx, |scroller, cx| scroller.scroll_to_end(cx));
+                return;
+            }
+            Jump::LastWeek => now - 7 * DAY,
+            Jump::LastMonth => now - 30 * DAY,
+            Jump::Beginning => 0,
+        };
+        let starts_after = self
+            .oldest_loaded(cx)
+            .and_then(|ts| ts.secs())
+            .is_some_and(|oldest| oldest > since);
+        if starts_after {
+            self.pending_jump = Some(since);
+            cx.emit(MessageListEvent::NeedHistorySince {
+                channel: self.channel.clone(),
+                since,
+            });
+        }
+        self.scroll_to_time(since, cx);
+    }
+
+    /// The jump's older history landed (or ran out): scroll to its target.
+    pub fn finish_jump(&mut self, cx: &mut Context<Self>) {
+        if let Some(since) = self.pending_jump.take() {
+            self.scroll_to_time(since, cx);
+        }
+    }
+
+    /// The oldest message of the open conversation's loaded window.
+    pub fn oldest_loaded(&self, cx: &App) -> Option<Ts> {
+        self.data
+            .read(cx)
+            .messages
+            .first()
+            .map(|message| message.ts.clone())
+    }
+
+    fn scroll_to_time(&mut self, since: i64, cx: &mut Context<Self>) {
+        let ix = self
+            .data
+            .read(cx)
+            .messages
+            .iter()
+            .position(|message| message.ts.secs().is_some_and(|secs| secs >= since))
+            .unwrap_or(0);
+        self.scroller.update(cx, |scroller, cx| {
+            scroller.scroll_to_item(ix, cx);
+        });
+    }
+
     /// Mark or unmark `ts` saved (the Later list changed elsewhere).
     pub fn set_saved(&mut self, ts: &Ts, saved: bool, cx: &mut Context<Self>) {
         self.data.update(cx, |data, _| {
@@ -702,7 +775,12 @@ fn transcript_row(
             .secs()
             .map(|secs| date_label(&CivilTime::from_unix(secs), now))
             .unwrap_or_else(|| message.ts.as_str().to_owned());
-        row = row.child(date_divider(label, cx));
+        row = row.child(date_divider(
+            label,
+            format!("day-{}", message.ts.as_str()),
+            this.downgrade(),
+            cx,
+        ));
     } else if new_break {
         row = row.child(new_messages_divider(cx));
     }
@@ -1041,34 +1119,43 @@ fn message_header(
 }
 
 /// Slack's day divider: a full-width rule with the day's pill (label, then a chevron) on it.
-fn date_divider(label: String, cx: &App) -> Div {
+/// The date divider's "Jump to…" targets.
+#[derive(Clone, Copy)]
+pub enum Jump {
+    Recent,
+    LastWeek,
+    LastMonth,
+    Beginning,
+}
+
+fn date_divider(label: String, key: String, list: WeakEntity<MessageList>, cx: &App) -> Div {
     let border = cx.theme().border;
-    let muted = cx.theme().muted_foreground;
-    let background = cx.theme().background;
     h_flex()
         .items_center()
         .py_1()
         .child(div().flex_1().h(px(1.)).bg(border))
         .child(
-            h_flex()
-                .flex_none()
-                .items_center()
-                .gap_1()
-                .px_3()
-                .py_0p5()
-                .rounded_full()
-                .border_1()
-                .border_color(border)
-                .bg(background)
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(muted)
-                .child(label)
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .text_color(muted)
-                        .size(px(12.)),
-                ),
+            Button::new(SharedString::from(key))
+                .outline()
+                .with_size(Size::XSmall)
+                .rounded(ButtonRounded::Size(px(999.)))
+                .label(label)
+                .dropdown_caret(true)
+                .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                    menu = menu.label("Jump to…");
+                    for (jump, text) in [
+                        (Jump::Recent, "Most recent"),
+                        (Jump::LastWeek, "Last week"),
+                        (Jump::LastMonth, "Last month"),
+                        (Jump::Beginning, "The very beginning"),
+                    ] {
+                        let list = list.clone();
+                        menu = menu.item(PopupMenuItem::new(text).on_click(move |_, _, cx| {
+                            let _ = list.update(cx, |list, cx| list.jump(jump, cx));
+                        }));
+                    }
+                    menu
+                }),
         )
         .child(div().flex_1().h(px(1.)).bg(border))
 }
