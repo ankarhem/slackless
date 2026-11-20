@@ -41,7 +41,7 @@ pub fn tab(
         .gap_1p5()
         .px_0p5()
         .cursor_pointer()
-        .text_size(px(13.))
+        .text_size(px(14.))
         .text_color(color)
         .font_weight(if active {
             FontWeight::SEMIBOLD

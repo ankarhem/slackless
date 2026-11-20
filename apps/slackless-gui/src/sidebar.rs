@@ -486,11 +486,12 @@ impl Sidebar {
         // Owned color copies: `cx.theme()` borrows `cx`, so nothing may outlive the
         // statement that reads it across the `&mut Context` calls below.
         let border = cx.theme().sidebar_border;
-        let rail_bg = cx.theme().sidebar;
+        let rail_bg = cx.theme().title_bar;
         let mut rail = v_flex()
             .flex_none()
             .h_full()
             .w(px(72.))
+            .bg(rail_bg)
             .items_center()
             .pt_3()
             .pb_3()
@@ -1243,11 +1244,13 @@ impl Sidebar {
         let mut row = h_flex()
             .id(SharedString::from(format!("conversation-{id}")))
             .h(px(28.))
-            .pl(px(24.))
+            .ml(px(2.))
+            .mr(px(2.))
+            .pl(px(22.))
             .pr_2()
             .gap_2()
             .items_center()
-            .rounded_sm()
+            .rounded_md()
             .text_color(color)
             .cursor_pointer()
             .when(selected, |row| row.bg(theme.sidebar_accent))
@@ -1558,8 +1561,6 @@ impl Render for Sidebar {
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
-            .border_l_1()
-            .border_color(sidebar_border)
             .pb_2();
         let (mut below, mut above) = (None, None);
         let list = match self.active_nav {
@@ -1658,7 +1659,7 @@ impl Render for Sidebar {
         h_flex()
             .relative()
             .size_full()
-            .bg(sidebar_bg)
+            .bg(cx.theme().title_bar)
             .text_color(sidebar_fg)
             .text_sm()
             .child(self.workspace_rail(
@@ -1668,12 +1669,16 @@ impl Render for Sidebar {
                 cx,
             ))
             .child(
-                // A relative wrapper, so the pills can float over the list's edges.
+                // A relative wrapper, so the pills can float over the list's edges. The white
+                // card rounds into the tinted window chrome, as Slack's does.
                 div()
                     .relative()
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
+                    .bg(sidebar_bg)
+                    .rounded_tl(px(10.))
+                    .rounded_tr(px(10.))
                     .child(list)
                     .when_some(below, |list, pill| {
                         list.child(

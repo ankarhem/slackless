@@ -116,6 +116,9 @@ pub struct Fixtures {
     pub real_names_in_mentions: bool,
     /// Live mode: ids of the sidebar sections the user collapsed in Slack.
     pub collapsed_sections: HashSet<String>,
+    /// The appearance Slack stores for the user, applied at launch; `None` in the sample
+    /// workspace, which keeps the reference screenshot's dark look.
+    pub appearance: Option<crate::theme::Appearance>,
 }
 
 /// A custom emoji's picture: a generated sample image, or a live `emoji.list` URL that GPUI's
@@ -846,6 +849,7 @@ pub fn load() -> Fixtures {
         real_names: false,
         real_names_in_mentions: false,
         collapsed_sections: HashSet::new(),
+        appearance: None,
     }
 }
 
@@ -974,6 +978,7 @@ pub fn live(
         real_names,
         real_names_in_mentions,
         collapsed_sections,
+        appearance: crate::theme::appearance_from_prefs(&prefs),
     }
 }
 

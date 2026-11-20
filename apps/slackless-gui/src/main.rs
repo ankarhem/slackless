@@ -80,6 +80,9 @@ fn main() {
             .and_then(|session| CoreBridge::start(session, cx))
             .and_then(|bridge| Some((bridge.snapshot(&Default::default())?, bridge)));
         let (fixtures, bridge) = live.unwrap_or_else(|| (fixtures::load(), CoreBridge::offline()));
+        if let Some(appearance) = fixtures.appearance {
+            theme::activate_with(appearance.theme, appearance.palette, cx);
+        }
         let fixtures = Arc::new(fixtures);
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),

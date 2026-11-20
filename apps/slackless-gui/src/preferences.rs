@@ -24,7 +24,7 @@ use gpui_kit::gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 
-use crate::theme::{self, CUSTOM_ACCENTS, CUSTOM_SIDEBARS, Palette};
+use crate::theme::{self, CUSTOM_ACCENTS, CUSTOM_SIDEBARS, Palette, SlackTheme};
 
 pub enum PreferencesEvent {
     /// Some setting changed; read [`Preferences::settings`].
@@ -356,6 +356,20 @@ impl Preferences {
     pub fn set_appearance_mode(&mut self, mode: AppearanceMode, cx: &mut Context<Self>) {
         if self.settings.mode != mode {
             self.settings.mode = mode;
+            cx.notify();
+        }
+    }
+
+    /// Start on the appearance Slack stores for the workspace, so the picker shows the theme
+    /// already in effect and a later change applies over it.
+    pub fn set_slack_appearance(&mut self, appearance: theme::Appearance, cx: &mut Context<Self>) {
+        let mode = match appearance.theme {
+            SlackTheme::Light => AppearanceMode::Light,
+            SlackTheme::Dark => AppearanceMode::Dark,
+        };
+        if self.settings.mode != mode || self.settings.palette != appearance.palette {
+            self.settings.mode = mode;
+            self.settings.palette = appearance.palette;
             cx.notify();
         }
     }

@@ -471,6 +471,9 @@ impl App {
                     .auto_grow(1, 1)
             });
             let preferences = Preferences::new(window, cx);
+            if let Some(appearance) = fixtures.appearance {
+                preferences.update(cx, |prefs, cx| prefs.set_slack_appearance(appearance, cx));
+            }
             let status_picker = StatusPicker::new(window, cx);
             let user_menu = UserMenu::new(fixtures.clone(), cx);
             let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
@@ -2379,6 +2382,7 @@ impl Render for App {
         // statement that reads it across the `cx.listener` calls in the helpers below.
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
+        let chrome = cx.theme().title_bar;
         self.sync_badge(cx);
 
         let conversation = self.fixtures.conversation(&self.channel).cloned();
@@ -2501,7 +2505,16 @@ impl Render for App {
                     .size_range(px(360.)..px(640.))
                     .child(self.sidebar.clone()),
             )
-            .child(resizable_panel().child(main_column));
+            .child(
+                resizable_panel().child(
+                    div()
+                        .size_full()
+                        .bg(background)
+                        .rounded_tl(px(10.))
+                        .rounded_tr(px(10.))
+                        .child(main_column),
+                ),
+            );
         if self.thread_open {
             panels = panels.child(
                 resizable_panel()
@@ -2624,7 +2637,7 @@ impl Render for App {
             )
             .relative()
             .size_full()
-            .bg(background)
+            .bg(chrome)
             .text_color(foreground)
             .child(title_bar)
             .child(div().flex_1().min_h_0().w_full().child(panels))
@@ -2882,7 +2895,37 @@ impl App {
         let success = cx.theme().success;
         let huddle_here = self.huddle_here();
 
-        // Channels: the label already carries `# name`, like the reference header.
+        // Channels: the label already carries `# name`; Slack drops the hash behind a channel
+        // icon tile and adds a lock for private channels.
+        let channel = conversation.filter(|c| {
+            matches!(
+                c.kind(),
+                ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+            )
+        });
+        let channel_tile = channel.map(|_| {
+            h_flex()
+                .id("hdr-channel-tile")
+                .size(px(24.))
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(cx.theme().secondary)
+                .text_color(muted_foreground)
+                .text_size(px(14.))
+                .child("#")
+        });
+        let channel_lock = channel.filter(|c| c.is_private).map(|_| {
+            Icon::new(IconName::Lock)
+                .text_color(muted_foreground)
+                .size(px(16.))
+        });
+        let header_title = if channel.is_some() {
+            title.strip_prefix("# ").unwrap_or(title).to_owned()
+        } else {
+            title.to_owned()
+        };
         let peer = conversation
             .map(|c| conversation_avatar(&self.fixtures, c, 24., background, cx))
             .unwrap_or_else(div);
@@ -2922,11 +2965,14 @@ impl App {
             .px_1()
             .rounded_sm()
             .child(peer)
+            .children(channel_tile)
+            .children(channel_lock)
             .child(
                 div()
                     .truncate()
+                    .text_size(px(17.))
                     .font_weight(FontWeight::BOLD)
-                    .child(title.to_owned()),
+                    .child(header_title),
             )
             .when_some(peer_user, |name, user| {
                 name.cursor_pointer().hover(|el| el.bg(accent)).on_click(
@@ -2938,7 +2984,7 @@ impl App {
             .items_center()
             .gap_2()
             .px_4()
-            .h(px(46.))
+            .h(px(50.))
             .flex_none()
             .child(name)
             .when(!topic.is_empty(), |header| {
@@ -2988,7 +3034,6 @@ impl App {
     /// the actions slackless can run: Canvas (live only) and Link.
     fn conversation_tabs(&self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
-        let link = cx.theme().link;
         let foreground = cx.theme().foreground;
         let muted_foreground = cx.theme().muted_foreground;
 
@@ -3029,7 +3074,7 @@ impl App {
             .flex_none()
             .px_4()
             .gap_5()
-            .h(px(38.))
+            .h(px(40.))
             .border_b_1()
             .border_color(border)
             .children(specs.into_iter().map(|spec| {
@@ -3047,7 +3092,7 @@ impl App {
                     active,
                     foreground,
                     muted_foreground,
-                    link,
+                    foreground,
                 );
                 match spec.action {
                     TabAction::Switch(target) => {

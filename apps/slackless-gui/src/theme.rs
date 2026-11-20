@@ -125,6 +125,21 @@ impl Palette {
         }
     }
 
+    /// Slack's `sidebar_theme` pref value: the theme names Slack's own picker stores, without
+    /// the `_theme` suffix. Themes slackless does not ship a palette for keep the default look.
+    fn from_slack(name: &str) -> Self {
+        match name.strip_suffix("_theme").unwrap_or(name) {
+            "aubergine" => Palette::Aubergine,
+            "clementine" => Palette::Clementine,
+            "banana" => Palette::Banana,
+            "jade" => Palette::Jade,
+            "lagoon" | "ocean" => Palette::Lagoon,
+            "barbra" => Palette::Barbra,
+            "mood_indigo" => Palette::MoodIndigo,
+            _ => Palette::Default,
+        }
+    }
+
     /// The swatch shown for this theme in the picker: its sidebar color, or the current
     /// sidebar token for the default theme.
     pub fn swatch(self, current_sidebar: Hsla) -> (Hsla, Hsla) {
@@ -133,6 +148,37 @@ impl Palette {
             None => (current_sidebar, color(0x11_64_A3)),
         }
     }
+}
+
+/// The appearance Slack stores for the signed-in user: `messages_theme` chooses light or dark
+/// and `sidebar_theme` the color theme, so slackless opens looking like Slack itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Appearance {
+    pub theme: SlackTheme,
+    pub palette: Palette,
+}
+
+/// Read Slack's theme prefs into an [`Appearance`]; `None` when the message theme is absent.
+pub fn appearance_from_prefs(prefs: &crate::blockkit::serde_json::Value) -> Option<Appearance> {
+    let messages = prefs
+        .get("messages_theme")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let theme = if messages.starts_with("light") {
+        SlackTheme::Light
+    } else if messages.starts_with("dark") {
+        SlackTheme::Dark
+    } else {
+        return None;
+    };
+    let sidebar = prefs
+        .get("sidebar_theme")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    Some(Appearance {
+        theme,
+        palette: Palette::from_slack(sidebar),
+    })
 }
 
 /// Sidebar swatches offered by the custom theme builder.
@@ -277,7 +323,7 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.sidebar_primary_foreground = color(0xFF_FF_FF);
         theme.sidebar_accent = color(0x11_64_A3);
         theme.sidebar_accent_foreground = color(0xFF_FF_FF);
-        theme.title_bar = color(0xFF_FF_FF);
+        theme.title_bar = color(0xDC_EF_F8);
         theme.title_bar_border = color(0xE1_E3_E5);
         theme.popover = color(0xFF_FF_FF);
         theme.popover_foreground = color(0x1D_1C_1D);
@@ -311,4 +357,31 @@ pub fn avatar_color(key: &str) -> Hsla {
 /// Initials color on avatar chips: white in every theme.
 pub fn avatar_foreground() -> Hsla {
     color(0xFF_FF_FF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockkit::serde_json::json;
+
+    #[test]
+    fn appearance_follows_the_workspace_theme_prefs() {
+        let light = json!({
+            "messages_theme": "light_with_avatars",
+            "sidebar_theme": "hoth_theme",
+        });
+        let appearance = appearance_from_prefs(&light).expect("Slack's light prefs");
+        assert!(appearance.theme == SlackTheme::Light);
+        assert!(appearance.palette == Palette::Default);
+
+        let dark = json!({
+            "messages_theme": "dark_with_avatars",
+            "sidebar_theme": "aubergine_theme",
+        });
+        let appearance = appearance_from_prefs(&dark).expect("Slack's dark prefs");
+        assert!(appearance.theme == SlackTheme::Dark);
+        assert!(appearance.palette == Palette::Aubergine);
+
+        assert!(appearance_from_prefs(&json!({})).is_none());
+    }
 }
