@@ -71,8 +71,8 @@ pub struct ActionSet {
 
 pub type ActionHandler = Rc<dyn Fn(MessageAction, &mut Window, &mut App)>;
 
-/// Slack's one-click reactions at the front of the hover bar.
-const QUICK_REACTIONS: [&str; 3] = ["white_check_mark", "eyes", "raised_hands"];
+/// Slack's default one-click reactions at the front of the hover bar.
+pub const DEFAULT_QUICK_REACTIONS: [&str; 3] = ["white_check_mark", "eyes", "raised_hands"];
 /// Emoji the menu's Add reaction submenu lists before "More reactions...".
 const MENU_REACTIONS: [&str; 8] = [
     "thumbsup", "heart", "joy", "tada", "eyes", "fire", "pray", "rocket",
@@ -87,9 +87,10 @@ fn toolbar_button(id: String, handler: &ActionHandler, action: MessageAction) ->
 }
 
 /// The floating hover bar of one message row; revealed while the row's `group` is hovered.
-/// `key` makes element ids unique per row.
+/// `key` makes element ids unique per row; `quick` are the user's one-click reactions.
 pub fn hover_toolbar(
     key: &str,
+    quick: &[String],
     set: ActionSet,
     handler: &ActionHandler,
     group: SharedString,
@@ -109,7 +110,7 @@ pub fn hover_toolbar(
         .right_2()
         .opacity(0.)
         .group_hover(group, |bar| bar.opacity(1.));
-    for name in QUICK_REACTIONS {
+    for name in quick {
         let Some(glyph) = emoji::glyph(name) else {
             continue;
         };
@@ -117,7 +118,7 @@ pub fn hover_toolbar(
             toolbar_button(
                 format!("{key}-quick-{name}"),
                 handler,
-                MessageAction::React(name.to_owned()),
+                MessageAction::React(name.clone()),
             )
             .label(glyph)
             .tooltip(format!(":{name}:")),

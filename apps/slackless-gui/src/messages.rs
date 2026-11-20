@@ -855,6 +855,7 @@ fn transcript_row(
         .when(!editing, |card| {
             card.child(actions::hover_toolbar(
                 &key,
+                &fixtures.quick_reactions,
                 set,
                 &handler,
                 "msg".into(),

@@ -511,7 +511,14 @@ impl ThreadPanel {
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
             .map(|chips| chips.pl(px(TEXT_INSET)));
 
-        let toolbar = actions::hover_toolbar(&key, set, &handler, row_group.clone(), cx);
+        let toolbar = actions::hover_toolbar(
+            &key,
+            &self.fixtures.quick_reactions,
+            set,
+            &handler,
+            row_group.clone(),
+            cx,
+        );
         let menu_handler = handler;
         div()
             .id(SharedString::from(key))

@@ -40,6 +40,33 @@ fn base_ts() -> u64 {
     (now / DAY).saturating_sub(2) * DAY + 8 * 3_600
 }
 
+/// Slack's one-click reactions from the user's prefs: none when `show_quick_reactions` is
+/// off, the three customized emoji when set, else Slack's defaults.
+fn quick_reactions(prefs: &crate::blockkit::serde_json::Value) -> Vec<String> {
+    if prefs.get("show_quick_reactions").and_then(|v| v.as_bool()) == Some(false) {
+        return Vec::new();
+    }
+    let customized = prefs
+        .get("user_customized_quick_reactions_has_customized")
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    let custom: Vec<String> = (1..=3)
+        .filter_map(|i| {
+            prefs
+                .get(format!("user_customized_quick_reactions_emoji_{i}").as_str())
+                .and_then(|v| v.as_str())
+                .map(|name| name.trim_matches(':').to_owned())
+        })
+        .collect();
+    if customized && !custom.is_empty() {
+        custom
+    } else {
+        crate::actions::DEFAULT_QUICK_REACTIONS
+            .map(String::from)
+            .to_vec()
+    }
+}
+
 /// Live presence per user, shared by every snapshot of a workspace: a `presence_change` lands
 /// in place and repaints, with no store reload.
 pub type PresenceMap = Arc<RwLock<HashMap<UserId, Presence>>>;
@@ -62,6 +89,8 @@ pub struct Fixtures {
     pub presence: PresenceMap,
     /// Conversations whose notification level is not "All new posts" (the header bell).
     pub notify_levels: HashMap<ChannelId, NotifyLevel>,
+    /// The message hover bar's one-click reactions (none when the user turned them off).
+    pub quick_reactions: Vec<String>,
     /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
     pub thumbnails: HashMap<FileId, Arc<Image>>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
@@ -804,6 +833,9 @@ pub fn load() -> Fixtures {
         directory,
         presence: Arc::new(RwLock::new(presence)),
         notify_levels: HashMap::new(),
+        quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
+            .map(String::from)
+            .to_vec(),
         thumbnails,
         profile_extras,
         custom_emoji,
@@ -931,6 +963,7 @@ pub fn live(
         directory,
         presence: PresenceMap::default(),
         notify_levels: slackless_core::notify_levels(&prefs),
+        quick_reactions: quick_reactions(&prefs),
         thumbnails: HashMap::new(),
         profile_extras: HashMap::new(),
         custom_emoji,
