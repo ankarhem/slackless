@@ -202,7 +202,7 @@ pub fn pins_panel(
                     .child(Icon::new(IconName::Pin).text_color(muted).size(px(12.)))
                     .child("Pinned"),
             )
-            .child(message_row(fixtures, message, cx))
+            .child(message_row(fixtures, message, None, cx))
     });
     v_flex()
         .size_full()

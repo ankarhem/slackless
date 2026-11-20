@@ -195,7 +195,7 @@ impl SearchView {
             .map(|c| self.fixtures.conversation_label(c))
             .unwrap_or_else(|| hit.channel.to_string());
         let channel = hit.channel.clone();
-        let row = message_row(&self.fixtures, &hit.message, cx);
+        let row = message_row(&self.fixtures, &hit.message, None, cx);
         v_flex()
             .id(("search-hit", ix))
             .gap_1()

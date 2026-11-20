@@ -2554,6 +2554,7 @@ fn subscribe_workspace(
                     this.open_thread(channel.clone(), thread_ts.clone(), cx);
                 }
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
+                MessageListEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                 MessageListEvent::NeedOlder { channel, before } => {
                     this.load_older(channel, before.clone(), cx);
                 }
@@ -2585,6 +2586,7 @@ fn subscribe_workspace(
                     this.thread_open = false;
                     cx.notify();
                 }
+                ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                 ThreadPanelEvent::Reply {
                     channel,
                     thread_ts,

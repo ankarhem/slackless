@@ -111,6 +111,8 @@ pub enum MessageListEvent {
         channel: ChannelId,
         before: Ts,
     },
+    /// A message's avatar or name was clicked: show that user's profile.
+    OpenProfile(UserId),
 }
 
 /// Snapshot the `'static` virtual-list row renderer reads: the current conversation's history
@@ -475,6 +477,7 @@ impl MessageList {
             MessageAction::MarkUnread => self.mark_unread(ts, cx),
             MessageAction::Edit => self.begin_edit(ts, window, cx),
             MessageAction::Delete => self.delete(ts, cx),
+            MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
         }
     }
 
@@ -718,7 +721,13 @@ fn transcript_row(
 
     let mut body = v_flex().flex_1().min_w_0().gap_0p5().text_sm();
     if !grouped || editing {
-        body = body.child(message_header(message, &author, fixtures, cx));
+        body = body.child(message_header(
+            message,
+            &author,
+            fixtures,
+            Some(&handler),
+            cx,
+        ));
     }
     if editing {
         let (cancel, save) = (this.clone(), this.clone());
@@ -818,8 +827,14 @@ fn transcript_row(
                     .text_color(cx.theme().muted_foreground)
                     .child(format_clock(&message.ts)),
             )
+            .into_any_element()
     } else {
-        crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE)
+        profile_link(
+            crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
+            format!("{key}-avatar"),
+            message.user.as_ref(),
+            Some(&handler),
+        )
     };
 
     let set = ActionSet {
@@ -905,7 +920,12 @@ fn author_name(message: &Message, fixtures: &Fixtures) -> String {
 /// One full message card: avatar, author header, rich-text / Block Kit body and static
 /// reaction chips. Shared with the thread panel and search so every column renders messages
 /// identically.
-pub fn message_row(fixtures: &Fixtures, message: &Message, cx: &App) -> Div {
+pub fn message_row(
+    fixtures: &Fixtures,
+    message: &Message,
+    handler: Option<&actions::ActionHandler>,
+    cx: &App,
+) -> Div {
     let author_key = author_key(message);
     let author = author_name(message, fixtures);
     let kcx = KitCx {
@@ -918,7 +938,7 @@ pub fn message_row(fixtures: &Fixtures, message: &Message, cx: &App) -> Div {
         .min_w_0()
         .gap_0p5()
         .text_sm()
-        .child(message_header(message, &author, fixtures, cx))
+        .child(message_header(message, &author, fixtures, handler, cx))
         .child(message_body(message, &kcx, cx));
     if let Some(files) = crate::files::attachments(fixtures, message, cx) {
         body = body.child(files);
@@ -935,17 +955,45 @@ pub fn message_row(fixtures: &Fixtures, message: &Message, cx: &App) -> Div {
         .items_start()
         .gap_3()
         .min_w_0()
-        .child(crate::avatars::author_avatar(
-            fixtures,
-            message,
-            &author_key,
-            &author,
-            AVATAR_SIZE,
+        .child(profile_link(
+            crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
+            format!("{key}-avatar"),
+            message.user.as_ref(),
+            handler,
         ))
         .child(body)
 }
 
-fn message_header(message: &Message, author: &str, fixtures: &Fixtures, cx: &App) -> Div {
+/// `element` as a link to `user`'s profile, like Slack's message avatars and names; plain
+/// when there is no user or no action handler (search and pinned cards).
+fn profile_link(
+    element: impl IntoElement,
+    id: String,
+    user: Option<&UserId>,
+    handler: Option<&actions::ActionHandler>,
+) -> AnyElement {
+    let (Some(user), Some(handler)) = (user, handler) else {
+        return element.into_any_element();
+    };
+    let (user, handler) = (user.clone(), handler.clone());
+    div()
+        .id(SharedString::from(id))
+        .cursor_pointer()
+        .hover(|link| link.underline())
+        .child(element)
+        .on_click(move |_, window, cx| {
+            handler(MessageAction::OpenProfile(user.clone()), window, cx)
+        })
+        .into_any_element()
+}
+
+fn message_header(
+    message: &Message,
+    author: &str,
+    fixtures: &Fixtures,
+    handler: Option<&actions::ActionHandler>,
+    cx: &App,
+) -> Div {
     let muted = cx.theme().muted_foreground;
     // Like Slack, the author's current (unexpired) status emoji follows their name.
     let now = std::time::SystemTime::now()
@@ -974,11 +1022,14 @@ fn message_header(message: &Message, author: &str, fixtures: &Fixtures, cx: &App
             h_flex()
                 .items_center()
                 .gap_1()
-                .child(
+                .child(profile_link(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(author.to_owned()),
-                )
+                    format!("author-{}", message.ts.as_str()),
+                    message.user.as_ref(),
+                    handler,
+                ))
                 .children(status),
         )
         .child(

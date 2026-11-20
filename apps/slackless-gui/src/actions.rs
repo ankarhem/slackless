@@ -56,6 +56,8 @@ pub enum MessageAction {
     MarkUnread,
     Edit,
     Delete,
+    /// The author's avatar or name was clicked: show their profile.
+    OpenProfile(UserId),
 }
 
 /// Which actions apply to one message.

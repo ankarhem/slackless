@@ -32,7 +32,7 @@ use gpui_kit::gpui::{
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::types::{ChannelId, Message, Ts};
+use slackless_core::types::{ChannelId, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction};
 use crate::composer::{Composer, ComposerEvent};
@@ -43,6 +43,8 @@ use crate::slash::{Invocation, SHRUG, SlashKind};
 
 pub enum ThreadPanelEvent {
     Close,
+    /// A message's avatar or name was clicked: show that user's profile.
+    OpenProfile(UserId),
     /// The user replied; the panel has already shown the reply locally.
     Reply {
         channel: ChannelId,
@@ -345,6 +347,7 @@ impl ThreadPanel {
             MessageAction::MarkUnread => self.mark_unread(ts.clone(), cx),
             MessageAction::Edit => self.begin_edit(ts.clone(), window, cx),
             MessageAction::Delete => self.delete_message(ts, cx),
+            MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
         }
     }
 
@@ -507,7 +510,7 @@ impl ThreadPanel {
         // interactive chips (toggle + add control) below the card instead.
         let mut display = message.clone();
         let reactions = std::mem::take(&mut display.reactions);
-        let card = message_row(&self.fixtures, &display, cx);
+        let card = message_row(&self.fixtures, &display, Some(&handler), cx);
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
             .map(|chips| chips.pl(px(TEXT_INSET)));
 
