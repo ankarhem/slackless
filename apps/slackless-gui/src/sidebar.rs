@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -151,6 +151,8 @@ pub struct Sidebar {
     read: HashSet<ChannelId>,
     /// The "Find a conversation…" field above the sections.
     find: Entity<TextareaState>,
+    /// The "Find a conversation…" query, trimmed and lowercased; empty lists everything.
+    find_query: String,
     /// Channels joined from the channel browser this session, listed after the fixtures'.
     joined: Vec<Conversation>,
     /// The conversation with a live huddle; its row carries the headphones indicator.
@@ -202,6 +204,12 @@ impl Sidebar {
                 .map(SharedString::from)
                 .collect();
             let subscriptions = vec![
+                cx.subscribe(&find, |this: &mut Sidebar, find, event: &InputEvent, cx| {
+                    if let InputEvent::Change = event {
+                        this.find_query = find.read(cx).value().trim().to_lowercase();
+                        cx.notify();
+                    }
+                }),
                 cx.observe(&activity, |_, _, cx| cx.notify()),
                 cx.subscribe(
                     &activity,
@@ -234,6 +242,7 @@ impl Sidebar {
                 nav_offsets: HashMap::new(),
                 collapsed,
                 read: HashSet::new(),
+                find_query: String::new(),
                 find,
                 joined: Vec::new(),
                 huddle: None,
@@ -800,9 +809,17 @@ impl Sidebar {
             let unread = self.unread_in(conversation, watermark);
             // Like Slack, a collapsed section still lists its unread and open conversations;
             // "Active only" additionally hides stale ones from expanded sections.
-            let listed = conversation.id == self.selected
-                || unread.count > 0
-                || (open && self.active_recent(conversation));
+            // A "Find a conversation…" query instead lists every match, collapsed or stale.
+            let listed = if self.find_query.is_empty() {
+                conversation.id == self.selected
+                    || unread.count > 0
+                    || (open && self.active_recent(conversation))
+            } else {
+                self.fixtures
+                    .conversation_label(conversation)
+                    .to_lowercase()
+                    .contains(&self.find_query)
+            };
             if !listed {
                 continue;
             }
