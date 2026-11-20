@@ -51,6 +51,12 @@ impl ProfilePanel {
         })
     }
 
+    /// Live refresh: the shown profile stays open, drawn from `fixtures`.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     pub fn open(&mut self, user: UserId, cx: &mut Context<Self>) {
         self.user = Some(user);
         cx.notify();

@@ -118,6 +118,12 @@ impl ActivityFeed {
         })
     }
 
+    /// Live refresh: rebuild the items from `fixtures`, keeping the chosen filter.
+    pub fn set_fixtures(&mut self, fixtures: &Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.items = build(fixtures);
+        cx.notify();
+    }
+
     /// Unread items across every filter.
     pub fn unread_count(&self) -> u32 {
         self.items.iter().filter(|item| item.unread).count() as u32

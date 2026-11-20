@@ -74,6 +74,12 @@ impl QuickSwitcher {
         })
     }
 
+    /// Live refresh: match the query against the conversations in `fixtures`.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     /// Clear the filter and focus the field; call when the dialog opens.
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.query.clear();

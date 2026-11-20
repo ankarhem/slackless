@@ -150,6 +150,12 @@ impl ThreadPanel {
         })
     }
 
+    /// Live refresh: the open thread stays open, drawn from `fixtures`.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     /// Forward the Enter-to-send preference to the reply composer.
     pub fn set_enter_sends(&mut self, enter_sends: bool, cx: &mut Context<Self>) {
         self.composer

@@ -67,6 +67,15 @@ impl SearchView {
         })
     }
 
+    /// Live refresh: the query and its results stay; names come from `fixtures`.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        if let Some(team) = fixtures.workspaces.first() {
+            self.workspace = team.id.clone();
+        }
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     pub fn run(&mut self, query: String, cx: &mut Context<Self>) {
         self.query = query.trim().to_owned();
         self.results.clear();

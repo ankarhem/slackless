@@ -936,6 +936,12 @@ impl App {
         self.drafts_open = false;
         self.later_open = false;
         cx.notify();
+        self.show_conversation(channel, cx);
+    }
+
+    /// Open `channel` in the transcript (a no-op when it already is): the sidebar selection,
+    /// the core's open conversation, its history and its draft follow.
+    fn show_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         if channel == self.channel {
             return;
         }
@@ -1018,24 +1024,27 @@ impl App {
         // Presence is transient (never stored), so the live map rides along every snapshot.
         snapshot.presence = self.presence.clone();
         let fixtures = Arc::new(snapshot);
-        let channel = match fixtures.conversation(&self.channel) {
-            Some(_) if self.chosen => self.channel.clone(),
-            _ => first_conversation(&fixtures),
-        };
-        let archive = self.bridge.store().cloned();
-        let views = build_workspace(&fixtures, self.workspace, archive, &channel, window, cx);
-        self.workspace_subscriptions = subscribe_workspace(&views, window, cx);
-        self.swap_views(views);
+        // Refresh the views in place, as Slack does: a status change or a new channel keeps
+        // every scroll position, collapsed section and open panel.
+        self.sidebar
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.messages
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.thread
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.results
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.browser
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.profile
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.switcher
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
-        if channel != self.channel {
-            self.bridge
-                .send(Command::CloseConversation(self.channel.clone()));
-            self.bridge.send(Command::OpenConversation(channel.clone()));
-            self.channel = channel.clone();
+        if !keep {
+            self.show_conversation(first_conversation(&self.fixtures), cx);
         }
-        self.thread_open = false;
-        self.profile_open = false;
-        self.load_history(&channel, cx);
         self.sync_composer_placeholder(cx);
         self.apply_preferences(window, cx);
         cx.notify();

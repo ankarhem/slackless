@@ -68,6 +68,12 @@ impl ChannelBrowser {
         })
     }
 
+    /// Live refresh: list the channels in `fixtures`, keeping the typed filter.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     fn is_member(&self, conversation: &Conversation) -> bool {
         conversation.is_member || self.joined.contains(&conversation.id)
     }

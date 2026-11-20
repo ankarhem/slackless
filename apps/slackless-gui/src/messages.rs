@@ -202,6 +202,17 @@ impl MessageList {
         })
     }
 
+    /// Live refresh: draw names, emoji and conversations from `fixtures`; the loaded history,
+    /// scroll position and new-messages divider stay.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.data.update(cx, |data, cx| {
+            data.fixtures = fixtures.clone();
+            cx.notify();
+        });
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     pub fn set_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.channel = channel;
         self.sync(cx);

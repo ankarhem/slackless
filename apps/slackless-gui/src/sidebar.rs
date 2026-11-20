@@ -28,8 +28,9 @@ use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img, px,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, img, point, px,
 };
 use slackless_core::types::{
     ChannelId, ChannelSection, Conversation, ConversationKind, Message, SectionKind, Team, Ts,
@@ -66,7 +67,7 @@ pub enum SidebarEvent {
 }
 
 /// The nav destinations stacked in the workspace rail.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NavItem {
     Home,
     Dms,
@@ -129,6 +130,8 @@ pub struct Sidebar {
     selected: ChannelId,
     active_workspace: usize,
     active_nav: NavItem,
+    /// Each rail destination's list scroll, restored when the reader comes back to it.
+    nav_offsets: HashMap<NavItem, Point<Pixels>>,
     /// Keys of the collapsed sidebar sections.
     collapsed: HashSet<SharedString>,
     /// Conversations read in this session since Slack's counts were taken.
@@ -196,6 +199,7 @@ impl Sidebar {
                 selected,
                 active_workspace: 0,
                 active_nav: NavItem::Home,
+                nav_offsets: HashMap::new(),
                 collapsed,
                 read: HashSet::new(),
                 find,
@@ -209,6 +213,23 @@ impl Sidebar {
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Live refresh: draw `fixtures` while keeping the reader's scroll, collapsed sections and
+    /// read marks. A changed collapse pref from Slack still lands.
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        if fixtures.collapsed_sections != self.fixtures.collapsed_sections {
+            self.collapsed = fixtures
+                .collapsed_sections
+                .iter()
+                .cloned()
+                .map(SharedString::from)
+                .collect();
+        }
+        self.activity
+            .update(cx, |feed, cx| feed.set_fixtures(&fixtures, cx));
+        self.fixtures = fixtures;
+        cx.notify();
     }
 
     /// Mark `channel` selected without emitting (the root opened it from elsewhere).
@@ -225,6 +246,13 @@ impl Sidebar {
 
     /// Show a rail destination (keyboard shortcuts).
     pub(crate) fn show_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
+        // One scroll container serves every destination: each keeps its own position, and a
+        // first visit starts at the top.
+        self.nav_offsets
+            .insert(self.active_nav, self.scroll.offset());
+        let offset = self.nav_offsets.get(&item).copied();
+        self.scroll
+            .set_offset(offset.unwrap_or_else(|| point(px(0.), px(0.))));
         self.active_nav = item;
         cx.notify();
     }
@@ -615,10 +643,7 @@ impl Sidebar {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(item.label()),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.active_nav = item;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.show_nav(item, cx)))
     }
 
     /// A sidebar section: a dim header row (section emoji or icon + name; click collapses)
@@ -1194,8 +1219,7 @@ impl Sidebar {
         } else {
             y
         };
-        self.scroll
-            .set_offset(gpui_kit::gpui::point(self.scroll.offset().x, y));
+        self.scroll.set_offset(point(self.scroll.offset().x, y));
     }
 }
 
