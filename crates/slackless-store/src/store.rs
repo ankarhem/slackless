@@ -381,6 +381,28 @@ impl Store {
         Ok(())
     }
 
+    /// A slackless-local value for `workspace` (state Slack does not keep for this client).
+    pub fn local(&self, workspace: &TeamId, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM local_state WHERE workspace_id = ?1 AND key = ?2",
+                params![workspace.as_str(), key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// Sets a slackless-local value for `workspace`, replacing any previous one.
+    pub fn set_local(&mut self, workspace: &TeamId, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO local_state (workspace_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT (workspace_id, key) DO UPDATE SET value = excluded.value",
+            params![workspace.as_str(), key, value],
+        )?;
+        Ok(())
+    }
+
     /// The signed-in user's prefs blob, if hydrated (e.g. `display_real_names`).
     pub fn prefs(&self, workspace: &TeamId) -> Result<Option<serde_json::Value>> {
         let json = self
@@ -830,6 +852,20 @@ mod tests {
             text: text.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn local_state_round_trips_per_workspace() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (a, b) = (TeamId::from("T1"), TeamId::from("T2"));
+        assert_eq!(store.local(&a, "last_conversation").unwrap(), None);
+        store.set_local(&a, "last_conversation", "C1").unwrap();
+        store.set_local(&a, "last_conversation", "C2").unwrap();
+        assert_eq!(
+            store.local(&a, "last_conversation").unwrap().as_deref(),
+            Some("C2")
+        );
+        assert_eq!(store.local(&b, "last_conversation").unwrap(), None);
     }
 
     #[test]

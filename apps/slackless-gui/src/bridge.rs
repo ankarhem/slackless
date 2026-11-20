@@ -42,6 +42,9 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// Newest messages of a conversation the message list shows in live mode.
 const HISTORY_LIMIT: usize = 500;
 
+/// The store's local-state key for the last open conversation.
+const LAST_CONVERSATION: &str = "last_conversation";
+
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
 struct EventHub;
@@ -205,6 +208,33 @@ impl CoreBridge {
     /// fixture mode.
     pub fn store(&self) -> Option<&SharedStore> {
         self.store.as_ref()
+    }
+
+    /// The conversation last open in this workspace, restored at launch like Slack. `None`
+    /// offline or before the first one.
+    pub fn last_conversation(&self) -> Option<ChannelId> {
+        let team = &self.session.as_ref()?.team_id;
+        let store = self.store.as_ref()?.lock().ok()?;
+        let id = store.local(team, LAST_CONVERSATION).ok().flatten()?;
+        Some(ChannelId::from(id.as_str()))
+    }
+
+    /// Live mode: a write remembering `channel` as the open conversation, to run off the UI
+    /// thread. `None` offline.
+    pub fn remember_conversation(
+        &self,
+        channel: ChannelId,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let team = self.session.as_ref()?.team_id.clone();
+        let store = self.store.clone()?;
+        Some(async move {
+            let Ok(mut store) = store.lock() else {
+                return;
+            };
+            if let Err(e) = store.set_local(&team, LAST_CONVERSATION, channel.as_str()) {
+                eprintln!("slackless: could not remember the open conversation ({e})");
+            }
+        })
     }
 
     /// Subscribe to the core's [`Event`]s. The handler runs on the UI thread whenever the

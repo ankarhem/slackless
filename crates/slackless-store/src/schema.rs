@@ -150,7 +150,18 @@ CREATE TABLE prefs (
 ) WITHOUT ROWID;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2];
+/// Version 3: slackless-local state Slack does not keep for this client (the last open
+/// conversation, restored at launch).
+const V3: &str = r#"
+CREATE TABLE local_state (
+    workspace_id TEXT NOT NULL,
+    key          TEXT NOT NULL,
+    value        TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, key)
+) WITHOUT ROWID;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

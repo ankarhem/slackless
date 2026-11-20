@@ -406,7 +406,13 @@ impl App {
         cx: &mut gpui::App,
     ) -> Entity<App> {
         let app = cx.new(|cx| {
-            let channel = first_conversation(&fixtures);
+            // Like Slack, reopen the conversation that was open last; a fresh store falls back
+            // to the sidebar's first conversation until the user picks one.
+            let restored = bridge
+                .last_conversation()
+                .filter(|channel| fixtures.conversation(channel).is_some());
+            let chosen = restored.is_some();
+            let channel = restored.unwrap_or_else(|| first_conversation(&fixtures));
             let archive = bridge
                 .store()
                 .cloned()
@@ -643,7 +649,7 @@ impl App {
                 back: Vec::new(),
                 forward: Vec::new(),
                 recent: Vec::new(),
-                chosen: false,
+                chosen,
                 focus,
                 workspace_subscriptions,
                 _subscriptions: subscriptions,
@@ -1254,6 +1260,9 @@ impl App {
     fn show_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         if channel == self.channel {
             return;
+        }
+        if let Some(write) = self.bridge.remember_conversation(channel.clone()) {
+            cx.background_executor().spawn(write).detach();
         }
         /// Recent conversations kept for the history menu.
         const RECENT_MAX: usize = 50;
