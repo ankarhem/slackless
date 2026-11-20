@@ -181,7 +181,7 @@
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -198,9 +198,7 @@ use gpui_kit::gpui::{
 };
 use slackless_core::api::ConversationCounts;
 use slackless_core::platform::{self, BadgeSetter, Notifier};
-use slackless_core::types::{
-    ChannelId, Conversation, ConversationKind, Message, Presence, Ts, UserId,
-};
+use slackless_core::types::{ChannelId, Conversation, ConversationKind, Message, Ts, UserId};
 use slackless_core::{Command, Event, SharedStore};
 
 use crate::actions::notify;
@@ -368,7 +366,7 @@ pub struct App {
     counts: HashMap<ChannelId, ConversationCounts>,
     /// Live mode: last known presence per DM peer (`users.getPresence`, `presence_change`);
     /// injected into every live fixtures snapshot so sidebar rows and headers render dots.
-    presence: HashMap<UserId, Presence>,
+    presence: fixtures::PresenceMap,
     /// Live mode: DM peers whose notifications are paused right now (`dnd.info`).
     peer_dnd_paused: HashMap<UserId, bool>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
@@ -615,7 +613,7 @@ impl App {
                 history_complete: HashSet::new(),
                 thread_generation: 0,
                 counts: HashMap::new(),
-                presence: HashMap::new(),
+                presence: fixtures::PresenceMap::default(),
                 peer_dnd_paused: HashMap::new(),
                 member_counts: HashMap::new(),
                 chosen: false,
@@ -997,10 +995,13 @@ impl App {
             ),
             Event::Error(error) => eprintln!("slackless: {error}"),
             Event::Presence { users, presence } => {
-                for user in users {
-                    self.presence.insert(user.clone(), presence.clone());
-                }
-                self.reload_live(window, cx);
+                // Every snapshot shares this map: update it in place and repaint, with no
+                // store reload however often presence changes.
+                self.presence
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(users.iter().map(|user| (user.clone(), presence.clone())));
+                window.refresh();
             }
             Event::DndPaused { user, paused } => {
                 self.peer_dnd_paused.insert(user.clone(), *paused);

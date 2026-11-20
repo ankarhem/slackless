@@ -3,7 +3,7 @@
 //! Both use the real `slackless_types` model, so views render the same either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::gpui::{Image, ImageSource, SharedString};
@@ -39,6 +39,10 @@ fn base_ts() -> u64 {
     (now / DAY).saturating_sub(2) * DAY + 8 * 3_600
 }
 
+/// Live presence per user, shared by every snapshot of a workspace: a `presence_change` lands
+/// in place and repaints, with no store reload.
+pub type PresenceMap = Arc<RwLock<HashMap<UserId, Presence>>>;
+
 pub struct Fixtures {
     pub workspaces: Vec<Team>,
     /// The signed-in user; author of locally composed messages.
@@ -53,8 +57,8 @@ pub struct Fixtures {
     pub threads: HashMap<(ChannelId, Ts), Vec<Message>>,
     /// Workspace channels the signed-in user has not joined (channel browser only).
     pub directory: Vec<Conversation>,
-    /// Last known presence per user (`users.getPresence` / `presence_change`).
-    pub presence: HashMap<UserId, Presence>,
+    /// Last known presence per user (`presence_change` / `users.getPresence`).
+    pub presence: PresenceMap,
     /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
     pub thumbnails: HashMap<FileId, Arc<Image>>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
@@ -137,8 +141,12 @@ impl Fixtures {
         self.users.iter().find(|u| u.id == *id)
     }
 
-    pub fn presence(&self, user: &UserId) -> Option<&Presence> {
-        self.presence.get(user)
+    pub fn presence(&self, user: &UserId) -> Option<Presence> {
+        self.presence
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(user)
+            .cloned()
     }
 
     /// The name an @mention of `id` shows (see [`Fixtures::real_names_in_mentions`]).
@@ -791,7 +799,7 @@ pub fn load() -> Fixtures {
         messages,
         threads,
         directory,
-        presence,
+        presence: Arc::new(RwLock::new(presence)),
         thumbnails,
         profile_extras,
         custom_emoji,
@@ -917,7 +925,7 @@ pub fn live(
         messages: HashMap::new(),
         threads: HashMap::new(),
         directory,
-        presence: HashMap::new(),
+        presence: PresenceMap::default(),
         thumbnails: HashMap::new(),
         profile_extras: HashMap::new(),
         custom_emoji,

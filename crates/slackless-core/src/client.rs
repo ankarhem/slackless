@@ -14,6 +14,7 @@ use crate::auth::Session;
 use crate::backend::Backend;
 use crate::backfill::{Backfill, PAGE_DELAY, SyncedMap};
 use crate::fetcher::Fetcher;
+use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
 use crate::types::{ChannelId, ConversationKind, SlackEvent, TeamId, UserId};
@@ -471,6 +472,10 @@ impl<B: Backend> Core<B> {
     async fn on_rtm(&mut self, event: RtmEvent) {
         match event {
             RtmEvent::State(state) => {
+                // Subscriptions last one websocket session: (re)subscribe on every `hello`.
+                if matches!(state, ConnectionState::Connected { .. }) {
+                    self.subscribe_dm_presence();
+                }
                 self.events.emit(Event::Connection(state));
             }
             RtmEvent::Event(event) => {
@@ -579,6 +584,41 @@ impl<B: Backend> Core<B> {
             })
             .await?;
             events.emit(Event::UsersChanged(ids));
+            Ok(())
+        });
+    }
+
+    /// Subscribes presence for every DM peer, so each DM row carries Slack's dot. Slack answers
+    /// a `presence_sub` with the current presence of each newly subscribed id, so no per-user
+    /// request is needed; each frame replaces the whole subscription, so the accumulated peers
+    /// (including ones a DM open added) are resent.
+    fn subscribe_dm_presence(&self) {
+        /// Slack's recommended ceiling for one presence subscription.
+        const PRESENCE_SUB_MAX: usize = 500;
+        let Some(rtm) = self.rtm.clone() else {
+            return;
+        };
+        let (store, ws, events) = (
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+        );
+        let watched = Arc::clone(&self.presence_peers);
+        self.spawn("presence_sub", async move {
+            let conversations = with_store(&store, move |s| s.conversations(&ws)).await?;
+            let peers = {
+                let mut watched = watched.lock().unwrap_or_else(PoisonError::into_inner);
+                for peer in conversations.into_iter().filter_map(|c| c.user) {
+                    if !watched.contains(&peer) {
+                        watched.push(peer);
+                    }
+                }
+                watched.truncate(PRESENCE_SUB_MAX);
+                watched.clone()
+            };
+            if let Err(e) = rtm.presence_sub(peers) {
+                events.emit(Event::Error(format!("presence_sub: {e}")));
+            }
             Ok(())
         });
     }

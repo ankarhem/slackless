@@ -124,7 +124,7 @@ fn initials_chip(key: &str, label: &str, size: f32) -> Div {
 /// `chip` with the presence dot riding its bottom-right corner.
 pub fn with_presence(
     chip: Div,
-    presence: Option<&Presence>,
+    presence: Option<Presence>,
     size: f32,
     ring: Hsla,
     cx: &App,
