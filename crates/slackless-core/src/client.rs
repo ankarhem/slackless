@@ -1,6 +1,6 @@
 //! The runtime thread, the command loop and the front-end handle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -243,6 +243,8 @@ pub(crate) struct Core<B> {
     /// and subscribed on the websocket. Every `presence_sub` frame replaces the whole
     /// subscription, so the accumulated set is resent as it grows.
     presence_peers: Arc<Mutex<Vec<UserId>>>,
+    /// Ids already sent to `users.info` this session (found or not): each is asked once.
+    users_asked: HashSet<UserId>,
 }
 
 impl<B: Backend> Core<B> {
@@ -264,6 +266,7 @@ impl<B: Backend> Core<B> {
             backfills: HashMap::new(),
             rtm: None,
             presence_peers: Arc::new(Mutex::new(Vec::new())),
+            users_asked: HashSet::new(),
         }
     }
 
@@ -384,6 +387,7 @@ impl<B: Backend> Core<B> {
                     task.abort();
                 }
             }
+            Command::ResolveUsers(ids) => self.resolve_users(ids),
             Command::OpenThread { channel, thread_ts } => {
                 let backfill = self.backfill.clone();
                 self.spawn("conversations.replies", async move {
@@ -541,6 +545,44 @@ impl<B: Backend> Core<B> {
         });
     }
 
+    /// `users.info` for people `users.list` leaves out (members of other organizations in
+    /// shared channels and DMs), each id asked once per session. Found profiles are stored
+    /// and announced together; a failed lookup is reported and the rest still land.
+    fn resolve_users(&mut self, ids: Vec<UserId>) {
+        let ids: Vec<UserId> = ids
+            .into_iter()
+            .filter(|id| self.users_asked.insert(id.clone()))
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let (backend, store, ws, events) = (
+            self.backend.clone(),
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+        );
+        self.spawn("users.info", async move {
+            let mut users = Vec::new();
+            for id in ids {
+                match backend.user_info(id).await {
+                    Ok(user) => users.push(user),
+                    Err(e) => events.report("users.info", e.into()),
+                }
+            }
+            if users.is_empty() {
+                return Ok(());
+            }
+            let ids = users.iter().map(|user| user.id.clone()).collect();
+            with_store(&store, move |s| {
+                users.iter().try_for_each(|user| s.upsert_user(&ws, user))
+            })
+            .await?;
+            events.emit(Event::UsersChanged(ids));
+            Ok(())
+        });
+    }
+
     /// Presence for a DM peer: one `users.getPresence` read the first time their DM opens,
     /// then the websocket subscription keeps it current through `presence_change` events
     /// (each `presence_sub` frame replaces the previous subscription, so the whole
@@ -678,6 +720,7 @@ pub(crate) mod tests {
         presence: HashMap<UserId, UserPresence>,
         dnd_calls: Vec<UserId>,
         presence_calls: Vec<UserId>,
+        user_info_calls: Vec<UserId>,
     }
 
     impl FakeBackend {
@@ -744,6 +787,11 @@ pub(crate) mod tests {
         /// Users asked for `users.getPresence`, in order.
         pub fn presence_calls(&self) -> Vec<UserId> {
             self.state.lock().unwrap().presence_calls.clone()
+        }
+
+        /// Users asked for `users.info`, in order.
+        pub fn user_info_calls(&self) -> Vec<UserId> {
+            self.state.lock().unwrap().user_info_calls.clone()
         }
 
         pub fn messages(&self) -> Vec<Message> {
@@ -887,6 +935,17 @@ pub(crate) mod tests {
                     is_archived: true,
                     ..Default::default()
                 },
+            })
+        }
+
+        /// Every id resolves, to a profile named `ext-<id>`.
+        async fn user_info(&self, user: UserId) -> api::Result<User> {
+            let mut state = self.state.lock().unwrap();
+            state.user_info_calls.push(user.clone());
+            Ok(User {
+                name: format!("ext-{}", user.as_str()),
+                id: user,
+                ..Default::default()
             })
         }
 
@@ -1209,6 +1268,24 @@ pub(crate) mod tests {
         assert_eq!(stored.num_members, Some(42), "member count lands from info");
         assert_eq!(stored.unread_count_display, Some(7), "boot fields survive");
         assert_eq!(stored.name.as_deref(), Some("general"));
+    }
+
+    #[tokio::test]
+    async fn resolve_users_stores_each_missing_profile_once() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+        let ext = UserId::from("U9");
+
+        core.handle(Command::ResolveUsers(vec![ext.clone(), ext.clone()]));
+        assert_eq!(next(&mut rx).await, Event::UsersChanged(vec![ext.clone()]));
+        let users = store.lock().unwrap().users(&TeamId::from("T1")).unwrap();
+        let names: Vec<&str> = users.iter().map(|user| user.name.as_str()).collect();
+        assert_eq!(names, ["ext-U9"], "the profile lands in the store");
+
+        // Asked once per session: a repeat never reaches `users.info` again.
+        core.handle(Command::ResolveUsers(vec![ext.clone()]));
+        assert_eq!(fake.user_info_calls(), vec![ext]);
     }
 
     #[tokio::test]

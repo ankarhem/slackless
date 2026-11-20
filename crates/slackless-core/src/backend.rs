@@ -45,6 +45,8 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<Conversation>> + Send;
     /// A user's do-not-disturb state (`dnd.info`). Read-only.
     fn dnd_info(&self, user: UserId) -> impl Future<Output = api::Result<DndStatus>> + Send;
+    /// One user's profile (`users.info`), reaching people `users.list` omits. Read-only.
+    fn user_info(&self, user: UserId) -> impl Future<Output = api::Result<User>> + Send;
     /// A user's current presence (`users.getPresence`). Read-only.
     fn user_presence(&self, user: UserId)
     -> impl Future<Output = api::Result<UserPresence>> + Send;
@@ -137,6 +139,10 @@ impl Backend for SlackApi {
 
     async fn dnd_info(&self, user: UserId) -> api::Result<DndStatus> {
         SlackApi::dnd_info(self, &user).await
+    }
+
+    async fn user_info(&self, user: UserId) -> api::Result<User> {
+        self.users_info(&user).await
     }
 
     async fn user_presence(&self, user: UserId) -> api::Result<UserPresence> {

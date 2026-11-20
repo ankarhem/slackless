@@ -44,6 +44,11 @@ pub enum Command {
     OpenConversation(ChannelId),
     /// Stop backfilling a conversation (it stays in the store).
     CloseConversation(ChannelId),
+    /// Look up people the workspace directory (`users.list`) leaves out, such as members of
+    /// other organizations in shared channels and DMs, so they show by name. Each id is asked
+    /// once per session; found profiles are stored and announced with
+    /// [`Event::UsersChanged`].
+    ResolveUsers(Vec<UserId>),
     /// The user opened a thread: fetch its full history (root + all replies) from Slack into
     /// the store. Read-only; it never moves the user's read cursor.
     OpenThread {

@@ -198,7 +198,9 @@ use gpui_kit::gpui::{
 };
 use slackless_core::api::ConversationCounts;
 use slackless_core::platform::{self, BadgeSetter, Notifier};
-use slackless_core::types::{ChannelId, Conversation, ConversationKind, Presence, Ts, UserId};
+use slackless_core::types::{
+    ChannelId, Conversation, ConversationKind, Message, Presence, Ts, UserId,
+};
 use slackless_core::{Command, Event, SharedStore};
 
 use crate::actions::notify;
@@ -1042,6 +1044,7 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
+        self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
         if !keep {
             self.show_conversation(first_conversation(&self.fixtures), cx);
         }
@@ -1063,6 +1066,7 @@ impl App {
             let history = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
                 if app.history_generation == generation && app.channel == channel {
+                    app.resolve_named_users(&history);
                     let newest = history.last().map(|message| message.ts.clone());
                     app.messages.update(cx, |list, cx| {
                         list.set_history(channel.clone(), history, cx)
@@ -1099,6 +1103,7 @@ impl App {
                     app.history_complete.insert(channel);
                     return;
                 }
+                app.resolve_named_users(&older);
                 app.messages.update(cx, |list, cx| {
                     list.prepend_history(channel.clone(), older, cx)
                 });
@@ -1121,6 +1126,7 @@ impl App {
             let messages = cx.background_executor().spawn(read).await;
             this.update(cx, |app, cx| {
                 if app.thread_generation == generation {
+                    app.resolve_named_users(&messages);
                     app.thread.update(cx, |panel, cx| {
                         panel.set_thread(channel, thread_ts, messages, cx)
                     });
@@ -1128,6 +1134,37 @@ impl App {
             })
         })
         .detach();
+    }
+
+    /// Ask the core to look up `users` the snapshot lacks: members of other organizations,
+    /// whom `users.list` leaves out, so they show by name instead of id.
+    fn resolve_users(&self, users: impl IntoIterator<Item = UserId>) {
+        // Dedupe before the snapshot lookups: a page names the same few people many times.
+        let named: HashSet<UserId> = users.into_iter().collect();
+        let missing: Vec<UserId> = named
+            .into_iter()
+            .filter(|user| self.fixtures.user(user).is_none())
+            .collect();
+        if !missing.is_empty() {
+            self.bridge.send(Command::ResolveUsers(missing));
+        }
+    }
+
+    /// [`App::resolve_users`] for the people `messages` name: authors, repliers and
+    /// `<@U…>` / `<@U…|name>` mentions.
+    fn resolve_named_users(&self, messages: &[Message]) {
+        self.resolve_users(messages.iter().flat_map(|message| {
+            let mentions = message.text.split("<@").skip(1).filter_map(|rest| {
+                let end = rest.find(['>', '|'])?;
+                Some(UserId::from(&rest[..end]))
+            });
+            message
+                .user
+                .iter()
+                .chain(&message.reply_users)
+                .cloned()
+                .chain(mentions)
+        }));
     }
 
     /// Like Slack, viewing a conversation with unreads marks it read up to its newest message:
