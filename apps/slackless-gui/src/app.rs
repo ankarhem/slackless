@@ -216,13 +216,16 @@ use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
 use crate::composer::{self, Composer, ComposerEvent};
+use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
 use crate::fixtures::{self, Fixtures};
 use crate::huddle::{self, HuddleBar, HuddleEvent};
+use crate::huddles::{self, HuddlesEvent, HuddlesView};
 use crate::later::{LaterEvent, LaterView, SaveRequest};
 use crate::lists::list_view;
 use crate::messages::{MessageList, MessageListEvent};
+use crate::new_message::{NewMessageEvent, NewMessageView};
 use crate::pins;
 use crate::preferences::{AppearanceMode, Preferences, PreferencesEvent, Section};
 use crate::profile::{ProfileEvent, ProfilePanel};
@@ -234,6 +237,8 @@ use crate::status::{SelfState, StatusEvent, StatusPicker, UserMenu, UserMenuEven
 use crate::switcher::{QuickSwitcher, SwitcherEvent};
 use crate::theme::{self, Palette, SlackTheme};
 use crate::threads::{ThreadPanel, ThreadPanelEvent};
+use crate::threads_cards::{local_cards, store_cards};
+use crate::threads_view::{ThreadsEvent, ThreadsView};
 
 actions!(
     slackless,
@@ -303,6 +308,8 @@ enum ConversationTab {
 enum PickerTarget {
     Composer,
     ThreadComposer,
+    ThreadsComposer,
+    ComposeView,
     Message { channel: ChannelId, ts: Ts },
     ThreadMessage(Ts),
 }
@@ -359,6 +366,20 @@ pub struct App {
     /// Saved messages and reminders; shown in place of the message column while `later_open`.
     later: Entity<LaterView>,
     later_open: bool,
+    /// The Threads view; replaces the message column while `threads_open`.
+    threads: Entity<ThreadsView>,
+    threads_open: bool,
+    /// The Huddles page; replaces the message column while `huddles_open`.
+    huddles: Entity<HuddlesView>,
+    huddles_open: bool,
+    /// The directory; replaces the message column while `directory_open`.
+    directory: Entity<DirectoryView>,
+    directory_open: bool,
+    /// The "New message" view; replaces the message column while `compose_open`.
+    compose: Entity<NewMessageView>,
+    compose_open: bool,
+    /// A compose send waiting for its DM to open ([`Command::OpenDm`]).
+    pending_dm: Option<MessageContent>,
     /// The pinned-messages panel of the open conversation (right column, exclusive with the
     /// thread and profile panels).
     pins_open: bool,
@@ -441,6 +462,10 @@ impl App {
             let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
             let drafts = DraftsView::new(cx);
             let later = LaterView::new(cx);
+            let threads = ThreadsView::new(fixtures.clone(), window, cx);
+            let huddles = HuddlesView::new(fixtures.clone(), cx);
+            let directory = DirectoryView::new(fixtures.clone(), window, cx);
+            let compose = NewMessageView::new(fixtures.clone(), window, cx);
             later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
             cx.bind_keys([
                 KeyBinding::new("cmd-k", QuickSwitch, None),
@@ -581,6 +606,106 @@ impl App {
                         LaterEvent::Changed => this.sync_later_count(cx),
                     },
                 ),
+                cx.subscribe_in(
+                    &threads,
+                    window,
+                    |this: &mut App, _, event: &ThreadsEvent, window, cx| match event {
+                        ThreadsEvent::Open { channel, thread_ts } => {
+                            this.threads_open = false;
+                            this.select(channel.clone(), cx);
+                            this.open_thread(channel.clone(), thread_ts.clone(), cx);
+                        }
+                        ThreadsEvent::Reply {
+                            channel,
+                            thread_ts,
+                            content,
+                        } => {
+                            this.bridge.send(Command::SendMessage {
+                                channel: channel.clone(),
+                                content: content.clone(),
+                                thread_ts: Some(thread_ts.clone()),
+                            });
+                        }
+                        ThreadsEvent::PickEmoji(position) => {
+                            this.open_picker(PickerTarget::ThreadsComposer, *position, window, cx);
+                        }
+                        ThreadsEvent::SlashCommand(invocation) => {
+                            this.run_slash(invocation, window, cx)
+                        }
+                        ThreadsEvent::Close => {
+                            this.threads_open = false;
+                            cx.notify();
+                        }
+                    },
+                ),
+                cx.subscribe_in(
+                    &huddles,
+                    window,
+                    |this: &mut App, _, event: &HuddlesEvent, _, cx| match event {
+                        HuddlesEvent::Open(channel) => {
+                            this.huddles_open = false;
+                            this.select(channel.clone(), cx);
+                            this.huddle_open = this.huddle_here();
+                            cx.notify();
+                        }
+                        HuddlesEvent::Close => {
+                            this.huddles_open = false;
+                            cx.notify();
+                        }
+                    },
+                ),
+                cx.subscribe_in(
+                    &directory,
+                    window,
+                    |this: &mut App, _, event: &DirectoryEvent, _, cx| match event {
+                        DirectoryEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                        DirectoryEvent::Join(channel) => {
+                            if let Some(joined) = this.fixtures.conversation(channel).cloned() {
+                                this.sidebar
+                                    .update(cx, |sidebar, cx| sidebar.add_channel(joined, cx));
+                            }
+                        }
+                        DirectoryEvent::Open(channel) => this.select(channel.clone(), cx),
+                        DirectoryEvent::Close => {
+                            this.directory_open = false;
+                            cx.notify();
+                        }
+                    },
+                ),
+                cx.subscribe_in(
+                    &compose,
+                    window,
+                    |this: &mut App, _, event: &NewMessageEvent, window, cx| match event {
+                        NewMessageEvent::Send { channel, content } => {
+                            this.compose_open = false;
+                            this.select(channel.clone(), cx);
+                            this.send(content.clone(), cx);
+                        }
+                        NewMessageEvent::OpenDm { user, content } => {
+                            if this.bridge.store().is_some() {
+                                this.pending_dm = Some(content.clone());
+                                this.bridge.send(Command::OpenDm { user: user.clone() });
+                            } else {
+                                notify(
+                                    "Needs a live workspace",
+                                    "Sign in to start a new DM with this person.",
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                        NewMessageEvent::PickEmoji(position) => {
+                            this.open_picker(PickerTarget::ComposeView, *position, window, cx);
+                        }
+                        NewMessageEvent::SlashCommand(invocation) => {
+                            this.run_slash(invocation, window, cx)
+                        }
+                        NewMessageEvent::Close => {
+                            this.compose_open = false;
+                            cx.notify();
+                        }
+                    },
+                ),
             ];
             cx.spawn_in(window, async move |this, cx| {
                 loop {
@@ -636,6 +761,15 @@ impl App {
                 drafts_open: false,
                 later,
                 later_open: false,
+                threads,
+                threads_open: false,
+                huddles,
+                huddles_open: false,
+                directory,
+                directory_open: false,
+                compose,
+                compose_open: false,
+                pending_dm: None,
                 pins_open: false,
                 os: Rc::new(platform::current()),
                 badge: None,
@@ -788,6 +922,10 @@ impl App {
             .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
         self.thread
             .update(cx, |thread, cx| thread.set_enter_sends(enter_sends, cx));
+        self.threads
+            .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
+        self.compose
+            .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
         self.push_self_state(cx);
     }
 
@@ -935,6 +1073,14 @@ impl App {
                 self.thread
                     .update(cx, |thread, cx| thread.insert_emoji(choice, window, cx));
             }
+            PickerTarget::ThreadsComposer => {
+                self.threads
+                    .update(cx, |view, cx| view.insert_emoji(choice, window, cx));
+            }
+            PickerTarget::ComposeView => {
+                self.compose
+                    .update(cx, |view, cx| view.insert_emoji(choice, window, cx));
+            }
             PickerTarget::Message { channel, ts } => {
                 self.messages.update(cx, |list, cx| {
                     list.add_reaction(&channel, &ts, &choice.name, cx)
@@ -971,9 +1117,7 @@ impl App {
     /// later). History is the caller's: [`App::select`] records it, back/forward replay it.
     fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.chosen = true;
-        self.searching = false;
-        self.drafts_open = false;
-        self.later_open = false;
+        self.close_full_column_views();
         cx.notify();
         self.show_conversation(channel, cx);
     }
@@ -1332,6 +1476,18 @@ impl App {
                 self.peer_dnd_paused.insert(user.clone(), *paused);
                 cx.notify();
             }
+            Event::ThreadsView(view) => {
+                self.threads
+                    .update(cx, |threads, cx| threads.set_remote((**view).clone(), cx));
+                cx.notify();
+            }
+            Event::ConversationOpened(channel) => {
+                let pending = self.pending_dm.take();
+                self.select(channel.clone(), cx);
+                if let Some(content) = pending {
+                    self.send(content, cx);
+                }
+            }
             Event::ConversationInfo {
                 channel,
                 num_members: Some(count),
@@ -1369,6 +1525,14 @@ impl App {
         self.switcher
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.composer
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.threads
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.huddles
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.directory
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.compose
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
@@ -1617,6 +1781,11 @@ impl App {
         self.searching = false;
         self.drafts_open = false;
         self.later_open = false;
+        self.threads_open = false;
+        self.huddles_open = false;
+        self.directory_open = false;
+        self.compose_open = false;
+        self.pending_dm = None;
         self.thread_open = false;
         self.profile_open = false;
         self.pins_open = false;
@@ -1692,6 +1861,117 @@ impl App {
         cx.notify();
     }
 
+    /// Close every full-column view (a conversation or another view is taking the column).
+    fn close_full_column_views(&mut self) {
+        self.searching = false;
+        self.drafts_open = false;
+        self.later_open = false;
+        self.threads_open = false;
+        self.huddles_open = false;
+        self.directory_open = false;
+        self.compose_open = false;
+    }
+
+    /// The Threads view: local cards at once, Slack's own list (`subscriptions.thread.getView`)
+    /// when the fetch answers - and the local ones stay if it never does.
+    fn open_threads(&mut self, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        let cards = local_cards(&self.fixtures);
+        let fixtures = self.fixtures.clone();
+        self.threads.update(cx, |view, cx| {
+            view.set_fixtures(fixtures, cx);
+            view.show_local(cards, cx);
+        });
+        if let Some(store) = self.bridge.store().cloned() {
+            let team = self.fixtures.workspaces[self.workspace].id.clone();
+            let me = self.fixtures.self_user.clone();
+            cx.spawn(async move |this, cx| {
+                let cards = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let Ok(store) = store.lock() else {
+                            return Vec::new();
+                        };
+                        store_cards(&store, &team, &me)
+                    })
+                    .await;
+                this.update(cx, |app, cx| {
+                    app.threads
+                        .update(cx, |view, cx| view.show_store(cards, cx));
+                })
+            })
+            .detach();
+            self.bridge.send(Command::FetchThreads);
+        }
+        self.close_full_column_views();
+        self.threads_open = true;
+        cx.notify();
+    }
+
+    /// The Huddles page: the bundled sample huddle, or the stored `huddle_thread` trails live.
+    fn open_huddles(&mut self, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        let fixtures = self.fixtures.clone();
+        self.huddles
+            .update(cx, |view, cx| view.show_local(&fixtures, cx));
+        if let Some(store) = self.bridge.store().cloned() {
+            let team = self.fixtures.workspaces[self.workspace].id.clone();
+            cx.spawn(async move |this, cx| {
+                let huddles = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let Ok(store) = store.lock() else {
+                            return Vec::new();
+                        };
+                        huddles::store_huddles(&store, &team)
+                    })
+                    .await;
+                this.update(cx, |app, cx| {
+                    app.huddles
+                        .update(cx, |view, cx| view.set_huddles(huddles, cx));
+                })
+            })
+            .detach();
+        }
+        self.close_full_column_views();
+        self.huddles_open = true;
+        cx.notify();
+    }
+
+    /// The directory: the workspace's people and channels.
+    fn open_directory(&mut self, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        let fixtures = self.fixtures.clone();
+        self.directory
+            .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
+        self.close_full_column_views();
+        self.directory_open = true;
+        cx.notify();
+    }
+
+    /// The "New message" view, focused on its To field.
+    fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        let fixtures = self.fixtures.clone();
+        self.compose
+            .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
+        self.compose.update(cx, |view, cx| view.open(window, cx));
+        self.close_full_column_views();
+        self.compose_open = true;
+        cx.notify();
+    }
+
+    /// The gear menu's "Create a channel section": Slack-side in live mode (the section
+    /// arrives with the next sidebar reload), local in the bundled sample workspace.
+    fn create_section(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.fixtures.sample {
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.add_section(name, cx));
+        } else {
+            self.bridge.send(Command::CreateSection { name });
+        }
+    }
+
     fn open_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, _, cx| {
             dialog
@@ -1704,6 +1984,10 @@ impl App {
     fn show_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
         self.drafts_open = false;
         self.later_open = false;
+        self.threads_open = false;
+        self.huddles_open = false;
+        self.directory_open = false;
+        self.compose_open = false;
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.show_nav(item, cx));
         cx.notify();
@@ -1888,6 +2172,14 @@ impl Render for App {
             v_flex().size_full().child(self.drafts.clone())
         } else if self.later_open {
             v_flex().size_full().child(self.later.clone())
+        } else if self.threads_open {
+            v_flex().size_full().child(self.threads.clone())
+        } else if self.huddles_open {
+            v_flex().size_full().child(self.huddles.clone())
+        } else if self.directory_open {
+            v_flex().size_full().child(self.directory.clone())
+        } else if self.compose_open {
+            v_flex().size_full().child(self.compose.clone())
         } else {
             let header = self.conversation_header(&title, &topic, conversation.as_ref(), cx);
             let tabs = self.conversation_tabs(cx);
@@ -2587,6 +2879,11 @@ fn subscribe_workspace(
                 SidebarEvent::SwitchWorkspace(index) => this.switch_workspace(*index, window, cx),
                 SidebarEvent::OpenDrafts => this.open_drafts(cx),
                 SidebarEvent::OpenLater => this.open_later(cx),
+                SidebarEvent::OpenThreads => this.open_threads(cx),
+                SidebarEvent::OpenHuddles => this.open_huddles(cx),
+                SidebarEvent::OpenDirectories => this.open_directory(cx),
+                SidebarEvent::OpenCompose => this.open_compose(window, cx),
+                SidebarEvent::CreateSection { name } => this.create_section(name.clone(), cx),
                 SidebarEvent::ToggleTheme => this.toggle_theme(window, cx),
                 SidebarEvent::OpenUserMenu => {
                     this.user_menu_open = !this.user_menu_open;
@@ -2775,6 +3072,11 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
             | "later"
             | "pins"
             | "activity"
+            | "threads"
+            | "huddles"
+            | "directory"
+            | "compose"
+            | "wsmenu"
             | "notify"
     ) {
         let this = cx.weak_entity();
@@ -2798,6 +3100,13 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                     "later" => app.open_later(cx),
                     "pins" => app.toggle_pins(cx),
                     "activity" => app.show_nav(NavItem::Activity, cx),
+                    "threads" => app.open_threads(cx),
+                    "huddles" => app.open_huddles(cx),
+                    "directory" => app.open_directory(cx),
+                    "compose" => app.open_compose(window, cx),
+                    "wsmenu" => app
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.show_settings_menu(cx)),
                     "notify" => app.post_notification(
                         "demo",
                         "slackless",

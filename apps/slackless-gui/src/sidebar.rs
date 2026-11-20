@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
@@ -43,6 +43,7 @@ use crate::avatars::conversation_avatar;
 use crate::emoji;
 use crate::fixtures::Fixtures;
 use crate::messages::list_stamp;
+use crate::sidebar_menu::{SectionFormEvent, SectionNameForm, workspace_menu};
 use crate::status::{SelfState, self_avatar};
 
 pub enum SidebarEvent {
@@ -55,6 +56,18 @@ pub enum SidebarEvent {
     OpenDrafts,
     /// The "Saved" row.
     OpenLater,
+    /// The "Threads" row: open the Threads view.
+    OpenThreads,
+    /// The "Huddles" row: open the Huddles page.
+    OpenHuddles,
+    /// The "Directories" row: open the directory.
+    OpenDirectories,
+    /// The workspace header's pen: open the "New message" view.
+    OpenCompose,
+    /// The gear menu's "Create a channel section" dialog confirmed `name`.
+    CreateSection {
+        name: String,
+    },
     /// The rail's moon button: switch between the dark and light palette.
     ToggleTheme,
     /// The rail's own avatar: open the user menu.
@@ -146,6 +159,15 @@ pub struct Sidebar {
     draft_count: usize,
     /// In-progress Later items, shown on the "Later" row.
     later_count: usize,
+    /// The gear menu is open (a scrim covers the sidebar list under it).
+    settings_menu_open: bool,
+    /// Slack's "Active only" sidebar filter (Slack's default): hide conversations with no
+    /// activity in 30 days.
+    active_only: bool,
+    /// Sections created locally this session (fixture mode; live ones arrive via the store).
+    local_sections: Vec<ChannelSection>,
+    /// The "Create a channel section" dialog body.
+    section_form: Entity<SectionNameForm>,
     /// Tracks the sidebar list's scroll state; the "More unreads" pills read which unread
     /// rows the scroll offset carries out of view.
     scroll: ScrollHandle,
@@ -172,6 +194,7 @@ impl Sidebar {
                     .auto_grow(1, 1)
             });
             let activity = ActivityFeed::new(fixtures.clone(), cx);
+            let section_form = SectionNameForm::new(window, cx);
             let collapsed = fixtures
                 .collapsed_sections
                 .iter()
@@ -193,6 +216,15 @@ impl Sidebar {
                         }
                     },
                 ),
+                cx.subscribe_in(
+                    &section_form,
+                    window,
+                    |_: &mut Sidebar, _, event: &SectionFormEvent, window, cx| {
+                        let SectionFormEvent::Create(name) = event;
+                        window.close_dialog(cx);
+                        cx.emit(SidebarEvent::CreateSection { name: name.clone() });
+                    },
+                ),
             ];
             Sidebar {
                 fixtures,
@@ -207,6 +239,10 @@ impl Sidebar {
                 huddle: None,
                 draft_count: 0,
                 later_count: 0,
+                settings_menu_open: false,
+                active_only: true,
+                local_sections: Vec::new(),
+                section_form,
                 scroll: ScrollHandle::new(),
                 activity,
                 self_state: SelfState::default(),
@@ -279,6 +315,12 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Open the workspace gear menu (the demo capture hook; a click does the same).
+    pub fn show_settings_menu(&mut self, cx: &mut Context<Self>) {
+        self.settings_menu_open = true;
+        cx.notify();
+    }
+
     /// The dock badge count: unread Activity items plus unread DM messages.
     pub fn badge_count(&self, cx: &gpui_kit::gpui::App) -> u32 {
         let watermark = self.read_watermark();
@@ -300,6 +342,59 @@ impl Sidebar {
             self.joined.push(conversation);
         }
         cx.notify();
+    }
+
+    /// List a section created locally (fixture mode) after the stored ones.
+    pub fn add_section(&mut self, name: String, cx: &mut Context<Self>) {
+        let index = self.local_sections.len() + 1;
+        self.local_sections.push(ChannelSection {
+            id: format!("LLOCAL{index}"),
+            name,
+            kind: SectionKind::Standard,
+            emoji: String::new(),
+            next_id: None,
+            channel_ids: Vec::new(),
+        });
+        cx.notify();
+    }
+
+    /// Slack's "Active only" rule (docs/research/slack-features-shell.md F-SHELL-068): a
+    /// conversation stays listed when it saw activity in the last 30 days. Unknown activity
+    /// keeps it, so a workspace without counts never blanks its sidebar.
+    fn active_recent(&self, conversation: &Conversation) -> bool {
+        if !self.active_only {
+            return true;
+        }
+        let latest = self
+            .fixtures
+            .counts
+            .get(&conversation.id)
+            .and_then(|counts| counts.latest.clone())
+            .or_else(|| {
+                self.fixtures
+                    .messages
+                    .get(&conversation.id)
+                    .and_then(|history| history.last())
+                    .map(|message| message.ts.clone())
+            });
+        let cutoff = crate::drafts::now_secs().saturating_sub(30 * 86_400);
+        latest
+            .and_then(|ts| ts.secs())
+            .and_then(|secs| u64::try_from(secs).ok())
+            .is_none_or(|secs| secs >= cutoff)
+    }
+
+    /// The gear menu's "Create a channel section": the dialog over a fresh name field.
+    fn open_section_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.section_form
+            .update(cx, |form, cx| form.open(window, cx));
+        let form = self.section_form.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("Create a channel section")
+                .w(px(440.))
+                .child(form.clone())
+        });
     }
 
     fn select_row(&mut self, id: ChannelId, cx: &mut Context<Self>) {
@@ -513,8 +608,17 @@ impl Sidebar {
                     .text_color(dim)
                     .size(px(14.)),
             )
-            .child(self.header_icon("ws-settings", IconName::Settings, dim, hover))
-            .child(self.header_icon("ws-compose", IconName::SquarePen, dim, hover))
+            .child(
+                self.header_icon("ws-settings", IconName::Settings, dim, hover)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_menu_open = !this.settings_menu_open;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                self.header_icon("ws-compose", IconName::SquarePen, dim, hover)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenCompose))),
+            )
     }
 
     /// One 24px hover-square for the workspace header's gear / compose icons.
@@ -692,11 +796,16 @@ impl Sidebar {
             v_flex().px_2().pt_2().child(header).into_any_element(),
             ListChild::Plain,
         )];
-        for conversation in conversations.iter().filter(|conversation| {
-            open || conversation.id == self.selected
-                || self.unread_in(conversation, watermark).count > 0
-        }) {
+        for conversation in conversations.iter() {
             let unread = self.unread_in(conversation, watermark);
+            // Like Slack, a collapsed section still lists its unread and open conversations;
+            // "Active only" additionally hides stale ones from expanded sections.
+            let listed = conversation.id == self.selected
+                || unread.count > 0
+                || (open && self.active_recent(conversation));
+            if !listed {
+                continue;
+            }
             let kind = if unread.count > 0 {
                 ListChild::Unread(unread.mentions > 0)
             } else {
@@ -731,7 +840,14 @@ impl Sidebar {
         watermark: Option<&Ts>,
         cx: &mut Context<Self>,
     ) -> Vec<(AnyElement, ListChild)> {
-        if self.fixtures.sections.is_empty() {
+        let sections: Vec<ChannelSection> = self
+            .fixtures
+            .sections
+            .iter()
+            .chain(&self.local_sections)
+            .cloned()
+            .collect();
+        if sections.is_empty() {
             let mut children = self.section(
                 "channels".into(),
                 Some(caret()),
@@ -751,9 +867,7 @@ impl Sidebar {
             return children;
         }
         // Slack fills External connections itself, from the externally shared channels.
-        let connect = self
-            .fixtures
-            .sections
+        let connect = sections
             .iter()
             .any(|section| section.kind == SectionKind::SlackConnect);
         let builtin = |kind: &SectionKind| {
@@ -767,9 +881,7 @@ impl Sidebar {
             SectionKind::UserGroup => 2,
             _ => 3,
         };
-        let mut ranked: Vec<&ChannelSection> = self
-            .fixtures
-            .sections
+        let mut ranked: Vec<&ChannelSection> = sections
             .iter()
             .filter(|section| !builtin(&section.kind))
             .collect();
@@ -787,7 +899,7 @@ impl Sidebar {
                 .find(|conversation| conversation.id == *id)
         };
         let mut list = Vec::new();
-        for section in &self.fixtures.sections {
+        for section in &sections {
             let mut rows: Vec<Conversation> = match section.kind {
                 SectionKind::Channels => channels
                     .iter()
@@ -1467,8 +1579,10 @@ impl Render for Sidebar {
                         false,
                         None,
                         cx,
-                    ),
-                    self.nav_row("huddles", IconName::Headphones, "Huddles", false, None, cx),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenThreads))),
+                    self.nav_row("huddles", IconName::Headphones, "Huddles", false, None, cx)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles))),
                     self.nav_row(
                         "drafts",
                         IconName::Send,
@@ -1494,7 +1608,8 @@ impl Render for Sidebar {
                         false,
                         None,
                         cx,
-                    ),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenDirectories))),
                 ] {
                     children.push(row.into_any_element());
                 }
@@ -1524,6 +1639,7 @@ impl Render for Sidebar {
         };
 
         h_flex()
+            .relative()
             .size_full()
             .bg(sidebar_bg)
             .text_color(sidebar_fg)
@@ -1567,5 +1683,51 @@ impl Render for Sidebar {
                         )
                     }),
             )
+            .when(self.settings_menu_open, |sidebar| {
+                let toggle = cx.weak_entity();
+                let on_active_only = move |_: &mut Window, cx: &mut gpui_kit::gpui::App| {
+                    toggle
+                        .update(cx, |sidebar: &mut Sidebar, cx| {
+                            sidebar.active_only = !sidebar.active_only;
+                            sidebar.settings_menu_open = false;
+                            cx.notify();
+                        })
+                        .ok();
+                };
+                let create = cx.weak_entity();
+                let on_create_section = move |window: &mut Window, cx: &mut gpui_kit::gpui::App| {
+                    create
+                        .update(cx, |sidebar: &mut Sidebar, cx| {
+                            sidebar.settings_menu_open = false;
+                            sidebar.open_section_dialog(window, cx);
+                        })
+                        .ok();
+                };
+                sidebar
+                    .child(
+                        div()
+                            .id("workspace-menu-scrim")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings_menu_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(44.))
+                            .right(px(8.))
+                            .child(workspace_menu(
+                                self.active_only,
+                                on_active_only,
+                                on_create_section,
+                                cx,
+                            )),
+                    )
+            })
     }
 }

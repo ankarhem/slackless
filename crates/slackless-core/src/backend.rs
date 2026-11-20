@@ -5,7 +5,7 @@ use std::future::Future;
 
 use crate::api::{
     self, ClientCounts, HistoryOpts, MessageContent, Page, PostedMessage, SearchMessages,
-    SearchOpts, SlackApi, UserBoot,
+    SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
 };
 use crate::types::{
     ChannelId, ChannelSection, Conversation, DndStatus, Message, Ts, User, UserId, UserPresence,
@@ -13,6 +13,9 @@ use crate::types::{
 
 /// `conversations.history` page size the core requests (Slack max 999).
 pub(crate) const HISTORY_PAGE_LIMIT: u32 = 200;
+
+/// `subscriptions.thread.getView` page size the core requests.
+pub(crate) const THREADS_PAGE_LIMIT: u32 = 50;
 
 /// The Slack calls the core makes. [`SlackApi`] is the real implementation; tests drive the core
 /// with an in-process fake.
@@ -91,6 +94,15 @@ pub trait Backend: Clone + Send + Sync + 'static {
         ts: Ts,
         name: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// The followed threads of the Threads view (`subscriptions.thread.getView`), page one.
+    fn threads_view(&self) -> impl Future<Output = api::Result<ThreadsView>> + Send;
+    /// Open (or find) the DM with `user` (`conversations.open`).
+    fn open_dm(&self, user: UserId) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Create a sidebar channel section (`users.channelSections.create`).
+    fn create_section(
+        &self,
+        name: String,
+    ) -> impl Future<Output = api::Result<SectionCreated>> + Send;
     fn search(&self, query: String) -> impl Future<Output = api::Result<SearchMessages>> + Send;
     fn mark_read(&self, channel: ChannelId, ts: Ts)
     -> impl Future<Output = api::Result<()>> + Send;
@@ -209,6 +221,18 @@ impl Backend for SlackApi {
 
     async fn search(&self, query: String) -> api::Result<SearchMessages> {
         self.search_messages(&query, &SearchOpts::default()).await
+    }
+
+    async fn threads_view(&self) -> api::Result<ThreadsView> {
+        self.subscriptions_thread_get_view(THREADS_PAGE_LIMIT).await
+    }
+
+    async fn open_dm(&self, user: UserId) -> api::Result<Conversation> {
+        self.conversations_open(user.as_str()).await
+    }
+
+    async fn create_section(&self, name: String) -> api::Result<SectionCreated> {
+        self.users_channel_sections_create(&name, "").await
     }
 
     async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {

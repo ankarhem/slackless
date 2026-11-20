@@ -23,7 +23,8 @@ pub use error::ApiError;
 pub use methods::{
     AuthTest, ClientCounts, ConversationCounts, ConversationView, HistoryOpts, ListOpts,
     MessageContent, PostedMessage, SearchChannel, SearchMatch, SearchMessages, SearchOpts,
-    SearchPagination, SearchSort, ThreadCounts, UserBoot,
+    SearchPagination, SearchSort, SectionCreated, ThreadCounts, ThreadSubscription, ThreadsView,
+    UserBoot,
 };
 pub use pagination::{Page, paginate};
 

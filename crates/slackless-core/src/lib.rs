@@ -67,6 +67,11 @@ pub enum Command {
         channel: ChannelId,
         thread_ts: Ts,
     },
+    /// The user opened the Threads view: fetch the followed threads from Slack
+    /// (`subscriptions.thread.getView`) and announce them as [`Event::ThreadsView`]. No
+    /// store fallback lives here; the front-end serves its local data until the event lands
+    /// (and keeps it when the fetch fails).
+    FetchThreads,
     /// Post a message (its blocks, with the text as fallback); `thread_ts` replies in a
     /// thread.
     SendMessage {
@@ -101,6 +106,16 @@ pub enum Command {
     MarkRead {
         channel: ChannelId,
         ts: Ts,
+    },
+    /// Open (or find) the DM with `user` (`conversations.open`), store it and announce it
+    /// with [`Event::ConversationOpened`].
+    OpenDm {
+        user: UserId,
+    },
+    /// Create a sidebar channel section (`users.channelSections.create`), then re-read the
+    /// sections and announce [`Event::SidebarChanged`].
+    CreateSection {
+        name: String,
     },
     /// Send a typing indicator.
     Typing {
@@ -159,6 +174,11 @@ pub enum Event {
         query: String,
         results: Box<api::SearchMessages>,
     },
+    /// The followed threads of [`Command::FetchThreads`]
+    /// (`subscriptions.thread.getView`).
+    ThreadsView(Box<api::ThreadsView>),
+    /// The DM of a [`Command::OpenDm`] opened (or was already open): its conversation id.
+    ConversationOpened(ChannelId),
     /// The session was rejected; the user has to sign in again. Carries Slack's error.
     AuthExpired(String),
     /// A non-fatal failure worth surfacing.

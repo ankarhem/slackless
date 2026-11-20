@@ -421,3 +421,108 @@ async fn fetches_a_users_dnd_and_presence() {
     assert_eq!(presence.presence, slackless_api::types::Presence::Active);
     assert_eq!(presence.online, Some(true));
 }
+
+#[tokio::test]
+async fn thread_view_parses_roots_and_sends_web_client_params() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/subscriptions.thread.getView"))
+        .and(body_string_contains("limit=50"))
+        .and(body_string_contains("fetch_threads_state=true"))
+        .and(body_string_contains("priority_mode=all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "total_unread_replies": 3,
+            "new_threads_count": 1,
+            "has_more": true,
+            "max_ts": "1772325870.309319",
+            "threads": [
+                {
+                    "root_msg": {
+                        "channel": "C1",
+                        "ts": "1700000300.000400",
+                        "thread_ts": "1700000300.000400",
+                        "user": "U1",
+                        "text": "root",
+                        "reply_count": 2,
+                        "last_read": "1700000300.000500",
+                        "subscribed": true
+                    },
+                    "latest_replies": [
+                        {"ts": "1700000300.000600", "user": "U2", "text": "newest"}
+                    ],
+                    "unread_replies": [
+                        {"ts": "1700000300.000500", "user": "U2", "text": "unread"}
+                    ]
+                },
+                {
+                    "root_msg": null,
+                    "latest_replies": [{"ts": "1.0", "text": "orphan"}]
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let view = api.subscriptions_thread_get_view(50).await.unwrap();
+    assert_eq!(view.total_unread_replies, 3);
+    assert!(view.has_more);
+    assert_eq!(view.threads.len(), 2, "a null root keeps its thread entry");
+    let thread = &view.threads[0];
+    assert_eq!(thread.root.channel.as_ref().unwrap().as_str(), "C1");
+    assert_eq!(thread.root.reply_count, Some(2));
+    assert_eq!(thread.root.subscribed, Some(true));
+    assert_eq!(
+        thread.root.last_read.as_ref().unwrap().as_str(),
+        "1700000300.000500"
+    );
+    assert_eq!(thread.latest_replies[0].text, "newest");
+    assert_eq!(thread.unread_replies.len(), 1);
+    assert_eq!(view.threads[1].root.ts.as_str(), "", "a null root defaults");
+}
+
+#[tokio::test]
+async fn conversations_open_parses_the_channel() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.open"))
+        .and(body_string_contains("users=U2"))
+        .and(body_string_contains("return_im=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "no_op": true,
+            "already_open": true,
+            "channel": {"id": "D1", "is_im": true, "user": "U2", "is_open": true}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dm = api.conversations_open("U2").await.unwrap();
+    assert_eq!(dm.id.as_str(), "D1");
+    assert_eq!(dm.user.as_ref().unwrap().as_str(), "U2");
+    assert!(dm.is_im);
+}
+
+#[tokio::test]
+async fn channel_section_create_sends_name_and_emoji_key() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.channelSections.create"))
+        .and(body_string_contains("name=Priority"))
+        .and(body_string_contains("emoji="))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "channel_section_id": "L0B12LBBCTD"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let created = api
+        .users_channel_sections_create("Priority", "")
+        .await
+        .unwrap();
+    assert_eq!(created.channel_section_id, "L0B12LBBCTD");
+}

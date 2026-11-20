@@ -479,6 +479,30 @@ impl<B: Backend> Core<B> {
             Command::MarkRead { channel, ts } => self.spawn("conversations.mark", async move {
                 Ok(backend.mark_read(channel, ts).await?)
             }),
+            Command::FetchThreads => {
+                self.spawn("subscriptions.thread.getView", async move {
+                    let view = Box::new(backend.threads_view().await?);
+                    events.emit(Event::ThreadsView(view));
+                    Ok(())
+                });
+            }
+            Command::OpenDm { user } => self.spawn("conversations.open", async move {
+                let dm = backend.open_dm(user).await?;
+                let channel = dm.id.clone();
+                with_store(&store, move |s| s.upsert_conversation(&ws, &dm)).await?;
+                events.emit(Event::Conversations(vec![channel.clone()]));
+                events.emit(Event::ConversationOpened(channel));
+                Ok(())
+            }),
+            Command::CreateSection { name } => {
+                self.spawn("users.channelSections.create", async move {
+                    backend.create_section(name).await?;
+                    let sections = backend.channel_sections().await?;
+                    with_store(&store, move |s| s.replace_sections(&ws, &sections)).await?;
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
             Command::Typing { channel, thread_ts } => {
                 if let Some(Err(e)) = self.rtm.as_ref().map(|r| r.user_typing(channel, thread_ts)) {
                     events.emit(Event::Error(format!("typing: {e}")));
@@ -785,6 +809,10 @@ pub(crate) mod tests {
         calls: Vec<(Option<Ts>, Option<String>)>,
         /// One thread (`conversations.replies`): the root followed by its replies.
         thread: Vec<Message>,
+        /// The `subscriptions.thread.getView` answer.
+        threads_view: api::ThreadsView,
+        /// Sidebar sections served by `channel_sections`; `create_section` appends here.
+        sections: Vec<ChannelSection>,
         reply_calls: Vec<(Ts, Option<String>)>,
         rate_limited: u32,
         fail_replies: bool,
@@ -805,6 +833,11 @@ pub(crate) mod tests {
             let fake = Self::default();
             fake.push_history(range);
             fake
+        }
+
+        /// The `subscriptions.thread.getView` answer.
+        pub fn set_threads_view(&self, view: api::ThreadsView) {
+            self.state.lock().unwrap().threads_view = view;
         }
 
         pub fn push_history(&self, range: RangeInclusive<u32>) {
@@ -935,24 +968,32 @@ pub(crate) mod tests {
 
         async fn channel_sections(&self) -> api::Result<Vec<ChannelSection>> {
             // Stored order is deliberately not display order: L2 points at L1.
-            Ok(vec![
-                ChannelSection {
-                    id: "L1".to_owned(),
-                    name: "Channels".to_owned(),
-                    kind: SectionKind::Channels,
-                    emoji: String::new(),
-                    next_id: None,
-                    channel_ids: Vec::new(),
-                },
-                ChannelSection {
-                    id: "L2".to_owned(),
-                    name: "Priority".to_owned(),
-                    kind: SectionKind::Standard,
-                    emoji: "rocket".to_owned(),
-                    next_id: Some("L1".to_owned()),
-                    channel_ids: vec![ChannelId::from("C1")],
-                },
-            ])
+            let base = || {
+                vec![
+                    ChannelSection {
+                        id: "L1".to_owned(),
+                        name: "Channels".to_owned(),
+                        kind: SectionKind::Channels,
+                        emoji: String::new(),
+                        next_id: None,
+                        channel_ids: Vec::new(),
+                    },
+                    ChannelSection {
+                        id: "L2".to_owned(),
+                        name: "Priority".to_owned(),
+                        kind: SectionKind::Standard,
+                        emoji: "rocket".to_owned(),
+                        next_id: Some("L1".to_owned()),
+                        channel_ids: vec![ChannelId::from("C1")],
+                    },
+                ]
+            };
+            let state = self.state.lock().unwrap();
+            Ok(if state.sections.is_empty() {
+                base()
+            } else {
+                state.sections.clone()
+            })
         }
 
         async fn custom_emoji(&self) -> api::Result<HashMap<String, String>> {
@@ -1116,6 +1157,33 @@ pub(crate) mod tests {
             Ok(SearchMessages {
                 total: 7,
                 ..Default::default()
+            })
+        }
+
+        async fn threads_view(&self) -> api::Result<api::ThreadsView> {
+            Ok(self.state.lock().unwrap().threads_view.clone())
+        }
+
+        async fn open_dm(&self, user: UserId) -> api::Result<Conversation> {
+            Ok(Conversation {
+                id: ChannelId::from("D9"),
+                is_im: true,
+                user: Some(user),
+                ..Default::default()
+            })
+        }
+
+        async fn create_section(&self, name: String) -> api::Result<api::SectionCreated> {
+            self.state.lock().unwrap().sections.push(ChannelSection {
+                id: "LNEW".to_owned(),
+                name,
+                kind: SectionKind::Standard,
+                emoji: String::new(),
+                next_id: None,
+                channel_ids: Vec::new(),
+            });
+            Ok(api::SectionCreated {
+                channel_section_id: "LNEW".to_owned(),
             })
         }
 
@@ -1528,5 +1596,93 @@ pub(crate) mod tests {
         }
         assert_eq!(fake.presence_calls(), vec![UserId::from("U2")]);
         assert_eq!(fake.dnd_calls().len(), 2, "dnd re-fetched per open");
+    }
+
+    #[tokio::test]
+    async fn fetch_threads_emits_the_view() {
+        let fake = FakeBackend::default();
+        fake.set_threads_view(api::ThreadsView {
+            total_unread_replies: 2,
+            threads: vec![api::ThreadSubscription {
+                root: Message {
+                    ts: Ts::from("5.0"),
+                    text: "root".into(),
+                    ..Default::default()
+                },
+                latest_replies: vec![Message {
+                    ts: Ts::from("5.0.1"),
+                    text: "reply".into(),
+                    ..Default::default()
+                }],
+                unread_replies: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::FetchThreads);
+
+        let Event::ThreadsView(view) = next(&mut rx).await else {
+            panic!("expected the threads view");
+        };
+        assert_eq!(view.total_unread_replies, 2);
+        assert_eq!(view.threads[0].root.ts.as_str(), "5.0");
+        assert_eq!(view.threads[0].latest_replies[0].text, "reply");
+    }
+
+    #[tokio::test]
+    async fn open_dm_stores_and_announces_the_conversation() {
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(
+            FakeBackend::default(),
+            Arc::clone(&store),
+            TeamId::from("T1"),
+            events,
+        );
+
+        core.handle(Command::OpenDm {
+            user: UserId::from("U2"),
+        });
+
+        assert_eq!(
+            next(&mut rx).await,
+            Event::Conversations(vec![ChannelId::from("D9")])
+        );
+        assert_eq!(
+            next(&mut rx).await,
+            Event::ConversationOpened(ChannelId::from("D9"))
+        );
+        let stored = store
+            .lock()
+            .unwrap()
+            .conversation(&TeamId::from("T1"), &ChannelId::from("D9"))
+            .unwrap()
+            .expect("the DM lands in the store");
+        assert_eq!(stored.user, Some(UserId::from("U2")));
+    }
+
+    #[tokio::test]
+    async fn create_section_reloads_the_stored_sections() {
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(
+            FakeBackend::default(),
+            Arc::clone(&store),
+            TeamId::from("T1"),
+            events,
+        );
+
+        core.handle(Command::CreateSection {
+            name: "Quiet".into(),
+        });
+
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        let sections = store.lock().unwrap().sections(&TeamId::from("T1")).unwrap();
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.id == "LNEW" && section.name == "Quiet"),
+            "the created section is back from the section re-read"
+        );
     }
 }

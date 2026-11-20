@@ -331,6 +331,38 @@ pub struct SearchPagination {
     pub next_cursor: Option<String>,
 }
 
+/// `subscriptions.thread.getView`: the Threads view's followed threads, newest activity
+/// first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ThreadsView {
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub total_unread_replies: u32,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub has_more: bool,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub threads: Vec<ThreadSubscription>,
+}
+
+/// One thread of [`ThreadsView`]: the channel-level root plus its latest and unread replies.
+/// The root's `extra` carries the view-only fields (`last_read`, `subscribed`, ...); a thread
+/// whose root did not parse keeps the default root (empty `ts`) and is skipped by callers.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ThreadSubscription {
+    #[serde(rename = "root_msg", default, deserialize_with = "null_default")]
+    pub root: Message,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub latest_replies: Vec<Message>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub unread_replies: Vec<Message>,
+}
+
+/// `users.channelSections.create`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SectionCreated {
+    #[serde(default)]
+    pub channel_section_id: String,
+}
+
 // Wire wrappers for payloads that nest the useful value under one key.
 
 #[derive(Deserialize)]
@@ -605,6 +637,34 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `conversations.open`: opens (or finds) the DM with `users`, a comma-separated id list.
+    /// `return_im` makes a single-user call answer one `channel` object.
+    pub async fn conversations_open(&self, users: &str) -> Result<Conversation> {
+        let params = vec![
+            ("users", users.to_owned()),
+            ("return_im", "true".to_owned()),
+        ];
+        let resp = self
+            .call::<ChannelWire>(method::CONVERSATIONS_OPEN, params)
+            .await?;
+        Ok(resp.data.channel)
+    }
+
+    /// `subscriptions.thread.getView`: the followed threads of the Threads view, newest
+    /// activity first (the web client's `fetch_threads_state` / `priority_mode` parameters;
+    /// `limit` is the page size, `has_more` says older threads exist).
+    pub async fn subscriptions_thread_get_view(&self, limit: u32) -> Result<ThreadsView> {
+        let params = vec![
+            ("limit", limit.to_string()),
+            ("fetch_threads_state", "true".to_owned()),
+            ("priority_mode", "all".to_owned()),
+        ];
+        Ok(self
+            .call(method::SUBSCRIPTIONS_THREAD_GET_VIEW, params)
+            .await?
+            .data)
+    }
+
     /// `chat.postMessage` in the web client's wire format: `blocks` JSON, a fresh UUID
     /// `client_msg_id` for server-side dedup, `unfurl=[]`. Set `thread_ts` to reply in a thread;
     /// `reply_broadcast` also posts the reply to the channel.
@@ -783,6 +843,21 @@ impl SlackApi {
             }
         }
         Ok(sections)
+    }
+
+    /// `users.channelSections.create`: a sidebar section. `emoji` is a bare emoji name; the
+    /// key is sent even when empty because Slack rejects a call without it
+    /// (docs/research/api-channels.md).
+    pub async fn users_channel_sections_create(
+        &self,
+        name: &str,
+        emoji: &str,
+    ) -> Result<SectionCreated> {
+        let params = vec![("name", name.to_owned()), ("emoji", emoji.to_owned())];
+        Ok(self
+            .call(method::USERS_CHANNEL_SECTIONS_CREATE, params)
+            .await?
+            .data)
     }
 
     /// `search.messages` with Slack's query modifier syntax (`in:`, `from:`, `before:`, ...).
