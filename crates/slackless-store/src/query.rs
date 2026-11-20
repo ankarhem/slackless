@@ -24,6 +24,11 @@ pub struct SearchFilters {
     /// Messages strictly after this day (UTC).
     pub after: Option<Date>,
     pub has: Vec<Has>,
+    /// Messages mentioning this user id (`<@U…>` in the text). Not parsed from a
+    /// modifier: the search menu's "Includes me" chip sets it programmatically.
+    pub includes_user: Option<String>,
+    /// Only thread replies (a stored `thread_ts`). Set by the "Threads only" chip.
+    pub threads_only: bool,
 }
 
 /// `has:` targets.

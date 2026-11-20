@@ -3,7 +3,7 @@
 use futures::TryStreamExt;
 use serde_json::json;
 use slackless_api::types::{Block, ChannelId, MessageSubtype, SectionKind, Ts, UserId};
-use slackless_api::{ApiError, HistoryOpts, MessageContent, SlackApi, paginate};
+use slackless_api::{ApiError, FilesFilter, HistoryOpts, MessageContent, SlackApi, paginate};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -653,7 +653,7 @@ async fn files_list_pages_by_count_and_page() {
         .await;
 
     let page = api
-        .files_list(&ChannelId::from("C1"), 100, 1)
+        .files_list(&FilesFilter::channel(ChannelId::from("C1")), 100, 1)
         .await
         .unwrap();
 
@@ -664,6 +664,40 @@ async fn files_list_pages_by_count_and_page() {
         page.next_cursor.is_none(),
         "page-based paging carries no cursor"
     );
+}
+
+#[tokio::test]
+async fn files_list_without_a_channel_sends_only_the_given_filters() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/files.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "files": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let filter = FilesFilter {
+        user: Some(UserId::from("U1")),
+        types: Some("canvas".to_owned()),
+        ..FilesFilter::workspace()
+    };
+    api.files_list(&filter, 200, 1).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let sent = form(&requests[0]);
+    let param = |key: &str| {
+        sent.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(
+        param("channel"),
+        None,
+        "a workspace-wide list names no channel"
+    );
+    assert_eq!(param("user"), Some("U1"));
+    assert_eq!(param("types"), Some("canvas"));
+    assert_eq!(param("count"), Some("200"));
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use futures::TryStreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::client::Params;
@@ -70,6 +70,35 @@ pub struct ListOpts {
     pub exclude_archived: bool,
     /// Page size (Slack max 999, default 100).
     pub limit: Option<u32>,
+}
+
+/// Filters for `files.list` (`FilesFilter::channel` / `FilesFilter::workspace` plus the
+/// optional narrowings).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FilesFilter {
+    /// The conversation whose shared files to list (the Files & links tab); `None` asks
+    /// for every file the signed-in user can see workspace-wide (the Files view).
+    pub channel: Option<ChannelId>,
+    /// Only files uploaded by this person.
+    pub user: Option<UserId>,
+    /// Comma-delimited file kinds: Slack documents `images`, `pdfs`, `snippets`, `spaces`
+    /// (legacy Posts) and more; `canvas` (canvases) is observed but undocumented.
+    pub types: Option<String>,
+}
+
+impl FilesFilter {
+    /// The files shared with one conversation.
+    pub fn channel(channel: ChannelId) -> Self {
+        Self {
+            channel: Some(channel),
+            ..Default::default()
+        }
+    }
+
+    /// Every file the signed-in user can see in the workspace.
+    pub fn workspace() -> Self {
+        Self::default()
+    }
 }
 
 /// `sort` for `search.messages`.
@@ -436,6 +465,118 @@ pub struct CanvasCreated {
     pub canvas_id: String,
 }
 
+/// `activity.feed`: the Activity view's items, newest first, with the read state Slack
+/// tracks per entry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityFeed {
+    pub items: Vec<ActivityItem>,
+    /// Cursor of the next (older) page; `None` on the last page.
+    pub next_cursor: Option<String>,
+}
+
+/// The feed categories slackless models; each maps onto a tab of the Activity view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivityKind {
+    #[default]
+    Unknown,
+    /// A message that mentions the user: every mention flavour plus keyword highlights.
+    Mention,
+    /// A followed thread with activity.
+    Thread,
+    /// A reaction to the user's message.
+    Reaction,
+    /// A direct message.
+    Dm,
+    /// An app/bot DM (`bot_dm_bundle`).
+    App,
+    /// Activity in a channel the user is not joined to (`channel`).
+    Channel,
+}
+
+impl ActivityKind {
+    /// The `type` string Slack tags the payload with (the same string `activity.markRead`
+    /// hands back; alias mention flavours collapse to `at_user`).
+    pub fn type_name(self) -> &'static str {
+        match self {
+            ActivityKind::Unknown => "unknown",
+            ActivityKind::Mention => "at_user",
+            ActivityKind::Thread => "thread_v2",
+            ActivityKind::Reaction => "message_reaction",
+            ActivityKind::Dm => "dm",
+            ActivityKind::App => "bot_dm_bundle",
+            ActivityKind::Channel => "channel",
+        }
+    }
+}
+
+/// One `activity.feed` row, normalized from its per-type payload: every modeled type points
+/// at a conversation message and says who the row is about, so the view renders one shape.
+/// Entries of a type slackless does not model fail the tag parse, so `lenient_vec` skips
+/// them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityItem {
+    pub kind: ActivityKind,
+    pub unread: bool,
+    /// When the entry landed in the feed; with `key`, the `activity.markRead` handles.
+    pub feed_ts: Ts,
+    /// The entry's server id, e.g. `thread_v2-C0123-1784891984.803759`.
+    pub key: String,
+    /// The conversation the row opens.
+    pub channel: ChannelId,
+    /// The thread the row opens (thread activity, replies to the user's threaded message).
+    pub thread_ts: Option<Ts>,
+    /// The row's message: its author and its stamp.
+    pub ts: Ts,
+    /// Who the row is about: the mentioning author, the reactor. Thread rows name their
+    /// latest replier through the hydrated body.
+    pub actor: Option<UserId>,
+    /// `message_reaction`: the reaction and who added it.
+    pub reaction: Option<ActivityReaction>,
+    /// The unread pill count (thread activity), 0 when the row only shows a dot.
+    pub count: u32,
+    /// The row's body when the feed or [`SlackApi::messages_list`] carried it; the text to
+    /// render, and the avatar/name source once present.
+    pub message: Option<Message>,
+}
+
+/// A reaction on a `message_reaction` row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityReaction {
+    /// Emoji shortcode, e.g. `eyes`.
+    pub name: String,
+    /// Who reacted.
+    pub user: Option<UserId>,
+}
+
+impl ActivityItem {
+    /// The entry `activity.markRead` / `activity.markUnread` needs for this row: the type
+    /// string is the key's prefix (Slack embeds it: `thread_v2-C…-…`), which keeps alias
+    /// mention flavours (`at_channel`, …) their own type.
+    pub fn entry(&self) -> ActivityEntry {
+        let kind = self
+            .key
+            .split_once('-')
+            .map(|(kind, _)| kind.to_owned())
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or_else(|| self.kind.type_name().to_owned());
+        ActivityEntry {
+            kind,
+            key: self.key.clone(),
+            feed_ts: self.feed_ts.clone(),
+        }
+    }
+}
+
+/// One `activity.markRead` / `activity.markUnread` entry: the `type` / `key` / `feed_ts`
+/// handles every feed item carries.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivityEntry {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub key: String,
+    pub feed_ts: Ts,
+}
+
 // Wire wrappers for payloads that nest the useful value under one key.
 
 #[derive(Deserialize)]
@@ -447,6 +588,11 @@ struct MessagesWire {
 #[derive(Deserialize)]
 struct ChannelWire {
     channel: Conversation,
+}
+
+#[derive(Deserialize)]
+struct TeamWire {
+    team: Team,
 }
 
 #[derive(Deserialize)]
@@ -559,6 +705,166 @@ struct SectionWire {
 struct IdsPageWire {
     #[serde(default, deserialize_with = "or_default")]
     channel_ids: Vec<ChannelId>,
+}
+
+/// One `activity.feed` entry as Slack sends it: the read-state envelope around a payload
+/// tagged with its `type`. Unknown tags fail the tag parse, so `lenient_vec` skips the
+/// whole entry.
+#[derive(Deserialize)]
+struct ActivityItemWire {
+    #[serde(rename = "is_unread", default, deserialize_with = "lenient_bool")]
+    unread: bool,
+    #[serde(default)]
+    feed_ts: Ts,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    item: ActivityPayloadWire,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(tag = "type")]
+enum ActivityPayloadWire {
+    /// Every mention flavour the feed carries in one shape: `at_user`, `at_user_group`,
+    /// `at_channel`, `at_everyone`, `keyword`, `unjoined_channel_mention`.
+    #[serde(
+        rename = "at_user",
+        alias = "at_user_group",
+        alias = "at_channel",
+        alias = "at_everyone",
+        alias = "keyword",
+        alias = "unjoined_channel_mention"
+    )]
+    Mention {
+        #[serde(default)]
+        message: ActivityRefWire,
+    },
+    /// A followed thread's activity.
+    #[serde(rename = "thread_v2")]
+    Thread {
+        #[serde(default)]
+        bundle_info: ActivityThreadBundleWire,
+    },
+    /// Someone reacted to the user's message.
+    #[serde(rename = "message_reaction")]
+    Reaction {
+        #[serde(default)]
+        message: ActivityRefWire,
+        #[serde(default)]
+        reaction: ActivityReactionWire,
+    },
+    /// A DM (`bundle_info.payload.dm_entry`).
+    #[serde(rename = "dm")]
+    Dm {
+        #[serde(default)]
+        bundle_info: ActivityMessageBundleWire,
+    },
+    /// An app/bot DM (`bundle_info.payload.message`).
+    #[serde(rename = "bot_dm_bundle")]
+    App {
+        #[serde(default)]
+        bundle_info: ActivityMessageBundleWire,
+    },
+    /// Channel activity (`bundle_info.payload.channel_entry`).
+    #[serde(rename = "channel")]
+    Channel {
+        #[serde(default)]
+        bundle_info: ActivityMessageBundleWire,
+    },
+    /// The envelope's `item` was missing; never produced for a tag Slack sent.
+    #[default]
+    Unknown,
+}
+
+/// The message pointer a mention or reaction carries: ids, no body (those rows are hydrated
+/// through `messages.list`).
+#[derive(Deserialize, Default)]
+struct ActivityRefWire {
+    #[serde(default)]
+    channel: ChannelId,
+    #[serde(default)]
+    ts: Ts,
+    #[serde(rename = "author_user_id", default)]
+    author: Option<UserId>,
+    #[serde(default)]
+    thread_ts: Option<Ts>,
+}
+
+/// `thread_v2`'s `bundle_info`: the unread pill plus the nested `payload.thread_entry`.
+#[derive(Deserialize, Default)]
+struct ActivityThreadBundleWire {
+    #[serde(default, deserialize_with = "lenient_u32")]
+    unread_count: u32,
+    #[serde(default, deserialize_with = "or_default")]
+    payload: ActivityThreadPayloadWire,
+}
+
+#[derive(Deserialize, Default)]
+struct ActivityThreadPayloadWire {
+    #[serde(default, deserialize_with = "or_default")]
+    thread_entry: Option<ActivityThreadEntryWire>,
+}
+
+#[derive(Deserialize, Default)]
+struct ActivityThreadEntryWire {
+    #[serde(rename = "channel_id", default)]
+    channel: ChannelId,
+    #[serde(default)]
+    thread_ts: Ts,
+    #[serde(default)]
+    latest_ts: Ts,
+    #[serde(default, deserialize_with = "lenient_u32")]
+    unread_msg_count: u32,
+}
+
+/// `message_reaction`'s `reaction`.
+#[derive(Deserialize, Default)]
+struct ActivityReactionWire {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    user: Option<UserId>,
+}
+
+/// `dm` / `bot_dm_bundle` / `channel`'s `bundle_info`: the newest message under `payload`
+/// (keyed by the payload's own entry name) plus the bundle's unread count.
+#[derive(Deserialize, Default)]
+struct ActivityMessageBundleWire {
+    #[serde(default, deserialize_with = "lenient_u32")]
+    unread_count: u32,
+    #[serde(default, deserialize_with = "or_default")]
+    payload: ActivityPayloadEntryWire,
+}
+
+#[derive(Deserialize, Default)]
+struct ActivityPayloadEntryWire {
+    #[serde(default, deserialize_with = "or_default")]
+    dm_entry: Option<ActivityLatestWire>,
+    #[serde(default, deserialize_with = "or_default")]
+    channel_entry: Option<ActivityLatestWire>,
+    #[serde(default, deserialize_with = "or_default")]
+    message: Option<Message>,
+}
+
+/// An entry whose `latest_message` is a full message object (the channel id rides in its
+/// `extra`, as with every `Message`).
+#[derive(Deserialize, Default)]
+struct ActivityLatestWire {
+    #[serde(default, deserialize_with = "or_default")]
+    latest_message: Option<Message>,
+}
+
+/// `messages.list`: the bodies of the asked-for messages, by channel.
+#[derive(Deserialize, Default)]
+struct MessagesListWire {
+    #[serde(default, deserialize_with = "or_default")]
+    messages_data: HashMap<String, MessagesChannelWire>,
+}
+
+#[derive(Deserialize, Default)]
+struct MessagesChannelWire {
+    #[serde(default, deserialize_with = "null_default")]
+    messages: Vec<Message>,
 }
 
 #[derive(Deserialize)]
@@ -869,6 +1175,53 @@ impl SlackApi {
         Ok(resp.data.channel)
     }
 
+    /// `conversations.setTopic`: replace `channel`'s topic; the answer carries the updated
+    /// channel object.
+    pub async fn conversations_set_topic(
+        &self,
+        channel: &ChannelId,
+        topic: &str,
+    ) -> Result<Conversation> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("topic", topic.to_owned()),
+        ];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_SET_TOPIC, params)
+            .await?
+            .data
+            .channel)
+    }
+
+    /// `conversations.setPurpose`: replace `channel`'s description; the answer carries the
+    /// updated channel object.
+    pub async fn conversations_set_purpose(
+        &self,
+        channel: &ChannelId,
+        purpose: &str,
+    ) -> Result<Conversation> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("purpose", purpose.to_owned()),
+        ];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_SET_PURPOSE, params)
+            .await?
+            .data
+            .channel)
+    }
+
+    /// `team.info`: one workspace's record, by team id. Reaches the other organizations of a
+    /// Slack Connect channel, which `client.userBoot` never carries.
+    pub async fn team_info(&self, team: &TeamId) -> Result<Team> {
+        let params = vec![("team", team.to_string())];
+        Ok(self
+            .call::<TeamWire>(method::TEAM_INFO, params)
+            .await?
+            .data
+            .team)
+    }
+
     /// `subscriptions.thread.getView`: the followed threads of the Threads view, newest
     /// activity first (the web client's `fetch_threads_state` / `priority_mode` parameters;
     /// `limit` is the page size, `has_more` says older threads exist).
@@ -1156,19 +1509,28 @@ impl SlackApi {
         Ok(())
     }
 
-    /// One page of `files.list`: the files shared with `channel`, newest first. `files.list`
-    /// paginates by `page`, so a single large first page covers the Files & links view.
+    /// One page of `files.list`: the files matching `filter`, newest first. A `channel`
+    /// scopes the call to a conversation; without it Slack answers every file the
+    /// signed-in user can see workspace-wide. `files.list` paginates by `page`, so a
+    /// single large first page covers both the Files & links tab and the Files view.
     pub async fn files_list(
         &self,
-        channel: &ChannelId,
+        filter: &FilesFilter,
         count: u32,
         page_no: u32,
     ) -> Result<Page<File>> {
-        let params = vec![
-            ("channel", channel.to_string()),
-            ("count", count.to_string()),
-            ("page", page_no.to_string()),
-        ];
+        let mut params = Vec::new();
+        if let Some(channel) = &filter.channel {
+            params.push(("channel", channel.to_string()));
+        }
+        if let Some(user) = &filter.user {
+            params.push(("user", user.to_string()));
+        }
+        if let Some(types) = &filter.types {
+            params.push(("types", types.clone()));
+        }
+        params.push(("count", count.to_string()));
+        params.push(("page", page_no.to_string()));
         let resp = self.call::<FilesWire>(method::FILES_LIST, params).await?;
         Ok(page(resp, |w| w.files))
     }
@@ -1185,5 +1547,587 @@ impl SlackApi {
             .call(method::CONVERSATIONS_CANVASES_CREATE, params)
             .await?
             .data)
+    }
+
+    /// `activity.feed`, page one (the view's first `limit` items, newest first; the next
+    /// page's cursor rides in [`ActivityFeed::next_cursor`]). Row bodies arrive separately
+    /// through [`SlackApi::messages_list`] when the feed itself carried none.
+    pub async fn activity_feed(&self, limit: u32) -> Result<ActivityFeed> {
+        let params = vec![
+            ("types", ACTIVITY_TYPES.to_owned()),
+            ("mode", "chrono_v1".to_owned()),
+            ("limit", limit.to_string()),
+            ("is_activity_inbox", "true".to_owned()),
+        ];
+        let resp = self
+            .call::<ActivityFeedWire>(method::ACTIVITY_FEED, params)
+            .await?;
+        let next_cursor = resp.next_cursor().map(str::to_owned);
+        Ok(ActivityFeed {
+            items: resp.data.items.into_iter().filter_map(row).collect(),
+            next_cursor,
+        })
+    }
+
+    /// `messages.list`: the bodies of the given messages, as the web client fills the
+    /// Activity feed's previews. At most [`MESSAGES_LIST_CHANNELS`] channels per call (a
+    /// workspace that accepted 9 rejected 39), so wider asks are batched here.
+    pub async fn messages_list(
+        &self,
+        ids: &[(ChannelId, Vec<Ts>)],
+    ) -> Result<HashMap<ChannelId, Vec<Message>>> {
+        let mut bodies = HashMap::new();
+        for batch in ids.chunks(MESSAGES_LIST_CHANNELS) {
+            let message_ids: Vec<Value> = batch
+                .iter()
+                .map(|(channel, stamps)| {
+                    Value::Object(Map::from_iter([
+                        (
+                            "channel".to_owned(),
+                            Value::String(channel.as_str().to_owned()),
+                        ),
+                        (
+                            "timestamps".to_owned(),
+                            Value::Array(
+                                stamps
+                                    .iter()
+                                    .map(|ts| Value::String(ts.as_str().to_owned()))
+                                    .collect(),
+                            ),
+                        ),
+                    ]))
+                })
+                .collect();
+            let params = vec![
+                ("message_ids", serde_json::to_string(&message_ids)?),
+                ("org_wide_aware", "true".to_owned()),
+                ("cached_latest_updates", "{}".to_owned()),
+            ];
+            let resp = self
+                .call::<MessagesListWire>(method::MESSAGES_LIST, params)
+                .await?;
+            for (channel, entry) in resp.data.messages_data {
+                bodies.insert(ChannelId::from(channel.as_str()), entry.messages);
+            }
+        }
+        Ok(bodies)
+    }
+
+    /// `activity.markRead`: marks feed entries read (each item's handles, see
+    /// [`ActivityItem::entry`]).
+    pub async fn activity_mark_read(&self, entries: &[ActivityEntry]) -> Result<()> {
+        self.activity_mark(method::ACTIVITY_MARK_READ, entries)
+            .await
+    }
+
+    /// `activity.markUnread`: marks feed entries unread.
+    pub async fn activity_mark_unread(&self, entries: &[ActivityEntry]) -> Result<()> {
+        self.activity_mark(method::ACTIVITY_MARK_UNREAD, entries)
+            .await
+    }
+
+    async fn activity_mark(&self, method: &str, entries: &[ActivityEntry]) -> Result<()> {
+        let params = vec![
+            ("entries", serde_json::to_string(entries)?),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method, params).await?;
+        Ok(())
+    }
+}
+
+/// `activity.feed`'s envelope.
+#[derive(Deserialize)]
+struct ActivityFeedWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    items: Vec<ActivityItemWire>,
+}
+
+/// Item types the feed is asked for: every category slackless models, minus
+/// `unjoined_channel_mention`, which this workspace rejects with `invalid_arguments`
+/// (probed live; Slack's fuller bootstrap list adds only types the view skips anyway).
+const ACTIVITY_TYPES: &str = concat!(
+    "at_user,at_user_group,at_channel,at_everyone,keyword,",
+    "thread_v2,message_reaction,dm,bot_dm_bundle,channel"
+);
+
+/// Channels per `messages.list` call before Slack answers `too_many_channels`
+/// (docs/research/api-activity.md, `messages.list`).
+const MESSAGES_LIST_CHANNELS: usize = 8;
+
+/// Normalizes one wire entry into the row the view renders; `None` for the shapes slackless
+/// does not model (`Unknown`) or cannot place (no channel or message ts).
+fn row(wire: ActivityItemWire) -> Option<ActivityItem> {
+    let unread = wire.unread;
+    let feed_ts = wire.feed_ts;
+    let key = wire.key;
+    let item = match wire.item {
+        ActivityPayloadWire::Mention { message } => ActivityItem {
+            kind: ActivityKind::Mention,
+            unread,
+            feed_ts,
+            key,
+            channel: message.channel.clone(),
+            thread_ts: message.thread_ts.clone(),
+            ts: message.ts.clone(),
+            actor: message.author.clone(),
+            reaction: None,
+            count: 0,
+            message: None,
+        },
+        ActivityPayloadWire::Thread { bundle_info } => {
+            let entry = bundle_info.payload.thread_entry?;
+            ActivityItem {
+                kind: ActivityKind::Thread,
+                unread,
+                feed_ts,
+                key,
+                channel: entry.channel.clone(),
+                thread_ts: Some(entry.thread_ts.clone()),
+                ts: entry.latest_ts.clone(),
+                actor: None,
+                reaction: None,
+                count: bundle_info.unread_count.max(entry.unread_msg_count),
+                message: None,
+            }
+        }
+        ActivityPayloadWire::Reaction { message, reaction } => ActivityItem {
+            kind: ActivityKind::Reaction,
+            unread,
+            feed_ts,
+            key,
+            channel: message.channel.clone(),
+            thread_ts: message.thread_ts.clone(),
+            ts: message.ts.clone(),
+            actor: reaction.user.clone(),
+            reaction: Some(ActivityReaction {
+                name: reaction.name,
+                user: reaction.user,
+            }),
+            count: 0,
+            message: None,
+        },
+        ActivityPayloadWire::Dm { bundle_info } => {
+            let latest = bundle_info
+                .payload
+                .dm_entry
+                .and_then(|entry| entry.latest_message);
+            let count = bundle_info.unread_count;
+            message_row(ActivityKind::Dm, unread, feed_ts, key, latest, count)?
+        }
+        ActivityPayloadWire::App { bundle_info } => {
+            let count = bundle_info.unread_count;
+            message_row(
+                ActivityKind::App,
+                unread,
+                feed_ts,
+                key,
+                bundle_info.payload.message,
+                count,
+            )?
+        }
+        ActivityPayloadWire::Channel { bundle_info } => {
+            let latest = bundle_info
+                .payload
+                .channel_entry
+                .and_then(|entry| entry.latest_message);
+            let count = bundle_info.unread_count;
+            message_row(ActivityKind::Channel, unread, feed_ts, key, latest, count)?
+        }
+        ActivityPayloadWire::Unknown => return None,
+    };
+    (item.channel.as_str() != "" && item.ts.as_str() != "").then_some(item)
+}
+
+/// A `dm` / `bot_dm_bundle` / `channel` row: its entry points at the newest message, which
+/// the feed sends as a bare ref (channel + ts) — the body arrives through `messages.list`
+/// hydration, so `message` is only set once that lands (or immediately, when Slack someday
+/// sends the body inline).
+fn message_row(
+    kind: ActivityKind,
+    unread: bool,
+    feed_ts: Ts,
+    key: String,
+    message: Option<Message>,
+    count: u32,
+) -> Option<ActivityItem> {
+    let message = message?;
+    let mut item = ActivityItem {
+        kind,
+        unread,
+        feed_ts,
+        key,
+        channel: message.channel.clone().unwrap_or_default(),
+        thread_ts: None,
+        ts: message.ts.clone(),
+        actor: message.user.clone(),
+        reaction: None,
+        count,
+        message: None,
+    };
+    let has_body = !message.text.is_empty() || !message.blocks.is_empty();
+    if has_body {
+        item.message = Some(message);
+    }
+    Some(item)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ApiResponse;
+
+    /// A captured `activity.feed` answer (personal data replaced): one row per modeled type,
+    /// an unknown type, and a thread entry without its bundle.
+    const FEED: &str = r#"{
+        "ok": true,
+        "items": [
+            {
+                "is_unread": true,
+                "is_bot": false,
+                "is_archived": false,
+                "version": "v2",
+                "feed_ts": "1784892914.789649",
+                "key": "thread_v2-C0ENG-1784891984.803759",
+                "item": {
+                    "type": "thread_v2",
+                    "bundle_info": {
+                        "unread_count": 3,
+                        "payload": {
+                            "thread_entry": {
+                                "channel_id": "C0ENG",
+                                "thread_ts": "1784891984.803759",
+                                "latest_ts": "1784892900.000100",
+                                "unread_msg_count": 2
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "is_unread": false,
+                "is_bot": false,
+                "feed_ts": "1784891000.000200",
+                "key": "at_user-C0ENG-1784891000.000200",
+                "item": {
+                    "type": "at_user",
+                    "message": {
+                        "ts": "1784891000.000200",
+                        "channel": "C0ENG",
+                        "author_user_id": "U0AUTHOR",
+                        "thread_ts": "1784891984.803759",
+                        "is_broadcast": false
+                    }
+                }
+            },
+            {
+                "is_unread": false,
+                "feed_ts": "1784890000.000300",
+                "key": "at_channel-C0ENG-1784890000.000300",
+                "item": {
+                    "type": "at_channel",
+                    "message": {
+                        "ts": "1784890000.000300",
+                        "channel": "C0ENG",
+                        "author_user_id": "U0AUTHOR",
+                        "is_broadcast": true
+                    }
+                }
+            },
+            {
+                "is_unread": true,
+                "feed_ts": "1784889000.000400",
+                "key": "message_reaction-C0ENG-1784889000.000400",
+                "item": {
+                    "type": "message_reaction",
+                    "message": {
+                        "ts": "1784800000.000400",
+                        "channel": "C0ENG",
+                        "author_user_id": "U0ME"
+                    },
+                    "reaction": { "user": "U0REACTOR", "name": "eyes" }
+                }
+            },
+            {
+                "is_unread": true,
+                "feed_ts": "1784888000.000500",
+                "key": "dm-D0PEER",
+                "item": {
+                    "type": "dm",
+                    "bundle_info": {
+                        "unread_count": 2,
+                        "payload": {
+                            "dm_entry": {
+                                "latest_message": {
+                                    "ts": "1784888000.000500",
+                                    "channel": "D0PEER"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "is_bot": true,
+                "is_unread": false,
+                "feed_ts": "1784887000.000600",
+                "key": "bot_dm_bundle-D0BOT",
+                "item": {
+                    "type": "bot_dm_bundle",
+                    "bundle_info": {
+                        "unread_count": 0,
+                        "payload": {
+                            "message": {
+                                "ts": "1784887000.000600",
+                                "channel": "D0BOT"
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "is_unread": false,
+                "feed_ts": "1784886000.000700",
+                "key": "saved_reminder-X0-1784886000.000700",
+                "item": {
+                    "type": "saved_reminder",
+                    "saved_reminder_payload": { "item_type": "message" }
+                }
+            }
+        ],
+        "response_metadata": { "next_cursor": "abc" }
+    }"#;
+
+    #[test]
+    fn parses_activity_feed_and_skips_unknown_types() {
+        let value: Value = serde_json::from_str(FEED).unwrap();
+        let resp: ApiResponse<ActivityFeedWire> =
+            ApiResponse::from_value(value).expect("feed parses");
+        let next_cursor = resp.next_cursor().map(str::to_owned);
+        let feed = ActivityFeed {
+            items: resp.data.items.into_iter().filter_map(row).collect(),
+            next_cursor,
+        };
+
+        assert_eq!(feed.next_cursor.as_deref(), Some("abc"));
+        let items = feed.items;
+        assert_eq!(items.len(), 6, "the saved_reminder row is skipped");
+
+        let thread = &items[0];
+        assert_eq!(thread.kind, ActivityKind::Thread);
+        assert!(thread.unread);
+        assert_eq!(thread.channel.as_str(), "C0ENG");
+        assert_eq!(
+            thread.thread_ts.as_ref().map(|ts| ts.as_str()),
+            Some("1784891984.803759")
+        );
+        assert_eq!(thread.ts.as_str(), "1784892900.000100");
+        assert_eq!(
+            thread.count, 3,
+            "the bundle's unread count wins over the entry's"
+        );
+        assert!(thread.message.is_none(), "thread rows hydrate separately");
+
+        let mention = &items[1];
+        assert_eq!(mention.kind, ActivityKind::Mention);
+        assert_eq!(mention.actor.as_ref().map(|u| u.as_str()), Some("U0AUTHOR"));
+        assert_eq!(
+            mention.thread_ts.as_ref().map(|ts| ts.as_str()),
+            Some("1784891984.803759")
+        );
+
+        // The at_channel alias parses into the same mention shape.
+        assert_eq!(items[2].kind, ActivityKind::Mention);
+        assert!(items[2].thread_ts.is_none());
+
+        let reaction = &items[3];
+        assert_eq!(reaction.kind, ActivityKind::Reaction);
+        assert_eq!(
+            reaction.actor.as_ref().map(|u| u.as_str()),
+            Some("U0REACTOR")
+        );
+        let reaction = reaction.reaction.as_ref().unwrap();
+        assert_eq!(
+            (
+                reaction.name.as_str(),
+                reaction.user.as_ref().map(|u| u.as_str())
+            ),
+            ("eyes", Some("U0REACTOR"))
+        );
+
+        let dm = &items[4];
+        assert_eq!(dm.kind, ActivityKind::Dm);
+        assert_eq!(dm.channel.as_str(), "D0PEER", "the ref carries the channel");
+        assert_eq!(dm.ts.as_str(), "1784888000.000500");
+        assert_eq!(dm.count, 2, "the bundle's unread count becomes the pill");
+        assert!(dm.message.is_none(), "a bare ref hydrates separately");
+
+        let app = &items[5];
+        assert_eq!(app.kind, ActivityKind::App);
+        assert_eq!(app.channel.as_str(), "D0BOT");
+        assert!(app.message.is_none());
+        assert_eq!(app.count, 0);
+    }
+
+    #[test]
+    fn team_info_wire_parses_the_connected_org_record() {
+        let value: Value = serde_json::from_str(
+            r#"{
+                "ok": true,
+                "team": {
+                    "id": "T0KLARNA",
+                    "name": "Klarna",
+                    "domain": "klarna",
+                    "email_domain": "klarna.com",
+                    "icon": {
+                        "image_default": true,
+                        "image_34": "https://a.slack-edge.com/img/avatars-teams/ava_34.png",
+                        "image_68": "https://a.slack-edge.com/img/avatars-teams/ava_68.png"
+                    },
+                    "avatar_base_url": "https://ca-slack-atl.com/"
+                }
+            }"#,
+        )
+        .unwrap();
+        let resp: ApiResponse<TeamWire> = ApiResponse::from_value(value).expect("team parses");
+        let team = resp.data.team;
+        assert_eq!(team.id.as_str(), "T0KLARNA");
+        assert_eq!(team.name, "Klarna");
+        assert_eq!(team.domain, "klarna");
+        assert_eq!(
+            team.icon.as_ref().and_then(|icon| icon.get("image_34")),
+            Some(&Value::String(
+                "https://a.slack-edge.com/img/avatars-teams/ava_34.png".into()
+            )),
+            "the icon object survives verbatim for the UI to pick a URL from"
+        );
+        assert!(team.extra.contains_key("avatar_base_url"));
+    }
+
+    #[test]
+    fn mark_read_entry_keeps_the_keys_type_prefix() {
+        let value: Value = serde_json::from_str(FEED).unwrap();
+        let resp: ApiResponse<ActivityFeedWire> =
+            ApiResponse::from_value(value).expect("feed parses");
+        let next_cursor = resp.next_cursor().map(str::to_owned);
+        let items: Vec<ActivityItem> = resp.data.items.into_iter().filter_map(row).collect();
+        assert_eq!(next_cursor.as_deref(), Some("abc"));
+        let entries: Vec<ActivityEntry> = items.iter().map(ActivityItem::entry).collect();
+        assert_eq!(entries[0].kind, "thread_v2");
+        assert_eq!(entries[0].key, "thread_v2-C0ENG-1784891984.803759");
+        assert_eq!(entries[0].feed_ts.as_str(), "1784892914.789649");
+        // An at_channel mention keeps its own type, not at_user.
+        assert_eq!(entries[2].kind, "at_channel");
+        assert_eq!(entries[5].kind, "bot_dm_bundle");
+        // The wire form is the JSON array Slack expects.
+        assert_eq!(
+            serde_json::to_string(&entries[0]).unwrap(),
+            "{\"type\":\"thread_v2\",\"key\":\"thread_v2-C0ENG-1784891984.803759\",\"feed_ts\":\"1784892914.789649\"}"
+        );
+    }
+
+    #[test]
+    fn messages_list_bodies_parse_by_channel() {
+        let wire: MessagesListWire = serde_json::from_str(
+            r#"{ "messages_data": {
+                "C0ENG": { "messages": [
+                    { "ts": "1784891000.000200", "user": "U0AUTHOR", "text": "hey <@U0ME>" }
+                ] },
+                "D0PEER": { "messages": [] }
+            } }"#,
+        )
+        .unwrap();
+        let bodies: HashMap<ChannelId, Vec<Message>> = wire
+            .messages_data
+            .into_iter()
+            .map(|(channel, entry)| (ChannelId::from(channel.as_str()), entry.messages))
+            .collect();
+        let eng = &bodies[&ChannelId::from("C0ENG")];
+        assert_eq!((eng.len(), eng[0].text.as_str()), (1, "hey <@U0ME>"));
+        assert!(bodies[&ChannelId::from("D0PEER")].is_empty());
+    }
+
+    /// A one-off probe of the live `activity.feed` answer, printed as raw JSON so the
+    /// parser is built against the real shape (values carry personal data; the shipped
+    /// fixture replaces them). Run manually with the signed-in session in the app's store;
+    /// never in CI:
+    ///
+    /// ```text
+    /// CARGO_BUILD_JOBS=4 direnv exec . cargo test -p slackless-api activity_feed_live \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "probes the live workspace; run manually (see the test docs)"]
+    fn activity_feed_live() {
+        use std::process::Command;
+
+        let sessions: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                    .join("Library/Application Support/slackless/sessions.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let team = sessions[0]["team_id"].as_str().unwrap().to_owned();
+        let url = sessions[0]["workspace_url"].as_str().unwrap().to_owned();
+        let secret = Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "slackless",
+                "-a",
+                &team,
+                "-w",
+            ])
+            .output()
+            .unwrap();
+        let secret: Value = serde_json::from_slice(secret.stdout.trim_ascii_end()).unwrap();
+        let host = url::Url::parse(&url)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_owned();
+        let domain = host.strip_suffix(".slack.com").unwrap_or(&host);
+        let api = SlackApi::for_workspace(
+            domain,
+            secret["xoxc"].as_str().unwrap(),
+            secret["d"].as_str().unwrap(),
+        )
+        .unwrap();
+
+        // Param bisection: which type lists Slack accepts.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let params: Vec<(&'static str, String)> = vec![
+            ("types", ACTIVITY_TYPES.to_owned()),
+            ("mode", "chrono_v1".to_owned()),
+            ("limit", "50".to_owned()),
+            ("is_activity_inbox", "true".to_owned()),
+        ];
+        let resp = rt
+            .block_on(api.call::<Value>(method::ACTIVITY_FEED, params))
+            .unwrap();
+        println!("{}", serde_json::to_string_pretty(&resp.data).unwrap());
+
+        // messages.list hydration of the first few rows.
+        let feed = rt.block_on(api.activity_feed(10)).unwrap();
+        let ids: Vec<(ChannelId, Vec<Ts>)> = feed
+            .items
+            .iter()
+            .take(6)
+            .map(|item| (item.channel.clone(), vec![item.ts.clone()]))
+            .collect();
+        let bodies = rt.block_on(api.messages_list(&ids)).unwrap();
+        println!("hydrated {} channels", bodies.len());
+        for (channel, messages) in &bodies {
+            println!(
+                "{channel}: {} messages, first text {} chars",
+                messages.len(),
+                messages.first().map(|m| m.text.len()).unwrap_or(0)
+            );
+        }
     }
 }

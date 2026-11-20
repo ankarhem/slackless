@@ -21,10 +21,11 @@ pub use assets::AssetClient;
 pub use client::{MAX_RATE_LIMIT_RETRIES, SlackApi};
 pub use error::ApiError;
 pub use methods::{
-    AuthTest, BookmarksList, CanvasCreated, ChannelBookmark, ClientCounts, ConversationCounts,
-    ConversationView, HistoryOpts, ListOpts, MessageContent, PinnedItem, PinsList, PostedMessage,
-    SearchChannel, SearchMatch, SearchMessages, SearchOpts, SearchPagination, SearchSort,
-    SectionCreated, ThreadCounts, ThreadSubscription, ThreadsView, UserBoot,
+    ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction, AuthTest,
+    BookmarksList, CanvasCreated, ChannelBookmark, ClientCounts, ConversationCounts,
+    ConversationView, FilesFilter, HistoryOpts, ListOpts, MessageContent, PinnedItem, PinsList,
+    PostedMessage, SearchChannel, SearchMatch, SearchMessages, SearchOpts, SearchPagination,
+    SearchSort, SectionCreated, ThreadCounts, ThreadSubscription, ThreadsView, UserBoot,
 };
 pub use pagination::{Page, paginate};
 

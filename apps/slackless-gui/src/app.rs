@@ -178,11 +178,21 @@
 //! pins.rs (pins panel in the right column)
 //!   pub fn pinned(&Fixtures, &ChannelId) / pins_panel(.., Option<&Loaded<Message>>, ..)
 //!
-//! activity.rs (the sidebar's Activity destination)
+//! activity.rs (the Activity page, rendered full-width beside the rail while the rail's
+//! Activity destination is active)
 //!   ActivityFeed::new(Arc<Fixtures>, &mut App) -> Entity<ActivityFeed>
-//!   emits ActivityEvent::Open { channel, thread_ts }; the sidebar re-emits thread items as
-//!   SidebarEvent::OpenThread { channel, thread_ts }
-//!   Sidebar::badge_count(&App) -> u32 drives the dock badge (slackless_core::platform)
+//!   emits ActivityEvent::Open { channel, thread_ts } (this root opens the conversation,
+//!   thread items with the thread panel), Mark { entries, read } (forwarded to the core as
+//!   Command::MarkActivity) and Retry (Command::FetchActivity)
+//!   Sidebar::badge_count() -> u32 drives the dock badge (slackless_core::platform); the
+//!   sidebar's activity part is pushed from the feed's unread rows
+//!
+//! files_page.rs (the Files view: the main-area page of the rail's Files destination, beside
+//! the sidebar's Files list column)
+//!   FilesPage::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<FilesPage>
+//!   open(Arc<Fixtures>, cx) / show_section(FilesSection, ..) / land(&FilesFilter, ..)
+//!   emits FilesPageEvent::Load(FilesFilter) (forwarded to the core as Command::LoadFiles);
+//!   the sidebar emits SidebarEvent::OpenFiles and ShowFilesSection(FilesSection)
 //!
 //! app.rs
 //!   App::new(Arc<Fixtures>, CoreBridge, &mut Window, &mut gpui::App) -> Entity<App>
@@ -208,26 +218,29 @@ use gpui_kit::component::{
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     self, Anchor, AppContext as _, ClipboardItem, Context, Div, Edges, Entity, FocusHandle,
-    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Point, Render,
+    Focusable as _, FontWeight, Hsla, InputPreference, InteractiveElement as _, IntoElement,
+    KeyBinding, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Point, Render,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription,
-    SystemNotification, Window, WindowAppearance, actions, anchored, deferred, div, point, px,
+    SystemNotification, Window, actions, anchored, deferred, div, point, px,
 };
-use slackless_core::api::{ChannelBookmark, ConversationCounts, MessageContent};
+use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{self, BadgeSetter, Notifier};
 use slackless_core::types::{ChannelId, Conversation, ConversationKind, File, Message, Ts, UserId};
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
 use crate::actions::{MessageChange, notify};
+use crate::activity::{ActivityEvent, ActivityFeed};
 use crate::avatars::conversation_avatar;
 use crate::bookmarks;
 use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
+use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
 use crate::composer::{self, Composer, ComposerEvent, Placeholder};
 use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
+use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
 use crate::huddle::{self, HuddleBar, HuddleEvent};
 use crate::huddles::{self, HuddlesEvent, HuddlesView};
@@ -283,6 +296,11 @@ const REMINDER_POLL: Duration = Duration::from_secs(10);
 
 /// Rail + channel sidebar, measured on Slack desktop (69px rail, 318px sidebar).
 const SIDEBAR_WIDTH: Pixels = px(390.);
+/// The rail alone: the Activity page spans the whole main area right of it (the width
+/// `sidebar.rs`'s `workspace_rail` draws).
+const RAIL_WIDTH: Pixels = px(72.);
+/// Rail + the DMs destination's wider DM list, measured on Slack desktop (524px list).
+const DM_LIST_WIDTH: Pixels = px(596.);
 /// The thread / profile / pins panel, measured on Slack desktop.
 const FLEXPANE_WIDTH: Pixels = px(540.);
 
@@ -358,6 +376,8 @@ pub struct App {
     preferences: Entity<Preferences>,
     /// The theme last installed, so unrelated preference edits do not repaint the theme.
     applied_theme: (SlackTheme, Palette),
+    /// The Color Mode last stored (`None` offline), so only a changed mode is written.
+    color_mode: Option<AppearanceMode>,
     /// The profile pane; shown in the right panel while `profile_open` (exclusive with the
     /// thread panel).
     profile: Entity<ProfilePanel>,
@@ -381,6 +401,14 @@ pub struct App {
     /// The Threads view; replaces the message column while `threads_open`.
     threads: Entity<ThreadsView>,
     threads_open: bool,
+    /// The Activity page (the rail's Activity destination): a full-width page right of the
+    /// rail - the sidebar's list column hides while the destination is active.
+    activity: Entity<ActivityFeed>,
+    /// The rail's Activity destination is active (the page owns the main area).
+    activity_open: bool,
+    /// The Files view (the rail's Files destination): the main-area page beside the
+    /// sidebar's Files list column, shown while that destination is active.
+    files_page: Entity<FilesPage>,
     /// The Huddles page; replaces the message column while `huddles_open`.
     huddles: Entity<HuddlesView>,
     huddles_open: bool,
@@ -390,6 +418,15 @@ pub struct App {
     /// The "New message" view; replaces the message column while `compose_open`.
     compose: Entity<NewMessageView>,
     compose_open: bool,
+    /// The channel details dialog's body, mounted in a dialog on demand.
+    details: Entity<ChannelDetails>,
+    /// Live: the open channel's member ids as the core last announced them
+    /// (`Event::ConversationInfo`), for the details dialog and the Slack Connect banner. Only
+    /// the open channel's list is kept: every open fetches it again.
+    open_members: Option<(ChannelId, Vec<UserId>)>,
+    /// The connect banner's lines for the open conversation, recomputed when its members or
+    /// the snapshot change - never per frame.
+    connect_orgs: Vec<channel_details::OrgLine>,
     /// A compose send waiting for its DM to open ([`Command::OpenDm`]).
     pending_dm: Option<MessageContent>,
     /// The pinned-messages panel of the open conversation (right column, exclusive with the
@@ -485,21 +522,53 @@ impl App {
                     .placeholder("Describe what you are looking for")
                     .auto_grow(1, 1)
             });
-            let search_menu = SearchMenu::new(fixtures.clone(), cx);
-            let preferences = Preferences::new(window, cx);
-            if let Some(appearance) = fixtures.appearance {
-                preferences.update(cx, |prefs, cx| prefs.set_slack_appearance(appearance, cx));
+            let search_menu = SearchMenu::new(fixtures.clone(), search.clone(), cx);
+            // The search panel's remembered state, restored at launch like Slack's: the
+            // recent searches, both toggles and the recently visited conversations.
+            if let Some(history) = bridge.search_history() {
+                search_menu.update(cx, |menu, cx| menu.set_history(history, cx));
             }
+            if let Some(on) = bridge.search_history_shown() {
+                search_menu.update(cx, |menu, cx| menu.set_history_shown(on, cx));
+            }
+            if let Some(on) = bridge.search_filters_shown() {
+                search_menu.update(cx, |menu, cx| menu.set_filters_shown(on, cx));
+            }
+            let restored_recent = bridge
+                .recent_places()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|channel| fixtures.conversation(channel).is_some())
+                .collect();
+            let preferences = Preferences::new(window, cx);
+            // Live: the remembered Color Mode over Slack's color theme, as `main` installed it
+            // before the first frame. The sample workspace keeps its dark reference look.
+            let color_mode = bridge.color_mode();
+            let applied_theme = match color_mode {
+                Some(mode) => {
+                    let palette = fixtures.palette.unwrap_or(Palette::Default);
+                    let font = theme::font(cx);
+                    preferences.update(cx, |prefs, cx| {
+                        prefs.set_appearance(mode, palette, font, cx)
+                    });
+                    (mode.resolve(window.appearance()), palette)
+                }
+                None => (SlackTheme::Dark, Palette::Default),
+            };
             let status_picker = StatusPicker::new(window, cx);
             let user_menu = UserMenu::new(fixtures.clone(), cx);
             let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
             let drafts = DraftsView::new(cx);
             let later = LaterView::new(cx);
             let threads = ThreadsView::new(fixtures.clone(), window, cx);
+            let activity = ActivityFeed::new(fixtures.clone(), cx);
+            let files_page = FilesPage::new(fixtures.clone(), window, cx);
             let huddles = HuddlesView::new(fixtures.clone(), cx);
             let directory = DirectoryView::new(fixtures.clone(), window, cx);
             let compose = NewMessageView::new(fixtures.clone(), window, cx);
+            let details = ChannelDetails::new(fixtures.clone(), window, cx);
             later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
+            crate::actions::bind_menu_keys(cx);
             cx.bind_keys([
                 KeyBinding::new("cmd-k", QuickSwitch, None),
                 KeyBinding::new("cmd-[", NavigateBack, None),
@@ -525,9 +594,31 @@ impl App {
             let focus = cx.focus_handle();
             focus.focus(window, cx);
 
+            let this = cx.weak_entity();
             let subscriptions = vec![
                 cx.observe_window_bounds(window, |this, window, cx| {
                     this.save_window_state(window, cx);
+                }),
+                // While the search panel is open, Up/Down/Enter/Escape steer its rows. GPUI
+                // resolves the focused field's own key bindings (caret moves, a newline)
+                // before any listener around it, so the keys are taken here, ahead of them.
+                cx.intercept_keystrokes(move |event, window, cx| {
+                    if event.input_preference == InputPreference::CharacterInput {
+                        return;
+                    }
+                    let _ = this.update(cx, |app, cx| {
+                        if !app.search_menu_open
+                            || !app.search.read(cx).focus_handle(cx).is_focused(window)
+                        {
+                            return;
+                        }
+                        if app
+                            .search_menu
+                            .update(cx, |menu, cx| menu.handle_key(&event.keystroke, cx))
+                        {
+                            cx.stop_propagation();
+                        }
+                    });
                 }),
                 bridge.subscribe_in(window, cx, |this: &mut App, event, window, cx| {
                     this.on_core_event(event, window, cx);
@@ -563,9 +654,25 @@ impl App {
                             this.select(channel.clone(), cx);
                             this.focus.focus(window, cx);
                         }
+                        // The Threads row of "Unreads & drafts": the sidebar's own path.
+                        SearchMenuEvent::OpenThreads => {
+                            this.search_menu_open = false;
+                            this.open_threads(cx);
+                            this.focus.focus(window, cx);
+                        }
                         SearchMenuEvent::Search(query) => {
                             this.search_menu_open = false;
                             this.run_message_search(query.clone(), cx);
+                        }
+                        SearchMenuEvent::SetHistoryShown(on) => {
+                            if let Some(write) = this.bridge.remember_search_history_shown(*on) {
+                                cx.background_executor().spawn(write).detach();
+                            }
+                        }
+                        SearchMenuEvent::SetFiltersShown(on) => {
+                            if let Some(write) = this.bridge.remember_search_filters_shown(*on) {
+                                cx.background_executor().spawn(write).detach();
+                            }
                         }
                         SearchMenuEvent::Dismiss => this.close_search_menu(window, cx),
                     },
@@ -698,6 +805,38 @@ impl App {
                         }
                     },
                 ),
+                cx.subscribe(
+                    &activity,
+                    |this: &mut App, _, event: &ActivityEvent, cx| match event {
+                        ActivityEvent::Open { channel, thread_ts } => {
+                            this.select(channel.clone(), cx);
+                            if let Some(thread_ts) = thread_ts {
+                                this.open_thread(channel.clone(), thread_ts.clone(), cx);
+                            }
+                        }
+                        ActivityEvent::Mark { entries, read } => {
+                            this.bridge.send(Command::MarkActivity {
+                                entries: entries.clone(),
+                                read: *read,
+                            });
+                        }
+                        ActivityEvent::Retry => this.fetch_activity(cx),
+                    },
+                ),
+                cx.observe(&activity, |this: &mut App, _, cx| {
+                    // The rail tile and the dock badge follow the feed's unread rows.
+                    let unread = this.activity.read(cx).unread_count();
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_activity_unread(unread, cx));
+                    cx.notify();
+                }),
+                cx.subscribe(
+                    &files_page,
+                    |this: &mut App, _, event: &FilesPageEvent, _| {
+                        let FilesPageEvent::Load(filter) = event;
+                        this.bridge.send(Command::LoadFiles(filter.clone()));
+                    },
+                ),
                 cx.subscribe_in(
                     &huddles,
                     window,
@@ -730,6 +869,13 @@ impl App {
                             this.directory_open = false;
                             cx.notify();
                         }
+                    },
+                ),
+                cx.subscribe_in(
+                    &details,
+                    window,
+                    |this: &mut App, _, event: &ChannelDetailsEvent, window, cx| {
+                        this.details_event(event, window, cx);
                     },
                 ),
                 cx.subscribe_in(
@@ -786,6 +932,9 @@ impl App {
             }
             demo(&results, window, cx);
             let parked = fixtures.workspaces.iter().map(|_| None).collect();
+            // The fixture-derived feed lights the rail tile before any live fetch lands.
+            let unread = activity.read(cx).unread_count();
+            sidebar.update(cx, |sidebar, cx| sidebar.set_activity_unread(unread, cx));
 
             App {
                 fixtures,
@@ -793,7 +942,7 @@ impl App {
                 workspace: 0,
                 parked,
                 channel,
-                theme: SlackTheme::Dark,
+                theme: applied_theme.0,
                 sidebar,
                 messages,
                 composer,
@@ -809,7 +958,8 @@ impl App {
                 huddle,
                 huddle_open: false,
                 preferences,
-                applied_theme: (SlackTheme::Dark, Palette::Default),
+                applied_theme,
+                color_mode,
                 profile,
                 profile_open: false,
                 self_state: SelfState::default(),
@@ -825,12 +975,16 @@ impl App {
                 later_open: false,
                 threads,
                 threads_open: false,
+                activity,
+                activity_open: false,
+                files_page,
                 huddles,
                 huddles_open: false,
                 directory,
                 directory_open: false,
                 compose,
                 compose_open: false,
+                details,
                 pending_dm: None,
                 pins_open: false,
                 pins: HashMap::new(),
@@ -849,9 +1003,11 @@ impl App {
                 peer_dnd_paused: HashMap::new(),
                 member_counts: HashMap::new(),
                 app_counts: HashMap::new(),
+                open_members: None,
+                connect_orgs: Vec::new(),
                 back: Vec::new(),
                 forward: Vec::new(),
-                recent: Vec::new(),
+                recent: restored_recent,
                 chosen,
                 focus,
                 workspace_subscriptions,
@@ -989,7 +1145,7 @@ impl App {
 
     /// Hand the unread count to the dock badge when it changed (empty badge at zero).
     fn sync_badge(&mut self, cx: &mut Context<Self>) {
-        let count = self.sidebar.read(cx).badge_count(cx);
+        let count = self.sidebar.read(cx).badge_count();
         if self.badge != Some(count) {
             self.badge = Some(count);
             let label = (count > 0).then(|| count.to_string());
@@ -1072,7 +1228,7 @@ impl App {
             }
             ConversationTab::Files => {
                 forget_failure(&mut self.files, &channel);
-                Command::LoadFiles(channel)
+                Command::LoadFiles(FilesFilter::channel(channel))
             }
             ConversationTab::Folder { .. } => {
                 forget_failure(&mut self.bookmarks, &channel);
@@ -1200,18 +1356,26 @@ impl App {
     /// tinted by the color theme), Enter-to-send, and the schedule shown in the user menu.
     fn apply_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = self.preferences.read(cx).settings().clone();
-        let theme = match settings.mode {
-            AppearanceMode::Light => SlackTheme::Light,
-            AppearanceMode::Dark => SlackTheme::Dark,
-            AppearanceMode::System => match window.appearance() {
-                WindowAppearance::Dark | WindowAppearance::VibrantDark => SlackTheme::Dark,
-                WindowAppearance::Light | WindowAppearance::VibrantLight => SlackTheme::Light,
-            },
-        };
+        let theme = settings.mode.resolve(window.appearance());
+        if self
+            .color_mode
+            .is_some_and(|stored| stored != settings.mode)
+        {
+            self.color_mode = Some(settings.mode);
+            if let Some(write) = self.bridge.remember_color_mode(settings.mode) {
+                cx.background_executor().spawn(write).detach();
+            }
+        }
         if self.applied_theme != (theme, settings.palette) {
             self.theme = theme;
             self.applied_theme = (theme, settings.palette);
             theme::activate_with(theme, settings.palette, cx);
+        }
+        if theme::font(cx) != settings.font {
+            theme::set_font(settings.font, cx);
+            if let Some(write) = self.bridge.remember_font(settings.font) {
+                cx.background_executor().spawn(write).detach();
+            }
         }
         let enter_sends = settings.enter_sends;
         self.composer
@@ -1443,6 +1607,82 @@ impl App {
         cx.notify();
     }
 
+    /// Slack's channel details dialog, opened by clicking the channel name in the header:
+    /// the About and Members tabs over the channel's record and member list. A creator
+    /// missing from the snapshot resolves through the core, like any other unknown person.
+    fn open_channel_details(
+        &mut self,
+        channel: &ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conversation) = self.fixtures.conversation(channel).cloned() else {
+            return;
+        };
+        if let Some(creator) = &conversation.creator {
+            self.resolve_users(std::iter::once(creator.clone()));
+        }
+        // Live mode without a member list yet keeps the Members tab on its placeholder until
+        // `Event::ConversationInfo` lands.
+        let stored = self.member_ids(channel, &conversation).to_vec();
+        let loading = stored.is_empty() && self.bridge.store().is_some();
+        self.details.update(cx, |details, cx| {
+            details.open(self.fixtures.clone(), channel.clone(), stored, loading, cx)
+        });
+        let title = format!(
+            "# {}",
+            conversation
+                .name
+                .as_deref()
+                .unwrap_or_else(|| channel.as_str())
+        );
+        let details = self.details.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(title.clone())
+                .w(px(720.))
+                .child(details.clone())
+        });
+    }
+
+    /// The channel details dialog's actions.
+    fn details_event(
+        &mut self,
+        event: &ChannelDetailsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ChannelDetailsEvent::Leave(channel) => {
+                window.close_dialog(cx);
+                self.leave(channel.clone(), window, cx);
+            }
+            ChannelDetailsEvent::SetTopic { channel, topic } => {
+                self.bridge.send(Command::SetChannelTopic {
+                    channel: channel.clone(),
+                    topic: topic.clone(),
+                });
+            }
+            ChannelDetailsEvent::SetPurpose { channel, purpose } => {
+                self.bridge.send(Command::SetChannelPurpose {
+                    channel: channel.clone(),
+                    purpose: purpose.clone(),
+                });
+            }
+            ChannelDetailsEvent::StartHuddle => self.start_huddle(cx),
+            ChannelDetailsEvent::SetNotifyLevel { channel, level } => {
+                self.bridge.send(Command::SetNotifyLevel {
+                    channel: channel.clone(),
+                    level: *level,
+                });
+            }
+            ChannelDetailsEvent::OpenProfile(user) => {
+                window.close_dialog(cx);
+                self.open_profile(user.clone(), cx);
+            }
+        }
+    }
+
     fn select(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         if channel != self.channel {
             self.back.push(self.channel.clone());
@@ -1455,7 +1695,7 @@ impl App {
     /// later). History is the caller's: [`App::select`] records it, back/forward replay it.
     fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.chosen = true;
-        self.close_full_column_views();
+        self.close_full_column_views(cx);
         cx.notify();
         self.show_conversation(channel, cx);
     }
@@ -1563,13 +1803,27 @@ impl App {
     }
 
     /// Search messages for `query`, showing results in place of the message column. The
-    /// pill's Enter and the dropdown's "Search for ..." row both land here.
+    /// pill's Enter and the dropdown's rows both land here; the dropdown's filter chips
+    /// (and only its non-empty query) narrow the run and join its history.
     fn run_message_search(&mut self, query: String, cx: &mut Context<Self>) {
-        self.results
-            .update(cx, |results, cx| results.run(query, cx));
+        let filters = self
+            .search_menu
+            .read(cx)
+            .search_filters(&self.channel, &self.fixtures.self_user);
+        self.results.update(cx, |results, cx| {
+            results.run_with_filters(query.clone(), filters, cx)
+        });
         self.searching = true;
         self.drafts_open = false;
         self.later_open = false;
+        if !query.trim().is_empty() {
+            self.search_menu
+                .update(cx, |menu, cx| menu.record_search(&query, cx));
+            let history = self.search_menu.read(cx).history().to_vec();
+            if let Some(write) = self.bridge.remember_search_history(&history) {
+                cx.background_executor().spawn(write).detach();
+            }
+        }
         cx.notify();
     }
 
@@ -1618,7 +1872,13 @@ impl App {
             .filter(|id| self.fixtures.conversation(id).is_some())
             .cloned()
             .collect();
-        Snapshot { unreads, recents }
+        let (mentions, threads) = self.sidebar.read(cx).search_unread_counts();
+        Snapshot {
+            unreads,
+            recents,
+            mentions,
+            threads,
+        }
     }
 
     /// "Leave channel": it drops out of the sidebar at once and the view steps back, as in
@@ -1630,6 +1890,9 @@ impl App {
         self.back.retain(|c| *c != channel);
         self.forward.retain(|c| *c != channel);
         self.recent.retain(|c| *c != channel);
+        if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
+            cx.background_executor().spawn(write).detach();
+        }
         self.reload_live(window, cx);
         if self.channel == channel {
             let next = self
@@ -1811,6 +2074,9 @@ impl App {
         self.recent.retain(|c| *c != left && *c != channel);
         self.recent.insert(0, left);
         self.recent.truncate(RECENT_MAX);
+        if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
+            cx.background_executor().spawn(write).detach();
+        }
         self.save_draft(cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_selected(channel.clone(), cx));
@@ -1821,6 +2087,8 @@ impl App {
             .update(cx, |list, cx| list.set_conversation(channel.clone(), cx));
         self.load_history(&channel, cx);
         self.channel = channel;
+        self.open_members = None;
+        self.sync_connect_orgs();
         self.thread_open = false;
         self.tab = ConversationTab::Messages;
         // An open pins panel follows the conversation: fetch the new one's pins.
@@ -1888,6 +2156,16 @@ impl App {
                     .update(cx, |threads, cx| threads.set_remote((**view).clone(), cx));
                 cx.notify();
             }
+            Event::ActivityView { feed } => match feed.as_deref() {
+                Ok(feed) => {
+                    self.activity
+                        .update(cx, |view, cx| view.show_remote(feed.clone(), cx));
+                }
+                Err(text) => {
+                    self.activity
+                        .update(cx, |view, cx| view.show_error(text, cx));
+                }
+            },
             Event::ConversationOpened(channel) => {
                 let pending = self.pending_dm.take();
                 self.select(channel.clone(), cx);
@@ -1897,12 +2175,37 @@ impl App {
             }
             Event::ConversationInfo {
                 channel,
-                num_members: Some(count),
+                num_members,
                 num_apps,
+                members,
             } => {
-                self.member_counts.insert(channel.clone(), *count);
+                if let Some(count) = num_members {
+                    self.member_counts.insert(channel.clone(), *count);
+                }
                 if let Some(apps) = num_apps {
                     self.app_counts.insert(channel.clone(), *apps);
+                }
+                // A late answer for a channel left since is moot: the open one's follows.
+                if *channel == self.channel {
+                    if !members.is_empty() {
+                        self.open_members = Some((channel.clone(), members.clone()));
+                        // Members `users.list` leaves out - the other organizations of a Slack
+                        // Connect channel - resolve on demand, the same way unknown DM peers
+                        // do; an ordinary channel's people all sit in the directory already.
+                        if self
+                            .fixtures
+                            .conversation(channel)
+                            .is_some_and(|c| c.is_ext_shared)
+                        {
+                            self.resolve_users(members.iter().cloned());
+                        }
+                    }
+                    self.sync_connect_orgs();
+                    // An empty list (the fetch failed) turns the dialog's Members tab from
+                    // loading to its inline error.
+                    self.details.update(cx, |details, cx| {
+                        details.set_conversation_info(channel, members.clone(), cx)
+                    });
                 }
                 cx.notify();
             }
@@ -1923,11 +2226,19 @@ impl App {
                 self.bookmarks.insert(channel.clone(), bookmarks.clone());
                 cx.notify();
             }
-            Event::FilesLoaded { channel, files } => {
+            Event::FilesLoaded { filter, files } => {
                 if let Ok(files) = files {
                     self.resolve_users(files.iter().filter_map(|file| file.user.clone()));
                 }
-                self.files.insert(channel.clone(), files.clone());
+                match &filter.channel {
+                    Some(channel) => {
+                        self.files.insert(channel.clone(), files.clone());
+                    }
+                    // A workspace-wide list answers the Files view.
+                    None => self
+                        .files_page
+                        .update(cx, |page, cx| page.land(filter, files, cx)),
+                }
                 cx.notify();
             }
             Event::ChannelCanvasCreated { channel, canvas_id } if *channel == self.channel => {
@@ -1974,8 +2285,13 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.compose
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.details
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.files_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
+        self.sync_connect_orgs();
         self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
         if !keep {
             self.show_conversation(first_conversation(&self.fixtures), cx);
@@ -2146,10 +2462,13 @@ impl App {
     /// whom `users.list` leaves out, so they show by name instead of id.
     fn resolve_users(&self, users: impl IntoIterator<Item = UserId>) {
         // Dedupe before the snapshot lookups: a page names the same few people many times.
+        // One set of the known ids keeps whole member lists (a connect channel's ids) from
+        // scanning the directory per id.
         let named: HashSet<UserId> = users.into_iter().collect();
+        let known: HashSet<&UserId> = self.fixtures.users.iter().map(|user| &user.id).collect();
         let missing: Vec<UserId> = named
             .into_iter()
-            .filter(|user| self.fixtures.user(user).is_none())
+            .filter(|user| !known.contains(&user))
             .collect();
         if !missing.is_empty() {
             self.bridge.send(Command::ResolveUsers(missing));
@@ -2240,6 +2559,8 @@ impl App {
         };
         self.parked[self.workspace] = Some(outgoing);
         self.workspace = index;
+        self.open_members = None;
+        self.sync_connect_orgs();
         self.searching = false;
         self.drafts_open = false;
         self.later_open = false;
@@ -2257,6 +2578,9 @@ impl App {
         self.search_menu_open = false;
         self.search_menu
             .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
+        // The Files view serves every workspace: its rows follow the shown one.
+        self.files_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         // Before the draft is loaded: its mentions are named from this workspace.
         self.composer
             .update(cx, |composer, cx| composer.set_fixtures(fixtures, cx));
@@ -2327,7 +2651,7 @@ impl App {
     }
 
     /// Close every full-column view (a conversation or another view is taking the column).
-    fn close_full_column_views(&mut self) {
+    fn close_full_column_views(&mut self, cx: &mut Context<Self>) {
         self.searching = false;
         self.drafts_open = false;
         self.later_open = false;
@@ -2335,6 +2659,10 @@ impl App {
         self.huddles_open = false;
         self.directory_open = false;
         self.compose_open = false;
+        // The Activity and Files pages are sidebar destinations, so leaving the full-column
+        // views returns the rail to Home.
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.leave_pages(cx));
     }
 
     /// The Threads view: local cards at once, Slack's own list (`subscriptions.thread.getView`)
@@ -2368,7 +2696,7 @@ impl App {
             .detach();
             self.bridge.send(Command::FetchThreads);
         }
-        self.close_full_column_views();
+        self.close_full_column_views(cx);
         self.threads_open = true;
         cx.notify();
     }
@@ -2398,7 +2726,7 @@ impl App {
             })
             .detach();
         }
-        self.close_full_column_views();
+        self.close_full_column_views(cx);
         self.huddles_open = true;
         cx.notify();
     }
@@ -2409,7 +2737,7 @@ impl App {
         let fixtures = self.fixtures.clone();
         self.directory
             .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
-        self.close_full_column_views();
+        self.close_full_column_views(cx);
         self.directory_open = true;
         cx.notify();
     }
@@ -2423,7 +2751,7 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
         self.compose
             .update(cx, |view, cx| view.open(draft, window, cx));
-        self.close_full_column_views();
+        self.close_full_column_views(cx);
         self.compose_open = true;
         cx.notify();
     }
@@ -2449,14 +2777,56 @@ impl App {
     }
 
     fn show_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
-        self.drafts_open = false;
-        self.later_open = false;
-        self.threads_open = false;
-        self.huddles_open = false;
-        self.directory_open = false;
-        self.compose_open = false;
+        match item {
+            NavItem::Activity => self.open_activity(cx),
+            NavItem::Files => self.open_files(cx),
+            _ => {
+                self.close_full_column_views(cx);
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.show_nav(item, cx));
+                cx.notify();
+            }
+        }
+    }
+
+    /// The Activity page (the rail's Activity destination): a full-width page right of the
+    /// rail - the sidebar hides its list column while it is active. Slack's own feed
+    /// (`activity.feed`) lands with the next [`Event::ActivityView`]; the fixture workspace
+    /// serves its derived rows.
+    fn open_activity(&mut self, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.close_full_column_views(cx);
         self.sidebar
-            .update(cx, |sidebar, cx| sidebar.show_nav(item, cx));
+            .update(cx, |sidebar, cx| sidebar.show_nav(NavItem::Activity, cx));
+        self.activity_open = true;
+        let fixtures = self.fixtures.clone();
+        self.activity
+            .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
+        self.fetch_activity(cx);
+        cx.notify();
+    }
+
+    /// Ask the core for the Activity feed (live mode; fixture mode keeps its derived rows).
+    fn fetch_activity(&mut self, cx: &mut Context<Self>) {
+        if self.bridge.store().is_some() {
+            self.activity.update(cx, |view, cx| view.start_loading(cx));
+            self.bridge
+                .send(Command::FetchActivity { with_bodies: true });
+        }
+    }
+
+    /// The Files view (the rail's Files destination): the sidebar shows its Files list
+    /// column and the page takes the main area. Live mode refetches the shown page's rows
+    /// (`files.list`, answered by [`Event::FilesLoaded`]); the sample workspace derives them
+    /// from its messages.
+    fn open_files(&mut self, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.close_full_column_views(cx);
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.show_nav(NavItem::Files, cx));
+        let fixtures = self.fixtures.clone();
+        self.files_page
+            .update(cx, |page, cx| page.open(fixtures, cx));
         cx.notify();
     }
 
@@ -2621,7 +2991,10 @@ impl Render for App {
         // statement that reads it across the `cx.listener` calls in the helpers below.
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
+        // The chrome (and its corner glow) is painted once here; the title bar and rail are
+        // transparent over it.
         let chrome = cx.theme().title_bar;
+        let (glow_side, glow) = crate::theme::chrome_glow(cx);
         self.sync_badge(cx);
 
         let conversation = self.fixtures.conversation(&self.channel).cloned();
@@ -2651,6 +3024,13 @@ impl Render for App {
             v_flex().size_full().child(self.directory.clone())
         } else if self.compose_open {
             v_flex().size_full().child(self.compose.clone())
+        } else if self.activity_open {
+            // The Activity page spans the whole main area; the sidebar renders only its
+            // rail while this destination is active.
+            v_flex().size_full().child(self.activity.clone())
+        } else if self.sidebar.read(cx).active_nav() == NavItem::Files {
+            // The Files view owns the main area beside the sidebar's Files list column.
+            v_flex().size_full().child(self.files_page.clone())
         } else {
             let header = self.conversation_header(&title, &topic, conversation.as_ref(), cx);
             let tabs = self.conversation_tabs(cx);
@@ -2703,6 +3083,7 @@ impl Render for App {
                 // The Pins tab keeps the transcript under it; its panel is the right column.
                 ConversationTab::Messages | ConversationTab::Pins => column
                     .child(div().flex_1().min_h_0().child(self.messages.clone()))
+                    .children(self.connect_banner(cx))
                     .children(self.dnd_banner(conversation.as_ref(), cx))
                     .child(self.composer.clone()),
                 ConversationTab::Canvas => {
@@ -2736,17 +3117,29 @@ impl Render for App {
             }
         };
 
-        let mut panels = h_resizable("workspace")
+        // Slack's DM list is wider than its channel sidebar, and each keeps the width it is
+        // dragged to: one resizable layout (and so one remembered width) per destination.
+        // The Activity page replaces the sidebar's list column, so its layout keeps only
+        // the rail's width.
+        let nav = self.sidebar.read(cx).active_nav();
+        let (layout, sidebar_width) = match nav {
+            NavItem::Dms => ("workspace-dms", DM_LIST_WIDTH),
+            NavItem::Activity => ("workspace-activity", RAIL_WIDTH),
+            _ => ("workspace", SIDEBAR_WIDTH),
+        };
+        let sidebar_panel = if nav == NavItem::Activity {
+            resizable_panel().size(sidebar_width).fixed()
+        } else {
+            resizable_panel()
+                .size(sidebar_width)
+                .size_range(px(360.)..px(800.))
+                .fixed()
+        };
+        let mut panels = h_resizable(layout)
             // Like Slack, opening the thread / profile / pins panel narrows the conversation,
             // never the sidebar, and resizing the window only resizes the conversation: the
             // sidebar and the side panel are fixed at the widths Slack gives them.
-            .child(
-                resizable_panel()
-                    .size(SIDEBAR_WIDTH)
-                    .size_range(px(360.)..px(640.))
-                    .fixed()
-                    .child(self.sidebar.clone()),
-            )
+            .child(sidebar_panel.child(self.sidebar.clone()))
             .child(
                 resizable_panel().child(
                     div()
@@ -2885,6 +3278,7 @@ impl Render for App {
             .size_full()
             .bg(chrome)
             .text_color(foreground)
+            .child(div().absolute().top_0().left_0().size(glow_side).bg(glow))
             .child(title_bar)
             .child(div().flex_1().min_h_0().w_full().child(panels))
             .when(self.user_menu_open, |root| {
@@ -2955,11 +3349,12 @@ impl Render for App {
                 root.when_some(
                     (bounds.size.width > px(0.)).then_some(bounds),
                     |root, bounds| {
-                        // Slack's search panel: hangs from the pill, just as wide, above
-                        // every pane. A press outside it (and outside the pill) folds it.
+                        // Slack's search panel: hangs over the pill from its top-left
+                        // corner, just as wide, above every pane. A press outside it (and
+                        // outside the pill) folds it.
                         root.child(deferred(
                             anchored()
-                                .position(bounds.bottom_left())
+                                .position(bounds.origin)
                                 .anchor(Anchor::TopLeft)
                                 .snap_to_window_with_margin(Edges::all(px(8.)))
                                 .child(
@@ -3064,18 +3459,6 @@ impl App {
                     .px_2()
                     .rounded(px(6.))
                     .bg(pill)
-                    // While the dropdown is open its keys steer it, not the field's caret.
-                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if !this.search_menu_open {
-                            return;
-                        }
-                        if this
-                            .search_menu
-                            .update(cx, |menu, cx| menu.handle_key(event, cx))
-                        {
-                            cx.stop_propagation();
-                        }
-                    }))
                     // Like Slack, a click anywhere on the pill focuses search (and never
                     // drags the window, as the rest of the title bar does) and opens the
                     // dropdown under it.
@@ -3094,11 +3477,19 @@ impl App {
                             .size(px(14.)),
                     )
                     .child(
-                        div().flex_1().min_w_0().text_sm().child(
-                            Textarea::new(&self.search)
-                                .appearance(false)
-                                .bordered(false),
-                        ),
+                        // While the dropdown is open the field renders inside the panel;
+                        // the pill keeps its box so the bar does not shift.
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .when(!self.search_menu_open, |field| {
+                                field.child(
+                                    Textarea::new(&self.search)
+                                        .appearance(false)
+                                        .bordered(false),
+                                )
+                            }),
                     ),
             );
 
@@ -3130,38 +3521,42 @@ impl App {
         // Slack's 40px top bar: the history arrows hug the left of a search pill centred in
         // the window (the right padding mirrors the traffic lights' inset on the left), with
         // status and help pinned to the right edge.
-        TitleBar::new().h(px(40.)).child(
-            h_flex()
-                .relative()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .pr(px(80.))
-                .child(h_flex().flex_1().min_w_0().justify_end().pr_2().child(nav))
-                .child(search_pill)
-                .child(div().flex_1().min_w_0())
-                .child(
-                    h_flex()
-                        .absolute()
-                        .right_2()
-                        .top_0()
-                        .h_full()
-                        .items_center()
-                        .gap_1()
-                        .child(status_button)
-                        .child(
-                            chrome_icon(
-                                "help",
-                                IconName::CircleQuestionMark,
-                                muted_foreground,
-                                accent,
-                            )
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_shortcuts(window, cx)),
+        // Transparent over the root's chrome (and its corner glow), like the rail.
+        TitleBar::new()
+            .h(px(40.))
+            .bg(gpui_kit::gpui::transparent_black())
+            .child(
+                h_flex()
+                    .relative()
+                    .flex_1()
+                    .h_full()
+                    .items_center()
+                    .pr(px(80.))
+                    .child(h_flex().flex_1().min_w_0().justify_end().pr_2().child(nav))
+                    .child(search_pill)
+                    .child(div().flex_1().min_w_0())
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .right_2()
+                            .top_0()
+                            .h_full()
+                            .items_center()
+                            .gap_1()
+                            .child(status_button)
+                            .child(
+                                chrome_icon(
+                                    "help",
+                                    IconName::CircleQuestionMark,
+                                    muted_foreground,
+                                    accent,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.open_shortcuts(window, cx),
+                                )),
                             ),
-                        ),
-                ),
-        )
+                    ),
+            )
     }
 
     /// Slack's paused-notifications strip for a DM whose peer has do-not-disturb on: a
@@ -3199,6 +3594,80 @@ impl App {
                         .child("They will see your messages when they're back."),
                 ),
         )
+    }
+
+    /// The Slack Connect banner of an externally shared channel: one line per connected
+    /// organization, its icon and "<N> external people are from <Org>" (the count in link
+    /// color). Recomputed on member/snapshot changes, never per frame.
+    fn connect_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        let conversation = self.fixtures.conversation(&self.channel)?;
+        if !conversation.is_ext_shared || self.connect_orgs.is_empty() {
+            return None;
+        }
+        let muted = cx.theme().muted;
+        let muted_foreground = cx.theme().muted_foreground;
+        let link = cx.theme().link;
+        Some(
+            v_flex()
+                .gap_1()
+                .mx_4()
+                .mb_1()
+                .px_3()
+                .py_1p5()
+                .flex_none()
+                .rounded_md()
+                .bg(muted)
+                .children(self.connect_orgs.iter().map(|org| {
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(channel_details::org_chip(&org.team, 16.))
+                        .child(
+                            div().text_xs().text_color(muted_foreground).child(
+                                h_flex()
+                                    .items_baseline()
+                                    .gap_1()
+                                    .child(div().text_color(link).child(format!(
+                                        "{} external {}",
+                                        org.members,
+                                        if org.members == 1 { "person" } else { "people" }
+                                    )))
+                                    .child(div().child(format!(
+                                        "{} from {}",
+                                        if org.members == 1 { "is" } else { "are" },
+                                        org.team.name
+                                    ))),
+                            ),
+                        )
+                })),
+        )
+    }
+
+    /// Recompute [`Self::connect_orgs`] for the open conversation: only a Slack Connect
+    /// channel has other organizations to count.
+    fn sync_connect_orgs(&mut self) {
+        self.connect_orgs = match self.fixtures.conversation(&self.channel) {
+            Some(conversation) if conversation.is_ext_shared => channel_details::external_orgs(
+                &channel_details::own_team(&self.fixtures),
+                self.member_ids(&self.channel, conversation),
+                &self.fixtures.users,
+                &self.fixtures.teams,
+            ),
+            _ => Vec::new(),
+        };
+    }
+
+    /// The freshest member ids of `channel`: the core's announcement while it is the open
+    /// channel, else the conversation row (the sample workspace's lists).
+    fn member_ids<'a>(
+        &'a self,
+        channel: &ChannelId,
+        conversation: &'a Conversation,
+    ) -> &'a [UserId] {
+        match &self.open_members {
+            Some((open, members)) if open == channel => members,
+            _ => &conversation.members,
+        }
     }
 
     /// The conversation header row: star, peer avatar for DMs (presence dot for IMs, stacked
@@ -3312,6 +3781,8 @@ impl App {
         let peer_user = conversation
             .filter(|c| c.kind() == ConversationKind::Im)
             .and_then(|c| c.user.clone());
+        // Channels: the name tile opens the details dialog, as in Slack.
+        let details_channel = channel.map(|c| c.id.clone());
         // Slack offers no huddle with yourself.
         let can_huddle = peer_user.as_ref() != Some(&self.fixtures.self_user);
         // Slack keeps the whole name; the topic after it truncates instead.
@@ -3336,6 +3807,13 @@ impl App {
                 name.cursor_pointer().hover(|el| el.bg(accent)).on_click(
                     cx.listener(move |this, _, _, cx| this.open_profile(user.clone(), cx)),
                 )
+            })
+            .when_some(details_channel, |name, channel| {
+                name.cursor_pointer()
+                    .hover(|el| el.bg(accent))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_channel_details(&channel, window, cx)
+                    }))
             });
 
         h_flex()
@@ -3547,6 +4025,15 @@ fn subscribe_workspace(
                 SidebarEvent::OpenDrafts => this.open_drafts(cx),
                 SidebarEvent::OpenLater => this.open_later(cx),
                 SidebarEvent::OpenThreads => this.open_threads(cx),
+                SidebarEvent::OpenActivity => this.open_activity(cx),
+                SidebarEvent::LeftActivity => {
+                    this.activity_open = false;
+                    cx.notify();
+                }
+                SidebarEvent::OpenFiles => this.open_files(cx),
+                SidebarEvent::ShowFilesSection(section) => this
+                    .files_page
+                    .update(cx, |page, cx| page.show_section(*section, window, cx)),
                 SidebarEvent::OpenHuddles => this.open_huddles(cx),
                 SidebarEvent::OpenDirectories => this.open_directory(cx),
                 SidebarEvent::OpenCompose => this.open_compose("", window, cx),
@@ -3555,9 +4042,6 @@ fn subscribe_workspace(
                 SidebarEvent::OpenUserMenu => {
                     this.user_menu_open = !this.user_menu_open;
                     cx.notify();
-                }
-                SidebarEvent::OpenThread { channel, thread_ts } => {
-                    this.open_thread(channel.clone(), thread_ts.clone(), cx);
                 }
             },
         ),
@@ -3710,7 +4194,8 @@ fn subscribe_workspace(
 /// Block Kit message; `=emoji` additionally opens the composer's emoji picker. `=shortcuts`
 /// opens the shortcuts sheet, `=drafts` Drafts & sent, `=side` the second workspace and
 /// `=slash` the composer's slash menu. `=later` opens Later, `=pins` the pins panel,
-/// `=activity` the Activity feed, and `=notify` posts a test system notification.
+/// `=activity` the Activity page, `=files` the Files view (`=files:canvases` / `=files:lists`
+/// on that page), and `=notify` posts a test system notification.
 fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>) {
     let Ok(demo) = std::env::var("SLACKLESS_GUI_DEMO") else {
         return;
@@ -3745,10 +4230,14 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
             | "later"
             | "pins"
             | "activity"
+            | "files"
+            | "files:canvases"
+            | "files:lists"
             | "threads"
             | "huddles"
             | "directory"
             | "compose"
+            | "details"
             | "wsmenu"
             | "notify"
     ) {
@@ -3773,10 +4262,26 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                     "later" => app.open_later(cx),
                     "pins" => app.toggle_pins(cx),
                     "activity" => app.show_nav(NavItem::Activity, cx),
+                    "files" => app.show_nav(NavItem::Files, cx),
+                    "files:canvases" | "files:lists" => {
+                        app.show_nav(NavItem::Files, cx);
+                        let section = if demo == "files:lists" {
+                            FilesSection::Lists
+                        } else {
+                            FilesSection::Canvases
+                        };
+                        app.sidebar
+                            .update(cx, |sidebar, cx| sidebar.show_files_section(section, cx));
+                    }
                     "threads" => app.open_threads(cx),
                     "huddles" => app.open_huddles(cx),
                     "directory" => app.open_directory(cx),
                     "compose" => app.open_compose("", window, cx),
+                    "details" => {
+                        // The Slack Connect channel: the dialog and banner together.
+                        app.select("C0PARTNER".into(), cx);
+                        app.open_channel_details(&"C0PARTNER".into(), window, cx);
+                    }
                     "wsmenu" => app
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.show_settings_menu(cx)),

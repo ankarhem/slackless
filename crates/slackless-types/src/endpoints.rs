@@ -121,6 +121,7 @@ pub mod method {
     pub const CONVERSATIONS_RENAME: &str = "conversations.rename";
     pub const CONVERSATIONS_REPLIES: &str = "conversations.replies";
     pub const CONVERSATIONS_SET_TEAMS: &str = "conversations.setTeams";
+    pub const CONVERSATIONS_SET_PURPOSE: &str = "conversations.setPurpose";
     pub const CONVERSATIONS_SET_TOPIC: &str = "conversations.setTopic";
     pub const CONVERSATIONS_TEAM_CONNECTIONS: &str = "conversations.teamConnections";
     pub const CONVERSATIONS_UPDATE_TAB: &str = "conversations.updateTab";

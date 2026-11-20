@@ -34,6 +34,11 @@ use slackless_core::{Client, Command, Event, SharedStore};
 use crate::fixtures::{self, Fixtures};
 use crate::media::CoreHttp;
 
+/// `serde_json` through gpui's re-export (see `crate::blockkit`).
+use crate::blockkit::serde_json;
+use crate::preferences::AppearanceMode;
+use crate::theme;
+
 /// Idle wait between event polls while the core is running. The guide's pattern would await
 /// the stream directly; without a `futures` dependency a short bounded poll keeps events at
 /// sub-frame latency without spinning the executor.
@@ -47,6 +52,25 @@ const LAST_CONVERSATION: &str = "last_conversation";
 
 /// The store's local-state key for the window's frame (AppKit restorable state, hex-encoded).
 const WINDOW_STATE: &str = "window_state";
+
+/// The store's local-state key for the Color Mode chosen in Preferences.
+const COLOR_MODE: &str = "color_mode";
+
+/// The store's local-state key for the search pill's recent searches.
+const SEARCH_HISTORY: &str = "search_history";
+
+/// The store's local-state key for the search panel's history toggle.
+const SEARCH_HISTORY_SHOWN: &str = "search_history_shown";
+
+/// The store's local-state key for the search panel's filter toggle.
+const SEARCH_FILTERS_SHOWN: &str = "search_filters_shown";
+
+/// The store's local-state key for the recently visited conversations (the search menu's
+/// "Recent places" and the history clock's menu).
+const RECENT_PLACES: &str = "recent_places";
+
+/// The store's local-state key for the Font chosen in Preferences (its family name).
+const FONT: &str = "font";
 
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
@@ -236,9 +260,7 @@ impl CoreBridge {
     /// The conversation last open in this workspace, restored at launch like Slack. `None`
     /// offline or before the first one.
     pub fn last_conversation(&self) -> Option<ChannelId> {
-        let team = &self.session.as_ref()?.team_id;
-        let store = self.store.as_ref()?.lock().ok()?;
-        let id = store.local(team, LAST_CONVERSATION).ok().flatten()?;
+        let id = self.local(LAST_CONVERSATION)?;
         Some(ChannelId::from(id.as_str()))
     }
 
@@ -248,24 +270,17 @@ impl CoreBridge {
         &self,
         channel: ChannelId,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
-        let team = self.session.as_ref()?.team_id.clone();
-        let store = self.store.clone()?;
-        Some(async move {
-            let Ok(mut store) = store.lock() else {
-                return;
-            };
-            if let Err(e) = store.set_local(&team, LAST_CONVERSATION, channel.as_str()) {
-                eprintln!("slackless: could not remember the open conversation ({e})");
-            }
-        })
+        self.write_local(
+            LAST_CONVERSATION,
+            channel.as_str().to_owned(),
+            "open conversation",
+        )
     }
 
     /// The window frame saved by [`Self::remember_window_state`], so the window reopens where
     /// and how it was left, like Slack's. `None` offline or before the first save.
     pub fn window_state(&self) -> Option<Vec<u8>> {
-        let team = &self.session.as_ref()?.team_id;
-        let store = self.store.as_ref()?.lock().ok()?;
-        let hex = store.local(team, WINDOW_STATE).ok().flatten()?;
+        let hex = self.local(WINDOW_STATE)?;
         (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
@@ -278,15 +293,142 @@ impl CoreBridge {
         &self,
         state: Vec<u8>,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let hex = state.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.write_local(WINDOW_STATE, hex, "window frame")
+    }
+
+    /// The Color Mode chosen in Preferences, which Slack keeps on the client rather than in the
+    /// workspace prefs; `System` until one is chosen, following the computer as the user's
+    /// Slack does. `None` offline: the sample workspace keeps its dark reference look.
+    pub fn color_mode(&self) -> Option<AppearanceMode> {
+        self.store.as_ref()?;
+        let saved = self.local(COLOR_MODE);
+        Some(
+            saved
+                .as_deref()
+                .and_then(AppearanceMode::from_key)
+                .unwrap_or(AppearanceMode::System),
+        )
+    }
+
+    /// Live mode: a write remembering `mode` as the Color Mode, to run off the UI thread.
+    /// `None` offline.
+    pub fn remember_color_mode(
+        &self,
+        mode: AppearanceMode,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(COLOR_MODE, mode.key().to_owned(), "color mode")
+    }
+
+    /// The search pill's recent searches, newest first, as last recorded; empty until the
+    /// first one. `None` offline.
+    pub fn search_history(&self) -> Option<Vec<String>> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(SEARCH_HISTORY)?).ok()
+    }
+
+    /// Live mode: a write remembering the search history, to run off the UI thread. `None`
+    /// offline.
+    pub fn remember_search_history(
+        &self,
+        queries: &[String],
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(
+            SEARCH_HISTORY,
+            serde_json::to_string(queries).ok()?,
+            "search history",
+        )
+    }
+
+    /// The search panel's history toggle, as last chosen; `None` offline or before the
+    /// first choice (the panel then starts with the toggle off, like Slack's).
+    pub fn search_history_shown(&self) -> Option<bool> {
+        self.store.as_ref()?;
+        self.local(SEARCH_HISTORY_SHOWN)?.parse().ok()
+    }
+
+    /// Live mode: a write remembering the history toggle, to run off the UI thread. `None`
+    /// offline.
+    pub fn remember_search_history_shown(
+        &self,
+        on: bool,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(SEARCH_HISTORY_SHOWN, on.to_string(), "history toggle")
+    }
+
+    /// The search panel's filter toggle, as last chosen; `None` offline or before the first
+    /// choice.
+    pub fn search_filters_shown(&self) -> Option<bool> {
+        self.store.as_ref()?;
+        self.local(SEARCH_FILTERS_SHOWN)?.parse().ok()
+    }
+
+    /// Live mode: a write remembering the filter toggle, to run off the UI thread. `None`
+    /// offline.
+    pub fn remember_search_filters_shown(
+        &self,
+        on: bool,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(SEARCH_FILTERS_SHOWN, on.to_string(), "filter toggle")
+    }
+
+    /// The recently visited conversations, newest first, as last recorded. `None` offline.
+    pub fn recent_places(&self) -> Option<Vec<ChannelId>> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(RECENT_PLACES)?).ok()
+    }
+
+    /// Live mode: a write remembering the recently visited conversations, to run off the UI
+    /// thread. `None` offline.
+    pub fn remember_recent_places(
+        &self,
+        ids: &[ChannelId],
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(
+            RECENT_PLACES,
+            serde_json::to_string(ids).ok()?,
+            "recent places",
+        )
+    }
+
+    /// The Font chosen in Preferences, an index into [`theme::FONT_LABELS`]; `None` offline
+    /// or before one is chosen (Lato, Slack's default, applies).
+    pub fn font(&self) -> Option<usize> {
+        let family = self.local(FONT)?;
+        theme::FONT_FAMILIES
+            .iter()
+            .position(|known| *known == family)
+    }
+
+    /// Live mode: a write remembering [`theme::FONT_LABELS`]`[font]` as the Font, to run off
+    /// the UI thread. `None` offline.
+    pub fn remember_font(&self, font: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(FONT, theme::FONT_FAMILIES[font].to_owned(), "font")
+    }
+
+    /// This workspace's stored local-state `key`; `None` offline or when unset.
+    fn local(&self, key: &str) -> Option<String> {
+        let team = &self.session.as_ref()?.team_id;
+        let store = self.store.as_ref()?.lock().ok()?;
+        store.local(team, key).ok().flatten()
+    }
+
+    /// A write storing `value` under this workspace's local-state `key`, to run off the UI
+    /// thread; a failure is logged naming `what` was not remembered. `None` offline.
+    fn write_local(
+        &self,
+        key: &'static str,
+        value: String,
+        what: &'static str,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.store.clone()?;
         Some(async move {
-            let hex: String = state.iter().map(|byte| format!("{byte:02x}")).collect();
             let Ok(mut store) = store.lock() else {
                 return;
             };
-            if let Err(e) = store.set_local(&team, WINDOW_STATE, &hex) {
-                eprintln!("slackless: could not remember the window frame ({e})");
+            if let Err(e) = store.set_local(&team, key, &value) {
+                eprintln!("slackless: could not remember the {what} ({e})");
             }
         })
     }

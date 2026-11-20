@@ -485,6 +485,13 @@ impl MessageList {
                 cx.emit(MessageListEvent::OpenThread { channel, thread_ts });
             }
             MessageAction::CopyLink => actions::copy_link(&self.fixtures, &channel, ts, window, cx),
+            MessageAction::CopyText => {
+                let data = self.data.read(cx);
+                if let Some(message) = data.messages.iter().find(|m| &m.ts == ts) {
+                    let text = self.fixtures.plain_text(message);
+                    cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(text));
+                }
+            }
             MessageAction::Forward => cx.emit(MessageListEvent::Forward(actions::permalink(
                 &self.fixtures,
                 &self.channel,
@@ -809,6 +816,11 @@ fn transcript_row(
     let fixtures = &store.fixtures;
     let message = &messages[ix];
     let previous = ix.checked_sub(1).map(|previous| &messages[previous]);
+    // Like Slack, a run of joins (or of leaves) reads as its first line, "<name> and N others
+    // left #channel."; the rest of the run keeps an empty row (and so its scroll position).
+    if previous.is_some_and(|prev| membership_run(prev, message)) {
+        return div();
+    }
 
     let date_break = previous.is_none_or(|prev| day_index(&prev.ts) != day_index(&message.ts));
     // Like Slack, your own messages never count as new: the line goes above the first unread
@@ -847,7 +859,11 @@ fn transcript_row(
         row = row.child(new_messages_divider(cx));
     }
     if is_membership(message) {
-        return row.child(membership_line(message, &author, store, cx));
+        let others = messages[ix + 1..]
+            .iter()
+            .take_while(|next| membership_run(message, next))
+            .count();
+        return row.child(membership_line(message, &author, others, store, cx));
     }
 
     let key = format!("msg-{}", message.ts.as_str());
@@ -1233,9 +1249,28 @@ fn is_membership(message: &Message) -> bool {
     )
 }
 
+/// Whether `next` continues `message`'s run of joins (or of leaves), which Slack shows as one
+/// line.
+fn membership_run(message: &Message, next: &Message) -> bool {
+    let leave = |m: &Message| {
+        matches!(
+            m.subtype,
+            Some(MessageSubtype::ChannelLeave | MessageSubtype::GroupLeave)
+        )
+    };
+    is_membership(message) && is_membership(next) && leave(message) == leave(next)
+}
+
 /// Slack's compact join / leave line: a person icon in the avatar gutter, "<name> joined
-/// #channel." and the time, all muted.
-fn membership_line(message: &Message, author: &str, store: &MessageData, cx: &App) -> Div {
+/// #channel." ("<name> and N others left #channel." for a run of `others` more) and the
+/// time, all muted.
+fn membership_line(
+    message: &Message,
+    author: &str,
+    others: usize,
+    store: &MessageData,
+    cx: &App,
+) -> Div {
     let muted = cx.theme().muted_foreground;
     let channel = store
         .fixtures
@@ -1264,7 +1299,11 @@ fn membership_line(message: &Message, author: &str, store: &MessageData, cx: &Ap
                         .size(px(15.)),
                 ),
         )
-        .child(format!("{author} {verb} {channel}."))
+        .child(match others {
+            0 => format!("{author} {verb} {channel}."),
+            1 => format!("{author} and 1 other {verb} {channel}."),
+            n => format!("{author} and {n} others {verb} {channel}."),
+        })
         .child(div().text_xs().child(format_clock(&message.ts)))
 }
 
@@ -2289,6 +2328,22 @@ pub(crate) fn list_stamp(ts: &Ts) -> String {
     }
 }
 
+/// When a file was created, as the Files view words it after "Created": "today",
+/// "yesterday", "on October 1st", or "on January 19th, 2025" outside the current year.
+pub(crate) fn file_day(secs: i64) -> String {
+    let now = CivilTime::now();
+    let time = CivilTime::from_unix(secs);
+    let label = date_label(&time, &now);
+    if time.day_index == now.day_index || time.day_index + 1 == now.day_index {
+        return label.to_lowercase();
+    }
+    // Within the current year the label leads with the weekday: "Monday, October 1st".
+    match label.split_once(", ") {
+        Some((_, day)) if time.year == now.year => format!("on {day}"),
+        _ => format!("on {label}"),
+    }
+}
+
 /// The stamp on a message card outside the day-divided transcript (threads, search, pins):
 /// like Slack, the time for today's messages, the day and time otherwise.
 fn card_stamp(ts: &Ts) -> String {
@@ -2298,6 +2353,14 @@ fn card_stamp(ts: &Ts) -> String {
         }
         _ => day_and_time(ts),
     }
+}
+
+/// The day header of a day-grouped list (the Activity page): the divider's day label
+/// (`Today`, `Yesterday`, `Tuesday, November 10th`), or the raw ts when it does not parse.
+pub(crate) fn day_label(ts: &Ts) -> String {
+    ts.secs()
+        .map(|secs| date_label(&CivilTime::from_unix(secs), &CivilTime::now()))
+        .unwrap_or_else(|| ts.as_str().to_owned())
 }
 
 /// Slack's long stamp (attachment footers, thread replies from other days):

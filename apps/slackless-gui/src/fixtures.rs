@@ -76,17 +76,10 @@ fn with_glyphs(text: &str) -> String {
 /// Slack's one-click reactions from the user's prefs: none when turned off, the three
 /// customized emoji when set, else Slack's defaults.
 fn quick_reactions(prefs: &crate::blockkit::serde_json::Value) -> Vec<String> {
-    // Slack's current client decides by `user_customized_quick_reactions_display_feature`
-    // and ignores the legacy `show_quick_reactions` then (observed: feature 2 with the
-    // legacy pref false shows the defaults on hover); 0 is taken as off. The legacy pref
-    // decides only where the newer one is absent.
-    let shown = match prefs
-        .get("user_customized_quick_reactions_display_feature")
-        .and_then(|v| v.as_u64())
-    {
-        Some(feature) => feature != 0,
-        None => prefs.get("show_quick_reactions").and_then(|v| v.as_bool()) != Some(false),
-    };
+    // `show_quick_reactions` decides, as the official client shows it on 2026-11-20: with it
+    // off (and `user_customized_quick_reactions_display_feature` 2) Slack's hover bar has no
+    // one-click reactions, in channels and DMs alike. Absent, they show.
+    let shown = prefs.get("show_quick_reactions").and_then(|v| v.as_bool()) != Some(false);
     if !shown {
         return Vec::new();
     }
@@ -117,6 +110,9 @@ pub type PresenceMap = Arc<RwLock<HashMap<UserId, Presence>>>;
 
 pub struct Fixtures {
     pub workspaces: Vec<Team>,
+    /// Every organization the snapshot knows: the signed-in workspace's own team first, then
+    /// the connected teams of Slack Connect channels (live: stored `team.info` records).
+    pub teams: Vec<Team>,
     /// The signed-in user; author of locally composed messages.
     pub self_user: UserId,
     pub users: Vec<User>,
@@ -167,9 +163,9 @@ pub struct Fixtures {
     pub real_names_in_mentions: bool,
     /// Live mode: ids of the sidebar sections the user collapsed in Slack.
     pub collapsed_sections: HashSet<String>,
-    /// The appearance Slack stores for the user, applied at launch; `None` in the sample
+    /// The color theme Slack stores for the user, applied at launch; `None` in the sample
     /// workspace, which keeps the reference screenshot's dark look.
-    pub appearance: Option<crate::theme::Appearance>,
+    pub palette: Option<crate::theme::Palette>,
 }
 
 /// A custom emoji's picture: a generated sample image, or a live `emoji.list` URL that GPUI's
@@ -199,20 +195,20 @@ pub struct ProfileExtras {
 
 impl Fixtures {
     pub fn user_name<'a>(&'a self, id: &'a UserId) -> &'a str {
-        self.users
-            .iter()
-            .find(|u| u.id == *id)
-            .map(|user| {
-                let real = [user.profile.real_name.as_deref(), user.real_name.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .find(|name| !name.is_empty());
-                match real {
-                    Some(real) if self.real_names => real,
-                    _ => user.display_name(),
-                }
-            })
-            .unwrap_or(id.as_str())
+        self.user(id).map_or(id.as_str(), |user| self.name_of(user))
+    }
+
+    /// The name `user` shows by: their full name where the workspace shows full names, else
+    /// their display name ([`Fixtures::user_name`] for a profile already at hand).
+    pub fn name_of<'a>(&self, user: &'a User) -> &'a str {
+        let real = [user.profile.real_name.as_deref(), user.real_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|name| !name.is_empty());
+        match real {
+            Some(real) if self.real_names => real,
+            _ => user.display_name(),
+        }
     }
 
     pub fn conversation(&self, id: &ChannelId) -> Option<&Conversation> {
@@ -267,9 +263,9 @@ impl Fixtures {
         }
     }
 
-    /// One-line plain preview of a message: user mentions resolved to `@name`, standard
-    /// `:emoji:` shown as their glyph, file-only messages described by their first file.
-    pub fn preview(&self, message: &Message) -> String {
+    /// A message's text as plain text (Slack's "Copy message"): user mentions resolved to
+    /// `@name`, standard `:emoji:` shown as their glyph, line breaks kept.
+    pub fn plain_text(&self, message: &Message) -> String {
         let mut text = message.text.clone();
         for user in &self.users {
             text = text.replace(
@@ -277,12 +273,18 @@ impl Fixtures {
                 &format!("@{}", user.display_name()),
             );
         }
-        if text.trim().is_empty() {
+        with_glyphs(&text)
+    }
+
+    /// One-line plain preview of a message: [`Self::plain_text`] on one line, file-only
+    /// messages described by their first file.
+    pub fn preview(&self, message: &Message) -> String {
+        if message.text.trim().is_empty() {
             if let Some(file) = message.files.first() {
                 return format!("Shared a file: {}", file.name.as_deref().unwrap_or("file"));
             }
         }
-        with_glyphs(&text.replace('\n', " "))
+        self.plain_text(message).replace('\n', " ")
     }
 
     /// Sidebar/header label: `# name` for channels, the other parties' names for DMs.
@@ -478,6 +480,16 @@ pub fn load() -> Fixtures {
     })
     .collect();
 
+    // The two members of the connected organization in the Slack Connect channel.
+    for (id, name, real) in [
+        ("U0KLA1", "elin", "Elin Ekman"),
+        ("U0KLA2", "johannes", "Johannes Jonsson"),
+    ] {
+        let mut external = user(id, name, real);
+        external.team_id = Some("T0KLARNA".into());
+        users.push(external);
+    }
+
     let mut channels = vec![
         channel(
             "C0GENERAL",
@@ -497,6 +509,49 @@ pub fn load() -> Fixtures {
         channel("C0DESIGN", "design", "Private design reviews", true, 7),
     ];
     channels[0].is_general = true;
+    // The creators and creation dates of the sample channels (Slack's details dialog).
+    for (ix, creator, created) in [
+        (0, "U0ALICE", 1_565_568_000), // 2019-08-12
+        (1, "U0BOB", 1_565_654_400),   // 2019-08-13
+        (2, "U0ALICE", 1_593_043_200), // 2020-06-25
+        (3, "U0CARA", 1_633_305_600),  // 2021-10-04
+    ] {
+        channels[ix].creator = Some(creator.into());
+        channels[ix].created = Some(created);
+    }
+
+    // A Slack Connect channel shared with Klarna: 3 Acme members + 2 from the connected
+    // organization, hosted by them, like the reference capture's partner channel.
+    let mut partner = channel(
+        "C0PARTNER",
+        "partner-support-klarna",
+        "Escalations with Klarna's support desk",
+        true,
+        5,
+    );
+    partner.is_shared = true;
+    partner.is_ext_shared = true;
+    partner.purpose = Some(TopicPurpose {
+        value: "Escalation lane between Acme support and Klarna".into(),
+        ..Default::default()
+    });
+    partner.creator = Some("U0KLA1".into());
+    partner.created = Some(1_593_043_200); // 2020-06-25
+    partner.context_team_id = Some("T0KLARNA".into());
+    partner.members = vec![
+        "U0ME".into(),
+        "U0ALICE".into(),
+        "U0BOB".into(),
+        "U0KLA1".into(),
+        "U0KLA2".into(),
+    ];
+    let mut partner_extra = crate::blockkit::serde_json::Map::new();
+    partner_extra.insert(
+        "conversation_host_id".to_owned(),
+        crate::blockkit::serde_json::Value::String("T0KLARNA".to_owned()),
+    );
+    partner.extra = partner_extra;
+    channels.push(partner);
 
     let directory = [
         (
@@ -884,7 +939,31 @@ pub fn load() -> Fixtures {
         ),
     ];
 
+    // The Slack Connect channel's history: a question from the connected org, answered in
+    // kind, so external authors render with their profiles.
+    let partner = vec![
+        msg(
+            "C0PARTNER",
+            500,
+            "U0KLA1",
+            "Hej! Dispute #4812 needs Acme's ledger entries from Tuesday.",
+        ),
+        msg(
+            "C0PARTNER",
+            DAY + 560,
+            "U0ALICE",
+            "Pulling them now — expect an export in a few minutes.",
+        ),
+        msg(
+            "C0PARTNER",
+            DAY + 620,
+            "U0KLA2",
+            "Tack! We'll keep the dispute open until then.",
+        ),
+    ];
+
     let messages = HashMap::from([
+        ("C0PARTNER".into(), partner),
         ("C0GENERAL".into(), general),
         ("C0RANDOM".into(), random),
         ("C0ENG".into(), eng),
@@ -896,8 +975,20 @@ pub fn load() -> Fixtures {
     let threads = HashMap::from([(("C0ENG".into(), eng_thread_root), eng_replies)]);
     let latest = latest_from_histories(&messages);
 
+    // The Acme record reappears as the own team of [`Fixtures::teams`], beside Klarna's.
+    let teams = vec![
+        workspaces[0].clone(),
+        Team {
+            id: "T0KLARNA".into(),
+            name: "Klarna".into(),
+            domain: "klarna".into(),
+            ..Default::default()
+        },
+    ];
+
     Fixtures {
         workspaces,
+        teams,
         self_user: "U0ME".into(),
         users,
         channels,
@@ -922,7 +1013,7 @@ pub fn load() -> Fixtures {
         real_names: false,
         real_names_in_mentions: false,
         collapsed_sections: HashSet::new(),
-        appearance: None,
+        palette: None,
     }
 }
 
@@ -1013,6 +1104,12 @@ pub fn live(
             domain,
             ..Default::default()
         });
+    // The own team first, then the connected organizations Slack Connect channels resolved
+    // (`team.info` records stored beside it). A read failure keeps the own record alone.
+    let mut teams = store.teams(team).unwrap_or_default();
+    if !teams.iter().any(|stored| stored.id == *team) {
+        teams.insert(0, workspace.clone());
+    }
     let sections = store.sections(team).unwrap_or_else(|e| {
         eprintln!("slackless: could not read sidebar sections from the local store ({e})");
         Vec::new()
@@ -1063,6 +1160,7 @@ pub fn live(
     );
     Fixtures {
         workspaces: vec![workspace],
+        teams,
         self_user: session.user_id.clone(),
         users,
         channels,
@@ -1085,7 +1183,7 @@ pub fn live(
         real_names,
         real_names_in_mentions,
         collapsed_sections,
-        appearance: crate::theme::appearance_from_prefs(&prefs),
+        palette: crate::theme::palette_from_prefs(&prefs),
     }
 }
 

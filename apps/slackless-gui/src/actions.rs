@@ -4,9 +4,9 @@
 //!
 //! - [`hover_toolbar`]: Slack's floating bar revealed on row hover (quick reactions, add
 //!   reaction, reply in thread, forward, save for later, and a "more" dropdown);
-//! - [`actions_menu`]: the full menu behind "more" and the row's right-click `ContextMenu`
-//!   (add reaction submenu, reply, copy link, forward, save, remind me submenu, mark unread,
-//!   edit, delete);
+//! - [`actions_menu`]: the full menu behind "more" and the row's right-click `ContextMenu`,
+//!   in Slack's order (edit; mark unread, save, reminder submenu; copy link, copy message;
+//!   delete), each with Slack's keyboard shortcut while the menu is open ([`bind_menu_keys`]);
 //! - [`reaction_chips`]: reaction aggregates, interactive (toggle + add) when a handler is
 //!   given, static otherwise;
 //! - [`edit_box`]: the inline edit draft that replaces a row while it is edited;
@@ -29,9 +29,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, App, ClipboardItem, Context, Div, Entity, FontWeight, InteractiveElement as _,
-    ParentElement as _, Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, px,
+    Anchor, AnyWindowHandle, App, ClipboardItem, Context, DismissEvent, Div, Entity,
+    Focusable as _, FontWeight, Global, InteractiveElement as _, KeyBinding, ParentElement as _,
+    Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window,
+    actions, div, px,
 };
 use slackless_core::types::{ChannelId, Edited, Message, Reaction, RichTextBlock, Ts, UserId};
 
@@ -57,6 +58,8 @@ pub enum MessageAction {
     MarkUnread,
     Edit,
     Delete,
+    /// Copy the message's text ("Copy message").
+    CopyText,
     /// The author's avatar or name was clicked: show their profile.
     OpenProfile(UserId),
 }
@@ -76,16 +79,86 @@ pub type ActionHandler = Rc<dyn Fn(MessageAction, &mut Window, &mut App)>;
 
 /// Slack's default one-click reactions at the front of the hover bar.
 pub const DEFAULT_QUICK_REACTIONS: [&str; 3] = ["white_check_mark", "eyes", "raised_hands"];
-/// Emoji the menu's Add reaction submenu lists before "More reactions...".
-const MENU_REACTIONS: [&str; 8] = [
-    "thumbsup", "heart", "joy", "tada", "eyes", "fire", "pray", "rocket",
-];
+
+actions!(
+    message_menu,
+    [
+        EditMessage,
+        MarkMessageUnread,
+        SaveMessage,
+        CopyMessageLink,
+        CopyMessageText,
+        DeleteMessage
+    ]
+);
+
+/// Slack's shortcuts for the open message menu, shown beside its items. The kit draws menus
+/// in the root's popover layer, outside any message row, so the actions are handled app-wide
+/// and routed to the open menu's message ([`MenuTarget`]).
+pub fn bind_menu_keys(cx: &mut App) {
+    const MENU: Option<&str> = Some("PopupMenu");
+    cx.bind_keys([
+        KeyBinding::new("e", EditMessage, MENU),
+        KeyBinding::new("u", MarkMessageUnread, MENU),
+        KeyBinding::new("shift-cmd-s", SaveMessage, MENU),
+        KeyBinding::new("l", CopyMessageLink, MENU),
+        KeyBinding::new("cmd-c", CopyMessageText, MENU),
+        KeyBinding::new("backspace", DeleteMessage, MENU),
+    ]);
+    cx.on_action(|_: &EditMessage, cx| shortcut(MessageAction::Edit, cx));
+    cx.on_action(|_: &MarkMessageUnread, cx| shortcut(MessageAction::MarkUnread, cx));
+    cx.on_action(|_: &SaveMessage, cx| shortcut(MessageAction::SaveForLater, cx));
+    cx.on_action(|_: &CopyMessageLink, cx| shortcut(MessageAction::CopyLink, cx));
+    cx.on_action(|_: &CopyMessageText, cx| shortcut(MessageAction::CopyText, cx));
+    cx.on_action(|_: &DeleteMessage, cx| shortcut(MessageAction::Delete, cx));
+}
+
+/// The message whose actions menu opened last: the menu's shortcuts act on it while that
+/// menu has focus.
+struct MenuTarget {
+    set: ActionSet,
+    handler: ActionHandler,
+    menu: WeakEntity<PopupMenu>,
+    window: AnyWindowHandle,
+}
+
+impl Global for MenuTarget {}
+
+/// Run a menu shortcut on the open menu's message, closing the menu first as a click does.
+/// Edit and delete apply to the signed-in user's messages only, as their items do. The
+/// dispatch holds the window, so the shortcut runs once it is released.
+fn shortcut(action: MessageAction, cx: &mut App) {
+    let Some(window) = cx.try_global::<MenuTarget>().map(|target| target.window) else {
+        return;
+    };
+    cx.defer(move |cx| {
+        let _ = window.update(cx, |_, window, cx| {
+            let Some(target) = cx.try_global::<MenuTarget>() else {
+                return;
+            };
+            let Some(menu) = target.menu.upgrade() else {
+                return;
+            };
+            let own_only = matches!(action, MessageAction::Edit | MessageAction::Delete);
+            if (own_only && !target.set.own) || !menu.focus_handle(cx).contains_focused(window, cx)
+            {
+                return;
+            }
+            let handler = target.handler.clone();
+            menu.update(cx, |_, cx| cx.emit(DismissEvent));
+            handler(action, window, cx);
+        });
+    });
+}
+
+/// Slack's hover-bar buttons: 32px squares.
+const BAR_BUTTON: Size = Size::Medium;
 
 fn toolbar_button(id: String, handler: &ActionHandler, action: MessageAction) -> Button {
     let handler = handler.clone();
     Button::new(SharedString::from(id))
         .ghost()
-        .with_size(Size::XSmall)
+        .with_size(BAR_BUTTON)
         .on_click(move |_, window, cx| handler(action.clone(), window, cx))
 }
 
@@ -100,16 +173,17 @@ pub fn hover_toolbar(
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
+    // Like Slack's, the bar straddles the row's top edge.
     let mut bar = h_flex()
         .gap_0p5()
         .p_0p5()
-        .rounded_md()
+        .rounded_lg()
         .border_1()
         .border_color(theme.border)
         .bg(theme.background)
         .shadow_sm()
         .absolute()
-        .top_0()
+        .top(px(-16.))
         .right_2()
         .opacity(0.)
         .group_hover(group, |bar| bar.opacity(1.));
@@ -131,7 +205,7 @@ pub fn hover_toolbar(
     bar = bar.child(
         Button::new(SharedString::from(format!("{key}-react")))
             .ghost()
-            .with_size(Size::XSmall)
+            .with_size(BAR_BUTTON)
             .icon(IconName::FaceSlightlySmilingPlus)
             .tooltip("Add reaction")
             .on_click(move |event, window, cx| {
@@ -167,7 +241,7 @@ pub fn hover_toolbar(
     .child(
         Button::new(SharedString::from(format!("{key}-more")))
             .ghost()
-            .with_size(Size::XSmall)
+            .with_size(BAR_BUTTON)
             .icon(IconName::EllipsisVertical)
             .tooltip("More actions")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
@@ -188,8 +262,10 @@ fn menu_item(
         .on_click(move |_, window, cx| handler(action.clone(), window, cx))
 }
 
-/// The full action menu: the hover bar's "more" dropdown and the row's right-click menu.
-/// `menu` is the fresh popup the framework hands to the builder closure.
+/// The full action menu: the hover bar's "more" dropdown and the row's right-click menu, in
+/// Slack's order with Slack's shortcut beside each item ([`bind_menu_keys`]). Reacting,
+/// replying and forwarding live on the hover bar only, as in Slack. `menu` is the fresh popup
+/// the framework hands to the builder closure.
 pub fn actions_menu(
     menu: PopupMenu,
     set: ActionSet,
@@ -197,26 +273,16 @@ pub fn actions_menu(
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let reactions = PopupMenu::build(window, cx, |mut menu, _, _| {
-        for name in MENU_REACTIONS {
-            let Some(glyph) = emoji::glyph(name) else {
-                continue;
-            };
-            let handler = handler.clone();
-            menu = menu.item(PopupMenuItem::new(format!("{glyph}  :{name}:")).on_click(
-                move |_, window, cx| handler(MessageAction::React(name.to_owned()), window, cx),
-            ));
-        }
-        let more = handler.clone();
-        menu.separator().item(
-            PopupMenuItem::new("More reactions...")
-                .icon(IconName::Search)
-                .on_click(move |event, window, cx| {
-                    more(MessageAction::PickReaction(event.position()), window, cx);
-                }),
-        )
+    // The items' shortcut hints resolve against the menu's own key context, which exists
+    // once the menu has painted: draw it once more after its first frame.
+    cx.on_next_frame(window, |_, _, cx| cx.notify());
+    let menu_entity = cx.entity().downgrade();
+    cx.set_global(MenuTarget {
+        set,
+        handler: handler.clone(),
+        menu: menu_entity,
+        window: window.window_handle(),
     });
-
     let remind = PopupMenu::build(window, cx, |mut menu, _, _| {
         for preset in Remind::ALL {
             menu = menu.item(menu_item(
@@ -229,63 +295,87 @@ pub fn actions_menu(
         menu
     });
 
-    let mut menu = menu.item(
-        PopupMenuItem::submenu("Add reaction", reactions).icon(IconName::FaceSlightlySmilingPlus),
-    );
-    if set.reply {
-        menu = menu.item(menu_item(
-            "Reply in thread",
-            IconName::MessageSquareReply,
-            handler,
-            MessageAction::ReplyInThread,
-        ));
-    }
-    menu = menu
-        .separator()
-        .item(menu_item(
-            "Copy link",
-            IconName::Link2,
-            handler,
-            MessageAction::CopyLink,
-        ))
-        .item(menu_item(
-            "Forward message",
-            IconName::Forward,
-            handler,
-            MessageAction::Forward,
-        ))
-        .item(menu_item(
-            if set.saved {
-                "Remove from saved"
-            } else {
-                "Save for later"
-            },
-            IconName::Bookmark,
-            handler,
-            MessageAction::SaveForLater,
-        ))
-        .item(PopupMenuItem::submenu("Remind me about this", remind).icon(IconName::AlarmClock))
-        .item(menu_item(
-            "Mark unread",
-            IconName::BellOff,
-            handler,
-            MessageAction::MarkUnread,
-        ));
+    let mut menu = menu;
     if set.own {
         menu = menu
-            .separator()
-            .item(menu_item(
-                "Edit message",
-                IconName::Pencil,
+            .item(
+                menu_item(
+                    "Edit message",
+                    IconName::Pencil,
+                    handler,
+                    MessageAction::Edit,
+                )
+                .action(Box::new(EditMessage)),
+            )
+            .separator();
+    }
+    menu = menu
+        .item(
+            menu_item(
+                "Mark unread",
+                IconName::SquareDot,
                 handler,
-                MessageAction::Edit,
-            ))
-            .item(menu_item(
-                "Delete message",
-                IconName::Trash,
+                MessageAction::MarkUnread,
+            )
+            .action(Box::new(MarkMessageUnread)),
+        )
+        .item(
+            menu_item(
+                if set.saved {
+                    "Remove from saved"
+                } else {
+                    "Add to saved"
+                },
+                IconName::Bookmark,
                 handler,
-                MessageAction::Delete,
-            ));
+                MessageAction::SaveForLater,
+            )
+            .action(Box::new(SaveMessage)),
+        )
+        .item(PopupMenuItem::submenu("Add a reminder", remind).icon(IconName::AlarmClock))
+        .separator()
+        .item(
+            menu_item(
+                "Copy link",
+                IconName::Link2,
+                handler,
+                MessageAction::CopyLink,
+            )
+            .action(Box::new(CopyMessageLink)),
+        )
+        .item(
+            menu_item(
+                "Copy message",
+                IconName::Type,
+                handler,
+                MessageAction::CopyText,
+            )
+            .action(Box::new(CopyMessageText)),
+        );
+    if set.own {
+        // Slack's destructive item: no icon, in the danger color.
+        let delete = handler.clone();
+        menu = menu.separator().item(
+            PopupMenuItem::element(|_, cx| {
+                h_flex()
+                    .w_full()
+                    .gap_3()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_color(crate::theme::danger_text(cx))
+                            .child("Delete message..."),
+                    )
+                    // The menu's hint for the backspace binding, as Slack labels that key.
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("delete"),
+                    )
+            })
+            .action(Box::new(DeleteMessage))
+            .on_click(move |_, window, cx| delete(MessageAction::Delete, window, cx)),
+        );
     }
     menu
 }

@@ -276,17 +276,70 @@ impl Store {
         Ok(())
     }
 
-    /// The workspace's team record (`client.userBoot.team`), if hydrated.
+    /// The workspace's own team record (`client.userBoot.team`, whose id is the workspace
+    /// id), if hydrated. Connected organizations of shared channels are stored under the same
+    /// workspace with their own ids, so the id pin keeps the own record answerable.
     pub fn team(&self, workspace: &TeamId) -> Result<Option<Team>> {
         let json = self
             .conn
             .query_row(
-                "SELECT json FROM team WHERE workspace_id = ?1",
+                "SELECT json FROM team WHERE workspace_id = ?1 AND id = ?1",
                 params![workspace.as_str()],
                 |r| r.get::<_, String>(0),
             )
             .optional()?;
         Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
+    }
+
+    /// Every stored team of `workspace`: its own record first, then the connected
+    /// organizations Slack Connect shared channels introduced, by name.
+    pub fn teams(&self, workspace: &TeamId) -> Result<Vec<Team>> {
+        let teams: Vec<Team> = self
+            .json_column("SELECT json FROM team WHERE workspace_id = ?1", workspace)?
+            .iter()
+            .map(|json| serde_json::from_str(json))
+            .collect::<std::result::Result<_, _>>()?;
+        let mut sorted = teams;
+        sorted.sort_by(|a, b| {
+            let own = |team: &Team| team.id == *workspace;
+            own(b).cmp(&own(a)).then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(sorted)
+    }
+
+    /// The distinct team ids, other than `workspace`, that the stored profiles of `members`
+    /// belong to: the organizations a shared channel's external people are from.
+    pub fn member_team_ids(&self, workspace: &TeamId, members: &[UserId]) -> Result<Vec<TeamId>> {
+        let ask: Vec<&UserId> = members
+            .iter()
+            .filter(|id| id.as_str() != "USLACKBOT")
+            .collect();
+        if ask.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `team_id` lives in the stored JSON blob, not a column, so the rows parse here;
+        // unreadable profiles read as own-team (a missing profile never invents an org).
+        let sql = format!(
+            r#"SELECT json FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
+            vec!["?"; ask.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(ask.len() + 1);
+        args.push(SqlValue::Text(workspace.as_str().to_owned()));
+        args.extend(ask.iter().map(|id| SqlValue::Text(id.as_str().to_owned())));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        let mut teams: Vec<TeamId> = Vec::new();
+        for row in rows {
+            let Ok(user) = serde_json::from_str::<User>(&row?) else {
+                continue;
+            };
+            if let Some(team) = user.team_id {
+                if team != *workspace && !teams.contains(&team) {
+                    teams.push(team);
+                }
+            }
+        }
+        Ok(teams)
     }
 
     /// Replaces the workspace's sidebar sections wholesale: `users.channelSections.list`
@@ -783,6 +836,13 @@ impl Store {
                 }
             });
         }
+        if let Some(user) = &f.includes_user {
+            sql.push_str(" AND instr(m.text, ?) > 0");
+            args.push(SqlValue::Text(format!("<@{user}>")));
+        }
+        if f.threads_only {
+            sql.push_str(" AND m.thread_ts IS NOT NULL");
+        }
         sql.push_str(" ORDER BY m.ts_key DESC LIMIT ?");
         args.push(SqlValue::Integer(limit as i64));
 
@@ -1030,6 +1090,7 @@ fn now_ts() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::SearchFilters;
     use crate::types::{Edited, File, FileId, Reaction, SectionKind, UserId};
 
     fn ws() -> TeamId {
@@ -1221,6 +1282,65 @@ mod tests {
         let prefs = serde_json::json!({"display_real_names": true});
         store.replace_prefs(&ws(), &prefs).unwrap();
         assert_eq!(store.prefs(&ws()).unwrap(), Some(prefs));
+    }
+
+    #[test]
+    fn connected_teams_list_behind_the_own_team() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(store.teams(&ws()).unwrap().is_empty());
+
+        let team = |id: &str, name: &str| Team {
+            id: TeamId::from(id),
+            name: name.to_owned(),
+            domain: name.to_lowercase(),
+            ..Default::default()
+        };
+        // The external org sorts before the own id, so a plain scan would shadow it.
+        store.upsert_team(&ws(), &team("T0AEXT", "Zeta")).unwrap();
+        store
+            .upsert_team(&ws(), &team(ws().as_str(), "Acme"))
+            .unwrap();
+        store.upsert_team(&ws(), &team("T0BEXT", "Beta")).unwrap();
+
+        assert_eq!(
+            store.team(&ws()).unwrap().unwrap().name,
+            "Acme",
+            "the own record stays answerable with connected teams stored beside it"
+        );
+        let names: Vec<_> = store
+            .teams(&ws())
+            .unwrap()
+            .into_iter()
+            .map(|team| team.name)
+            .collect();
+        assert_eq!(names, ["Acme", "Beta", "Zeta"], "own first, then by name");
+    }
+
+    #[test]
+    fn member_team_ids_lists_only_external_distinct_teams() {
+        let mut store = Store::open_in_memory().unwrap();
+        let user = |id: &str, team: Option<&str>| User {
+            id: UserId::from(id),
+            team_id: team.map(TeamId::from),
+            ..Default::default()
+        };
+        store.upsert_user(&ws(), &user("U1", Some("T1"))).unwrap();
+        store
+            .upsert_user(&ws(), &user("U2", Some("T0EXT")))
+            .unwrap();
+        store
+            .upsert_user(&ws(), &user("U3", Some("T0EXT")))
+            .unwrap();
+        store.upsert_user(&ws(), &user("U4", None)).unwrap();
+
+        let members = ["U1", "U2", "U3", "U4", "U9", "USLACKBOT"]
+            .map(UserId::from)
+            .to_vec();
+        assert_eq!(
+            store.member_team_ids(&ws(), &members).unwrap(),
+            vec![TeamId::from("T0EXT")],
+            "own team, duplicates, missing profiles and USLACKBOT never list"
+        );
     }
 
     #[test]
@@ -1635,6 +1755,61 @@ mod tests {
             texts(r#"rocket" OR "x"#).is_empty(),
             "FTS syntax in input is literal"
         );
+    }
+
+    #[test]
+    fn filter_chip_constraints() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_conversation(
+                &ws(),
+                &Conversation {
+                    id: general(),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut mention = msg("1704153600.000100", "U2", "ping <@U1> about the rocket");
+        mention.thread_ts = Some(Ts::from("1704153600.000000"));
+        let plain = msg("1704240000.000100", "U1", "plain rocket");
+        let top = msg("1704240010.000100", "U2", "top-level rocket <@U2>");
+        store.upsert_message(&ws(), &general(), &mention).unwrap();
+        store.upsert_message(&ws(), &general(), &plain).unwrap();
+        store.upsert_message(&ws(), &general(), &top).unwrap();
+
+        let found = |filters: SearchFilters| -> Vec<String> {
+            let mut query = SearchQuery::parse("rocket");
+            query.filters = filters;
+            store
+                .search(&ws(), &query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.message.text)
+                .collect()
+        };
+        let threads = SearchFilters {
+            threads_only: true,
+            ..Default::default()
+        };
+        assert_eq!(found(threads), ["ping <@U1> about the rocket"]);
+        let mentions_me = SearchFilters {
+            includes_user: Some("U1".into()),
+            ..Default::default()
+        };
+        assert_eq!(found(mentions_me), ["ping <@U1> about the rocket"]);
+        let both = SearchFilters {
+            includes_user: Some("U1".into()),
+            threads_only: true,
+            ..Default::default()
+        };
+        assert_eq!(found(both).len(), 1);
+        let nobody = SearchFilters {
+            includes_user: Some("U9".into()),
+            ..Default::default()
+        };
+        assert!(found(nobody).is_empty());
     }
 
     #[test]

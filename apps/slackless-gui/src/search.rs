@@ -20,7 +20,7 @@ use gpui_kit::gpui::{
     Styled as _, Window, div, px,
 };
 use slackless_core::SharedStore;
-use slackless_core::store::{SearchQuery, Store, StoredMessage};
+use slackless_core::store::{SearchFilters, SearchQuery, Store, StoredMessage};
 use slackless_core::types::{ChannelId, TeamId};
 
 use crate::fixtures::Fixtures;
@@ -76,12 +76,33 @@ impl SearchView {
         cx.notify();
     }
 
+    /// Search messages for `query` (the pill's Enter, the dropdown's search row).
     pub fn run(&mut self, query: String, cx: &mut Context<Self>) {
+        self.run_with_filters(query, SearchFilters::default(), cx);
+    }
+
+    /// Search for `query` with the search menu's filter chips layered over the query's own
+    /// Slack-style modifiers: the chips' channel/user/has clauses join theirs (both resolve
+    /// to SQL WHERE clauses), their mention user and thread switch set what no modifier
+    /// expresses.
+    pub fn run_with_filters(
+        &mut self,
+        query: String,
+        mut filters: SearchFilters,
+        cx: &mut Context<Self>,
+    ) {
         self.query = query.trim().to_owned();
         self.results.clear();
         self.error = None;
         if let (Some(archive), false) = (&self.archive, self.query.is_empty()) {
-            let parsed = SearchQuery::parse(&self.query);
+            let mut parsed = SearchQuery::parse(&self.query);
+            parsed.filters.in_channels.append(&mut filters.in_channels);
+            parsed.filters.from_users.append(&mut filters.from_users);
+            parsed.filters.has.append(&mut filters.has);
+            if parsed.filters.includes_user.is_none() {
+                parsed.filters.includes_user = filters.includes_user.take();
+            }
+            parsed.filters.threads_only |= filters.threads_only;
             let found = match archive.lock() {
                 Ok(store) => store
                     .search(&self.workspace, &parsed, RESULT_LIMIT)

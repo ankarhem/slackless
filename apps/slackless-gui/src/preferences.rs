@@ -5,8 +5,9 @@
 //!
 //! Every control writes the in-memory [`Settings`] and emits [`PreferencesEvent::Changed`];
 //! the root applies what the app already honors (theme mode + color theme, Enter-to-send,
-//! the notification schedule shown in the DND menu). Persisting the settings and syncing them
-//! with Slack's `users.prefs.set` is a follow-up; until then they reset at launch.
+//! the notification schedule shown in the DND menu). The Color Mode is remembered locally, as
+//! Slack keeps it on the client; persisting the other settings and syncing them with Slack's
+//! `users.prefs.set` is a follow-up, until then they reset at launch.
 //!
 //! `Preferences::new(&mut Window, &mut App) -> Entity<Preferences>`
 //! `Preferences::settings(&self) -> &Settings`
@@ -21,7 +22,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowAppearance, div, px,
 };
 
 use crate::theme::{self, CUSTOM_ACCENTS, CUSTOM_SIDEBARS, Palette, SlackTheme};
@@ -31,12 +32,46 @@ pub enum PreferencesEvent {
     Changed,
 }
 
-/// Light / Dark / follow the OS.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Slack's Color Mode: Light / Dark / System (follow the computer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppearanceMode {
     Light,
     Dark,
     System,
+}
+
+impl AppearanceMode {
+    /// The theme this mode shows while the computer is in `appearance`.
+    pub fn resolve(self, appearance: WindowAppearance) -> SlackTheme {
+        match self {
+            AppearanceMode::Light => SlackTheme::Light,
+            AppearanceMode::Dark => SlackTheme::Dark,
+            AppearanceMode::System => match appearance {
+                WindowAppearance::Dark | WindowAppearance::VibrantDark => SlackTheme::Dark,
+                WindowAppearance::Light | WindowAppearance::VibrantLight => SlackTheme::Light,
+            },
+        }
+    }
+
+    /// The value slackless stores the mode under.
+    pub fn key(self) -> &'static str {
+        match self {
+            AppearanceMode::Light => "light",
+            AppearanceMode::Dark => "dark",
+            AppearanceMode::System => "system",
+        }
+    }
+
+    /// The mode stored as `key`; `None` for anything else.
+    pub fn from_key(key: &str) -> Option<Self> {
+        [
+            AppearanceMode::Light,
+            AppearanceMode::Dark,
+            AppearanceMode::System,
+        ]
+        .into_iter()
+        .find(|mode| mode.key() == key)
+    }
 }
 
 /// The Preferences sections, in Slack's order.
@@ -115,7 +150,6 @@ const SHOW: [&str; 4] = [
     "Mentions only",
     "Custom by section",
 ];
-const FONTS: [&str; 3] = ["Lato (default)", "Inter", "System font"];
 const SKIN_TONES: [&str; 6] = [
     "\u{270B}",
     "\u{270B}\u{1F3FB}",
@@ -249,7 +283,7 @@ impl Default for Settings {
             profile_photos: true,
             mode: AppearanceMode::Dark,
             palette: Palette::Default,
-            font: 0,
+            font: theme::DEFAULT_FONT,
             skin_tone: 0,
             jumbomoji: true,
             convert_emoticons: true,
@@ -360,16 +394,19 @@ impl Preferences {
         }
     }
 
-    /// Start on the appearance Slack stores for the workspace, so the picker shows the theme
-    /// already in effect and a later change applies over it.
-    pub fn set_slack_appearance(&mut self, appearance: theme::Appearance, cx: &mut Context<Self>) {
-        let mode = match appearance.theme {
-            SlackTheme::Light => AppearanceMode::Light,
-            SlackTheme::Dark => AppearanceMode::Dark,
-        };
-        if self.settings.mode != mode || self.settings.palette != appearance.palette {
-            self.settings.mode = mode;
-            self.settings.palette = appearance.palette;
+    /// Start on the remembered Color Mode and Font and the color theme Slack stores for the
+    /// workspace, so the pane shows the look already in effect and a later change applies
+    /// over it.
+    pub fn set_appearance(
+        &mut self,
+        mode: AppearanceMode,
+        palette: Palette,
+        font: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = &mut self.settings;
+        if (settings.mode, settings.palette, settings.font) != (mode, palette, font) {
+            (settings.mode, settings.palette, settings.font) = (mode, palette, font);
             cx.notify();
         }
     }
@@ -790,48 +827,33 @@ impl Preferences {
 
     fn appearance(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (border, ring, muted, sidebar) = (
-            theme.border,
-            theme.ring,
-            theme.muted_foreground,
-            theme.sidebar,
-        );
+        let (border, ring, sidebar) = (theme.border, theme.ring, theme.sidebar);
+        // Slack's Color Mode: three equal buttons in a row, icon beside the label, the chosen
+        // one ringed in the accent.
         let mode = self.settings.mode;
-        let modes = h_flex().gap_3().children(
+        let modes = h_flex().gap_2().children(
             [
                 (AppearanceMode::Light, "Light", IconName::Sun),
                 (AppearanceMode::Dark, "Dark", IconName::Moon),
-                (AppearanceMode::System, "Sync with OS", IconName::Monitor),
+                (AppearanceMode::System, "System", IconName::Monitor),
             ]
             .into_iter()
             .enumerate()
             .map(|(ix, (choice, label, icon))| {
                 let on = choice == mode;
-                v_flex()
+                h_flex()
                     .id(("appearance-mode", ix))
-                    .w(px(150.))
-                    .items_center()
+                    .flex_1()
+                    .h(px(38.))
+                    .justify_center()
                     .gap_2()
-                    .p_3()
                     .rounded_md()
                     .cursor_pointer()
-                    .border_2()
+                    .border_1()
                     .border_color(if on { ring } else { border })
-                    .child(
-                        Icon::new(icon)
-                            .text_color(if on { ring } else { muted })
-                            .size(px(24.)),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(if on {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .child(label),
-                    )
+                    .when(on, |button| button.shadow_xs())
+                    .child(Icon::new(icon).size(px(16.)))
+                    .child(div().text_sm().child(label))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.mode = choice;
                         this.changed(cx);
@@ -912,7 +934,7 @@ impl Preferences {
                 swatch_row("custom-accent", &CUSTOM_ACCENTS, custom_accent, cx),
             ));
 
-        let font = self.select("appearance-font", &FONTS, |s| &mut s.font, cx);
+        let font = self.select("appearance-font", &theme::FONT_LABELS, |s| &mut s.font, cx);
         let skin = self.radios("appearance-skin", &SKIN_TONES, |s| &mut s.skin_tone, cx);
         let jumbo = self.checkbox(
             "appearance-jumbo",
@@ -928,10 +950,10 @@ impl Preferences {
         );
 
         v_flex()
-            .child(self.group("Color mode", Some("Choose if Slack's appearance should be light or dark, or follow your computer's settings."), modes, cx))
+            .child(self.group("Font", None, font, cx))
+            .child(self.group("Color Mode", Some("Choose if Slack's appearance should be light or dark, or follow your computer's settings."), modes, cx))
             .child(self.group("Slack themes", Some("Single-color themes that tint your sidebar and highlights."), named, cx))
             .child(self.group("Custom theme", Some("Build your own: pick a sidebar and an accent color."), custom, cx))
-            .child(self.group("Font", None, font, cx))
             .child(self.group(
                 "Emoji",
                 None,

@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::api::{
-    self, ChannelBookmark, ClientCounts, HistoryOpts, ListOpts, MessageContent, Page, PinnedItem,
-    PostedMessage, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
+    self, ActivityEntry, ActivityFeed, ChannelBookmark, ClientCounts, FilesFilter, HistoryOpts,
+    ListOpts, MessageContent, Page, PinnedItem, PostedMessage, SearchMessages, SearchOpts,
+    SectionCreated, SlackApi, ThreadsView, UserBoot,
 };
 use crate::types::{
-    ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File, Message, Ts, User,
-    UserId, UserPresence,
+    ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File, Message, Team,
+    TeamId, Ts, User, UserId, UserPresence,
 };
 
 /// `conversations.history` page size the core requests (Slack max 999).
@@ -17,8 +18,13 @@ pub(crate) const HISTORY_PAGE_LIMIT: u32 = 200;
 
 /// `subscriptions.thread.getView` page size the core requests.
 pub(crate) const THREADS_PAGE_LIMIT: u32 = 50;
+/// `activity.feed` page size the core requests for the Activity view.
+pub(crate) const ACTIVITY_PAGE_LIMIT: u32 = 50;
 /// `files.list` page size the core requests for a conversation's Files & links tab.
 pub(crate) const FILES_PAGE: u32 = 100;
+/// `files.list` page size the core requests for a workspace-wide list (the Files view's
+/// row cap: one page, newest first).
+pub(crate) const FILES_WORKSPACE_PAGE: u32 = 200;
 
 /// The Slack calls the core makes. [`SlackApi`] is the real implementation; tests drive the core
 /// with an in-process fake.
@@ -75,6 +81,23 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Replace `channel`'s topic (`conversations.setTopic`); the answer carries the updated
+    /// conversation.
+    fn set_topic(
+        &self,
+        channel: ChannelId,
+        topic: String,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Replace `channel`'s description (`conversations.setPurpose`); the answer carries the
+    /// updated conversation.
+    fn set_purpose(
+        &self,
+        channel: ChannelId,
+        purpose: String,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// One workspace's record (`team.info`), by team id: the connected organizations of a
+    /// Slack Connect channel, which `client.userBoot` never carries.
+    fn team_info(&self, team: TeamId) -> impl Future<Output = api::Result<Team>> + Send;
     /// One per-channel notification pref (`users.prefs.setNotifications`, web client).
     fn set_notification_pref(
         &self,
@@ -118,6 +141,24 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<()>> + Send;
     /// The followed threads of the Threads view (`subscriptions.thread.getView`), page one.
     fn threads_view(&self) -> impl Future<Output = api::Result<ThreadsView>> + Send;
+    /// The Activity view's feed (`activity.feed`), page one; row bodies hydrate separately
+    /// through [`Backend::messages_list`].
+    fn activity_feed(&self) -> impl Future<Output = api::Result<ActivityFeed>> + Send;
+    /// `messages.list`: the bodies of the given (channel, ts) pairs, batched per call.
+    fn messages_list(
+        &self,
+        ids: Vec<(ChannelId, Vec<Ts>)>,
+    ) -> impl Future<Output = api::Result<HashMap<ChannelId, Vec<Message>>>> + Send;
+    /// `activity.markRead` for feed entries.
+    fn activity_mark_read(
+        &self,
+        entries: Vec<ActivityEntry>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// `activity.markUnread` for feed entries.
+    fn activity_mark_unread(
+        &self,
+        entries: Vec<ActivityEntry>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
     /// Open (or find) the DM with `user` (`conversations.open`).
     fn open_dm(&self, user: UserId) -> impl Future<Output = api::Result<Conversation>> + Send;
     /// Create a sidebar channel section (`users.channelSections.create`).
@@ -136,8 +177,9 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<Vec<ChannelBookmark>>> + Send;
-    /// The files shared with a conversation (`files.list`), newest first. Read-only.
-    fn files(&self, channel: ChannelId) -> impl Future<Output = api::Result<Vec<File>>> + Send;
+    /// The files matching `filter` (`files.list`), newest first: one conversation's shared
+    /// files, or every file the signed-in user can see when no channel is set. Read-only.
+    fn files(&self, filter: FilesFilter) -> impl Future<Output = api::Result<Vec<File>>> + Send;
     /// Add a link bookmark to a conversation's bar (`bookmarks.add`).
     fn add_bookmark(
         &self,
@@ -249,6 +291,18 @@ impl Backend for SlackApi {
         self.conversations_leave(&channel).await
     }
 
+    async fn set_topic(&self, channel: ChannelId, topic: String) -> api::Result<Conversation> {
+        self.conversations_set_topic(&channel, &topic).await
+    }
+
+    async fn set_purpose(&self, channel: ChannelId, purpose: String) -> api::Result<Conversation> {
+        self.conversations_set_purpose(&channel, &purpose).await
+    }
+
+    async fn team_info(&self, team: TeamId) -> api::Result<Team> {
+        SlackApi::team_info(self, &team).await
+    }
+
     async fn set_notification_pref(
         &self,
         channel: ChannelId,
@@ -304,6 +358,25 @@ impl Backend for SlackApi {
         self.subscriptions_thread_get_view(THREADS_PAGE_LIMIT).await
     }
 
+    async fn activity_feed(&self) -> api::Result<ActivityFeed> {
+        SlackApi::activity_feed(self, ACTIVITY_PAGE_LIMIT).await
+    }
+
+    async fn messages_list(
+        &self,
+        ids: Vec<(ChannelId, Vec<Ts>)>,
+    ) -> api::Result<HashMap<ChannelId, Vec<Message>>> {
+        SlackApi::messages_list(self, &ids).await
+    }
+
+    async fn activity_mark_read(&self, entries: Vec<ActivityEntry>) -> api::Result<()> {
+        SlackApi::activity_mark_read(self, &entries).await
+    }
+
+    async fn activity_mark_unread(&self, entries: Vec<ActivityEntry>) -> api::Result<()> {
+        SlackApi::activity_mark_unread(self, &entries).await
+    }
+
     async fn open_dm(&self, user: UserId) -> api::Result<Conversation> {
         self.conversations_open(user.as_str()).await
     }
@@ -323,8 +396,13 @@ impl Backend for SlackApi {
     async fn bookmarks(&self, channel: ChannelId) -> api::Result<Vec<ChannelBookmark>> {
         Ok(self.bookmarks_list(&channel).await?.bookmarks)
     }
-    async fn files(&self, channel: ChannelId) -> api::Result<Vec<File>> {
-        Ok(self.files_list(&channel, FILES_PAGE, 1).await?.items)
+    async fn files(&self, filter: FilesFilter) -> api::Result<Vec<File>> {
+        let count = if filter.channel.is_some() {
+            FILES_PAGE
+        } else {
+            FILES_WORKSPACE_PAGE
+        };
+        Ok(self.files_list(&filter, count, 1).await?.items)
     }
 
     async fn add_bookmark(

@@ -10,7 +10,8 @@
 //! channel with the huddle bar open on its Canvas or List tab; `=prefs` / `=profile` /
 //! `=status` / `=switcher` / `=menu` start on Preferences, a profile, the status picker, the
 //! Cmd+K switcher or the user menu (for screenshots); `=later` / `=pins` / `=activity` on
-//! Later, the pins panel or the Activity feed, and `=notify` posts a test notification.
+//! Later, the pins panel or the Activity feed, `=details` the Slack Connect channel with its
+//! details dialog, and `=notify` posts a test notification.
 
 mod actions;
 mod activity;
@@ -21,6 +22,7 @@ mod bookmarks;
 mod bridge;
 mod browser;
 mod canvas;
+mod channel_details;
 mod compose_targets;
 mod composer;
 mod directory;
@@ -29,6 +31,7 @@ mod drafts;
 mod editor;
 mod emoji;
 mod files;
+mod files_page;
 mod fixtures;
 mod huddle;
 mod huddles;
@@ -82,8 +85,15 @@ fn main() {
             .and_then(|session| CoreBridge::start(session, cx))
             .and_then(|bridge| Some((bridge.snapshot(&Default::default())?, bridge)));
         let (fixtures, bridge) = live.unwrap_or_else(|| (fixtures::load(), CoreBridge::offline()));
-        if let Some(appearance) = fixtures.appearance {
-            theme::activate_with(appearance.theme, appearance.palette, cx);
+        // Live: the Font and Slack's Color Mode (both remembered locally; Lato and `System`
+        // until chosen) over the color theme it stores for the workspace, installed before the
+        // first frame.
+        if let Some(font) = bridge.font() {
+            theme::set_font(font, cx);
+        }
+        if let Some(mode) = bridge.color_mode() {
+            let palette = fixtures.palette.unwrap_or(theme::Palette::Default);
+            theme::activate_with(mode.resolve(cx.window_appearance()), palette, cx);
         }
         let fixtures = Arc::new(fixtures);
         // Like Slack, the window fills the screen on first launch and later reopens with the

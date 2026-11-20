@@ -151,7 +151,8 @@ fn file_name(file: &File) -> String {
         .unwrap_or_else(|| file.id.to_string())
 }
 
-/// Type icon and tile color: PDFs red, spreadsheets green, images and the rest blue.
+/// Type icon and tile color: PDFs red, spreadsheets green, images, canvases, lists and the
+/// rest blue.
 pub(crate) fn file_icon(file: &File, cx: &App) -> (IconName, Hsla) {
     let theme = cx.theme();
     match file.filetype.as_deref().unwrap_or_default() {
@@ -159,6 +160,9 @@ pub(crate) fn file_icon(file: &File, cx: &App) -> (IconName, Hsla) {
         "xlsx" | "xls" | "csv" | "gsheet" => (IconName::FileSpreadsheet, theme.success),
         "zip" | "gz" | "tar" => (IconName::FileArchive, theme.warning),
         "png" | "jpg" | "jpeg" | "gif" | "webp" => (IconName::FileImage, theme.link),
+        // Slack's canvases are `quip` files; its lists are `list` files.
+        "quip" => (IconName::StickyNote, theme.link),
+        "list" => (IconName::Table2, theme.link),
         _ => (IconName::File, theme.link),
     }
 }

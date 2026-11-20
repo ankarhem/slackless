@@ -402,6 +402,12 @@ impl ThreadPanel {
                     actions::copy_link(&self.fixtures, channel, ts, window, cx);
                 }
             }
+            MessageAction::CopyText => {
+                if let Some(message) = self.message_at_mut(ts).map(|message| message.clone()) {
+                    let text = self.fixtures.plain_text(&message);
+                    cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(text));
+                }
+            }
             MessageAction::Forward => {
                 if let Some((channel, _)) = &self.thread {
                     let link = actions::permalink(&self.fixtures, channel, ts);

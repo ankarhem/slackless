@@ -17,7 +17,7 @@ use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
-use crate::types::{ChannelId, ConversationKind, SlackEvent, TeamId, UserId};
+use crate::types::{ChannelId, ConversationKind, SlackEvent, TeamId, Ts, UserId};
 use crate::unfurl::{Unfurls, event_messages};
 use crate::{Command, Event, apply_event};
 
@@ -255,6 +255,9 @@ pub(crate) struct Core<B: Backend> {
     presence_peers: Arc<Mutex<Vec<UserId>>>,
     /// Ids already sent to `users.info` this session (found or not): each is asked once.
     users_asked: HashSet<UserId>,
+    /// Team ids already sent to `team.info` this session (found or not): each is asked
+    /// once. Shared with spawned tasks, which compute the ids off the `&self` borrow.
+    teams_asked: Arc<Mutex<HashSet<TeamId>>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -285,6 +288,7 @@ impl<B: Backend> Core<B> {
             rtm: None,
             presence_peers: Arc::new(Mutex::new(Vec::new())),
             users_asked: HashSet::new(),
+            teams_asked: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -441,6 +445,38 @@ impl<B: Backend> Core<B> {
         }
         self.events.emit(Event::SidebarChanged);
         self.fetch_dm_previews();
+        // The Activity badges need the feed's unread state; last, so the boot's own events
+        // keep their order. The boot fetch skips the `messages.list` hydration (the view
+        // asks for it with bodies when it opens).
+        self.fetch_activity(false);
+    }
+
+    /// The Activity feed (`activity.feed`): announces [`Event::ActivityView`] when it lands,
+    /// or the same event carrying the error text when it does not. `with_bodies` also
+    /// hydrates the rows through `messages.list` (the view wants bodies; the boot fetch
+    /// that feeds the badges does not).
+    fn fetch_activity(&self, with_bodies: bool) {
+        let (backend, events) = (self.backend.clone(), self.events.clone());
+        self.spawn("activity.feed", async move {
+            let fetched = backend.activity_feed().await;
+            match fetched {
+                Ok(mut feed) => {
+                    if with_bodies {
+                        hydrate_activity(&backend, &events, &mut feed).await;
+                    }
+                    events.emit(Event::ActivityView {
+                        feed: Ok(Box::new(feed)),
+                    });
+                    Ok(())
+                }
+                Err(e) => {
+                    events.emit(Event::ActivityView {
+                        feed: Err(e.to_string()),
+                    });
+                    Err(e.into())
+                }
+            }
+        });
     }
 
     /// DM-list previews: every IM/MPIM that is open (listed in Slack's DMs tab) and has
@@ -544,6 +580,22 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SetChannelTopic { channel, topic } => {
+                self.spawn("conversations.setTopic", async move {
+                    let updated = backend.set_topic(channel.clone(), topic).await?;
+                    with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
+            Command::SetChannelPurpose { channel, purpose } => {
+                self.spawn("conversations.setPurpose", async move {
+                    let updated = backend.set_purpose(channel.clone(), purpose).await?;
+                    with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
             Command::OpenThread { channel, thread_ts } => {
                 let backfill = self.backfill.clone();
                 self.spawn("conversations.replies", async move {
@@ -611,6 +663,17 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::FetchActivity { with_bodies } => self.fetch_activity(with_bodies),
+            Command::MarkActivity { entries, read } => {
+                self.spawn("activity.mark", async move {
+                    if read {
+                        backend.activity_mark_read(entries).await?
+                    } else {
+                        backend.activity_mark_unread(entries).await?
+                    }
+                    Ok(())
+                });
+            }
             Command::OpenDm { user } => self.spawn("conversations.open", async move {
                 let dm = backend.open_dm(user).await?;
                 let channel = dm.id.clone();
@@ -644,12 +707,9 @@ impl<B: Backend> Core<B> {
                     bookmarks,
                 })
             }),
-            Command::LoadFiles(channel) => self.spawn("files.list", async move {
-                let files = backend.files(channel.clone()).await;
-                answer_load(&events, files, |files| Event::FilesLoaded {
-                    channel,
-                    files,
-                })
+            Command::LoadFiles(filter) => self.spawn("files.list", async move {
+                let files = backend.files(filter.clone()).await;
+                answer_load(&events, files, |files| Event::FilesLoaded { filter, files })
             }),
             Command::AddBookmark {
                 channel,
@@ -737,31 +797,68 @@ impl<B: Backend> Core<B> {
     /// Open-time `conversations.info`: metadata `client.userBoot` omits (topic, member
     /// counts) merged into the stored copy, so richer stored fields survive the refresh. The
     /// header's counts come from `conversations.members` cross-checked against the stored
-    /// profiles (`Event::ConversationInfo` carries the split); when the member list cannot be
-    /// read, `conversations.info`'s raw `num_members` stands.
+    /// profiles (`Event::ConversationInfo` carries the split, plus the member id list for
+    /// member panels and Slack Connect org counts); when the member list cannot be read,
+    /// `conversations.info`'s raw `num_members` stands. A Slack Connect channel also resolves
+    /// the connected organizations' `team.info` records, each asked once per session.
     fn merge_channel_info(&self, channel: ChannelId) {
-        let (backend, store, ws, events) = (
+        let (backend, store, ws, events, teams_asked) = (
             self.backend.clone(),
             Arc::clone(&self.store),
             self.workspace.clone(),
             self.events.clone(),
+            Arc::clone(&self.teams_asked),
         );
         self.spawn("conversations.info", async move {
-            let mut fresh = backend.conversation_info(channel.clone()).await?;
+            let mut fresh = match backend.conversation_info(channel.clone()).await {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    // Nothing is known; the announcement still lands so front-ends waiting on
+                    // the member list stop waiting (the failure itself is reported).
+                    events.emit(Event::ConversationInfo {
+                        channel,
+                        num_members: None,
+                        num_apps: None,
+                        members: Vec::new(),
+                    });
+                    return Err(e.into());
+                }
+            };
+            let mut members = Vec::new();
             let mut num_apps = None;
-            if let Ok(members) = backend.conversation_members(channel.clone()).await {
-                let ws2 = ws.clone();
-                let counts = with_store(&store, move |s| s.member_counts(&ws2, &members)).await?;
+            let mut external_teams = Vec::new();
+            if let Ok(listed) = backend.conversation_members(channel.clone()).await {
+                let (ws2, shared) = (ws.clone(), fresh.is_ext_shared);
+                // One store read for both: the header's split and, for a Slack Connect
+                // channel, the other organizations its stored people belong to. The list
+                // rides the event only: stored on the row it would bloat every snapshot.
+                let (counts, teams, listed) = with_store(&store, move |s| {
+                    let counts = s.member_counts(&ws2, &listed)?;
+                    let teams = if shared {
+                        s.member_team_ids(&ws2, &listed)?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok::<_, StoreError>((counts, teams, listed))
+                })
+                .await?;
                 fresh.num_members = Some(counts.humans);
                 num_apps = Some(counts.apps);
+                external_teams = teams;
+                members = listed;
             }
             let num_members = fresh.num_members;
-            with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+            let ws2 = ws.clone();
+            with_store(&store, move |s| s.merge_conversation(&ws2, &fresh)).await?;
             events.emit(Event::ConversationInfo {
                 channel,
                 num_members,
                 num_apps,
+                members,
             });
+            if !external_teams.is_empty() {
+                resolve_teams(backend, store, ws, events, teams_asked, external_teams).await;
+            }
             Ok(())
         });
     }
@@ -790,7 +887,9 @@ impl<B: Backend> Core<B> {
 
     /// `users.info` for people `users.list` leaves out (members of other organizations in
     /// shared channels and DMs), each id asked once per session. Found profiles are stored
-    /// and announced together; a failed lookup is reported and the rest still land.
+    /// and announced together; a failed lookup is reported and the rest still land. The
+    /// organizations the people found belong to are resolved next ([`resolve_teams`]), so a
+    /// Slack Connect channel can name them on its first visit.
     fn resolve_users(&mut self, ids: Vec<UserId>) {
         let ids: Vec<UserId> = ids
             .into_iter()
@@ -799,11 +898,12 @@ impl<B: Backend> Core<B> {
         if ids.is_empty() {
             return;
         }
-        let (backend, store, ws, events) = (
+        let (backend, store, ws, events, teams_asked) = (
             self.backend.clone(),
             Arc::clone(&self.store),
             self.workspace.clone(),
             self.events.clone(),
+            Arc::clone(&self.teams_asked),
         );
         self.spawn("users.info", async move {
             let mut users = Vec::new();
@@ -817,11 +917,20 @@ impl<B: Backend> Core<B> {
                 return Ok(());
             }
             let ids = users.iter().map(|user| user.id.clone()).collect();
+            let teams: Vec<TeamId> = users
+                .iter()
+                .filter_map(|user| user.team_id.clone())
+                .filter(|team| *team != ws)
+                .collect();
+            let ws2 = ws.clone();
             with_store(&store, move |s| {
-                users.iter().try_for_each(|user| s.upsert_user(&ws, user))
+                users.iter().try_for_each(|user| s.upsert_user(&ws2, user))
             })
             .await?;
             events.emit(Event::UsersChanged(ids));
+            if !teams.is_empty() {
+                resolve_teams(backend, store, ws, events, teams_asked, teams).await;
+            }
             Ok(())
         });
     }
@@ -930,6 +1039,44 @@ impl<B: Backend> Core<B> {
     }
 }
 
+/// Fills each Activity row's body through `messages.list`, one batched call per
+/// [`api`] channel cap. Rows whose channel stays silent (or the whole call, when it fails)
+/// keep no body: the view renders them without text and the failure is reported.
+async fn hydrate_activity<B: Backend>(
+    backend: &B,
+    events: &Emitter,
+    feed: &mut crate::api::ActivityFeed,
+) {
+    let mut by_channel: Vec<(ChannelId, Vec<Ts>)> = Vec::new();
+    for item in &feed.items {
+        if item.message.is_none() {
+            match by_channel
+                .iter_mut()
+                .find(|(channel, _)| *channel == item.channel)
+            {
+                Some((_, stamps)) => stamps.push(item.ts.clone()),
+                None => by_channel.push((item.channel.clone(), vec![item.ts.clone()])),
+            }
+        }
+    }
+    if by_channel.is_empty() {
+        return;
+    }
+    match backend.messages_list(by_channel).await {
+        Ok(bodies) => {
+            for item in &mut feed.items {
+                if item.message.is_none() {
+                    item.message = bodies
+                        .get(&item.channel)
+                        .and_then(|messages| messages.iter().find(|message| message.ts == item.ts))
+                        .cloned();
+                }
+            }
+        }
+        Err(e) => events.report("messages.list", e.into()),
+    }
+}
+
 /// Answers a lazy tab load with its data, or with the error text the tab shows instead of
 /// loading forever; the failure is also returned for the usual report.
 fn answer_load<T>(
@@ -972,6 +1119,53 @@ async fn im_peer(
         .and_then(|c| c.user))
 }
 
+/// `team.info` for the connected organizations of shared channels (`team_ids`), each id
+/// asked once per session through `asked` (found or not). Records are stored beside the
+/// workspace's own team and announced with [`Event::SidebarChanged`], whose reload re-reads
+/// them; a failed lookup is reported and the rest still land, so one bad org never blocks
+/// the others.
+async fn resolve_teams(
+    backend: impl Backend,
+    store: SharedStore,
+    workspace: TeamId,
+    events: Emitter,
+    asked: Arc<Mutex<HashSet<TeamId>>>,
+    team_ids: Vec<TeamId>,
+) {
+    let fresh: Vec<TeamId> = {
+        let mut asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
+        team_ids
+            .into_iter()
+            .filter(|id| asked.insert(id.clone()))
+            .collect()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    let mut teams = Vec::new();
+    for id in fresh {
+        match backend.team_info(id).await {
+            Ok(team) => teams.push(team),
+            Err(e) => events.report("team.info", e.into()),
+        }
+    }
+    if teams.is_empty() {
+        return;
+    }
+    let outcome = with_store(&store, move |s| {
+        teams
+            .iter()
+            .try_for_each(|team| s.upsert_team(&workspace, team))
+    })
+    .await;
+    match outcome {
+        Ok(()) => {
+            events.emit(Event::SidebarChanged);
+        }
+        Err(e) => events.report("team.info store", e.into()),
+    }
+}
+
 /// Unix seconds now; 0 if the clock is somehow before the epoch.
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -986,8 +1180,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::api::{
-        self, ChannelBookmark, ClientCounts, MessageContent, Page, PinnedItem, PostedMessage,
-        SearchMessages, UserBoot,
+        self, ChannelBookmark, ClientCounts, FilesFilter, MessageContent, Page, PinnedItem,
+        PostedMessage, SearchMessages, UserBoot,
     };
     use crate::rtm::ConnectionState;
     use crate::types::{
@@ -1045,7 +1239,17 @@ pub(crate) mod tests {
         dnd_calls: Vec<UserId>,
         presence_calls: Vec<UserId>,
         user_info_calls: Vec<UserId>,
+        /// `users.info` answers' organizations by user; others answer without one.
+        user_teams: HashMap<UserId, TeamId>,
         leave_calls: Vec<ChannelId>,
+        /// `conversations.setTopic` asks: (channel, topic).
+        topic_calls: Vec<(ChannelId, String)>,
+        /// `conversations.setPurpose` asks: (channel, purpose).
+        purpose_calls: Vec<(ChannelId, String)>,
+        /// `team.info` answers keyed by team id; an unconfigured team fails.
+        teams: HashMap<TeamId, Team>,
+        /// `team.info` asks, in order.
+        team_info_calls: Vec<TeamId>,
         notification_calls: Vec<(ChannelId, &'static str, &'static str)>,
         /// `pins.list` answer.
         pins: Vec<PinnedItem>,
@@ -1057,6 +1261,12 @@ pub(crate) mod tests {
         canvas_creations: Vec<ChannelId>,
         /// Every tab load (`pins.list`, `bookmarks.list`, `files.list`) fails.
         fail_tab_loads: bool,
+        /// The `activity.feed` answer.
+        activity: api::ActivityFeed,
+        /// `messages.list` bodies by channel.
+        activity_bodies: HashMap<ChannelId, Vec<Message>>,
+        /// `activity.markRead`/`markUnread` asks: (read?, entries).
+        activity_marks: Vec<(bool, Vec<api::ActivityEntry>)>,
     }
 
     impl FakeBackend {
@@ -1069,6 +1279,22 @@ pub(crate) mod tests {
         /// The `subscriptions.thread.getView` answer.
         pub fn set_threads_view(&self, view: api::ThreadsView) {
             self.state.lock().unwrap().threads_view = view;
+        }
+
+        /// The `activity.feed` answer, and the `messages.list` bodies by channel.
+        pub fn set_activity(
+            &self,
+            feed: api::ActivityFeed,
+            bodies: HashMap<ChannelId, Vec<Message>>,
+        ) {
+            let mut state = self.state.lock().unwrap();
+            state.activity = feed;
+            state.activity_bodies = bodies;
+        }
+
+        /// `activity.markRead`/`markUnread` asks so far: (read?, entries).
+        pub fn activity_marks(&self) -> Vec<(bool, Vec<api::ActivityEntry>)> {
+            self.state.lock().unwrap().activity_marks.clone()
         }
 
         pub fn push_history(&self, range: RangeInclusive<u32>) {
@@ -1235,6 +1461,35 @@ pub(crate) mod tests {
         /// Channels left through `conversations.leave`, in order.
         pub fn leave_calls(&self) -> Vec<ChannelId> {
             self.state.lock().unwrap().leave_calls.clone()
+        }
+
+        /// The recorded `conversations.setTopic` calls.
+        pub fn topic_calls(&self) -> Vec<(ChannelId, String)> {
+            self.state.lock().unwrap().topic_calls.clone()
+        }
+
+        /// The recorded `conversations.setPurpose` calls.
+        pub fn purpose_calls(&self) -> Vec<(ChannelId, String)> {
+            self.state.lock().unwrap().purpose_calls.clone()
+        }
+
+        /// The `team.info` answer for `team` (an unconfigured team still fails).
+        pub fn set_team(&self, team: Team) {
+            self.state
+                .lock()
+                .unwrap()
+                .teams
+                .insert(team.id.clone(), team);
+        }
+
+        /// Teams asked for `team.info`, in order.
+        pub fn team_info_calls(&self) -> Vec<TeamId> {
+            self.state.lock().unwrap().team_info_calls.clone()
+        }
+
+        /// The organization `users.info` answers for `user`.
+        pub fn set_user_team(&self, user: UserId, team: TeamId) {
+            self.state.lock().unwrap().user_teams.insert(user, team);
         }
 
         /// `users.prefs.setNotifications` writes, in order.
@@ -1438,6 +1693,52 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        async fn set_topic(&self, channel: ChannelId, topic: String) -> api::Result<Conversation> {
+            self.state
+                .lock()
+                .unwrap()
+                .topic_calls
+                .push((channel.clone(), topic.clone()));
+            Ok(Conversation {
+                id: channel,
+                topic: Some(crate::types::TopicPurpose {
+                    value: topic,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+
+        async fn set_purpose(
+            &self,
+            channel: ChannelId,
+            purpose: String,
+        ) -> api::Result<Conversation> {
+            self.state
+                .lock()
+                .unwrap()
+                .purpose_calls
+                .push((channel.clone(), purpose.clone()));
+            Ok(Conversation {
+                id: channel,
+                purpose: Some(crate::types::TopicPurpose {
+                    value: purpose,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+
+        async fn team_info(&self, team: TeamId) -> api::Result<Team> {
+            let mut state = self.state.lock().unwrap();
+            state.team_info_calls.push(team.clone());
+            state
+                .teams
+                .get(&team)
+                .cloned()
+                .ok_or_else(|| ApiError::Slack("team_not_found".into()))
+        }
+
         async fn set_notification_pref(
             &self,
             channel: ChannelId,
@@ -1455,6 +1756,7 @@ pub(crate) mod tests {
             state.user_info_calls.push(user.clone());
             Ok(User {
                 name: format!("ext-{}", user.as_str()),
+                team_id: state.user_teams.get(&user).cloned(),
                 id: user,
                 ..Default::default()
             })
@@ -1532,6 +1834,46 @@ pub(crate) mod tests {
             Ok(self.state.lock().unwrap().threads_view.clone())
         }
 
+        async fn activity_feed(&self) -> api::Result<api::ActivityFeed> {
+            Ok(self.state.lock().unwrap().activity.clone())
+        }
+
+        async fn messages_list(
+            &self,
+            ids: Vec<(ChannelId, Vec<Ts>)>,
+        ) -> api::Result<HashMap<ChannelId, Vec<Message>>> {
+            let state = self.state.lock().unwrap();
+            Ok(ids
+                .into_iter()
+                .map(|(channel, _)| {
+                    let messages = state
+                        .activity_bodies
+                        .get(&channel)
+                        .cloned()
+                        .unwrap_or_default();
+                    (channel, messages)
+                })
+                .collect())
+        }
+
+        async fn activity_mark_read(&self, entries: Vec<api::ActivityEntry>) -> api::Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .activity_marks
+                .push((true, entries));
+            Ok(())
+        }
+
+        async fn activity_mark_unread(&self, entries: Vec<api::ActivityEntry>) -> api::Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .activity_marks
+                .push((false, entries));
+            Ok(())
+        }
+
         async fn open_dm(&self, user: UserId) -> api::Result<Conversation> {
             Ok(Conversation {
                 id: ChannelId::from("D9"),
@@ -1567,7 +1909,7 @@ pub(crate) mod tests {
             self.tab_load(|state| &state.bookmarks)
         }
 
-        async fn files(&self, _: ChannelId) -> api::Result<Vec<File>> {
+        async fn files(&self, _: FilesFilter) -> api::Result<Vec<File>> {
             self.tab_load(|state| &state.files)
         }
 
@@ -1663,13 +2005,22 @@ pub(crate) mod tests {
         assert_eq!((channel, bookmarks.len()), (c1(), 1));
         assert_eq!(bookmarks[0].title, "Runbook");
 
-        core.handle(Command::LoadFiles(c1()));
-        let Event::FilesLoaded { channel, files } = next(&mut rx).await else {
+        core.handle(Command::LoadFiles(FilesFilter::channel(c1())));
+        let Event::FilesLoaded { filter, files } = next(&mut rx).await else {
             panic!("expected files");
         };
         let files = files.expect("files load");
-        assert_eq!((channel, files.len()), (c1(), 1));
+        assert_eq!(filter, FilesFilter::channel(c1()));
+        assert_eq!(files.len(), 1);
         assert_eq!(files[0].id.as_str(), "F1");
+
+        // A workspace-wide load (the Files view) keeps its filter on the answer too.
+        core.handle(Command::LoadFiles(FilesFilter::workspace()));
+        let Event::FilesLoaded { filter, files } = next(&mut rx).await else {
+            panic!("expected workspace files");
+        };
+        assert_eq!(filter, FilesFilter::workspace());
+        assert_eq!(files.expect("files load").len(), 1);
     }
 
     #[tokio::test]
@@ -1679,12 +2030,12 @@ pub(crate) mod tests {
         let (store, events, mut rx) = fake_core_parts();
         let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
 
-        core.handle(Command::LoadFiles(c1()));
+        core.handle(Command::LoadFiles(FilesFilter::channel(c1())));
 
-        let Event::FilesLoaded { channel, files } = next(&mut rx).await else {
+        let Event::FilesLoaded { filter, files } = next(&mut rx).await else {
             panic!("a failed load still answers its tab");
         };
-        assert_eq!(channel, c1());
+        assert_eq!(filter, FilesFilter::channel(c1()));
         assert!(
             files.is_err_and(|error| error.contains("channel_not_found")),
             "the tab gets Slack's error instead of loading forever"
@@ -2066,6 +2417,7 @@ pub(crate) mod tests {
                     channel,
                     num_members,
                     num_apps,
+                    members,
                 } if channel == c1() => {
                     assert_eq!(
                         num_members,
@@ -2077,6 +2429,7 @@ pub(crate) mod tests {
                         Some(1),
                         "the live bot; UGONE is deactivated and USLACKBOT built-in"
                     );
+                    assert_eq!(members.len(), 5, "the member id list rides along");
                     break;
                 }
                 Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
@@ -2116,9 +2469,11 @@ pub(crate) mod tests {
                     channel,
                     num_members,
                     num_apps,
+                    members,
                 } if channel == c1() => {
                     assert_eq!(num_members, Some(17), "the raw count stands in");
                     assert_eq!(num_apps, None, "no member list, no app count");
+                    assert!(members.is_empty(), "no member list, no ids either");
                     break;
                 }
                 Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
@@ -2126,6 +2481,130 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(fake.member_calls(), vec![c1()]);
+    }
+
+    #[tokio::test]
+    async fn open_conversation_of_connect_channel_resolves_the_connected_teams() {
+        let fake = FakeBackend::default();
+        fake.set_info(Conversation {
+            is_ext_shared: true,
+            num_members: Some(5),
+            ..Default::default()
+        });
+        let members = vec![
+            UserId::from("U1"),
+            UserId::from("UEXT1"),
+            UserId::from("UEXT2"),
+        ];
+        fake.set_members(members.clone());
+        fake.set_team(Team {
+            id: TeamId::from("T0EXT"),
+            name: "Klarna".into(),
+            domain: "klarna".into(),
+            ..Default::default()
+        });
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        {
+            let store = &mut *store.lock().unwrap();
+            store
+                .upsert_conversation(
+                    &ws,
+                    &Conversation {
+                        id: c1(),
+                        is_channel: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            for (id, team) in [("U1", "T1"), ("UEXT1", "T0EXT"), ("UEXT2", "T0EXT")] {
+                store
+                    .upsert_user(
+                        &ws,
+                        &User {
+                            id: UserId::from(id),
+                            team_id: Some(TeamId::from(team)),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+
+        core.handle(Command::OpenConversation(c1()));
+
+        let mut announced = Vec::new();
+        loop {
+            match next(&mut rx).await {
+                Event::SidebarChanged => break,
+                Event::ConversationInfo { members, .. } => announced = members,
+                Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
+        assert_eq!(announced, members, "the member ids ride the announcement");
+        assert_eq!(fake.team_info_calls(), vec![TeamId::from("T0EXT")]);
+        let teams = store.lock().unwrap().teams(&ws).unwrap();
+        assert_eq!(
+            teams
+                .iter()
+                .map(|team| team.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Klarna"],
+            "the connected org's record lands beside the workspace's own"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_topic_and_purpose_merge_into_the_stored_conversation() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        store
+            .lock()
+            .unwrap()
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: c1(),
+                    name: Some("general".into()),
+                    is_channel: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+
+        core.handle(Command::SetChannelTopic {
+            channel: c1(),
+            topic: "Ship it".into(),
+        });
+        assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+        core.handle(Command::SetChannelPurpose {
+            channel: c1(),
+            purpose: "Deploys at 14:00".into(),
+        });
+        assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+        let stored = store
+            .lock()
+            .unwrap()
+            .conversation(&ws, &c1())
+            .unwrap()
+            .expect("the conversation stays stored");
+        assert_eq!(
+            stored.topic.as_ref().map(|t| t.value.as_str()),
+            Some("Ship it")
+        );
+        assert_eq!(
+            stored.purpose.as_ref().map(|p| p.value.as_str()),
+            Some("Deploys at 14:00")
+        );
+        assert_eq!(fake.topic_calls(), vec![(c1(), "Ship it".to_owned())]);
+        assert_eq!(
+            fake.purpose_calls(),
+            vec![(c1(), "Deploys at 14:00".to_owned())]
+        );
     }
 
     #[tokio::test]
@@ -2171,7 +2650,8 @@ pub(crate) mod tests {
                 Event::Conversations(_)
                 | Event::UsersChanged(_)
                 | Event::Counts(_)
-                | Event::SidebarChanged => {}
+                | Event::SidebarChanged
+                | Event::ActivityView { .. } => {}
                 other => panic!("unexpected hydrate event: {other:?}"),
             }
         }
@@ -2273,7 +2753,8 @@ pub(crate) mod tests {
                 Event::Conversations(_)
                 | Event::UsersChanged(_)
                 | Event::Counts(_)
-                | Event::SidebarChanged => {}
+                | Event::SidebarChanged
+                | Event::ActivityView { .. } => {}
                 other => panic!("unexpected hydrate event: {other:?}"),
             }
         }
@@ -2366,7 +2847,7 @@ pub(crate) mod tests {
                 match next(rx).await {
                     Event::SidebarChanged => break conversations,
                     Event::Conversations(ids) => conversations.extend(ids),
-                    Event::UsersChanged(_) | Event::Counts(_) => {}
+                    Event::UsersChanged(_) | Event::Counts(_) | Event::ActivityView { .. } => {}
                     other => panic!("unexpected hydrate event: {other:?}"),
                 }
             }
@@ -2489,6 +2970,71 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_users_learns_the_organizations_of_the_people_found() {
+        let fake = FakeBackend::default();
+        let ext = UserId::from("UEXT");
+        fake.set_user_team(ext.clone(), TeamId::from("T0EXT"));
+        fake.set_team(Team {
+            id: TeamId::from("T0EXT"),
+            name: "Klarna".into(),
+            ..Default::default()
+        });
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+
+        // The external person's profile lands first, then their organization's record, so a
+        // Slack Connect channel can name it on its first visit.
+        core.handle(Command::ResolveUsers(vec![ext.clone()]));
+        assert_eq!(next(&mut rx).await, Event::UsersChanged(vec![ext]));
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        assert_eq!(fake.team_info_calls(), vec![TeamId::from("T0EXT")]);
+        let names: Vec<String> = store
+            .lock()
+            .unwrap()
+            .teams(&ws)
+            .unwrap()
+            .into_iter()
+            .map(|team| team.name)
+            .collect();
+        assert_eq!(names, ["Klarna"]);
+    }
+
+    #[tokio::test]
+    async fn open_conversation_announces_an_empty_member_list_when_info_fails() {
+        let fake = FakeBackend::default();
+        fake.fail_info();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::OpenConversation(c1()));
+
+        loop {
+            match next(&mut rx).await {
+                Event::ConversationInfo {
+                    channel,
+                    num_members,
+                    num_apps,
+                    members,
+                } if channel == c1() => {
+                    assert_eq!((num_members, num_apps), (None, None), "nothing is known");
+                    assert!(
+                        members.is_empty(),
+                        "front-ends stop waiting on a member list"
+                    );
+                    break;
+                }
+                Event::StoreChanged { .. } | Event::HistoryComplete { .. } | Event::Error(_) => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
+        assert!(
+            fake.member_calls().is_empty(),
+            "no member list without the channel's info"
+        );
+    }
+
+    #[tokio::test]
     async fn open_dm_fetches_peer_dnd_and_presence_once_each() {
         let fake = FakeBackend::default();
         fake.set_dnd(
@@ -2604,6 +3150,88 @@ pub(crate) mod tests {
         assert_eq!(view.total_unread_replies, 2);
         assert_eq!(view.threads[0].root.ts.as_str(), "5.0");
         assert_eq!(view.threads[0].latest_replies[0].text, "reply");
+    }
+
+    #[tokio::test]
+    async fn fetch_activity_hydrates_rows_and_marks_route() {
+        let fake = FakeBackend::default();
+        let feed = api::ActivityFeed {
+            items: vec![
+                api::ActivityItem {
+                    kind: api::ActivityKind::Mention,
+                    unread: true,
+                    feed_ts: Ts::from("9.1"),
+                    key: "at_user-C1-9.1".into(),
+                    channel: ChannelId::from("C1"),
+                    ts: Ts::from("9.1"),
+                    actor: Some(UserId::from("U2")),
+                    ..Default::default()
+                },
+                api::ActivityItem {
+                    kind: api::ActivityKind::Dm,
+                    feed_ts: Ts::from("8.1"),
+                    key: "dm-D2".into(),
+                    channel: ChannelId::from("D2"),
+                    ts: Ts::from("8.1"),
+                    message: Some(Message {
+                        ts: Ts::from("8.1"),
+                        text: "inline".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            next_cursor: None,
+        };
+        let mut bodies = HashMap::new();
+        bodies.insert(
+            ChannelId::from("C1"),
+            vec![Message {
+                ts: Ts::from("9.1"),
+                text: "hydrated <@U1>".into(),
+                ..Default::default()
+            }],
+        );
+        fake.set_activity(feed, bodies);
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
+
+        // Without bodies (the boot fetch): the ref row stays empty, the inline one keeps its
+        // body, and the badge state still lands.
+        core.handle(Command::FetchActivity { with_bodies: false });
+        let Event::ActivityView { feed } = next(&mut rx).await else {
+            panic!("expected the activity view");
+        };
+        let feed = feed.expect("the fake feed answers");
+        assert!(feed.items[0].message.is_none());
+        assert_eq!(feed.items[1].message.as_ref().unwrap().text, "inline");
+
+        // With bodies (the view opened): the ref row is hydrated by (channel, ts).
+        core.handle(Command::FetchActivity { with_bodies: true });
+        let Event::ActivityView { feed } = next(&mut rx).await else {
+            panic!("expected the hydrated activity view");
+        };
+        let feed = feed.expect("the fake feed answers");
+        assert_eq!(
+            feed.items[0].message.as_ref().unwrap().text,
+            "hydrated <@U1>"
+        );
+
+        core.handle(Command::MarkActivity {
+            entries: vec![feed.items[0].entry()],
+            read: true,
+        });
+        // The mark runs detached; a further fetch's event (same single-threaded runtime,
+        // FIFO polling) only lands after the earlier spawn completed.
+        core.handle(Command::FetchActivity { with_bodies: false });
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::ActivityView { feed: Ok(_) }
+        ));
+        let marks = core.backend.activity_marks();
+        assert_eq!(marks.len(), 1);
+        assert!(marks[0].0);
+        assert_eq!(marks[0].1[0].kind, "at_user");
     }
 
     #[tokio::test]

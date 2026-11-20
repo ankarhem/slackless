@@ -3,14 +3,18 @@
 //! mention count pills (gpui-kit-guide section 3). Counts are derived from the fixture
 //! history so fixture mode renders exactly what live mode will feed it.
 //!
-//! The rail's DMs and Activity destinations swap the list for the DM inbox (a "Direct
+//! The rail's DMs destination swaps the list for the DM inbox (a "Direct
 //! messages" header with Slack's Unreads filter toggle and a "Find a DM…" field over every
-//! DM with its presence/group avatar, bold name, relative stamp and latest-message preview)
-//! and the [`ActivityFeed`] (mentions,
-//! reactions and thread replies with read state); Home shows the Unreads, Threads, Huddles,
-//! Drafts & sent, Saved and Directories rows above the sections and an "Add channels" row that asks the root to open the
-//! channel browser. [`Sidebar::badge_count`] is the dock badge: unread activity plus unread
-//! DMs.
+//! DM with its presence/group avatar, bold name, relative stamp and latest-message preview);
+//! the Activity destination is a full-width page the root renders beside the rail, so the
+//! sidebar shows only the rail while it is active ([`crate::activity`]); the Files
+//! destination swaps the list for Slack's Files list column (a "Files" header over the All
+//! files, Canvases and Lists rows), whose pages the root renders in the main area
+//! ([`crate::files_page`]); Home shows the
+//! Unreads, Threads, Huddles, Drafts & sent, Saved and Directories rows above the sections
+//! and an "Add channels" row that asks the root to open the channel browser.
+//! [`Sidebar::badge_count`] is the dock badge: unread activity (pushed by the root from the
+//! live feed) plus unread DMs.
 //!
 //! Slack's floating "More unreads" pill rides the list's bottom (or top) edge whenever
 //! unread rows sit outside the scrolled view: the sidebar's primary colors while any hidden
@@ -43,9 +47,9 @@ use slackless_core::types::{
     rich_text::{Block, RichTextContainer, RichTextElement},
 };
 
-use crate::activity::{ActivityEvent, ActivityFeed};
 use crate::avatars::conversation_avatar;
 use crate::emoji;
+use crate::files_page::FilesSection;
 use crate::fixtures::Fixtures;
 use crate::messages::list_stamp;
 use crate::sidebar_menu::{SectionFormEvent, SectionNameForm, workspace_menu};
@@ -77,11 +81,17 @@ pub enum SidebarEvent {
     ToggleTheme,
     /// The rail's own avatar: open the user menu.
     OpenUserMenu,
-    /// An Activity thread item: open the conversation with the thread panel on `thread_ts`.
-    OpenThread {
-        channel: ChannelId,
-        thread_ts: Ts,
-    },
+    /// The rail's Activity tile (or the Home list's Unreads row): open the Activity page,
+    /// which the root renders beside the rail instead of this sidebar's list column.
+    OpenActivity,
+    /// A rail destination other than Activity was shown while the Activity page was open;
+    /// the root stops rendering the page.
+    LeftActivity,
+    /// The rail's Files tile: open the Files view, whose page the root renders in the main
+    /// area beside this sidebar's Files list column.
+    OpenFiles,
+    /// A Files list-column row: show that page of the Files view.
+    ShowFilesSection(FilesSection),
 }
 
 /// The nav destinations stacked in the workspace rail.
@@ -148,6 +158,8 @@ pub struct Sidebar {
     selected: ChannelId,
     active_workspace: usize,
     active_nav: NavItem,
+    /// The Files list column's selected row: the page the Files view shows.
+    files_section: FilesSection,
     /// Each rail destination's list scroll, restored when the reader comes back to it.
     nav_offsets: HashMap<NavItem, Point<Pixels>>,
     /// Keys of the collapsed sidebar sections.
@@ -191,8 +203,9 @@ pub struct Sidebar {
     /// Tracks the sidebar list's scroll state; the "More unreads" pills read which unread
     /// rows the scroll offset carries out of view.
     scroll: ScrollHandle,
-    /// The rail's Activity destination.
-    activity: Entity<ActivityFeed>,
+    /// Unread Activity rows (the root pushes the live feed's count; fixture mode derives
+    /// it), for the rail tile and the dock badge.
+    activity_unread: u32,
     /// The signed-in user's status and presence, for the rail avatar.
     self_state: SelfState,
     _subscriptions: Vec<Subscription>,
@@ -218,7 +231,6 @@ impl Sidebar {
                     .placeholder("Find a DM…")
                     .auto_grow(1, 1)
             });
-            let activity = ActivityFeed::new(fixtures.clone(), cx);
             let section_form = SectionNameForm::new(window, cx);
             let collapsed = fixtures
                 .collapsed_sections
@@ -242,20 +254,6 @@ impl Sidebar {
                         }
                     },
                 ),
-                cx.observe(&activity, |_, _, cx| cx.notify()),
-                cx.subscribe(
-                    &activity,
-                    |this: &mut Sidebar, _, event: &ActivityEvent, cx| {
-                        let ActivityEvent::Open { channel, thread_ts } = event;
-                        this.select_row(channel.clone(), cx);
-                        if let Some(thread_ts) = thread_ts {
-                            cx.emit(SidebarEvent::OpenThread {
-                                channel: channel.clone(),
-                                thread_ts: thread_ts.clone(),
-                            });
-                        }
-                    },
-                ),
                 cx.subscribe_in(
                     &section_form,
                     window,
@@ -271,6 +269,7 @@ impl Sidebar {
                 selected,
                 active_workspace: 0,
                 active_nav: NavItem::Home,
+                files_section: FilesSection::All,
                 nav_offsets: HashMap::new(),
                 collapsed,
                 read: HashSet::new(),
@@ -290,7 +289,7 @@ impl Sidebar {
                 local_sections: Vec::new(),
                 section_form,
                 scroll: ScrollHandle::new(),
-                activity,
+                activity_unread: 0,
                 self_state: SelfState::default(),
                 _subscriptions: subscriptions,
             }
@@ -308,8 +307,6 @@ impl Sidebar {
                 .map(SharedString::from)
                 .collect();
         }
-        self.activity
-            .update(cx, |feed, cx| feed.set_fixtures(&fixtures, cx));
         // The snapshot read the store after every fresher read kept here.
         self.fresh_latest.clear();
         self.fixtures = fixtures;
@@ -347,8 +344,10 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Show a rail destination (keyboard shortcuts).
+    /// Show a rail destination (keyboard shortcuts; the rail tile and the Unreads row route
+    /// Activity through the root, which owns the page).
     pub(crate) fn show_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
+        let leaving_activity = self.active_nav == NavItem::Activity && item != NavItem::Activity;
         // One scroll container serves every destination: each keeps its own position, and a
         // first visit starts at the top.
         self.nav_offsets
@@ -357,6 +356,25 @@ impl Sidebar {
         self.scroll
             .set_offset(offset.unwrap_or_else(|| point(px(0.), px(0.))));
         self.active_nav = item;
+        if leaving_activity {
+            cx.emit(SidebarEvent::LeftActivity);
+        }
+        cx.notify();
+    }
+
+    /// Leave the Activity or Files destination, whose page owns the main area (a
+    /// conversation or another full-column view takes over); nothing to do from any other
+    /// destination.
+    pub(crate) fn leave_pages(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.active_nav, NavItem::Activity | NavItem::Files) {
+            self.show_nav(NavItem::Home, cx);
+        }
+    }
+
+    /// Unread Activity rows (the root pushes the live feed's count; fixture mode derives
+    /// it), for the rail tile and the dock badge.
+    pub fn set_activity_unread(&mut self, count: u32, cx: &mut Context<Self>) {
+        self.activity_unread = count;
         cx.notify();
     }
 
@@ -389,9 +407,9 @@ impl Sidebar {
     }
 
     /// The dock badge count: unread Activity items plus unread DM messages.
-    pub fn badge_count(&self, cx: &gpui_kit::gpui::App) -> u32 {
+    pub fn badge_count(&self) -> u32 {
         let watermark = self.read_watermark();
-        self.activity.read(cx).unread_count()
+        self.activity_unread
             + self
                 .total_unread(&self.fixtures.dms, watermark.as_ref())
                 .count
@@ -553,6 +571,29 @@ impl Sidebar {
             .collect()
     }
 
+    /// The search dropdown's unread state, alongside [`Self::unread_ids`]: per conversation
+    /// unread-mention counts (conversations with any only), and the followed-threads state
+    /// (unread replies present, mentions among them) for its Threads row and badge.
+    pub fn search_unread_counts(&self) -> (Vec<(ChannelId, u32)>, (bool, u32)) {
+        let watermark = self.read_watermark();
+        let mentions = self
+            .fixtures
+            .channels
+            .iter()
+            .chain(&self.fixtures.dms)
+            .filter_map(|conversation| {
+                let mentions = self.unread_in(conversation, watermark.as_ref()).mentions;
+                (mentions > 0).then(|| (conversation.id.clone(), mentions))
+            })
+            .collect();
+        (mentions, self.threads_unread)
+    }
+
+    /// The rail destination the list column shows.
+    pub(crate) fn active_nav(&self) -> NavItem {
+        self.active_nav
+    }
+
     /// The nav rail. Like Slack, Home and DMs get an unread dot, Activity its unread count.
     fn workspace_rail(
         &self,
@@ -564,12 +605,12 @@ impl Sidebar {
         // Owned color copies: `cx.theme()` borrows `cx`, so nothing may outlive the
         // statement that reads it across the `&mut Context` calls below.
         let border = cx.theme().sidebar_border;
+        // The rail is transparent over the root's chrome gradient; its tint rings the avatar.
         let rail_bg = cx.theme().title_bar;
         let mut rail = v_flex()
             .flex_none()
             .h_full()
             .w(px(72.))
-            .bg(rail_bg)
             .items_center()
             .pt_3()
             .pb_3()
@@ -787,7 +828,7 @@ impl Sidebar {
         let fg = theme.sidebar_foreground;
         let tile_bg = theme.sidebar_foreground.opacity(0.16);
         let hover = theme.sidebar_foreground.opacity(0.08);
-        let (badge_bg, badge_fg) = (theme.danger, theme.danger_foreground);
+        let (badge_bg, badge_fg) = crate::theme::mention_badge(cx);
         v_flex()
             .id(SharedString::from(format!("nav-{}", item.label())))
             .w_full()
@@ -851,7 +892,12 @@ impl Sidebar {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(item.label()),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.show_nav(item, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| match item {
+                // Both destinations' pages live in the root, which opens them.
+                NavItem::Activity => cx.emit(SidebarEvent::OpenActivity),
+                NavItem::Files => cx.emit(SidebarEvent::OpenFiles),
+                _ => this.show_nav(item, cx),
+            }))
     }
 
     /// A sidebar section: a dim header row (section emoji or icon + name; click collapses)
@@ -1145,6 +1191,63 @@ impl Sidebar {
             .children(trailing)
     }
 
+    /// The rail's Files destination, Slack's Files list column: the "Files" header over one
+    /// row per page of the Files view (All files, Canvases, Lists), the shown one selected.
+    /// Slack's Deleted, Recently viewed and Starred rows are left out: their data sits behind
+    /// private methods slackless does not call (`files.recentlyDeleted`,
+    /// `files.favorites.list`) or no mapped method at all.
+    fn files_list(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .child(
+                div()
+                    .px_4()
+                    .pt_3()
+                    .pb_2()
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .child("Files"),
+            )
+            .children(FilesSection::ALL.map(|section| self.files_row(section, cx)))
+    }
+
+    /// One Files list-column row; a click shows its page.
+    fn files_row(&self, section: FilesSection, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let selected = section == self.files_section;
+        let color = if selected {
+            theme.sidebar_accent_foreground
+        } else {
+            theme.sidebar_foreground.opacity(0.75)
+        };
+        let (fill, hover) = (theme.sidebar_accent, theme.sidebar_foreground.opacity(0.08));
+        h_flex()
+            .id(SharedString::from(format!("files-{section:?}")))
+            .flex_none()
+            .mx_2()
+            .px_2()
+            .h(px(28.))
+            .gap_2()
+            .items_center()
+            .rounded_md()
+            .text_color(color)
+            .cursor_pointer()
+            .when(selected, |row| row.bg(fill))
+            .when(!selected, |row| row.hover(|row| row.bg(hover)))
+            .child(Icon::new(section.icon()).text_color(color).size(px(16.)))
+            .child(section.title())
+            .on_click(cx.listener(move |this, _, _, cx| this.show_files_section(section, cx)))
+    }
+
+    /// Select `section`'s Files list-column row and ask the root to show its page (a row
+    /// click, or the demo hook).
+    pub(crate) fn show_files_section(&mut self, section: FilesSection, cx: &mut Context<Self>) {
+        if self.files_section != section {
+            self.files_section = section;
+            cx.emit(SidebarEvent::ShowFilesSection(section));
+            cx.notify();
+        }
+    }
+
     /// The rail's DMs destination, Slack's DM list: the collapsible "Direct messages" header
     /// with the "Unreads" filter toggle and the compose pen, a "Find a DM…" field, then one
     /// row per DM, latest activity first — presence or stacked group avatar, bold name with
@@ -1242,16 +1345,17 @@ impl Sidebar {
                     .rounded_sm()
                     .cursor_pointer()
                     .hover(|title| title.bg(hover))
+                    // Slack's title reads "Direct messages ⌄": the chevron follows it.
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Direct messages"),
+                    )
                     .child(
                         Icon::new(IconName::ChevronDown)
                             .text_color(dim)
                             .size(px(14.)),
-                    )
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Direct messages"),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         let key = SharedString::from("dm-list");
@@ -1291,25 +1395,23 @@ impl Sidebar {
         let theme = cx.theme();
         let selected = dm.id == self.selected;
         let unread = self.unread_in(dm, watermark);
-        let (fg, dim) = (
+        let (fg, dim, preview_fg) = (
             theme.sidebar_foreground,
             theme.sidebar_foreground.opacity(0.6),
+            theme.sidebar_foreground.opacity(0.9),
         );
         // Slack's DM list marks the open DM with a gray wash and keeps its text colors.
         let selected_bg = theme.sidebar.blend(theme.sidebar_foreground.opacity(0.1));
         let ring = if selected { selected_bg } else { theme.sidebar };
         let hover = theme.accent;
-        // The self-DM reads "Name (you)" here, as Slack's DM list shows it; every other
-        // surface keeps the plain label.
-        let mut label = self.fixtures.conversation_label(dm);
-        if dm.is_im
+        // The self-DM reads "Name (you)" here, "(you)" in regular weight, as Slack's DM list
+        // shows it; every other surface keeps the plain label.
+        let label = self.fixtures.conversation_label(dm);
+        let is_self = dm.is_im
             && dm
                 .user
                 .as_ref()
-                .is_some_and(|user| *user == self.fixtures.self_user)
-        {
-            label.push_str(" (you)");
-        }
+                .is_some_and(|user| *user == self.fixtures.self_user);
         let preview = last.map(|message| {
             // Slack prefixes only your own messages, in group DMs too.
             let author = match &message.user {
@@ -1332,7 +1434,7 @@ impl Sidebar {
         h_flex()
             .id(SharedString::from(format!("dm-{id}")))
             .px_2()
-            .py_1p5()
+            .py_3()
             .gap_2()
             .items_center()
             .rounded_md()
@@ -1350,22 +1452,22 @@ impl Sidebar {
                         h_flex()
                             .gap_2()
                             .child(
-                                div()
+                                h_flex()
                                     .flex_1()
-                                    .truncate()
+                                    .min_w_0()
+                                    .gap_1()
                                     .text_color(fg)
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(label),
+                                    .child(
+                                        div().truncate().font_weight(FontWeight::BOLD).child(label),
+                                    )
+                                    .when(is_self, |name| {
+                                        name.child(div().flex_none().child("(you)"))
+                                    }),
                             )
                             .child(div().flex_none().text_xs().text_color(dim).child(stamp)),
                     )
-                    .child(
-                        div()
-                            .line_clamp(2)
-                            .text_xs()
-                            .text_color(dim)
-                            .children(preview),
-                    ),
+                    // Slack's preview is as large as the name and only slightly dimmer.
+                    .child(div().line_clamp(2).text_color(preview_fg).children(preview)),
             )
             .when(unread.count > 0, |row| {
                 row.child(count_pill(unread.count, unread.mentions > 0, cx))
@@ -1471,7 +1573,8 @@ impl Sidebar {
     fn unreads_pill(&self, target: HiddenUnreads, cx: &Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
         let (bg, hover, fg) = if target.mentions {
-            (theme.danger, theme.danger_hover, theme.danger_foreground)
+            let (bg, fg) = crate::theme::mention_badge(cx);
+            (bg, bg.blend(fg.opacity(0.1)), fg)
         } else {
             // Opaque like Slack's chip: the rows it floats over must not show through.
             (
@@ -1554,17 +1657,19 @@ impl Sidebar {
 fn count_pill(count: u32, mentions: bool, cx: &gpui_kit::gpui::App) -> Div {
     let theme = cx.theme();
     let (bg, fg) = if mentions {
-        (theme.danger, theme.danger_foreground)
+        crate::theme::mention_badge(cx)
     } else {
         (theme.sidebar_primary, theme.sidebar_primary_foreground)
     };
+    // Slack's pill is wider than tall: 18px high, at least 25px wide.
     h_flex()
         .flex_none()
         .justify_center()
+        .items_center()
         .gap_0p5()
-        .min_w(px(18.))
-        .px_1p5()
-        .py_0p5()
+        .h(px(18.))
+        .min_w(px(25.))
+        .px_2()
         .rounded_full()
         .bg(bg)
         .text_color(fg)
@@ -1759,8 +1864,11 @@ impl Render for Sidebar {
         let (mut below, mut above) = (None, None);
         let list = match self.active_nav {
             NavItem::Dms => list.child(self.dm_list(watermark.as_ref(), cx)),
-            NavItem::Activity => list.child(self.activity.clone()),
-            NavItem::Home | NavItem::Files | NavItem::Todos | NavItem::Agents | NavItem::Admin => {
+            // The Activity page replaces the whole sidebar column; the empty list keeps
+            // this match exhaustive (the rail-only render below never reaches it).
+            NavItem::Activity => list,
+            NavItem::Files => list.child(self.files_list(cx)),
+            NavItem::Home | NavItem::Todos | NavItem::Agents | NavItem::Admin => {
                 let mut children = vec![
                     self.workspace_header(cx).into_any_element(),
                     self.find_field(&self.find, cx).into_any_element(),
@@ -1780,10 +1888,7 @@ impl Render for Sidebar {
                         None,
                         cx,
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.active_nav = NavItem::Activity;
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenActivity))),
                     // Slack bolds Threads while followed threads have unread replies and
                     // counts the ones mentioning you in a red pill.
                     self.nav_row(
@@ -1858,52 +1963,55 @@ impl Render for Sidebar {
         h_flex()
             .relative()
             .size_full()
-            .bg(cx.theme().title_bar)
             .text_color(sidebar_fg)
             .text_sm()
             .child(self.workspace_rail(
                 channel_unread.count > 0,
                 dm_unread.count > 0,
-                self.activity.read(cx).unread_count(),
+                self.activity_unread,
                 cx,
             ))
-            .child(
-                // A relative wrapper, so the pills can float over the list's edges. The white
-                // card rounds into the tinted window chrome, as Slack's does.
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .h_full()
-                    .bg(sidebar_bg)
-                    .rounded_tl(px(10.))
-                    .rounded_tr(px(10.))
-                    .child(list)
-                    .when_some(below, |list, pill| {
-                        list.child(
-                            div()
-                                .absolute()
-                                .bottom_2()
-                                .left_0()
-                                .right_0()
-                                .flex()
-                                .justify_center()
-                                .child(self.unreads_pill(pill, cx)),
-                        )
-                    })
-                    .when_some(above, |list, pill| {
-                        list.child(
-                            div()
-                                .absolute()
-                                .top_2()
-                                .left_0()
-                                .right_0()
-                                .flex()
-                                .justify_center()
-                                .child(self.unreads_pill(pill, cx)),
-                        )
-                    }),
-            )
+            // The Activity page spans the whole main area right of the rail, so its own
+            // card replaces this sidebar's list column while it is the active destination.
+            .when(self.active_nav != NavItem::Activity, |sidebar| {
+                sidebar.child(
+                    // A relative wrapper, so the pills can float over the list's edges. The
+                    // white card rounds into the tinted window chrome, as Slack's does.
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h_full()
+                        .bg(sidebar_bg)
+                        .rounded_tl(px(10.))
+                        .rounded_tr(px(10.))
+                        .child(list)
+                        .when_some(below, |list, pill| {
+                            list.child(
+                                div()
+                                    .absolute()
+                                    .bottom_2()
+                                    .left_0()
+                                    .right_0()
+                                    .flex()
+                                    .justify_center()
+                                    .child(self.unreads_pill(pill, cx)),
+                            )
+                        })
+                        .when_some(above, |list, pill| {
+                            list.child(
+                                div()
+                                    .absolute()
+                                    .top_2()
+                                    .left_0()
+                                    .right_0()
+                                    .flex()
+                                    .justify_center()
+                                    .child(self.unreads_pill(pill, cx)),
+                            )
+                        }),
+                )
+            })
             .when(self.settings_menu_open, |sidebar| {
                 let toggle = cx.weak_entity();
                 let on_active_only = move |_: &mut Window, cx: &mut gpui_kit::gpui::App| {

@@ -9,8 +9,35 @@
 //! not surfaces, and the theme picker previews each palette's own colors ([`Palette::swatch`],
 //! [`swatch_color`]).
 
+use std::borrow::Cow;
+
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
-use gpui_kit::gpui::{App, Hsla, rgb};
+use gpui_kit::gpui::{
+    App, Background, Global, Hsla, Pixels, linear_color_stop, linear_gradient, px, rgb,
+};
+
+/// Slack's Font choices slackless can show (Preferences > Appearance > Font): Lato, Slack's
+/// default, embedded as a Latin subset (`fonts/OFL.txt`), and the families macOS ships.
+/// Slack's own web fonts (Atkinson Hyperlegible Next, Noto Sans, OpenDyslexic, Roboto Mono)
+/// are not bundled, keeping the binary small.
+pub const FONT_LABELS: [&str; 5] = [
+    "Arial",
+    "Comic Sans",
+    "Georgia",
+    "Lato (Default)",
+    "San Francisco Pro (System)",
+];
+
+/// The font family behind each of [`FONT_LABELS`].
+pub const FONT_FAMILIES: [&str; 5] = ["Arial", "Comic Sans MS", "Georgia", "Lato", ".SystemUIFont"];
+
+/// Lato, Slack's default font.
+pub const DEFAULT_FONT: usize = 3;
+
+/// The Font in effect, re-applied whenever a theme change reloads the kit's own.
+struct UiFont(usize);
+
+impl Global for UiFont {}
 
 /// The palettes slackless ships.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,9 +63,33 @@ impl SlackTheme {
     }
 }
 
-/// Install the startup theme: Slack Dark, per the reference screenshot.
+/// Embed Lato and install the startup theme: Slack Dark, per the reference screenshot.
 pub fn init(cx: &mut App) {
+    let lato = [
+        include_bytes!("../fonts/Lato-Regular.ttf").as_slice(),
+        include_bytes!("../fonts/Lato-Italic.ttf"),
+        include_bytes!("../fonts/Lato-Bold.ttf"),
+        include_bytes!("../fonts/Lato-BoldItalic.ttf"),
+    ];
+    if let Err(e) = cx.text_system().add_fonts(lato.map(Cow::Borrowed).to_vec()) {
+        eprintln!("slackless: could not load Lato ({e})");
+    }
     activate(SlackTheme::Dark, cx);
+}
+
+/// The Font in effect, an index into [`FONT_LABELS`].
+pub fn font(cx: &App) -> usize {
+    cx.try_global::<UiFont>()
+        .map_or(DEFAULT_FONT, |font| font.0)
+}
+
+/// Switch the UI font to [`FONT_LABELS`]`[font]` (a valid index); a no-op when it is in effect.
+pub fn set_font(font: usize, cx: &mut App) {
+    if self::font(cx) == font {
+        return;
+    }
+    cx.set_global(UiFont(font));
+    Theme::update(cx, |theme| theme.font_family = FONT_FAMILIES[font].into());
 }
 
 /// Switch the whole app to `theme` with the default color theme and repaint every window.
@@ -53,10 +104,12 @@ pub fn activate(theme: SlackTheme, cx: &mut App) {
 /// same-closure edits.
 pub fn activate_with(theme: SlackTheme, palette: Palette, cx: &mut App) {
     let mode = theme.mode();
+    let family = FONT_FAMILIES[font(cx)];
     Theme::change(mode, None, cx);
     Theme::update(cx, |theme| {
         apply(mode.is_dark(), theme);
         tint(palette, mode.is_dark(), theme);
+        theme.font_family = family.into();
     });
 }
 
@@ -150,35 +203,14 @@ impl Palette {
     }
 }
 
-/// The appearance Slack stores for the signed-in user: `messages_theme` chooses light or dark
-/// and `sidebar_theme` the color theme, so slackless opens looking like Slack itself.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Appearance {
-    pub theme: SlackTheme,
-    pub palette: Palette,
-}
-
-/// Read Slack's theme prefs into an [`Appearance`]; `None` when the message theme is absent.
-pub fn appearance_from_prefs(prefs: &crate::blockkit::serde_json::Value) -> Option<Appearance> {
-    let messages = prefs
-        .get("messages_theme")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let theme = if messages.starts_with("light") {
-        SlackTheme::Light
-    } else if messages.starts_with("dark") {
-        SlackTheme::Dark
-    } else {
-        return None;
-    };
-    let sidebar = prefs
+/// The color theme Slack stores for the signed-in user (`sidebar_theme`), so slackless opens
+/// tinted like Slack itself; `None` when the pref is absent. Light, dark or system is not a
+/// workspace pref: Slack keeps its Color Mode on the client, and so does slackless.
+pub fn palette_from_prefs(prefs: &crate::blockkit::serde_json::Value) -> Option<Palette> {
+    prefs
         .get("sidebar_theme")
         .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    Some(Appearance {
-        theme,
-        palette: Palette::from_slack(sidebar),
-    })
+        .map(Palette::from_slack)
 }
 
 /// Sidebar swatches offered by the custom theme builder.
@@ -230,6 +262,51 @@ pub fn code_foreground(cx: &App) -> Hsla {
     }
 }
 
+/// Slack's destructive text ("Delete message..."): the danger red on light themes, a light
+/// rose on dark ones.
+pub fn danger_text(cx: &App) -> Hsla {
+    let theme = cx.theme();
+    if theme.mode.is_dark() {
+        color(0xE6_9B_A1)
+    } else {
+        theme.danger
+    }
+}
+
+/// Slack's mention badge (mention counts, the "Unread mentions" chip) as (background,
+/// foreground): the danger red with white text on light themes, a light rose with dark text
+/// on dark ones (measured on Slack 4.53).
+pub fn mention_badge(cx: &App) -> (Hsla, Hsla) {
+    let theme = cx.theme();
+    if theme.mode.is_dark() {
+        (color(0xE6_9B_A1), color(0x1A_1D_21))
+    } else {
+        (theme.danger, theme.danger_foreground)
+    }
+}
+
+/// The glow Slack's window chrome carries in its top-left corner, over the flat chrome tint
+/// (`title_bar`), as measured on Slack 4.53: the side of the square it is painted on and
+/// the square's fill. The fill fades the glow to transparent along the diagonal, reaching it
+/// where `x + y` equals the side; fading the alpha with the color gives Slack's quick
+/// falloff near the corner. A square keeps GPUI's aspect-scaled gradient math exact.
+pub fn chrome_glow(cx: &App) -> (Pixels, Background) {
+    let theme = cx.theme();
+    let (side, glow) = if theme.mode.is_dark() {
+        (900., color(0x33_3B_40))
+    } else {
+        (1400., color(0xF5_FA_FB))
+    };
+    // On a square, a 135deg gradient puts the corner at t = 0.5 - 1/sqrt(2) and the
+    // anti-diagonal through (side, 0) at t = 0.5.
+    let fill = linear_gradient(
+        135.,
+        linear_color_stop(glow, 0.5 - std::f32::consts::FRAC_1_SQRT_2),
+        linear_color_stop(theme.title_bar.opacity(0.), 0.5),
+    );
+    (px(side), fill)
+}
+
 /// Fill the global theme's color tokens with the named Slack palette.
 ///
 /// Editing the fields the app and views actually consume is enough: untouched kit tokens
@@ -272,14 +349,15 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.success_foreground = color(0xFF_FF_FF);
         theme.warning = color(0xEC_B2_2E);
         theme.warning_foreground = color(0x1A_1D_21);
-        theme.sidebar = color(0x1A_1D_21);
-        theme.sidebar_border = color(0x30_36_3D);
+        // The sidebar card sits a shade darker than the message card, on navy chrome.
+        theme.sidebar = color(0x13_18_1D);
+        theme.sidebar_border = color(0x24_28_2C);
         theme.sidebar_foreground = color(0xD1_D2_D3);
         theme.sidebar_primary = color(0xD1_D2_D3); // unread pill: near-white bg
         theme.sidebar_primary_foreground = color(0x1A_1D_21);
-        theme.sidebar_accent = color(0x11_64_A3); // selected row blue
+        theme.sidebar_accent = color(0x05_66_96); // selected row blue
         theme.sidebar_accent_foreground = color(0xFF_FF_FF);
-        theme.title_bar = color(0x1A_1D_21);
+        theme.title_bar = color(0x07_1D_2C);
         theme.title_bar_border = color(0x101216);
         theme.popover = color(0x25_28_2D);
         theme.popover_foreground = color(0xD1_D2_D3);
@@ -335,7 +413,7 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.sidebar_primary_foreground = color(0xFF_FF_FF);
         theme.sidebar_accent = color(0x11_64_A3);
         theme.sidebar_accent_foreground = color(0xFF_FF_FF);
-        theme.title_bar = color(0xDC_EF_F8);
+        theme.title_bar = color(0xB1_EB_FC);
         theme.title_bar_border = color(0xE1_E3_E5);
         theme.popover = color(0xFF_FF_FF);
         theme.popover_foreground = color(0x1D_1C_1D);
@@ -377,23 +455,11 @@ mod tests {
     use crate::blockkit::serde_json::json;
 
     #[test]
-    fn appearance_follows_the_workspace_theme_prefs() {
-        let light = json!({
-            "messages_theme": "light_with_avatars",
-            "sidebar_theme": "hoth_theme",
-        });
-        let appearance = appearance_from_prefs(&light).expect("Slack's light prefs");
-        assert!(appearance.theme == SlackTheme::Light);
-        assert!(appearance.palette == Palette::Default);
-
-        let dark = json!({
-            "messages_theme": "dark_with_avatars",
-            "sidebar_theme": "aubergine_theme",
-        });
-        let appearance = appearance_from_prefs(&dark).expect("Slack's dark prefs");
-        assert!(appearance.theme == SlackTheme::Dark);
-        assert!(appearance.palette == Palette::Aubergine);
-
-        assert!(appearance_from_prefs(&json!({})).is_none());
+    fn palette_follows_the_workspace_sidebar_theme() {
+        let hoth = json!({ "sidebar_theme": "hoth_theme" });
+        assert_eq!(palette_from_prefs(&hoth), Some(Palette::Default));
+        let aubergine = json!({ "sidebar_theme": "aubergine_theme" });
+        assert_eq!(palette_from_prefs(&aubergine), Some(Palette::Aubergine));
+        assert_eq!(palette_from_prefs(&json!({})), None);
     }
 }

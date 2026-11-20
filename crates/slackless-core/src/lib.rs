@@ -51,7 +51,9 @@ pub enum Command {
     /// Look up people the workspace directory (`users.list`) leaves out, such as members of
     /// other organizations in shared channels and DMs, so they show by name. Each id is asked
     /// once per session; found profiles are stored and announced with
-    /// [`Event::UsersChanged`].
+    /// [`Event::UsersChanged`], then the other organizations they belong to are looked up
+    /// (`team.info`, each once per session), stored and announced with
+    /// [`Event::SidebarChanged`].
     ResolveUsers(Vec<UserId>),
     /// The user chose "Leave channel": leave it on Slack, then store it as no longer joined
     /// and announce it with [`Event::Conversations`].
@@ -73,6 +75,21 @@ pub enum Command {
     /// store fallback lives here; the front-end serves its local data until the event lands
     /// (and keeps it when the fetch fails).
     FetchThreads,
+    /// The user opened the Activity view (or the badge needs its count): fetch Slack's
+    /// Activity feed (`activity.feed`, page one) with its row bodies (`messages.list`) and
+    /// announce it as [`Event::ActivityView`]. The boot hydrate sends the same command
+    /// without the bodies, so the badges light up before the view is ever opened.
+    FetchActivity {
+        /// Hydrate the rows' bodies through `messages.list` (the view needs them; the
+        /// badge does not).
+        with_bodies: bool,
+    },
+    /// Mark feed entries read (`activity.markRead`) or unread (`activity.markUnread`);
+    /// `entries` carries each item's handles (see `slackless_api::ActivityItem::entry`).
+    MarkActivity {
+        entries: Vec<api::ActivityEntry>,
+        read: bool,
+    },
     /// Post a message (its blocks, with the text as fallback); `thread_ts` replies in a
     /// thread, and `broadcast` also posts that reply to the channel (Slack's "Also send to").
     SendMessage {
@@ -119,6 +136,18 @@ pub enum Command {
     CreateSection {
         name: String,
     },
+    /// Replace `channel`'s topic (`conversations.setTopic`), merge the returned channel
+    /// into the store and announce it with [`Event::Conversations`].
+    SetChannelTopic {
+        channel: ChannelId,
+        topic: String,
+    },
+    /// Replace `channel`'s description (`conversations.setPurpose`), merge the returned
+    /// channel into the store and announce it with [`Event::Conversations`].
+    SetChannelPurpose {
+        channel: ChannelId,
+        purpose: String,
+    },
     /// Send a typing indicator.
     Typing {
         channel: ChannelId,
@@ -130,9 +159,11 @@ pub enum Command {
     /// The user opened a bookmarks surface of a conversation (folder tab, bookmark bar):
     /// fetch its bookmarks (`bookmarks.list`), folders included.
     LoadBookmarks(ChannelId),
-    /// The user opened a conversation's Files & links tab: fetch its shared files
-    /// (`files.list`).
-    LoadFiles(ChannelId),
+    /// The user opened a files surface: fetch its files (`files.list`). A `channel` in the
+    /// filter asks for that conversation's shared files (the Files & links tab); without
+    /// one Slack answers every file the signed-in user can see workspace-wide (the Files
+    /// view).
+    LoadFiles(api::FilesFilter),
     /// Add a link bookmark to the conversation's bar (`bookmarks.add`), then re-fetch the
     /// list so the bar shows the new entry.
     AddBookmark {
@@ -163,16 +194,21 @@ pub enum Event {
     /// `num_members` counts human members (`conversations.members` cross-checked against the
     /// stored profiles: apps, deactivated people and `USLACKBOT` excluded) and `num_apps`
     /// counts the app/bot members for the header's separate apps chip; when the member list
-    /// cannot be read, `num_apps` is `None` and `num_members` falls back to
-    /// `conversations.info`'s raw count.
+    /// cannot be read, `num_apps` is `None`, `num_members` falls back to
+    /// `conversations.info`'s raw count and `members` is empty. Otherwise `members` carries
+    /// the full member id list (member panels, Slack Connect org counts). When
+    /// `conversations.info` itself fails, the event still lands carrying nothing (`None`
+    /// counts, no members) so front-ends stop waiting; the failure is reported as usual.
     ConversationInfo {
         channel: ChannelId,
         num_members: Option<u32>,
         num_apps: Option<u32>,
+        members: Vec<UserId>,
     },
     /// These users were added or updated in the store.
     UsersChanged(Vec<UserId>),
-    /// Sidebar inputs (team, sections, custom emoji, prefs) changed in the store; re-read them.
+    /// Sidebar inputs (the team and its connected organizations, sections, custom emoji,
+    /// prefs) changed in the store; re-read them.
     SidebarChanged,
     /// Unread and mention counts from `client.counts`.
     Counts(Box<api::ClientCounts>),
@@ -204,6 +240,12 @@ pub enum Event {
     /// The followed threads of [`Command::FetchThreads`]
     /// (`subscriptions.thread.getView`).
     ThreadsView(Box<api::ThreadsView>),
+    /// The answer to a [`Command::FetchActivity`] (`activity.feed`, hydrated through
+    /// `messages.list` when asked): the Activity view's rows, or the error text the view
+    /// shows instead of loading forever (the failure is also reported).
+    ActivityView {
+        feed: Result<Box<api::ActivityFeed>, String>,
+    },
     /// The DM of a [`Command::OpenDm`] opened (or was already open): its conversation id.
     ConversationOpened(ChannelId),
     /// The session was rejected; the user has to sign in again. Carries Slack's error.
@@ -220,10 +262,11 @@ pub enum Event {
         channel: ChannelId,
         bookmarks: Result<Vec<api::ChannelBookmark>, String>,
     },
-    /// The answer to a [`Command::LoadFiles`]: the conversation's shared files, or the error
-    /// text.
+    /// The answer to a [`Command::LoadFiles`]: the files matching its filter, or the error
+    /// text. The filter rides along so a workspace-wide load (the Files view) and a
+    /// per-conversation one (the Files & links tab) land in the right place.
     FilesLoaded {
-        channel: ChannelId,
+        filter: api::FilesFilter,
         files: Result<Vec<File>, String>,
     },
     /// The conversation's channel canvas was created and the stored conversation refreshed;
