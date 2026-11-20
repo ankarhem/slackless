@@ -138,6 +138,12 @@ pub struct Fixtures {
     pub notify_levels: HashMap<ChannelId, NotifyLevel>,
     /// The message hover bar's one-click reactions (none when the user turned them off).
     pub quick_reactions: Vec<String>,
+    /// The emoji picker's Frequently Used, most used first, from the user's `emoji_use` pref
+    /// (live mode); empty in the sample workspace, whose picker shows its defaults.
+    pub frequent_emoji: Vec<String>,
+    /// The user's emoji skin tone (`preferred_skin_tone`): 1 is the default yellow, 2..=6 the
+    /// Fitzpatrick tones.
+    pub skin_tone: u8,
     /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
     pub thumbnails: HashMap<FileId, Arc<Image>>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
@@ -1003,6 +1009,8 @@ pub fn load() -> Fixtures {
         quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
             .map(String::from)
             .to_vec(),
+        frequent_emoji: Vec::new(),
+        skin_tone: 1,
         thumbnails,
         profile_extras,
         custom_emoji,
@@ -1114,13 +1122,15 @@ pub fn live(
         eprintln!("slackless: could not read sidebar sections from the local store ({e})");
         Vec::new()
     });
-    let custom_emoji = store
+    let custom_emoji: BTreeMap<String, EmojiImage> = store
         .custom_emoji(team)
         .unwrap_or_default()
         .into_iter()
         .map(|(name, url)| (name, EmojiImage::Url(url.into())))
         .collect();
     let prefs = store.prefs(team).ok().flatten().unwrap_or_default();
+    let frequent_emoji =
+        crate::emoji::frequent_from_prefs(&prefs, |name| custom_emoji.contains_key(name));
     // Per-section sidebar state, kept as JSON text in the `channel_sections` pref:
     // `"c": "1"` marks a collapsed section.
     let collapsed_sections = prefs
@@ -1173,6 +1183,8 @@ pub fn live(
         presence: PresenceMap::default(),
         notify_levels: slackless_core::notify_levels(&prefs),
         quick_reactions: quick_reactions(&prefs),
+        frequent_emoji,
+        skin_tone: crate::emoji::skin_tone_from_prefs(&prefs),
         thumbnails: HashMap::new(),
         profile_extras: HashMap::new(),
         custom_emoji,
