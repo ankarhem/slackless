@@ -549,10 +549,8 @@ impl Render for LaterView {
 
         let empty = rows.is_empty().then(|| {
             let (icon, text) = match tab {
-                LaterState::InProgress => (
-                    IconName::Bookmark,
-                    "Nothing saved. Use Save for later or Remind me on a message.",
-                ),
+                // Slack's empty Saved page.
+                LaterState::InProgress => (IconName::Bookmark, "Nothing saved yet"),
                 LaterState::Archived => (IconName::Archive, "Archived items show up here."),
                 LaterState::Completed => (IconName::CircleCheck, "Completed items show up here."),
             };
@@ -563,7 +561,15 @@ impl Render for LaterView {
                 .text_sm()
                 .text_color(muted)
                 .child(Icon::new(icon).text_color(muted).size(px(28.)))
-                .child(text)
+                .child(
+                    div()
+                        .text_color(foreground)
+                        .font_weight(FontWeight::BOLD)
+                        .child(text),
+                )
+                .when(tab == LaterState::InProgress, |empty| {
+                    empty.child("Save a message to keep it here.")
+                })
         });
 
         v_flex()
@@ -579,13 +585,10 @@ impl Render for LaterView {
                         h_flex()
                             .items_center()
                             .gap_2()
+                            .text_lg()
                             .font_weight(FontWeight::BOLD)
-                            .child(
-                                Icon::new(IconName::Bookmark)
-                                    .text_color(foreground)
-                                    .size(px(16.)),
-                            )
-                            .child("Later"),
+                            // Slack's sidebar row and page are both "Saved".
+                            .child("Saved"),
                     )
                     .child(
                         Button::new("later-close")

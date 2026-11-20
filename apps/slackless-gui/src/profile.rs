@@ -230,10 +230,19 @@ impl Render for ProfilePanel {
                 div()
                     .size(px(10.))
                     .rounded_full()
-                    .when(!away, |dot| dot.bg(success))
-                    .when(away, |dot| dot.border_1().border_color(muted)),
+                    .when(!user.deleted && !away, |dot| dot.bg(success))
+                    .when(!user.deleted && away, |dot| {
+                        dot.border_1().border_color(muted)
+                    }),
             )
-            .child(if away { "Away" } else { "Active" })
+            // Slack marks a deactivated person instead of showing a presence.
+            .child(if user.deleted {
+                "Deactivated account"
+            } else if away {
+                "Away"
+            } else {
+                "Active"
+            })
             .when(is_self, |row| {
                 row.children(self.self_state.pause_label().map(|label| {
                     h_flex()
@@ -273,7 +282,8 @@ impl Render for ProfilePanel {
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(ProfileEvent::EditStatus))),
                 )
             })
-            .when(!is_self, |row| {
+            // A deactivated person cannot be messaged.
+            .when(!is_self && !user.deleted, |row| {
                 row.child(
                     action(
                         "profile-message",
@@ -305,15 +315,25 @@ impl Render for ProfilePanel {
                     .child(div().text_xs().text_color(muted).child("Email address"))
                     .child(div().text_sm().text_color(link).child(email))
             }))
-            .children(user.profile.phone.clone().map(|phone| {
-                v_flex()
-                    .child(div().text_xs().text_color(muted).child("Phone"))
-                    .child(div().text_sm().text_color(link).child(phone))
-            }));
+            .children(
+                user.profile
+                    .phone
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .map(|phone| {
+                        v_flex()
+                            .child(div().text_xs().text_color(muted).child("Phone"))
+                            .child(div().text_sm().text_color(link).child(phone))
+                    }),
+            );
         let about =
             v_flex()
                 .gap_2()
-                .child(section("About me"))
+                // Like Slack, the section only shows when it has something in it.
+                .when(
+                    user.tz_label.is_some() || extras.is_some_and(|e| !e.fields.is_empty()),
+                    |about| about.child(section("About me")),
+                )
                 .children(user.tz_label.clone().map(|zone| {
                     v_flex()
                         .child(div().text_xs().text_color(muted).child("Time zone"))
