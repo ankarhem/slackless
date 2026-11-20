@@ -122,7 +122,8 @@ impl NewMessageView {
     }
 
     /// Reset and focus the To field; call when the view opens.
-    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Show the view empty, or with `draft` in the composer (a forwarded message's link).
+    pub fn open(&mut self, draft: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.query.clear();
         self.selected = 0;
         self.picked = None;
@@ -131,7 +132,7 @@ impl NewMessageView {
             state.focus_handle(cx).focus(window, cx);
         });
         self.composer
-            .update(cx, |composer, cx| composer.load_draft("", cx));
+            .update(cx, |composer, cx| composer.load_draft(draft, cx));
         cx.notify();
     }
 

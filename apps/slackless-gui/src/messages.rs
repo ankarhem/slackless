@@ -114,6 +114,8 @@ pub enum MessageListEvent {
     },
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
+    /// Forward this message (its permalink): the root opens New message with it drafted.
+    Forward(String),
     /// "Jump to…" needs history older than the loaded window: the root pages it in until it
     /// reaches `since` (unix seconds), then calls [`MessageList::finish_jump`].
     NeedHistorySince {
@@ -462,15 +464,11 @@ impl MessageList {
                 cx.emit(MessageListEvent::OpenThread { channel, thread_ts });
             }
             MessageAction::CopyLink => actions::copy_link(&self.fixtures, &channel, ts, window, cx),
-            MessageAction::Forward => {
-                eprintln!("slackless: forward {channel}/{ts} (needs a live workspace)");
-                actions::notify(
-                    "Forward message",
-                    "Forwarding needs a live workspace.",
-                    window,
-                    cx,
-                );
-            }
+            MessageAction::Forward => cx.emit(MessageListEvent::Forward(actions::permalink(
+                &self.fixtures,
+                &self.channel,
+                ts,
+            ))),
             MessageAction::SaveForLater => {
                 let saved = !self.data.read(cx).saved.contains(ts);
                 let title = if saved {

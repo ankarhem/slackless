@@ -452,17 +452,22 @@ pub fn copy_link(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let link = permalink(fixtures, channel, ts);
+    cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
+    notify("Link copied", link, window, cx);
+}
+
+/// Slack's permalink to the message `ts` in `channel`.
+pub fn permalink(fixtures: &Fixtures, channel: &ChannelId, ts: &Ts) -> String {
     let domain = fixtures
         .workspaces
         .first()
         .map(|team| team.domain.as_str())
         .unwrap_or("app");
-    let link = format!(
+    format!(
         "https://{domain}.slack.com/archives/{channel}/p{}",
         ts.as_str().replace('.', "")
-    );
-    cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
-    notify("Link copied", link, window, cx);
+    )
 }
 
 /// Toggle `me`'s `name` reaction on `message`; an emptied aggregate is removed.

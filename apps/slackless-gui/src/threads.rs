@@ -47,6 +47,8 @@ pub enum ThreadPanelEvent {
     Close,
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
+    /// Forward this message (its permalink): the root opens New message with it drafted.
+    Forward(String),
     /// The user replied; the panel has already shown the reply locally.
     Reply {
         channel: ChannelId,
@@ -350,13 +352,10 @@ impl ThreadPanel {
                 }
             }
             MessageAction::Forward => {
-                eprintln!("slackless: forward thread message {ts} (needs a live workspace)");
-                actions::notify(
-                    "Forward message",
-                    "Forwarding needs a live workspace.",
-                    window,
-                    cx,
-                );
+                if let Some((channel, _)) = &self.thread {
+                    let link = actions::permalink(&self.fixtures, channel, ts);
+                    cx.emit(ThreadPanelEvent::Forward(link));
+                }
             }
             MessageAction::SaveForLater => {
                 let saved = !self.saved.contains(ts);

@@ -1950,12 +1950,14 @@ impl App {
     }
 
     /// The "New message" view, focused on its To field.
-    fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Slack's "New message" view, empty or with `draft` (Forward drafts the permalink).
+    fn open_compose(&mut self, draft: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.save_draft(cx);
         let fixtures = self.fixtures.clone();
         self.compose
             .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
-        self.compose.update(cx, |view, cx| view.open(window, cx));
+        self.compose
+            .update(cx, |view, cx| view.open(draft, window, cx));
         self.close_full_column_views();
         self.compose_open = true;
         cx.notify();
@@ -2882,7 +2884,7 @@ fn subscribe_workspace(
                 SidebarEvent::OpenThreads => this.open_threads(cx),
                 SidebarEvent::OpenHuddles => this.open_huddles(cx),
                 SidebarEvent::OpenDirectories => this.open_directory(cx),
-                SidebarEvent::OpenCompose => this.open_compose(window, cx),
+                SidebarEvent::OpenCompose => this.open_compose("", window, cx),
                 SidebarEvent::CreateSection { name } => this.create_section(name.clone(), cx),
                 SidebarEvent::ToggleTheme => this.toggle_theme(window, cx),
                 SidebarEvent::OpenUserMenu => {
@@ -2931,6 +2933,7 @@ fn subscribe_workspace(
                 }
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
                 MessageListEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                MessageListEvent::Forward(link) => this.open_compose(link, window, cx),
                 MessageListEvent::NeedHistorySince { channel, since } => {
                     this.load_since(channel, *since, cx);
                 }
@@ -2966,6 +2969,7 @@ fn subscribe_workspace(
                     cx.notify();
                 }
                 ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                ThreadPanelEvent::Forward(link) => this.open_compose(link, window, cx),
                 ThreadPanelEvent::Reply {
                     channel,
                     thread_ts,
@@ -3103,7 +3107,7 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                     "threads" => app.open_threads(cx),
                     "huddles" => app.open_huddles(cx),
                     "directory" => app.open_directory(cx),
-                    "compose" => app.open_compose(window, cx),
+                    "compose" => app.open_compose("", window, cx),
                     "wsmenu" => app
                         .sidebar
                         .update(cx, |sidebar, cx| sidebar.show_settings_menu(cx)),
