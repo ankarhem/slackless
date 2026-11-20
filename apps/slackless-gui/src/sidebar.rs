@@ -1133,7 +1133,7 @@ impl Sidebar {
                 theme.secondary_foreground,
             )
         };
-        let row = target.row;
+        let (row, below) = (target.row, target.below);
         h_flex()
             .id(if target.below {
                 "unreads-below"
@@ -1166,9 +1166,36 @@ impl Sidebar {
             // The pill floats over sidebar rows: a click must not also open the row beneath.
             .occlude()
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.scroll.scroll_to_item(row);
+                this.reveal_unread(row, below);
                 cx.notify();
             }))
+    }
+
+    /// Scroll `row` into view a pill's height inside the edge its pill floats on, so the
+    /// revealed unread row is not hidden under the pill that is still shown for later ones.
+    fn reveal_unread(&self, row: usize, below: bool) {
+        let Some(bounds) = self.scroll.bounds_for_item(row) else {
+            self.scroll.scroll_to_item(row);
+            return;
+        };
+        let viewport = self.scroll.bounds();
+        let clearance = px(PILL_CLEARANCE);
+        // Child bounds are unscrolled: on screen a row sits at its bounds plus the offset.
+        let y = if below {
+            viewport.bottom() - clearance - bounds.bottom()
+        } else {
+            viewport.top() + clearance - bounds.top()
+        };
+        let max = self.scroll.max_offset().y;
+        let y = if y > px(0.) {
+            px(0.)
+        } else if y < -max {
+            -max
+        } else {
+            y
+        };
+        self.scroll
+            .set_offset(gpui_kit::gpui::point(self.scroll.offset().x, y));
     }
 }
 
@@ -1205,10 +1232,14 @@ enum ListChild {
     Plain,
 }
 
+/// Room kept between a revealed unread row and the list edge: the pill's height plus its inset.
+const PILL_CLEARANCE: f32 = 44.;
+
 /// One edge of the list's hidden unreads: the unread row the pill scrolls to next, and
 /// whether any unread row hidden past that edge carries mentions. `below` picks the pill's
 /// arrow and the list edge it rides.
 #[derive(Clone, Copy)]
+
 struct HiddenUnreads {
     row: usize,
     mentions: bool,
