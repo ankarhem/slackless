@@ -25,11 +25,13 @@ mod backend;
 mod backfill;
 mod client;
 mod fetcher;
+mod notify;
 mod reducer;
 
 pub use backend::Backend;
 pub use client::{Client, ClientHandle, SharedStore};
 pub use fetcher::Fetcher;
+pub use notify::{NotifyLevel, notify_levels};
 pub use reducer::apply_event;
 
 use rtm::ConnectionState;
@@ -52,6 +54,12 @@ pub enum Command {
     /// The user chose "Leave channel": leave it on Slack, then store it as no longer joined
     /// and announce it with [`Event::Conversations`].
     LeaveConversation(ChannelId),
+    /// The header bell's choice: set `channel`'s notification level on Slack, mirror it into
+    /// the stored prefs, then announce [`Event::SidebarChanged`].
+    SetNotifyLevel {
+        channel: ChannelId,
+        level: NotifyLevel,
+    },
     /// The user opened a thread: fetch its full history (root + all replies) from Slack into
     /// the store. Read-only; it never moves the user's read cursor.
     OpenThread {

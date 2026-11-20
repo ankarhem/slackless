@@ -389,6 +389,23 @@ impl<B: Backend> Core<B> {
                 }
             }
             Command::ResolveUsers(ids) => self.resolve_users(ids),
+            Command::SetNotifyLevel { channel, level } => {
+                self.spawn("users.prefs.setNotifications", async move {
+                    for &(name, value) in level.writes() {
+                        backend
+                            .set_notification_pref(channel.clone(), name, value)
+                            .await?;
+                    }
+                    with_store(&store, move |s| {
+                        let mut prefs = s.prefs(&ws)?.unwrap_or_default();
+                        crate::notify::set_notify_level(&mut prefs, &channel, level);
+                        s.replace_prefs(&ws, &prefs)
+                    })
+                    .await?;
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
             Command::LeaveConversation(channel) => {
                 self.spawn("conversations.leave", async move {
                     backend.leave_conversation(channel.clone()).await?;
@@ -778,6 +795,7 @@ pub(crate) mod tests {
         presence_calls: Vec<UserId>,
         user_info_calls: Vec<UserId>,
         leave_calls: Vec<ChannelId>,
+        notification_calls: Vec<(ChannelId, &'static str, &'static str)>,
     }
 
     impl FakeBackend {
@@ -854,6 +872,11 @@ pub(crate) mod tests {
         /// Channels left through `conversations.leave`, in order.
         pub fn leave_calls(&self) -> Vec<ChannelId> {
             self.state.lock().unwrap().leave_calls.clone()
+        }
+
+        /// `users.prefs.setNotifications` writes, in order.
+        pub fn notification_calls(&self) -> Vec<(ChannelId, &'static str, &'static str)> {
+            self.state.lock().unwrap().notification_calls.clone()
         }
 
         pub fn messages(&self) -> Vec<Message> {
@@ -1002,6 +1025,17 @@ pub(crate) mod tests {
 
         async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
             self.state.lock().unwrap().leave_calls.push(channel);
+            Ok(())
+        }
+
+        async fn set_notification_pref(
+            &self,
+            channel: ChannelId,
+            name: &'static str,
+            value: &'static str,
+        ) -> api::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.notification_calls.push((channel, name, value));
             Ok(())
         }
 
@@ -1335,6 +1369,34 @@ pub(crate) mod tests {
         assert_eq!(stored.num_members, Some(42), "member count lands from info");
         assert_eq!(stored.unread_count_display, Some(7), "boot fields survive");
         assert_eq!(stored.name.as_deref(), Some("general"));
+    }
+
+    #[tokio::test]
+    async fn set_notify_level_writes_slack_prefs_then_mirrors_them() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+
+        core.handle(Command::SetNotifyLevel {
+            channel: c1(),
+            level: crate::NotifyLevel::Mentions,
+        });
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        assert_eq!(
+            fake.notification_calls(),
+            vec![(c1(), "muted", "false"), (c1(), "desktop", "mention")]
+        );
+        let prefs = store
+            .lock()
+            .unwrap()
+            .prefs(&ws)
+            .unwrap()
+            .expect("prefs stored");
+        assert_eq!(
+            crate::notify_levels(&prefs).get(&c1()),
+            Some(&crate::NotifyLevel::Mentions)
+        );
     }
 
     #[tokio::test]

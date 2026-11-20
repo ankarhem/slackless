@@ -203,7 +203,7 @@ use gpui_kit::gpui::{
 use slackless_core::api::ConversationCounts;
 use slackless_core::platform::{self, BadgeSetter, Notifier};
 use slackless_core::types::{ChannelId, Conversation, ConversationKind, Message, Ts, UserId};
-use slackless_core::{Command, Event, SharedStore};
+use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
 use crate::actions::notify;
 use crate::avatars::conversation_avatar;
@@ -1117,6 +1117,55 @@ impl App {
                             cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
                         }),
                 )
+            })
+    }
+
+    /// The header bell: Slack's "Notify you about…" menu for this conversation, checked at
+    /// its current level; the icon is a crossed-out bell while muted.
+    fn notify_menu(
+        &self,
+        conversation: Option<&Conversation>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let channel = conversation.map(|c| c.id.clone());
+        let level = channel
+            .as_ref()
+            .and_then(|c| self.fixtures.notify_levels.get(c).copied())
+            .unwrap_or(NotifyLevel::Everything);
+        let icon = if level == NotifyLevel::Muted {
+            IconName::BellOff
+        } else {
+            IconName::Bell
+        };
+        Button::new("hdr-bell")
+            .ghost()
+            .with_size(Size::Small)
+            .icon(icon)
+            .disabled(channel.is_none())
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                menu = menu.label("Notify you about…");
+                for (choice, label) in [
+                    (NotifyLevel::Everything, "All new posts"),
+                    (NotifyLevel::Mentions, "Just mentions"),
+                    (NotifyLevel::Muted, "Mute and hide"),
+                ] {
+                    let (this, channel) = (this.clone(), channel.clone());
+                    menu = menu.item(PopupMenuItem::new(label).checked(choice == level).on_click(
+                        move |_, _, cx| {
+                            let Some(channel) = channel.clone() else {
+                                return;
+                            };
+                            let _ = this.update(cx, |app, _| {
+                                app.bridge.send(Command::SetNotifyLevel {
+                                    channel,
+                                    level: choice,
+                                })
+                            });
+                        },
+                    ));
+                }
+                menu
             })
     }
 
@@ -2264,12 +2313,7 @@ impl App {
                         .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx))),
                     )
                     .child(self.huddle_menu(cx))
-                    .child(chrome_icon(
-                        "hdr-bell",
-                        IconName::Bell,
-                        muted_foreground,
-                        accent,
-                    ))
+                    .child(self.notify_menu(conversation, cx))
                     .child(
                         chrome_icon("hdr-search", IconName::Search, muted_foreground, accent)
                             .on_click(cx.listener(|this, _, window, cx| {

@@ -14,7 +14,7 @@ slackless-platform.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

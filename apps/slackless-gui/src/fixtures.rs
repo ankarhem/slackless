@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::gpui::{Image, ImageSource, SharedString};
 
+use slackless_core::NotifyLevel;
 use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
 use slackless_core::store::Store;
@@ -59,6 +60,8 @@ pub struct Fixtures {
     pub directory: Vec<Conversation>,
     /// Last known presence per user (`presence_change` / `users.getPresence`).
     pub presence: PresenceMap,
+    /// Conversations whose notification level is not "All new posts" (the header bell).
+    pub notify_levels: HashMap<ChannelId, NotifyLevel>,
     /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
     pub thumbnails: HashMap<FileId, Arc<Image>>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
@@ -800,6 +803,7 @@ pub fn load() -> Fixtures {
         threads,
         directory,
         presence: Arc::new(RwLock::new(presence)),
+        notify_levels: HashMap::new(),
         thumbnails,
         profile_extras,
         custom_emoji,
@@ -926,6 +930,7 @@ pub fn live(
         threads: HashMap::new(),
         directory,
         presence: PresenceMap::default(),
+        notify_levels: slackless_core::notify_levels(&prefs),
         thumbnails: HashMap::new(),
         profile_extras: HashMap::new(),
         custom_emoji,

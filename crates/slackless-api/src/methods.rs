@@ -690,6 +690,25 @@ impl SlackApi {
     }
 
     /// `users.info`.
+    pub async fn users_prefs_set_notifications(
+        &self,
+        channel: &ChannelId,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
+        let params = vec![
+            ("name", name.to_owned()),
+            ("value", value.to_owned()),
+            ("channel_id", channel.to_string()),
+            // A per-channel override, as the web client sends it (`prefs-store`).
+            ("global", "false".to_owned()),
+            ("sync", "false".to_owned()),
+        ];
+        self.call::<Empty>(method::USERS_PREFS_SET_NOTIFICATIONS, params)
+            .await?;
+        Ok(())
+    }
+
     pub async fn users_info(&self, user: &UserId) -> Result<User> {
         let params = vec![("user", user.to_string())];
         Ok(self

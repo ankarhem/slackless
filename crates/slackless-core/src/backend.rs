@@ -52,6 +52,13 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// One per-channel notification pref (`users.prefs.setNotifications`, web client).
+    fn set_notification_pref(
+        &self,
+        channel: ChannelId,
+        name: &'static str,
+        value: &'static str,
+    ) -> impl Future<Output = api::Result<()>> + Send;
     /// A user's current presence (`users.getPresence`). Read-only.
     fn user_presence(&self, user: UserId)
     -> impl Future<Output = api::Result<UserPresence>> + Send;
@@ -152,6 +159,16 @@ impl Backend for SlackApi {
 
     async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
         self.conversations_leave(&channel).await
+    }
+
+    async fn set_notification_pref(
+        &self,
+        channel: ChannelId,
+        name: &'static str,
+        value: &'static str,
+    ) -> api::Result<()> {
+        self.users_prefs_set_notifications(&channel, name, value)
+            .await
     }
 
     async fn user_presence(&self, user: UserId) -> api::Result<UserPresence> {
