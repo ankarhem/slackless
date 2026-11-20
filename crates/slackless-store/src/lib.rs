@@ -23,7 +23,7 @@ mod store;
 
 pub use query::{Date, Has, SearchFilters, SearchQuery};
 pub use schema::SCHEMA_VERSION;
-pub use store::{Revision, Store, StoredMessage};
+pub use store::{MemberCounts, Revision, Store, StoredMessage};
 
 /// Store errors.
 #[derive(Debug, thiserror::Error)]

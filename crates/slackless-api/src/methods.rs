@@ -16,8 +16,8 @@ use crate::pagination::{Page, paginate};
 use crate::types::endpoints::method;
 use crate::types::{
     ApiResponse, Attachment, Block, BotId, ChannelId, ChannelSection, Conversation,
-    ConversationKind, DndStatus, Empty, File, Message, RichTextBlock, SectionKind, Team, TeamId,
-    Ts, User, UserId, UserPresence,
+    ConversationKind, DndStatus, Empty, File, Latest, Message, RichTextBlock, SectionKind, Team,
+    TeamId, Ts, User, UserId, UserPresence,
 };
 use crate::{Result, SlackApi};
 
@@ -466,6 +466,57 @@ struct MembersWire {
     members: Vec<User>,
 }
 
+/// `conversations.members` returns bare member ids.
+#[derive(Deserialize)]
+struct MemberIdsWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    members: Vec<UserId>,
+}
+
+/// `client.dms` answers one DMs-tab row per conversation: the `channel` object with the
+/// row's bare `latest` duplicated beside it.
+#[derive(Deserialize)]
+struct DmWire {
+    #[serde(default)]
+    id: ChannelId,
+    #[serde(default, deserialize_with = "or_default")]
+    latest: Option<Ts>,
+    #[serde(default, deserialize_with = "or_default")]
+    channel: Option<Conversation>,
+}
+
+impl DmWire {
+    /// The row's conversation: the nested object when Slack sent one, else the bare minimum
+    /// (`id` + `latest`) the row carries on its own.
+    fn into_conversation(self) -> Conversation {
+        let latest = self.latest.map(Latest::Ts);
+        match self.channel {
+            Some(mut conversation) => {
+                if conversation.id.as_str().is_empty() {
+                    conversation.id = self.id;
+                }
+                if conversation.latest.is_none() {
+                    conversation.latest = latest;
+                }
+                conversation
+            }
+            None => Conversation {
+                id: self.id,
+                latest,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DmsWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    ims: Vec<DmWire>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    mpims: Vec<DmWire>,
+}
+
 #[derive(Deserialize)]
 struct SearchWire {
     #[serde(default, deserialize_with = "or_default")]
@@ -562,6 +613,26 @@ fn kind_wire(kind: ConversationKind) -> &'static str {
     }
 }
 
+/// The shared `types`/`exclude_archived`/`limit`/`cursor` params of the conversation listing
+/// methods (`conversations.list`, `users.conversations`).
+fn listing_params(opts: &ListOpts, cursor: Option<String>) -> Params {
+    let mut params = Vec::new();
+    if !opts.kinds.is_empty() {
+        let kinds: Vec<_> = opts.kinds.iter().copied().map(kind_wire).collect();
+        params.push(("types", kinds.join(",")));
+    }
+    if opts.exclude_archived {
+        params.push(("exclude_archived", "true".to_owned()));
+    }
+    if let Some(limit) = opts.limit {
+        params.push(("limit", limit.to_string()));
+    }
+    if let Some(cursor) = cursor {
+        params.push(("cursor", cursor));
+    }
+    params
+}
+
 // ---------------------------------------------------------------------------------------------
 // Methods
 // ---------------------------------------------------------------------------------------------
@@ -576,6 +647,10 @@ impl SlackApi {
     pub async fn client_user_boot(&self) -> Result<UserBoot> {
         let params = vec![
             ("version_all_channels", "false".to_owned()),
+            // The official boot asks for every MPDM relevant to the sidebar; without it the
+            // boot channel list is capped and newer group DMs never arrive
+            // (docs/research/api-channels.md, "The boot channel list is not a directory").
+            ("return_all_relevant_mpdms", "true".to_owned()),
             ("omit_channels", "false".to_owned()),
             ("include_min_version_bump_check", "1".to_owned()),
             ("_x_reason", "initial-data".to_owned()),
@@ -588,6 +663,9 @@ impl SlackApi {
     pub async fn client_counts(&self) -> Result<ClientCounts> {
         let params = vec![
             ("thread_counts_by_channel", "true".to_owned()),
+            // As the official client asks: without it Slack leaves some joined conversations
+            // (e.g. Slack Connect channels) out, and the sidebar cannot list them.
+            ("include_all_unreads", "true".to_owned()),
             ("org_wide_aware", "true".to_owned()),
             ("include_file_channels", "true".to_owned()),
             (
@@ -673,29 +751,91 @@ impl SlackApi {
         opts: &ListOpts,
         cursor: Option<String>,
     ) -> Result<Page<Conversation>> {
-        let mut params = Vec::new();
-        if !opts.kinds.is_empty() {
-            let kinds: Vec<_> = opts.kinds.iter().copied().map(kind_wire).collect();
-            params.push(("types", kinds.join(",")));
-        }
-        if opts.exclude_archived {
-            params.push(("exclude_archived", "true".to_owned()));
-        }
-        if let Some(limit) = opts.limit {
-            params.push(("limit", limit.to_string()));
-        }
-        if let Some(cursor) = cursor {
-            params.push(("cursor", cursor));
-        }
+        let params = listing_params(opts, cursor);
         let resp = self
             .call::<ChannelsWire>(method::CONVERSATIONS_LIST, params)
             .await?;
         Ok(page(resp, |w| w.channels))
     }
 
+    /// One page of `users.conversations`: the conversations the signed-in user is a member
+    /// of. Reports no `is_open`, so it is no source for DM visibility.
+    pub async fn users_conversations(
+        &self,
+        opts: &ListOpts,
+        cursor: Option<String>,
+    ) -> Result<Page<Conversation>> {
+        let params = listing_params(opts, cursor);
+        let resp = self
+            .call::<ChannelsWire>(method::USERS_CONVERSATIONS, params)
+            .await?;
+        Ok(page(resp, |w| w.channels))
+    }
+
+    /// Every page of `users.conversations`.
+    pub async fn users_conversations_all(&self, opts: &ListOpts) -> Result<Vec<Conversation>> {
+        paginate(|cursor| self.users_conversations(opts, cursor))
+            .try_collect()
+            .await
+    }
+
     /// Every page of `conversations.list`.
     pub async fn conversations_list_all(&self, opts: &ListOpts) -> Result<Vec<Conversation>> {
         paginate(|cursor| self.conversations_list(opts, cursor))
+            .try_collect()
+            .await
+    }
+
+    /// One page of `conversations.members`: the conversation's member ids.
+    pub async fn conversations_members(
+        &self,
+        channel: &ChannelId,
+        cursor: Option<String>,
+    ) -> Result<Page<UserId>> {
+        let mut params = vec![("channel", channel.to_string())];
+        if let Some(cursor) = cursor {
+            params.push(("cursor", cursor));
+        }
+        let resp = self
+            .call::<MemberIdsWire>(method::CONVERSATIONS_MEMBERS, params)
+            .await?;
+        Ok(page(resp, |w| w.members))
+    }
+
+    /// Every page of `conversations.members`.
+    pub async fn conversations_members_all(&self, channel: &ChannelId) -> Result<Vec<UserId>> {
+        paginate(|cursor| self.conversations_members(channel, cursor))
+            .try_collect()
+            .await
+    }
+
+    /// One page of `client.dms`: the DMs-tab list (IMs and MPIMs) with per-DM `is_open`,
+    /// closed DMs included (docs/research/api-channels.md, `client.dms`).
+    pub async fn client_dms(&self, cursor: Option<String>) -> Result<Page<Conversation>> {
+        let mut params = vec![
+            ("count", "250".to_owned()),
+            ("include_closed", "true".to_owned()),
+            ("include_channel", "true".to_owned()),
+            ("_x_reason", "dms-tab-populate".to_owned()),
+        ];
+        if let Some(cursor) = cursor {
+            params.push(("cursor", cursor));
+        }
+        let resp = self.call::<DmsWire>(method::CLIENT_DMS, params).await?;
+        let next_cursor = resp.next_cursor().map(str::to_owned);
+        let items = resp
+            .data
+            .ims
+            .into_iter()
+            .chain(resp.data.mpims)
+            .map(DmWire::into_conversation)
+            .collect();
+        Ok(Page { items, next_cursor })
+    }
+
+    /// Every page of `client.dms`.
+    pub async fn client_dms_all(&self) -> Result<Vec<Conversation>> {
+        paginate(|cursor| self.client_dms(cursor))
             .try_collect()
             .await
     }

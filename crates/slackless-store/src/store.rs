@@ -12,7 +12,7 @@ use crate::query::{Has, SearchQuery};
 use crate::schema;
 use crate::types::{
     ChannelId, ChannelSection, Conversation, ConversationKind, Message, MessageSubtype, Team,
-    TeamId, Ts, User,
+    TeamId, Ts, User, UserId,
 };
 
 /// A message as the store currently renders it.
@@ -23,6 +23,16 @@ pub struct StoredMessage {
     pub message: Message,
     /// Slack deleted the message; render a tombstone (the content is kept locally).
     pub deleted: bool,
+}
+
+/// Human and app members of a conversation, as Slack's header counts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemberCounts {
+    /// Human members: neither bots nor deactivated people (and not `USLACKBOT`). A member
+    /// with no stored profile counts as a human whose identity is merely unknown.
+    pub humans: u32,
+    /// App/bot members that are still active (not deactivated, not `USLACKBOT`).
+    pub apps: u32,
 }
 
 /// One entry of a message's append-only revision log.
@@ -454,6 +464,220 @@ impl Store {
         collect(rows)
     }
 
+    /// Each of `channels`' newest channel-level message (roots, plain messages and thread
+    /// broadcasts; replies excluded), in one query: the DM list's previews, stamps and order
+    /// without loading histories. Deleted messages are included as tombstones; channels
+    /// with nothing stored are absent.
+    pub fn latest_messages(
+        &self,
+        workspace: &TeamId,
+        channels: &[ChannelId],
+    ) -> Result<HashMap<ChannelId, StoredMessage>> {
+        if channels.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // The bare `?`s continue the numbering `?1` starts, so the fixed parameters come
+        // before the IN list in the SQL text and in `args` alike.
+        let sql = format!(
+            "SELECT channel_id, json, deleted FROM (
+                 SELECT channel_id, json, deleted,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY channel_id ORDER BY ts_key DESC) AS newest
+                 FROM message_current
+                 WHERE workspace_id = ?1
+                   AND (thread_ts IS NULL OR thread_ts = ts OR subtype = ?)
+                   AND deleted = 0
+                   AND channel_id IN ({slots}))
+             WHERE newest = 1",
+            slots = vec!["?"; channels.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(channels.len() + 2);
+        args.push(SqlValue::Text(workspace.as_str().to_owned()));
+        args.push(SqlValue::Text(
+            MessageSubtype::ThreadBroadcast.as_str().to_owned(),
+        ));
+        args.extend(
+            channels
+                .iter()
+                .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), raw_row)?;
+        Ok(collect(rows)?
+            .into_iter()
+            .map(|stored| (stored.channel.clone(), stored))
+            .collect())
+    }
+
+    /// Which of `channels` have at least one stored message, deleted ones included: the
+    /// DM-list preview backfill fetches only the conversations this leaves out.
+    pub fn channels_with_messages(
+        &self,
+        workspace: &TeamId,
+        channels: &[ChannelId],
+    ) -> Result<HashSet<ChannelId>> {
+        if channels.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let sql = format!(
+            "SELECT DISTINCT channel_id FROM message_current
+             WHERE workspace_id = ?1 AND channel_id IN ({})",
+            vec!["?"; channels.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(channels.len() + 1);
+        args.push(SqlValue::Text(workspace.as_str().to_owned()));
+        args.extend(
+            channels
+                .iter()
+                .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+            .into_iter()
+            .map(ChannelId::from)
+            .collect())
+    }
+
+    /// Splits `members` into Slack's header counts (see [`MemberCounts`]). The workspace's
+    /// built-in `USLACKBOT` is neither a human nor an app; a deactivated member is neither.
+    pub fn member_counts(&self, workspace: &TeamId, members: &[UserId]) -> Result<MemberCounts> {
+        /// Slack's built-in workspace bot.
+        const USLACKBOT: &str = "USLACKBOT";
+        let ask: Vec<&UserId> = members
+            .iter()
+            .filter(|id| id.as_str() != USLACKBOT)
+            .collect();
+        let mut counts = MemberCounts {
+            humans: ask.len() as u32,
+            apps: 0,
+        };
+        if ask.is_empty() {
+            return Ok(counts);
+        }
+        // Everyone starts as a human (unknown identities included); the stored profiles then
+        // re-classify the bots and drop the deactivated.
+        let sql = format!(
+            r#"SELECT id, is_bot, deleted FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
+            vec!["?"; ask.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(ask.len() + 1);
+        args.push(SqlValue::Text(workspace.as_str().to_owned()));
+        args.extend(ask.iter().map(|id| SqlValue::Text(id.as_str().to_owned())));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (_, is_bot, deleted) = row?;
+            if deleted {
+                counts.humans -= 1;
+            } else if is_bot {
+                counts.humans -= 1;
+                counts.apps += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Which of `channels` are stored with `is_member = 1` (one query): the boot hydrate
+    /// preserves these flags, because `client.userBoot` objects omit `is_member` and the
+    /// membership sync (`users.conversations`) only runs after them.
+    pub fn member_flags(
+        &self,
+        workspace: &TeamId,
+        channels: &[ChannelId],
+    ) -> Result<HashSet<ChannelId>> {
+        if channels.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let sql = format!(
+            "SELECT id FROM conversation
+             WHERE workspace_id = ?1 AND is_member = 1 AND id IN ({})",
+            vec!["?"; channels.len()].join(", ")
+        );
+        let mut args = Vec::with_capacity(channels.len() + 1);
+        args.push(SqlValue::Text(workspace.as_str().to_owned()));
+        args.extend(
+            channels
+                .iter()
+                .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<HashSet<_>>>()?
+            .into_iter()
+            .map(ChannelId::from)
+            .collect())
+    }
+
+    /// Records the signed-in user's channel memberships (`users.conversations`): the ids in
+    /// `members` become `is_member = 1`, every other stored public/private channel `0`, the
+    /// `json` copy of the flag included. One transaction; rows that already agree are not
+    /// rewritten. Returns the ids whose flag flipped, in both directions, so callers announce
+    /// exactly the changed rows. IM/MPIM rows are never touched: their flag is not channel
+    /// membership.
+    pub fn set_channel_memberships(
+        &mut self,
+        workspace: &TeamId,
+        members: &[ChannelId],
+    ) -> Result<Vec<ChannelId>> {
+        /// Only channel rows carry a membership flag worth syncing.
+        const CHANNEL_KINDS: &str = "('public_channel', 'private_channel')";
+        let mut flipped = Vec::new();
+        let tx = self.conn.transaction()?;
+        if !members.is_empty() {
+            let sql = format!(
+                "UPDATE conversation
+                 SET is_member = 1, json = json_set(json, '$.is_member', json('true')),
+                     updated_at = ?1
+                 WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 0
+                   AND id IN ({}) RETURNING id",
+                vec!["?"; members.len()].join(", ")
+            );
+            let mut args = vec![
+                SqlValue::Integer(now_secs()),
+                SqlValue::Text(workspace.as_str().to_owned()),
+            ];
+            args.extend(
+                members
+                    .iter()
+                    .map(|id| SqlValue::Text(id.as_str().to_owned())),
+            );
+            flipped.extend(flipping(&tx, &sql, args)?);
+        }
+        let left_out = if !members.is_empty() {
+            format!(" AND id NOT IN ({})", vec!["?"; members.len()].join(", "))
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "UPDATE conversation
+             SET is_member = 0, json = json_set(json, '$.is_member', json('false')),
+                 updated_at = ?1
+             WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 1{left_out}
+             RETURNING id"
+        );
+        let mut args = vec![
+            SqlValue::Integer(now_secs()),
+            SqlValue::Text(workspace.as_str().to_owned()),
+        ];
+        args.extend(
+            members
+                .iter()
+                .map(|id| SqlValue::Text(id.as_str().to_owned())),
+        );
+        flipped.extend(flipping(&tx, &sql, args)?);
+        tx.commit()?;
+        Ok(flipped)
+    }
+
     /// A thread's root and replies, oldest first.
     pub fn thread_replies(
         &self,
@@ -749,6 +973,17 @@ fn write_current(
 
 type RawRow = (String, String, bool);
 
+/// Runs one membership `UPDATE ... RETURNING id`, collecting the flipped ids.
+fn flipping(tx: &Transaction<'_>, sql: &str, args: Vec<SqlValue>) -> Result<Vec<ChannelId>> {
+    let mut stmt = tx.prepare(sql)?;
+    let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(ChannelId::from)
+        .collect())
+}
+
 fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
 }
@@ -1018,6 +1253,217 @@ mod tests {
             store.revisions(&ws(), &general(), &first.ts).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn latest_messages_picks_each_channels_newest_top_level() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (dm1, dm2) = (ChannelId::from("D1"), ChannelId::from("D2"));
+        let older = msg("1700000000.000100", "U1", "older");
+        let newest = msg("1700000002.000200", "U2", "newest");
+        let mut reply = msg("1700000003.000300", "U1", "in thread");
+        reply.thread_ts = Some(newest.ts.clone());
+        for m in [&older, &newest, &reply] {
+            store.upsert_message(&ws(), &dm1, m).unwrap();
+        }
+        store
+            .upsert_message(&ws(), &dm2, &msg("1700000001.000100", "U2", "other dm"))
+            .unwrap();
+        // Another workspace's message must not leak into the batch.
+        store
+            .upsert_message(
+                &TeamId::from("T2"),
+                &dm1,
+                &msg("1800000000.000000", "U1", "elsewhere"),
+            )
+            .unwrap();
+
+        let latest = store
+            .latest_messages(&ws(), &[dm1.clone(), dm2.clone(), ChannelId::from("D3")])
+            .unwrap();
+        assert_eq!(
+            latest.len(),
+            2,
+            "only the asked channels; empty D3 stays absent"
+        );
+        assert_eq!(
+            latest[&dm1].message.text, "newest",
+            "a reply is not top-level"
+        );
+        assert!(!latest[&dm1].deleted);
+        assert_eq!(latest[&dm1].message.channel, Some(dm1.clone()));
+        assert_eq!(latest[&dm2].message.text, "other dm");
+
+        // A deleted message is never the latest: dm2's only message gone, it has none.
+        store
+            .record_deletion(&ws(), &dm2, &Ts::from("1700000001.000100"), None, None)
+            .unwrap();
+        let latest = store
+            .latest_messages(&ws(), &[dm1.clone(), dm2.clone()])
+            .unwrap();
+        assert!(!latest.contains_key(&dm2));
+        assert!(latest.contains_key(&dm1));
+
+        assert!(store.latest_messages(&ws(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn member_counts_split_humans_apps_and_drop_the_gone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let user = |id: &str, bot: bool, deleted: bool| User {
+            id: UserId::from(id),
+            is_bot: bot,
+            deleted,
+            ..Default::default()
+        };
+        store.upsert_user(&ws(), &user("U1", false, false)).unwrap();
+        store
+            .upsert_user(&ws(), &user("UBOT", true, false))
+            .unwrap();
+        store
+            .upsert_user(&ws(), &user("UDEADBOT", true, true))
+            .unwrap();
+        store
+            .upsert_user(&ws(), &user("UGONE", false, true))
+            .unwrap();
+
+        let members = [
+            "U1",
+            "UBOT",
+            "UDEADBOT",
+            "UGONE",
+            // No stored profile: an unknown person is still a person.
+            "UEXT",
+            // The workspace bot is neither a human nor an app.
+            "USLACKBOT",
+        ]
+        .map(UserId::from)
+        .to_vec();
+
+        assert_eq!(
+            store.member_counts(&ws(), &members).unwrap(),
+            MemberCounts { humans: 2, apps: 1 }
+        );
+        // Another workspace's profiles never leak in: everyone is an unknown human there.
+        assert_eq!(
+            store.member_counts(&TeamId::from("T2"), &members).unwrap(),
+            MemberCounts { humans: 5, apps: 0 }
+        );
+        assert_eq!(
+            store
+                .member_counts(&ws(), &[UserId::from("USLACKBOT")])
+                .unwrap(),
+            MemberCounts::default()
+        );
+    }
+
+    #[test]
+    fn channels_with_messages_counts_deleted_ones_as_stored() {
+        let mut store = Store::open_in_memory().unwrap();
+        let dm1 = ChannelId::from("D1");
+        store
+            .upsert_message(&ws(), &dm1, &msg("1700000000.000100", "U1", "only one"))
+            .unwrap();
+        let dm2 = ChannelId::from("D2");
+        store
+            .upsert_message(&ws(), &dm2, &msg("1700000001.000100", "U1", "soon gone"))
+            .unwrap();
+        store
+            .record_deletion(&ws(), &dm2, &Ts::from("1700000001.000100"), None, None)
+            .unwrap();
+
+        let asked = [dm1.clone(), dm2.clone(), ChannelId::from("D3")];
+        assert_eq!(
+            store.channels_with_messages(&ws(), &asked).unwrap(),
+            [dm1, dm2].into_iter().collect(),
+            "D2's deleted message still means its history was fetched once"
+        );
+        assert!(store.channels_with_messages(&ws(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_channel_memberships_flips_channel_rows_only_and_only_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        let channel = |id: &str, member: bool, private: bool| Conversation {
+            id: ChannelId::from(id),
+            is_channel: !private,
+            is_private: private,
+            is_member: member,
+            ..Default::default()
+        };
+        store
+            .upsert_conversation(&ws(), &channel("C1", false, false))
+            .unwrap();
+        store
+            .upsert_conversation(&ws(), &channel("C2", true, false))
+            .unwrap();
+        store
+            .upsert_conversation(&ws(), &channel("C3", true, true))
+            .unwrap();
+        store
+            .upsert_conversation(
+                &ws(),
+                &Conversation {
+                    id: ChannelId::from("M1"),
+                    is_mpim: true,
+                    is_member: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut flipped = store
+            .set_channel_memberships(&ws(), &[ChannelId::from("C1")])
+            .unwrap();
+        flipped.sort();
+        assert_eq!(
+            flipped,
+            vec![
+                ChannelId::from("C1"),
+                ChannelId::from("C2"),
+                ChannelId::from("C3"),
+            ],
+            "joiner up, both leavers down"
+        );
+        let read = |store: &Store, id: &str| {
+            store
+                .conversation(&ws(), &ChannelId::from(id))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} stored"))
+        };
+        assert!(
+            read(&store, "C1").is_member,
+            "the json copy follows the column"
+        );
+        assert!(!read(&store, "C2").is_member);
+        assert!(!read(&store, "C3").is_member);
+        assert!(read(&store, "M1").is_member, "group DM rows are untouched");
+
+        // An unchanged pass rewrites nothing: no flips, not even updated_at.
+        let stamps = |store: &Store| -> Vec<(String, i64)> {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT id, updated_at FROM conversation ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let before = stamps(&store);
+        assert!(
+            store
+                .set_channel_memberships(&ws(), &[ChannelId::from("C1")])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(stamps(&store), before, "no churn when nothing flips");
+
+        // An empty membership list resets every channel row.
+        let flipped = store.set_channel_memberships(&ws(), &[]).unwrap();
+        assert_eq!(flipped, vec![ChannelId::from("C1")]);
+        assert!(!read(&store, "C1").is_member);
+        assert!(read(&store, "M1").is_member);
     }
 
     #[test]
