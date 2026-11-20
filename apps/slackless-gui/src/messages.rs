@@ -831,11 +831,7 @@ fn transcript_row(
             cx,
         ));
     } else {
-        let kcx = KitCx {
-            fixtures,
-            kit: Some(&store.kit),
-            ts: &message.ts,
-        };
+        let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts);
         let broadcast_root = message
             .root
             .as_deref()
@@ -1020,11 +1016,7 @@ pub fn message_row(
 ) -> Div {
     let author_key = author_key(message);
     let author = author_name(message, fixtures);
-    let kcx = KitCx {
-        fixtures,
-        kit: None,
-        ts: &message.ts,
-    };
+    let kcx = KitCx::new(fixtures, None, &message.ts);
     let mut body = v_flex()
         .flex_1()
         .min_w_0()
@@ -1271,10 +1263,12 @@ struct RunTheme {
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
     /// within its message (GPUI keys interaction and accessibility state by the id path).
     paragraphs: Cell<usize>,
+    /// The message this render belongs to; text ids are also unique across messages.
+    key: SharedString,
 }
 
 impl RunTheme {
-    fn from_app(cx: &App) -> Self {
+    fn from_app(cx: &App, key: SharedString) -> Self {
         let theme = cx.theme();
         let base_font = Font {
             family: theme.font_family.clone(),
@@ -1294,6 +1288,7 @@ impl RunTheme {
             code_fg: crate::theme::code_foreground(cx),
             base_font,
             paragraphs: Cell::new(0),
+            key,
         }
     }
 
@@ -1473,7 +1468,7 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
             Segment::Text { text, runs, links } => {
                 let mut hasher = DefaultHasher::new();
                 text.hash(&mut hasher);
-                let id = format!("text-{paragraph}-{n}-{:x}", hasher.finish());
+                let id = format!("text-{}-{paragraph}-{n}-{:x}", theme.key, hasher.finish());
                 let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
                 let styled = StyledText::new(text).with_runs(runs);
                 InteractiveText::new(SharedString::from(id), styled)
@@ -1798,6 +1793,7 @@ fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
             kcx.fixtures,
             false,
             inline_edited,
+            kcx.text_key(),
             cx,
         ));
     }
@@ -1821,7 +1817,7 @@ pub(crate) fn render_block(
         Block::RichText(rich) => render_containers(
             &rich.elements,
             kcx.fixtures,
-            &RunTheme::from_app(cx),
+            &RunTheme::from_app(cx, kcx.text_key().into()),
             edited,
         ),
         Block::Unknown { r#type, raw } => blockkit::block(r#type, raw, ix, kcx, cx)
@@ -1835,8 +1831,15 @@ pub(crate) fn render_block(
 /// `<!here>` chips, `<url|label>` links and `:emoji:` (custom emoji as images). `muted`
 /// renders plain runs in the muted color (Block Kit context blocks). Unknown markup stays
 /// literal.
-pub(crate) fn mrkdwn(text: &str, fixtures: &Fixtures, muted: bool, edited: bool, cx: &App) -> Div {
-    let mut theme = RunTheme::from_app(cx);
+pub(crate) fn mrkdwn(
+    text: &str,
+    fixtures: &Fixtures,
+    muted: bool,
+    edited: bool,
+    key: String,
+    cx: &App,
+) -> Div {
+    let mut theme = RunTheme::from_app(cx, key.into());
     if muted {
         theme.foreground = theme.muted;
     }

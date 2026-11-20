@@ -64,6 +64,27 @@ pub struct KitCx<'a> {
     /// Interactive state; `None` renders controls from the payload's initial values only.
     pub kit: Option<&'a Entity<BlockKitState>>,
     pub ts: &'a Ts,
+    /// Keys handed to inline text renderers, so their element ids stay unique across the
+    /// blocks and attachments of one message (GPUI keys a11y nodes by id alone).
+    keys: std::cell::Cell<usize>,
+}
+
+impl<'a> KitCx<'a> {
+    pub fn new(fixtures: &'a Fixtures, kit: Option<&'a Entity<BlockKitState>>, ts: &'a Ts) -> Self {
+        Self {
+            fixtures,
+            kit,
+            ts,
+            keys: std::cell::Cell::new(0),
+        }
+    }
+
+    /// A fresh text-element key for this message.
+    pub fn text_key(&self) -> String {
+        let n = self.keys.get();
+        self.keys.set(n + 1);
+        format!("{}-t{n}", self.ts.as_str())
+    }
 }
 
 /// Stable key of a control: message ts, block id (or index), action id (or index).
@@ -146,7 +167,10 @@ fn text_of(object: &Json) -> Option<&str> {
 fn text_object(object: &Json, kcx: &KitCx, muted: bool, cx: &App) -> Option<AnyElement> {
     let text = text_of(object)?;
     if object["type"].as_str() == Some("mrkdwn") {
-        return Some(messages::mrkdwn(text, kcx.fixtures, muted, false, cx).into_any_element());
+        return Some(
+            messages::mrkdwn(text, kcx.fixtures, muted, false, kcx.text_key(), cx)
+                .into_any_element(),
+        );
     }
     Some(
         div()
@@ -726,7 +750,14 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         });
     }
     if let Some(text) = &attachment.text {
-        body = body.child(messages::mrkdwn(text, fixtures, false, false, cx));
+        body = body.child(messages::mrkdwn(
+            text,
+            fixtures,
+            false,
+            false,
+            kcx.text_key(),
+            cx,
+        ));
     }
     // Short fields pair up in two columns; long fields take a full row.
     let mut fields = attachment.fields.iter().peekable();
@@ -744,7 +775,14 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                     )
                 })
                 .when_some(field.value.as_deref(), |cell, value| {
-                    cell.child(messages::mrkdwn(value, fixtures, false, false, cx))
+                    cell.child(messages::mrkdwn(
+                        value,
+                        fixtures,
+                        false,
+                        false,
+                        kcx.text_key(),
+                        cx,
+                    ))
                 })
         };
         let mut row = h_flex().items_start().gap_4().child(cell(field));
@@ -756,11 +794,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         body = body.child(row);
     }
     let block_ts = Ts::new(format!("{}-att{n}", kcx.ts.as_str()));
-    let nested = KitCx {
-        fixtures,
-        kit: kcx.kit,
-        ts: &block_ts,
-    };
+    let nested = KitCx::new(fixtures, kcx.kit, &block_ts);
     for (ix, nested_block) in attachment.blocks.iter().enumerate() {
         body = body.children(messages::render_block(nested_block, ix, &nested, false, cx));
     }
@@ -790,7 +824,14 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         .gap_1()
         .min_w_0()
         .when_some(attachment.pretext.as_deref(), |card, pretext| {
-            card.child(messages::mrkdwn(pretext, fixtures, false, false, cx))
+            card.child(messages::mrkdwn(
+                pretext,
+                fixtures,
+                false,
+                false,
+                kcx.text_key(),
+                cx,
+            ))
         })
         .child(
             h_flex()
