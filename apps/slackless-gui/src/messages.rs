@@ -491,6 +491,22 @@ impl MessageList {
         }
     }
 
+    /// Slack's Up arrow in an empty composer: edit the signed-in user's newest message here.
+    pub fn edit_last_own(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = self.fixtures.self_user.clone();
+        let newest = self
+            .data
+            .read(cx)
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.user.as_ref() == Some(&me))
+            .map(|message| message.ts.clone());
+        if let Some(ts) = newest {
+            self.begin_edit(&ts, window, cx);
+        }
+    }
+
     /// The date divider's "Jump to…": scroll to the newest message, or to the first message
     /// at or after a point in time, asking the root to page older history in first when the
     /// loaded window starts after it.

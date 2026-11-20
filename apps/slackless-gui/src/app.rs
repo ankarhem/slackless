@@ -490,7 +490,9 @@ impl App {
                         }
                         // The message list has no way in to start an edit from outside yet;
                         // the thread panel handles this for its own composer.
-                        ComposerEvent::EditLast => {}
+                        ComposerEvent::EditLast => this
+                            .messages
+                            .update(cx, |list, cx| list.edit_last_own(window, cx)),
                         ComposerEvent::SlashCommand(invocation) => {
                             this.run_slash(invocation, window, cx);
                         }
