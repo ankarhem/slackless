@@ -41,6 +41,7 @@ mod pins;
 mod preferences;
 mod profile;
 mod search;
+mod search_menu;
 mod shortcuts;
 mod sidebar;
 mod sidebar_menu;
@@ -59,7 +60,8 @@ mod thumbnail;
 use std::sync::Arc;
 
 use gpui_kit::assets::AllAssets;
-use gpui_kit::gpui::{WindowBounds, WindowOptions, px, size};
+use gpui_kit::component::TitleBar;
+use gpui_kit::gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 use gpui_kit::open_window;
 
 use crate::app::App;
@@ -84,12 +86,38 @@ fn main() {
             theme::activate_with(appearance.theme, appearance.palette, cx);
         }
         let fixtures = Arc::new(fixtures);
+        // Like Slack, the window fills the screen on first launch and later reopens with the
+        // frame it was left in (`App` saves it as it changes). A saved frame is restored onto a
+        // plain window: restoring onto a zoomed one lets AppKit's zoom state skew the frame.
+        // The traffic lights sit inside the 40px top bar, vertically centred, as in Slack's.
+        let saved_frame = bridge.window_state();
+        let default_bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1200.), px(800.)), cx)),
-            ..Default::default()
+            window_bounds: Some(if saved_frame.is_some() {
+                WindowBounds::Windowed(default_bounds)
+            } else {
+                WindowBounds::Maximized(default_bounds)
+            }),
+            titlebar: Some(TitlebarOptions {
+                traffic_light_position: Some(point(px(8.), px(12.))),
+                ..TitleBar::title_bar_options()
+            }),
+            // A restored window stays hidden until its saved frame is applied (below).
+            show: saved_frame.is_none(),
+            ..TitleBar::window_options()
         };
 
         open_window(window_options, cx, move |window, cx| {
+            if let Some(state) = saved_frame {
+                // Restore once the window is built, then re-read its size: AppKit's resize
+                // notification can miss GPUI (the viewport would keep the 1200x800 default and
+                // the rest stay black until the next input).
+                window.defer(cx, move |window, cx| {
+                    window.restore_native_window_state(&state);
+                    window.bounds_changed(cx);
+                    window.activate_window();
+                });
+            }
             App::new(fixtures.clone(), bridge, window, cx)
         })
         .expect("Failed to open window");

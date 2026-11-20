@@ -1,11 +1,12 @@
 //! File attachments under a message body: image thumbnails rendered from in-memory bytes
-//! (gpui-kit-guide section 9) and Slack-style file cards (type tile, name, type and size).
-//! Images whose thumbnail has not been decoded yet fall back to a file card.
+//! (gpui-kit-guide section 9) or, live, loaded from Slack's thumbnail URL through the app's
+//! HTTP client, and Slack-style file cards (type tile, name, type and size) for the rest.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
-    App, Div, FontWeight, Hsla, ImageSource, ParentElement as _, Styled as _, div, img, px,
+    App, Div, FontWeight, Hsla, ImageSource, ParentElement as _, SharedString, Styled as _, div,
+    img, px,
 };
 use slackless_core::types::{File, Message};
 
@@ -23,15 +24,34 @@ pub fn attachments(fixtures: &Fixtures, message: &Message, cx: &App) -> Option<D
     }
     let mut column = v_flex().gap_2().pt_1();
     for file in &message.files {
-        column = column.child(match fixtures.thumbnails.get(&file.id) {
-            Some(image) => image_attachment(file, image.clone(), cx),
+        let thumbnail = match fixtures.thumbnails.get(&file.id) {
+            Some(image) => Some(ImageSource::Image(image.clone())),
+            None => remote_thumbnail(file).map(|url| ImageSource::from(SharedString::from(url))),
+        };
+        column = column.child(match thumbnail {
+            Some(source) => image_attachment(file, source, cx),
             None => file_card(file, cx),
         });
     }
     Some(column)
 }
 
-fn image_attachment(file: &File, image: std::sync::Arc<gpui_kit::gpui::Image>, cx: &App) -> Div {
+/// A live image's thumbnail URL, sized for the inline preview on a 2x display.
+fn remote_thumbnail(file: &File) -> Option<String> {
+    if !file
+        .mimetype
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("image/"))
+    {
+        return None;
+    }
+    file.thumb_480
+        .clone()
+        .or_else(|| file.thumb_360.clone())
+        .or_else(|| file.thumb_720.clone())
+}
+
+fn image_attachment(file: &File, image: ImageSource, cx: &App) -> Div {
     let theme = cx.theme();
     let (w, h) = fit(file.original_w, file.original_h);
     v_flex()
@@ -57,7 +77,7 @@ fn image_attachment(file: &File, image: std::sync::Arc<gpui_kit::gpui::Image>, c
                 .overflow_hidden()
                 .border_1()
                 .border_color(theme.border)
-                .child(img(ImageSource::Image(image)).size_full()),
+                .child(img(image).size_full()),
         )
 }
 

@@ -15,11 +15,12 @@
 //! Each view supplies an [`ActionHandler`] that maps a [`MessageAction`] onto its own state.
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
@@ -302,8 +303,7 @@ pub fn reaction_chips(
         return None;
     }
     let theme = cx.theme();
-    let (accent, link, secondary, secondary_hover, muted) = (
-        theme.accent,
+    let (link, secondary, secondary_hover, muted) = (
         theme.link,
         theme.secondary,
         theme.secondary_hover,
@@ -321,10 +321,11 @@ pub fn reaction_chips(
             .gap_1()
             .px_1p5()
             .py_0p5()
-            .rounded_md()
+            // Slack's pill: blue-washed and outlined when it includes you, gray otherwise.
+            .rounded_full()
             .text_xs()
             .when(mine, |chip| {
-                chip.border_1().border_color(link).bg(accent.opacity(0.15))
+                chip.border_1().border_color(link).bg(link.opacity(0.1))
             })
             .when(!mine, |chip| {
                 chip.bg(secondary).hover(|chip| chip.bg(secondary_hover))
@@ -345,14 +346,16 @@ pub fn reaction_chips(
     }
     if let Some(handler) = handler.cloned() {
         row = row.child(
-            Button::new(SharedString::from(format!("{key}-reaction-add")))
-                .ghost()
-                .with_size(Size::XSmall)
-                .icon(IconName::FaceSlightlySmilingPlus)
-                .tooltip("Add reaction")
-                .on_click(move |event, window, cx| {
-                    handler(MessageAction::PickReaction(event.position()), window, cx);
-                }),
+            div().rounded_full().bg(secondary).child(
+                Button::new(SharedString::from(format!("{key}-reaction-add")))
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::FaceSlightlySmilingPlus)
+                    .tooltip("Add reaction")
+                    .on_click(move |event, window, cx| {
+                        handler(MessageAction::PickReaction(event.position()), window, cx);
+                    }),
+            ),
         );
     }
     Some(row)
@@ -470,41 +473,109 @@ pub fn permalink(fixtures: &Fixtures, channel: &ChannelId, ts: &Ts) -> String {
     )
 }
 
-/// Toggle `me`'s `name` reaction on `message`; an emptied aggregate is removed.
-pub fn toggle_reaction(message: &mut Message, me: &UserId, name: &str) {
+/// Toggle `me`'s `name` reaction on `message`; an emptied aggregate is removed. Returns
+/// whether `me` has the reaction afterwards.
+pub fn toggle_reaction(message: &mut Message, me: &UserId, name: &str) -> bool {
     match message.reactions.iter().position(|r| r.name == name) {
         Some(index) => {
             let reaction = &mut message.reactions[index];
-            match reaction.users.iter().position(|user| user == me) {
+            let reacted = match reaction.users.iter().position(|user| user == me) {
                 Some(position) => {
                     reaction.users.remove(position);
+                    false
                 }
-                None => reaction.users.push(me.clone()),
-            }
+                None => {
+                    reaction.users.push(me.clone());
+                    true
+                }
+            };
             reaction.count = reaction.users.len() as u32;
             if reaction.count == 0 {
                 message.reactions.remove(index);
             }
+            reacted
         }
         None => add_reaction(message, me, name),
     }
 }
 
-/// Add `me`'s `name` reaction unless it is already there.
-pub fn add_reaction(message: &mut Message, me: &UserId, name: &str) {
+/// Add `me`'s `name` reaction unless it is already there; returns whether it was added.
+pub fn add_reaction(message: &mut Message, me: &UserId, name: &str) -> bool {
     match message.reactions.iter_mut().find(|r| r.name == name) {
         Some(reaction) => {
-            if !reaction.users.contains(me) {
+            let added = !reaction.users.contains(me);
+            if added {
                 reaction.users.push(me.clone());
             }
             reaction.count = reaction.users.len() as u32;
+            added
         }
-        None => message.reactions.push(Reaction {
-            name: name.to_owned(),
-            count: 1,
-            users: vec![me.clone()],
-        }),
+        None => {
+            message.reactions.push(Reaction {
+                name: name.to_owned(),
+                count: 1,
+                users: vec![me.clone()],
+            });
+            true
+        }
     }
+}
+
+/// Slack's "Delete message" confirmation, previewing `message`; `delete` runs only when the
+/// user picks Delete.
+pub fn confirm_delete(
+    message: Message,
+    fixtures: Arc<Fixtures>,
+    window: &mut Window,
+    cx: &mut App,
+    delete: impl Fn(&mut App) + 'static,
+) {
+    let delete = Rc::new(delete);
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let delete = delete.clone();
+        let preview = div()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(crate::messages::message_row(&fixtures, &message, None, cx));
+        alert
+            // Slack seats it in the middle of the window, the message shown under the question.
+            .centered()
+            .width(px(520.))
+            .title("Delete message")
+            .description(
+                v_flex()
+                    .gap_3()
+                    .child("Are you sure you want to delete this message? This cannot be undone.")
+                    .child(preview),
+            )
+            .show_cancel(true)
+            .ok_text("Delete")
+            .ok_variant(ButtonVariant::Danger)
+            .on_ok(move |_, _, cx| {
+                delete(cx);
+                true
+            })
+    });
+}
+
+/// A change the user made to a message, already shown by the view that made it, which the
+/// root must post to Slack (reactions, edits and deletions are not local-only in live mode).
+pub enum MessageChange {
+    /// `add`: the user's `name` reaction was added (else removed).
+    React {
+        ts: Ts,
+        name: String,
+        add: bool,
+    },
+    Edit {
+        ts: Ts,
+        text: String,
+    },
+    Delete {
+        ts: Ts,
+    },
 }
 
 /// Apply a local edit: new text (re-rendered as one plain rich-text block, as the web client

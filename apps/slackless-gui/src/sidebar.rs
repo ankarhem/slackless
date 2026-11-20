@@ -3,8 +3,10 @@
 //! mention count pills (gpui-kit-guide section 3). Counts are derived from the fixture
 //! history so fixture mode renders exactly what live mode will feed it.
 //!
-//! The rail's DMs and Activity destinations swap the list for the DM inbox (every DM with its
-//! presence/group avatar, last message and time) and the [`ActivityFeed`] (mentions,
+//! The rail's DMs and Activity destinations swap the list for the DM inbox (a "Direct
+//! messages" header with Slack's Unreads filter toggle and a "Find a DM…" field over every
+//! DM with its presence/group avatar, bold name, relative stamp and latest-message preview)
+//! and the [`ActivityFeed`] (mentions,
 //! reactions and thread replies with read state); Home shows the Unreads, Threads, Huddles,
 //! Drafts & sent, Saved and Directories rows above the sections and an "Add channels" row that asks the root to open the
 //! channel browser. [`Sidebar::badge_count`] is the dock badge: unread activity plus unread
@@ -24,7 +26,10 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
@@ -153,6 +158,19 @@ pub struct Sidebar {
     find: Entity<TextareaState>,
     /// The "Find a conversation…" query, trimmed and lowercased; empty lists everything.
     find_query: String,
+    /// The DM list's "Find a DM…" field.
+    dm_find: Entity<TextareaState>,
+    /// The DM list's "Find a DM…" query, trimmed and lowercased; empty lists every DM.
+    dm_find_query: String,
+    /// Live mode: DMs' newest messages read from the store since the last snapshot (a send,
+    /// an arrival, an edit or a deletion), fresher than the snapshot's `latest`; `None`: the
+    /// DM has no message left.
+    fresh_latest: HashMap<ChannelId, Option<Message>>,
+    /// Slack's thread state (`client.counts`): whether followed threads have unread replies,
+    /// and how many of those mention you.
+    threads_unread: (bool, u32),
+    /// The DM list's "Unreads" toggle: only DMs with unread messages.
+    dm_unreads_only: bool,
     /// Channels joined from the channel browser this session, listed after the fixtures'.
     joined: Vec<Conversation>,
     /// The conversation with a live huddle; its row carries the headphones indicator.
@@ -195,6 +213,11 @@ impl Sidebar {
                     .placeholder("Find a conversation…")
                     .auto_grow(1, 1)
             });
+            let dm_find = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Find a DM…")
+                    .auto_grow(1, 1)
+            });
             let activity = ActivityFeed::new(fixtures.clone(), cx);
             let section_form = SectionNameForm::new(window, cx);
             let collapsed = fixtures
@@ -210,6 +233,15 @@ impl Sidebar {
                         cx.notify();
                     }
                 }),
+                cx.subscribe(
+                    &dm_find,
+                    |this: &mut Sidebar, find, event: &InputEvent, cx| {
+                        if let InputEvent::Change = event {
+                            this.dm_find_query = find.read(cx).value().trim().to_lowercase();
+                            cx.notify();
+                        }
+                    },
+                ),
                 cx.observe(&activity, |_, _, cx| cx.notify()),
                 cx.subscribe(
                     &activity,
@@ -244,6 +276,11 @@ impl Sidebar {
                 read: HashSet::new(),
                 find_query: String::new(),
                 find,
+                dm_find,
+                dm_find_query: String::new(),
+                fresh_latest: HashMap::new(),
+                threads_unread: (false, 0),
+                dm_unreads_only: false,
                 joined: Vec::new(),
                 huddle: None,
                 draft_count: 0,
@@ -273,7 +310,28 @@ impl Sidebar {
         }
         self.activity
             .update(cx, |feed, cx| feed.set_fixtures(&fixtures, cx));
+        // The snapshot read the store after every fresher read kept here.
+        self.fresh_latest.clear();
         self.fixtures = fixtures;
+        cx.notify();
+    }
+
+    /// Live mode: Slack's thread counts (unread replies in followed threads, mentions among
+    /// them) for the Threads row.
+    pub fn set_thread_counts(&mut self, has_unreads: bool, mentions: u32, cx: &mut Context<Self>) {
+        self.threads_unread = (has_unreads, mentions);
+        cx.notify();
+    }
+
+    /// Live mode: `channel`'s newest message as just re-read from the store, so the DM list's
+    /// preview, stamp and order follow it before the next snapshot.
+    pub fn set_latest(
+        &mut self,
+        channel: ChannelId,
+        latest: Option<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        self.fresh_latest.insert(channel, latest);
         cx.notify();
     }
 
@@ -386,9 +444,16 @@ impl Sidebar {
                     .and_then(|history| history.last())
                     .map(|message| message.ts.clone())
             });
+        // A change to the channel itself (members, connection, settings; `updated`, millis)
+        // counts too: Slack lists #partner_support_klarna, silent since April 2025 but updated
+        // within the month.
+        let updated = conversation
+            .updated
+            .map(|at| if at > 100_000_000_000 { at / 1000 } else { at });
         let cutoff = crate::drafts::now_secs().saturating_sub(30 * 86_400);
         latest
             .and_then(|ts| ts.secs())
+            .max(updated)
             .and_then(|secs| u64::try_from(secs).ok())
             .is_none_or(|secs| secs >= cutoff)
     }
@@ -473,6 +538,19 @@ impl Sidebar {
             total.mentions += unread.mentions;
         }
         total
+    }
+
+    /// Conversations with unread messages, in sidebar row order: the search pill's
+    /// dropdown "Unreads & drafts" section (the root adds drafted conversations).
+    pub fn unread_ids(&self) -> Vec<ChannelId> {
+        let watermark = self.read_watermark();
+        self.fixtures
+            .channels
+            .iter()
+            .chain(&self.fixtures.dms)
+            .filter(|conversation| self.unread_in(conversation, watermark.as_ref()).count > 0)
+            .map(|conversation| conversation.id.clone())
+            .collect()
     }
 
     /// The nav rail. Like Slack, Home and DMs get an unread dot, Activity its unread count.
@@ -600,23 +678,32 @@ impl Sidebar {
         let team = &self.fixtures.workspaces[self.active_workspace];
         let dim = theme.sidebar_foreground.opacity(0.6);
         let hover = theme.accent;
+        // Slack's "Norce ⌄": the chevron rides right after the name, the icons sit right.
         h_flex()
+            .flex_none()
             .px_4()
             .pt_3()
             .pb_1()
             .gap_1()
             .child(
-                div()
+                h_flex()
                     .flex_1()
-                    .truncate()
-                    .text_lg()
-                    .font_weight(FontWeight::BOLD)
-                    .child(team.name.clone()),
-            )
-            .child(
-                Icon::new(IconName::ChevronDown)
-                    .text_color(dim)
-                    .size(px(14.)),
+                    .min_w_0()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .child(team.name.clone()),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .flex_none()
+                            .text_color(dim)
+                            .size(px(14.)),
+                    ),
             )
             .child(
                 self.header_icon("ws-settings", IconName::Settings, dim, hover)
@@ -631,7 +718,7 @@ impl Sidebar {
             )
     }
 
-    /// One 24px hover-square for the workspace header's gear / compose icons.
+    /// One 28px hover-square for the workspace header's gear / compose icons.
     fn header_icon(
         &self,
         id: &'static str,
@@ -642,7 +729,7 @@ impl Sidebar {
         div()
             .id(SharedString::from(id))
             .flex_none()
-            .size(px(24.))
+            .size(px(28.))
             .rounded_sm()
             .flex()
             .items_center()
@@ -650,31 +737,38 @@ impl Sidebar {
             .cursor_pointer()
             .text_color(dim)
             .hover(|el| el.bg(hover))
-            .child(Icon::new(icon).text_color(dim).size(px(15.)))
+            .child(Icon::new(icon).text_color(dim).size(px(20.)))
     }
 
-    /// The "Find a conversation…" field between the workspace header and the sections.
-    fn find_field(&self, cx: &Context<Self>) -> Div {
+    /// One of the sidebar's slim find fields: the Home list's "Find a conversation…" or the
+    /// DM list's "Find a DM…". Slack's field is a slim 28px box led by its text-search glyph.
+    fn find_field(&self, field: &Entity<TextareaState>, cx: &Context<Self>) -> Div {
         let border = cx.theme().sidebar_border;
         let dim = cx.theme().sidebar_foreground.opacity(0.6);
+        // Slack's field is a slim 28px box led by its text-search glyph.
         h_flex()
             .mx_2()
             .mt_1()
             .flex_none()
+            .h(px(28.))
+            .overflow_hidden()
             .items_center()
             .gap_1p5()
             .px_2()
-            .py_0p5()
             .rounded_md()
             .border_1()
             .border_color(border)
-            .child(Icon::new(IconName::Search).text_color(dim).size(px(14.)))
+            .child(
+                Icon::new(IconName::TextSearch)
+                    .text_color(dim)
+                    .size(px(16.)),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .text_size(px(13.))
-                    .child(Textarea::new(&self.find).appearance(false).bordered(false)),
+                    .child(Textarea::new(field).appearance(false).bordered(false)),
             )
     }
 
@@ -1024,8 +1118,10 @@ impl Sidebar {
             theme.sidebar_foreground.opacity(0.75)
         };
         let hover = theme.sidebar_foreground.opacity(0.08);
+        // `flex_none`: in the overflowing scroll column these rows would otherwise shrink.
         h_flex()
             .id(id)
+            .flex_none()
             .mx_2()
             .px_2()
             .h(px(28.))
@@ -1049,45 +1145,140 @@ impl Sidebar {
             .children(trailing)
     }
 
-    /// Bold title row heading the DM inbox and Activity lists.
-    fn list_title(&self, title: &str, cx: &Context<Self>) -> Div {
-        let border = cx.theme().sidebar_border;
-        h_flex()
-            .px_4()
-            .pt_3()
-            .pb_2()
-            .border_b_1()
-            .border_color(border)
-            .child(
-                div()
-                    .text_base()
-                    .font_weight(FontWeight::BOLD)
-                    .child(title.to_owned()),
-            )
-    }
-
-    /// The rail's DMs destination: every DM, newest activity first, with presence or
-    /// stacked group avatar, last message preview and its time.
+    /// The rail's DMs destination, Slack's DM list: the collapsible "Direct messages" header
+    /// with the "Unreads" filter toggle and the compose pen, a "Find a DM…" field, then one
+    /// row per DM, latest activity first — presence or stacked group avatar, bold name with
+    /// its relative stamp, and a muted preview of the latest message ([`Fixtures::latest`] in
+    /// live mode, the history in fixtures).
     fn dm_list(&self, watermark: Option<&Ts>, cx: &mut Context<Self>) -> Div {
+        let query = self.dm_find_query.as_str();
         let mut dms: Vec<(&Conversation, Option<&Message>)> = self
             .fixtures
             .dms
             .iter()
-            .map(|dm| {
-                (
-                    dm,
-                    self.fixtures.messages.get(&dm.id).and_then(|h| h.last()),
-                )
+            // Slack lists apps' and Slackbot's DMs under Apps, not here.
+            .filter(|dm| {
+                !dm.user.as_ref().is_some_and(|user| {
+                    matches!(user.as_str(), "USLACKBOT" | "USLACK")
+                        || self.fixtures.user(user).is_some_and(|u| u.is_bot)
+                })
             })
+            .map(|dm| (dm, self.dm_latest(dm)))
+            .filter(|&(dm, _)| {
+                query.is_empty()
+                    || self
+                        .fixtures
+                        .conversation_label(dm)
+                        .to_lowercase()
+                        .contains(query)
+            })
+            .filter(|&(dm, _)| !self.dm_unreads_only || self.unread_in(dm, watermark).count > 0)
             .collect();
-        dms.sort_by(|a, b| b.1.map(|m| &m.ts).cmp(&a.1.map(|m| &m.ts)));
-        let rows: Vec<_> = dms
-            .into_iter()
-            .map(|(dm, last)| self.dm_row(dm, last, watermark, cx))
-            .collect();
+        dms.sort_by(|a, b| {
+            b.1.map(|message| &message.ts)
+                .cmp(&a.1.map(|message| &message.ts))
+        });
+        let border = cx.theme().sidebar_border;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, (dm, last)) in dms.into_iter().enumerate() {
+            // Slack separates the rows with hairlines, not gaps.
+            if index > 0 {
+                rows.push(div().h(px(1.)).flex_none().bg(border).into_any_element());
+            }
+            rows.push(self.dm_row(dm, last, watermark, cx).into_any_element());
+        }
+        let collapsed = SharedString::from("dm-list");
         v_flex()
-            .child(self.list_title("Direct messages", cx))
-            .child(v_flex().p_2().gap_0p5().children(rows))
+            .child(self.dm_header(cx))
+            .when(!self.collapsed.contains(&collapsed), |list| {
+                list.child(self.find_field(&self.dm_find, cx))
+                    .child(v_flex().pt_1().pb_2().children(rows))
+            })
+    }
+
+    /// The DM's latest top-level message: the freshest history the views hold (fixture mode,
+    /// or live mode's open conversation), else the snapshot's per-DM latest message.
+    fn dm_latest(&self, dm: &Conversation) -> Option<&Message> {
+        if let Some(fresh) = self.fresh_latest.get(&dm.id) {
+            return fresh.as_ref();
+        }
+        self.fixtures
+            .messages
+            .get(&dm.id)
+            .and_then(|history| history.last())
+            .or_else(|| self.fixtures.latest.get(&dm.id))
+    }
+
+    /// The DM list's header: the collapsible "Direct messages" title, Slack's "Unreads"
+    /// filter toggle and the compose pen on the right.
+    fn dm_header(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let dim = theme.sidebar_foreground.opacity(0.6);
+        let hover = theme.accent;
+        let border = theme.sidebar_border;
+        let toggle = cx.weak_entity();
+        let on_unreads = move |checked: &bool, _: &mut Window, cx: &mut gpui_kit::gpui::App| {
+            toggle
+                .update(cx, |sidebar: &mut Sidebar, cx| {
+                    sidebar.dm_unreads_only = *checked;
+                    cx.notify();
+                })
+                .ok();
+        };
+        h_flex()
+            .px_4()
+            .pt_3()
+            .pb_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .id("dm-list-title")
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .items_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|title| title.bg(hover))
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .text_color(dim)
+                            .size(px(14.)),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Direct messages"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let key = SharedString::from("dm-list");
+                        if !this.collapsed.remove(&key) {
+                            this.collapsed.insert(key);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .text_color(dim)
+                    .child("Unreads")
+                    .child(
+                        Switch::new("dm-unreads")
+                            .accessibility_label("Unreads")
+                            .with_size(Size::XSmall)
+                            .checked(self.dm_unreads_only)
+                            .on_click(on_unreads),
+                    ),
+            )
+            .child(
+                self.header_icon("dm-compose", IconName::SquarePen, dim, hover)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenCompose))),
+            )
     }
 
     fn dm_row(
@@ -1100,34 +1291,39 @@ impl Sidebar {
         let theme = cx.theme();
         let selected = dm.id == self.selected;
         let unread = self.unread_in(dm, watermark);
-        let (fg, dim) = if selected {
-            (
-                theme.sidebar_accent_foreground,
-                theme.sidebar_accent_foreground.opacity(0.8),
-            )
-        } else {
-            (
-                theme.sidebar_foreground,
-                theme.sidebar_foreground.opacity(0.6),
-            )
-        };
-        let ring = if selected {
-            theme.sidebar_accent
-        } else {
-            theme.sidebar
-        };
-        let (selected_bg, hover) = (theme.sidebar_accent, theme.accent);
+        let (fg, dim) = (
+            theme.sidebar_foreground,
+            theme.sidebar_foreground.opacity(0.6),
+        );
+        // Slack's DM list marks the open DM with a gray wash and keeps its text colors.
+        let selected_bg = theme.sidebar.blend(theme.sidebar_foreground.opacity(0.1));
+        let ring = if selected { selected_bg } else { theme.sidebar };
+        let hover = theme.accent;
+        // The self-DM reads "Name (you)" here, as Slack's DM list shows it; every other
+        // surface keeps the plain label.
+        let mut label = self.fixtures.conversation_label(dm);
+        if dm.is_im
+            && dm
+                .user
+                .as_ref()
+                .is_some_and(|user| *user == self.fixtures.self_user)
+        {
+            label.push_str(" (you)");
+        }
         let preview = last.map(|message| {
+            // Slack prefixes only your own messages, in group DMs too.
             let author = match &message.user {
-                Some(user) if *user == self.fixtures.self_user => "You: ".to_owned(),
-                _ if dm.is_mpim => message
-                    .user
-                    .as_ref()
-                    .map(|user| format!("{}: ", self.fixtures.user_name(user)))
-                    .unwrap_or_default(),
-                _ => String::new(),
+                Some(user) if *user == self.fixtures.self_user => "You: ",
+                _ => "",
             };
-            format!("{author}{}", self.fixtures.preview(message))
+            // Formatting, links and emoji render as in the transcript, as Slack's list does.
+            crate::messages::mrkdwn_preview(
+                &format!("{author}{}", self.fixtures.preview(message)),
+                &self.fixtures,
+                dim,
+                format!("dm-preview-{}", dm.id),
+                cx,
+            )
         });
         let stamp = last
             .map(|message| list_stamp(&message.ts))
@@ -1141,13 +1337,15 @@ impl Sidebar {
             .items_center()
             .rounded_md()
             .cursor_pointer()
+            // Like Slack, the selected row keeps its colour under the pointer.
             .when(selected, |row| row.bg(selected_bg))
-            .hover(|row| row.bg(hover))
-            .child(conversation_avatar(&self.fixtures, dm, 32., ring, cx))
+            .when(!selected, |row| row.hover(|row| row.bg(hover)))
+            .child(conversation_avatar(&self.fixtures, dm, 36., ring, cx))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
+                    .gap_0p5()
                     .child(
                         h_flex()
                             .gap_2()
@@ -1156,21 +1354,17 @@ impl Sidebar {
                                     .flex_1()
                                     .truncate()
                                     .text_color(fg)
-                                    .font_weight(if unread.count > 0 {
-                                        FontWeight::BOLD
-                                    } else {
-                                        FontWeight::SEMIBOLD
-                                    })
-                                    .child(self.fixtures.conversation_label(dm)),
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(label),
                             )
                             .child(div().flex_none().text_xs().text_color(dim).child(stamp)),
                     )
                     .child(
                         div()
-                            .truncate()
+                            .line_clamp(2)
                             .text_xs()
                             .text_color(dim)
-                            .child(preview.unwrap_or_default()),
+                            .children(preview),
                     ),
             )
             .when(unread.count > 0, |row| {
@@ -1254,7 +1448,7 @@ impl Sidebar {
             .text_color(color)
             .cursor_pointer()
             .when(selected, |row| row.bg(theme.sidebar_accent))
-            .hover(|row| row.bg(theme.accent))
+            .when(!selected, |row| row.hover(|row| row.bg(theme.accent)))
             .child(leading)
             .child(div().flex_1().truncate().font_weight(weight).child(label));
         if self.huddle.as_ref() == Some(&conversation.id) {
@@ -1272,16 +1466,12 @@ impl Sidebar {
     }
 
     /// Slack's floating "More unreads" chip for one edge of the list: it points at hidden
-    /// unread rows, takes the sidebar's primary colors while any of them carries mentions,
-    /// and otherwise reads as a neutral raised chip.
+    /// unread rows, turns into the red "Unread mentions" chip while any of them carries
+    /// mentions, and otherwise reads as a neutral raised chip.
     fn unreads_pill(&self, target: HiddenUnreads, cx: &Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
         let (bg, hover, fg) = if target.mentions {
-            (
-                theme.sidebar_primary,
-                theme.sidebar_primary,
-                theme.sidebar_primary_foreground,
-            )
+            (theme.danger, theme.danger_hover, theme.danger_foreground)
         } else {
             // Opaque like Slack's chip: the rows it floats over must not show through.
             (
@@ -1312,14 +1502,18 @@ impl Sidebar {
             .cursor_pointer()
             .child(
                 Icon::new(if target.below {
-                    IconName::ChevronDown
+                    IconName::ArrowDown
                 } else {
-                    IconName::ChevronUp
+                    IconName::ArrowUp
                 })
                 .text_color(fg)
                 .size(px(14.)),
             )
-            .child("More unreads")
+            .child(if target.mentions {
+                "Unread mentions"
+            } else {
+                "More unreads"
+            })
             // The pill floats over sidebar rows: a click must not also open the row beneath.
             .occlude()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1569,7 +1763,7 @@ impl Render for Sidebar {
             NavItem::Home | NavItem::Files | NavItem::Todos | NavItem::Agents | NavItem::Admin => {
                 let mut children = vec![
                     self.workspace_header(cx).into_any_element(),
-                    self.find_field(cx).into_any_element(),
+                    self.find_field(&self.find, cx).into_any_element(),
                     div()
                         .mx_2()
                         .my_2()
@@ -1590,14 +1784,19 @@ impl Render for Sidebar {
                         this.active_nav = NavItem::Activity;
                         cx.notify();
                     })),
+                    // Slack bolds Threads while followed threads have unread replies and
+                    // counts the ones mentioning you in a red pill.
                     self.nav_row(
                         "threads",
                         IconName::MessageSquareText,
                         "Threads",
-                        false,
+                        self.threads_unread.0,
                         None,
                         cx,
                     )
+                    .when(self.threads_unread.1 > 0, |row| {
+                        row.child(count_pill(self.threads_unread.1, true, cx))
+                    })
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenThreads))),
                     self.nav_row("huddles", IconName::Headphones, "Huddles", false, None, cx)
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles))),

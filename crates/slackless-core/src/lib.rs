@@ -27,6 +27,7 @@ mod client;
 mod fetcher;
 mod notify;
 mod reducer;
+mod unfurl;
 
 pub use backend::Backend;
 pub use client::{Client, ClientHandle, SharedStore};
@@ -73,11 +74,12 @@ pub enum Command {
     /// (and keeps it when the fetch fails).
     FetchThreads,
     /// Post a message (its blocks, with the text as fallback); `thread_ts` replies in a
-    /// thread.
+    /// thread, and `broadcast` also posts that reply to the channel (Slack's "Also send to").
     SendMessage {
         channel: ChannelId,
         content: MessageContent,
         thread_ts: Option<Ts>,
+        broadcast: bool,
     },
     /// Replace a message's text.
     EditMessage {
@@ -158,9 +160,15 @@ pub enum Event {
     Conversations(Vec<ChannelId>),
     /// An opened channel's `conversations.info` refresh (already merged into the store).
     /// Details only, so front-ends update the header without rebuilding conversation lists.
+    /// `num_members` counts human members (`conversations.members` cross-checked against the
+    /// stored profiles: apps, deactivated people and `USLACKBOT` excluded) and `num_apps`
+    /// counts the app/bot members for the header's separate apps chip; when the member list
+    /// cannot be read, `num_apps` is `None` and `num_members` falls back to
+    /// `conversations.info`'s raw count.
     ConversationInfo {
         channel: ChannelId,
         num_members: Option<u32>,
+        num_apps: Option<u32>,
     },
     /// These users were added or updated in the store.
     UsersChanged(Vec<UserId>),

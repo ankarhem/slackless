@@ -93,19 +93,17 @@ impl QuickSwitcher {
 
     /// Conversations matching the filter: name-prefix matches, then substring matches.
     fn matches(&self) -> Vec<(ChannelId, String)> {
-        let all = self
-            .fixtures
-            .dms
-            .iter()
-            .chain(&self.fixtures.channels)
-            .map(|c| (c.id.clone(), self.fixtures.conversation_label(c)));
-        let key = |label: &str| label.trim_start_matches("# ").to_lowercase();
-        let (mut prefix, mut rest): (Vec<_>, Vec<_>) = all
-            .filter(|(_, label)| key(label).contains(&self.query))
-            .partition(|(_, label)| key(label).starts_with(&self.query));
-        prefix.append(&mut rest);
-        prefix.truncate(MAX_ROWS);
-        prefix
+        // The same prefix-then-substring ranking the search pill's dropdown lists
+        // ([`crate::search_menu::rank_matches`]).
+        crate::search_menu::rank_matches(
+            &self.query,
+            self.fixtures
+                .dms
+                .iter()
+                .chain(&self.fixtures.channels)
+                .map(|c| (c.id.clone(), self.fixtures.conversation_label(c))),
+            MAX_ROWS,
+        )
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {

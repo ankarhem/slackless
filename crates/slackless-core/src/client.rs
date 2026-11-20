@@ -12,12 +12,13 @@ use tokio::task::AbortHandle;
 use crate::api::{ApiError, SlackApi};
 use crate::auth::Session;
 use crate::backend::Backend;
-use crate::backfill::{Backfill, PAGE_DELAY, SyncedMap};
+use crate::backfill::{Backfill, PAGE_DELAY, SyncedMap, wait_out_rate_limits};
 use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
 use crate::types::{ChannelId, ConversationKind, SlackEvent, TeamId, UserId};
+use crate::unfurl::{Unfurls, event_messages};
 use crate::{Command, Event, apply_event};
 
 /// The store shared between the core (writer) and front-ends (readers).
@@ -50,7 +51,13 @@ impl Client {
             .thread_name("slackless-tokio")
             .enable_all()
             .build()?;
-        let fetcher = Fetcher::new(runtime.handle().clone());
+        let files = SlackApi::new(
+            &session.api_base(),
+            session.xoxc_token.clone(),
+            &session.d_cookie,
+        )
+        .ok();
+        let fetcher = Fetcher::new(runtime.handle().clone(), files);
         let thread = std::thread::Builder::new()
             .name("slackless-core".into())
             .spawn(move || {
@@ -232,13 +239,15 @@ async fn next_rtm(rtm: &mut Option<tokio::sync::mpsc::Receiver<RtmEvent>>) -> Rt
     std::future::pending().await
 }
 
-pub(crate) struct Core<B> {
+pub(crate) struct Core<B: Backend> {
     backend: B,
     store: SharedStore,
     workspace: TeamId,
     events: Emitter,
     backfill: Backfill<B>,
     backfills: HashMap<ChannelId, AbortHandle>,
+    /// Names the foreign channels shared-message unfurls point at (shared with `backfill`).
+    unfurls: Unfurls<B>,
     rtm: Option<RtmClient>,
     /// DM peers whose presence is already covered: fetched once through `users.getPresence`
     /// and subscribed on the websocket. Every `presence_sub` frame replaces the whole
@@ -250,6 +259,12 @@ pub(crate) struct Core<B> {
 
 impl<B: Backend> Core<B> {
     pub fn new(backend: B, store: SharedStore, workspace: TeamId, events: Emitter) -> Self {
+        let unfurls = Unfurls::new(
+            backend.clone(),
+            Arc::clone(&store),
+            workspace.clone(),
+            events.clone(),
+        );
         let backfill = Backfill {
             backend: backend.clone(),
             store: Arc::clone(&store),
@@ -257,6 +272,7 @@ impl<B: Backend> Core<B> {
             events: events.clone(),
             synced: SyncedMap::default(),
             page_delay: PAGE_DELAY,
+            unfurls: unfurls.clone(),
         };
         Self {
             backend,
@@ -265,6 +281,7 @@ impl<B: Backend> Core<B> {
             events,
             backfill,
             backfills: HashMap::new(),
+            unfurls,
             rtm: None,
             presence_peers: Arc::new(Mutex::new(Vec::new())),
             users_asked: HashSet::new(),
@@ -282,9 +299,20 @@ impl<B: Backend> Core<B> {
                 let prefs = boot.prefs.clone();
                 let ws = self.workspace.clone();
                 let stored = with_store(&self.store, move |store| {
+                    // `client.userBoot` objects omit `is_member`, so a row the membership
+                    // sync already marked must keep its flag: the front-end rebuilds its
+                    // snapshot on this step's event, before `users.conversations` runs.
+                    let ids: Vec<ChannelId> = boot
+                        .channels
+                        .iter()
+                        .chain(&boot.ims)
+                        .map(|conversation| conversation.id.clone())
+                        .collect();
+                    let member = store.member_flags(&ws, &ids)?;
                     let mut ids = Vec::new();
-                    for conversation in boot.channels.iter().chain(&boot.ims) {
-                        store.upsert_conversation(&ws, conversation)?;
+                    for mut conversation in boot.channels.into_iter().chain(boot.ims) {
+                        conversation.is_member |= member.contains(&conversation.id);
+                        store.upsert_conversation(&ws, &conversation)?;
                         ids.push(conversation.id.clone());
                     }
                     if let Some(me) = &boot.self_user {
@@ -319,6 +347,49 @@ impl<B: Backend> Core<B> {
                 }
             }
             Err(e) => self.events.report("client.userBoot", e.into()),
+        }
+        match self.backend.dm_list().await {
+            Ok(dms) => {
+                let ws = self.workspace.clone();
+                let stored = with_store(&self.store, move |store| {
+                    let mut ids = Vec::new();
+                    for conversation in &dms {
+                        // `client.userBoot` caps its channel list, so newer group DMs only
+                        // ever arrive here; merging keeps boot's richer rows intact.
+                        store.merge_conversation(&ws, conversation)?;
+                        ids.push(conversation.id.clone());
+                    }
+                    Ok::<_, StoreError>(ids)
+                })
+                .await;
+                match stored {
+                    Ok(ids) if !ids.is_empty() => {
+                        self.events.emit(Event::Conversations(ids));
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.events.report("client.dms", e.into()),
+                }
+            }
+            Err(e) => self.events.report("client.dms", e.into()),
+        }
+        match self.backend.channel_memberships().await {
+            Ok(members) => {
+                let ws = self.workspace.clone();
+                let ids = members.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+                let flipped =
+                    with_store(&self.store, move |s| s.set_channel_memberships(&ws, &ids)).await;
+                match flipped {
+                    Ok(flipped) if !flipped.is_empty() => {
+                        self.events.emit(Event::Conversations(flipped));
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.events.report("users.conversations", e.into()),
+                }
+            }
+            // Slack Connect channels hosted by another org never reach `client.counts`, so
+            // the GUI's membership gate needs this row state; failing it leaves the boot
+            // flags (usually `false`) in place until the next hydrate.
+            Err(e) => self.events.report("users.conversations", e.into()),
         }
         match self.backend.users().await {
             Ok(users) => {
@@ -369,6 +440,57 @@ impl<B: Backend> Core<B> {
             Err(e) => self.events.report("emoji.list", e.into()),
         }
         self.events.emit(Event::SidebarChanged);
+        self.fetch_dm_previews();
+    }
+
+    /// DM-list previews: every IM/MPIM that is open (listed in Slack's DMs tab) and has
+    /// nothing stored at all gets its newest message (one `conversations.history` limit-1
+    /// call each, sequential and paced at the Tier-3 rate) so the DM list previews and sorts
+    /// conversations never opened in slackless, as Slack does. Closed conversations stay
+    /// unfetched. A fetched preview only adds one message: it touches neither the backfill's
+    /// synced spans nor any completeness state, so opening the conversation still walks its
+    /// full history from the newest page.
+    fn fetch_dm_previews(&self) {
+        let (backend, store, ws, events, unfurls) = (
+            self.backend.clone(),
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+            self.unfurls.clone(),
+        );
+        self.spawn("dm previews", async move {
+            let ws2 = ws.clone();
+            let conversations = with_store(&store, move |s| s.conversations(&ws2)).await?;
+            let dms: Vec<ChannelId> = conversations
+                .iter()
+                .filter(|c| {
+                    matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim) && c.is_open
+                })
+                .map(|c| c.id.clone())
+                .collect();
+            let ws3 = ws.clone();
+            let asked = dms.clone();
+            let filled =
+                with_store(&store, move |s| s.channels_with_messages(&ws3, &asked)).await?;
+            let mut first = true;
+            for channel in dms.iter().filter(|id| !filled.contains(*id)) {
+                if !std::mem::take(&mut first) {
+                    tokio::time::sleep(PAGE_DELAY).await;
+                }
+                let message =
+                    wait_out_rate_limits(|| backend.latest_message(channel.clone())).await?;
+                let Some(message) = message else {
+                    continue;
+                };
+                unfurls.resolve(std::slice::from_ref(&message));
+                let (ws4, target) = (ws.clone(), (*channel).clone());
+                with_store(&store, move |s| s.upsert_message(&ws4, &target, &message)).await?;
+                events.emit(Event::StoreChanged {
+                    channel: (*channel).clone(),
+                });
+            }
+            Ok(())
+        });
     }
 
     pub fn handle(&mut self, command: Command) {
@@ -432,13 +554,16 @@ impl<B: Backend> Core<B> {
                 channel,
                 content,
                 thread_ts,
+                broadcast,
             } => {
+                let unfurls = self.unfurls.clone();
                 self.spawn("chat.postMessage", async move {
                     let posted = backend
-                        .post_message(channel.clone(), content, thread_ts)
+                        .post_message(channel.clone(), content, thread_ts, broadcast)
                         .await?;
                     // Store the echo now; the websocket copy of it is an idempotent re-upsert.
                     if let Some(message) = posted.message {
+                        unfurls.resolve(std::slice::from_ref(&message));
                         let target = channel.clone();
                         with_store(&store, move |s| s.upsert_message(&ws, &target, &message))
                             .await?;
@@ -583,6 +708,7 @@ impl<B: Backend> Core<B> {
                 if let Some(channel) = refresh_target(&event) {
                     self.refresh_conversation(channel);
                 }
+                self.unfurls.resolve(event_messages(&event));
                 let ws = self.workspace.clone();
                 let changed = with_store(&self.store, move |s| apply_event(s, &ws, event)).await;
                 if let Some(changed) = changed {
@@ -608,8 +734,11 @@ impl<B: Backend> Core<B> {
         });
     }
 
-    /// Open-time `conversations.info`: metadata `client.userBoot` omits (member counts, topic)
-    /// merged into the stored copy, so richer stored fields survive the refresh.
+    /// Open-time `conversations.info`: metadata `client.userBoot` omits (topic, member
+    /// counts) merged into the stored copy, so richer stored fields survive the refresh. The
+    /// header's counts come from `conversations.members` cross-checked against the stored
+    /// profiles (`Event::ConversationInfo` carries the split); when the member list cannot be
+    /// read, `conversations.info`'s raw `num_members` stands.
     fn merge_channel_info(&self, channel: ChannelId) {
         let (backend, store, ws, events) = (
             self.backend.clone(),
@@ -618,12 +747,20 @@ impl<B: Backend> Core<B> {
             self.events.clone(),
         );
         self.spawn("conversations.info", async move {
-            let fresh = backend.conversation_info(channel.clone()).await?;
+            let mut fresh = backend.conversation_info(channel.clone()).await?;
+            let mut num_apps = None;
+            if let Ok(members) = backend.conversation_members(channel.clone()).await {
+                let ws2 = ws.clone();
+                let counts = with_store(&store, move |s| s.member_counts(&ws2, &members)).await?;
+                fresh.num_members = Some(counts.humans);
+                num_apps = Some(counts.apps);
+            }
             let num_members = fresh.num_members;
             with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
             events.emit(Event::ConversationInfo {
                 channel,
                 num_members,
+                num_apps,
             });
             Ok(())
         });
@@ -882,6 +1019,26 @@ pub(crate) mod tests {
         fail_replies: bool,
         /// `conversations.info` answer; the default echoes the id with `is_archived` set.
         info: Option<Conversation>,
+        /// `conversations.info` asks, in order.
+        info_calls: Vec<ChannelId>,
+        /// Every `conversations.info` call fails with `channel_not_found`.
+        fail_info: bool,
+        /// `conversations.members` answer for every channel.
+        members: Vec<UserId>,
+        /// Every `conversations.members` call fails with `channel_not_found`.
+        fail_members: bool,
+        /// `conversations.members` asks, in order.
+        member_calls: Vec<ChannelId>,
+        /// `conversations.history` limit-1 asks (DM previews), in order.
+        latest_calls: Vec<ChannelId>,
+        /// `client.dms` answer.
+        dms: Vec<Conversation>,
+        /// How often `client.dms` was asked.
+        dm_calls: usize,
+        /// `users.conversations` answer (ids).
+        memberships: Vec<ChannelId>,
+        /// How often `users.conversations` was asked.
+        membership_calls: usize,
         /// `dnd.info` answers keyed by user; an unconfigured user is never paused.
         dnd: HashMap<UserId, DndStatus>,
         presence: HashMap<UserId, UserPresence>,
@@ -951,6 +1108,61 @@ pub(crate) mod tests {
         /// The `conversations.info` answer for every channel.
         pub fn set_info(&self, conversation: Conversation) {
             self.state.lock().unwrap().info = Some(conversation);
+        }
+
+        /// Make every `conversations.info` call fail with `channel_not_found`.
+        pub fn fail_info(&self) {
+            self.state.lock().unwrap().fail_info = true;
+        }
+
+        /// `conversations.info` asks, in order.
+        pub fn info_calls(&self) -> Vec<ChannelId> {
+            self.state.lock().unwrap().info_calls.clone()
+        }
+
+        /// The `conversations.members` answer for every channel.
+        pub fn set_members(&self, members: Vec<UserId>) {
+            self.state.lock().unwrap().members = members;
+        }
+
+        /// Make every `conversations.members` call fail with `channel_not_found`.
+        pub fn fail_members(&self) {
+            self.state.lock().unwrap().fail_members = true;
+        }
+
+        /// `conversations.members` asks, in order.
+        pub fn member_calls(&self) -> Vec<ChannelId> {
+            self.state.lock().unwrap().member_calls.clone()
+        }
+
+        /// `conversations.history` limit-1 asks (DM previews), in order.
+        pub fn latest_calls(&self) -> Vec<ChannelId> {
+            self.state.lock().unwrap().latest_calls.clone()
+        }
+
+        /// The `client.dms` answer.
+        pub fn set_dms(&self, dms: Vec<Conversation>) {
+            self.state.lock().unwrap().dms = dms;
+        }
+
+        /// How often `client.dms` was asked.
+        pub fn dm_calls(&self) -> usize {
+            self.state.lock().unwrap().dm_calls
+        }
+
+        /// The `users.conversations` answer: the ids of the user's channel memberships.
+        pub fn set_memberships(&self, members: Vec<ChannelId>) {
+            self.state.lock().unwrap().memberships = members;
+        }
+
+        /// How often `users.conversations` was asked.
+        pub fn membership_calls(&self) -> usize {
+            self.state.lock().unwrap().membership_calls
+        }
+
+        /// Pushes one message into the shared history (unfurl attachments included).
+        pub fn push_message(&self, message: Message) {
+            self.state.lock().unwrap().history.push(message);
         }
 
         /// The `pins.list` answer.
@@ -1119,6 +1331,25 @@ pub(crate) mod tests {
             )]))
         }
 
+        async fn dm_list(&self) -> api::Result<Vec<Conversation>> {
+            let mut state = self.state.lock().unwrap();
+            state.dm_calls += 1;
+            Ok(state.dms.clone())
+        }
+
+        async fn channel_memberships(&self) -> api::Result<Vec<Conversation>> {
+            let mut state = self.state.lock().unwrap();
+            state.membership_calls += 1;
+            Ok(state
+                .memberships
+                .iter()
+                .map(|id| Conversation {
+                    id: id.clone(),
+                    ..Default::default()
+                })
+                .collect())
+        }
+
         async fn history_page(
             &self,
             _channel: ChannelId,
@@ -1168,7 +1399,12 @@ pub(crate) mod tests {
         }
 
         async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
-            let info = self.state.lock().unwrap().info.clone();
+            let mut state = self.state.lock().unwrap();
+            state.info_calls.push(channel.clone());
+            if state.fail_info {
+                return Err(ApiError::Slack("channel_not_found".into()));
+            }
+            let info = state.info.clone();
             Ok(match info {
                 Some(mut conversation) => {
                     conversation.id = channel;
@@ -1180,6 +1416,21 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             })
+        }
+
+        async fn conversation_members(&self, channel: ChannelId) -> api::Result<Vec<UserId>> {
+            let mut state = self.state.lock().unwrap();
+            state.member_calls.push(channel);
+            if state.fail_members {
+                return Err(ApiError::Slack("channel_not_found".into()));
+            }
+            Ok(state.members.clone())
+        }
+
+        async fn latest_message(&self, channel: ChannelId) -> api::Result<Option<Message>> {
+            let mut state = self.state.lock().unwrap();
+            state.latest_calls.push(channel);
+            Ok(state.history.iter().max_by(|a, b| a.ts.cmp(&b.ts)).cloned())
         }
 
         async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
@@ -1233,6 +1484,7 @@ pub(crate) mod tests {
             channel: ChannelId,
             content: MessageContent,
             _thread_ts: Option<Ts>,
+            _broadcast: bool,
         ) -> api::Result<PostedMessage> {
             let ts = Ts::from("100.0");
             let message = Message {
@@ -1584,6 +1836,7 @@ pub(crate) mod tests {
             channel: c1(),
             content: MessageContent::plain("hi there"),
             thread_ts: None,
+            broadcast: false,
         });
         assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
         let history = store
@@ -1721,6 +1974,9 @@ pub(crate) mod tests {
             num_members: Some(42),
             ..Default::default()
         });
+        // 42 members with no stored profiles: all of them humans, so the count survives the
+        // human-only re-count.
+        fake.set_members((1..=42).map(|i| UserId::from(format!("U{i}"))).collect());
         let (store, events, mut rx) = fake_core_parts();
         let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
         let ws = TeamId::from("T1");
@@ -1747,6 +2003,7 @@ pub(crate) mod tests {
                 Event::ConversationInfo {
                     channel,
                     num_members,
+                    ..
                 } if channel == c1() => {
                     assert_eq!(num_members, Some(42), "the event carries the count");
                     break;
@@ -1760,6 +2017,403 @@ pub(crate) mod tests {
         assert_eq!(stored.num_members, Some(42), "member count lands from info");
         assert_eq!(stored.unread_count_display, Some(7), "boot fields survive");
         assert_eq!(stored.name.as_deref(), Some("general"));
+    }
+
+    #[tokio::test]
+    async fn open_conversation_counts_humans_and_apps_for_the_header() {
+        let fake = FakeBackend::default();
+        // Slack's raw count (17) includes apps and deactivated people; the header must not.
+        fake.set_info(Conversation {
+            num_members: Some(17),
+            ..Default::default()
+        });
+        fake.set_members(vec![
+            UserId::from("U1"),
+            UserId::from("UBOT"),
+            UserId::from("UGONE"),
+            UserId::from("USLACKBOT"),
+            UserId::from("UEXT"),
+        ]);
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        {
+            let store = &mut *store.lock().unwrap();
+            for (id, is_bot, deleted) in [
+                ("U1", false, false),
+                ("UBOT", true, false),
+                ("UGONE", true, true),
+            ] {
+                store
+                    .upsert_user(
+                        &ws,
+                        &User {
+                            id: UserId::from(id),
+                            is_bot,
+                            deleted,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+
+        core.handle(Command::OpenConversation(c1()));
+
+        loop {
+            match next(&mut rx).await {
+                Event::ConversationInfo {
+                    channel,
+                    num_members,
+                    num_apps,
+                } if channel == c1() => {
+                    assert_eq!(
+                        num_members,
+                        Some(2),
+                        "U1 and the unknown UEXT are the humans"
+                    );
+                    assert_eq!(
+                        num_apps,
+                        Some(1),
+                        "the live bot; UGONE is deactivated and USLACKBOT built-in"
+                    );
+                    break;
+                }
+                Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
+        assert_eq!(fake.member_calls(), vec![c1()]);
+        let stored = store
+            .lock()
+            .unwrap()
+            .conversation(&ws, &c1())
+            .unwrap()
+            .expect("the conversation stays stored");
+        assert_eq!(
+            stored.num_members,
+            Some(2),
+            "the human count lands in the stored conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_conversation_falls_back_to_infos_count_when_members_fail() {
+        let fake = FakeBackend::default();
+        fake.set_info(Conversation {
+            num_members: Some(17),
+            ..Default::default()
+        });
+        fake.fail_members();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::OpenConversation(c1()));
+
+        loop {
+            match next(&mut rx).await {
+                Event::ConversationInfo {
+                    channel,
+                    num_members,
+                    num_apps,
+                } if channel == c1() => {
+                    assert_eq!(num_members, Some(17), "the raw count stands in");
+                    assert_eq!(num_apps, None, "no member list, no app count");
+                    break;
+                }
+                Event::StoreChanged { .. } | Event::HistoryComplete { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
+        assert_eq!(fake.member_calls(), vec![c1()]);
+    }
+
+    #[tokio::test]
+    async fn hydrate_backfills_previews_only_for_dms_without_stored_messages() {
+        let fake = FakeBackend::with_history(1..=3);
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        let (dm1, dm2) = (ChannelId::from("D1"), ChannelId::from("D2"));
+        {
+            let store = &mut *store.lock().unwrap();
+            for id in [&dm1, &dm2] {
+                store
+                    .upsert_conversation(
+                        &ws,
+                        &Conversation {
+                            id: id.clone(),
+                            is_im: true,
+                            is_open: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            store
+                .upsert_message(
+                    &ws,
+                    &dm1,
+                    &Message {
+                        ts: Ts::from("1700000000.000100"),
+                        text: "already stored".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+        core.hydrate().await;
+
+        // The preview lands for the message-less DM through the message-store write path.
+        loop {
+            match next(&mut rx).await {
+                Event::StoreChanged { channel } if channel == dm2 => break,
+                Event::Conversations(_)
+                | Event::UsersChanged(_)
+                | Event::Counts(_)
+                | Event::SidebarChanged => {}
+                other => panic!("unexpected hydrate event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            fake.latest_calls(),
+            vec![dm2.clone()],
+            "only the DM with nothing stored is asked; dm1 and the C1 channel are skipped"
+        );
+        let latest = store
+            .lock()
+            .unwrap()
+            .latest_messages(&ws, &[dm1.clone(), dm2.clone()])
+            .unwrap();
+        assert_eq!(
+            latest[&dm2].message.text, "m3",
+            "the newest message previews"
+        );
+        assert_eq!(latest[&dm1].message.text, "already stored");
+        assert!(
+            fake.calls().is_empty(),
+            "the preview never walks full history pages"
+        );
+        assert!(
+            !core.backfills.contains_key(&dm2),
+            "no backfill was started"
+        );
+
+        // Opening the DM still walks the full history from the newest page: one stored
+        // preview message neither satisfies nor completes it.
+        core.handle(Command::OpenConversation(dm2.clone()));
+        loop {
+            match next(&mut rx).await {
+                Event::HistoryComplete { channel } if channel == dm2 => break,
+                Event::StoreChanged { .. } | Event::ConversationInfo { .. } => {}
+                other => panic!("unexpected event after open: {other:?}"),
+            }
+        }
+        let calls = fake.calls();
+        assert_eq!(
+            calls.first(),
+            Some(&(None, None)),
+            "the walk starts at the newest page"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "1..=3 at 2 per page: a full walk, not a limit-1 fetch"
+        );
+        let history = store
+            .lock()
+            .unwrap()
+            .channel_history(&ws, &dm2, None, 10)
+            .unwrap();
+        assert_eq!(history.len(), 3, "the whole history is stored");
+    }
+
+    #[tokio::test]
+    async fn hydrate_lists_dms_and_previews_only_open_conversations() {
+        let fake = FakeBackend::default();
+        fake.push_history(1..=2);
+        // A group DM too new for `client.userBoot`'s capped channel list, plus a closed DM.
+        fake.set_dms(vec![
+            Conversation {
+                id: ChannelId::from("M1"),
+                name: Some("mpdm-fredrik--linus--jakob-1".into()),
+                is_mpim: true,
+                is_open: true,
+                ..Default::default()
+            },
+            Conversation {
+                id: ChannelId::from("D3"),
+                is_im: true,
+                is_open: false,
+                user: Some(UserId::from("U9")),
+                ..Default::default()
+            },
+        ]);
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        // A closed group DM that is stored: listed by neither Slack nor this preview fetch.
+        store
+            .lock()
+            .unwrap()
+            .upsert_conversation(
+                &ws,
+                &Conversation {
+                    id: ChannelId::from("M2"),
+                    is_mpim: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+        core.hydrate().await;
+
+        loop {
+            match next(&mut rx).await {
+                Event::StoreChanged { channel } if channel == ChannelId::from("M1") => break,
+                Event::Conversations(_)
+                | Event::UsersChanged(_)
+                | Event::Counts(_)
+                | Event::SidebarChanged => {}
+                other => panic!("unexpected hydrate event: {other:?}"),
+            }
+        }
+        assert_eq!(fake.dm_calls(), 1);
+        assert_eq!(
+            fake.latest_calls(),
+            vec![ChannelId::from("M1")],
+            "only the open group DM is asked; the closed DM and the closed stored one are skipped"
+        );
+        let asked = [
+            ChannelId::from("M1"),
+            ChannelId::from("D3"),
+            ChannelId::from("M2"),
+        ];
+        let latest = store.lock().unwrap().latest_messages(&ws, &asked).unwrap();
+        assert!(latest.contains_key(&asked[0]), "the new group DM previews");
+        assert!(!latest.contains_key(&asked[1]) && !latest.contains_key(&asked[2]));
+        let m1 = store
+            .lock()
+            .unwrap()
+            .conversation(&ws, &asked[0])
+            .unwrap()
+            .expect("the group DM userBoot never delivered lands in the store");
+        assert_eq!(m1.name.as_deref(), Some("mpdm-fredrik--linus--jakob-1"));
+        assert!(m1.is_open);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .conversation(&ws, &asked[1])
+                .unwrap()
+                .is_some(),
+            "closed DMs are still stored for naming"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_records_channel_memberships_from_users_conversations() {
+        let fake = FakeBackend::default();
+        // userBoot delivers C1 (its channel objects omit `is_member`); the externally hosted
+        // Slack Connect channel and a previously-left one only exist in the store.
+        fake.set_memberships(vec![c1(), ChannelId::from("CEXT")]);
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        {
+            let store = &mut *store.lock().unwrap();
+            store
+                .upsert_conversation(
+                    &ws,
+                    &Conversation {
+                        id: ChannelId::from("CEXT"),
+                        name: Some("partner_support_klarna".into()),
+                        is_channel: true,
+                        is_ext_shared: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .upsert_conversation(
+                    &ws,
+                    &Conversation {
+                        id: ChannelId::from("CLEFT"),
+                        name: Some("avarda-checkout".into()),
+                        is_channel: true,
+                        is_member: true,
+                        is_ext_shared: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .upsert_conversation(
+                    &ws,
+                    &Conversation {
+                        id: ChannelId::from("M1"),
+                        is_mpim: true,
+                        is_member: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let core = Core::new(fake.clone(), Arc::clone(&store), ws.clone(), events);
+        core.hydrate().await;
+
+        async fn run_to_sidebar(rx: &mut UnboundedReceiver<Event>) -> Vec<ChannelId> {
+            let mut conversations = Vec::new();
+            loop {
+                match next(rx).await {
+                    Event::SidebarChanged => break conversations,
+                    Event::Conversations(ids) => conversations.extend(ids),
+                    Event::UsersChanged(_) | Event::Counts(_) => {}
+                    other => panic!("unexpected hydrate event: {other:?}"),
+                }
+            }
+        }
+        let mut announced = run_to_sidebar(&mut rx).await;
+        let mut sorted = std::mem::take(&mut announced);
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted,
+            vec![c1(), ChannelId::from("CEXT"), ChannelId::from("CLEFT")],
+            "exactly the flipped channels are announced"
+        );
+        let stored = |id: &str| {
+            store
+                .lock()
+                .unwrap()
+                .conversation(&ws, &ChannelId::from(id))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} stored"))
+        };
+        assert!(stored("C1").is_member, "boot's omitted flag filled in");
+        assert!(
+            stored("CEXT").is_member,
+            "the externally hosted channel counts"
+        );
+        assert!(!stored("CLEFT").is_member, "left channels drop out");
+        assert!(stored("M1").is_member, "group DM rows are never touched");
+        assert_eq!(fake.membership_calls(), 1);
+
+        // A re-hydrate replays userBoot before syncing memberships again. The boot upsert
+        // preserves stored flags now, so they never dip and the second membership sync
+        // flips nothing.
+        core.hydrate().await;
+        let announced_again = run_to_sidebar(&mut rx).await;
+        assert_eq!(
+            announced_again,
+            vec![c1()],
+            "boot still announces its rows; no membership flips a second time"
+        );
+        assert_eq!(fake.membership_calls(), 2);
+        assert!(
+            stored("C1").is_member,
+            "the boot overwrite is re-synced after it"
+        );
+        assert!(stored("CEXT").is_member);
+        assert!(!stored("CLEFT").is_member);
     }
 
     #[tokio::test]

@@ -4,17 +4,18 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, ClickEvent, Context, Div, FontWeight, InteractiveElement as _, IntoElement,
+    Anchor, AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement,
     MouseButton, ParentElement as _, Stateful, StatefulInteractiveElement as _, Styled as _, div,
     px,
 };
 
 use super::keys::Tool;
-use super::{Composer, ComposerEvent};
+use super::{AlsoSendTarget, Composer, ComposerEvent};
 use crate::drafts::SendLater;
 use crate::editor::{LineKind, Style};
 
@@ -43,7 +44,11 @@ pub(super) const TOOLBAR: [Slot; 12] = [
     ),
     Slot::Tool("fmt-ul", IconName::List, Tool::Block(LineKind::Bullet)),
     Slot::Divider,
-    Slot::Tool("fmt-quote", IconName::Quote, Tool::Block(LineKind::Quote)),
+    Slot::Tool(
+        "fmt-quote",
+        IconName::TextQuote,
+        Tool::Block(LineKind::Quote),
+    ),
     Slot::Tool("fmt-code", IconName::CodeXml, Tool::Style(Style::CODE)),
     Slot::Tool(
         "fmt-code-block",
@@ -65,8 +70,14 @@ fn control(id: &'static str) -> Stateful<Div> {
 }
 
 impl Composer {
-    /// A button that runs `tool`, lit while the tool is in effect at the caret.
-    pub(super) fn tool_button(&self, slot: &Slot, cx: &mut Context<Self>) -> AnyElement {
+    /// A button that runs `tool`, lit while the tool is in effect at the caret. Like Slack's,
+    /// the toolbar's icons are faint until the draft has focus.
+    pub(super) fn tool_button(
+        &self,
+        slot: &Slot,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let Slot::Tool(id, icon, tool) = slot else {
             return div()
@@ -81,8 +92,10 @@ impl Composer {
         let (color, lit, hover) = (
             if is_active {
                 theme.foreground
-            } else {
+            } else if focused {
                 theme.muted_foreground
+            } else {
+                theme.muted_foreground.opacity(0.5)
             },
             theme.secondary_hover,
             theme.secondary_hover,
@@ -96,6 +109,48 @@ impl Composer {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(move |this, _, window, cx| this.run(tool, window, cx)))
             .into_any_element()
+    }
+
+    /// Slack's "Also send to #channel" checkbox between the reply draft and the action row.
+    pub(super) fn also_send_row(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (target, ticked) = self.also_send.clone()?;
+        let muted = cx.theme().muted_foreground;
+        let label = match target {
+            AlsoSendTarget::Channel { name, private } => h_flex()
+                .gap_1()
+                .items_center()
+                .child("Also send to")
+                .child(
+                    Icon::new(if private {
+                        IconName::Lock
+                    } else {
+                        IconName::Hash
+                    })
+                    .text_color(muted)
+                    .size(px(12.)),
+                )
+                .child(name),
+            AlsoSendTarget::DirectMessage => h_flex().child("Also send as direct message"),
+        };
+        Some(
+            h_flex()
+                .px_3()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(
+                    Checkbox::new("also-send")
+                        .checked(ticked)
+                        .on_click(cx.listener(|this, ticked: &bool, _, cx| {
+                            if let Some((_, state)) = &mut this.also_send {
+                                *state = *ticked;
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(label),
+        )
     }
 
     /// The chevron beside Send: Slack's "Schedule for later" menu.
@@ -131,6 +186,7 @@ impl Composer {
     pub(super) fn action_row(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let (muted, border, hover) = (theme.muted_foreground, theme.border, theme.secondary_hover);
+        let secondary = theme.secondary;
         let (primary, primary_foreground) = (theme.primary, theme.primary_foreground);
         let can_send = !self.editor.doc().is_blank();
         let icon = |name: IconName| Icon::new(name).text_color(muted).size(px(15.));
@@ -145,16 +201,16 @@ impl Composer {
                 .child(label)
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         };
-        let aa = div()
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .child("Aa")
-            .into_any_element();
-        let smiley = div().text_sm().child("\u{1F642}").into_any_element();
+        let aa = div().text_sm().underline().child("Aa").into_any_element();
+        let smiley = icon(IconName::FaceSlightlySmiling).into_any_element();
         let tools = h_flex()
             .items_center()
             .gap_0p5()
-            .child(chrome("act-plus", icon(IconName::Plus).into_any_element()))
+            .child(
+                chrome("act-plus", icon(IconName::Plus).into_any_element())
+                    .rounded_full()
+                    .bg(secondary),
+            )
             .child(chrome("act-format", aa))
             .child(button("act-emoji", smiley).on_click(cx.listener(
                 |_, event: &ClickEvent, _, cx| {
@@ -174,7 +230,7 @@ impl Composer {
             .child(chrome("act-mic", icon(IconName::Mic).into_any_element()))
             .child(separator())
             .child(
-                button("act-slash", icon(IconName::Slash).into_any_element())
+                button("act-slash", icon(IconName::SquareSlash).into_any_element())
                     .on_click(cx.listener(|this, _, window, cx| this.run(Tool::Slash, window, cx))),
             );
         let send = div()

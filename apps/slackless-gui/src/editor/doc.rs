@@ -39,6 +39,11 @@ impl Doc {
         &self.atoms
     }
 
+    /// Whether nothing at all is typed (the textarea shows its placeholder).
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     /// Whether there is nothing to send: only whitespace and block markers.
     pub fn is_blank(&self) -> bool {
         if self.atoms.is_empty() {

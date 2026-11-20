@@ -211,6 +211,12 @@ pub struct Attachment {
     /// The unfurled URL.
     #[serde(default)]
     pub from_url: Option<String>,
+    /// A shared-message unfurl (`is_msg_unfurl`): the conversation the shared message lives
+    /// in, so the UI can name "Thread in <channel>" even when it is not in the local store.
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_msg_unfurl: bool,
     #[serde(default)]
     pub original_url: Option<String>,
     #[serde(default)]

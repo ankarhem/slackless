@@ -45,6 +45,9 @@ const HISTORY_LIMIT: usize = 500;
 /// The store's local-state key for the last open conversation.
 const LAST_CONVERSATION: &str = "last_conversation";
 
+/// The store's local-state key for the window's frame (AppKit restorable state, hex-encoded).
+const WINDOW_STATE: &str = "window_state";
+
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
 struct EventHub;
@@ -168,6 +171,26 @@ impl CoreBridge {
         })
     }
 
+    /// Live mode: a read of `channel`'s newest undeleted top-level message (the DM list's
+    /// preview) to run off the UI thread. `None` offline.
+    pub fn latest(
+        &self,
+        channel: ChannelId,
+    ) -> Option<impl Future<Output = Option<Message>> + Send + 'static> {
+        let team = self.session.as_ref()?.team_id.clone();
+        let store = self.store.clone()?;
+        Some(async move {
+            let store = store.lock().ok()?;
+            match store.latest_messages(&team, std::slice::from_ref(&channel)) {
+                Ok(mut latest) => latest.remove(&channel).map(|stored| stored.message),
+                Err(e) => {
+                    eprintln!("slackless: could not read {channel}'s latest message ({e})");
+                    None
+                }
+            }
+        })
+    }
+
     /// Live mode: a read of one thread's stored history (root + replies, oldest first,
     /// without deleted messages) to run off the UI thread. `None` offline.
     pub fn thread(
@@ -233,6 +256,37 @@ impl CoreBridge {
             };
             if let Err(e) = store.set_local(&team, LAST_CONVERSATION, channel.as_str()) {
                 eprintln!("slackless: could not remember the open conversation ({e})");
+            }
+        })
+    }
+
+    /// The window frame saved by [`Self::remember_window_state`], so the window reopens where
+    /// and how it was left, like Slack's. `None` offline or before the first save.
+    pub fn window_state(&self) -> Option<Vec<u8>> {
+        let team = &self.session.as_ref()?.team_id;
+        let store = self.store.as_ref()?.lock().ok()?;
+        let hex = store.local(team, WINDOW_STATE).ok().flatten()?;
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+            .collect()
+    }
+
+    /// Live mode: a write remembering the window's native state (`Window::native_window_state`),
+    /// to run off the UI thread. `None` offline.
+    pub fn remember_window_state(
+        &self,
+        state: Vec<u8>,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let team = self.session.as_ref()?.team_id.clone();
+        let store = self.store.clone()?;
+        Some(async move {
+            let hex: String = state.iter().map(|byte| format!("{byte:02x}")).collect();
+            let Ok(mut store) = store.lock() else {
+                return;
+            };
+            if let Err(e) = store.set_local(&team, WINDOW_STATE, &hex) {
+                eprintln!("slackless: could not remember the window frame ({e})");
             }
         })
     }

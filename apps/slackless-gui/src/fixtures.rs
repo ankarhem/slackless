@@ -40,10 +40,54 @@ fn base_ts() -> u64 {
     (now / DAY).saturating_sub(2) * DAY + 8 * 3_600
 }
 
-/// Slack's one-click reactions from the user's prefs: none when `show_quick_reactions` is
-/// off, the three customized emoji when set, else Slack's defaults.
+/// `text` with each `:shortcode:` of a standard emoji replaced by its glyph, as Slack's
+/// previews show them; anything else between colons (times, URLs) is kept.
+fn with_glyphs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let emoji = after
+            .find(':')
+            .map(|end| &after[..end])
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-'))
+            })
+            .and_then(|name| crate::emoji::glyph(name).map(|glyph| (name.len(), glyph)));
+        match emoji {
+            Some((len, glyph)) => {
+                out.push_str(glyph);
+                rest = &after[len + 1..];
+            }
+            None => {
+                out.push(':');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Slack's one-click reactions from the user's prefs: none when turned off, the three
+/// customized emoji when set, else Slack's defaults.
 fn quick_reactions(prefs: &crate::blockkit::serde_json::Value) -> Vec<String> {
-    if prefs.get("show_quick_reactions").and_then(|v| v.as_bool()) == Some(false) {
+    // Slack's current client decides by `user_customized_quick_reactions_display_feature`
+    // and ignores the legacy `show_quick_reactions` then (observed: feature 2 with the
+    // legacy pref false shows the defaults on hover); 0 is taken as off. The legacy pref
+    // decides only where the newer one is absent.
+    let shown = match prefs
+        .get("user_customized_quick_reactions_display_feature")
+        .and_then(|v| v.as_u64())
+    {
+        Some(feature) => feature != 0,
+        None => prefs.get("show_quick_reactions").and_then(|v| v.as_bool()) != Some(false),
+    };
+    if !shown {
         return Vec::new();
     }
     let customized = prefs
@@ -81,10 +125,17 @@ pub struct Fixtures {
     pub dms: Vec<Conversation>,
     /// Channel history, oldest first. Thread replies live in `threads`.
     pub messages: HashMap<ChannelId, Vec<Message>>,
+    /// Each DM's latest top-level message: one store query in live mode ([`live`]), the last
+    /// history message in fixture mode. Feeds the DM list's previews, stamps and order
+    /// without loading histories.
+    pub latest: HashMap<ChannelId, Message>,
     /// Replies keyed by `(channel, thread root ts)`, oldest first.
     pub threads: HashMap<(ChannelId, Ts), Vec<Message>>,
     /// Workspace channels the signed-in user has not joined (channel browser only).
     pub directory: Vec<Conversation>,
+    /// Archived channels: never listed, only named (a shared message's "Thread in #old
+    /// (archived)").
+    pub archived: Vec<Conversation>,
     /// Last known presence per user (`presence_change` / `users.getPresence`).
     pub presence: PresenceMap,
     /// Conversations whose notification level is not "All new posts" (the header bell).
@@ -169,6 +220,7 @@ impl Fixtures {
             .iter()
             .chain(&self.dms)
             .chain(&self.directory)
+            .chain(&self.archived)
             .find(|c| c.id == *id)
     }
 
@@ -215,8 +267,8 @@ impl Fixtures {
         }
     }
 
-    /// One-line plain preview of a message: user mentions resolved to `@name`, file-only
-    /// messages described by their first file.
+    /// One-line plain preview of a message: user mentions resolved to `@name`, standard
+    /// `:emoji:` shown as their glyph, file-only messages described by their first file.
     pub fn preview(&self, message: &Message) -> String {
         let mut text = message.text.clone();
         for user in &self.users {
@@ -230,7 +282,7 @@ impl Fixtures {
                 return format!("Shared a file: {}", file.name.as_deref().unwrap_or("file"));
             }
         }
-        text.replace('\n', " ")
+        with_glyphs(&text.replace('\n', " "))
     }
 
     /// Sidebar/header label: `# name` for channels, the other parties' names for DMs.
@@ -240,13 +292,17 @@ impl Fixtures {
                 || conversation.id.to_string(),
                 |u| self.user_name(u).to_owned(),
             ),
-            ConversationKind::Mpim => conversation
-                .members
-                .iter()
-                .filter(|u| **u != self.self_user)
-                .map(|u| self.user_name(u))
-                .collect::<Vec<_>>()
-                .join(", "),
+            // Slack names a group DM by its other people, alphabetically.
+            ConversationKind::Mpim => {
+                let mut names: Vec<&str> = conversation
+                    .members
+                    .iter()
+                    .filter(|u| **u != self.self_user)
+                    .map(|u| self.user_name(u))
+                    .collect();
+                names.sort_by_cached_key(|name| name.to_lowercase());
+                names.join(", ")
+            }
             ConversationKind::PublicChannel | ConversationKind::PrivateChannel => format!(
                 "# {}",
                 conversation
@@ -276,6 +332,20 @@ impl Fixtures {
             ..Default::default()
         }
     }
+}
+
+/// Each conversation's newest history message, the fixture-mode [`Fixtures::latest`].
+fn latest_from_histories(
+    messages: &HashMap<ChannelId, Vec<Message>>,
+) -> HashMap<ChannelId, Message> {
+    messages
+        .iter()
+        .filter_map(|(channel, history)| {
+            history
+                .last()
+                .map(|latest| (channel.clone(), latest.clone()))
+        })
+        .collect()
 }
 
 pub fn load() -> Fixtures {
@@ -824,6 +894,7 @@ pub fn load() -> Fixtures {
         ("G0TRIO".into(), trio),
     ]);
     let threads = HashMap::from([(("C0ENG".into(), eng_thread_root), eng_replies)]);
+    let latest = latest_from_histories(&messages);
 
     Fixtures {
         workspaces,
@@ -832,8 +903,10 @@ pub fn load() -> Fixtures {
         channels,
         dms,
         messages,
+        latest,
         threads,
         directory,
+        archived: Vec::new(),
         presence: Arc::new(RwLock::new(presence)),
         notify_levels: HashMap::new(),
         quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
@@ -854,8 +927,9 @@ pub fn load() -> Fixtures {
 }
 
 /// The signed-in workspace as the local store has it (live mode): its conversations and people.
-/// History is not part of the snapshot; the message list loads it per conversation
-/// ([`crate::bridge::CoreBridge::history`]).
+/// History is not part of the snapshot (the message list loads it per conversation,
+/// [`crate::bridge::CoreBridge::history`]); only each DM's latest message rides along, one
+/// batched store query feeding the DM list.
 pub fn live(
     session: &Session,
     store: &Store,
@@ -870,9 +944,15 @@ pub fn live(
         eprintln!("slackless: could not read people from the local store ({e})");
         Vec::new()
     });
+    // Archived conversations never list; archived channels stay nameable.
+    let (archived, conversations): (Vec<_>, Vec<_>) =
+        conversations.into_iter().partition(|c| c.is_archived);
+    let archived: Vec<Conversation> = archived
+        .into_iter()
+        .filter(|c| !matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim))
+        .collect();
     let (dms, rooms): (Vec<_>, Vec<_>) = conversations
         .into_iter()
-        .filter(|c| !c.is_archived)
         .map(|mut c| {
             // `client.userBoot` omits read cursors; `client.counts` has them.
             if let Some(read) = counts.get(&c.id).and_then(|n| n.last_read.clone()) {
@@ -881,15 +961,40 @@ pub fn live(
             c
         })
         .partition(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim));
-    // Sidebar membership: the stored channel objects are partial and leave `is_member` false
-    // even for joined channels, but `client.counts` lists exactly the sidebar's conversations.
-    // Until counts arrive, every stored channel is listed.
-    let (channels, directory) = rooms
-        .into_iter()
-        .partition(|c| c.is_member || counts.is_empty() || counts.contains_key(&c.id));
-    let dms = dms
+    // Sidebar membership: `client.counts` lists exactly the sidebar's conversations hosted in
+    // this workspace; until counts arrive, every stored channel is listed. Membership
+    // (`users.conversations`) also covers channels joined since, but over-reports Slack Connect
+    // channels the sidebar leaves out, so a shared channel needs counts too - unless another
+    // organization hosts it, as it then never appears in this workspace's counts.
+    let hosted_elsewhere = |c: &Conversation| {
+        c.extra
+            .get("conversation_host_id")
+            .and_then(|host| host.as_str())
+            .is_some_and(|host| host != team.as_str())
+    };
+    let (channels, directory) = rooms.into_iter().partition(|c| {
+        counts.is_empty()
+            || counts.contains_key(&c.id)
+            || (c.is_member && (!c.is_ext_shared || hosted_elsewhere(c)))
+    });
+    let dms: Vec<Conversation> = dms
         .into_iter()
         .filter(|c| c.kind() == ConversationKind::Mpim || c.is_open)
+        .collect();
+    // Each DM's latest top-level message in one query: the DM list's previews, stamps and
+    // order without loading any history.
+    let latest = store
+        .latest_messages(
+            team,
+            &dms.iter().map(|dm| dm.id.clone()).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("slackless: could not read latest DM messages from the local store ({e})");
+            HashMap::new()
+        })
+        .into_iter()
+        // Like Slack, a deleted message never previews: the store skips it for the one before.
+        .map(|(id, stored)| (id, stored.message))
         .collect();
     let domain = session
         .workspace_url
@@ -963,8 +1068,10 @@ pub fn live(
         channels,
         dms,
         messages: HashMap::new(),
+        latest,
         threads: HashMap::new(),
         directory,
+        archived,
         presence: PresenceMap::default(),
         notify_levels: slackless_core::notify_levels(&prefs),
         quick_reactions: quick_reactions(&prefs),
@@ -1090,6 +1197,7 @@ pub fn workspace(index: usize) -> Fixtures {
         ),
     ]);
     fixtures.threads = HashMap::new();
+    fixtures.latest = latest_from_histories(&fixtures.messages);
     fixtures
 }
 

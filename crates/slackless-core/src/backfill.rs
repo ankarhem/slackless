@@ -13,6 +13,7 @@ use crate::api::{ApiError, Page};
 use crate::backend::Backend;
 use crate::client::{CoreError, Emitter, SharedStore, with_store};
 use crate::types::{ChannelId, Message, TeamId, Ts};
+use crate::unfurl::Unfurls;
 
 /// Pause between history pages. `conversations.history` is Tier 3 (~50 requests/minute).
 pub(crate) const PAGE_DELAY: Duration = Duration::from_millis(1200);
@@ -34,13 +35,15 @@ pub(crate) type SyncedMap = Arc<Mutex<HashMap<ChannelId, Synced>>>;
 /// aborting its task: every page is committed before the next is fetched, so an aborted walk
 /// resumes where it stopped on the next run.
 #[derive(Clone)]
-pub(crate) struct Backfill<B> {
+pub(crate) struct Backfill<B: Backend> {
     pub backend: B,
     pub store: SharedStore,
     pub workspace: TeamId,
     pub events: Emitter,
     pub synced: SyncedMap,
     pub page_delay: Duration,
+    /// Names the foreign channels the pages' unfurls point at.
+    pub(crate) unfurls: Unfurls<B>,
 }
 
 impl<B: Backend> Backfill<B> {
@@ -172,6 +175,7 @@ impl<B: Backend> Backfill<B> {
             let next = page
                 .next_cursor
                 .filter(|next| Some(next) != cursor.as_ref());
+            self.unfurls.resolve(page.items.iter());
             let (ws, target) = (self.workspace.clone(), channel.clone());
             with_store(&self.store, move |store| {
                 page.items
@@ -192,6 +196,7 @@ impl<B: Backend> Backfill<B> {
     }
 
     async fn store_page(&self, channel: &ChannelId, items: Vec<Message>) -> Result<(), CoreError> {
+        self.unfurls.resolve(items.iter());
         let (ws, channel) = (self.workspace.clone(), channel.clone());
         with_store(&self.store, move |store| {
             items
@@ -209,7 +214,7 @@ impl<B: Backend> Backfill<B> {
 
 /// Runs `fetch` until it stops hitting a rate limit, waiting Slack's `retry_after` each time
 /// (on top of the API client's own retries; at most [`MAX_RATE_LIMIT_WAITS`] waits).
-async fn wait_out_rate_limits<T, F, Fut>(mut fetch: F) -> Result<T, ApiError>
+pub(crate) async fn wait_out_rate_limits<T, F, Fut>(mut fetch: F) -> Result<T, ApiError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ApiError>>,
@@ -242,11 +247,12 @@ mod tests {
         let (store, events, rx) = fake_core_parts();
         let backfill = Backfill {
             backend: fake.clone(),
-            store,
+            store: Arc::clone(&store),
             workspace: TeamId::from("T1"),
-            events,
+            events: events.clone(),
             synced: SyncedMap::default(),
             page_delay: PAGE_DELAY,
+            unfurls: Unfurls::new(fake.clone(), store, TeamId::from("T1"), events),
         };
         (backfill, rx)
     }
@@ -372,5 +378,56 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(stored_ts(&bf.store).len() < 40);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn history_pages_name_the_channels_their_unfurls_point_at() {
+        use crate::types::{Attachment, Conversation};
+
+        let fake = FakeBackend::default();
+        fake.set_info(Conversation {
+            name: Some("third-line".into()),
+            is_archived: true,
+            ..Default::default()
+        });
+        fake.push_history(1..=1);
+        fake.push_message(Message {
+            ts: Ts::from("2.0"),
+            text: "look at this".into(),
+            attachments: vec![Attachment {
+                is_msg_unfurl: true,
+                channel_id: Some(ChannelId::from("CEXT")),
+                from_url: Some("https://acme.slack.com/archives/CEXT/p1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let (bf, mut rx) = backfill(&fake);
+        bf.clone().run(ChannelId::from("C1")).await;
+
+        // The walk stored its page; the spawned unfurl resolution then announces the foreign
+        // conversation it looked up.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.next()).await {
+                Ok(Some(Event::Conversations(ids))) if ids.contains(&ChannelId::from("CEXT")) => {
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => panic!("the unfurl conversation is never announced"),
+            }
+        }
+        let stored = bf
+            .store
+            .lock()
+            .unwrap()
+            .conversation(&bf.workspace, &ChannelId::from("CEXT"))
+            .unwrap()
+            .expect("the foreign channel lands in the store");
+        assert_eq!(stored.name.as_deref(), Some("third-line"));
+        assert!(stored.is_archived, "the archived flag survives");
+        assert!(
+            !stored.is_member,
+            "a named reference never joins the sidebar"
+        );
     }
 }

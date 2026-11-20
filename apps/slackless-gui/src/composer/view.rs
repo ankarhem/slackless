@@ -1,16 +1,17 @@
 //! The composer's frame: the formatting toolbar over the draft over Slack's action row
 //! (both in `toolbar.rs`), with the completion menu or the link prompt floating above.
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, Textarea};
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
-    Context, Div, InteractiveElement as _, IntoElement, ParentElement as _, Render, Stateful,
-    Styled as _, Window, div, px, relative,
+    Context, Div, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, Stateful, Styled as _, Window, div, px, relative,
 };
 
-use super::Composer;
 use super::tokens::{self, Palette};
 use super::toolbar::TOOLBAR;
+use super::{Composer, Placeholder};
 
 impl Composer {
     /// The link prompt floating above the frame: a URL field for the selected text.
@@ -45,6 +46,16 @@ impl Composer {
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(placeholder) = self.pending_placeholder.take() {
+            let placeholder = match placeholder {
+                Placeholder::Text(text) => {
+                    self.private_placeholder = None;
+                    text
+                }
+                Placeholder::Private(name) => {
+                    self.private_placeholder = Some(name);
+                    SharedString::default()
+                }
+            };
             let input = self.input.clone();
             window.defer(cx, move |window, cx| {
                 input.update(cx, |state, cx| {
@@ -64,12 +75,22 @@ impl Render for Composer {
             });
         }
 
+        // Slack's formatting bar: a shaded band across the top of the box.
+        let focused = self.input.focus_handle(cx).is_focused(window);
+        let band = cx.theme().secondary;
         let toolbar = h_flex()
             .items_center()
             .gap_0p5()
             .px_1p5()
-            .pt_1p5()
-            .children(TOOLBAR.iter().map(|slot| self.tool_button(slot, cx)));
+            .py_1()
+            .rounded_t_lg()
+            .bg(band)
+            .children(
+                TOOLBAR
+                    .iter()
+                    .map(|slot| self.tool_button(slot, focused, cx)),
+            );
+        let also_send = self.also_send_row(cx);
         let actions = self.action_row(cx);
         let overlay = if self.link_open {
             Some(self.link_panel(cx))
@@ -86,6 +107,30 @@ impl Render for Composer {
             .on_paste(move |item, window, cx| {
                 weak.update(cx, |composer, cx| composer.on_paste(item, window, cx))
                     .unwrap_or(false)
+            });
+        // Slack's private-channel prompt, "Message 🔒name", over the empty draft where the
+        // textarea's own (plain-text) placeholder would sit.
+        let muted = cx.theme().muted_foreground;
+        let private_prompt = self
+            .private_placeholder
+            .clone()
+            .filter(|_| self.editor.doc().is_empty())
+            .map(|name| {
+                h_flex()
+                    .absolute()
+                    .top(px(4.))
+                    .left(px(8.))
+                    .items_center()
+                    .gap_1()
+                    .text_color(muted)
+                    .child("Message")
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_px()
+                            .child(Icon::new(IconName::Lock).size(px(12.)).text_color(muted))
+                            .child(name),
+                    )
             });
         let theme = cx.theme();
         div()
@@ -112,7 +157,17 @@ impl Render for Composer {
                     .border_color(theme.input)
                     .bg(theme.background)
                     .child(toolbar)
-                    .child(div().w_full().min_w_0().px_2().py_1().child(draft))
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .child(draft)
+                            .children(private_prompt),
+                    )
+                    .children(also_send)
                     .child(actions),
             )
     }

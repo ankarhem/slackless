@@ -261,6 +261,13 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.danger_foreground = color(0xFF_FF_FF);
         theme.danger_hover = color(0xE8_4A_79);
         theme.danger_active = color(0xB9_1A_4C);
+        // Destructive buttons ("Delete message") are Slack's solid red, not the kit's tint.
+        theme.button_danger = theme.danger;
+        theme.button_danger_foreground = theme.danger_foreground;
+        theme.button_danger_hover = theme.danger_hover;
+        theme.button_danger_active = theme.danger_active;
+        // Slack dims the window behind a modal with a light black wash.
+        theme.overlay = color(0x00_00_00).opacity(0.2);
         theme.success = color(0x2B_AC_76); // presence green
         theme.success_foreground = color(0xFF_FF_FF);
         theme.warning = color(0xEC_B2_2E);
@@ -312,6 +319,11 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.danger_foreground = color(0xFF_FF_FF);
         theme.danger_hover = color(0xE8_4A_79);
         theme.danger_active = color(0xB9_1A_4C);
+        theme.button_danger = theme.danger;
+        theme.button_danger_foreground = theme.danger_foreground;
+        theme.button_danger_hover = theme.danger_hover;
+        theme.button_danger_active = theme.danger_active;
+        theme.overlay = color(0x00_00_00).opacity(0.2);
         theme.success = color(0x2B_AC_76);
         theme.success_foreground = color(0xFF_FF_FF);
         theme.warning = color(0xEC_B2_2E);

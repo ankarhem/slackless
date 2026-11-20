@@ -33,10 +33,10 @@ use gpui_kit::gpui::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::MessageContent;
-use slackless_core::types::{ChannelId, Message, Ts, UserId};
+use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
 
-use crate::actions::{self, ActionHandler, ActionSet, MessageAction};
-use crate::composer::{Composer, ComposerEvent};
+use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
+use crate::composer::{AlsoSendTarget, Composer, ComposerEvent};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
@@ -49,11 +49,19 @@ pub enum ThreadPanelEvent {
     OpenProfile(UserId),
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
-    /// The user replied; the panel has already shown the reply locally.
+    /// The user reacted to, edited or deleted a message of the open thread (already shown
+    /// here); the root posts the change to Slack.
+    Changed {
+        channel: ChannelId,
+        change: MessageChange,
+    },
+    /// The user replied; the panel has already shown the reply locally. `broadcast`: "Also
+    /// send to" was ticked, so the reply posts to the conversation too.
     Reply {
         channel: ChannelId,
         thread_ts: Ts,
         content: MessageContent,
+        broadcast: bool,
     },
     /// An add-reaction control asked for the emoji picker at `position`; the root routes the
     /// pick back through [`ThreadPanel::add_reaction`].
@@ -181,6 +189,18 @@ impl ThreadPanel {
             .get(&channel)
             .and_then(|history| history.iter().find(|m| m.ts == thread_ts))
             .cloned();
+        let target =
+            self.fixtures
+                .conversation(&channel)
+                .map(|conversation| match conversation.kind() {
+                    ConversationKind::Im | ConversationKind::Mpim => AlsoSendTarget::DirectMessage,
+                    kind => AlsoSendTarget::Channel {
+                        name: conversation.name.clone().unwrap_or_default().into(),
+                        private: kind == ConversationKind::PrivateChannel,
+                    },
+                });
+        self.composer
+            .update(cx, |composer, cx| composer.set_also_send(target, cx));
         let key = (channel, thread_ts);
         self.replies = self.fixtures.threads.get(&key).cloned().unwrap_or_default();
         self.thread = Some(key);
@@ -291,10 +311,27 @@ impl ThreadPanel {
     /// Add the signed-in user's `name` reaction if they have not already reacted with it.
     pub fn add_reaction(&mut self, ts: &Ts, name: &str, cx: &mut Context<Self>) {
         let me = self.fixtures.self_user.clone();
-        if let Some(message) = self.message_at_mut(ts) {
-            actions::add_reaction(message, &me, name);
+        let added = self
+            .message_at_mut(ts)
+            .is_some_and(|message| actions::add_reaction(message, &me, name));
+        if added {
+            self.post(
+                MessageChange::React {
+                    ts: ts.clone(),
+                    name: name.to_owned(),
+                    add: true,
+                },
+                cx,
+            );
         }
         cx.notify();
+    }
+
+    /// Hand a change of the open thread's messages to the root, to post to Slack.
+    fn post(&self, change: MessageChange, cx: &mut Context<Self>) {
+        if let Some((channel, _)) = self.thread.clone() {
+            cx.emit(ThreadPanelEvent::Changed { channel, change });
+        }
     }
 
     fn reply(&mut self, content: MessageContent, cx: &mut Context<Self>) {
@@ -308,10 +345,14 @@ impl ThreadPanel {
         message.blocks = content.blocks.clone();
         self.replies.push(message);
         self.reply_hint = false;
+        let broadcast = self
+            .composer
+            .update(cx, |composer, cx| composer.take_also_send(cx));
         cx.emit(ThreadPanelEvent::Reply {
             channel,
             thread_ts,
             content,
+            broadcast,
         });
         cx.notify();
     }
@@ -334,8 +375,18 @@ impl ThreadPanel {
         match action {
             MessageAction::React(name) => self.add_reaction(ts, &name, cx),
             MessageAction::ToggleReaction(name) => {
-                if let Some(message) = self.message_at_mut(ts) {
-                    actions::toggle_reaction(message, &me, &name);
+                let toggled = self
+                    .message_at_mut(ts)
+                    .map(|message| actions::toggle_reaction(message, &me, &name));
+                if let Some(add) = toggled {
+                    self.post(
+                        MessageChange::React {
+                            ts: ts.clone(),
+                            name,
+                            add,
+                        },
+                        cx,
+                    );
                 }
                 cx.notify();
             }
@@ -372,7 +423,17 @@ impl ThreadPanel {
             }
             MessageAction::MarkUnread => self.mark_unread(ts.clone(), cx),
             MessageAction::Edit => self.begin_edit(ts.clone(), window, cx),
-            MessageAction::Delete => self.delete_message(ts, cx),
+            MessageAction::Delete => {
+                let Some(message) = self.message_at_mut(ts).map(|message| message.clone()) else {
+                    return;
+                };
+                let fixtures = self.fixtures.clone();
+                let (this, ts) = (cx.entity().downgrade(), ts.clone());
+                actions::confirm_delete(message, fixtures, window, cx, move |cx| {
+                    // Gone only if the panel itself was dropped meanwhile: nothing to delete.
+                    let _ = this.update(cx, |panel, cx| panel.delete_message(&ts, cx));
+                });
+            }
             MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
         }
     }
@@ -405,7 +466,8 @@ impl ThreadPanel {
         }
         let me = self.fixtures.self_user.clone();
         if let Some(message) = self.message_at_mut(&ts) {
-            actions::apply_edit(message, &me, text);
+            actions::apply_edit(message, &me, text.clone());
+            self.post(MessageChange::Edit { ts, text }, cx);
         }
         self.editing = None;
         cx.notify();
@@ -429,6 +491,7 @@ impl ThreadPanel {
     }
 
     fn delete_message(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        self.post(MessageChange::Delete { ts: ts.clone() }, cx);
         if self.root.as_ref().is_some_and(|root| &root.ts == ts) {
             // Deleting the root discards the whole thread and closes the panel.
             self.root = None;
@@ -576,25 +639,19 @@ impl Render for ThreadPanel {
         let muted = theme.muted_foreground;
         let background = theme.background;
         let danger = theme.danger;
-        let subtitle = self
-            .thread
-            .as_ref()
-            .and_then(|(channel, _)| self.fixtures.conversation(channel))
-            .map(|conversation| self.fixtures.conversation_label(conversation));
-
+        // Slack's header is just the bold title; the conversation is not repeated under it.
         let header = h_flex()
             .justify_between()
+            .items_center()
             .px_4()
             .py_2()
             .border_b_1()
             .border_color(border)
             .child(
-                v_flex()
-                    .gap_0p5()
-                    .child(div().font_weight(FontWeight::BOLD).child("Thread"))
-                    .when_some(subtitle, |column, label| {
-                        column.child(div().text_xs().text_color(muted).child(label))
-                    }),
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .child("Thread"),
             )
             .child(
                 Button::new("close-thread")
@@ -617,31 +674,32 @@ impl Render for ThreadPanel {
                     body = body.child(new_messages_divider(cx));
                 }
                 body = body.child(self.thread_message_row(root, true, cx));
+                // Slack's "16 replies ——" rule under the root; none before the first reply.
                 let new_count = self.unread_new_count();
-                body = body.child(
-                    h_flex()
-                        .items_center()
-                        .gap_2()
-                        .px_4()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(border)
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(format!("{} replies", self.replies.len())),
-                        )
-                        .when(new_count > 0, |row| {
-                            row.child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(danger)
-                                    .child(format!("{new_count} new")),
-                            )
-                        }),
-                );
+                let replies = match self.replies.len() {
+                    1 => "1 reply".to_owned(),
+                    n => format!("{n} replies"),
+                };
+                body = body.when(!self.replies.is_empty(), |body| {
+                    body.child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .px_4()
+                            .py_1()
+                            .child(div().text_xs().text_color(muted).child(replies))
+                            .when(new_count > 0, |row| {
+                                row.child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(danger)
+                                        .child(format!("{new_count} new")),
+                                )
+                            })
+                            .child(div().flex_1().h(px(1.)).bg(border)),
+                    )
+                });
                 for message in &self.replies {
                     if self.unread_after.as_ref() == Some(&message.ts) {
                         body = body.child(new_messages_divider(cx));

@@ -31,13 +31,14 @@ use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Div, Entity, FontWeight, Hsla, ImageSource, IntoElement,
-    ObjectFit, ParentElement as _, SharedString, Styled as _, StyledImage as _, Window, div, img,
-    px,
+    AnyElement, App, AppContext as _, Div, Entity, FontWeight, Hsla, ImageSource,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
 };
-use slackless_core::types::{Attachment, Block, Message, Ts};
+use slackless_core::types::{Attachment, Block, ConversationKind, Message, Ts, UserId};
 
 use crate::actions;
+use crate::avatars;
 use crate::emoji;
 use crate::fixtures::Fixtures;
 use crate::messages;
@@ -56,6 +57,8 @@ pub struct BlockKitState {
     checked: HashMap<String, HashSet<String>>,
     /// Drafts of text inputs; created on first render because a textarea needs the window.
     inputs: HashMap<String, Entity<TextareaState>>,
+    /// Attachments whose long text the user expanded ("Show more"), by message and index.
+    expanded: HashSet<String>,
 }
 
 /// What one message's blocks render with.
@@ -331,6 +334,24 @@ fn options(element: &Json) -> Vec<(String, String)> {
 fn choice(kcx: &KitCx, key: &str, cx: &App) -> Option<String> {
     kcx.kit
         .and_then(|kit| kit.read(cx).choices.get(key).cloned())
+}
+
+/// What Slack shows of a long attachment text until "Show more": its first five lines, at
+/// most 700 characters, cut at a word.
+fn collapsed(text: &str) -> String {
+    let lines = text
+        .match_indices('\n')
+        .nth(4)
+        .map_or(text, |(end, _)| &text[..end]);
+    let head = match lines.char_indices().nth(700) {
+        Some((end, _)) => {
+            let cut = &lines[..end];
+            cut.rfind(char::is_whitespace)
+                .map_or(cut, |word| &cut[..word])
+        }
+        None => lines,
+    };
+    format!("{}…", head.trim_end())
 }
 
 fn set_choice(kit: Option<&Entity<BlockKitState>>, key: &str, value: &str, cx: &mut App) {
@@ -635,7 +656,9 @@ fn text_input(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// A decoded fixture image for `url`, or a framed placeholder carrying the alt text.
+/// The image at `url`: a decoded fixture image, or live, the remote image loaded through the
+/// app's HTTP client; a framed placeholder carrying the alt text while there is none (or it
+/// fails to load).
 fn picture(
     url: Option<&str>,
     alt: &str,
@@ -644,15 +667,33 @@ fn picture(
     kcx: &KitCx,
     cx: &App,
 ) -> AnyElement {
-    if let Some(image) = url.and_then(|url| kcx.fixtures.block_images.get(url)) {
-        return img(ImageSource::Image(image.clone()))
+    let theme = cx.theme();
+    let colors = (theme.border, theme.secondary, theme.muted_foreground);
+    let placeholder = {
+        let alt = alt.to_owned();
+        move || picture_frame(&alt, width, height, colors).into_any_element()
+    };
+    let source = url.and_then(|url| match kcx.fixtures.block_images.get(url) {
+        Some(image) => Some(ImageSource::Image(image.clone())),
+        None if !kcx.fixtures.sample && url.starts_with("https://") => {
+            Some(ImageSource::from(SharedString::from(url.to_owned())))
+        }
+        None => None,
+    });
+    match source {
+        Some(source) => img(source)
             .w(px(width))
             .h(px(height))
             .object_fit(ObjectFit::Contain)
             .rounded_md()
-            .into_any_element();
+            .with_fallback(placeholder)
+            .into_any_element(),
+        None => placeholder(),
     }
-    let theme = cx.theme();
+}
+
+/// The framed stand-in for a missing image: an image glyph over the alt text.
+fn picture_frame(alt: &str, width: f32, height: f32, (border, bg, fg): (Hsla, Hsla, Hsla)) -> Div {
     v_flex()
         .w(px(width))
         .h(px(height))
@@ -661,17 +702,12 @@ fn picture(
         .gap_1()
         .rounded_md()
         .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
+        .border_color(border)
+        .bg(bg)
         .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(
-            Icon::new(IconName::Image)
-                .text_color(theme.muted_foreground)
-                .size(px(16.)),
-        )
+        .text_color(fg)
+        .child(Icon::new(IconName::Image).text_color(fg).size(px(16.)))
         .when(height >= 48., |frame| frame.child(alt.to_owned()))
-        .into_any_element()
 }
 
 /// An `image` element (context, accessory) at `size` px square.
@@ -723,7 +759,235 @@ fn bar_color(color: Option<&str>, cx: &App) -> Hsla {
     }
 }
 
+/// The attachment's own timestamp (`ts`, a number or a numeric string), in Unix seconds.
+fn attachment_secs(attachment: &Attachment) -> Option<i64> {
+    attachment.ts.as_ref().and_then(|ts| {
+        ts.as_i64().or_else(|| {
+            ts.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|secs| secs as i64)
+        })
+    })
+}
+
+/// `text` with Slack's link markup reduced to what it displays: `<url|label>` to `label`,
+/// `<url>` to `url` (footers show links as plain muted text).
+fn link_labels(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open..].find('>').map(|close| open + close) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let inner = &rest[open + 1..close];
+        out.push_str(inner.split_once('|').map_or(inner, |(_, label)| label));
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Slack's card for a shared message link (`is_msg_unfurl`): a bordered box with the author's
+/// avatar, name and day, "Posted in #channel", then the message itself (its blocks when it
+/// has them, else its mrkdwn text — never both, they carry the same words).
+fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    let fixtures = kcx.fixtures;
+    let extra = |key: &str| attachment.extra.get(key).and_then(|value| value.as_str());
+    let name = extra("author_subname")
+        .or(attachment.author_name.as_deref())
+        .unwrap_or_default()
+        .to_owned();
+    // The author's photo; for someone the workspace snapshot lacks, the card's own icon.
+    let author = extra("author_id").map(UserId::from);
+    let avatar = match (&author, attachment.author_icon.as_deref()) {
+        (Some(user), Some(icon)) if fixtures.user(user).is_none() => Some(
+            div()
+                .size(px(36.))
+                .flex_none()
+                .rounded(px(7.))
+                .overflow_hidden()
+                .child(img(SharedString::from(icon.to_owned())).size_full()),
+        ),
+        (Some(user), _) => Some(avatars::user_chip(fixtures, user, 36.)),
+        (None, _) => None,
+    };
+    let day =
+        attachment_secs(attachment).map(|secs| messages::list_stamp(&Ts::new(secs.to_string())));
+    // Slack names where the shared message lives: "Thread in" for a thread's root, else
+    // "Posted in", with the channel's icon and an "(archived)" mark.
+    let thread_root = attachment
+        .extra
+        .get("is_thread_root_unfurl")
+        .and_then(|value| value.as_bool())
+        == Some(true);
+    let posted_in = attachment
+        .channel_id
+        .as_ref()
+        .and_then(|channel| fixtures.conversation(channel))
+        .filter(|conversation| conversation.name.is_some())
+        .map(|conversation| {
+            let icon = if conversation.is_archived {
+                IconName::Archive
+            } else if conversation.kind() == ConversationKind::PrivateChannel {
+                IconName::Lock
+            } else {
+                IconName::Hash
+            };
+            let name = conversation.name.clone().unwrap_or_default();
+            h_flex()
+                .gap_1()
+                .items_center()
+                .text_sm()
+                .text_color(muted)
+                .child(if thread_root {
+                    "Thread in"
+                } else {
+                    "Posted in"
+                })
+                .child(Icon::new(icon).text_color(muted).size(px(12.)))
+                .child(if conversation.is_archived {
+                    format!("{name} (archived)")
+                } else {
+                    name
+                })
+        });
+    let block_ts = Ts::new(format!("{}-att{n}", kcx.ts.as_str()));
+    let nested = KitCx::new(fixtures, kcx.kit, &block_ts);
+    let body: Vec<AnyElement> = if attachment.blocks.is_empty() {
+        attachment
+            .text
+            .as_deref()
+            .map(|text| messages::mrkdwn(text, fixtures, false, false, kcx.text_key(), cx))
+            .map(IntoElement::into_any_element)
+            .into_iter()
+            .collect()
+    } else {
+        attachment
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(ix, block)| messages::render_block(block, ix, &nested, false, cx))
+            .collect()
+    };
+    v_flex()
+        .max_w(px(640.))
+        .min_w_0()
+        .p_3()
+        .gap_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            h_flex().gap_2().items_center().children(avatar).child(
+                v_flex()
+                    .min_w_0()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_baseline()
+                            .child(div().font_weight(FontWeight::BOLD).child(name))
+                            .children(day.map(|day| div().text_xs().text_color(muted).child(day))),
+                    )
+                    .children(posted_in),
+            ),
+        )
+        .children(body)
+}
+
+/// Slack's card for a plain link preview (a page's title, description, site and image): a
+/// bordered box with the text on the left and the image as a thumbnail on the right.
+fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (border, muted) = (theme.border, theme.muted_foreground);
+    let title = attachment.title.clone().map(|title| {
+        let url = attachment
+            .title_link
+            .clone()
+            .or_else(|| attachment.from_url.clone());
+        div()
+            .id(SharedString::from(format!(
+                "bk-{}-att-{n}-link",
+                kcx.ts.as_str()
+            )))
+            .font_weight(FontWeight::BOLD)
+            .when_some(url, |title, url| {
+                title
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+            })
+            .child(title)
+    });
+    let description = attachment
+        .text
+        .as_deref()
+        .map(|text| messages::mrkdwn(text, kcx.fixtures, true, false, kcx.text_key(), cx));
+    let site = attachment.service_name.clone().map(|name| {
+        h_flex()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .text_color(muted)
+            .when_some(attachment.service_icon.clone(), |row, icon| {
+                row.child(
+                    img(SharedString::from(icon))
+                        .flex_none()
+                        .size(px(14.))
+                        .rounded_sm(),
+                )
+            })
+            .child(name)
+    });
+    let thumb = attachment
+        .image_url
+        .as_deref()
+        .or(attachment.thumb_url.as_deref())
+        .map(|url| {
+            div()
+                .flex_none()
+                .p_2()
+                .border_l_1()
+                .border_color(border)
+                .child(picture(Some(url), "", 88., 88., kcx, cx))
+        });
+    h_flex()
+        .max_w(px(640.))
+        .min_w_0()
+        .items_stretch()
+        .rounded_lg()
+        .border_1()
+        .border_color(border)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .p_3()
+                .gap_1()
+                .children(title)
+                .children(description)
+                .children(site),
+        )
+        .children(thumb)
+}
+
 fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div {
+    if attachment.is_msg_unfurl {
+        return message_unfurl(attachment, n, kcx, cx);
+    }
+    // A page preview (no app behind it, no colour bar): Slack's link card.
+    let is_page_preview = attachment.from_url.is_some()
+        && attachment.service_name.is_some()
+        && attachment.color.is_none()
+        && attachment
+            .extra
+            .get("is_app_unfurl")
+            .and_then(|value| value.as_bool())
+            != Some(true);
+    if is_page_preview {
+        return link_unfurl(attachment, n, kcx, cx);
+    }
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let fixtures = kcx.fixtures;
@@ -749,15 +1013,51 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
             None => div().font_weight(FontWeight::SEMIBOLD).child(title.clone()),
         });
     }
-    if let Some(text) = &attachment.text {
+    // Slack shows an attachment's blocks instead of its text when it has both.
+    if let Some(text) = attachment
+        .text
+        .as_ref()
+        .filter(|_| attachment.blocks.is_empty())
+    {
+        // Slack collapses text of 700+ characters or 5+ line breaks behind "Show more";
+        // static cards (no kit state to expand into) show it whole.
+        let key = format!("{}-att-{n}", kcx.ts.as_str());
+        let long = text.chars().count() >= 700 || text.matches('\n').count() >= 5;
+        let expanded = kcx
+            .kit
+            .is_none_or(|kit| kit.read(cx).expanded.contains(&key));
+        let head;
+        let shown = if long && !expanded {
+            head = collapsed(text);
+            &head
+        } else {
+            text
+        };
         body = body.child(messages::mrkdwn(
-            text,
+            shown,
             fixtures,
             false,
             false,
             kcx.text_key(),
             cx,
         ));
+        if let Some(kit) = kcx.kit.filter(|_| long).cloned() {
+            body = body.child(
+                div()
+                    .id(SharedString::from(format!("bk-{key}-more")))
+                    .text_color(cx.theme().link)
+                    .cursor_pointer()
+                    .child(if expanded { "Show less" } else { "Show more" })
+                    .on_click(move |_, _, cx| {
+                        kit.update(cx, |state, cx| {
+                            if !state.expanded.remove(&key) {
+                                state.expanded.insert(key.clone());
+                            }
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
     }
     // Short fields pair up in two columns; long fields take a full row.
     let mut fields = attachment.fields.iter().peekable();
@@ -767,12 +1067,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                 .flex_1()
                 .min_w_0()
                 .when_some(field.title.clone(), |cell, title| {
-                    cell.child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(title),
-                    )
+                    cell.child(div().font_weight(FontWeight::BOLD).child(title))
                 })
                 .when_some(field.value.as_deref(), |cell, value| {
                     cell.child(messages::mrkdwn(
@@ -801,23 +1096,34 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
     if let Some(url) = attachment.image_url.as_deref() {
         body = body.child(picture(Some(url), "attachment image", 360., 160., kcx, cx));
     }
-    let stamp = attachment.ts.as_ref().and_then(|ts| {
-        ts.as_i64().or_else(|| {
-            ts.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|secs| secs as i64)
-        })
-    });
+    // Slack's footer line: the footer icon, then "<footer> | Yesterday at 9:25 AM", its
+    // links shown as their labels.
+    let stamp = attachment_secs(attachment);
     if attachment.footer.is_some() || stamp.is_some() {
         let footer = [
-            attachment.footer.clone(),
-            stamp.map(|secs| messages::list_stamp(&Ts::new(secs.to_string()))),
+            attachment.footer.as_deref().map(link_labels),
+            stamp.map(|secs| messages::day_and_time(&Ts::new(secs.to_string()))),
         ]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
-        .join(" \u{00B7} ");
-        body = body.child(div().text_xs().text_color(muted).child(footer));
+        .join(" | ");
+        body = body.child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .when_some(attachment.footer_icon.clone(), |row, icon| {
+                    row.child(
+                        img(SharedString::from(icon))
+                            .flex_none()
+                            .size(px(16.))
+                            .rounded_sm(),
+                    )
+                })
+                .child(footer),
+        );
     }
 
     v_flex()

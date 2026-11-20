@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::api::{
-    self, ChannelBookmark, ClientCounts, HistoryOpts, MessageContent, Page, PinnedItem,
+    self, ChannelBookmark, ClientCounts, HistoryOpts, ListOpts, MessageContent, Page, PinnedItem,
     PostedMessage, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
 };
 use crate::types::{
-    ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Ts, User, UserId,
-    UserPresence,
+    ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File, Message, Ts, User,
+    UserId, UserPresence,
 };
 
 /// `conversations.history` page size the core requests (Slack max 999).
@@ -31,6 +31,12 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn channel_sections(&self) -> impl Future<Output = api::Result<Vec<ChannelSection>>> + Send;
     /// The workspace's custom emoji (`emoji.list`).
     fn custom_emoji(&self) -> impl Future<Output = api::Result<HashMap<String, String>>> + Send;
+    /// The DMs-tab list (`client.dms`): IMs and MPIMs with per-DM `is_open`, closed DMs
+    /// included. Read-only.
+    fn dm_list(&self) -> impl Future<Output = api::Result<Vec<Conversation>>> + Send;
+    /// The signed-in user's channel memberships (`users.conversations`, public/private,
+    /// unarchived, all pages). Read-only.
+    fn channel_memberships(&self) -> impl Future<Output = api::Result<Vec<Conversation>>> + Send;
     /// One page of channel history, newest first, strictly older than `latest` when set.
     fn history_page(
         &self,
@@ -49,6 +55,17 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Every member id of a conversation (`conversations.members`, all pages). Read-only.
+    fn conversation_members(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<Vec<UserId>>> + Send;
+    /// The newest message of a conversation (`conversations.history`, limit 1). Read-only;
+    /// the DM-list preview backfill uses it for conversations with nothing stored.
+    fn latest_message(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<Option<Message>>> + Send;
     /// A user's do-not-disturb state (`dnd.info`). Read-only.
     fn dnd_info(&self, user: UserId) -> impl Future<Output = api::Result<DndStatus>> + Send;
     /// One user's profile (`users.info`), reaching people `users.list` omits. Read-only.
@@ -68,11 +85,13 @@ pub trait Backend: Clone + Send + Sync + 'static {
     /// A user's current presence (`users.getPresence`). Read-only.
     fn user_presence(&self, user: UserId)
     -> impl Future<Output = api::Result<UserPresence>> + Send;
+    /// `broadcast` also posts a thread reply to the channel (`reply_broadcast`).
     fn post_message(
         &self,
         channel: ChannelId,
         content: MessageContent,
         thread_ts: Option<Ts>,
+        broadcast: bool,
     ) -> impl Future<Output = api::Result<PostedMessage>> + Send;
     fn update_message(
         &self,
@@ -153,6 +172,22 @@ impl Backend for SlackApi {
         self.emoji_list().await
     }
 
+    async fn dm_list(&self) -> api::Result<Vec<Conversation>> {
+        self.client_dms_all().await
+    }
+
+    async fn channel_memberships(&self) -> api::Result<Vec<Conversation>> {
+        let opts = ListOpts {
+            kinds: vec![
+                ConversationKind::PublicChannel,
+                ConversationKind::PrivateChannel,
+            ],
+            exclude_archived: true,
+            limit: Some(1000),
+        };
+        self.users_conversations_all(&opts).await
+    }
+
     async fn history_page(
         &self,
         channel: ChannelId,
@@ -183,6 +218,23 @@ impl Backend for SlackApi {
 
     async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
         self.conversations_info(&channel).await
+    }
+
+    async fn conversation_members(&self, channel: ChannelId) -> api::Result<Vec<UserId>> {
+        self.conversations_members_all(&channel).await
+    }
+
+    async fn latest_message(&self, channel: ChannelId) -> api::Result<Option<Message>> {
+        let opts = HistoryOpts {
+            limit: Some(1),
+            ..Default::default()
+        };
+        Ok(self
+            .conversations_history(&channel, &opts, None)
+            .await?
+            .items
+            .into_iter()
+            .next())
     }
 
     async fn dnd_info(&self, user: UserId) -> api::Result<DndStatus> {
@@ -216,8 +268,9 @@ impl Backend for SlackApi {
         channel: ChannelId,
         content: MessageContent,
         thread_ts: Option<Ts>,
+        broadcast: bool,
     ) -> api::Result<PostedMessage> {
-        self.chat_post_message(&channel, &content, thread_ts.as_ref(), false)
+        self.chat_post_message(&channel, &content, thread_ts.as_ref(), broadcast)
             .await
     }
 

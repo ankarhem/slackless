@@ -100,8 +100,8 @@
 //!   ThreadPanel::open_thread(&self) -> Option<(ChannelId, Ts)>
 //!   ThreadPanel::set_thread(&mut self, ChannelId, Ts, Vec<Message>, &mut Context<Self>)   (live)
 //!   emits ThreadPanelEvent::Close
-//!   emits ThreadPanelEvent::Reply { channel: ChannelId, thread_ts: Ts, text: String }
-//!       (reply already shown in the panel)
+//!   emits ThreadPanelEvent::Reply { channel: ChannelId, thread_ts: Ts, content: MessageContent,
+//!       broadcast: bool }   (reply already shown in the panel; `broadcast`: "Also send to")
 //!   emits ThreadPanelEvent::PickReaction { ts: Ts, position } / ThreadPanelEvent::PickEmoji(position)
 //!   emits ThreadPanelEvent::SlashCommand(Invocation)   (commands other than /shrug)
 //!   ThreadPanel::add_reaction(&mut self, &Ts, name: &str, &mut Context<Self>)
@@ -209,22 +209,22 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     self, Anchor, AppContext as _, ClipboardItem, Context, Div, Edges, Entity, FocusHandle,
     Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
-    ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
-    WindowAppearance, actions, anchored, deferred, div, point, px,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Point, Render,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription,
+    SystemNotification, Window, WindowAppearance, actions, anchored, deferred, div, point, px,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, MessageContent};
 use slackless_core::platform::{self, BadgeSetter, Notifier};
 use slackless_core::types::{ChannelId, Conversation, ConversationKind, File, Message, Ts, UserId};
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
-use crate::actions::notify;
+use crate::actions::{MessageChange, notify};
 use crate::avatars::conversation_avatar;
 use crate::bookmarks;
 use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
-use crate::composer::{self, Composer, ComposerEvent};
+use crate::composer::{self, Composer, ComposerEvent, Placeholder};
 use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
@@ -239,6 +239,7 @@ use crate::pins;
 use crate::preferences::{AppearanceMode, Preferences, PreferencesEvent, Section};
 use crate::profile::{ProfileEvent, ProfilePanel};
 use crate::search::{SearchEvent, SearchView, fixture_archive};
+use crate::search_menu::{SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
 use crate::sidebar::{NavItem, Sidebar, SidebarEvent};
 use crate::slash::{Invocation, SHRUG, SlashKind};
@@ -279,6 +280,11 @@ actions!(
 
 /// How often due Later reminders are checked.
 const REMINDER_POLL: Duration = Duration::from_secs(10);
+
+/// Rail + channel sidebar, measured on Slack desktop (69px rail, 318px sidebar).
+const SIDEBAR_WIDTH: Pixels = px(390.);
+/// The thread / profile / pins panel, measured on Slack desktop.
+const FLEXPANE_WIDTH: Pixels = px(540.);
 
 /// The OS integration the root uses: system notifications and the dock badge.
 trait Os: Notifier + BadgeSetter {}
@@ -335,6 +341,9 @@ pub struct App {
     thread: Entity<ThreadPanel>,
     /// The global search field in the title bar.
     search: Entity<TextareaState>,
+    /// The search pill's dropdown; open while `search_menu_open`.
+    search_menu: Entity<SearchMenu>,
+    search_menu_open: bool,
     /// Results of the last search; shown in place of the message column while `searching`.
     results: Entity<SearchView>,
     searching: bool,
@@ -401,6 +410,10 @@ pub struct App {
     os: Rc<dyn Os>,
     /// The badge count last handed to the dock, so it is only set on change.
     badge: Option<u32>,
+    /// The window title last set, so it is only set on change.
+    window_title: String,
+    /// The pending, debounced save of the window frame (replacing it cancels the last one).
+    window_state_save: gpui::Task<()>,
     /// Live mode: the newest history read started; an overtaken read is dropped.
     history_generation: u64,
     /// Live mode: channels whose stored history has no older page left; the transcript
@@ -417,6 +430,8 @@ pub struct App {
     peer_dnd_paused: HashMap<UserId, bool>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
     member_counts: HashMap<ChannelId, u32>,
+    /// Apps among a channel's members, counted apart from people as Slack's header does.
+    app_counts: HashMap<ChannelId, u32>,
     /// Conversations navigated away from, newest last (Slack's back arrow, Cmd+[).
     back: Vec<ChannelId>,
     /// Conversations stepped back from, newest last (the forward arrow, Cmd+]).
@@ -470,6 +485,7 @@ impl App {
                     .placeholder("Describe what you are looking for")
                     .auto_grow(1, 1)
             });
+            let search_menu = SearchMenu::new(fixtures.clone(), cx);
             let preferences = Preferences::new(window, cx);
             if let Some(appearance) = fixtures.appearance {
                 preferences.update(cx, |prefs, cx| prefs.set_slack_appearance(appearance, cx));
@@ -510,22 +526,48 @@ impl App {
             focus.focus(window, cx);
 
             let subscriptions = vec![
+                cx.observe_window_bounds(window, |this, window, cx| {
+                    this.save_window_state(window, cx);
+                }),
                 bridge.subscribe_in(window, cx, |this: &mut App, event, window, cx| {
                     this.on_core_event(event, window, cx);
                 }),
                 cx.subscribe_in(
                     &search,
                     window,
-                    |this: &mut App, search, event: &InputEvent, _, cx| {
-                        if let InputEvent::PressEnter { .. } = event {
+                    |this: &mut App, search, event: &InputEvent, _, cx| match event {
+                        InputEvent::PressEnter { .. } => {
                             let query = search.read(cx).value().to_string();
-                            this.results
-                                .update(cx, |results, cx| results.run(query, cx));
-                            this.searching = true;
-                            this.drafts_open = false;
-                            this.later_open = false;
+                            this.run_message_search(query, cx);
+                        }
+                        // The pill's text changed while the dropdown is open: refilter it.
+                        InputEvent::Change if this.search_menu_open => {
+                            let value = search.read(cx).value().to_string();
+                            this.search_menu
+                                .update(cx, |menu, cx| menu.set_query(&value, cx));
+                        }
+                        // Focus moved away from the pill (a dialog, another pane): fold it.
+                        InputEvent::Blur if this.search_menu_open => {
+                            this.search_menu_open = false;
                             cx.notify();
                         }
+                        _ => {}
+                    },
+                ),
+                cx.subscribe_in(
+                    &search_menu,
+                    window,
+                    |this: &mut App, _, event: &SearchMenuEvent, window, cx| match event {
+                        SearchMenuEvent::Open(channel) => {
+                            this.search_menu_open = false;
+                            this.select(channel.clone(), cx);
+                            this.focus.focus(window, cx);
+                        }
+                        SearchMenuEvent::Search(query) => {
+                            this.search_menu_open = false;
+                            this.run_message_search(query.clone(), cx);
+                        }
+                        SearchMenuEvent::Dismiss => this.close_search_menu(window, cx),
                     },
                 ),
                 cx.subscribe_in(
@@ -641,6 +683,7 @@ impl App {
                                 channel: channel.clone(),
                                 content: content.clone(),
                                 thread_ts: Some(thread_ts.clone()),
+                                broadcast: false,
                             });
                         }
                         ThreadsEvent::PickEmoji(position) => {
@@ -756,6 +799,8 @@ impl App {
                 composer,
                 thread,
                 search,
+                search_menu,
+                search_menu_open: false,
                 results,
                 searching: false,
                 browser,
@@ -794,6 +839,8 @@ impl App {
                 fixture_bookmarks: HashMap::new(),
                 os: Rc::new(platform::current()),
                 badge: None,
+                window_title: String::new(),
+                window_state_save: gpui::Task::ready(()),
                 history_generation: 0,
                 history_complete: HashSet::new(),
                 thread_generation: 0,
@@ -801,6 +848,7 @@ impl App {
                 presence: fixtures::PresenceMap::default(),
                 peer_dnd_paused: HashMap::new(),
                 member_counts: HashMap::new(),
+                app_counts: HashMap::new(),
                 back: Vec::new(),
                 forward: Vec::new(),
                 recent: Vec::new(),
@@ -886,6 +934,57 @@ impl App {
         });
         self.os.notify(title, body);
         notify(title, body.to_owned(), window, cx);
+    }
+
+    /// Remember the window's frame once it has settled after a move or resize, so the next
+    /// launch reopens it there, like Slack (live mode; a no-op offline or in full screen).
+    fn save_window_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const SETTLE: Duration = Duration::from_millis(500);
+        self.window_state_save = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SETTLE).await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                let write = window
+                    .native_window_state()
+                    .and_then(|state| app.bridge.remember_window_state(state));
+                if let Some(write) = write {
+                    cx.background_executor().spawn(write).detach();
+                }
+            });
+        });
+    }
+
+    /// Slack's window title (Window menu, Mission Control):
+    /// "<conversation> (Channel|DM) - <workspace> - N new items - <app>".
+    fn sync_window_title(&mut self, conversation: Option<&Conversation>, window: &mut Window) {
+        let mut parts = Vec::with_capacity(4);
+        if let Some(conversation) = conversation {
+            let kind = match conversation.kind() {
+                ConversationKind::Im | ConversationKind::Mpim => "DM",
+                ConversationKind::PublicChannel | ConversationKind::PrivateChannel => "Channel",
+            };
+            let label = self.fixtures.conversation_label(conversation);
+            let name = label.strip_prefix("# ").unwrap_or(&label);
+            parts.push(format!("{name} ({kind})"));
+        }
+        if let Some(team) = self
+            .fixtures
+            .workspaces
+            .get(self.workspace)
+            .filter(|team| !team.name.is_empty())
+        {
+            parts.push(team.name.clone());
+        }
+        match self.badge {
+            Some(1) => parts.push("1 new item".to_owned()),
+            Some(n) if n > 1 => parts.push(format!("{n} new items")),
+            _ => {}
+        }
+        parts.push("slackless".to_owned());
+        let title = parts.join(" - ");
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
     }
 
     /// Hand the unread count to the dock badge when it changed (empty badge at zero).
@@ -1140,10 +1239,28 @@ impl App {
 
     /// The composer prompts with the open conversation's name, as Slack does.
     fn sync_composer_placeholder(&mut self, cx: &mut Context<Self>) {
-        let label = self.label(&self.channel).replacen("# ", "#", 1);
-        self.composer.update(cx, |composer, cx| {
-            composer.set_placeholder(format!("Message {label}").into(), cx)
-        });
+        // Slack's note-to-self DM prompts "Jot something down" instead of "Message <you>";
+        // a private channel's prompt carries a lock instead of "#".
+        let placeholder = match self.fixtures.conversation(&self.channel) {
+            Some(c)
+                if c.kind() == ConversationKind::Im
+                    && c.user.as_ref() == Some(&self.fixtures.self_user) =>
+            {
+                Placeholder::Text("Jot something down".into())
+            }
+            Some(c) if c.kind() == ConversationKind::PrivateChannel => {
+                Placeholder::Private(c.name.as_deref().unwrap_or(c.id.as_str()).to_owned().into())
+            }
+            _ => Placeholder::Text(
+                format!(
+                    "Message {}",
+                    self.label(&self.channel).replacen("# ", "#", 1)
+                )
+                .into(),
+            ),
+        };
+        self.composer
+            .update(cx, |composer, cx| composer.set_placeholder(placeholder, cx));
     }
 
     fn push_self_state(&mut self, cx: &mut Context<Self>) {
@@ -1254,6 +1371,30 @@ impl App {
         self.picker = None;
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// Post a reaction, edit or deletion a view already shows to Slack.
+    fn post_change(&self, channel: &ChannelId, change: &MessageChange) {
+        let channel = channel.clone();
+        self.bridge.send(match change {
+            MessageChange::React { ts, name, add } => {
+                let (ts, name) = (ts.clone(), name.clone());
+                if *add {
+                    Command::AddReaction { channel, ts, name }
+                } else {
+                    Command::RemoveReaction { channel, ts, name }
+                }
+            }
+            MessageChange::Edit { ts, text } => Command::EditMessage {
+                channel,
+                ts: ts.clone(),
+                text: text.clone(),
+            },
+            MessageChange::Delete { ts } => Command::DeleteMessage {
+                channel,
+                ts: ts.clone(),
+            },
+        });
     }
 
     /// Route a pick: composers get the emoji, messages a reaction.
@@ -1419,6 +1560,65 @@ impl App {
         self.search
             .update(cx, |search, cx| search.set_value(scope, window, cx));
         self.search.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// Search messages for `query`, showing results in place of the message column. The
+    /// pill's Enter and the dropdown's "Search for ..." row both land here.
+    fn run_message_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.results
+            .update(cx, |results, cx| results.run(query, cx));
+        self.searching = true;
+        self.drafts_open = false;
+        self.later_open = false;
+        cx.notify();
+    }
+
+    /// Open the search pill's dropdown under the pill: the empty-query sections (unreads
+    /// & drafts, recent places) are computed here, once per open.
+    fn open_search_menu(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.search_menu_snapshot(cx);
+        let query = self.search.read(cx).value().to_string();
+        self.search_menu
+            .update(cx, |menu, cx| menu.open(snapshot, &query, cx));
+        self.search_menu_open = true;
+        cx.notify();
+    }
+
+    /// Fold the dropdown and blur the pill (Escape or a click outside it).
+    fn close_search_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_menu_open {
+            return;
+        }
+        self.search_menu_open = false;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// The dropdown's empty-query rows: conversations with unread messages (the sidebar's
+    /// own read state) or a saved draft, then the recently left ones, current excluded —
+    /// it is the place the user is jumping from.
+    fn search_menu_snapshot(&self, cx: &Context<Self>) -> Snapshot {
+        let mut unreads = self.sidebar.read(cx).unread_ids();
+        let drafts = self.drafts.read(cx);
+        for conversation in self.fixtures.channels.iter().chain(&self.fixtures.dms) {
+            if conversation.id != self.channel
+                && !unreads.contains(&conversation.id)
+                && drafts.draft(self.workspace, &conversation.id).is_some()
+            {
+                unreads.push(conversation.id.clone());
+            }
+        }
+        // Slack lists them by latest activity, newest first.
+        unreads.sort_by_cached_key(|id| {
+            std::cmp::Reverse(self.fixtures.counts.get(id).and_then(|n| n.latest.clone()))
+        });
+        let recents = self
+            .recent
+            .iter()
+            .filter(|id| self.fixtures.conversation(id).is_some())
+            .cloned()
+            .collect();
+        Snapshot { unreads, recents }
     }
 
     /// "Leave channel": it drops out of the sidebar at once and the view steps back, as in
@@ -1639,6 +1839,11 @@ impl App {
                 self.reload_live(window, cx)
             }
             Event::Counts(counts) => {
+                let threads = &counts.threads;
+                let (has_unreads, mentions) = (threads.has_unreads, threads.mention_count);
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_thread_counts(has_unreads, mentions, cx)
+                });
                 self.counts = [&counts.channels, &counts.ims, &counts.mpims]
                     .into_iter()
                     .flatten()
@@ -1650,6 +1855,7 @@ impl App {
                 if *channel == self.channel {
                     self.load_history(channel, cx);
                 }
+                self.refresh_dm_latest(channel, cx);
                 // The open thread: a fetched replies page landed, or a live reply arrived.
                 if self.thread_open {
                     let open = self.thread.read(cx).open_thread();
@@ -1692,8 +1898,12 @@ impl App {
             Event::ConversationInfo {
                 channel,
                 num_members: Some(count),
+                num_apps,
             } => {
                 self.member_counts.insert(channel.clone(), *count);
+                if let Some(apps) = num_apps {
+                    self.app_counts.insert(channel.clone(), *apps);
+                }
                 cx.notify();
             }
             Event::PinsLoaded { channel, pins } => {
@@ -1752,6 +1962,8 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.switcher
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.search_menu
+            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
         self.composer
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.threads
@@ -1775,6 +1987,28 @@ impl App {
 
     /// Live mode: show `channel`'s stored history, read off the UI thread. A read that a newer
     /// one overtook, or whose conversation is no longer open, is dropped.
+    /// Live mode: a DM's messages changed (a send, an arrival, an edit or a deletion): re-read
+    /// its newest message off the UI thread so the DM list's preview and order follow, as in
+    /// Slack, without rebuilding the whole snapshot.
+    fn refresh_dm_latest(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        let is_dm = self
+            .fixtures
+            .conversation(channel)
+            .is_some_and(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim));
+        let Some(read) = is_dm.then(|| self.bridge.latest(channel.clone())).flatten() else {
+            return;
+        };
+        let channel = channel.clone();
+        cx.spawn(async move |this, cx| {
+            let latest = cx.background_executor().spawn(read).await;
+            this.update(cx, |app, cx| {
+                app.sidebar
+                    .update(cx, |sidebar, cx| sidebar.set_latest(channel, latest, cx));
+            })
+        })
+        .detach();
+    }
+
     fn load_history(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
         let Some(read) = self.bridge.history(channel.clone(), None) else {
             return;
@@ -2020,6 +2254,9 @@ impl App {
         let fixtures = self.fixtures.clone();
         self.later
             .update(cx, |later, cx| later.seed(index, &fixtures, cx));
+        self.search_menu_open = false;
+        self.search_menu
+            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
         // Before the draft is loaded: its mentions are named from this workspace.
         self.composer
             .update(cx, |composer, cx| composer.set_fixtures(fixtures, cx));
@@ -2267,6 +2504,7 @@ impl App {
             channel: entry.channel.clone(),
             content,
             thread_ts: None,
+            broadcast: false,
         });
         notify(
             "Message sent",
@@ -2370,6 +2608,7 @@ impl App {
             channel,
             content,
             thread_ts: None,
+            broadcast: false,
         });
         // The composer is empty now: drop any saved draft for this conversation.
         self.save_draft(cx);
@@ -2386,6 +2625,7 @@ impl Render for App {
         self.sync_badge(cx);
 
         let conversation = self.fixtures.conversation(&self.channel).cloned();
+        self.sync_window_title(conversation.as_ref(), window);
         let title = conversation
             .as_ref()
             .map(|c| self.fixtures.conversation_label(c))
@@ -2498,11 +2738,13 @@ impl Render for App {
 
         let mut panels = h_resizable("workspace")
             // Like Slack, opening the thread / profile / pins panel narrows the conversation,
-            // never the sidebar.
+            // never the sidebar, and resizing the window only resizes the conversation: the
+            // sidebar and the side panel are fixed at the widths Slack gives them.
             .child(
                 resizable_panel()
-                    .size(px(360.))
+                    .size(SIDEBAR_WIDTH)
                     .size_range(px(360.)..px(640.))
+                    .fixed()
                     .child(self.sidebar.clone()),
             )
             .child(
@@ -2518,15 +2760,17 @@ impl Render for App {
         if self.thread_open {
             panels = panels.child(
                 resizable_panel()
-                    .size(px(380.))
+                    .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
+                    .fixed()
                     .child(self.thread.clone()),
             );
         } else if self.profile_open {
             panels = panels.child(
                 resizable_panel()
-                    .size(px(360.))
+                    .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
+                    .fixed()
                     .child(self.profile.clone()),
             );
         } else if self.pins_open {
@@ -2554,8 +2798,9 @@ impl Render for App {
             let panel = pins::pins_panel(&self.fixtures, pinned, &title, close, cx);
             panels = panels.child(
                 resizable_panel()
-                    .size(px(380.))
+                    .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
+                    .fixed()
                     .child(panel),
             );
         }
@@ -2587,6 +2832,7 @@ impl Render for App {
             )
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.search.read(cx).focus_handle(cx).focus(window, cx);
+                this.open_search_menu(cx);
             }))
             .on_action(cx.listener(|this, _: &NavigateBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _: &NavigateForward, _, cx| this.go_forward(cx)))
@@ -2704,6 +2950,41 @@ impl Render for App {
                     ))
                 },
             )
+            .when(self.search_menu_open, |root| {
+                let bounds = self.search_menu.read(cx).pill_bounds();
+                root.when_some(
+                    (bounds.size.width > px(0.)).then_some(bounds),
+                    |root, bounds| {
+                        // Slack's search panel: hangs from the pill, just as wide, above
+                        // every pane. A press outside it (and outside the pill) folds it.
+                        root.child(deferred(
+                            anchored()
+                                .position(bounds.bottom_left())
+                                .anchor(Anchor::TopLeft)
+                                .snap_to_window_with_margin(Edges::all(px(8.)))
+                                .child(
+                                    div()
+                                        .id("search-menu-overlay")
+                                        .occlude()
+                                        .w(bounds.size.width)
+                                        .on_mouse_down_out(cx.listener(
+                                            |this, event: &MouseDownEvent, window, cx| {
+                                                if !this
+                                                    .search_menu
+                                                    .read(cx)
+                                                    .pill_bounds()
+                                                    .contains(&event.position)
+                                                {
+                                                    this.close_search_menu(window, cx);
+                                                }
+                                            },
+                                        ))
+                                        .child(self.search_menu.clone()),
+                                ),
+                        ))
+                    },
+                )
+            })
     }
 }
 
@@ -2712,9 +2993,9 @@ impl App {
     /// centered search pill, and the workspace chip, theme toggle and help on the right —
     /// the reference screenshot's top row.
     fn global_bar(&mut self, cx: &mut Context<Self>) -> TitleBar {
-        let muted = cx.theme().muted;
         let muted_foreground = cx.theme().muted_foreground;
-        let border = cx.theme().border;
+        // Slack's pill is a translucent shade of the chrome, not a bordered field.
+        let pill = cx.theme().foreground.opacity(0.08);
         let accent = cx.theme().accent;
 
         let this = cx.entity().downgrade();
@@ -2762,28 +3043,63 @@ impl App {
                     }),
             );
 
-        let search_pill = h_flex()
-            .w(px(520.))
-            .max_w_full()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_0p5()
-            .rounded_md()
-            .bg(muted)
-            .border_1()
-            .border_color(border)
+        // The dropdown hangs under the pill: capture its window bounds as it paints
+        // (stored only, never notified — the panel's rows are computed on open and query
+        // change, never per frame).
+        let menu = self.search_menu.downgrade();
+        let search_pill = div()
+            .w(px(820.))
+            .min_w(px(200.))
+            .on_children_prepainted(move |children, _, cx| {
+                if let Some(bounds) = children.first() {
+                    let _ = menu.update(cx, |menu, _| menu.set_pill_bounds(*bounds));
+                }
+            })
             .child(
-                Icon::new(IconName::Search)
-                    .text_color(muted_foreground)
-                    .size(px(14.)),
-            )
-            .child(
-                div().flex_1().min_w_0().text_sm().child(
-                    Textarea::new(&self.search)
-                        .appearance(false)
-                        .bordered(false),
-                ),
+                h_flex()
+                    .w_full()
+                    .h(px(26.))
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .rounded(px(6.))
+                    .bg(pill)
+                    // While the dropdown is open its keys steer it, not the field's caret.
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if !this.search_menu_open {
+                            return;
+                        }
+                        if this
+                            .search_menu
+                            .update(cx, |menu, cx| menu.handle_key(event, cx))
+                        {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    // Like Slack, a click anywhere on the pill focuses search (and never
+                    // drags the window, as the rest of the title bar does) and opens the
+                    // dropdown under it.
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            window.prevent_default();
+                            this.search.read(cx).focus_handle(cx).focus(window, cx);
+                            this.open_search_menu(cx);
+                        }),
+                    )
+                    .child(
+                        Icon::new(IconName::Search)
+                            .text_color(muted_foreground)
+                            .size(px(14.)),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().text_sm().child(
+                            Textarea::new(&self.search)
+                                .appearance(false)
+                                .bordered(false),
+                        ),
+                    ),
             );
 
         // Slack's top-right status button: the status emoji (a plain face while none is set)
@@ -2811,33 +3127,39 @@ impl App {
             )
             .on_click(cx.listener(|this, _, window, cx| this.open_status_picker(window, cx)));
 
-        TitleBar::new().child(
+        // Slack's 40px top bar: the history arrows hug the left of a search pill centred in
+        // the window (the right padding mirrors the traffic lights' inset on the left), with
+        // status and help pinned to the right edge.
+        TitleBar::new().h(px(40.)).child(
             h_flex()
+                .relative()
                 .flex_1()
+                .h_full()
                 .items_center()
-                .gap_2()
-                .pr_2()
-                .child(nav)
+                .pr(px(80.))
+                .child(h_flex().flex_1().min_w_0().justify_end().pr_2().child(nav))
+                .child(search_pill)
+                .child(div().flex_1().min_w_0())
                 .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .justify_center()
-                        .child(search_pill),
-                )
-                .child(
-                    h_flex().items_center().gap_1().child(status_button).child(
-                        chrome_icon(
-                            "help",
-                            IconName::CircleQuestionMark,
-                            muted_foreground,
-                            accent,
-                        )
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_shortcuts(window, cx)),
+                    h_flex()
+                        .absolute()
+                        .right_2()
+                        .top_0()
+                        .h_full()
+                        .items_center()
+                        .gap_1()
+                        .child(status_button)
+                        .child(
+                            chrome_icon(
+                                "help",
+                                IconName::CircleQuestionMark,
+                                muted_foreground,
+                                accent,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_shortcuts(window, cx)),
+                            ),
                         ),
-                    ),
                 ),
         )
     }
@@ -2903,7 +3225,23 @@ impl App {
                 ConversationKind::PublicChannel | ConversationKind::PrivateChannel
             )
         });
+        // Slack's tile shows the emoji of the sidebar section holding the channel, else "#".
+        let section_emoji = channel.and_then(|c| {
+            self.fixtures
+                .sections
+                .iter()
+                .find(|section| !section.emoji.is_empty() && section.channel_ids.contains(&c.id))
+                .map(|section| section.emoji.as_str())
+                .filter(|emoji| {
+                    crate::emoji::display_glyph(emoji).is_some()
+                        || self.fixtures.custom_emoji(emoji).is_some()
+                })
+        });
         let channel_tile = channel.map(|_| {
+            let glyph = match section_emoji {
+                Some(emoji) => crate::emoji::emoji_element(emoji, &self.fixtures, px(16.)),
+                None => "#".into_any_element(),
+            };
             h_flex()
                 .id("hdr-channel-tile")
                 .size(px(24.))
@@ -2914,7 +3252,7 @@ impl App {
                 .bg(cx.theme().secondary)
                 .text_color(muted_foreground)
                 .text_size(px(14.))
-                .child("#")
+                .child(glyph)
         });
         let channel_lock = channel.filter(|c| c.is_private).map(|_| {
             Icon::new(IconName::Lock)
@@ -2945,17 +3283,37 @@ impl App {
                     .text_sm()
                     .text_color(muted_foreground)
                     .child(
-                        Icon::new(IconName::Users)
+                        Icon::new(IconName::User)
                             .text_color(muted_foreground)
-                            .size(px(14.)),
+                            .size(px(16.)),
                     )
                     .child(count.to_string())
+            });
+        // Slack counts the channel's apps apart: "👤 13  ⊞ 4".
+        let apps = conversation
+            .and_then(|c| self.app_counts.get(&c.id).copied())
+            .filter(|&apps| apps > 0)
+            .map(|apps| {
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .text_color(muted_foreground)
+                    .child(
+                        Icon::new(IconName::LayoutGrid)
+                            .text_color(muted_foreground)
+                            .size(px(16.)),
+                    )
+                    .child(apps.to_string())
             });
 
         // IMs: the peer avatar + name open the peer's profile, as in Slack.
         let peer_user = conversation
             .filter(|c| c.kind() == ConversationKind::Im)
             .and_then(|c| c.user.clone());
+        // Slack offers no huddle with yourself.
+        let can_huddle = peer_user.as_ref() != Some(&self.fixtures.self_user);
         // Slack keeps the whole name; the topic after it truncates instead.
         let name = h_flex()
             .id("hdr-peer")
@@ -2999,24 +3357,28 @@ impl App {
             })
             .child(div().flex_1())
             .children(members)
+            .children(apps)
             .child(
                 h_flex()
                     .items_center()
                     .gap_1()
-                    .child(
-                        chrome_icon(
-                            "hdr-huddle",
-                            IconName::Headphones,
-                            if huddle_here {
-                                success
-                            } else {
-                                muted_foreground
-                            },
-                            accent,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx))),
-                    )
-                    .child(self.huddle_menu(cx))
+                    .when(can_huddle, |actions| {
+                        actions
+                            .child(
+                                chrome_icon(
+                                    "hdr-huddle",
+                                    IconName::Headphones,
+                                    if huddle_here {
+                                        success
+                                    } else {
+                                        muted_foreground
+                                    },
+                                    accent,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx))),
+                            )
+                            .child(self.huddle_menu(cx))
+                    })
                     .child(self.notify_menu(conversation, cx))
                     .child(
                         chrome_icon("hdr-search", IconName::Search, muted_foreground, accent)
@@ -3235,6 +3597,7 @@ fn subscribe_workspace(
                     this.open_thread(channel.clone(), thread_ts.clone(), cx);
                 }
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
+                MessageListEvent::Changed { channel, change } => this.post_change(channel, change),
                 MessageListEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                 MessageListEvent::Forward(link) => this.open_compose(link, window, cx),
                 MessageListEvent::NeedHistorySince { channel, since } => {
@@ -3277,17 +3640,20 @@ fn subscribe_workspace(
                     channel,
                     thread_ts,
                     content,
+                    broadcast,
                 } => {
                     this.bridge.send(Command::SendMessage {
                         channel: channel.clone(),
                         content: content.clone(),
                         thread_ts: Some(thread_ts.clone()),
+                        broadcast: *broadcast,
                     });
                 }
                 ThreadPanelEvent::SlashCommand(invocation) => {
                     this.run_slash(invocation, window, cx)
                 }
                 ThreadPanelEvent::Later(request) => this.save_for_later(request, cx),
+                ThreadPanelEvent::Changed { channel, change } => this.post_change(channel, change),
             },
         ),
         cx.subscribe_in(

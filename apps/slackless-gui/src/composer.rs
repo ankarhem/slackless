@@ -53,6 +53,23 @@ pub enum ComposerEvent {
     EditLast,
 }
 
+/// Where the thread composer's "Also send" checkbox posts the reply as well.
+#[derive(Clone)]
+pub enum AlsoSendTarget {
+    /// "Also send to #name" (a lock instead of `#` for a private channel).
+    Channel { name: SharedString, private: bool },
+    /// "Also send as direct message".
+    DirectMessage,
+}
+
+/// What the composer prompts with while empty.
+pub enum Placeholder {
+    /// Plain text: "Message #general", "Jot something down".
+    Text(SharedString),
+    /// A private channel's "Message 🔒name", the lock drawn as Slack's icon.
+    Private(SharedString),
+}
+
 pub struct Composer {
     /// The textarea the draft is typed in.
     input: Entity<TextareaState>,
@@ -72,12 +89,17 @@ pub struct Composer {
     /// window): a draft was loaded.
     is_stale: bool,
     /// A placeholder to apply on the next frame (setting it needs the window).
-    pending_placeholder: Option<SharedString>,
+    pending_placeholder: Option<Placeholder>,
+    /// The private channel the prompt names: drawn with its lock over the empty draft, as a
+    /// textarea placeholder is plain text.
+    private_placeholder: Option<SharedString>,
     /// Preferences > Messages & media: Enter sends (Shift+Enter newline) when true; when
     /// false Enter inserts a newline and Cmd+Enter sends.
     enter_sends: bool,
     /// Whether the "Schedule for later" chevron is offered.
     scheduling: bool,
+    /// The thread composer's "Also send" checkbox: its target and whether it is ticked.
+    also_send: Option<(AlsoSendTarget, bool)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -134,15 +156,17 @@ impl Composer {
                 palette: None,
                 is_stale: false,
                 pending_placeholder: None,
+                private_placeholder: None,
                 enter_sends: true,
                 scheduling: true,
+                also_send: None,
                 _subscriptions: subscriptions,
             }
         })
     }
 
     /// Prompt with `placeholder` while empty ("Message #general"); applied on the next frame.
-    pub fn set_placeholder(&mut self, placeholder: SharedString, cx: &mut Context<Self>) {
+    pub fn set_placeholder(&mut self, placeholder: Placeholder, cx: &mut Context<Self>) {
         self.pending_placeholder = Some(placeholder);
         cx.notify();
     }
@@ -151,6 +175,21 @@ impl Composer {
     pub fn set_scheduling(&mut self, scheduling: bool, cx: &mut Context<Self>) {
         self.scheduling = scheduling;
         cx.notify();
+    }
+
+    /// Show Slack's "Also send to…" checkbox (unticked) under the draft, or hide it.
+    pub fn set_also_send(&mut self, target: Option<AlsoSendTarget>, cx: &mut Context<Self>) {
+        self.also_send = target.map(|target| (target, false));
+        cx.notify();
+    }
+
+    /// Whether "Also send" was ticked for the reply just sent; like Slack, it unticks.
+    pub fn take_also_send(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((_, ticked)) = &mut self.also_send else {
+            return false;
+        };
+        cx.notify();
+        std::mem::take(ticked)
     }
 
     /// Complete and name people, channels and emoji from `fixtures`.

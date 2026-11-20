@@ -43,7 +43,7 @@ use slackless_core::types::rich_text::{
 };
 use slackless_core::types::{Block, ChannelId, Message, MessageSubtype, TextStyle, Ts, UserId};
 
-use crate::actions::{self, ActionHandler, ActionSet, MessageAction};
+use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
 use crate::blockkit::{self, BlockKitState, KitCx};
 use crate::emoji;
 use crate::fixtures::Fixtures;
@@ -105,6 +105,12 @@ pub enum MessageListEvent {
     },
     /// Save for later / Remind me / unsave; the root keeps the Later list.
     Later(SaveRequest),
+    /// The user reacted to, edited or deleted a message in `channel` (already shown here);
+    /// the root posts the change to Slack.
+    Changed {
+        channel: ChannelId,
+        change: MessageChange,
+    },
     /// The transcript scrolled to (near) the top of `channel`; the root reads the next older
     /// page from the store, strictly older than `before` (the oldest message shown). Emitted
     /// at most once per oldest message until the window refreshes.
@@ -359,8 +365,15 @@ impl MessageList {
             .messages
             .get_mut(channel)
             .and_then(|history| history.iter_mut().find(|message| &message.ts == ts));
-        if let Some(message) = message {
-            actions::add_reaction(message, &me, name);
+        if message.is_some_and(|message| actions::add_reaction(message, &me, name)) {
+            cx.emit(MessageListEvent::Changed {
+                channel: channel.clone(),
+                change: MessageChange::React {
+                    ts: ts.clone(),
+                    name: name.to_owned(),
+                    add: true,
+                },
+            });
         }
         if *channel == self.channel {
             self.refresh(cx);
@@ -445,7 +458,15 @@ impl MessageList {
             MessageAction::React(name) => self.add_reaction(&channel, ts, &name, cx),
             MessageAction::ToggleReaction(name) => {
                 if let Some(message) = self.current_mut(ts) {
-                    actions::toggle_reaction(message, &me, &name);
+                    let add = actions::toggle_reaction(message, &me, &name);
+                    cx.emit(MessageListEvent::Changed {
+                        channel,
+                        change: MessageChange::React {
+                            ts: ts.clone(),
+                            name,
+                            add,
+                        },
+                    });
                 }
                 self.refresh(cx);
             }
@@ -484,7 +505,18 @@ impl MessageList {
             }
             MessageAction::MarkUnread => self.mark_unread(ts, cx),
             MessageAction::Edit => self.begin_edit(ts, window, cx),
-            MessageAction::Delete => self.delete(ts, cx),
+            MessageAction::Delete => {
+                let data = self.data.read(cx);
+                let Some(message) = data.messages.iter().find(|m| &m.ts == ts).cloned() else {
+                    return;
+                };
+                let fixtures = data.fixtures.clone();
+                let (this, ts) = (cx.entity().downgrade(), ts.clone());
+                actions::confirm_delete(message, fixtures, window, cx, move |cx| {
+                    // Gone only if the list itself was dropped meanwhile: nothing to delete.
+                    let _ = this.update(cx, |list, cx| list.delete(&ts, cx));
+                });
+            }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
         }
     }
@@ -661,7 +693,14 @@ impl MessageList {
         }
         let me = self.fixtures.self_user.clone();
         if let Some(message) = self.current_mut(&ts) {
-            actions::apply_edit(message, &me, text);
+            actions::apply_edit(message, &me, text.clone());
+            cx.emit(MessageListEvent::Changed {
+                channel: self.channel.clone(),
+                change: MessageChange::Edit {
+                    ts: ts.clone(),
+                    text,
+                },
+            });
         }
         self.data.update(cx, |data, _| data.editing = None);
         self.refresh(cx);
@@ -677,6 +716,10 @@ impl MessageList {
         if let Some(history) = self.messages.get_mut(&self.channel) {
             history.retain(|message| &message.ts != ts);
         }
+        cx.emit(MessageListEvent::Changed {
+            channel: self.channel.clone(),
+            change: MessageChange::Delete { ts: ts.clone() },
+        });
         let row = self
             .data
             .read(cx)
@@ -768,10 +811,15 @@ fn transcript_row(
     let previous = ix.checked_sub(1).map(|previous| &messages[previous]);
 
     let date_break = previous.is_none_or(|prev| day_index(&prev.ts) != day_index(&message.ts));
+    // Like Slack, your own messages never count as new: the line goes above the first unread
+    // message from someone else (the scan back only crosses this conversation's unread tail).
+    let own = |m: &Message| m.user.as_ref() == Some(&fixtures.self_user);
     let new_break = match store.last_read.as_ref() {
-        Some(read) if !date_break => {
-            &message.ts > read && previous.is_none_or(|prev| &prev.ts <= read)
-        }
+        Some(read) if !date_break && &message.ts > read && !own(message) => messages[..ix]
+            .iter()
+            .rev()
+            .take_while(|prev| &prev.ts > read)
+            .all(own),
         _ => false,
     };
     let grouped =
@@ -816,6 +864,7 @@ fn transcript_row(
         body = body.child(message_header(
             message,
             &author,
+            format_clock(&message.ts),
             fixtures,
             Some(&handler),
             cx,
@@ -832,10 +881,13 @@ fn transcript_row(
         ));
     } else {
         let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts);
+        // The root as loaded here, so an edit to it shows as in Slack; else the copy the
+        // broadcast carries.
         let broadcast_root = message
             .root
             .as_deref()
-            .filter(|_| message.subtype == Some(MessageSubtype::ThreadBroadcast));
+            .filter(|_| message.subtype == Some(MessageSubtype::ThreadBroadcast))
+            .map(|root| messages.iter().find(|m| m.ts == root.ts).unwrap_or(root));
         if let Some(root) = broadcast_root.filter(|_| !grouped) {
             body = body.child(
                 h_flex()
@@ -1022,7 +1074,14 @@ pub fn message_row(
         .min_w_0()
         .gap_0p5()
         .text_sm()
-        .child(message_header(message, &author, fixtures, handler, cx))
+        .child(message_header(
+            message,
+            &author,
+            card_stamp(&message.ts),
+            fixtures,
+            handler,
+            cx,
+        ))
         .child(message_body(message, &kcx, cx));
     if let Some(files) = crate::files::attachments(fixtures, message, cx) {
         body = body.child(files);
@@ -1074,6 +1133,7 @@ fn profile_link(
 fn message_header(
     message: &Message,
     author: &str,
+    stamp: String,
     fixtures: &Fixtures,
     handler: Option<&actions::ActionHandler>,
     cx: &App,
@@ -1116,12 +1176,7 @@ fn message_header(
                 ))
                 .children(status),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(format_clock(&message.ts)),
-        )
+        .child(div().text_xs().text_color(muted).child(stamp))
 }
 
 /// Slack's day divider: a full-width rule with the day's pill (label, then a chevron) on it.
@@ -1348,8 +1403,8 @@ fn flags(style: Option<&TextStyle>) -> RunFlags {
     }
 }
 
-/// One inline chunk of a paragraph: styled text (with its clickable link ranges) or a custom
-/// emoji image.
+/// One inline chunk of a paragraph: styled text (with its clickable link ranges), a custom
+/// emoji image, or a link chip.
 enum Segment {
     Text {
         text: String,
@@ -1357,6 +1412,12 @@ enum Segment {
         links: Vec<(Range<usize>, String)>,
     },
     Image(ImageSource),
+    /// Slack's chip for a link labelled with its own address: a link icon and the label on a
+    /// tinted pill.
+    Chip {
+        url: String,
+        label: String,
+    },
 }
 
 /// Accumulates a paragraph's styled text and link ranges, split only at inline images.
@@ -1406,7 +1467,8 @@ impl ParagraphBuilder {
     }
 
     /// A link inside the paragraph's text: a link-colored run, clickable through its range.
-    /// A bare URL (label equal to the URL) gets Slack's chip look: no scheme, tinted wash.
+    /// Like Slack, a URL posted bare shows as itself, scheme and all, while a link labelled
+    /// with its own address minus the scheme (`github.com/…`) gets the tinted chip look.
     fn push_link(&mut self, url: String, label: String, theme: &RunTheme) {
         let address = |s: &str| {
             s.split_once("://")
@@ -1414,19 +1476,13 @@ impl ParagraphBuilder {
                 .trim_end_matches('/')
                 .to_owned()
         };
-        // Labelled with its own address (with or without the scheme): Slack's link chip.
-        let bare = address(&label) == address(&url);
-        let label = if bare {
-            url.split_once("://")
-                .map_or(url.as_str(), |(_, rest)| rest)
-                .trim_end_matches('/')
-                .to_owned()
-        } else {
-            label
-        };
+        if label != url && address(&label) == address(&url) {
+            self.flush();
+            self.segments.push(Segment::Chip { url, label });
+            return;
+        }
         let start = self.text.len();
-        let bg = bare.then_some(theme.code_bg);
-        self.push_text(&label, theme, RunFlags::default(), Some(theme.link), bg);
+        self.push_text(&label, theme, RunFlags::default(), Some(theme.link), None);
         self.links.push((start..self.text.len(), url));
     }
 
@@ -1461,31 +1517,103 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
     let single = segments.len() == 1;
     let mut row = h_flex().min_w_0().flex_wrap();
     for (n, segment) in segments.into_iter().enumerate() {
-        let text = match segment {
-            Segment::Text { text, runs, links } if links.is_empty() => {
-                StyledText::new(text).with_runs(runs).into_any_element()
-            }
-            Segment::Text { text, runs, links } => {
-                let mut hasher = DefaultHasher::new();
-                text.hash(&mut hasher);
-                let id = format!("text-{}-{paragraph}-{n}-{:x}", theme.key, hasher.finish());
-                let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
-                let styled = StyledText::new(text).with_runs(runs);
-                InteractiveText::new(SharedString::from(id), styled)
-                    .on_click(ranges, move |ix, _, cx| cx.open_url(&urls[ix]))
-                    .into_any_element()
+        match segment {
+            Segment::Text {
+                mut text,
+                mut runs,
+                mut links,
+            } => {
+                // In a row mixed with chips or images, a line break at a text's edge must end
+                // the row: inside the text it would only add an empty line to its own box.
+                let (lead, trail) = if single {
+                    (false, false)
+                } else {
+                    trim_breaks(&mut text, &mut runs, &mut links)
+                };
+                let element = (!text.is_empty()).then(|| {
+                    if links.is_empty() {
+                        return StyledText::new(text).with_runs(runs).into_any_element();
+                    }
+                    let mut hasher = DefaultHasher::new();
+                    text.hash(&mut hasher);
+                    let id = format!("text-{}-{paragraph}-{n}-{:x}", theme.key, hasher.finish());
+                    let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+                    let styled = StyledText::new(text).with_runs(runs);
+                    InteractiveText::new(SharedString::from(id), styled)
+                        .on_click(ranges, move |ix, _, cx| cx.open_url(&urls[ix]))
+                        .into_any_element()
+                });
+                if single {
+                    return div().w_full().min_w_0().children(element);
+                }
+                if lead {
+                    row = row.child(div().w_full().h_0());
+                }
+                if let Some(element) = element {
+                    row = row.child(div().min_w_0().child(element));
+                }
+                if trail {
+                    row = row.child(div().w_full().h_0());
+                }
             }
             Segment::Image(image) => {
                 row = row.child(img(image).flex_none().size(px(INLINE_EMOJI)).rounded_sm());
                 continue;
             }
-        };
-        if single {
-            return div().w_full().min_w_0().child(text);
+            Segment::Chip { url, label } => {
+                let id = format!("chip-{}-{paragraph}-{n}", theme.key);
+                row = row.child(
+                    h_flex()
+                        .id(SharedString::from(id))
+                        .min_w_0()
+                        .items_center()
+                        .gap_0p5()
+                        .px_0p5()
+                        .rounded_sm()
+                        .bg(theme.link.opacity(0.1))
+                        .text_color(theme.link)
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .child(
+                            Icon::new(IconName::Link)
+                                .flex_none()
+                                .size(px(12.))
+                                .text_color(theme.link),
+                        )
+                        .child(label),
+                );
+            }
         }
-        row = row.child(div().min_w_0().child(text));
     }
     row
+}
+
+/// Strip one line break from each edge of a text segment (keeping its runs and link ranges in
+/// step) and report which edges had one.
+fn trim_breaks(
+    text: &mut String,
+    runs: &mut Vec<TextRun>,
+    links: &mut [(Range<usize>, String)],
+) -> (bool, bool) {
+    let trail = text.ends_with('\n');
+    if trail {
+        text.pop();
+        if let Some(last) = runs.last_mut() {
+            last.len -= 1;
+        }
+    }
+    let lead = text.starts_with('\n');
+    if lead {
+        text.remove(0);
+        if let Some(first) = runs.first_mut() {
+            first.len -= 1;
+        }
+        for (range, _) in links.iter_mut() {
+            *range = range.start.saturating_sub(1)..range.end.saturating_sub(1);
+        }
+    }
+    runs.retain(|run| run.len > 0);
+    (lead, trail)
 }
 
 fn paragraph(
@@ -1516,7 +1644,10 @@ fn push_element(
 ) {
     match element {
         RichTextElement::Text(el) => {
-            builder.push_text(&el.text, theme, flags(el.style.as_ref()), None, None);
+            // Inline code gets the same wash as mrkdwn's backticks.
+            let run = flags(el.style.as_ref());
+            let bg = run.code.then_some(theme.code_bg);
+            builder.push_text(&el.text, theme, run, None, bg);
         }
         RichTextElement::Link(el) => {
             let label = el.text.clone().unwrap_or_else(|| el.url.clone());
@@ -1854,6 +1985,20 @@ pub(crate) fn mrkdwn(
         }))
 }
 
+/// A one-paragraph mrkdwn preview (the DM list): formatting, links and emoji as the
+/// transcript renders them, plain runs in `color`, line breaks flattened.
+pub(crate) fn mrkdwn_preview(
+    text: &str,
+    fixtures: &Fixtures,
+    color: Hsla,
+    key: String,
+    cx: &App,
+) -> Div {
+    let mut theme = RunTheme::from_app(cx, key.into());
+    theme.foreground = color;
+    mrkdwn_line(&text.replace('\n', " "), fixtures, &theme, false).unwrap_or_else(div)
+}
+
 fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme, edited: bool) -> Option<Div> {
     let mut builder = ParagraphBuilder::new();
     let mut run = RunFlags::default();
@@ -1892,14 +2037,17 @@ fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme, edited: bool) 
     Some(render_segments(segments, theme))
 }
 
-/// Plain mrkdwn text with Slack's three HTML escapes undone; inline code gets its wash.
-fn push_mrkdwn_text(builder: &mut ParagraphBuilder, text: &str, theme: &RunTheme, run: RunFlags) {
-    let text = text
-        .replace("&lt;", "<")
+/// `text` with Slack's three mrkdwn HTML escapes undone.
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
         .replace("&gt;", ">")
-        .replace("&amp;", "&");
+        .replace("&amp;", "&")
+}
+
+/// Plain mrkdwn text with Slack's HTML escapes undone; inline code gets its wash.
+fn push_mrkdwn_text(builder: &mut ParagraphBuilder, text: &str, theme: &RunTheme, run: RunFlags) {
     let bg = run.code.then_some(theme.code_bg);
-    builder.push_text(&text, theme, run, None, bg);
+    builder.push_text(&unescape(text), theme, run, None, bg);
 }
 
 /// Open or close the style `marker` stands for. A marker opens at a word start when a closing
@@ -1984,7 +2132,7 @@ fn angle_token(
             );
         }
     } else if target.contains("://") || target.starts_with("mailto:") {
-        builder.push_link(target.to_owned(), label.unwrap_or(target).to_owned(), theme);
+        builder.push_link(unescape(target), unescape(label.unwrap_or(target)), theme);
     } else {
         return None;
     }
@@ -2122,12 +2270,45 @@ pub(crate) fn local_offset_now() -> i64 {
 }
 
 /// Compact stamp for list rows (DM list, activity, search): the clock time for today's
-/// messages, the divider's day label otherwise.
+/// messages, just the weekday within the past week ("Monday"), the divider's day label
+/// otherwise.
 pub(crate) fn list_stamp(ts: &Ts) -> String {
     let now = CivilTime::now();
+    match ts.secs().map(CivilTime::from_unix) {
+        Some(time) if time.day_index == now.day_index => format_clock(ts),
+        // A week back still reads as the weekday ("Friday" on a Friday), as Slack shows it.
+        Some(time) if now.day_index - time.day_index <= 7 => {
+            let label = date_label(&time, &now);
+            match label.split_once(',') {
+                Some((weekday, _)) => weekday.to_owned(),
+                None => label,
+            }
+        }
+        Some(time) => date_label(&time, &now),
+        None => ts.as_str().to_owned(),
+    }
+}
+
+/// The stamp on a message card outside the day-divided transcript (threads, search, pins):
+/// like Slack, the time for today's messages, the day and time otherwise.
+fn card_stamp(ts: &Ts) -> String {
     match ts.secs() {
-        Some(secs) if CivilTime::from_unix(secs).day_index == now.day_index => format_clock(ts),
-        Some(secs) => date_label(&CivilTime::from_unix(secs), &now),
+        Some(secs) if CivilTime::from_unix(secs).day_index == CivilTime::now().day_index => {
+            format_clock(ts)
+        }
+        _ => day_and_time(ts),
+    }
+}
+
+/// Slack's long stamp (attachment footers, thread replies from other days):
+/// `Yesterday at 9:25 AM`, `Today at 3:01 PM`, `Tuesday, November 10th at 8:00 AM`.
+pub(crate) fn day_and_time(ts: &Ts) -> String {
+    match ts.secs() {
+        Some(secs) => format!(
+            "{} at {}",
+            date_label(&CivilTime::from_unix(secs), &CivilTime::now()),
+            format_clock(ts)
+        ),
         None => ts.as_str().to_owned(),
     }
 }
@@ -2181,10 +2362,11 @@ fn date_label(time: &CivilTime, now: &CivilTime) -> String {
         (3, _) => "rd",
         _ => "th",
     };
+    // Slack names the weekday only within the current year: "October 25th, 2022".
     if time.year == now.year {
         format!("{weekday}, {month} {day}{suffix}")
     } else {
-        format!("{weekday}, {month} {day}{suffix}, {}", time.year)
+        format!("{month} {day}{suffix}, {}", time.year)
     }
 }
 
