@@ -389,6 +389,10 @@ pub fn actions_menu(
     menu
 }
 
+/// The space Slack keeps under a message's reaction pills (each pill's 4px bottom margin
+/// plus its bar's), less the message card's own 2px bottom padding.
+pub const REACTIONS_BOTTOM: Pixels = px(6.);
+
 /// Reaction chips under a message. With a handler, a chip toggles the signed-in user's
 /// reaction and a trailing `+` opens the picker; without one the chips are static.
 pub fn reaction_chips(
@@ -405,7 +409,12 @@ pub fn reaction_chips(
     let (secondary, secondary_hover, foreground) =
         (theme.secondary, theme.secondary_hover, theme.foreground);
     let (reacted_bg, reacted_fg, reacted_ring) = crate::theme::reacted_pill(cx);
-    let mut row = h_flex().flex_wrap().items_center().gap_1().pt_1();
+    let mut row = h_flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .pt_1()
+        .pb(REACTIONS_BOTTOM);
     for reaction in reactions {
         let mine = reaction.users.contains(&fixtures.self_user);
         // Slack's `.c-reaction`: a 24px capsule, filled blue and bold when it includes you.
@@ -430,7 +439,17 @@ pub fn reaction_chips(
             .when(!mine, |chip| {
                 chip.bg(secondary).hover(|chip| chip.bg(secondary_hover))
             })
-            .child(emoji::emoji_element(&reaction.name, fixtures, px(16.)))
+            // Slack's reaction emoji fills a 16px box. A glyph inks about a quarter past its
+            // font size (20px of ink at 16px), so it is set at 13px; an image takes the box.
+            .child(emoji::emoji_element(
+                &reaction.name,
+                fixtures,
+                if emoji::glyph(&reaction.name).is_some() {
+                    px(13.)
+                } else {
+                    px(16.)
+                },
+            ))
             .child(
                 div()
                     .text_color(if mine { reacted_fg } else { foreground })

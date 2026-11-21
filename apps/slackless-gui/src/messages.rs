@@ -1182,7 +1182,13 @@ fn transcript_row(
                     .group("reply-bar")
                     .max_w(px(600.))
                     .h(px(34.))
-                    .mt_1()
+                    // 4px under the message; under reaction pills Slack pulls the bar up into
+                    // the space their row keeps below them, leaving the same 4px.
+                    .mt(if message.reactions.is_empty() {
+                        px(4.)
+                    } else {
+                        px(4.) - actions::REACTIONS_BOTTOM
+                    })
                     .ml(px(-5.))
                     .p_1()
                     .gap_1()
