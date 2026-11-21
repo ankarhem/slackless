@@ -4,9 +4,10 @@
 //! name, and for the signed-in user from the title-bar menu.
 //!
 //! `ProfilePanel::new(Arc<Fixtures>, &mut App) -> Entity<ProfilePanel>`
-//! `ProfilePanel::open(&mut self, UserId, &mut Context<Self>)`
+//! `ProfilePanel::open(&mut self, UserId, back: bool, &mut Context<Self>)`
 //! `ProfilePanel::set_self_state(&mut self, SelfState, &mut Context<Self>)`
-//! emits `ProfileEvent::Close` / `ProfileEvent::Message(UserId)` / `ProfileEvent::EditStatus`
+//! emits `ProfileEvent::Close` / `ProfileEvent::Back` / `ProfileEvent::Message(UserId)` /
+//! `ProfileEvent::EditStatus`
 
 use std::sync::Arc;
 
@@ -24,10 +25,11 @@ use crate::emoji::glyph as emoji_glyph;
 use crate::fixtures::Fixtures;
 use crate::messages::{clock, local_offset_now, now_secs};
 use crate::status::SelfState;
-use crate::theme;
 
 pub enum ProfileEvent {
     Close,
+    /// Return to the pane the profile was opened over (the thread).
+    Back,
     /// Open the DM with this user.
     Message(UserId),
     /// The signed-in user's "Set a status".
@@ -37,6 +39,8 @@ pub enum ProfileEvent {
 pub struct ProfilePanel {
     fixtures: Arc<Fixtures>,
     user: Option<UserId>,
+    /// Opened over another pane: the header leads with Slack's back chevron.
+    back: bool,
     self_state: SelfState,
 }
 
@@ -47,6 +51,7 @@ impl ProfilePanel {
         cx.new(|_| ProfilePanel {
             fixtures,
             user: None,
+            back: false,
             self_state: SelfState::default(),
         })
     }
@@ -57,8 +62,11 @@ impl ProfilePanel {
         cx.notify();
     }
 
-    pub fn open(&mut self, user: UserId, cx: &mut Context<Self>) {
+    /// Show `user`'s profile; `back` when it opens over another pane that its back
+    /// chevron returns to.
+    pub fn open(&mut self, user: UserId, back: bool, cx: &mut Context<Self>) {
         self.user = Some(user);
+        self.back = back;
         cx.notify();
     }
 
@@ -139,6 +147,26 @@ impl Render for ProfilePanel {
             .items_center()
             .border_b_1()
             .border_color(border)
+            .when(self.back, |header| {
+                header.child(
+                    div()
+                        .id("profile-back")
+                        .size(px(28.))
+                        .mr_3()
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(hover))
+                        .child(
+                            Icon::new(IconName::ChevronLeft)
+                                .text_color(muted)
+                                .size(px(16.)),
+                        )
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ProfileEvent::Back))),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -169,7 +197,8 @@ impl Render for ProfilePanel {
         };
         let is_self = user.id == self.fixtures.self_user;
         let extras = self.fixtures.profile_extras.get(&user.id);
-        let name = user.display_name().to_owned();
+        // The name messages show the person by (full or display name, per the workspace).
+        let name = self.fixtures.name_of(&user).to_owned();
         let real_name = user
             .profile
             .real_name
@@ -177,24 +206,8 @@ impl Render for ProfilePanel {
             .or(user.real_name.clone())
             .unwrap_or_default();
 
-        // Big identity tile: Slack shows the profile photo; fixtures have initials.
-        let initial = name
-            .chars()
-            .next()
-            .unwrap_or('?')
-            .to_uppercase()
-            .to_string();
-        let photo = div()
-            .size(px(240.))
-            .rounded_lg()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::avatar_color(user.id.as_str()))
-            .text_color(theme::avatar_foreground())
-            .text_size(px(96.))
-            .font_weight(FontWeight::BOLD)
-            .child(initial);
+        // Slack's big profile photo (an initials tile for someone without one).
+        let photo = crate::avatars::user_chip(&self.fixtures, &user.id, 240.);
 
         let status = if is_self {
             self.self_state

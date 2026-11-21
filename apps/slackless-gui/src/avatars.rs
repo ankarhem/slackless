@@ -103,7 +103,9 @@ pub fn with_external_badge(
 
 /// The profile image for an avatar `size` points wide, at twice that for Retina.
 fn photo_url(profile: &Profile, size: f32) -> Option<&str> {
-    let candidates = if size > 24. {
+    let candidates = if size > 96. {
+        [&profile.image_512, &profile.image_1024, &profile.image_192]
+    } else if size > 24. {
         [&profile.image_72, &profile.image_192, &profile.image_48]
     } else {
         [&profile.image_48, &profile.image_72, &profile.image_32]

@@ -120,7 +120,7 @@
 //!
 //! profile.rs (right-hand panel, exclusive with the thread panel)
 //!   ProfilePanel::new(Arc<Fixtures>, &mut App) -> Entity<ProfilePanel>
-//!   ProfilePanel::open(&mut self, UserId, &mut Context<Self>)
+//!   ProfilePanel::open(&mut self, UserId, back: bool, &mut Context<Self>)
 //!   ProfilePanel::set_self_state(&mut self, SelfState, &mut Context<Self>)
 //!   emits ProfileEvent::Close / ProfileEvent::Message(UserId) / ProfileEvent::EditStatus
 //!
@@ -1908,11 +1908,18 @@ impl App {
         cx.notify();
     }
 
+    /// Slack's profile pane. Opened from an open thread it stacks over the thread, which
+    /// stays loaded under it: the transcript drops the thread's tint while the profile
+    /// shows, and the profile's back chevron returns to the thread.
     fn open_profile(&mut self, user: UserId, cx: &mut Context<Self>) {
+        let over_thread = self.thread_open;
         self.profile
-            .update(cx, |profile, cx| profile.open(user, cx));
+            .update(cx, |profile, cx| profile.open(user, over_thread, cx));
         self.profile_open = true;
-        self.close_thread(cx);
+        if over_thread {
+            self.messages
+                .update(cx, |list, cx| list.set_open_thread(None, cx));
+        }
         self.pins_open = false;
         cx.notify();
     }
@@ -3613,21 +3620,22 @@ impl Render for App {
                 .when(dark, |pane| pane.border_l_1().border_color(outline))
                 .child(pane)
         };
-        if self.thread_open {
-            panels = panels.child(
-                resizable_panel()
-                    .size(FLEXPANE_WIDTH)
-                    .size_range(px(340.)..px(720.))
-                    .fixed()
-                    .child(side_pane(self.thread.clone().into_any_element())),
-            );
-        } else if self.profile_open {
+        // A profile opened from the thread stacks over it.
+        if self.profile_open {
             panels = panels.child(
                 resizable_panel()
                     .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
                     .fixed()
                     .child(side_pane(self.profile.clone().into_any_element())),
+            );
+        } else if self.thread_open {
+            panels = panels.child(
+                resizable_panel()
+                    .size(FLEXPANE_WIDTH)
+                    .size_range(px(340.)..px(720.))
+                    .fixed()
+                    .child(side_pane(self.thread.clone().into_any_element())),
             );
         } else if self.pins_open {
             let this = cx.weak_entity();
@@ -5180,8 +5188,17 @@ fn subscribe_workspace(
             &views.profile,
             window,
             |this: &mut App, _, event: &ProfileEvent, window, cx| match event {
+                // Slack's close shuts the whole pane, the thread under the profile too.
                 ProfileEvent::Close => {
                     this.profile_open = false;
+                    this.close_thread(cx);
+                    cx.notify();
+                }
+                ProfileEvent::Back => {
+                    this.profile_open = false;
+                    let root = this.thread.read(cx).open_thread().map(|(_, ts)| ts);
+                    this.messages
+                        .update(cx, |list, cx| list.set_open_thread(root, cx));
                     cx.notify();
                 }
                 ProfileEvent::Message(user) => {
