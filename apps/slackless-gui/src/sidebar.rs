@@ -29,6 +29,7 @@
 //! derived colors are opacity steps of `sidebar_foreground` for idle rows and icons.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,10 +44,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _, FontWeight,
-    Hsla, InteractiveElement as _, IntoElement, ParentElement as _, PathBuilder, Pixels, Point,
-    Render, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
-    Subscription, Task, Window, canvas, deferred, div, img, point, px, relative, transparent_black,
+    AnyElement, AppContext as _, Context, DismissEvent, Div, Edges, Entity, EventEmitter,
+    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, PathBuilder, Pixels, Point, Render, ScrollHandle, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, canvas,
+    deferred, div, img, point, px, relative, transparent_black,
 };
 use slackless_core::NotifyLevel;
 use slackless_core::types::{
@@ -61,8 +63,9 @@ use crate::files_page::FilesSection;
 use crate::fixtures::Fixtures;
 use crate::messages::list_stamp;
 use crate::sidebar_menu::{
-    ChannelDrag, ChannelMenuInput, MenuRow, SectionFilter, SectionFormEvent, SectionMenuInput,
-    SectionNameForm, SectionSort, channel_menu, section_menu, workspace_menu,
+    ChannelDrag, ChannelMenuInput, Hidden, HiddenConversations, MenuRow, SectionFilter,
+    SectionFormEvent, SectionMenuInput, SectionNameForm, SectionSort, channel_menu,
+    more_conversations_menu, section_menu, workspace_menu,
 };
 use crate::status::{FOCUS_DURATIONS, SelfState, self_avatar};
 
@@ -203,7 +206,7 @@ impl NavItem {
 /// signed-in user did not author that are newer than the newest message in the open
 /// conversation (the fixture-mode "read" watermark). `mentions` is the subset of `count`
 /// that @-mentions the signed-in user.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Unread {
     count: u32,
     mentions: u32,
@@ -263,9 +266,11 @@ pub struct Sidebar {
     /// Fixture mode's notification-level overrides (a live write lands through the store's
     /// prefs on the next snapshot).
     notify_override: HashMap<ChannelId, NotifyLevel>,
-    /// The open "More conversations" popover: its section and the conversations the
-    /// visibility rules hide, split muted / dormant, gathered when it opened.
+    /// The open "More conversations" popover.
     section_search: Option<SectionSearch>,
+    /// Whether the press on a "More conversations" button found its popover open: the press
+    /// closes it, so the click that follows must not open it again.
+    search_was_open: bool,
     /// What the "Create a channel section" dialog builds when it confirms: a plain
     /// section, a rename of `id`, or a new section that `channel` moves into.
     section_form_mode: SectionFormMode,
@@ -390,6 +395,7 @@ impl Sidebar {
                 notify_override: HashMap::new(),
 
                 section_search: None,
+                search_was_open: false,
                 section_form_mode: SectionFormMode::Create,
                 section_form,
                 scroll: ScrollHandle::new(),
@@ -783,6 +789,7 @@ impl Sidebar {
 
     /// The rows a section's menus and popover list: this menu's labels and glyphs.
     pub(crate) fn menu_rows(&self, ids: &[ChannelId]) -> Vec<MenuRow> {
+        let watermark = self.read_watermark();
         ids.iter()
             .filter_map(|id| {
                 let conversation = self.fixtures.conversation(id)?;
@@ -795,14 +802,26 @@ impl Sidebar {
                         conversation.kind(),
                         ConversationKind::Im | ConversationKind::Mpim
                     ),
+                    unread: self.unread_in(conversation, watermark.as_ref()).count > 0,
                 })
             })
             .collect()
     }
 
+    /// A DM menu row's avatar, cut out of the menu's surface.
+    pub(crate) fn menu_avatar(&self, id: &ChannelId, cx: &gpui_kit::gpui::App) -> Option<Div> {
+        let conversation = self.fixtures.conversation(id)?;
+        Some(conversation_avatar(
+            &self.fixtures,
+            conversation,
+            20.,
+            cx.theme().popover,
+            cx,
+        ))
+    }
+
     /// One section menu's whole input, gathered as the menu opens (never per frame): the
-    /// section's channels, the ones the visibility rules hide (muted, dormant), and the
-    /// mark-read / mute targets.
+    /// section's channels, the ones its rows leave out, and the mark-read / mute targets.
     fn section_menu_input(
         &self,
         key: SharedString,
@@ -811,31 +830,16 @@ impl Sidebar {
         ids: &[ChannelId],
     ) -> SectionMenuInput {
         let watermark = self.read_watermark();
-        let (mut muted, mut dormant) = (Vec::new(), Vec::new());
         let (mut unread, mut unmuted) = (Vec::new(), Vec::new());
         for id in ids {
-            let Some(conversation) = self
-                .fixtures
-                .channels
-                .iter()
-                .chain(&self.fixtures.dms)
-                .find(|conversation| conversation.id == *id)
-            else {
+            let Some(conversation) = self.fixtures.conversation(id) else {
                 continue;
             };
-            let counts = self.unread_in(conversation, watermark.as_ref());
-            if counts.count > 0 {
+            if self.unread_in(conversation, watermark.as_ref()).count > 0 {
                 unread.push(id.clone());
             }
             if self.notify_level(id) != Some(NotifyLevel::Muted) {
                 unmuted.push(id.clone());
-            }
-            // The popover and the menus list exactly the channels the visibility rules
-            // hide: a muted one without mentions, a dormant one without unreads.
-            if self.notify_level(id) == Some(NotifyLevel::Muted) && counts.mentions == 0 {
-                muted.push(id.clone());
-            } else if counts.count == 0 && self.is_dormant(conversation) {
-                dormant.push(id.clone());
             }
         }
         let dm = section
@@ -843,12 +847,12 @@ impl Sidebar {
             .map(|section| section.kind == SectionKind::DirectMessages)
             .unwrap_or_else(|| key.as_ref() == "dms");
         let (filter, sort) = (self.section_filter(&key), self.section_sort(&key, dm));
+        let hidden = self.hidden_conversations(&key, ids);
         SectionMenuInput {
             key,
             title,
             section,
-            muted,
-            dormant,
+            hidden,
             unread,
             unmuted,
             filter,
@@ -856,237 +860,105 @@ impl Sidebar {
         }
     }
 
-    /// Open (or close) the "More conversations" popover of `key`'s section, gathering the
-    /// conversations the visibility rules hide at open.
-    fn toggle_section_search(&mut self, key: &SharedString, cx: &mut Context<Self>) {
-        self.section_search = if self
-            .section_search
-            .as_ref()
-            .is_some_and(|search| search.key == *key)
-        {
-            None
-        } else {
-            let ids = self.section_channel_ids(key);
-            let watermark = self.read_watermark();
-            let (mut muted, mut dormant) = (Vec::new(), Vec::new());
-            for id in &ids {
-                let Some(conversation) = self
-                    .fixtures
-                    .channels
-                    .iter()
-                    .chain(&self.fixtures.dms)
-                    .find(|conversation| conversation.id == *id)
-                else {
-                    continue;
-                };
-                let counts = self.unread_in(conversation, watermark.as_ref());
-                if self.notify_level(id) == Some(NotifyLevel::Muted) && counts.mentions == 0 {
-                    muted.push(id.clone());
-                } else if counts.count == 0 && self.is_dormant(conversation) {
-                    dormant.push(id.clone());
-                }
+    /// The conversations of `ids` (the section keyed `key`) its rows leave out, grouped by
+    /// why ([`Self::hidden_reason`]).
+    fn hidden_conversations(&self, key: &SharedString, ids: &[ChannelId]) -> HiddenConversations {
+        let (open, filter) = (!self.collapsed.contains(key), self.section_filter(key));
+        let watermark = self.read_watermark();
+        let mut hidden = HiddenConversations::default();
+        for conversation in ids.iter().filter_map(|id| self.fixtures.conversation(id)) {
+            let unread = self.unread_in(conversation, watermark.as_ref());
+            if let Some(why) = self.hidden_reason(conversation, unread, filter, open) {
+                hidden.push(why, conversation.id.clone());
             }
-            Some(SectionSearch {
-                key: key.clone(),
-                muted,
-                dormant,
+        }
+        hidden
+    }
+
+    /// Open `key`'s "More conversations" popover over the section as it is now: "Mark all
+    /// as read" while anything in it is unread, then what its rows leave out.
+    fn open_more_conversations(
+        &mut self,
+        key: &SharedString,
+        ids: &[ChannelId],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hidden = self.hidden_conversations(key, ids);
+        let watermark = self.read_watermark();
+        let mark: Vec<ChannelId> = ids
+            .iter()
+            .filter(|id| {
+                self.fixtures
+                    .conversation(id)
+                    .is_some_and(|c| self.unread_in(c, watermark.as_ref()).count > 0)
             })
-        };
+            .cloned()
+            .collect();
+        let this = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, |menu, _, _| {
+            more_conversations_menu(
+                menu.min_w(px(300.)).max_w(px(300.)),
+                &hidden,
+                mark,
+                |ids| self.menu_rows(ids),
+                &this,
+            )
+        });
+        let dismiss = cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.section_search = None;
+            cx.notify();
+        });
+        menu.focus_handle(cx).focus(window, cx);
+        self.section_search = Some(SectionSearch {
+            key: key.clone(),
+            menu,
+            _dismiss: dismiss,
+        });
         cx.notify();
     }
 
-    /// Every conversation of the section keyed `key`, in list order (the rows it renders,
-    /// claims and all).
-    fn section_channel_ids(&self, key: &SharedString) -> Vec<ChannelId> {
-        let channels: Vec<Conversation> = self
-            .fixtures
-            .channels
-            .iter()
-            .chain(&self.joined)
-            .cloned()
-            .collect();
-        let sections = self.section_set();
-        if sections.is_empty() {
-            return if key.as_ref() == "dms" {
-                self.fixtures.dms.iter().map(|dm| dm.id.clone()).collect()
+    /// Why the section leaves `conversation` out of its rows, by Slack's rules in Slack's
+    /// order; `None` keeps it. The open conversation always stays. A muted one leaves unless
+    /// something mentions you there (Slack's "Mute and hide"); a collapsed section keeps
+    /// only the conversations that mention you; an expanded one applies its filter. What
+    /// leaves is grouped as the "More conversations" popover lists it: dormant (under
+    /// "Active only"), then muted, then unread, then read.
+    fn hidden_reason(
+        &self,
+        conversation: &Conversation,
+        unread: Unread,
+        filter: SectionFilter,
+        open: bool,
+    ) -> Option<Hidden> {
+        if conversation.id == self.selected {
+            return None;
+        }
+        let muted = self.notify_level(&conversation.id) == Some(NotifyLevel::Muted);
+        let listed = if muted || !open {
+            unread.mentions > 0
+        } else {
+            match filter {
+                SectionFilter::ActiveOnly => unread.count > 0 || self.active_recent(conversation),
+                SectionFilter::All => true,
+                SectionFilter::Unreads => unread.count > 0,
+                SectionFilter::Mentions => unread.mentions > 0,
+            }
+        };
+        if listed {
+            return None;
+        }
+        Some(
+            if filter == SectionFilter::ActiveOnly && !self.active_recent(conversation) {
+                Hidden::Dormant
+            } else if muted {
+                Hidden::Muted
+            } else if unread.count > 0 {
+                Hidden::Unread
             } else {
-                channels.iter().map(|c| c.id.clone()).collect()
-            };
-        }
-        // The same membership rule the list applies: a custom section owns its channels,
-        // the Channels bucket holds the unclaimed ones, the DMs bucket the unclaimed DMs.
-        let rank = |kind: &SectionKind| match kind {
-            SectionKind::Stars => 0,
-            SectionKind::Standard => 1,
-            SectionKind::UserGroup => 2,
-            _ => 3,
-        };
-        let mut ranked: Vec<&ChannelSection> = sections
-            .iter()
-            .filter(|section| {
-                !matches!(
-                    section.kind,
-                    SectionKind::Channels | SectionKind::DirectMessages
-                )
-            })
-            .collect();
-        ranked.sort_by_key(|section| rank(&section.kind));
-        let mut claimed: HashMap<&ChannelId, &str> = HashMap::new();
-        for section in ranked {
-            for id in &section.channel_ids {
-                claimed.entry(id).or_insert(section.id.as_str());
-            }
-        }
-        let member = |id: &ChannelId| {
-            channels
-                .iter()
-                .chain(&self.fixtures.dms)
-                .find(|conversation| conversation.id == *id)
-        };
-        for section in &sections {
-            if section.id.as_str() == key.as_ref() {
-                return match section.kind {
-                    SectionKind::Channels => channels
-                        .iter()
-                        .filter(|c| !claimed.contains_key(&c.id) && !c.is_ext_shared)
-                        .map(|c| c.id.clone())
-                        .collect(),
-                    SectionKind::DirectMessages => self
-                        .fixtures
-                        .dms
-                        .iter()
-                        .filter(|c| !claimed.contains_key(&c.id))
-                        .map(|c| c.id.clone())
-                        .collect(),
-                    _ => section
-                        .channel_ids
-                        .iter()
-                        .filter(|id| claimed.get(id) == Some(&section.id.as_str()))
-                        .filter_map(|id| member(id).map(|c| c.id.clone()))
-                        .collect(),
-                };
-            }
-        }
-        Vec::new()
-    }
-
-    /// The "More conversations" popover body, anchored under its section header's right
-    /// edge: "Mark all as read", then the section's muted and dormant conversations under
-    /// Slack's muted headings; a click opens the channel.
-    fn section_search_popover(&self, search: &SectionSearch, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let (border, muted, popover, hover, fg) = (
-            theme.border,
-            theme.muted_foreground,
-            theme.popover,
-            theme.accent,
-            theme.popover_foreground,
-        );
-        let rows = self.menu_rows(
-            &search
-                .muted
-                .iter()
-                .chain(&search.dormant)
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        let heading = |text: &'static str| {
-            div()
-                .px_3()
-                .pt_2()
-                .pb_1()
-                .text_xs()
-                .text_color(muted)
-                .child(text)
-        };
-        let mut body = v_flex()
-            .id(SharedString::from(format!("section-search-{}", search.key)))
-            .w(px(300.))
-            .py_1()
-            .rounded_lg()
-            .border_1()
-            .border_color(border)
-            .bg(popover)
-            .shadow_md()
-            .text_sm()
-            .text_color(fg)
-            .occlude();
-        let mark: Vec<ChannelId> = self.section_channel_ids(&search.key);
-        let mark = {
-            let watermark = self.read_watermark();
-            mark.into_iter()
-                .filter(|id| {
-                    self.fixtures
-                        .channels
-                        .iter()
-                        .chain(&self.fixtures.dms)
-                        .find(|c| c.id == *id)
-                        .map(|c| self.unread_in(c, watermark.as_ref()).count > 0)
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>()
-        };
-        let this = cx.entity().downgrade();
-        let targets = mark.clone();
-        body = body.child(
-            h_flex()
-                .id("section-search-mark")
-                .items_center()
-                .gap_2()
-                .mx_1()
-                .px_2()
-                .h(px(28.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .hover(|row| row.bg(hover))
-                .child(Icon::new(IconName::CheckCheck).size(px(14.)))
-                .child("Mark all as read")
-                .on_click(move |_, _, cx| {
-                    let _ = this.update(cx, |sidebar, cx| sidebar.mark_section_read(&targets, cx));
-                }),
-        );
-        for (text, ids) in [
-            ("Muted conversations", &search.muted),
-            ("No messages in at least 30 days", &search.dormant),
-        ] {
-            if ids.is_empty() {
-                continue;
-            }
-            body = body.child(heading(text));
-            for id in ids {
-                let Some(row) = rows.iter().find(|row| row.id == *id) else {
-                    continue;
-                };
-                let this = cx.entity().downgrade();
-                let id = id.clone();
-                body = body.child(
-                    h_flex()
-                        .id(SharedString::from(format!("section-search-row-{id}")))
-                        .items_center()
-                        .gap_2()
-                        .mx_1()
-                        .px_2()
-                        .h(px(28.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|row| row.bg(hover))
-                        .child(row_leading(row))
-                        .child(
-                            div().truncate().child(
-                                row.label
-                                    .strip_prefix("# ")
-                                    .unwrap_or(&row.label)
-                                    .to_owned(),
-                            ),
-                        )
-                        .on_click(move |_, _, cx| {
-                            let _ =
-                                this.update(cx, |sidebar, cx| sidebar.select_row(id.clone(), cx));
-                        }),
-                );
-            }
-        }
-        div().absolute().top(px(30.)).right(px(0.)).child(body)
+                Hidden::Read
+            },
+        )
     }
 
     /// Slack's "Active only" rule (`sidebar_behavior: hide_inactive_channels`): Slack's
@@ -1804,8 +1676,9 @@ impl Sidebar {
     }
 
     /// A sidebar section: a dim header row (section emoji or icon + name; click collapses)
-    /// over its conversation rows. Like Slack, a collapsed section still lists its unread and
-    /// open conversations. An expanded Channels section ends with the "Add channels" row.
+    /// over its conversation rows, less the ones Slack's rules hide ([`Self::hidden_reason`]);
+    /// a collapsed section keeps only its open conversation and the ones that mention you.
+    /// An expanded Channels section ends with the "Add channels" row.
     /// The section flattens into direct children of the scroll list (each carrying the
     /// section's own padding) so its scroll handle can track every row.
     /// `(title, leading)` is the section's name and the icon or emoji before it.
@@ -1824,34 +1697,20 @@ impl Sidebar {
                 .iter()
                 .any(|section| section.kind == SectionKind::Channels && section.id == key.as_ref());
         let open = !self.collapsed.contains(&key);
-        let header = self.section_header(key.clone(), leading, title, section, conversations, cx);
-        let mut children = vec![(
-            v_flex().px_2().pt_2().child(header).into_any_element(),
-            ListChild::Plain,
-        )];
         let filter = self.section_filter(&key);
+        let mut hidden = HiddenConversations::default();
+        let mut children = Vec::new();
         for conversation in conversations.iter() {
             let unread = self.unread_in(conversation, watermark);
-            // Like Slack, a collapsed section still lists its unread and open conversations;
-            // the section's filter additionally narrows what expanded sections show.
-            // A "Find a conversation…" query instead lists every match, collapsed or stale.
-            // Slack's "Mute and hide": a muted conversation leaves the section (its menus list
-            // it under "Muted conversations") unless something mentions you there.
-            let muted = self.notify_level(&conversation.id) == Some(NotifyLevel::Muted);
+            // A "Find a conversation…" query lists every match, collapsed or stale; otherwise
+            // the rows leave out what Slack's rules hide, which the header's "More
+            // conversations" popover lists.
             let listed = if self.find_query.is_empty() {
-                conversation.id == self.selected
-                    || if muted {
-                        unread.mentions > 0
-                    } else {
-                        match filter {
-                            SectionFilter::ActiveOnly => {
-                                unread.count > 0 || (open && self.active_recent(conversation))
-                            }
-                            SectionFilter::All => open || unread.count > 0,
-                            SectionFilter::Unreads => unread.count > 0,
-                            SectionFilter::Mentions => unread.mentions > 0,
-                        }
-                    }
+                let why = self.hidden_reason(conversation, unread, filter, open);
+                if let Some(why) = why {
+                    hidden.push(why, conversation.id.clone());
+                }
+                why.is_none()
             } else {
                 self.fixtures
                     .conversation_label(conversation)
@@ -1874,6 +1733,21 @@ impl Sidebar {
                 kind,
             ));
         }
+        let header = self.section_header(
+            key.clone(),
+            (title, leading),
+            section,
+            conversations,
+            &hidden,
+            cx,
+        );
+        children.insert(
+            0,
+            (
+                v_flex().px_2().pt_2().child(header).into_any_element(),
+                ListChild::Plain,
+            ),
+        );
         if open && add_channels {
             children.push((
                 v_flex()
@@ -1887,28 +1761,31 @@ impl Sidebar {
     }
 
     /// Slack's section header: the 26px caret square with its own hover wash (the caret
-    /// points down while open, right when collapsed), the name, and - only while the
-    /// pointer is over the header - the "More conversations" search and the ⋮ "More
-    /// actions", each with its dark tooltip. Right-click opens the section menu; the
+    /// points down while open, right when collapsed), the name (bold while the collapsed
+    /// section hides unread conversations), and - only while the pointer is over the
+    /// header - the "More conversations" button (while the section hides any of `hidden`)
+    /// and the ⋮ "More actions", each with its dark tooltip. Right-click opens the section menu; the
     /// ⋮ opens the same items with "Search in this section" first and the manage items
     /// inline. Header and rows take channel drops (a drop moves the channel here).
     fn section_header(
         &self,
         key: SharedString,
-        leading: Option<AnyElement>,
-        title: &str,
+        (title, leading): (&str, Option<AnyElement>),
         section: Option<&ChannelSection>,
         conversations: &[Conversation],
+        hidden: &HiddenConversations,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let bright = theme.sidebar_foreground;
         let dim = theme.sidebar_foreground.opacity(0.7);
         let wash = theme.sidebar_foreground.opacity(0.08);
         let icon_wash = theme.sidebar_foreground.opacity(0.12);
         let open = !self.collapsed.contains(&key);
         let toggle = key.clone();
         let header_group = SharedString::from(format!("section-header-{key}"));
-        let ids: Vec<ChannelId> = conversations.iter().map(|c| c.id.clone()).collect();
+        let ids: Rc<[ChannelId]> = conversations.iter().map(|c| c.id.clone()).collect();
+        let search_ids = ids.clone();
 
         // The ⋮ and right-click menus read the sidebar once, as they open.
         let menu_input = {
@@ -1967,21 +1844,62 @@ impl Sidebar {
                 })
                 .size(px(16.)),
             );
-        let search_key = key.clone();
+        let (search_key, press_key) = (key.clone(), key.clone());
         let more = Button::new(SharedString::from(format!("section-more-{key}")))
             .ghost()
             .with_size(Size::XSmall)
             .icon(IconName::EllipsisVertical)
             .tooltip("More actions")
             .dropdown_menu_with_anchor(gpui_kit::gpui::Anchor::TopRight, more_menu);
-        let search = Button::new(SharedString::from(format!("section-search-{key}")))
-            .ghost()
-            .with_size(Size::XSmall)
-            .icon(IconName::TextSearch)
-            .tooltip("More conversations")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_section_search(&search_key, cx);
-            }));
+        let popover = self
+            .section_search
+            .as_ref()
+            .filter(|search| search.key == key)
+            .map(|search| search.menu.clone());
+        let search = (!hidden.is_empty()).then(|| {
+            let button = Button::new(SharedString::from(format!("section-search-{key}")))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::TextSearch)
+                .tooltip("More conversations")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if !std::mem::take(&mut this.search_was_open) {
+                        this.open_more_conversations(&search_key, &search_ids, window, cx);
+                    }
+                }));
+            div()
+                .relative()
+                // The press finds the popover open or not before the popover's own
+                // outside-press closes it, so a second click closes it rather than reopening.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.search_was_open = this
+                            .section_search
+                            .as_ref()
+                            .is_some_and(|search| search.key == press_key);
+                    }),
+                )
+                .child(button)
+                // Slack hangs the popover off the button's right edge, level with its top.
+                .children(popover.map(|menu| {
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(relative(1.))
+                        .ml(px(6.))
+                        .child(
+                            deferred(
+                                anchored()
+                                    .snap_to_window_with_margin(Edges::all(px(8.)))
+                                    .child(menu),
+                            )
+                            .with_priority(2),
+                        )
+                }))
+        });
+        // A collapsed section that hides unread conversations bolds its name.
+        let alert = !open && !hidden.unread.is_empty();
 
         let header = h_flex()
             .id(SharedString::from(format!("section-{key}")))
@@ -2032,7 +1950,15 @@ impl Sidebar {
             } else {
                 caret.into_any_element()
             })
-            .child(div().flex_1().truncate().child(title.to_owned()))
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .when(alert, |name| {
+                        name.font_weight(FontWeight::BOLD).text_color(bright)
+                    })
+                    .child(title.to_owned()),
+            )
             // The search and ⋮ buttons stay mounted and show only while the header is hovered:
             // an open ⋮ menu has to outlive the pointer leaving the header.
             .child(
@@ -2044,7 +1970,10 @@ impl Sidebar {
                     .items_center()
                     .invisible()
                     .group_hover(header_group, |style| style.visible())
-                    .child(search)
+                    // The buttons' presses are theirs: a click reaches every element its
+                    // press reached, and the header's collapses the section.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(search)
                     .child(more),
             );
         let header = match drop_target(section, &key) {
@@ -2074,17 +2003,7 @@ impl Sidebar {
             }
             None => header,
         };
-        let popover = self
-            .section_search
-            .as_ref()
-            .filter(|search| search.key == key)
-            .map(|search| self.section_search_popover(search, cx));
-        div()
-            .relative()
-            .child(header.context_menu(context_menu))
-            .when_some(popover, |wrapper, popover| {
-                wrapper.child(deferred(popover).with_priority(2))
-            })
+        div().relative().child(header.context_menu(context_menu))
     }
 
     /// The sections under the nav rows. Live: the user's own sidebar sections in their order,
@@ -2953,12 +2872,11 @@ struct ScrollAnim {
     last: Pixels,
 }
 
-/// The open "More conversations" popover: its section and the conversations the visibility
-/// rules hide, split muted / dormant, gathered once when it opened.
+/// The open "More conversations" popover: its section and the menu, until the menu dismisses.
 struct SectionSearch {
     key: SharedString,
-    muted: Vec<ChannelId>,
-    dormant: Vec<ChannelId>,
+    menu: Entity<PopupMenu>,
+    _dismiss: Subscription,
 }
 
 /// What the "Create a channel section" dialog builds when it confirms.
@@ -3105,22 +3023,6 @@ pub(crate) fn tooltip_arrow(color: Hsla, up: bool) -> impl IntoElement {
 }
 
 /// Focus mode's subtle unread marker, in place of bolding and count pills.
-/// The leading glyph of one popover row: a lock for private channels, `#` for public ones.
-fn row_leading(row: &MenuRow) -> AnyElement {
-    if row.private {
-        Icon::new(IconName::Lock).size(px(14.)).into_any_element()
-    } else if row.is_dm {
-        div().w(px(14.)).into_any_element()
-    } else {
-        div()
-            .w(px(14.))
-            .flex()
-            .justify_center()
-            .child("#")
-            .into_any_element()
-    }
-}
-
 fn focus_dot(cx: &gpui_kit::gpui::App) -> Div {
     div()
         .flex_none()
@@ -3494,21 +3396,6 @@ impl Render for Sidebar {
                                     .child(self.unreads_pill(pill, cx)),
                             )
                         }),
-                )
-            })
-            .when(self.section_search.is_some(), |sidebar| {
-                // The popover is deferred above everything; this catches the click outside.
-                sidebar.child(
-                    div()
-                        .id("section-search-scrim")
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.section_search = None;
-                            cx.notify();
-                        })),
                 )
             })
             .when(self.settings_menu_open, |sidebar| {

@@ -11,6 +11,8 @@
 //! - [`section_menu`]: the section header's right-click menu and the ⋮ "More actions"
 //!   menu (the same items, "Search in this section" first, the manage items inline), with
 //!   the Filter / Sort submenus and the muted / dormant channel submenus.
+//! - [`more_conversations_menu`]: the header's "More conversations" popover, listing the
+//!   conversations the section hides ([`HiddenConversations`]).
 //! - [`channel_menu`]: a channel row's right-click menu (details, copy, move between
 //!   sections, notify levels, leave).
 //! - [`ChannelDrag`]: the value a drag carries and Slack's drag-layer preview.
@@ -26,8 +28,9 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
+    App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
     Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div,
     px,
@@ -268,10 +271,9 @@ pub(crate) struct SectionMenuInput {
     /// The stored section, when the sidebar has one; `None` for the sample workspace's
     /// synthesized buckets.
     pub section: Option<ChannelSection>,
-    /// The section's conversations hidden by the muted rule, then by the dormant rule
-    /// (the popover and the menus list exactly these).
-    pub muted: Vec<ChannelId>,
-    pub dormant: Vec<ChannelId>,
+    /// The conversations the section leaves out of its rows (the menus list the muted and
+    /// dormant ones).
+    pub hidden: HiddenConversations,
     /// Conversations with unread messages (the "Mark all as read" targets).
     pub unread: Vec<ChannelId>,
     /// Conversations not yet muted (the "Mute all conversations" targets).
@@ -279,6 +281,45 @@ pub(crate) struct SectionMenuInput {
     /// The section's current filter and sort.
     pub filter: SectionFilter,
     pub sort: SectionSort,
+}
+
+/// Why a section leaves a conversation out of its rows.
+#[derive(Clone, Copy)]
+pub(crate) enum Hidden {
+    Unread,
+    Read,
+    Muted,
+    /// "No messages in at least 30 days", under the "Active only" filter.
+    Dormant,
+}
+
+/// The conversations a section leaves out of its rows, in the section's order, grouped as
+/// Slack's "More conversations" popover lists them.
+#[derive(Default)]
+pub(crate) struct HiddenConversations {
+    pub unread: Vec<ChannelId>,
+    pub read: Vec<ChannelId>,
+    pub muted: Vec<ChannelId>,
+    pub dormant: Vec<ChannelId>,
+}
+
+impl HiddenConversations {
+    pub fn push(&mut self, why: Hidden, id: ChannelId) {
+        match why {
+            Hidden::Unread => &mut self.unread,
+            Hidden::Read => &mut self.read,
+            Hidden::Muted => &mut self.muted,
+            Hidden::Dormant => &mut self.dormant,
+        }
+        .push(id);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.unread.is_empty()
+            && self.read.is_empty()
+            && self.muted.is_empty()
+            && self.dormant.is_empty()
+    }
 }
 
 /// Whether the section is the DMs bucket (sorted by activity, no filter or sort menus).
@@ -304,6 +345,8 @@ pub(crate) struct MenuRow {
     pub label: String,
     pub private: bool,
     pub is_dm: bool,
+    /// Bold, as the sidebar draws an unread row.
+    pub unread: bool,
 }
 
 /// The section header's menu: `more` builds the ⋮ "More actions" variant ("Search in this
@@ -323,8 +366,7 @@ pub(crate) fn section_menu(
     let SectionMenuInput {
         key,
         title,
-        muted,
-        dormant,
+        hidden,
         unread,
         unmuted,
         filter,
@@ -395,8 +437,60 @@ pub(crate) fn section_menu(
             cx,
         );
     }
-    let menu = conversation_submenu(menu, "Muted conversations", &muted, sidebar, window, cx);
-    conversation_submenu(menu, "Inactive channels", &dormant, sidebar, window, cx)
+    let menu = conversation_submenu(
+        menu,
+        "Muted conversations",
+        &hidden.muted,
+        sidebar,
+        window,
+        cx,
+    );
+    conversation_submenu(
+        menu,
+        "Inactive channels",
+        &hidden.dormant,
+        sidebar,
+        window,
+        cx,
+    )
+}
+
+/// Slack's "More conversations" popover of a section header: "Mark all as read" while
+/// anything in the section is unread (`mark`), then the conversations the section hides,
+/// each group under its heading, groups apart by separators. `rows` resolves a group's
+/// labels and glyphs.
+pub(crate) fn more_conversations_menu(
+    mut menu: PopupMenu,
+    hidden: &HiddenConversations,
+    mark: Vec<ChannelId>,
+    rows: impl Fn(&[ChannelId]) -> Vec<MenuRow>,
+    sidebar: &WeakEntity<Sidebar>,
+) -> PopupMenu {
+    if !mark.is_empty() {
+        let this = sidebar.clone();
+        menu = menu.item(
+            PopupMenuItem::new("Mark all as read")
+                .icon(IconName::CheckCheck)
+                .on_click(move |_, _, cx| {
+                    let _ = this.update(cx, |sidebar, cx| sidebar.mark_section_read(&mark, cx));
+                }),
+        );
+    }
+    for (heading, ids) in [
+        ("Unread conversations", &hidden.unread),
+        ("Read conversations", &hidden.read),
+        ("Muted conversations", &hidden.muted),
+        ("No messages in at least 30 days", &hidden.dormant),
+    ] {
+        if ids.is_empty() {
+            continue;
+        }
+        if !menu.is_empty() {
+            menu = menu.separator();
+        }
+        menu = conversation_items(menu.label(heading), rows(ids), sidebar);
+    }
+    menu
 }
 
 /// A user-created section's "Manage section" group: Rename and Create a new section, the
@@ -506,16 +600,29 @@ fn conversation_submenu(
             .upgrade()
             .map(|sidebar| sidebar.read(cx).menu_rows(&ids))
             .unwrap_or_default();
-        rows.into_iter().fold(menu, |menu, row| {
-            let (this, id) = (this.clone(), row.id.clone());
-            menu.item(
-                PopupMenuItem::element(move |_, _| channel_menu_row(&row)).on_click(
-                    move |_, _, cx| {
-                        let _ = this.update(cx, |sidebar, cx| sidebar.select_row(id.clone(), cx));
-                    },
-                ),
-            )
-        })
+        conversation_items(menu, rows, &this)
+    })
+}
+
+/// One item per conversation row; a click opens the conversation.
+fn conversation_items(
+    menu: PopupMenu,
+    rows: Vec<MenuRow>,
+    sidebar: &WeakEntity<Sidebar>,
+) -> PopupMenu {
+    rows.into_iter().fold(menu, |menu, row| {
+        let (this, open, id) = (sidebar.clone(), sidebar.clone(), row.id.clone());
+        menu.item(
+            PopupMenuItem::element(move |_, cx| {
+                let avatar = this
+                    .upgrade()
+                    .and_then(|sidebar| sidebar.read(cx).menu_avatar(&row.id, cx));
+                channel_menu_row(&row, avatar)
+            })
+            .on_click(move |_, _, cx| {
+                let _ = open.update(cx, |sidebar, cx| sidebar.select_row(id.clone(), cx));
+            }),
+        )
     })
 }
 
@@ -754,13 +861,18 @@ pub(crate) fn channel_menu(
     menu
 }
 
-/// One conversation row inside a section menu: the channel's own leading glyph (a lock for
-/// private channels, `#` for public ones) beside its name.
-fn channel_menu_row(row: &MenuRow) -> Div {
+/// One conversation row inside a section menu: the conversation's own leading glyph (a lock
+/// for private channels, `#` for public ones, a DM's `avatar`) beside its name, bold while
+/// unread.
+fn channel_menu_row(row: &MenuRow, avatar: Option<Div>) -> Div {
     let leading = if row.private {
         Icon::new(IconName::Lock).size(px(14.)).into_any_element()
     } else if row.is_dm {
-        div().w(px(16.)).into_any_element()
+        div()
+            .w(px(20.))
+            .flex_none()
+            .children(avatar)
+            .into_any_element()
     } else {
         div()
             .w(px(16.))
@@ -779,7 +891,12 @@ fn channel_menu_row(row: &MenuRow) -> Div {
         .gap_2()
         .items_center()
         .child(leading)
-        .child(div().truncate().child(name))
+        .child(
+            div()
+                .truncate()
+                .when(row.unread, |name| name.font_weight(FontWeight::BOLD))
+                .child(name),
+        )
 }
 
 /// A channel row dragged onto another section (drag-and-drop move): the payload the drop
@@ -806,12 +923,8 @@ impl Render for ChannelDrag {
             label: self.label.clone(),
             private: self.private,
             is_dm: self.is_dm,
+            unread: false,
         };
-        let name = row
-            .label
-            .strip_prefix("# ")
-            .unwrap_or(&row.label)
-            .to_owned();
         div()
             .pl(self.position.x - px(80.))
             .pt(self.position.y - px(14.))
@@ -828,8 +941,7 @@ impl Render for ChannelDrag {
                     .shadow_md()
                     .bg(theme.sidebar_primary)
                     .text_color(theme.sidebar_primary_foreground)
-                    .child(channel_menu_row(&row))
-                    .child(div().flex_1().min_w_0().truncate().child(name)),
+                    .child(channel_menu_row(&row, None)),
             )
     }
 }
