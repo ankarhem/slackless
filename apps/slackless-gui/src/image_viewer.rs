@@ -105,8 +105,8 @@ pub struct ViewerImage {
     pub user: Option<UserId>,
     /// Upload time (unix seconds): a file's `timestamp`, else the message's.
     pub taken_at: Option<i64>,
-    /// Where Download sends the browser: the file's permalink, else its download url.
-    pub link: Option<String>,
+    /// What Download saves into ~/Downloads: the url and the file name.
+    pub download: Option<(String, String)>,
 }
 
 /// A conversation image paired with the click identity that opened it.
@@ -171,22 +171,19 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                 }
             }
         };
+        let name = file
+            .name
+            .clone()
+            .or_else(|| file.title.clone())
+            .unwrap_or_else(|| file.id.to_string());
         entries.push(ImageEntry {
             origin: ImageOrigin::File(ix),
             image: ViewerImage {
                 source,
-                name: file
-                    .name
-                    .clone()
-                    .or_else(|| file.title.clone())
-                    .unwrap_or_else(|| file.id.to_string()),
+                download: crate::files::download_url(file).map(|url| (url, name.clone())),
+                name,
                 user: file.user.clone().or_else(|| author.clone()),
                 taken_at: file.timestamp.or(taken_at),
-                link: file
-                    .permalink
-                    .clone()
-                    .or_else(|| file.url_private_download.clone())
-                    .or_else(|| file.url_private.clone()),
             },
         });
     }
@@ -251,7 +248,7 @@ fn url_image(
         name: if alt.is_empty() { url_tail(url) } else { alt },
         user,
         taken_at,
-        link: None,
+        download: Some((url.to_owned(), url_tail(url))),
     })
 }
 
@@ -722,10 +719,14 @@ impl Render for ImageViewer {
                                     })),
                             ),
                     )
-                    .child(match image.link.clone() {
-                        Some(link) => Self::tile_button("viewer-download", IconName::Download)
-                            .on_click(move |_, _, cx| cx.open_url(&link))
-                            .into_any_element(),
+                    .child(match image.download.clone() {
+                        Some((url, name)) => {
+                            Self::tile_button("viewer-download", IconName::Download)
+                                .on_click(move |_, window, cx| {
+                                    crate::media::download(url.clone(), name.clone(), window, cx)
+                                })
+                                .into_any_element()
+                        }
                         None => {
                             let button: Div = div()
                                 .flex_none()

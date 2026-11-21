@@ -616,6 +616,7 @@ impl MessageList {
                 });
             }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
+            MessageAction::OpenImage(origin) => self.open_image(ts, &origin, cx),
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
                 let dispatch = self
@@ -1394,8 +1395,15 @@ pub fn message_row_linked(
         Some(links) => KitCx::new(fixtures, None, &message.ts).with_links(links),
         None => KitCx::new(fixtures, None, &message.ts),
     };
+    // A row with a handler (the thread panel) opens its images through it too.
     let kcx = match handler {
-        Some(handler) => kcx.dispatching_actions(handler.clone()),
+        Some(handler) => {
+            let open = handler.clone();
+            kcx.dispatching_actions(handler.clone())
+                .opening_images(Rc::new(move |origin, window, cx| {
+                    open(MessageAction::OpenImage(origin), window, cx)
+                }))
+        }
         None => kcx,
     };
     let mut body = v_flex()

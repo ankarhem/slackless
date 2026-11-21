@@ -129,6 +129,7 @@ impl CoreBridge {
 
         // Remote images (`img(url)`: photos, emoji, the workspace icon) fetch through the core.
         cx.set_http_client(Arc::new(CoreHttp(handle.fetcher())));
+        crate::media::enable_downloads(handle.fetcher(), cx);
         let (commands, mut events, store) = handle.into_parts();
         bridge.store = Some(store);
         let sender = commands.clone();

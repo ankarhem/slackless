@@ -49,6 +49,13 @@ pub enum ThreadPanelEvent {
     Close,
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
+    /// A thread image was clicked: the root opens the image viewer over the thread's
+    /// `images`, at `index`.
+    OpenImage {
+        channel: ChannelId,
+        images: Arc<Vec<crate::image_viewer::ViewerImage>>,
+        index: usize,
+    },
     /// A link in message text was clicked: profile, channel, thread or URL (permalinks
     /// resolved in-app by the root).
     OpenLink(LinkTarget),
@@ -474,6 +481,31 @@ impl ThreadPanel {
                 });
             }
             MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
+            MessageAction::OpenImage(origin) => {
+                // The viewer pages through the thread's images, root first.
+                let Some((channel, _)) = self.thread.clone() else {
+                    return;
+                };
+                let mut images = Vec::new();
+                let mut index = None;
+                for message in self.root.iter().chain(&self.replies) {
+                    for entry in crate::image_viewer::message_images(&self.fixtures, message) {
+                        if index.is_none() && &message.ts == ts && entry.origin == origin {
+                            index = Some(images.len());
+                        }
+                        images.push(entry.image);
+                    }
+                }
+                if let Some(index) = index {
+                    cx.emit(ThreadPanelEvent::OpenImage {
+                        channel,
+                        // Main-thread only, like the transcript's: the Arc only shares it.
+                        #[allow(clippy::arc_with_non_send_sync)]
+                        images: Arc::new(images),
+                        index,
+                    });
+                }
+            }
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
                 let channel = self.thread.as_ref().map(|(channel, _)| channel.clone());

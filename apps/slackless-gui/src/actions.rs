@@ -69,6 +69,8 @@ pub enum MessageAction {
         action: crate::blockkit::Json,
         attachment: Option<i64>,
     },
+    /// One of the message's images was clicked: open the image viewer on it.
+    OpenImage(crate::image_viewer::ImageOrigin),
 }
 
 /// Which actions apply to one message.

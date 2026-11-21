@@ -4978,6 +4978,11 @@ fn subscribe_workspace(
                 }
                 ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                 ThreadPanelEvent::OpenLink(target) => this.open_link(target.clone(), window, cx),
+                ThreadPanelEvent::OpenImage {
+                    channel,
+                    images,
+                    index,
+                } => this.open_image_viewer(channel.clone(), images.clone(), *index, window, cx),
                 ThreadPanelEvent::Forward(link) => this.open_compose(link, window, cx),
                 ThreadPanelEvent::Reply {
                     channel,

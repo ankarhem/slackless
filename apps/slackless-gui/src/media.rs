@@ -4,7 +4,10 @@
 //! so the app keeps a single HTTP stack. Images that may animate (GIFs, animated custom emoji)
 //! render as a [`Picture`].
 
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::{ErrorKind, Write as _};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -41,6 +44,82 @@ impl HttpClient for CoreHttp {
                 .body(AsyncBody::from(bytes))?)
         })
     }
+}
+
+/// Saves message files into the user's Downloads folder, as Slack's app does, through the
+/// core's signed-in client (Slack's file hosts need the session cookie).
+struct Downloader(Fetcher);
+
+impl Global for Downloader {}
+
+/// Live mode: let [`download`] fetch through `fetcher`.
+pub fn enable_downloads(fetcher: Fetcher, cx: &mut App) {
+    cx.set_global(Downloader(fetcher));
+}
+
+/// Download `url` into ~/Downloads as `name` (`name (1).png` when that is taken), then say
+/// where it went. Fixture mode has nothing to fetch with and says so.
+pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
+    let Some(fetcher) = cx.try_global::<Downloader>().map(|d| d.0.clone()) else {
+        crate::actions::notify(
+            "Download",
+            "Downloads need a signed-in workspace.",
+            window,
+            cx,
+        );
+        return;
+    };
+    let bytes = fetcher.get(url);
+    window
+        .spawn(cx, async move |cx| {
+            let saved = match bytes.await {
+                Ok(bytes) => {
+                    cx.background_executor()
+                        .spawn(async move { save_download(&name, &bytes) })
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            cx.update(|window, cx| match saved {
+                Ok(path) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let message = format!("{name} is in your Downloads folder.");
+                    crate::actions::notify("Downloaded", message, window, cx);
+                }
+                Err(e) => crate::actions::notify("Download failed", e, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+}
+
+/// Writes `bytes` to ~/Downloads/`name`, numbering the name like a browser when it is taken.
+fn save_download(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").ok_or("no home folder")?;
+    let dir = PathBuf::from(home).join("Downloads");
+    // A name from Slack never reaches outside the folder.
+    let name = Path::new(name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_owned());
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_owned(), format!(".{ext}")),
+        _ => (name.clone(), String::new()),
+    };
+    let mut path = dir.join(&name);
+    for n in 1.. {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(bytes).map_err(|e| e.to_string())?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                path = dir.join(format!("{stem} ({n}){ext}"));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    unreachable!("the numbering never runs out")
 }
 
 /// An image filling its parent; an animated one (a GIF, an animated custom emoji) plays at
