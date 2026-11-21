@@ -16,16 +16,17 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Toggle;
+use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, Size, ThemeStyled as _, h_flex, v_flex,
 };
+use gpui_kit::gpui::SharedString;
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Point, Render,
+    ScrollHandle, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::store::{Has, SearchFilters};
 use slackless_core::types::{ChannelId, ConversationKind, UserId};
@@ -42,6 +43,8 @@ const MATCHES_SHOWN: usize = 12;
 /// Recent searches listed while the history toggle is on.
 const HISTORY_SHOWN: usize = 10;
 /// Searches kept (newest first, deduped) behind the shown slice.
+/// The field's resting placeholder; the open panel ghosts the current row over it.
+pub(crate) const SEARCH_PLACEHOLDER: &str = "Search";
 const HISTORY_KEEP: usize = 20;
 
 pub enum SearchMenuEvent {
@@ -141,7 +144,20 @@ pub struct SearchMenu {
     hidden_unreads: usize,
     /// The "Threads" row sits in the section (followed threads have unread replies).
     has_threads_row: bool,
+    /// The current suggestion: the last row the pointer touched or the arrows moved to.
+    /// Hovering selects, as in Slack, so Enter always opens the row the field previews.
     selected: usize,
+    /// The selection moved (arrows or hover) since the last open or keystroke: only then
+    /// does the row highlight and the field ghost it (row 0 rests unhighlighted).
+    keyboard_moved: bool,
+    /// The placeholder last applied to the field; a new ghost is applied only when it
+    /// differs, so a quiet frame sets nothing.
+    last_placeholder: SharedString,
+    /// The rows list's scroll, so the keyboard's selection can scroll into view.
+    rows_scroll: ScrollHandle,
+    /// Each row's index among the scroll container's children (headers and dividers
+    /// interleave), for ScrollHandle::scroll_to_item.
+    row_child: Vec<usize>,
     expanded: bool,
     /// Searches the user ran here, newest first, deduped, at most [`HISTORY_KEEP`].
     history: Vec<String>,
@@ -174,6 +190,10 @@ impl SearchMenu {
                 hidden_unreads: 0,
                 has_threads_row: false,
                 selected: 0,
+                keyboard_moved: false,
+                last_placeholder: SEARCH_PLACEHOLDER.into(),
+                rows_scroll: ScrollHandle::new(),
+                row_child: Vec::new(),
                 expanded: false,
                 history: Vec::new(),
                 show_history: false,
@@ -198,6 +218,8 @@ impl SearchMenu {
         self.snapshot = snapshot;
         self.expanded = false;
         self.selected = 0;
+        self.keyboard_moved = false;
+        self.rows_scroll.set_offset(Point::new(px(0.), px(0.)));
         let trimmed = query.trim();
         self.query = trimmed.to_lowercase();
         self.display_query = trimmed.to_owned();
@@ -214,6 +236,8 @@ impl SearchMenu {
         self.query = trimmed.to_lowercase();
         self.display_query = trimmed.to_owned();
         self.selected = 0;
+        self.keyboard_moved = false;
+        self.rows_scroll.set_offset(Point::new(px(0.), px(0.)));
         self.refresh();
         cx.notify();
     }
@@ -248,6 +272,8 @@ impl SearchMenu {
     pub fn set_history_shown(&mut self, on: bool, cx: &mut Context<Self>) {
         self.show_history = on;
         self.selected = 0;
+        self.keyboard_moved = false;
+        self.rows_scroll.set_offset(Point::new(px(0.), px(0.)));
         self.refresh();
         cx.notify();
     }
@@ -303,8 +329,90 @@ impl SearchMenu {
             return false;
         }
         self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
+        self.keyboard_moved = true;
+        // Keep the selection in view, as Slack's list does, whichever way it went.
+        // Arriving back at the first row restores the section header above it: Slack
+        // returns to the very top of the list, header included, not just to the row.
+        let child = self.row_child.get(self.selected).copied().unwrap_or(0);
+        let child = if self.selected == 0 {
+            child.saturating_sub(1)
+        } else {
+            child
+        };
+        self.rows_scroll.scroll_to_item(child);
         cx.notify();
         true
+    }
+
+    /// The row the field previews: the one the pointer last touched or the arrows moved
+    /// to, once either has moved since the panel opened or the text changed.
+    fn ghost_row(&self) -> Option<usize> {
+        if !self.keyboard_moved {
+            return None;
+        }
+        Some(self.selected.min(self.rows.len().saturating_sub(1)))
+    }
+
+    /// The field's leading glyph: the magnifier, swapped for the current row's channel
+    /// glyph (or avatar) while that row is hovered or arrow-selected, so the bar previews
+    /// the row Enter will open, as Slack's does.
+    fn ghost_leading(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let magnifier = || {
+            Icon::new(IconName::Search)
+                .text_color(muted)
+                .size(px(16.))
+                .into_any_element()
+        };
+        let Some(row) = self.ghost_row().and_then(|ix| self.rows.get(ix)) else {
+            return magnifier();
+        };
+        match row {
+            Row::Conversation { id, kind, .. } => match kind {
+                ConversationKind::PublicChannel => {
+                    channel_tile(IconName::Hash, false, cx).into_any_element()
+                }
+                ConversationKind::PrivateChannel => {
+                    channel_tile(IconName::Lock, false, cx).into_any_element()
+                }
+                ConversationKind::Im | ConversationKind::Mpim => {
+                    let popover = cx.theme().popover;
+                    self.fixtures
+                        .conversation(id)
+                        .map(|conversation| {
+                            conversation_avatar(&self.fixtures, conversation, 18., popover, cx)
+                                .into_any_element()
+                        })
+                        .unwrap_or_else(magnifier)
+                }
+            },
+            Row::Threads => div()
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(IconName::MessageSquareText)
+                        .text_color(muted)
+                        .size(px(14.)),
+                )
+                .into_any_element(),
+            _ => magnifier(),
+        }
+    }
+
+    /// The text the field ghosts - the row the pointer is on, else the keyboard's once the
+    /// arrows have moved it - as Slack's search bar does; None keeps the plain "Search".
+    fn ghost_placeholder(&self) -> Option<SharedString> {
+        let ix = self.ghost_row()?;
+        match self.rows.get(ix)? {
+            // The field only draws a placeholder while empty, and the search row needs a
+            // typed query to exist — it can never be ghosted.
+            Row::Search => None,
+            Row::Threads => Some("Threads".into()),
+            Row::History(query) => Some(query.clone().into()),
+            Row::Conversation { label, .. } => Some(label.clone().into()),
+        }
     }
 
     /// Enter: open the highlighted row — a conversation, the Threads view, or the message
@@ -326,6 +434,7 @@ impl SearchMenu {
 
     /// The unreads section's "Show N more" link was clicked: list the rest.
     fn expand(&mut self, cx: &mut Context<Self>) {
+        // Appended rows keep earlier indices stable, so the selection stays put.
         self.expanded = true;
         self.refresh();
         cx.notify();
@@ -430,14 +539,12 @@ impl SearchMenu {
     /// The panel's first row: the search icon, the pill's field, and the filter and
     /// history toggles (accent-tinted while on, with Slack's tooltips).
     fn input_row(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
         let this = cx.entity();
         let filters = self.filters_shown();
         let history = self.history_shown();
         let filter_toggle = icon_toggle(
             "search-menu-filter-toggle",
-            IconName::SlidersHorizontal,
+            IconName::Plus,
             filters,
             "Show filters",
             "Hide filters",
@@ -472,7 +579,14 @@ impl SearchMenu {
             .px_3()
             .h(px(40.))
             .flex_none()
-            .child(Icon::new(IconName::Search).text_color(muted).size(px(16.)))
+            .child(
+                // A fixed-width slot: the glyph may be a 16px magnifier, an 18px avatar
+                // or a 24px tile, and the field's text must not shift as it swaps.
+                h_flex()
+                    .w(px(24.))
+                    .flex_none()
+                    .child(self.ghost_leading(cx)),
+            )
             .child(
                 div().flex_1().min_w_0().text_sm().child(
                     Textarea::new(&self.search)
@@ -577,7 +691,10 @@ impl SearchMenu {
     /// on the highlighted row, an Enter hint at the right edge.
     fn row_element(&self, ix: usize, row: &Row, on: bool, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
-        let (muted, hover, popover) = (theme.muted_foreground, theme.accent, theme.popover);
+        let (muted, popover) = (theme.muted_foreground, theme.popover);
+        // The current row — hovered or arrow-selected — takes the sidebar's selected blue
+        // (with its foreground), the highlight Slack's suggestion list carries.
+        let (selected_bg, selected_fg) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
         let leading = match row {
             Row::Search => div()
                 .size(px(24.))
@@ -601,13 +718,13 @@ impl SearchMenu {
                     .size(px(16.)),
                 ),
             Row::Conversation { id, kind, .. } => match kind {
-                ConversationKind::PublicChannel => channel_tile(IconName::Hash, cx),
-                ConversationKind::PrivateChannel => channel_tile(IconName::Lock, cx),
+                ConversationKind::PublicChannel => channel_tile(IconName::Hash, on, cx),
+                ConversationKind::PrivateChannel => channel_tile(IconName::Lock, on, cx),
                 ConversationKind::Im | ConversationKind::Mpim => self
                     .fixtures
                     .conversation(id)
                     .map(|conversation| {
-                        let ring = if on { hover } else { popover };
+                        let ring = if on { selected_bg } else { popover };
                         conversation_avatar(&self.fixtures, conversation, 24., ring, cx)
                     })
                     .unwrap_or_else(div),
@@ -626,16 +743,101 @@ impl SearchMenu {
             Row::Conversation { mentions, .. } => *mentions,
             _ => 0,
         };
+        // A conversation row's hover-only actions, laid over the row's right edge: run the
+        // search scoped to it (channels only — a DM has no #name to scope by), or jump to
+        // it. One shared group name is enough, as GPUI resolves it against the row's own
+        // paint subtree; the blue backing matches every state that can reveal them.
+        let actions = match row {
+            Row::Conversation {
+                id, kind, label, ..
+            } => {
+                let (open, scope_id, fallback) = (id.clone(), id.clone(), label.clone());
+                let open_tip = SharedString::from(format!("Open {label}"));
+                let search_tip = matches!(
+                    kind,
+                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+                )
+                .then(|| SharedString::from(format!("Search in {label}")));
+                Some(
+                    h_flex()
+                        .absolute()
+                        .right(px(2.))
+                        .top_0()
+                        .h_full()
+                        .items_center()
+                        .pl(px(8.))
+                        .pr(px(2.))
+                        .rounded(theme.radius)
+                        .bg(selected_bg)
+                        .gap_1()
+                        .invisible()
+                        .group_hover("search-row", |style| style.visible())
+                        .when_some(search_tip, |actions, search_tip| {
+                            actions.child(
+                                Button::new(("search-in-channel", ix))
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::Search)
+                                    .tooltip(search_tip)
+                                    .on_click(cx.listener(move |menu, _, _, cx| {
+                                        cx.stop_propagation();
+                                        let scope = menu
+                                            .fixtures
+                                            .conversation(&scope_id)
+                                            .and_then(|conversation| conversation.name.clone())
+                                            .unwrap_or_else(|| {
+                                                fallback.trim_start_matches('#').trim().to_owned()
+                                            });
+                                        let prefix = if menu.display_query.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("{} ", menu.display_query)
+                                        };
+                                        cx.emit(SearchMenuEvent::Search(format!(
+                                            "{prefix}in:#{scope}"
+                                        )));
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new(("open-in", ix))
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::ArrowRight)
+                                .tooltip(open_tip)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(SearchMenuEvent::Open(open.clone()))
+                                })),
+                        ),
+                )
+            }
+            _ => None,
+        };
         h_flex()
             .id(("search-menu-row", ix))
+            .group("search-row")
+            .relative()
             .items_center()
             .gap_2()
             .px_3()
             .py_1p5()
             .rounded_md()
             .cursor_pointer()
-            .when(on, |row| row.bg(hover))
-            .when(!on, |row| row.hover(|el| el.bg(hover)))
+            .when(on, |row| row.bg(selected_bg).text_color(selected_fg))
+            .when(!on, |row| {
+                row.hover(|el| el.bg(selected_bg).text_color(selected_fg))
+            })
+            .on_hover(cx.listener(move |menu, hovered: &bool, _, cx| {
+                // Hovering selects the row, as in Slack: the field ghosts it and Enter
+                // opens it. Leaving the row keeps the selection — the field's preview
+                // stays, as Slack's does.
+                if *hovered && (!menu.keyboard_moved || menu.selected != ix) {
+                    menu.selected = ix;
+                    menu.keyboard_moved = true;
+                    cx.notify();
+                }
+            }))
             .child(leading)
             .child(
                 // Slack's rows are regular weight, unread or not.
@@ -649,7 +851,8 @@ impl SearchMenu {
                     }),
             )
             .when(mentions > 0, |row| row.child(mention_pill(mentions, cx)))
-            .when(on, |row| row.child(enter_hint(muted)))
+            .when_some(actions, |row, actions| row.child(actions))
+            .when(on, |row| row.child(enter_hint(selected_fg)))
             .on_click(cx.listener(move |menu, _, _, cx| menu.activate(ix, cx)))
     }
 
@@ -672,7 +875,22 @@ impl SearchMenu {
 }
 
 impl Render for SearchMenu {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The ghost placeholder needs the window, which a render cannot hand the field's
+        // state directly; apply it just after this frame, and only when it changed so a
+        // quiet frame sets nothing.
+        let placeholder: SharedString = self
+            .ghost_placeholder()
+            .unwrap_or_else(|| SEARCH_PLACEHOLDER.into());
+        if placeholder != self.last_placeholder {
+            self.last_placeholder = placeholder.clone();
+            let search = self.search.clone();
+            window.defer(cx, move |window, cx| {
+                search.update(cx, |state, cx| {
+                    state.set_placeholder(placeholder, window, cx)
+                });
+            });
+        }
         let theme = cx.theme();
         let (border, muted) = (theme.border, theme.muted_foreground);
         let selected = self.selected.min(self.rows.len().saturating_sub(1));
@@ -689,6 +907,7 @@ impl Render for SearchMenu {
         let unreads_section = unreads_end > 0;
 
         let mut children: Vec<AnyElement> = Vec::new();
+        let mut row_child: Vec<usize> = Vec::with_capacity(self.rows.len());
         for (ix, row) in self.rows.iter().enumerate() {
             if query_empty && ix == 0 {
                 children.push(
@@ -709,8 +928,9 @@ impl Render for SearchMenu {
                 children.push(divider(border).into_any_element());
                 children.push(header("Recent places", muted).into_any_element());
             }
+            row_child.push(children.len());
             children.push(
-                self.row_element(ix, row, ix == selected, cx)
+                self.row_element(ix, row, self.keyboard_moved && ix == selected, cx)
                     .into_any_element(),
             );
             if query_empty && !history_mode && hidden_unreads > 0 && ix + 1 == unreads_end {
@@ -718,6 +938,7 @@ impl Render for SearchMenu {
             }
         }
 
+        self.row_child = row_child;
         v_flex()
             .w_full()
             // The shared popup surface: popover background, ring shadow and radius.
@@ -730,6 +951,7 @@ impl Render for SearchMenu {
                     .id("search-menu-rows")
                     .max_h(px(520.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.rows_scroll)
                     .gap_0p5()
                     .px_1()
                     .children(children),
@@ -943,7 +1165,7 @@ pub(crate) fn record_history(history: Vec<String>, query: &str) -> Vec<String> {
 
 /// A conversation's 24px rounded tile: the hash / lock icon on a muted chip, at the
 /// panel's row scale (the quick switcher's leading icon).
-fn channel_tile(icon: IconName, cx: &App) -> Div {
+fn channel_tile(icon: IconName, on: bool, cx: &App) -> Div {
     let theme = cx.theme();
     div()
         .size(px(24.))
@@ -955,7 +1177,12 @@ fn channel_tile(icon: IconName, cx: &App) -> Div {
         .bg(theme.muted)
         .child(
             Icon::new(icon)
-                .text_color(theme.muted_foreground)
+                // On the selected row's blue, Slack's glyph sits a shade lighter still.
+                .text_color(if on {
+                    theme.link
+                } else {
+                    theme.muted_foreground
+                })
                 .size(px(14.)),
         )
 }

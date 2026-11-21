@@ -257,7 +257,7 @@ use crate::pins;
 use crate::preferences::{AppearanceMode, Preferences, PreferencesEvent, Section};
 use crate::profile::{ProfileEvent, ProfilePanel};
 use crate::search::{SearchEvent, SearchView, fixture_archive};
-use crate::search_menu::{SearchMenu, SearchMenuEvent, Snapshot};
+use crate::search_menu::{SEARCH_PLACEHOLDER, SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
 use crate::sidebar::{NavItem, Sidebar, SidebarEvent};
 use crate::slash::{Invocation, SHRUG, SlashKind};
@@ -585,7 +585,7 @@ impl App {
             let composer = Composer::new("Message".into(), fixtures.clone(), window, cx);
             let search = cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("Describe what you are looking for")
+                    .placeholder(SEARCH_PLACEHOLDER)
                     .auto_grow(1, 1)
             });
             let search_menu = SearchMenu::new(fixtures.clone(), search.clone(), cx);
@@ -747,7 +747,7 @@ impl App {
                 cx.subscribe_in(
                     &search,
                     window,
-                    |this: &mut App, search, event: &InputEvent, _, cx| match event {
+                    |this: &mut App, search, event: &InputEvent, window, cx| match event {
                         InputEvent::PressEnter { .. } => {
                             let query = search.read(cx).value().to_string();
                             this.run_message_search(query, cx);
@@ -758,10 +758,10 @@ impl App {
                             this.search_menu
                                 .update(cx, |menu, cx| menu.set_query(&value, cx));
                         }
-                        // Focus moved away from the pill (a dialog, another pane): fold it.
+                        // Focus moved away from the pill (a dialog, another pane): fold
+                        // it, leaving whatever took the focus alone.
                         InputEvent::Blur if this.search_menu_open => {
-                            this.search_menu_open = false;
-                            cx.notify();
+                            this.fold_search_menu(window, cx);
                         }
                         _ => {}
                     },
@@ -771,18 +771,19 @@ impl App {
                     window,
                     |this: &mut App, _, event: &SearchMenuEvent, window, cx| match event {
                         SearchMenuEvent::Open(channel) => {
-                            this.search_menu_open = false;
+                            this.close_search_menu(window, cx);
                             this.select(channel.clone(), cx);
                             this.focus.focus(window, cx);
                         }
                         // The Threads row of "Unreads & drafts": the sidebar's own path.
                         SearchMenuEvent::OpenThreads => {
-                            this.search_menu_open = false;
+                            this.close_search_menu(window, cx);
                             this.open_threads(cx);
                             this.focus.focus(window, cx);
                         }
+                        // The field stays focused: the query can be refined and re-run.
                         SearchMenuEvent::Search(query) => {
-                            this.search_menu_open = false;
+                            this.fold_search_menu(window, cx);
                             this.run_message_search(query.clone(), cx);
                         }
                         SearchMenuEvent::SetHistoryShown(on) => {
@@ -2194,14 +2195,28 @@ impl App {
         cx.notify();
     }
 
-    /// Fold the dropdown and blur the pill (Escape or a click outside it).
-    fn close_search_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Fold the dropdown and put the field's placeholder back to its resting text,
+    /// leaving focus alone: a blur, a search run or a workspace switch folds this way, so
+    /// whatever took the focus (a dialog, the field itself) keeps it.
+    fn fold_search_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.search_menu_open {
             return;
         }
         self.search_menu_open = false;
-        self.focus.focus(window, cx);
+        self.search.update(cx, |state, cx| {
+            state.set_placeholder(SharedString::from(SEARCH_PLACEHOLDER), window, cx)
+        });
         cx.notify();
+    }
+
+    /// Fold the dropdown and blur the pill (Escape or a click outside it): the open menu
+    /// ghosts the row under the pointer or the arrows.
+    fn close_search_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_menu_open {
+            return;
+        }
+        self.fold_search_menu(window, cx);
+        self.focus.focus(window, cx);
     }
 
     /// The dropdown's empty-query rows: conversations with unread messages (the sidebar's
@@ -2937,7 +2952,7 @@ impl App {
         let fixtures = self.fixtures.clone();
         self.later
             .update(cx, |later, cx| later.seed(index, &fixtures, cx));
-        self.search_menu_open = false;
+        self.fold_search_menu(window, cx);
         self.search_menu
             .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
         // The Files view serves every workspace: its rows follow the shown one.
@@ -4612,7 +4627,9 @@ impl App {
                     })),
                 }
             }))
-            .child(add_menu)
+            // The stretched row would top-align the small button: center it, as the tab
+            // labels are.
+            .child(h_flex().items_center().child(add_menu))
     }
 }
 
