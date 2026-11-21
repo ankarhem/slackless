@@ -75,6 +75,32 @@ pub fn author_avatar(
     }
 }
 
+/// Slack's badge on a member of another organization: `avatar` with that organization's icon
+/// over its bottom-right corner, cut out of the avatar by a ring of `ring` (the surface behind
+/// it). Own-organization people, bots and unknown organizations get `avatar` as is.
+pub fn with_external_badge(
+    fixtures: &Fixtures,
+    user: Option<&UserId>,
+    avatar: Div,
+    size: f32,
+    ring: Hsla,
+) -> Div {
+    let Some(team) = user.and_then(|user| fixtures.external_team(user)) else {
+        return avatar;
+    };
+    let badge = (size * 0.44).round();
+    div().relative().flex_none().child(avatar).child(
+        div()
+            .absolute()
+            .right(px(-3.))
+            .bottom(px(-3.))
+            .p(px(2.))
+            .rounded(px(avatar_radius(badge) + 2.))
+            .bg(ring)
+            .child(crate::channel_details::org_chip(team, badge)),
+    )
+}
+
 /// The profile image for an avatar `size` points wide, at twice that for Retina.
 fn photo_url(profile: &Profile, size: f32) -> Option<&str> {
     let candidates = if size > 24. {

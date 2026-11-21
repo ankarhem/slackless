@@ -3,15 +3,16 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, Textarea};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Size, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     Context, Div, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, Stateful, Styled as _, Window, div, px, relative,
+    SharedString, Stateful, Styled as _, Window, div, px, relative, rems,
 };
 
 use super::tokens::{self, Palette};
 use super::toolbar::TOOLBAR;
-use super::{Composer, Placeholder};
+use super::{BAR_TUCK, Composer, Placeholder};
 
 impl Composer {
     /// The link prompt floating above the frame: a URL field for the selected text.
@@ -77,13 +78,20 @@ impl Render for Composer {
 
         // Slack's formatting bar across the top of the box: a shaded band on light themes, the
         // box's own raised surface on dark ones.
-        let focused = self.input.focus_handle(cx).is_focused(window);
+        // Slack styles the composer by `:focus-within`, which the browser drops when the window
+        // loses focus; GPUI keeps the focused element, so the window's activation counts too
+        // (GPUI repaints the window when it changes).
+        let focused = self.input.focus_handle(cx).is_focused(window) && window.is_window_active();
         let (surface, band) = crate::theme::composer_surfaces(cx);
+        // A context bar takes the frame's top edge, and the formatting bar squares off under it.
+        let context_bar = self.context_bar.clone().map(|bar| bar(window, cx));
+        let has_bar = context_bar.is_some();
         let toolbar = h_flex()
             .items_center()
             .gap_0p5()
             .px_1p5()
-            .py_1()
+            // Slack's band: 4px around 28px buttons.
+            .py(px(5.))
             .rounded_t_lg()
             .bg(band)
             .children(
@@ -109,8 +117,10 @@ impl Render for Composer {
                 weak.update(cx, |composer, cx| composer.on_paste(item, window, cx))
                     .unwrap_or(false)
             });
-        // Slack's private-channel prompt, "Message 🔒name", over the empty draft where the
-        // textarea's own (plain-text) placeholder would sit.
+        // Slack's private-channel prompt, "Message 🔒name", over the empty draft exactly where
+        // the textarea's own (plain-text) placeholder would sit: past the frame's padding and
+        // the editor's own (the kit's medium input padding), in the editor's text size and
+        // line height.
         let muted = cx.theme().muted_foreground;
         let private_prompt = self
             .private_placeholder
@@ -119,10 +129,12 @@ impl Render for Composer {
             .map(|name| {
                 h_flex()
                     .absolute()
-                    .top(px(4.))
-                    .left(px(8.))
+                    .top(px(4.) + Size::Medium.input_py())
+                    .left(px(8.) + Size::Medium.input_px())
                     .items_center()
                     .gap_1()
+                    .text_sm()
+                    .line_height(rems(1.25))
                     .text_color(muted)
                     .child("Message")
                     .child(
@@ -150,12 +162,19 @@ impl Render for Composer {
             .capture_action(cx.listener(Self::on_redo))
             .capture_key_down(cx.listener(Self::on_key))
             .children(overlay)
+            // The context bar sits on the box, outside its outline.
+            .children(context_bar)
             .child(
                 v_flex()
                     .w_full()
                     .rounded_lg()
+                    // Slack's box sits over the context bar's lower edge: the bar runs on
+                    // under the box, showing behind its rounded top corners.
+                    .when(has_bar, |frame| frame.mt(px(-BAR_TUCK)))
                     .border_1()
-                    .border_color(theme.input)
+                    // Slack's outline: a faint 10% foreground (#eaeaea on white) that darkens
+                    // while the box has focus (#afafb0).
+                    .border_color(theme.foreground.opacity(if focused { 0.35 } else { 0.1 }))
                     .bg(surface)
                     .child(toolbar)
                     .child(

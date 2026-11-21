@@ -89,13 +89,16 @@ impl Composer {
         };
         let tool = *tool;
         let is_active = self.is_active(tool);
+        // Slack's icons are the foreground at 90% (#333235 on the light band), dimmed to 30%
+        // opacity while the draft lacks focus (#bdbdbe).
+        let idle = theme.foreground.opacity(0.9);
         let (color, lit, hover) = (
             if is_active {
                 theme.foreground
             } else if focused {
-                theme.muted_foreground
+                idle
             } else {
-                theme.muted_foreground.opacity(0.5)
+                idle.opacity(0.3)
             },
             theme.secondary_hover,
             theme.secondary_hover,

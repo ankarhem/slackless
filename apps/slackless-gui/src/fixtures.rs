@@ -13,9 +13,10 @@ use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
 use slackless_core::store::Store;
 use slackless_core::types::{
-    Attachment, Block, ChannelId, ChannelSection, Conversation, ConversationKind, Edited, File,
-    FileId, Message, MessageSubtype, Presence, Profile, Reaction, RichTextBlock, RichTextContainer,
-    RichTextElement, Team, TextStyle, TopicPurpose, Ts, User, UserId,
+    Attachment, Block, ChannelId, ChannelSection, Conversation, ConversationKind,
+    ConversationProperties, Edited, File, FileId, Message, MessageSubtype, Presence, Profile,
+    Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TextStyle, TopicPurpose, Ts,
+    User, UserId,
     message::AttachmentField,
     rich_text::{
         EmojiElement, LinkElement, ListStyle, RichTextList, RichTextPreformatted, RichTextSection,
@@ -293,6 +294,32 @@ impl Fixtures {
         self.plain_text(message).replace('\n', " ")
     }
 
+    /// The organization of `user` when it is not the signed-in workspace's own and its record
+    /// is known: Slack badges such people's avatars with its icon.
+    pub fn external_team(&self, user: &UserId) -> Option<&Team> {
+        let team = self.user(user)?.team_id.as_ref()?;
+        if self.workspaces.first().is_some_and(|own| own.id == *team) {
+            return None;
+        }
+        self.teams.iter().find(|candidate| candidate.id == *team)
+    }
+
+    /// The other organizations a Slack Connect conversation is shared with, in Slack's own
+    /// order (`shared_team_ids`), as far as their team records are known.
+    pub fn shared_teams(&self, conversation: &Conversation) -> Vec<&Team> {
+        let own = self.workspaces.first().map(|team| team.id.as_str());
+        conversation
+            .extra
+            .get("shared_team_ids")
+            .and_then(|ids| ids.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|id| id.as_str())
+            .filter(|id| Some(*id) != own)
+            .filter_map(|id| self.teams.iter().find(|team| team.id.as_str() == id))
+            .collect()
+    }
+
     /// Sidebar/header label: `# name` for channels, the other parties' names for DMs.
     pub fn conversation_label(&self, conversation: &Conversation) -> String {
         match conversation.kind() {
@@ -558,6 +585,23 @@ pub fn load() -> Fixtures {
     );
     partner.extra = partner_extra;
     channels.push(partner);
+
+    // A dormant channel ("No messages in at least 30 days"): Slack's "Active only" default
+    // hides it from the list, so it only surfaces through the section popover and menus.
+    let mut archive = channel(
+        "C0ARCHIVE",
+        "archive-talk",
+        "Planning threads from the old roadmap",
+        false,
+        3,
+    );
+    let mut archive_properties = ConversationProperties::default();
+    archive_properties.extra.insert(
+        "is_dormant".to_owned(),
+        crate::blockkit::serde_json::Value::Bool(true),
+    );
+    archive.properties = Some(archive_properties);
+    channels.push(archive);
 
     let directory = [
         (
@@ -1005,7 +1049,7 @@ pub fn load() -> Fixtures {
         directory,
         archived: Vec::new(),
         presence: Arc::new(RwLock::new(presence)),
-        notify_levels: HashMap::new(),
+        notify_levels: HashMap::from([(ChannelId::from("C0DESIGN"), NotifyLevel::Muted)]),
         quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
             .map(String::from)
             .to_vec(),

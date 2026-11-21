@@ -24,6 +24,7 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
 };
@@ -436,17 +437,26 @@ pub fn reaction_chips(
         row = row.child(chip);
     }
     if let Some(handler) = handler.cloned() {
+        // Slack's add-reaction control is a capsule the size of a reaction.
         row = row.child(
-            div().rounded_full().bg(secondary).child(
-                Button::new(SharedString::from(format!("{key}-reaction-add")))
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .icon(IconName::FaceSlightlySmilingPlus)
-                    .tooltip("Add reaction")
-                    .on_click(move |event, window, cx| {
-                        handler(MessageAction::PickReaction(event.position()), window, cx);
-                    }),
-            ),
+            h_flex()
+                .id(SharedString::from(format!("{key}-reaction-add")))
+                .h(px(24.))
+                .px_2()
+                .items_center()
+                .rounded_full()
+                .bg(secondary)
+                .hover(|pill| pill.bg(secondary_hover))
+                .cursor_pointer()
+                .child(
+                    Icon::new(IconName::FaceSlightlySmilingPlus)
+                        .size(px(16.))
+                        .text_color(foreground),
+                )
+                .tooltip(|window, cx| Tooltip::new("Add reaction").build(window, cx))
+                .on_click(move |event, window, cx| {
+                    handler(MessageAction::PickReaction(event.position()), window, cx);
+                }),
         );
     }
     Some(row)

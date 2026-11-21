@@ -23,11 +23,12 @@ mod tokens;
 mod toolbar;
 mod view;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::input::{InputEditsEvent, InputState, TextareaState};
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Pixels, Point,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Pixels, Point,
     SharedString, Subscription, Window,
 };
 use slackless_core::api::MessageContent;
@@ -62,6 +63,14 @@ pub enum AlsoSendTarget {
     DirectMessage,
 }
 
+/// Builds the strip Slack draws inside the composer's frame above the formatting bar, its
+/// context bar (the Slack Connect notice of a shared channel).
+pub type ContextBar = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+
+/// How far the composer box overlaps its context bar; the bar adds this to its bottom padding
+/// so its content stays clear.
+pub const BAR_TUCK: f32 = 8.;
+
 /// What the composer prompts with while empty.
 pub enum Placeholder {
     /// Plain text: "Message #general", "Jot something down".
@@ -93,6 +102,8 @@ pub struct Composer {
     /// The private channel the prompt names: drawn with its lock over the empty draft, as a
     /// textarea placeholder is plain text.
     private_placeholder: Option<SharedString>,
+    /// The context bar over the formatting bar, while the conversation has one.
+    context_bar: Option<ContextBar>,
     /// Preferences > Messages & media: Enter sends (Shift+Enter newline) when true; when
     /// false Enter inserts a newline and Cmd+Enter sends.
     enter_sends: bool,
@@ -157,6 +168,7 @@ impl Composer {
                 is_stale: false,
                 pending_placeholder: None,
                 private_placeholder: None,
+                context_bar: None,
                 enter_sends: true,
                 scheduling: true,
                 also_send: None,
@@ -166,6 +178,12 @@ impl Composer {
     }
 
     /// Prompt with `placeholder` while empty ("Message #general"); applied on the next frame.
+    /// Show `bar` inside the frame above the formatting bar, or remove it.
+    pub fn set_context_bar(&mut self, bar: Option<ContextBar>, cx: &mut Context<Self>) {
+        self.context_bar = bar;
+        cx.notify();
+    }
+
     pub fn set_placeholder(&mut self, placeholder: Placeholder, cx: &mut Context<Self>) {
         self.pending_placeholder = Some(placeholder);
         cx.notify();

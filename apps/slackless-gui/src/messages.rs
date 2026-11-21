@@ -229,6 +229,8 @@ struct MessageData {
     kit: Entity<BlockKitState>,
     /// Messages saved for later (fixture mode: in memory).
     saved: HashSet<Ts>,
+    /// Root of the thread open beside the list, tinted while it shows.
+    open_thread: Option<Ts>,
     /// The message being edited in place; its draft is `edit_draft`.
     editing: Option<Ts>,
     edit_draft: Entity<TextareaState>,
@@ -291,6 +293,7 @@ impl MessageList {
                     .and_then(|conversation| conversation.last_read.clone()),
                 kit,
                 saved: HashSet::new(),
+                open_thread: None,
                 editing: None,
                 edit_draft,
             });
@@ -761,6 +764,14 @@ impl MessageList {
         self.refresh(cx);
     }
 
+    /// Tint the root of the thread open beside the list (`None`: no thread is open).
+    pub fn set_open_thread(&mut self, root: Option<Ts>, cx: &mut Context<Self>) {
+        if self.data.read(cx).open_thread != root {
+            self.data.update(cx, |data, _| data.open_thread = root);
+            self.refresh(cx);
+        }
+    }
+
     /// Save (or unsave) `ts` in the open conversation, optionally with a reminder, and hand
     /// the request to the root's Later list.
     fn save_for_later(
@@ -1115,33 +1126,95 @@ fn transcript_row(
         ));
         if let Some(reply_count) = message.reply_count.filter(|&count| count > 0) {
             let reply = handler.clone();
-            // Slack's thread summary: the repliers' faces, then the reply count.
+            // Slack's thread summary (`.c-message__reply_bar`): the repliers' faces and the
+            // reply count, 4px under the message. Hovering the message raises it into a card
+            // (white, 13% foreground ring) with "Last reply …" and a chevron; hovering the
+            // bar itself swaps that line for "View thread".
             let faces = message
                 .reply_users
                 .iter()
                 .take(4)
-                .map(|user| crate::avatars::user_chip(fixtures, user, 22.));
+                .map(|user| crate::avatars::user_chip(fixtures, user, 24.));
             let label = if reply_count == 1 {
                 "1 reply".to_owned()
             } else {
                 format!("{reply_count} replies")
             };
+            let last_reply = message
+                .latest_reply
+                .as_ref()
+                .and_then(|ts| ts.secs())
+                .map(|secs| format!("Last reply {}", crate::image_viewer::relative_stamp(secs)));
+            let theme = cx.theme();
+            let (surface, edge, muted, link) = (
+                theme.background,
+                theme.foreground.opacity(0.13),
+                theme.muted_foreground,
+                theme.link,
+            );
             body = body.child(
                 h_flex()
                     .id(SharedString::from(format!(
                         "thread-{}",
                         message.ts.as_str()
                     )))
-                    .items_center()
+                    .group("reply-bar")
+                    .max_w(px(600.))
+                    .h(px(34.))
+                    .mt_1()
+                    .ml(px(-5.))
+                    .p_1()
                     .gap_1()
-                    .pb_1()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().link)
+                    .items_center()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(edge.opacity(0.))
+                    .text_size(px(13.))
                     .cursor_pointer()
-                    .hover(|el| el.opacity(0.8))
+                    .group_hover("msg", |bar| bar.bg(surface).border_color(edge))
                     .children(faces)
-                    .child(div().ml_1().child(label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(link)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .min_w_0()
+                            .ml_1()
+                            .text_color(muted)
+                            .whitespace_nowrap()
+                            .opacity(0.)
+                            .group_hover("msg", |line| line.opacity(1.))
+                            .children(last_reply.map(|last| {
+                                div()
+                                    .group_hover("reply-bar", |line| line.opacity(0.))
+                                    .child(last)
+                            }))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .opacity(0.)
+                                    .group_hover("reply-bar", |line| line.opacity(1.))
+                                    .child("View thread"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .ml_auto()
+                            .opacity(0.)
+                            .group_hover("msg", |arrow| arrow.opacity(1.))
+                            .child(
+                                Icon::new(IconName::ChevronRight)
+                                    .size(px(16.))
+                                    .text_color(muted),
+                            ),
+                    )
                     .on_click(move |_, window, cx| reply(MessageAction::ReplyInThread, window, cx)),
             );
         }
@@ -1167,7 +1240,13 @@ fn transcript_row(
             .into_any_element()
     } else {
         profile_link(
-            crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
+            crate::avatars::with_external_badge(
+                fixtures,
+                message.user.as_ref(),
+                crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
+                AVATAR_SIZE,
+                cx.theme().background,
+            ),
             format!("{key}-avatar"),
             message.user.as_ref(),
             Some(&handler),
@@ -1182,6 +1261,8 @@ fn transcript_row(
     let theme = cx.theme();
     let hover_bg = theme.secondary.opacity(0.5);
     let saved_bg = theme.warning.opacity(0.08);
+    let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
+    let thread_bg = crate::theme::thread_root(cx);
     let menu_handler = handler.clone();
     let card = div()
         .id(SharedString::from(key.clone()))
@@ -1195,7 +1276,10 @@ fn transcript_row(
         .when(saved, |card| {
             card.bg(saved_bg).child(actions::saved_banner(cx))
         })
-        .when(!saved, |card| card.hover(|card| card.bg(hover_bg)))
+        .when(thread_open, |card| card.bg(thread_bg))
+        .when(!saved && !thread_open, |card| {
+            card.hover(|card| card.bg(hover_bg))
+        })
         .child(
             h_flex()
                 .items_start()
@@ -1222,7 +1306,7 @@ fn transcript_row(
 
 /// Two consecutive messages group into one card when they share an author, land on the same
 /// day within [`GROUP_WINDOW_SECS`], and carry the same thread-ness.
-fn same_group(prev: &Message, message: &Message) -> bool {
+pub(crate) fn same_group(prev: &Message, message: &Message) -> bool {
     let same_author = match (&prev.user, &message.user) {
         (Some(a), Some(b)) => a == b,
         (None, None) => prev.username == message.username,
@@ -1264,16 +1348,19 @@ pub fn message_row(
     handler: Option<&actions::ActionHandler>,
     cx: &App,
 ) -> Div {
-    message_row_linked(fixtures, message, handler, None, cx)
+    message_row_linked(fixtures, message, handler, None, None, cx)
 }
 
 /// [`message_row`] with its text selectable and links routed through `links` (the thread
-/// panel: its events reach the root without a transcript).
+/// panel: its events reach the root without a transcript). With `grouped` (the row's hover
+/// group) the card continues the previous message's: no avatar or name, its time showing in
+/// the gutter on hover, as in Slack.
 pub fn message_row_linked(
     fixtures: &Fixtures,
     message: &Message,
     handler: Option<&actions::ActionHandler>,
     links: Option<&LinkHandler>,
+    grouped: Option<SharedString>,
     cx: &App,
 ) -> Div {
     let author_key = author_key(message);
@@ -1287,14 +1374,16 @@ pub fn message_row_linked(
         .min_w_0()
         .gap_0p5()
         .text_sm()
-        .child(message_header(
-            message,
-            &author,
-            card_stamp(&message.ts),
-            fixtures,
-            handler,
-            cx,
-        ))
+        .when(grouped.is_none(), |body| {
+            body.child(message_header(
+                message,
+                &author,
+                card_stamp(&message.ts),
+                fixtures,
+                handler,
+                cx,
+            ))
+        })
         .child(message_body(message, &kcx, cx));
     if let Some(files) = crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx) {
         body = body.child(files);
@@ -1307,16 +1396,38 @@ pub fn message_row_linked(
         None,
         cx,
     ));
+    let gutter = match grouped {
+        // Slack's continuation gutter: the time, shown while the row is hovered.
+        Some(group) => div()
+            .w(px(AVATAR_SIZE))
+            .flex_none()
+            .flex()
+            .justify_center()
+            .pt_0p5()
+            .opacity(0.)
+            .group_hover(group, |slot| slot.opacity(1.))
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(format_clock(&message.ts))
+            .into_any_element(),
+        None => profile_link(
+            crate::avatars::with_external_badge(
+                fixtures,
+                message.user.as_ref(),
+                crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
+                AVATAR_SIZE,
+                cx.theme().background,
+            ),
+            format!("{key}-avatar"),
+            message.user.as_ref(),
+            handler,
+        ),
+    };
     h_flex()
         .items_start()
         .gap_3()
         .min_w_0()
-        .child(profile_link(
-            crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
-            format!("{key}-avatar"),
-            message.user.as_ref(),
-            handler,
-        ))
+        .child(gutter)
         .child(body)
 }
 
@@ -1403,33 +1514,62 @@ pub enum Jump {
 }
 
 fn date_divider(label: String, key: String, list: WeakEntity<MessageList>, cx: &App) -> Div {
-    let border = cx.theme().border;
+    let theme = cx.theme();
+    let (border, background, fg) = (theme.border, theme.background, theme.foreground);
+    // Slack's pill: 28px high, 13px bold, 16px before the label and 8px after its small
+    // chevron, a 13% foreground ring and a faint drop shadow.
+    let pill = Button::new(SharedString::from(key))
+        .outline()
+        .with_size(Size::XSmall)
+        .rounded(ButtonRounded::Size(px(999.)))
+        .h(px(28.))
+        .pl(px(16.))
+        .pr(px(8.))
+        .bg(background)
+        .border_color(fg.opacity(0.13))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(fg)
+                .child(label),
+        )
+        .child(
+            Icon::new(IconName::ChevronDown)
+                .size(px(10.))
+                .text_color(fg),
+        );
+    // `Button::shadow` toggles the kit's own shadow; this is the element's.
+    let pill = gpui_kit::gpui::Styled::shadow(
+        pill,
+        vec![gpui_kit::gpui::BoxShadow {
+            color: Hsla::black().opacity(0.08),
+            offset: gpui_kit::gpui::point(px(0.), px(1.)),
+            blur_radius: px(3.),
+            spread_radius: px(0.),
+            inset: false,
+        }],
+    );
     h_flex()
         .items_center()
         .py_1()
         .child(div().flex_1().h(px(1.)).bg(border))
         .child(
-            Button::new(SharedString::from(key))
-                .outline()
-                .with_size(Size::XSmall)
-                .rounded(ButtonRounded::Size(px(999.)))
-                .label(label)
-                .dropdown_caret(true)
-                .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
-                    menu = menu.label("Jump to…");
-                    for (jump, text) in [
-                        (Jump::Recent, "Most recent"),
-                        (Jump::LastWeek, "Last week"),
-                        (Jump::LastMonth, "Last month"),
-                        (Jump::Beginning, "The very beginning"),
-                    ] {
-                        let list = list.clone();
-                        menu = menu.item(PopupMenuItem::new(text).on_click(move |_, _, cx| {
-                            let _ = list.update(cx, |list, cx| list.jump(jump, cx));
-                        }));
-                    }
-                    menu
-                }),
+            pill.dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                menu = menu.label("Jump to…");
+                for (jump, text) in [
+                    (Jump::Recent, "Most recent"),
+                    (Jump::LastWeek, "Last week"),
+                    (Jump::LastMonth, "Last month"),
+                    (Jump::Beginning, "The very beginning"),
+                ] {
+                    let list = list.clone();
+                    menu = menu.item(PopupMenuItem::new(text).on_click(move |_, _, cx| {
+                        let _ = list.update(cx, |list, cx| list.jump(jump, cx));
+                    }));
+                }
+                menu
+            }),
         )
         .child(div().flex_1().h(px(1.)).bg(border))
 }
@@ -1834,6 +1974,20 @@ impl ParagraphBuilder {
         self.segments.push(Segment::Text { text, runs, links });
     }
 
+    /// Drop the line breaks the paragraph ends with: Slack starts what follows (a code
+    /// block, a quote, a list or the message's end) on its own line without them.
+    fn trim_trailing_breaks(&mut self) {
+        while self.text.ends_with('\n') {
+            self.text.pop();
+            if let Some(last) = self.runs.last_mut() {
+                last.len -= 1;
+                if last.len == 0 {
+                    self.runs.pop();
+                }
+            }
+        }
+    }
+
     fn finish(mut self) -> Vec<Segment> {
         self.flush();
         self.segments
@@ -2000,6 +2154,10 @@ struct SelectableParagraph {
     document_order: u64,
     selection: Hsla,
     link: Hsla,
+    /// Inline code spans, outlined like Slack's `.c-mrkdwn__code` (a run-level background
+    /// cannot carry a border).
+    code: Vec<Range<usize>>,
+    code_border: Hsla,
 }
 
 /// What one paragraph keeps between frames: its selection handle (and the subscription
@@ -2022,7 +2180,22 @@ impl SelectableParagraph {
         theme: &RunTheme,
     ) -> Self {
         let text: SharedString = text.into();
+        // Inline code is the mono run with a wash; code blocks carry no run background.
+        let mut code: Vec<Range<usize>> = Vec::new();
+        let mut at = 0;
+        for run in &runs {
+            let span = at..at + run.len;
+            at = span.end;
+            if run.background_color.is_some() && run.font.family == theme.mono_font.family {
+                match code.last_mut() {
+                    Some(last) if last.end == span.start => last.end = span.end,
+                    _ => code.push(span),
+                }
+            }
+        }
         Self {
+            code,
+            code_border: theme.foreground.opacity(0.13),
             styled: StyledText::new(text.clone()).with_runs(runs),
             id,
             text,
@@ -2062,6 +2235,66 @@ impl SelectableParagraph {
             Point::new(bounds.left(), end.y),
             Point::new(end.x, end.y + line_height),
         ));
+        quads
+    }
+
+    /// Slack's inline-code outline: a 1px 13% foreground ring with 3px corners, a little
+    /// wider than the glyphs and a little shorter than the line.
+    fn paint_code_outline(&self, layout: &TextLayout, range: Range<usize>, window: &mut Window) {
+        for bounds in self.code_quads(layout, range) {
+            let outline = Bounds::from_corners(
+                Point::new(bounds.left() - px(2.), bounds.top() + px(1.)),
+                Point::new(bounds.right() + px(2.), bounds.bottom() - px(1.)),
+            );
+            window.paint_quad(PaintQuad {
+                bounds: outline,
+                background: transparent_black().into(),
+                corner_radii: Corners::all(px(3.)),
+                border_widths: Edges::all(px(1.)),
+                border_color: self.code_border,
+                border_style: BorderStyle::default(),
+            });
+        }
+    }
+
+    /// The boxes an inline-code range covers, one per wrapped line, each ending where that
+    /// line's text ends (a selection instead runs on to the paragraph's edge).
+    fn code_quads(&self, layout: &TextLayout, range: Range<usize>) -> Vec<Bounds<Pixels>> {
+        let (Some(start), Some(end)) = (
+            layout.position_for_index(range.start),
+            layout.position_for_index(range.end),
+        ) else {
+            return Vec::new();
+        };
+        let line_height = layout.line_height();
+        let quad = |y: Pixels, left: Pixels, right: Pixels| {
+            Bounds::from_corners(Point::new(left, y), Point::new(right, y + line_height))
+        };
+        if start.y == end.y {
+            return vec![quad(start.y, start.x, end.x)];
+        }
+        // A wrapped span. The layout places a wrap boundary at the end of the line it closes,
+        // so the farthest position found on a line is where that line's text ends; a line the
+        // span only touches at such a boundary gets no box.
+        let left = layout.bounds().left();
+        let mut quads = Vec::new();
+        let (mut y, mut from, mut to) = (start.y, start.x, start.x);
+        for ix in (range.start..=range.end).filter(|ix| self.text.is_char_boundary(*ix)) {
+            let Some(at) = layout.position_for_index(ix) else {
+                continue;
+            };
+            if at.y == y {
+                to = to.max(at.x);
+                continue;
+            }
+            if to - from > px(1.) {
+                quads.push(quad(y, from, to));
+            }
+            (y, from, to) = (at.y, left, at.x);
+        }
+        if to - from > px(1.) {
+            quads.push(quad(y, from, to));
+        }
         quads
     }
 
@@ -2300,6 +2533,17 @@ impl Element for SelectableParagraph {
             window,
             cx,
         );
+        for range in &self.code {
+            self.paint_code_outline(&layout, range.clone(), window);
+        }
+        // Selectable text takes the text cursor, as in Slack; links switch it to a hand.
+        let over_link = layout
+            .index_for_position(window.mouse_position())
+            .ok()
+            .is_some_and(|ix| self.links.iter().any(|(range, _)| range.contains(&ix)));
+        if !over_link {
+            window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        }
         if !self.links.is_empty() {
             self.paint_links(global_id, &layout, hitbox, window);
         }
@@ -2316,6 +2560,7 @@ fn paragraph(
     for element in elements {
         push_element(&mut builder, element, fixtures, theme);
     }
+    builder.trim_trailing_breaks();
     if edited {
         builder.push_edited(theme);
     }
@@ -2341,7 +2586,13 @@ fn push_element(
         }
         RichTextElement::Link(el) => {
             let label = el.text.clone().unwrap_or_else(|| el.url.clone());
-            builder.push_link(el.url.clone(), label, theme);
+            // Slack draws a link inside backticks as plain code, not a link.
+            let run = flags(el.style.as_ref());
+            if run.code {
+                builder.push_text(&label, theme, run, None, Some(theme.code_bg));
+            } else {
+                builder.push_link(el.url.clone(), label, theme);
+            }
         }
         RichTextElement::User(el) => {
             let label = format!("@{}", fixtures.mention_name(&el.user_id));
@@ -2492,7 +2743,8 @@ fn render_list(list: &RichTextList, fixtures: &Fixtures, theme: &RunTheme, edite
         .indent
         .unwrap_or(0)
         .saturating_add(list.offset.unwrap_or(0));
-    let indent = px(16. + 20. * depth as f32);
+    // Slack's disc sits 10px in, its text 28px in, nesting 22px a level.
+    let indent = px(10. + 22. * depth as f32);
     let mut column = v_flex().gap_1();
     for (n, item) in list.elements.iter().enumerate() {
         let elements: &[RichTextElement] = match item {
@@ -2502,6 +2754,7 @@ fn render_list(list: &RichTextList, fixtures: &Fixtures, theme: &RunTheme, edite
         if elements.is_empty() {
             continue;
         }
+        let ordered = matches!(list.style, ListStyle::Ordered);
         let marker = match &list.style {
             ListStyle::Ordered => format!("{}.", n + 1),
             _ => "•".to_owned(),
@@ -2511,9 +2764,17 @@ fn render_list(list: &RichTextList, fixtures: &Fixtures, theme: &RunTheme, edite
             column = column.child(
                 h_flex()
                     .items_start()
-                    .gap_2()
                     .pl(indent)
-                    .child(div().flex_none().text_color(theme.muted).child(marker))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(18.))
+                            .when(!ordered, |marker| {
+                                marker.text_size(px(20.)).line_height(px(22.))
+                            })
+                            .text_color(theme.foreground)
+                            .child(marker),
+                    )
                     .child(item_row),
             );
         }
@@ -2574,13 +2835,18 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
             },
         )
         .child(
+            // Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground
+            // ring with 4px corners.
             div()
                 .w_full()
                 .min_w_0()
-                .rounded_md()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.foreground.opacity(0.13))
                 .bg(theme.code_bg)
-                .px_2()
-                .py_1p5()
+                .p_2()
+                .text_size(px(12.))
+                .line_height(px(18.))
                 .child(text),
         )
 }
@@ -2603,7 +2869,8 @@ fn body_ends_in_text(message: &Message) -> bool {
         Some(Block::RichText(rich))
             if matches!(
                 rich.elements.last(),
-                Some(RichTextContainer::Section(_) | RichTextContainer::List(_))
+                // After a list Slack puts the edit marker on its own line.
+                Some(RichTextContainer::Section(_))
             )
     );
     fallback_text || ends_in_paragraph
@@ -3020,14 +3287,32 @@ pub(crate) fn file_day(secs: i64) -> String {
 }
 
 /// The stamp on a message card outside the day-divided transcript (threads, search, pins):
-/// like Slack, the time for today's messages, the day and time otherwise.
+/// like Slack, the time for today's messages, "Yesterday at …", the weekday within the past
+/// week ("Tuesday at 9:01 AM"), the full date before that.
 fn card_stamp(ts: &Ts) -> String {
-    match ts.secs() {
-        Some(secs) if CivilTime::from_unix(secs).day_index == CivilTime::now().day_index => {
-            format_clock(ts)
-        }
+    let Some(secs) = ts.secs() else {
+        return ts.as_str().to_owned();
+    };
+    let day = CivilTime::from_unix(secs).day_index;
+    match CivilTime::now().day_index - day {
+        0 => format_clock(ts),
+        2..=6 => format!("{} at {}", weekday_name(day), format_clock(ts)),
         _ => day_and_time(ts),
     }
+}
+
+/// The weekday of a day counted from the Unix epoch, which began on a Thursday.
+fn weekday_name(day_index: i64) -> &'static str {
+    const WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    WEEKDAYS[(day_index + 4).rem_euclid(7) as usize]
 }
 
 /// The day header of a day-grouped list (the Activity page): the divider's day label
@@ -3060,15 +3345,6 @@ pub(crate) fn iso_date(secs: i64) -> String {
 /// Slack's divider label: `Today` / `Yesterday` / `Tuesday, November 10th`, plus `, 2025`
 /// outside the current year.
 fn date_label(time: &CivilTime, now: &CivilTime) -> String {
-    const WEEKDAYS: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
     const MONTH_NAMES: [&str; 12] = [
         "January",
         "February",
@@ -3089,8 +3365,7 @@ fn date_label(time: &CivilTime, now: &CivilTime) -> String {
     if time.day_index + 1 == now.day_index {
         return "Yesterday".to_owned();
     }
-    // Day 0 of the Unix epoch (1970-01-01) was a Thursday.
-    let weekday = WEEKDAYS[(time.day_index + 4).rem_euclid(7) as usize];
+    let weekday = weekday_name(time.day_index);
     let month = MONTH_NAMES[(time.month - 1) as usize];
     let day = time.day;
     let suffix = match (day % 10, day % 100) {

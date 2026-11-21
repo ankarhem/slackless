@@ -289,7 +289,7 @@ fn collect_json_urls(value: &crate::blockkit::serde_json::Value, out: &mut Vec<(
 /// Slack's header stamp: "29 days ago in # praise - image.png" for a day-old upload,
 /// "just now" / "N minutes ago" / "N hours ago" / "yesterday" / "N days ago" within a
 /// week, then a plain "Mon D" date.
-fn relative_stamp(secs: i64) -> String {
+pub(crate) fn relative_stamp(secs: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];

@@ -1,7 +1,9 @@
 //! The signed-in user's status, presence and Do Not Disturb: the [`StatusPicker`] dialog
 //! (Slack's two steps: pick a suggestion or type, then duration + pause), the [`UserMenu`] dropped from the
-//! title-bar avatar (status, away/active, pause notifications, schedule, profile,
-//! preferences), and [`self_avatar`], the avatar with its presence / DND badge.
+//! title-bar avatar (Slack's profile menu: status, away/active, a Notifications hover
+//! submenu with the pause presets, profile, preferences, account settings, downloads and
+//! sign out), the [`PausePicker`] custom pause dialog, and [`self_avatar`], the avatar with
+//! its presence / DND badge.
 //!
 //! State lives in the root as a [`SelfState`] and is pushed down with `set_state`; the views
 //! only emit what the user asked for. Fixture mode keeps everything in memory; live mode will
@@ -21,12 +23,13 @@ use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _,
+    FontWeight, Hsla, InteractiveElement as _, InteractiveText, IntoElement, ParentElement as _,
+    Render, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledText,
+    Subscription, TextRun, Window, div, px,
 };
 
 use crate::avatars::user_chip;
@@ -668,6 +671,14 @@ pub enum UserMenuEvent {
     OpenPreferences,
     /// Preferences > Notifications, where the schedule lives.
     OpenSchedule,
+    /// Slack's "Custom…" pause dialog ([`PausePicker`]).
+    OpenPauseCustom,
+    /// The workspace's account settings at `<domain>.slack.com`, in the browser.
+    OpenAccount,
+    /// The user's Downloads folder in Finder (slackless has no download manager).
+    OpenDownloads,
+    /// Forget this workspace's stored session and quit; the next launch signs in.
+    SignOut,
 }
 
 /// The menu under the title-bar avatar.
@@ -675,7 +686,15 @@ pub struct UserMenu {
     fixtures: Arc<Fixtures>,
     state: SelfState,
     schedule: String,
-    pause_open: bool,
+    /// The Notifications row is under the pointer: its submenu is open (Slack opens it on
+    /// hover). The submenu keeps it open while the pointer is over it, so the two hover
+    /// flags stay independent and order-independent.
+    notif_hover: bool,
+    sub_hover: bool,
+    /// The hovered row id: Slack turns the whole row, hints included, white on its blue
+    /// highlight, which plain hover styles cannot express for the right-aligned hints.
+    hovered: Option<&'static str>,
+    _pause_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<UserMenuEvent> for UserMenu {}
@@ -686,7 +705,10 @@ impl UserMenu {
             fixtures,
             state: SelfState::default(),
             schedule: String::new(),
-            pause_open: false,
+            notif_hover: false,
+            sub_hover: false,
+            hovered: None,
+            _pause_subscription: None,
         })
     }
 
@@ -695,54 +717,128 @@ impl UserMenu {
         self.schedule = schedule;
         cx.notify();
     }
+
+    /// The menu was dismissed: drop hover state so the submenu cannot reappear stale.
+    pub fn closed(&mut self, cx: &mut Context<Self>) {
+        self.notif_hover = false;
+        self.sub_hover = false;
+        self.hovered = None;
+        cx.notify();
+    }
+
+    /// Slack's "Custom…" pause dialog: pick a wall-clock time to pause until.
+    pub fn open_pause_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picker = PausePicker::new(window, cx);
+        self._pause_subscription = Some(cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, event: &PauseEvent, window, cx| {
+                window.close_dialog(cx);
+                this.notif_hover = false;
+                this.sub_hover = false;
+                if let PauseEvent::Save(until) = event {
+                    cx.emit(UserMenuEvent::Pause(Some(*until)));
+                }
+            },
+        ));
+        let picker = picker.clone();
+        let first_focus = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            // The dialog shell takes focus when it opens; put the caret in the time field
+            // on the builder's first run only (it re-runs on rebuilds).
+            if first_focus.replace(false) {
+                // Split the reads from the focus call: the shared cx borrows must end first.
+                let handle = picker.read(cx).text.read(cx).focus_handle(cx);
+                handle.focus(window, cx);
+            }
+            dialog
+                .title("Pause notifications")
+                .w(px(360.))
+                .child(picker.clone())
+        });
+    }
 }
 
-/// A plain menu row.
-fn menu_row(id: &'static str, label: impl Into<String>, hover: Hsla) -> Stateful<Div> {
+/// A plain menu row sized like Slack's: 28pt tall, 24pt text inset. `hot` is Slack's
+/// state-driven hover: the workspace's selected-row blue with every child turned white.
+fn row_base(id: &'static str, hot: bool, blue: Hsla, on_blue: Hsla) -> Stateful<Div> {
     h_flex()
         .id(id)
+        .h(px(28.))
+        .px_6()
         .items_center()
-        .gap_2()
-        .px_4()
-        .py_1()
+        .gap_1()
         .cursor_pointer()
-        .text_sm()
-        .hover(|el| el.bg(hover))
-        .child(label.into())
+        .text_size(px(15.))
+        .when(hot, |row| row.bg(blue).text_color(on_blue))
 }
 
+/// A row whose children are plain text: hover styles alone flip them white.
+fn simple_row(id: impl Into<ElementId>) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .h(px(28.))
+        .px_6()
+        .items_center()
+        .gap_1()
+        .cursor_pointer()
+        .text_size(px(15.))
+}
+
+/// Slack's menu metrics (pt): the panel is ~300pt wide, the hover submenu is a ~260pt
+/// panel flush to the right edge with its top level with the status box under the header
+/// (20pt header top pad + 36pt avatar + 8pt + 8pt margins). Measured off Slack's menu.
+const MENU_WIDTH: f32 = 300.;
+const SUBMENU_TOP: f32 = 74.;
+const SUBMENU_WIDTH: f32 = 260.;
+
+/// Slack's submenu footer; the "in preferences" tail opens Preferences.
+const VIP_NOTE: &str = "You can choose to always allow notifications from VIPs ";
+const VIP_LINK: &str = "in preferences";
+
 impl Render for UserMenu {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (popover, border, muted, hover, success, foreground) = (
+        let (popover, border, muted, accent, success) = (
             theme.popover,
             theme.border,
             theme.muted_foreground,
             theme.accent,
             theme.success,
-            theme.foreground,
         );
+        // Slack highlights the hovered row with the workspace's selected-row blue, every
+        // hint on the row turned white with it.
+        let (blue, on_blue) = (theme.sidebar_accent, theme.sidebar_accent_foreground);
+        let link = theme.link;
         let state = self.state.clone();
         let name = self.fixtures.user_name(&self.fixtures.self_user).to_owned();
-        let avatar = self_avatar(&self.fixtures, &state, 36., popover, cx);
-        let presence = if state.away { "Away" } else { "Active" };
+        // Slack's menu header avatar carries no presence badge; the "● Active" line below
+        // the name is the only presence here (the rail avatar keeps its badge).
+        let avatar = user_chip(&self.fixtures, &self.fixtures.self_user, 36.);
+        let pause_open = self.notif_hover || self.sub_hover;
 
+        let presence = if state.away { "Away" } else { "Active" };
         let header = h_flex()
             .items_center()
             .gap_3()
-            .px_4()
-            .pt_3()
+            .px_6()
+            .pt_5()
             .pb_2()
             .child(avatar)
             .child(
                 v_flex()
-                    .child(div().font_weight(FontWeight::BOLD).child(name))
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::BOLD)
+                            .line_height(px(20.))
+                            .child(name),
+                    )
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_1()
-                            .text_xs()
-                            .text_color(muted)
+                            .gap_1p5()
                             .child(
                                 div()
                                     .size(px(8.))
@@ -750,26 +846,32 @@ impl Render for UserMenu {
                                     .when(!state.away, |dot| dot.bg(success))
                                     .when(state.away, |dot| dot.border_1().border_color(muted)),
                             )
-                            .child(presence),
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .line_height(px(16.))
+                                    .text_color(muted)
+                                    .child(presence),
+                            ),
                     ),
             );
 
         let status_box = h_flex()
             .id("menu-status")
-            .mx_4()
-            .my_1()
+            .mx_6()
+            .my_2()
+            .h(px(40.))
             .items_center()
             .gap_2()
-            .px_2()
-            .py_1p5()
-            .rounded_md()
+            .px_2p5()
+            .rounded(px(4.))
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .text_sm()
-            .hover(|el| el.bg(hover))
-            .map(|row| match &state.status {
-                Some(status) => row
+            .text_size(px(15.))
+            .hover(|boxel| boxel.bg(accent))
+            .map(|boxel| match &state.status {
+                Some(status) => boxel
                     .child(status.glyph())
                     .child(div().flex_1().truncate().child(status.text.clone()))
                     .child(
@@ -780,14 +882,14 @@ impl Render for UserMenu {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .hover(|el| el.bg(border))
+                            .hover(|x| x.bg(border))
                             .child(Icon::new(IconName::X).text_color(muted).size(px(12.)))
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.stop_propagation();
                                 cx.emit(UserMenuEvent::ClearStatus);
                             })),
                     ),
-                None => row
+                None => boxel
                     .text_color(muted)
                     .child(
                         Icon::new(IconName::FaceSlightlySmiling)
@@ -799,135 +901,445 @@ impl Render for UserMenu {
             .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::EditStatus)));
 
         let away = state.away;
-        let away_row = menu_row(
-            "menu-away",
-            if away {
-                "Set yourself as active"
-            } else {
-                "Set yourself as away"
-            },
-            hover,
-        )
-        .on_click(cx.listener(move |_, _, _, cx| cx.emit(UserMenuEvent::SetAway(!away))));
+        let away_row = simple_row("menu-away")
+            .hover(|row| row.bg(blue).text_color(on_blue))
+            .child("Set yourself as")
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .child(if away { "active" } else { "away" }),
+            )
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(UserMenuEvent::SetAway(!away))));
 
-        let pause_label = state.pause_label();
-        let pause_row = menu_row("menu-pause", "Pause notifications", hover)
+        let notif_hot = self.hovered == Some("menu-notifications");
+        let hint_color = if notif_hot { on_blue } else { muted };
+        let paused = state.paused();
+        let pause_label = if paused {
+            state
+                .paused_until
+                .filter(|until| *until != i64::MAX)
+                .map(|until| format!("Until {}", clock(until, None)))
+                .unwrap_or_else(|| "Paused".to_owned())
+        } else {
+            "On".to_owned()
+        };
+        let notifications_row = row_base("menu-notifications", notif_hot, blue, on_blue)
             .justify_between()
+            .child("Notifications")
             .child(
                 h_flex()
                     .items_center()
                     .gap_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(if state.paused() { "On" } else { "Off" })
                     .child(
-                        Icon::new(if self.pause_open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .text_color(muted)
-                        .size(px(14.)),
+                        div()
+                            .text_size(px(13.))
+                            .text_color(hint_color)
+                            .child(pause_label),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(14.))
+                            .text_color(hint_color),
                     ),
             )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.notif_hover = *hovered;
+                this.hovered = hovered.then_some("menu-notifications");
+                cx.notify();
+            }))
             .on_click(cx.listener(|this, _, _, cx| {
-                this.pause_open = !this.pause_open;
+                // Hover opens the submenu; a click pins it for touch input too.
+                this.notif_hover = true;
+                this.hovered = Some("menu-notifications");
                 cx.notify();
             }));
-        let pause_status = pause_label.map(|label| {
-            h_flex()
-                .items_center()
-                .gap_2()
-                .px_4()
-                .pb_1()
-                .text_xs()
-                .text_color(muted)
-                .child(
-                    Icon::new(IconName::MoonStar)
-                        .text_color(muted)
-                        .size(px(12.)),
-                )
-                .child(label)
-        });
-        let pause_options = self.pause_open.then(|| {
-            v_flex()
-                .pl_4()
-                .when(state.paused(), |col| {
-                    col.child(
-                        menu_row("menu-resume", "Resume notifications", hover)
-                            .text_color(foreground)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pause_open = false;
-                                cx.emit(UserMenuEvent::Pause(None));
-                            })),
-                    )
-                })
-                .children(
-                    PAUSE_OPTIONS
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, (label, length))| {
-                            let length = *length;
-                            h_flex()
-                                .id(("menu-pause-option", ix))
-                                .px_4()
-                                .py_1()
-                                .cursor_pointer()
-                                .text_sm()
-                                .hover(|el| el.bg(hover))
-                                .child(*label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pause_open = false;
-                                    cx.emit(UserMenuEvent::Pause(Some(length.until())));
-                                }))
-                        }),
-                )
-                .child(
-                    v_flex()
-                        .id("menu-schedule")
-                        .px_4()
-                        .py_1()
-                        .cursor_pointer()
-                        .hover(|el| el.bg(hover))
-                        .child(div().text_sm().child("Set a notification schedule"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(self.schedule.clone()),
-                        )
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenSchedule))),
-                )
-        });
 
-        let separator = || div().my_1().h(px(1.)).w_full().bg(border);
+        let prefs_hot = self.hovered == Some("menu-prefs");
+        let prefs_row = row_base("menu-prefs", prefs_hot, blue, on_blue)
+            .justify_between()
+            .child("Preferences")
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(if prefs_hot { on_blue } else { muted })
+                    .child("\u{2318},"),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.hovered = hovered.then_some("menu-prefs");
+                cx.notify();
+            }))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenPreferences)));
+
+        let account_hot = self.hovered == Some("menu-account");
+        let account_row = row_base("menu-account", account_hot, blue, on_blue)
+            .justify_between()
+            .child("Account settings")
+            .child(
+                Icon::new(IconName::ExternalLink)
+                    .size(px(14.))
+                    .text_color(if account_hot { on_blue } else { muted }),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.hovered = hovered.then_some("menu-account");
+                cx.notify();
+            }))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenAccount)));
+
+        let downloads_hot = self.hovered == Some("menu-downloads");
+        let downloads_row = row_base("menu-downloads", downloads_hot, blue, on_blue)
+            .justify_between()
+            .child("Downloads")
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(if downloads_hot { on_blue } else { muted })
+                    .child("\u{2318}\u{21e7}J"),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.hovered = hovered.then_some("menu-downloads");
+                cx.notify();
+            }))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenDownloads)));
+
+        let profile_row = simple_row("menu-profile")
+            .hover(|row| row.bg(blue).text_color(on_blue))
+            .child("Profile")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenProfile)));
+
+        let signout_row = simple_row("menu-signout")
+            .hover(|row| row.bg(blue).text_color(on_blue))
+            .child("Sign out")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::SignOut)));
+
+        let separator = || div().my_2().h(px(1.)).w_full().bg(border);
+
+        let font = window.text_style().font();
+        let run = |len: usize, color: Hsla| TextRun {
+            len,
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let note_text = format!("{VIP_NOTE}{VIP_LINK}.");
+        let runs = vec![
+            run(VIP_NOTE.len(), muted),
+            run(VIP_LINK.len(), link),
+            run(1, muted),
+        ];
+        let this = cx.entity();
+        let link_range =
+            std::iter::once(VIP_NOTE.len()..VIP_NOTE.len() + VIP_LINK.len()).collect::<Vec<_>>();
+        let footer = div().px_6().pt_1().pb_2().text_size(px(12.)).child(
+            InteractiveText::new(
+                "menu-vip-preferences",
+                StyledText::new(note_text).with_runs(runs),
+            )
+            .on_click(link_range, move |_, _, cx| {
+                this.update(cx, |_, cx| cx.emit(UserMenuEvent::OpenPreferences));
+            }),
+        );
+
+        let resume = paused.then(|| {
+            simple_row("menu-resume")
+                .hover(|row| row.bg(blue).text_color(on_blue))
+                .child("Resume notifications")
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::Pause(None))))
+        });
+        let options = PAUSE_OPTIONS
+            .iter()
+            .enumerate()
+            .map(|(ix, (label, length))| {
+                let length = *length;
+                simple_row(("menu-pause-option", ix))
+                    .hover(|row| row.bg(blue).text_color(on_blue))
+                    .child(*label)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(UserMenuEvent::Pause(Some(length.until())));
+                    }))
+            });
+        let custom_row = simple_row("menu-custom")
+            .hover(|row| row.bg(blue).text_color(on_blue))
+            .child("Custom\u{2026}")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenPauseCustom)));
+        let working_hot = self.hovered == Some("menu-working-hours");
+        let schedule_row = row_base("menu-working-hours", working_hot, blue, on_blue)
+            .child("Edit your working hours")
+            // Slack's submenu shows no schedule text; the current schedule stays in the
+            // row's accessibility label.
+            .aria_label(if self.schedule.is_empty() {
+                "Edit your working hours".to_owned()
+            } else {
+                format!(
+                    "Edit your working hours. Notification schedule: {}",
+                    self.schedule
+                )
+            })
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.hovered = hovered.then_some("menu-working-hours");
+                cx.notify();
+            }))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenSchedule)));
+
+        let submenu = pause_open.then(|| {
+            v_flex()
+                .id("menu-submenu")
+                .occlude()
+                .absolute()
+                // Flush to the menu's right edge (2pt overlap keeps the hover chain intact
+                // while the pointer crosses), top level with the status box, as Slack drops
+                // it.
+                .left(px(MENU_WIDTH - 2.))
+                .top(px(SUBMENU_TOP))
+                .w(px(SUBMENU_WIDTH))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(border)
+                .bg(popover)
+                .shadow_lg()
+                .pt_3()
+                .pb_3()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.sub_hover = *hovered;
+                    cx.notify();
+                }))
+                .child(
+                    h_flex()
+                        .h(px(28.))
+                        .px_6()
+                        .items_center()
+                        .text_size(px(13.))
+                        .text_color(muted)
+                        .child("Pause notifications for\u{2026}"),
+                )
+                .children(resume)
+                .children(options)
+                .child(custom_row)
+                .child(separator())
+                .child(schedule_row)
+                .child(separator())
+                .child(footer)
+        });
 
         v_flex()
-            .w(px(300.))
-            .py_1()
-            .rounded_lg()
+            .relative()
+            .w(px(MENU_WIDTH))
+            .rounded(px(6.))
             .border_1()
             .border_color(border)
             .bg(popover)
             .shadow_lg()
+            .pb_4()
             .child(header)
             .child(status_box)
-            .child(separator())
             .child(away_row)
-            .child(pause_row)
-            .children(pause_status)
-            .children(pause_options)
+            .child(notifications_row)
             .child(separator())
+            .child(profile_row)
+            .child(prefs_row)
+            .child(account_row)
+            .child(separator())
+            .child(downloads_row)
+            .child(separator())
+            .child(signout_row)
+            .children(submenu)
+    }
+}
+
+pub enum PauseEvent {
+    /// Pause notifications until this Unix time.
+    Save(i64),
+    Cancel,
+}
+
+/// Slack's "Custom…" pause dialog: a wall-clock time field with a live "Until …" hint.
+struct PausePicker {
+    text: Entity<TextareaState>,
+    /// The parsed pause end (Unix seconds), if the field holds a time.
+    until: Option<i64>,
+    /// The field holds text that is not a time.
+    invalid: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<PauseEvent> for PausePicker {}
+
+impl PausePicker {
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<PausePicker> {
+        cx.new(|cx| {
+            let text = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Until 4:30 PM")
+                    .auto_grow(1, 1)
+            });
+            let subscriptions = vec![cx.subscribe_in(
+                &text,
+                window,
+                |this: &mut PausePicker, text, event: &InputEvent, _, cx| match event {
+                    InputEvent::Change => this.parse(&text.read(cx).value(), cx),
+                    InputEvent::PressEnter { .. } => this.save(cx),
+                    _ => {}
+                },
+            )];
+            PausePicker {
+                text,
+                until: None,
+                invalid: false,
+                _subscriptions: subscriptions,
+            }
+        })
+    }
+
+    fn parse(&mut self, value: &str, cx: &mut Context<Self>) {
+        self.until = parse_until_time(value, now_secs(), local_offset_now());
+        self.invalid = self.until.is_none() && !value.trim().is_empty();
+        cx.notify();
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        if let Some(until) = self.until {
+            cx.emit(PauseEvent::Save(until));
+        }
+    }
+}
+
+impl Render for PausePicker {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, muted, foreground) = (theme.input, theme.muted_foreground, theme.foreground);
+        let hint = match (self.until, self.invalid) {
+            (Some(until), _) => {
+                format!("Notifications will stay off until {}.", clock(until, None))
+            }
+            (None, true) => "Enter a time like 4:30 PM or 16:30.".to_owned(),
+            (None, false) => "Notifications will stay paused until the time you pick.".to_owned(),
+        };
+        let hint_color = if self.invalid {
+            crate::theme::danger_text(cx)
+        } else {
+            muted
+        };
+
+        v_flex()
+            .gap_3()
             .child(
-                menu_row("menu-profile", "Profile", hover)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenProfile))),
+                div()
+                    .text_sm()
+                    .text_color(foreground)
+                    .child("Pause notifications until a time you pick."),
             )
             .child(
-                menu_row("menu-prefs", "Preferences", hover)
-                    .justify_between()
-                    .child(div().text_xs().text_color(muted).child("\u{2318},"))
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::OpenPreferences))),
+                h_flex()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .child(Textarea::new(&self.text).appearance(false).bordered(false)),
             )
+            .child(div().text_xs().text_color(hint_color).child(hint))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        Button::new("pause-cancel")
+                            .outline()
+                            .label("Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(PauseEvent::Cancel))),
+                    )
+                    .child(
+                        Button::new("pause-save")
+                            .primary()
+                            .label("Pause")
+                            .disabled(self.until.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    ),
+            )
+    }
+}
+
+/// The next occurrence of a wall-clock time (`4:30 pm`, `16:30`) as a Unix timestamp:
+/// today if it is still ahead, otherwise tomorrow. `None` when `text` is not a time.
+fn parse_until_time(text: &str, now: i64, offset: i64) -> Option<i64> {
+    let rest = text.trim().to_lowercase();
+    let (body, pm) = match rest.strip_suffix("pm") {
+        Some(body) => (body.trim_end(), true),
+        None => match rest.strip_suffix("am") {
+            Some(body) => (body.trim_end(), false),
+            None => (rest.as_str(), false),
+        },
+    };
+    let (hour_text, minute_text) = match body.split_once(':') {
+        Some((hour, minute)) => (hour.trim(), minute.trim()),
+        None => (body.trim(), "0"),
+    };
+    if hour_text.is_empty()
+        || !hour_text.chars().all(|c| c.is_ascii_digit())
+        || minute_text.len() > 2
+        || !minute_text.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour: i64 = hour_text.parse().ok()?;
+    let minute: i64 = minute_text.parse().ok()?;
+    let (low, high) = if pm { (1, 12) } else { (0, 23) };
+    if !(low..=high).contains(&hour) || minute > 59 {
+        return None;
+    }
+    // A 12-hour clock: 12 PM is noon, 12 AM is midnight, everything else shifts by twelve.
+    let hour = match (pm, hour) {
+        (true, 12) => 12,
+        (true, hour) => hour + 12,
+        (false, 12) => 0,
+        (false, hour) => hour,
+    };
+    let midnight = (now + offset).div_euclid(86_400) * 86_400 - offset;
+    let mut until = midnight + hour * 3_600 + minute * 60;
+    if until <= now {
+        until += 86_400;
+    }
+    Some(until)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_until_time;
+
+    /// 2024-03-07 10:00:00 UTC (`offset` 0 in the calls below).
+    const NOW: i64 = 1_709_805_600;
+
+    fn until(text: &str) -> Option<i64> {
+        parse_until_time(text, NOW, 0)
+    }
+
+    #[test]
+    fn parses_clock_times_to_the_next_occurrence() {
+        // 4:30 PM today is ahead of 10:00 AM: today at 16:30.
+        assert_eq!(until("4:30 pm"), Some(NOW + 23_400));
+        assert_eq!(until("4:30pm"), Some(NOW + 23_400));
+        assert_eq!(until("  16:30 "), Some(NOW + 23_400));
+        // Noon: 12 PM is noon, 12 AM is midnight (already past: tomorrow).
+        assert_eq!(until("12 pm"), Some(NOW + 7_200));
+        assert_eq!(until("12 am"), Some(NOW + 86_400 - 36_000));
+        // 9:05 AM already passed today: tomorrow at 9:05.
+        assert_eq!(until("9:05 am"), Some(NOW + 83_100));
+        // Bare hours count as 24-hour clock times.
+        assert_eq!(until("23"), Some(NOW + 46_800));
+    }
+
+    #[test]
+    fn rejects_non_times() {
+        assert_eq!(until(""), None);
+        assert_eq!(until("soon"), None);
+        assert_eq!(until("13 pm"), None);
+        assert_eq!(until("0 pm"), None);
+        assert_eq!(until("4:65 pm"), None);
+        assert_eq!(until("25:00"), None);
+        assert_eq!(until("4:3:00 pm"), None);
+        assert_eq!(until("-4 pm"), None);
     }
 }

@@ -4,7 +4,8 @@
 //! feeds it live data ([`ChannelDetailsEvent`] carries the actions upward).
 //!
 //! `ChannelDetails::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<ChannelDetails>`
-//! `ChannelDetails::open(&mut self, Arc<Fixtures>, ChannelId, members, loading, cx)`
+//! `ChannelDetails::open(&mut self, Arc<Fixtures>, ChannelId, members, loading, tab, cx)`
+//! `ChannelDetails::find_people_focus(&self, &App) -> FocusHandle` (Slack's open focus)
 //! `ChannelDetails::set_fixtures(&mut self, Arc<Fixtures>, &mut Context<Self>)` (live reloads)
 //! `ChannelDetails::set_conversation_info(&mut self, &ChannelId, Vec<UserId>, cx)`
 //! emits `ChannelDetailsEvent`
@@ -19,18 +20,25 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, img, px,
+    Anchor, AnyElement, App, AppContext as _, BoxShadow, Context, Div, Entity, EventEmitter,
+    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    Render, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Window, div, img, point, px,
 };
 use slackless_core::NotifyLevel;
-use slackless_core::types::{ChannelId, Conversation, Team, TeamId, User, UserId};
+use slackless_core::types::{
+    ChannelId, Conversation, Presence, Profile, Team, TeamId, User, UserId,
+};
 
-use crate::avatars::user_chip;
+use crate::avatars::{user_chip, with_external_badge};
+use crate::drafts::now_secs;
 use crate::fixtures::Fixtures;
 
 /// Members listed at once (the directory caps its lists the same way).
 const MAX_ROWS: usize = 30;
+
+/// Slack's channel details inset: the content's side padding (its rules run edge to edge).
+const PAD: f32 = 28.;
 
 /// What the dialog can do, executed by the root (it owns the bridge and the views).
 pub enum ChannelDetailsEvent {
@@ -51,8 +59,9 @@ pub enum ChannelDetailsEvent {
     OpenProfile(UserId),
 }
 
+/// Which of the dialog's tabs shows: the About cards or the member list.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DetailsTab {
+pub enum DetailsTab {
     About,
     Members,
 }
@@ -74,8 +83,20 @@ struct MemberRow {
     name: String,
     /// `name` lowercased: what the filter matches.
     key: String,
-    /// From another organization (Slack's External marker).
-    external: bool,
+    /// The member's organization when they are from another one
+    /// ([`Fixtures::external_team`]): the row's avatar badge, its square presence glyph and
+    /// the organization filter read it.
+    team: Option<TeamId>,
+    /// The display name shown after the full name, Slack's member list's second text.
+    handle: Option<String>,
+    /// The person's title, the row's second line.
+    job: Option<String>,
+    /// A current status emoji, trimmed of its colons; rendered as a glyph.
+    emoji: Option<String>,
+    /// Holds Slack's channel-manager role here.
+    manager: bool,
+    /// A guest account (`is_restricted` / `is_ultra_restricted`).
+    guest: bool,
 }
 
 /// Which About card is being edited.
@@ -99,10 +120,16 @@ pub struct ChannelDetails {
     /// row (sample); empty while the list loads.
     members: Vec<UserId>,
     member_list: MemberList,
+    /// The channel's managers as the core last announced them (empty until then).
+    managers: Vec<UserId>,
     /// The Members tab's rows by name and the About tab's Organizations lines, rebuilt when
-    /// the members or the snapshot change - never per frame.
+    /// the members, the managers or the snapshot change - never per frame.
     rows: Vec<MemberRow>,
     orgs: Vec<OrgLine>,
+    /// The member filter's choices and counts over [`Self::rows`], rebuilt with the rows.
+    filter_choices: Arc<Vec<FilterChoice>>,
+    /// The Members tab's filter, Slack's select beside "Find people".
+    member_filter: MemberFilter,
     /// The Members tab's filter.
     filter: Entity<TextareaState>,
     /// The About card being edited, with its draft.
@@ -120,7 +147,7 @@ impl ChannelDetails {
         cx.new(|cx| {
             let filter = cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("Search members")
+                    .placeholder("Find people")
                     .auto_grow(1, 1)
             });
             let subscriptions =
@@ -135,8 +162,11 @@ impl ChannelDetails {
                 tab: DetailsTab::About,
                 members: Vec::new(),
                 member_list: MemberList::Ready,
+                managers: Vec::new(),
                 rows: Vec::new(),
                 orgs: Vec::new(),
+                filter_choices: Arc::new(Vec::new()),
+                member_filter: MemberFilter::All,
                 filter,
                 editing: None,
                 local_topic: None,
@@ -148,13 +178,15 @@ impl ChannelDetails {
 
     /// Point the dialog at `channel`: called every time the dialog opens. `members` is the
     /// freshest list the root holds; `loading_members` keeps the Members tab on its
-    /// placeholder until the core announces the open-time fetch.
+    /// placeholder until the core announces the open-time fetch; `tab` is the tab the
+    /// dialog opens on (the header's members chip opens straight onto Members).
     pub fn open(
         &mut self,
         fixtures: Arc<Fixtures>,
         channel: ChannelId,
         members: Vec<UserId>,
         loading_members: bool,
+        tab: DetailsTab,
         cx: &mut Context<Self>,
     ) {
         self.fixtures = fixtures;
@@ -165,16 +197,38 @@ impl ChannelDetails {
         } else {
             MemberList::Ready
         };
+        self.managers.clear();
         self.rebuild();
-        self.tab = DetailsTab::About;
+        self.tab = tab;
         self.editing = None;
+        self.member_filter = MemberFilter::All;
         self.local_topic = None;
         self.local_purpose = None;
         cx.notify();
     }
 
+    /// Slack's member list puts the caret in "Find people" as the dialog opens; the root's
+    /// dialog builder calls this on its first build.
+    pub fn find_people_focus(&self, cx: &App) -> gpui_kit::gpui::FocusHandle {
+        self.filter.read(cx).focus_handle(cx)
+    }
+
     /// Live refresh: re-read everything from `fixtures`, keeping the open tab, filter and
-    /// draft.
+    /// draft.    /// The core announced `channel`'s managers (`Event::ChannelManagers`); a late answer
+    /// for a channel closed since is dropped.
+    pub fn set_managers(
+        &mut self,
+        channel: &ChannelId,
+        managers: Vec<UserId>,
+        cx: &mut Context<Self>,
+    ) {
+        if *channel == self.channel {
+            self.managers = managers;
+            self.rebuild();
+            cx.notify();
+        }
+    }
+
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
         self.fixtures = fixtures;
         self.rebuild();
@@ -216,6 +270,7 @@ impl ChannelDetails {
         let fixtures = Arc::clone(&self.fixtures);
         let own = own_team(&fixtures);
         let profiles = profiles_by_id(&fixtures.users);
+        let now = now_secs();
         let mut rows: Vec<MemberRow> = self
             .members
             .iter()
@@ -228,9 +283,13 @@ impl ChannelDetails {
                 MemberRow {
                     id: member.clone(),
                     key: name.to_lowercase(),
-                    external: profile
-                        .and_then(|user| user.team_id.as_ref())
-                        .is_some_and(|team| *team != own),
+                    team: fixtures.external_team(member).map(|team| team.id.clone()),
+                    handle: profile.and_then(|user| non_empty(&user.profile.display_name)),
+                    job: profile.and_then(|user| non_empty(&user.profile.title)),
+                    emoji: profile.and_then(|user| current_status_emoji(&user.profile, now)),
+                    manager: self.managers.contains(member),
+                    guest: profile
+                        .is_some_and(|user| user.is_restricted || user.is_ultra_restricted),
                     name,
                 }
             })
@@ -245,6 +304,7 @@ impl ChannelDetails {
         } else {
             Vec::new()
         };
+        self.filter_choices = Arc::new(filter_choices(&fixtures, &self.rows));
     }
 
     /// What the Members tab says instead of rows: the load in flight, its failure, a channel
@@ -340,13 +400,14 @@ impl ChannelDetails {
 }
 
 impl Render for ChannelDetails {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted_foreground, foreground, link) = (
+        let (border, muted_foreground, foreground, ring, background) = (
             theme.border,
             theme.muted_foreground,
             theme.foreground,
-            theme.link,
+            theme.ring,
+            theme.background,
         );
         let tab = self.tab;
         let member_count = if self.members.is_empty() {
@@ -357,50 +418,56 @@ impl Render for ChannelDetails {
             self.rows.len() as u32
         };
 
-        // Slack's tab row under the title, the active tab underlined.
+        // Slack's tab row under the title: tabs 20pt apart, the active one in the text color
+        // over a 2pt underline that covers the rule; a tab's count keeps the regular weight.
+        let underline = foreground.opacity(0.82);
         let tab_row = [
-            (DetailsTab::About, "About".to_owned(), "details-tab-About"),
+            (DetailsTab::About, "About", None, "details-tab-About"),
             (
                 DetailsTab::Members,
-                format!("Members {member_count}"),
+                "Members",
+                Some(member_count),
                 "details-tab-Members",
             ),
         ]
-        .map(|(entry, label, id)| {
+        .map(|(entry, label, count, id)| {
             let active = entry == tab;
-            div()
+            h_flex()
                 .id(SharedString::from(id))
                 .h_full()
-                .flex()
+                .mb(px(-1.))
                 .items_center()
-                .px_1()
+                .gap_1()
                 .cursor_pointer()
                 .text_sm()
                 .text_color(if active { foreground } else { muted_foreground })
-                .when(active, |tab| {
-                    tab.font_weight(FontWeight::SEMIBOLD)
-                        .border_b_2()
-                        .border_color(link)
-                })
+                .when(active, |tab| tab.border_b_2().border_color(underline))
                 .hover(|el| el.text_color(foreground))
-                .child(label)
+                .child(
+                    div()
+                        .when(active, |label| label.font_weight(FontWeight::SEMIBOLD))
+                        .child(label),
+                )
+                .children(count.map(|count| count.to_string()))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.tab = entry;
                     cx.notify();
                 }))
         });
 
+        // Slack's dialog grows with the window; the member list scrolls inside it.
+        let height = (window.viewport_size().height * 0.85 - px(100.)).max(px(360.));
         v_flex()
-            .h(px(560.))
+            .h(height)
             .w_full()
             .child(self.button_row(cx))
             .child(
                 h_flex()
                     .items_stretch()
                     .flex_none()
-                    .px_4()
-                    .gap_5()
-                    .h(px(38.))
+                    .px(px(PAD))
+                    .gap(px(20.))
+                    .h(px(32.))
                     .border_b_1()
                     .border_color(border)
                     .children(tab_row),
@@ -409,45 +476,71 @@ impl Render for ChannelDetails {
                 DetailsTab::About => self.about_tab(cx).into_any_element(),
                 DetailsTab::Members => {
                     let needle = self.needle(cx);
+                    // Slack's field carries the blue focus ring while the caret is in it
+                    // (the dialog opens with it focused).
+                    let find_focused = self.filter.read(cx).focus_handle(cx).is_focused(window);
+                    let filtering = !needle.is_empty() || self.member_filter != MemberFilter::All;
+                    let member_filter = &self.member_filter;
                     let matching: Vec<&MemberRow> = self
                         .rows
                         .iter()
+                        .filter(|row| member_filter.keeps(row))
                         .filter(|row| needle.is_empty() || row.key.contains(&needle))
                         .collect();
+                    let find_people = h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .h(px(36.))
+                        .rounded(px(8.))
+                        // Opaque, so the focus ring's spread shows only outside the field.
+                        .bg(background)
+                        .border_1()
+                        .border_color(if find_focused { ring } else { border })
+                        .when(find_focused, |field| {
+                            field.shadow(vec![BoxShadow {
+                                color: ring.opacity(0.3),
+                                offset: point(px(0.), px(0.)),
+                                blur_radius: px(0.),
+                                spread_radius: px(3.),
+                                inset: false,
+                            }])
+                        })
+                        .child(
+                            Icon::new(IconName::Search)
+                                .text_color(muted_foreground)
+                                .size(px(16.)),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Textarea::new(&self.filter)
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
+                        );
+                    let filter_select = self.filter_select(cx);
                     v_flex()
                         .flex_1()
                         .min_h_0()
-                        .p_4()
-                        .gap_2()
                         .child(
                             h_flex()
                                 .flex_none()
                                 .items_center()
                                 .gap_2()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .border_1()
+                                .px(px(PAD))
+                                .py_4()
+                                .border_b_1()
                                 .border_color(border)
-                                .child(
-                                    Icon::new(IconName::Search)
-                                        .text_color(muted_foreground)
-                                        .size(px(14.)),
-                                )
-                                .child(
-                                    div().flex_1().min_w_0().child(
-                                        Textarea::new(&self.filter)
-                                            .appearance(false)
-                                            .bordered(false),
-                                    ),
-                                ),
+                                .child(find_people)
+                                .child(filter_select),
                         )
-                        .child(
-                            if let Some(note) =
-                                self.member_note(matching.is_empty(), !needle.is_empty())
-                            {
+                        .child(v_flex().flex_1().min_h_0().child(
+                            if let Some(note) = self.member_note(matching.is_empty(), filtering) {
                                 div()
-                                    .p_6()
+                                    .px(px(PAD))
+                                    .py_6()
                                     .text_sm()
                                     .text_color(muted_foreground)
                                     .child(note)
@@ -468,7 +561,8 @@ impl Render for ChannelDetails {
                                     .when(matching.len() > MAX_ROWS, |list| {
                                         list.child(
                                             div()
-                                                .p_3()
+                                                .px(px(PAD))
+                                                .py_3()
                                                 .text_xs()
                                                 .text_color(muted_foreground)
                                                 .child(format!(
@@ -480,7 +574,7 @@ impl Render for ChannelDetails {
                                     })
                                     .into_any_element()
                             },
-                        )
+                        ))
                         .into_any_element()
                 }
             })
@@ -506,10 +600,11 @@ impl ChannelDetails {
             NotifyLevel::Muted => "Mute and hide",
         };
         let notify = Button::new("details-notify")
-            .ghost()
+            .outline()
             .with_size(Size::Small)
+            .icon(IconName::Bell)
             .label(level_label)
-            .icon(IconName::ChevronDown)
+            .dropdown_caret(true)
             .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
                 menu = menu.label("Notify you about…");
                 for (choice, label) in [
@@ -534,13 +629,13 @@ impl ChannelDetails {
         h_flex()
             .flex_none()
             .items_center()
-            .gap_1()
-            .px_4()
-            .py_2()
+            .gap_2()
+            .px(px(PAD))
+            .pb_2()
             .child(notify)
             .child(
                 Button::new("details-huddle")
-                    .ghost()
+                    .outline()
                     .with_size(Size::Small)
                     .icon(IconName::Headphones)
                     .label("Huddle")
@@ -557,7 +652,8 @@ impl ChannelDetails {
             .id("details-about")
             .flex_1()
             .min_h_0()
-            .p_4()
+            .px(px(PAD))
+            .py_4()
             .gap_2()
             .overflow_y_scroll();
 
@@ -744,43 +840,132 @@ impl ChannelDetails {
 
     /// One member row: avatar, name, and Slack's External marker for people from another
     /// organization; a click opens their profile.
+    /// Slack's member filter beside "Find people": a 36pt select whose menu lists each
+    /// choice with its count at the right, the organizations under "People from".
+    fn filter_select(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let choices = Arc::clone(&self.filter_choices);
+        let current = self.member_filter.clone();
+        let label = choices
+            .iter()
+            .find(|choice| choice.filter == current)
+            .map_or_else(|| SharedString::from("All"), |choice| choice.label.clone());
+        let muted = cx.theme().muted_foreground;
+        Button::new("details-member-filter")
+            .outline()
+            .flex_none()
+            .w(px(200.))
+            .h(px(36.))
+            .rounded(px(8.))
+            .label(label)
+            .dropdown_caret(true)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                menu = menu.min_w(px(320.));
+                let mut people_from = false;
+                for choice in choices.iter() {
+                    if matches!(choice.filter, MemberFilter::Team(_)) && !people_from {
+                        people_from = true;
+                        menu = menu.separator().label("People from");
+                    }
+                    let (this, filter) = (this.clone(), choice.filter.clone());
+                    let (label, count) = (choice.label.clone(), choice.count.to_string());
+                    let checked = filter == current;
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap_6()
+                                .justify_between()
+                                .child(label.clone())
+                                .child(div().text_color(muted).child(count.clone()))
+                        })
+                        .checked(checked)
+                        .on_click(move |_, _, cx| {
+                            let filter = filter.clone();
+                            let _ = this.update(cx, |this, cx| {
+                                this.member_filter = filter;
+                                cx.notify();
+                            });
+                        }),
+                    );
+                }
+                menu
+            })
+    }
+
+    /// One member row, Slack's member list: the 36px avatar (its organization's badge when
+    /// the person is external), the bold name and presence glyph, the display name with the
+    /// status emoji, and the title as a second muted line. A click opens their profile.
     fn member_row(&self, ix: usize, row: &MemberRow, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
-        let (muted_foreground, foreground, hover) =
-            (theme.muted_foreground, theme.foreground, theme.accent);
+        let (muted_foreground, foreground, hover, background, success) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.accent,
+            theme.background,
+            theme.success,
+        );
         let open = row.id.clone();
+        let presence = self.fixtures.presence(&row.id);
+        let emoji = row
+            .emoji
+            .as_deref()
+            .map(|code| crate::emoji::emoji_element(code, &self.fixtures, px(14.)));
         h_flex()
             .id(("details-member", ix))
             .flex_none()
+            .items_center()
+            .h(px(60.))
             .gap_3()
-            .px_1()
-            .py_2()
-            .rounded_md()
+            .px(px(PAD))
             .cursor_pointer()
             .hover(|el| el.bg(hover))
-            .child(user_chip(&self.fixtures, &row.id, 32.))
+            .child(with_external_badge(
+                &self.fixtures,
+                Some(&row.id),
+                user_chip(&self.fixtures, &row.id, 36.),
+                36.,
+                background,
+            ))
             .child(
-                h_flex()
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_2()
+                    .gap_0p5()
                     .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(foreground)
+                                    .child(row.name.clone()),
+                            )
+                            .child(member_presence(
+                                row.team.is_some(),
+                                presence,
+                                muted_foreground,
+                                success,
+                            ))
+                            .children(row.handle.as_ref().map(|handle| {
+                                div()
+                                    .truncate()
+                                    .text_size(px(15.))
+                                    .text_color(foreground)
+                                    .child(handle.clone())
+                            }))
+                            .children(emoji),
+                    )
+                    .children(row.job.as_ref().map(|job| {
                         div()
                             .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(foreground)
-                            .child(row.name.clone()),
-                    )
-                    .when(row.external, |line| {
-                        line.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(muted_foreground)
-                                .child("External"),
-                        )
-                    }),
+                            .text_size(px(15.))
+                            .text_color(muted_foreground)
+                            .child(job.clone())
+                    })),
             )
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(ChannelDetailsEvent::OpenProfile(open.clone()))
@@ -877,6 +1062,121 @@ fn is_listed(member: &UserId, profiles: &HashMap<&UserId, &User>) -> bool {
         && profiles
             .get(member)
             .is_none_or(|user| !user.is_bot && !user.deleted)
+}
+
+/// `field` when it holds more than whitespace.
+fn non_empty(field: &Option<String>) -> Option<String> {
+    field
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// The profile's status emoji while it is current, trimmed of its colons (Slack hides
+/// statuses past their expiration; `now` is unix seconds).
+fn current_status_emoji(profile: &Profile, now: u64) -> Option<String> {
+    if profile
+        .status_expiration
+        .is_some_and(|end| end != 0 && end <= now as i64)
+    {
+        return None;
+    }
+    non_empty(&profile.status_emoji).map(|code| code.trim_matches(':').to_owned())
+}
+
+/// Slack's presence glyph beside a member's name: a green dot when active, a hollow ring
+/// when away, and a hollow rounded square for people from another organization.
+fn member_presence(external: bool, presence: Option<Presence>, muted: Hsla, success: Hsla) -> Div {
+    let glyph = div().flex_none().size(px(9.));
+    if external {
+        return glyph.rounded(px(2.5)).border_1().border_color(muted);
+    }
+    match presence {
+        Some(Presence::Active) => glyph.rounded_full().bg(success),
+        _ => glyph.rounded_full().border_1().border_color(muted),
+    }
+}
+
+/// The Members tab's filter, Slack's select beside "Find people".
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum MemberFilter {
+    #[default]
+    All,
+    /// Everyone from another organization (offered once two or more are present).
+    External,
+    Managers,
+    /// Full members of the workspace: no channel manager, guest or external person.
+    Members,
+    Guests,
+    /// "People from": the signed-in workspace (`None`) or one external organization.
+    Team(Option<TeamId>),
+}
+
+impl MemberFilter {
+    fn keeps(&self, row: &MemberRow) -> bool {
+        match self {
+            Self::All => true,
+            Self::External => row.team.is_some(),
+            Self::Managers => row.manager,
+            Self::Members => !row.manager && !row.guest && row.team.is_none(),
+            Self::Guests => row.guest,
+            Self::Team(team) => row.team == *team,
+        }
+    }
+}
+
+/// One choice of the member filter: its label and how many rows it keeps.
+struct FilterChoice {
+    label: SharedString,
+    filter: MemberFilter,
+    count: usize,
+}
+
+/// Slack's filter choices over `rows` (its account-type filter and "People from" group):
+/// All; External organizations once two or more are present; Channel Managers, Members and
+/// Guests; then, when external people are listed, the signed-in workspace and each
+/// external organization in row order. Free-standing for the test.
+fn filter_choices(fixtures: &Fixtures, rows: &[MemberRow]) -> Vec<FilterChoice> {
+    let mut externals: Vec<&TeamId> = Vec::new();
+    for team in rows.iter().filter_map(|row| row.team.as_ref()) {
+        if !externals.contains(&team) {
+            externals.push(team);
+        }
+    }
+    let mut filters = vec![("All".to_owned(), MemberFilter::All)];
+    if externals.len() > 1 {
+        filters.push(("External organizations".to_owned(), MemberFilter::External));
+    }
+    filters.extend([
+        ("Channel Managers".to_owned(), MemberFilter::Managers),
+        ("Members".to_owned(), MemberFilter::Members),
+        ("Guests".to_owned(), MemberFilter::Guests),
+    ]);
+    if !externals.is_empty() {
+        let workspace = fixtures
+            .workspaces
+            .first()
+            .map_or_else(|| "Your workspace".to_owned(), |team| team.name.to_string());
+        filters.push((workspace, MemberFilter::Team(None)));
+        // Every row's team came from `external_team`, whose record is in `teams`.
+        for team in externals {
+            if let Some(record) = fixtures.teams.iter().find(|record| &record.id == team) {
+                filters.push((
+                    record.name.to_string(),
+                    MemberFilter::Team(Some(team.clone())),
+                ));
+            }
+        }
+    }
+    filters
+        .into_iter()
+        .map(|(label, filter)| FilterChoice {
+            count: rows.iter().filter(|row| filter.keeps(row)).count(),
+            label: label.into(),
+            filter,
+        })
+        .collect()
 }
 
 /// The organizations present in `members`: every team a resolved profile belongs to, plus the
@@ -1161,5 +1461,56 @@ mod tests {
         );
         let bare = team("T2", "Bare");
         assert_eq!(team_icon_url(&bare), None, "no icon object, no url");
+    }
+
+    #[test]
+    fn filter_choices_follow_slacks_order_and_counts() {
+        let mut fixtures = crate::fixtures::load();
+        fixtures.workspaces = vec![team("T0ACME", "Acme Corp")];
+        fixtures.teams = vec![team("T0KLARNA", "Klarna"), team("T0ZETA", "Zeta")];
+        let row = |team: Option<&str>, manager: bool, guest: bool| MemberRow {
+            id: UserId::from("U1"),
+            name: "A Person".to_owned(),
+            key: "a person".to_owned(),
+            team: team.map(TeamId::from),
+            handle: None,
+            job: None,
+            emoji: None,
+            manager,
+            guest,
+        };
+        let rows = vec![
+            row(None, true, false),
+            row(None, false, false),
+            row(None, false, true),
+            row(Some("T0ZETA"), false, false),
+            row(Some("T0KLARNA"), false, false),
+            row(Some("T0ZETA"), false, false),
+        ];
+        let choices = filter_choices(&fixtures, &rows);
+        let got: Vec<(&str, usize)> = choices
+            .iter()
+            .map(|choice| (choice.label.as_ref(), choice.count))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("All", 6),
+                ("External organizations", 3),
+                ("Channel Managers", 1),
+                ("Members", 1),
+                ("Guests", 1),
+                ("Acme Corp", 3),
+                ("Zeta", 2),
+                ("Klarna", 1),
+            ]
+        );
+        // An internal channel: neither the external choice nor the "People from" group.
+        let internal = filter_choices(&fixtures, &rows[..3]);
+        let labels: Vec<&str> = internal
+            .iter()
+            .map(|choice| choice.label.as_ref())
+            .collect();
+        assert_eq!(labels, ["All", "Channel Managers", "Members", "Guests"]);
     }
 }

@@ -24,11 +24,11 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, TextareaState};
-use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
@@ -36,11 +36,11 @@ use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
-use crate::composer::{AlsoSendTarget, Composer, ComposerEvent};
+use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, ContextBar};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
-use crate::messages::{LinkHandler, LinkTarget, message_row_linked};
+use crate::messages::{LinkHandler, LinkTarget, message_row_linked, same_group};
 use crate::slash::{Invocation, SHRUG, SlashKind};
 
 pub enum ThreadPanelEvent {
@@ -52,6 +52,14 @@ pub enum ThreadPanelEvent {
     OpenLink(LinkTarget),
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
+    /// The header menu followed or unfollowed the open thread (already shown here); the root
+    /// tells Slack. `last_read` is the thread's newest message.
+    SetSubscribed {
+        channel: ChannelId,
+        thread_ts: Ts,
+        last_read: Ts,
+        subscribed: bool,
+    },
     /// The user reacted to, edited or deleted a message of the open thread (already shown
     /// here); the root posts the change to Slack.
     Changed {
@@ -177,6 +185,12 @@ impl ThreadPanel {
         });
         self.fixtures = fixtures;
         cx.notify();
+    }
+
+    /// Show the conversation's context bar (Slack Connect notice) over the reply composer.
+    pub fn set_context_bar(&mut self, bar: Option<ContextBar>, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_context_bar(bar, cx));
     }
 
     /// Forward the Enter-to-send preference to the reply composer.
@@ -487,6 +501,30 @@ impl ThreadPanel {
         cx.notify();
     }
 
+    /// The header menu's toggle: flip the root's follow state at once, as Slack does, and hand
+    /// the change to the root to send.
+    fn toggle_subscribed(&mut self, cx: &mut Context<Self>) {
+        let Some((channel, thread_ts)) = self.thread.clone() else {
+            return;
+        };
+        let last_read = self
+            .replies
+            .last()
+            .map_or_else(|| thread_ts.clone(), |reply| reply.ts.clone());
+        let Some(root) = self.root.as_mut() else {
+            return;
+        };
+        let subscribed = root.subscribed != Some(true);
+        root.subscribed = Some(subscribed);
+        cx.emit(ThreadPanelEvent::SetSubscribed {
+            channel,
+            thread_ts,
+            last_read,
+            subscribed,
+        });
+        cx.notify();
+    }
+
     /// Summon the reply box: dismiss any inline edit and show the hint above the composer.
     fn prompt_reply(&mut self, cx: &mut Context<Self>) {
         self.editing = None;
@@ -570,6 +608,7 @@ impl ThreadPanel {
         &self,
         message: &Message,
         is_root: bool,
+        grouped: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let ts = message.ts.clone();
@@ -617,7 +656,15 @@ impl ThreadPanel {
         // interactive chips (toggle + add control) below the card instead.
         let mut display = message.clone();
         let reactions = std::mem::take(&mut display.reactions);
-        let card = message_row_linked(&self.fixtures, &display, Some(&handler), Some(&links), cx);
+        // Like Slack, a reply continuing the previous author's run drops its avatar and name.
+        let card = message_row_linked(
+            &self.fixtures,
+            &display,
+            Some(&handler),
+            Some(&links),
+            grouped.then(|| row_group.clone()),
+            cx,
+        );
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
             .map(|chips| chips.pl(px(TEXT_INSET)));
 
@@ -637,7 +684,8 @@ impl ThreadPanel {
             .w_full()
             .min_w_0()
             .px_2()
-            .py_1()
+            .when(!grouped, |row| row.pt_1())
+            .pb_1()
             .rounded_md()
             .hover(|row| row.bg(hover_bg))
             .when(saved, |row| row.child(actions::saved_banner(cx)))
@@ -657,14 +705,44 @@ impl Render for ThreadPanel {
         let muted = theme.muted_foreground;
         let background = theme.background;
         let danger = theme.danger;
+        // Slack's header menu ("More actions"): follow or unfollow the thread, and copy its
+        // link. Its other rows (AI summary, thread huddle, split view, new window) have
+        // nothing behind them here, so they are left out.
+        let more = self.root.as_ref().map(|root| {
+            let (panel, root_ts) = (cx.entity().downgrade(), root.ts.clone());
+            let following = root.subscribed == Some(true);
+            Button::new("thread-more")
+                .ghost()
+                .with_size(Size::Small)
+                .icon(IconName::EllipsisVertical)
+                .tooltip("More actions")
+                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                    let (toggle, copy, root_ts) = (panel.clone(), panel.clone(), root_ts.clone());
+                    menu.item(
+                        PopupMenuItem::new(if following {
+                            "Turn off notifications for replies"
+                        } else {
+                            "Get notified about new replies"
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ = toggle.update(cx, |panel, cx| panel.toggle_subscribed(cx));
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Copy link").on_click(move |_, window, cx| {
+                            let _ = copy.update(cx, |panel, cx| {
+                                panel.run_action(&root_ts, MessageAction::CopyLink, window, cx)
+                            });
+                        }),
+                    )
+                })
+        });
         // Slack's header is just the bold title; the conversation is not repeated under it.
         let header = h_flex()
             .justify_between()
             .items_center()
             .px_4()
             .py_2()
-            .border_b_1()
-            .border_color(border)
             .child(
                 div()
                     .text_lg()
@@ -672,12 +750,14 @@ impl Render for ThreadPanel {
                     .child("Thread"),
             )
             .child(
-                Button::new("close-thread")
-                    .ghost()
-                    .with_size(Size::Small)
-                    .icon(IconName::X)
-                    .tooltip("Close")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadPanelEvent::Close))),
+                h_flex().items_center().gap_1().children(more).child(
+                    Button::new("close-thread")
+                        .ghost()
+                        .with_size(Size::Small)
+                        .icon(IconName::X)
+                        .tooltip("Close")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadPanelEvent::Close))),
+                ),
             );
 
         let mut body = v_flex()
@@ -691,7 +771,7 @@ impl Render for ThreadPanel {
                 if self.unread_after.as_ref() == Some(&root.ts) {
                     body = body.child(new_messages_divider(cx));
                 }
-                body = body.child(self.thread_message_row(root, true, cx));
+                body = body.child(self.thread_message_row(root, true, false, cx));
                 // Slack's "16 replies ——" rule under the root; none before the first reply.
                 let new_count = self.unread_new_count();
                 let replies = match self.replies.len() {
@@ -718,11 +798,16 @@ impl Render for ThreadPanel {
                             .child(div().flex_1().h(px(1.)).bg(border)),
                     )
                 });
+                let mut previous: Option<&Message> = None;
                 for message in &self.replies {
-                    if self.unread_after.as_ref() == Some(&message.ts) {
+                    let divider = self.unread_after.as_ref() == Some(&message.ts);
+                    if divider {
                         body = body.child(new_messages_divider(cx));
                     }
-                    body = body.child(self.thread_message_row(message, false, cx));
+                    let grouped =
+                        !divider && previous.is_some_and(|prev| same_group(prev, message));
+                    body = body.child(self.thread_message_row(message, false, grouped, cx));
+                    previous = Some(message);
                 }
             }
             None => body = body.child(self.empty_state(cx)),

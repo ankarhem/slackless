@@ -309,13 +309,20 @@ pub fn mention_badge(cx: &App) -> (Hsla, Hsla) {
 }
 
 /// Slack's tab rail fill (`theme-surf-inv-sec`): on dark themes the near-black Slack 4.53
-/// measures (#0E171B, a dark wash over its chrome); on light ones a white wash over the chrome.
+/// measures (#0E171B, a dark wash over its chrome); on light ones a near-opaque white panel
+/// (measured at 90% over the chrome's blue, top and bottom).
 pub fn tab_rail_wash(cx: &App) -> Hsla {
     if cx.theme().mode.is_dark() {
         color(0x0E_17_1B)
     } else {
-        color(0xFF_FF_FF).opacity(0.1)
+        color(0xFF_FF_FF).opacity(0.9)
     }
+}
+
+/// The rail's fills over that wash as the sidebar foreground's opacity: the active tile and
+/// the round control buttons measure 30% on dark themes and 13% on light ones.
+pub fn rail_fill(cx: &App) -> f32 {
+    if cx.theme().mode.is_dark() { 0.3 } else { 0.13 }
 }
 
 /// Where a light-mode Slack panel's shadow (`box-shadow: 0 0 20px rgba(0,0,0,.1)`) falls on the
@@ -338,6 +345,17 @@ pub fn composer_surfaces(cx: &App) -> (Hsla, Hsla) {
     } else {
         (color(0xFF_FF_FF), color(0xF8_F8_F8))
     }
+}
+
+/// Slack's Slack Connect context bar over the composer: an amber wash over the message pane
+/// (#fff2df on white).
+pub fn connect_bar(cx: &App) -> Hsla {
+    cx.theme().background.blend(color(0xFF_A5_00).opacity(0.13))
+}
+
+/// Slack's tint on the channel message whose thread is open beside it (#fffae0 on white).
+pub fn thread_root(cx: &App) -> Hsla {
+    cx.theme().background.blend(color(0xFF_DE_30).opacity(0.15))
 }
 
 /// Slack's reaction pill that includes you (`.c-reaction--reacted`) as (background, count

@@ -201,6 +201,7 @@
 //!   OpenChannelBrowser (cmd-shift-l), SetStatus (cmd-shift-y), FocusSearch (cmd-g),
 //!   Workspace1..9 (cmd-1..9)
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
@@ -222,11 +223,13 @@ use gpui_kit::gpui::{
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
     ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
-    actions, anchored, deferred, div, hsla, point, px,
+    actions, anchored, deferred, div, hsla, point, px, relative,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{self, BadgeSetter, Notifier};
-use slackless_core::types::{ChannelId, Conversation, ConversationKind, File, Message, Ts, UserId};
+use slackless_core::types::{
+    ChannelId, Conversation, ConversationKind, File, Message, Team, Ts, UserId,
+};
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
 use crate::actions::{MessageChange, notify};
@@ -237,7 +240,7 @@ use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
 use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
-use crate::composer::{self, Composer, ComposerEvent, Placeholder};
+use crate::composer::{self, Composer, ComposerEvent, ContextBar, Placeholder};
 use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
@@ -281,6 +284,7 @@ actions!(
         OpenActivity,
         OpenDrafts,
         OpenChannelBrowser,
+        OpenDownloads,
         SetStatus,
         FocusSearch,
         Workspace1,
@@ -479,6 +483,13 @@ pub struct App {
     /// (`Event::ConversationInfo`), for the details dialog and the Slack Connect banner. Only
     /// the open channel's list is kept: every open fetches it again.
     open_members: Option<(ChannelId, Vec<UserId>)>,
+    /// The header members chip's hover: (chip, popover) - Slack keeps the tooltip while the
+    /// pointer is over either.
+    members_hover: (bool, bool),
+    /// The members popover's "Includes …" names for the open channel, computed when it opens
+    /// (and recomputed after the channel or its history changes) - never per frame. `None`
+    /// until then.
+    members_popover_names: Option<Vec<String>>,
     /// The connect banner's lines for the open conversation, recomputed when its members or
     /// the snapshot change - never per frame.
     connect_orgs: Vec<channel_details::OrgLine>,
@@ -633,6 +644,7 @@ impl App {
                 KeyBinding::new("cmd-shift-k", OpenDms, None),
                 KeyBinding::new("cmd-shift-a", OpenActivity, None),
                 KeyBinding::new("cmd-shift-d", OpenDrafts, None),
+                KeyBinding::new("cmd-shift-j", OpenDownloads, None),
                 KeyBinding::new("cmd-shift-l", OpenChannelBrowser, None),
                 KeyBinding::new("cmd-shift-y", SetStatus, None),
                 KeyBinding::new("cmd-g", FocusSearch, None),
@@ -652,6 +664,8 @@ impl App {
             let this = cx.weak_entity();
             // A second handle: the search intercept below moves `this` into its closure.
             let viewer_keys = cx.weak_entity();
+            // A third: the profile menu's Escape intercept moves `this` into its closure.
+            let menu_keys = cx.weak_entity();
             let subscriptions = vec![
                 cx.observe_window_bounds(window, |this, window, cx| {
                     this.save_window_state(window, cx);
@@ -704,6 +718,26 @@ impl App {
                                 }
                                 _ => {}
                             }
+                        });
+                    }
+                }),
+                // While the profile menu is open, Escape closes it, submenu included —
+                // Slack closes the whole menu, not just the open submenu.
+                cx.intercept_keystrokes({
+                    move |event, _, cx| {
+                        if event.input_preference == InputPreference::CharacterInput
+                            || event.keystroke.key.as_str() != "escape"
+                        {
+                            return;
+                        }
+                        let _ = menu_keys.update(cx, |app, cx| {
+                            if !app.user_menu_open {
+                                return;
+                            }
+                            app.user_menu_open = false;
+                            app.user_menu.update(cx, |menu, cx| menu.closed(cx));
+                            cx.notify();
+                            cx.stop_propagation();
                         });
                     }
                 }),
@@ -1094,6 +1128,8 @@ impl App {
                 member_counts: HashMap::new(),
                 app_counts: HashMap::new(),
                 open_members: None,
+                members_hover: (false, false),
+                members_popover_names: None,
                 connect_orgs: Vec::new(),
                 back: Vec::new(),
                 forward: Vec::new(),
@@ -1247,9 +1283,13 @@ impl App {
         self.thread.update(cx, |panel, cx| {
             panel.open(channel.clone(), thread_ts.clone(), cx)
         });
+        self.sync_thread_bar(cx);
         // Live mode: show the stored thread now, then fetch its full history from Slack
         // (fixture mode: both are no-ops and the panel keeps its fixture content).
         self.load_thread(&channel, &thread_ts, cx);
+        self.messages.update(cx, |list, cx| {
+            list.set_open_thread(Some(thread_ts.clone()), cx)
+        });
         self.bridge.send(Command::OpenThread { channel, thread_ts });
         self.thread_open = true;
         self.profile_open = false;
@@ -1260,10 +1300,17 @@ impl App {
         cx.notify();
     }
 
+    /// Hide the thread panel and drop the open-thread tint from the transcript.
+    fn close_thread(&mut self, cx: &mut Context<Self>) {
+        self.thread_open = false;
+        self.messages
+            .update(cx, |list, cx| list.set_open_thread(None, cx));
+    }
+
     fn toggle_pins(&mut self, cx: &mut Context<Self>) {
         self.pins_open = !self.pins_open;
         if self.pins_open {
-            self.thread_open = false;
+            self.close_thread(cx);
             self.profile_open = false;
             self.load_tab_data(&ConversationTab::Pins);
         } else if self.tab == ConversationTab::Pins {
@@ -1330,7 +1377,7 @@ impl App {
         }
         if target == ConversationTab::Pins {
             self.pins_open = true;
-            self.thread_open = false;
+            self.close_thread(cx);
             self.profile_open = false;
         }
         self.load_tab_data(&target);
@@ -1570,6 +1617,30 @@ impl App {
         cx.notify();
     }
 
+    /// A `file://` URL for `path`, percent-encoded (Finder opens folder URLs).
+    fn file_url(path: &std::path::Path) -> String {
+        let mut url = String::from("file://");
+        for byte in path.as_os_str().to_string_lossy().bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    url.push(byte as char)
+                }
+                _ => url.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        url
+    }
+
+    /// slackless has no download manager, so like the browser this reveals the user's
+    /// Downloads folder.
+    fn open_downloads(&mut self, cx: &mut Context<Self>) {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut downloads = std::path::PathBuf::from(home);
+            downloads.push("Downloads");
+            cx.open_url(&Self::file_url(&downloads));
+        }
+    }
+
     fn user_menu_event(
         &mut self,
         event: &UserMenuEvent,
@@ -1599,6 +1670,49 @@ impl App {
                 self.user_menu_open = false;
                 self.open_preferences(Some(Section::Notifications), window, cx);
             }
+            UserMenuEvent::OpenPauseCustom => {
+                self.user_menu_open = false;
+                self.user_menu
+                    .update(cx, |menu, cx| menu.open_pause_dialog(window, cx));
+            }
+            UserMenuEvent::OpenAccount => {
+                self.user_menu_open = false;
+                // Slack opens the workspace's account settings in the browser.
+                let domain = self
+                    .fixtures
+                    .workspaces
+                    .get(self.workspace)
+                    .map(|team| team.domain.as_str())
+                    .unwrap_or_default();
+                let url = if domain.is_empty() {
+                    "https://slack.com/account/settings".to_owned()
+                } else {
+                    format!("https://{domain}.slack.com/account/settings")
+                };
+                cx.open_url(&url);
+            }
+            UserMenuEvent::OpenDownloads => {
+                self.user_menu_open = false;
+                self.open_downloads(cx);
+            }
+            UserMenuEvent::SignOut => {
+                // Slack forgets the workspace's session and returns to sign-in; slackless
+                // removes the stored session (Keychain included) and quits, and the next
+                // launch runs the sign-in helper.
+                self.user_menu_open = false;
+                if let Some(team) = self.fixtures.workspaces.get(self.workspace) {
+                    if let Err(e) =
+                        slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
+                    {
+                        eprintln!("slackless: could not remove the stored session ({e})");
+                    }
+                }
+                cx.quit();
+            }
+        }
+        if !self.user_menu_open {
+            // Forget hover state so a closed menu cannot come back with its submenu open.
+            self.user_menu.update(cx, |menu, cx| menu.closed(cx));
         }
         self.push_self_state(cx);
     }
@@ -1785,17 +1899,19 @@ impl App {
         self.profile
             .update(cx, |profile, cx| profile.open(user, cx));
         self.profile_open = true;
-        self.thread_open = false;
+        self.close_thread(cx);
         self.pins_open = false;
         cx.notify();
     }
 
-    /// Slack's channel details dialog, opened by clicking the channel name in the header:
-    /// the About and Members tabs over the channel's record and member list. A creator
-    /// missing from the snapshot resolves through the core, like any other unknown person.
+    /// Slack's channel details dialog, opened by clicking the channel name in the header or
+    /// its members chip: the About and Members tabs over the channel's record and member
+    /// list. A creator missing from the snapshot resolves through the core, like any other
+    /// unknown person.
     fn open_channel_details(
         &mut self,
         channel: &ChannelId,
+        tab: channel_details::DetailsTab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1810,20 +1926,77 @@ impl App {
         let stored = self.member_ids(channel, &conversation).to_vec();
         let loading = stored.is_empty() && self.bridge.store().is_some();
         self.details.update(cx, |details, cx| {
-            details.open(self.fixtures.clone(), channel.clone(), stored, loading, cx)
+            details.open(
+                self.fixtures.clone(),
+                channel.clone(),
+                stored,
+                loading,
+                tab,
+                cx,
+            )
         });
-        let title = format!(
-            "# {}",
+        self.bridge.send(Command::FetchChannelManagers {
+            channel: channel.clone(),
+        });
+        // Slack's title row: a private channel's lock, else the hash, beside the name in the
+        // dialog's bold display size (the close X is the dialog's own).
+        let title_name: SharedString = if conversation.is_private {
             conversation
                 .name
                 .as_deref()
                 .unwrap_or_else(|| channel.as_str())
-        );
+                .to_owned()
+                .into()
+        } else {
+            format!(
+                "# {}",
+                conversation
+                    .name
+                    .as_deref()
+                    .unwrap_or_else(|| channel.as_str())
+            )
+            .into()
+        };
+        let title_private = conversation.is_private;
         let details = self.details.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
+        let focus_find_people = Rc::new(Cell::new(true));
+        window.open_dialog(cx, move |dialog, window, cx| {
+            // Slack puts the caret in "Find people" as the dialog opens.
+            if focus_find_people.replace(false) {
+                details.read(cx).find_people_focus(cx).focus(window, cx);
+            }
+            let mut title = h_flex()
+                .items_center()
+                .gap_1p5()
+                .text_size(px(22.))
+                .font_weight(FontWeight::BOLD);
+            title = if title_private {
+                title
+                    .child(Icon::new(IconName::Lock))
+                    .child(title_name.clone())
+            } else {
+                title.child(title_name.clone())
+            };
+            // Slack's 580pt dialog: its rules run edge to edge, so the content pads itself and
+            // the title row carries the close X.
+            let title_row = h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .px(px(28.))
+                .child(title)
+                .child(
+                    Button::new("details-close")
+                        .ghost()
+                        .icon(IconName::Close)
+                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                );
             dialog
-                .title(title.clone())
-                .w(px(720.))
+                .title(title_row)
+                .w(px(580.))
+                .px_0()
+                .pb_0()
+                .close_button(false)
                 .child(details.clone())
         });
     }
@@ -2271,8 +2444,10 @@ impl App {
         self.load_history(&channel, cx);
         self.channel = channel;
         self.open_members = None;
-        self.sync_connect_orgs();
-        self.thread_open = false;
+        self.members_hover = (false, false);
+        self.members_popover_names = None;
+        self.sync_connect_orgs(cx);
+        self.close_thread(cx);
         self.tab = ConversationTab::Messages;
         // An open pins panel follows the conversation: fetch the new one's pins.
         if self.pins_open {
@@ -2305,6 +2480,8 @@ impl App {
             Event::StoreChanged { channel } => {
                 if *channel == self.channel {
                     self.load_history(channel, cx);
+                    // The members popover names the history's recent authors: stale now.
+                    self.members_popover_names = None;
                 }
                 self.refresh_dm_latest(channel, cx);
                 // The open thread: a fetched replies page landed, or a live reply arrived.
@@ -2356,6 +2533,11 @@ impl App {
                     self.send(content, cx);
                 }
             }
+            Event::ChannelManagers { channel, users } => {
+                self.details.update(cx, |details, cx| {
+                    details.set_managers(channel, users.clone(), cx)
+                });
+            }
             Event::ConversationInfo {
                 channel,
                 num_members,
@@ -2383,7 +2565,7 @@ impl App {
                             self.resolve_users(members.iter().cloned());
                         }
                     }
-                    self.sync_connect_orgs();
+                    self.sync_connect_orgs(cx);
                     // An empty list (the fetch failed) turns the dialog's Members tab from
                     // loading to its inline error.
                     self.details.update(cx, |details, cx| {
@@ -2474,7 +2656,7 @@ impl App {
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
-        self.sync_connect_orgs();
+        self.sync_connect_orgs(cx);
         self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
         if !keep {
             self.show_conversation(first_conversation(&self.fixtures), cx);
@@ -2743,7 +2925,9 @@ impl App {
         self.parked[self.workspace] = Some(outgoing);
         self.workspace = index;
         self.open_members = None;
-        self.sync_connect_orgs();
+        self.members_hover = (false, false);
+        self.members_popover_names = None;
+        self.sync_connect_orgs(cx);
         self.searching = false;
         self.drafts_open = false;
         self.later_open = false;
@@ -2752,7 +2936,7 @@ impl App {
         self.directory_open = false;
         self.compose_open = false;
         self.pending_dm = None;
-        self.thread_open = false;
+        self.close_thread(cx);
         self.profile_open = false;
         self.pins_open = false;
         let fixtures = self.fixtures.clone();
@@ -3266,7 +3450,6 @@ impl Render for App {
                 // The Pins tab keeps the transcript under it; its panel is the right column.
                 ConversationTab::Messages | ConversationTab::Pins => column
                     .child(div().flex_1().min_h_0().child(self.messages.clone()))
-                    .children(self.connect_banner(cx))
                     .children(self.dnd_banner(conversation.as_ref(), cx))
                     .child(self.composer.clone()),
                 ConversationTab::Canvas => {
@@ -3438,6 +3621,7 @@ impl Render for App {
                     this.open_browser(window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenDownloads, _, cx| this.open_downloads(cx)))
             .on_action(
                 cx.listener(|this, _: &SetStatus, window, cx| this.open_status_picker(window, cx)),
             )
@@ -3548,6 +3732,7 @@ impl Render for App {
                         .size_full()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.user_menu_open = false;
+                            this.user_menu.update(cx, |menu, cx| menu.closed(cx));
                             cx.notify();
                         })),
                 )
@@ -3794,10 +3979,12 @@ impl App {
         // Slack's 40px top bar: the history arrows hug the left of a search pill centred in
         // the window (the right padding mirrors the traffic lights' inset on the left), with
         // status and help pinned to the right edge.
-        // Transparent over the root's chrome (and its corner glow), like the rail.
+        // Transparent over the root's chrome (and its corner glow), like the rail, and without
+        // the kit's bottom rule: Slack's chrome runs unbroken into the workspace column.
         TitleBar::new()
             .h(px(40.))
             .bg(gpui_kit::gpui::transparent_black())
+            .border_b_0()
             .child(
                 h_flex()
                     .relative()
@@ -3869,56 +4056,118 @@ impl App {
         )
     }
 
-    /// The Slack Connect banner of an externally shared channel: one line per connected
-    /// organization, its icon and "<N> external people are from <Org>" (the count in link
-    /// color). Recomputed on member/snapshot changes, never per frame.
-    fn connect_banner(&self, cx: &Context<Self>) -> Option<Div> {
+    /// Slack's context bar for an externally shared channel, drawn inside the composer's
+    /// frame: the first organizations' icons stacked, then "<N> external people are from
+    /// <Org>" (two organizations by name, more as a count), the count linking to the channel's
+    /// details. Built when the members or the snapshot change, never per frame.
+    fn connect_bar(&self, cx: &Context<Self>) -> Option<ContextBar> {
         let conversation = self.fixtures.conversation(&self.channel)?;
-        if !conversation.is_ext_shared || self.connect_orgs.is_empty() {
+        if !conversation.is_ext_shared {
             return None;
         }
-        let muted = cx.theme().muted;
-        let muted_foreground = cx.theme().muted_foreground;
-        let link = cx.theme().link;
-        Some(
-            v_flex()
-                .gap_1()
-                .mx_4()
-                .mb_1()
+        let mut teams: Vec<Team> = self
+            .fixtures
+            .shared_teams(conversation)
+            .into_iter()
+            .cloned()
+            .collect();
+        if teams.is_empty() {
+            teams = self
+                .connect_orgs
+                .iter()
+                .map(|org| org.team.clone())
+                .collect();
+        }
+        if teams.is_empty() {
+            return None;
+        }
+        let people: u32 = self.connect_orgs.iter().map(|org| org.members).sum();
+        let (count, rest) = if people == 0 {
+            (
+                format!("{} external organizations", teams.len()),
+                "can view this channel".to_owned(),
+            )
+        } else {
+            let from = match teams.as_slice() {
+                [team] => team.name.to_string(),
+                [a, b] => format!("{} and {}", a.name, b.name),
+                _ => format!("{} organizations", teams.len()),
+            };
+            (
+                format!(
+                    "{people} external {}",
+                    if people == 1 { "person" } else { "people" }
+                ),
+                format!("{} from {from}", if people == 1 { "is" } else { "are" }),
+            )
+        };
+        teams.truncate(3);
+        let (app, channel) = (cx.entity().downgrade(), self.channel.clone());
+        Some(Rc::new(move |_, cx| {
+            let (bg, fg, link) = (
+                crate::theme::connect_bar(cx),
+                cx.theme().foreground,
+                cx.theme().link,
+            );
+            let (app, channel) = (app.clone(), channel.clone());
+            h_flex()
+                .items_center()
+                .gap_2()
                 .px_3()
-                .py_1p5()
-                .flex_none()
-                .rounded_md()
-                .bg(muted)
-                .children(self.connect_orgs.iter().map(|org| {
+                // Slack's bar shows about 38pt of amber; the composer box covers the rest.
+                .pt(px(10.))
+                .pb(px(10. + composer::BAR_TUCK))
+                .rounded_tl(px(8.))
+                .rounded_tr(px(8.))
+                .bg(bg)
+                .text_size(px(13.))
+                .text_color(fg)
+                // Slack stacks the icons left to right, each ringed in the bar's color.
+                .child(
                     h_flex()
-                        .items_center()
-                        .gap_2()
-                        .child(channel_details::org_chip(&org.team, 16.))
+                        .flex_none()
+                        .children(teams.iter().enumerate().map(|(ix, team)| {
+                            div()
+                                .when(ix > 0, |chip| chip.ml(px(-7.)))
+                                .p(px(1.))
+                                .rounded(px(5.))
+                                .bg(bg)
+                                .child(channel_details::org_chip(team, 16.))
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
                         .child(
-                            div().text_xs().text_color(muted_foreground).child(
-                                h_flex()
-                                    .items_baseline()
-                                    .gap_1()
-                                    .child(div().text_color(link).child(format!(
-                                        "{} external {}",
-                                        org.members,
-                                        if org.members == 1 { "person" } else { "people" }
-                                    )))
-                                    .child(div().child(format!(
-                                        "{} from {}",
-                                        if org.members == 1 { "is" } else { "are" },
-                                        org.team.name
-                                    ))),
-                            ),
+                            div()
+                                .id("connect-count")
+                                .flex_none()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(link)
+                                .cursor_pointer()
+                                .hover(|count| count.underline())
+                                .child(count.clone())
+                                .on_click(move |_, window, cx| {
+                                    let _ = app.update(cx, |app, cx| {
+                                        app.open_channel_details(
+                                            &channel,
+                                            channel_details::DetailsTab::About,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                }),
                         )
-                })),
-        )
+                        .child(div().min_w_0().truncate().child(rest.clone())),
+                )
+                .into_any_element()
+        }))
     }
 
     /// Recompute [`Self::connect_orgs`] for the open conversation: only a Slack Connect
     /// channel has other organizations to count.
-    fn sync_connect_orgs(&mut self) {
+    fn sync_connect_orgs(&mut self, cx: &mut Context<Self>) {
         self.connect_orgs = match self.fixtures.conversation(&self.channel) {
             Some(conversation) if conversation.is_ext_shared => channel_details::external_orgs(
                 &channel_details::own_team(&self.fixtures),
@@ -3928,6 +4177,22 @@ impl App {
             ),
             _ => Vec::new(),
         };
+        let bar = self.connect_bar(cx);
+        self.composer
+            .update(cx, |composer, cx| composer.set_context_bar(bar, cx));
+        self.sync_thread_bar(cx);
+    }
+
+    /// Slack shows the channel's Slack Connect bar over the thread's reply box too.
+    fn sync_thread_bar(&mut self, cx: &mut Context<Self>) {
+        let here = self
+            .thread
+            .read(cx)
+            .open_thread()
+            .is_some_and(|(channel, _)| channel == self.channel);
+        let bar = here.then(|| self.connect_bar(cx)).flatten();
+        self.thread
+            .update(cx, |panel, cx| panel.set_context_bar(bar, cx));
     }
 
     /// The freshest member ids of `channel`: the core's announcement while it is the open
@@ -3941,6 +4206,100 @@ impl App {
             Some((open, members)) if open == channel => members,
             _ => &conversation.members,
         }
+    }
+
+    /// Slack's dark tooltip hanging under the header members chip (`.c-tooltip__tip`: the
+    /// inverse surface, 200px wide, 13px text on a 1.25 line, 8x12 padding, radius 8, the
+    /// arrow filling the 8px gap up to the chip).
+    fn members_popover(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (surface, ink) = (theme.foreground, theme.background);
+        div()
+            .id("hdr-members-popover")
+            .absolute()
+            .top(relative(1.))
+            .left_1_2()
+            .ml(px(-100.))
+            .pt(px(8.))
+            .occlude()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.members_hover.1 = *hovered;
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .items_center()
+                    .child(crate::sidebar::tooltip_arrow(surface, true))
+                    .child(
+                        v_flex()
+                            .w(px(200.))
+                            .px_3()
+                            .py_2()
+                            .rounded(px(8.))
+                            .bg(surface)
+                            .text_size(px(13.))
+                            .line_height(relative(1.25))
+                            .text_center()
+                            .text_color(ink)
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("View all members of this channel"),
+                            )
+                            .children(
+                                includes_line(self.members_popover_names.as_deref().unwrap_or(&[]))
+                                    .map(|line| div().text_color(ink.opacity(0.65)).child(line)),
+                            ),
+                    ),
+            )
+    }
+
+    /// The members popover's names for the open channel: fixture mode reads the snapshot's
+    /// loaded history in hand; live mode reads the same local-store history the transcript
+    /// opened with, off the UI thread. Cached until the channel or its history changes -
+    /// never per frame.
+    fn update_members_popover(&mut self, cx: &mut Context<Self>) {
+        if self.members_popover_names.is_some() {
+            return;
+        }
+        let channel = self.channel.clone();
+        if self.bridge.store().is_some() {
+            let Some(read) = self.bridge.history(channel.clone(), None) else {
+                return;
+            };
+            cx.spawn(async move |this, cx| {
+                let history = cx.background_executor().spawn(read).await;
+                this.update(cx, |app, cx| {
+                    if app.channel == channel {
+                        app.members_popover_names = Some(app.popover_names(&channel, &history));
+                        if app.members_hover.0 || app.members_hover.1 {
+                            cx.notify();
+                        }
+                    }
+                })
+            })
+            .detach();
+        } else {
+            let history = self
+                .fixtures
+                .messages
+                .get(&channel)
+                .cloned()
+                .unwrap_or_default();
+            self.members_popover_names = Some(self.popover_names(&channel, &history));
+            cx.notify();
+        }
+    }
+
+    /// The popover's names for `channel` from its loaded history: the most recent distinct
+    /// human authors, newest first, topped up from the member list.
+    fn popover_names(&self, channel: &ChannelId, history: &[Message]) -> Vec<String> {
+        let conversation = self.fixtures.conversation(channel);
+        popover_names(
+            &self.fixtures,
+            self.member_ids(channel, conversation.unwrap_or(&Conversation::default())),
+            history,
+        )
     }
 
     /// The conversation header row: star, peer avatar for DMs (presence dot for IMs, stacked
@@ -4006,6 +4365,9 @@ impl App {
         let peer = conversation
             .map(|c| conversation_avatar(&self.fixtures, c, 24., background, cx))
             .unwrap_or_else(div);
+        // Slack's members chip: hover shows the "View all members" popover, a click opens
+        // the details dialog straight onto its Members tab.
+        let members_channel = channel.map(|c| c.id.clone());
         let members = conversation
             .filter(|c| {
                 matches!(
@@ -4015,18 +4377,53 @@ impl App {
             })
             .and_then(|c| self.member_counts.get(&c.id).copied().or(c.num_members))
             .map(|count| {
-                h_flex()
+                let popover_open = self.members_hover.0 || self.members_hover.1;
+                div()
+                    .id("hdr-members")
+                    .relative()
                     .flex_none()
-                    .items_center()
-                    .gap_1()
-                    .text_sm()
-                    .text_color(muted_foreground)
+                    .cursor_pointer()
                     .child(
-                        Icon::new(IconName::User)
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .h(px(28.))
+                            .rounded_sm()
+                            .text_sm()
                             .text_color(muted_foreground)
-                            .size(px(16.)),
+                            .child(
+                                Icon::new(IconName::User)
+                                    .text_color(muted_foreground)
+                                    .size(px(16.)),
+                            )
+                            .child(count.to_string()),
                     )
-                    .child(count.to_string())
+                    // Slack keeps the pill lit while its tooltip is open, not only under
+                    // the pointer.
+                    .when(popover_open, |chip| chip.bg(accent))
+                    .hover(|el| el.bg(accent))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        this.members_hover.0 = *hovered;
+                        if *hovered {
+                            this.update_members_popover(cx);
+                        }
+                        cx.notify();
+                    }))
+                    .when_some(members_channel.clone(), |chip, channel| {
+                        chip.on_click(cx.listener(move |this, _, window, cx| {
+                            this.members_hover = (false, false);
+                            this.open_channel_details(
+                                &channel,
+                                channel_details::DetailsTab::Members,
+                                window,
+                                cx,
+                            );
+                        }))
+                    })
+                    .when(popover_open, |chip| {
+                        chip.child(deferred(self.members_popover(cx)).with_priority(1))
+                    })
             });
         // Slack counts the channel's apps apart: "👤 13  ⊞ 4".
         let apps = conversation
@@ -4082,7 +4479,12 @@ impl App {
                 name.cursor_pointer()
                     .hover(|el| el.bg(accent))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_channel_details(&channel, window, cx)
+                        this.open_channel_details(
+                            &channel,
+                            channel_details::DetailsTab::About,
+                            window,
+                            cx,
+                        )
                     }))
             });
 
@@ -4360,6 +4762,67 @@ fn subscribe_workspace(
                 SidebarEvent::OpenDirectories => this.open_directory(cx),
                 SidebarEvent::OpenCompose => this.open_compose("", window, cx),
                 SidebarEvent::CreateSection { name } => this.create_section(name.clone(), cx),
+                SidebarEvent::CreateSectionWithChannel { name, channel } => {
+                    if this.fixtures.sample {
+                        this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.add_section_with_channel(name.clone(), channel.clone(), cx)
+                        });
+                    } else {
+                        this.bridge.send(Command::CreateSectionWithChannel {
+                            name: name.clone(),
+                            channel: channel.clone(),
+                        });
+                    }
+                }
+                SidebarEvent::RenameSection { section, name } => {
+                    if this.fixtures.sample {
+                        this.sidebar.update(cx, |sidebar, cx| {
+                            sidebar.rename_section_local(section, name, cx)
+                        });
+                    } else {
+                        this.bridge.send(Command::RenameSection {
+                            section: section.clone(),
+                            name: name.clone(),
+                        });
+                    }
+                }
+                SidebarEvent::DeleteSection { section } => {
+                    if this.fixtures.sample {
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.delete_section_local(section, cx));
+                    } else {
+                        this.bridge.send(Command::DeleteSection {
+                            section: section.clone(),
+                        });
+                    }
+                }
+                SidebarEvent::MoveChannel { channel, from, to } => {
+                    this.bridge.send(Command::MoveChannel {
+                        channel: channel.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                }
+                SidebarEvent::MarkRead { channel, ts } => {
+                    this.mark_read(channel, ts.clone(), cx);
+                }
+                SidebarEvent::SetNotifyLevel { channel, level } => {
+                    this.bridge.send(Command::SetNotifyLevel {
+                        channel: channel.clone(),
+                        level: *level,
+                    });
+                }
+                SidebarEvent::OpenChannelDetails(channel) => {
+                    this.open_channel_details(
+                        channel,
+                        channel_details::DetailsTab::About,
+                        window,
+                        cx,
+                    );
+                }
+                SidebarEvent::LeaveChannel(channel) => {
+                    this.leave(channel.clone(), window, cx);
+                }
                 SidebarEvent::ToggleFocus => this.toggle_focus(window, cx),
                 SidebarEvent::FocusDuration(preset) => {
                     this.self_state.start_focus(*preset);
@@ -4447,7 +4910,7 @@ fn subscribe_workspace(
                     this.open_picker(PickerTarget::ThreadComposer, *position, window, cx);
                 }
                 ThreadPanelEvent::Close => {
-                    this.thread_open = false;
+                    this.close_thread(cx);
                     cx.notify();
                 }
                 ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
@@ -4471,6 +4934,17 @@ fn subscribe_workspace(
                 }
                 ThreadPanelEvent::Later(request) => this.save_for_later(request, cx),
                 ThreadPanelEvent::Changed { channel, change } => this.post_change(channel, change),
+                ThreadPanelEvent::SetSubscribed {
+                    channel,
+                    thread_ts,
+                    last_read,
+                    subscribed,
+                } => this.bridge.send(Command::SetThreadSubscribed {
+                    channel: channel.clone(),
+                    thread_ts: thread_ts.clone(),
+                    last_read: last_read.clone(),
+                    subscribed: *subscribed,
+                }),
             },
         ),
         cx.subscribe_in(
@@ -4613,7 +5087,12 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                     "details" => {
                         // The Slack Connect channel: the dialog and banner together.
                         app.select("C0PARTNER".into(), cx);
-                        app.open_channel_details(&"C0PARTNER".into(), window, cx);
+                        app.open_channel_details(
+                            &"C0PARTNER".into(),
+                            channel_details::DetailsTab::About,
+                            window,
+                            cx,
+                        );
                     }
                     "wsmenu" => app
                         .sidebar
@@ -4683,6 +5162,68 @@ fn forget_failure<T>(loaded: &mut HashMap<ChannelId, Loaded<T>>, channel: &Chann
 }
 
 /// A 28px square chrome icon button.
+/// The members popover's "Includes …" line for one to three names, Slack's list
+/// punctuation ("Includes A", "Includes A and B", "Includes A, B, and C").
+fn includes_line(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [a] => Some(format!("Includes {a}")),
+        [a, b] => Some(format!("Includes {a} and {b}")),
+        [a, b, c, ..] => Some(format!("Includes {a}, {b}, and {c}")),
+    }
+}
+
+/// The header members popover's names: the most recent distinct human authors of `history`
+/// (newest first, never the signed-in user, never bots), topped up from `members` - the
+/// message list's name resolution ([`Fixtures::user_name`]). Free-standing for the test.
+fn popover_names(fixtures: &Fixtures, members: &[UserId], history: &[Message]) -> Vec<String> {
+    const LIMIT: usize = 3;
+    let mut names: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    let self_user = &fixtures.self_user;
+    for message in history.iter().rev() {
+        // Thread replies and hidden metadata events are not channel authors; bots are not
+        // people Slack would name.
+        if message.hidden || message.bot_id.is_some() || message.bot_profile.is_some() {
+            continue;
+        }
+        if let Some(user) = message.user.as_ref() {
+            push_popover_name(fixtures, self_user, &mut names, &mut seen, user);
+            if names.len() == LIMIT {
+                return names;
+            }
+        }
+    }
+    for member in members {
+        push_popover_name(fixtures, self_user, &mut names, &mut seen, member);
+        if names.len() == LIMIT {
+            break;
+        }
+    }
+    names
+}
+
+/// Count `user` toward the popover's names once: only resolved people who are not the
+/// signed-in user.
+fn push_popover_name(
+    fixtures: &Fixtures,
+    self_user: &UserId,
+    names: &mut Vec<String>,
+    seen: &mut HashSet<UserId>,
+    user: &UserId,
+) {
+    if user == self_user || !seen.insert(user.clone()) {
+        return;
+    }
+    let Some(record) = fixtures.user(user) else {
+        return;
+    };
+    if record.is_bot || record.deleted {
+        return;
+    }
+    names.push(fixtures.user_name(user).to_owned());
+}
+
 fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) -> Stateful<Div> {
     div()
         .id(id)
@@ -4701,6 +5242,7 @@ fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slackless_core::types::User;
 
     #[test]
     fn permalinks_parse_into_their_in_app_targets() {
@@ -4726,5 +5268,64 @@ mod tests {
         assert!(parse_permalink("https://acme.slack.com/help").is_none());
         assert!(parse_permalink("https://acme.slack.com/archives/C0ENG").is_none());
         assert!(parse_permalink("https://acme.slack.com/archives/C0ENG/plive").is_none());
+    }
+
+    #[test]
+    fn includes_line_joins_slacks_member_list() {
+        assert_eq!(includes_line(&[]), None);
+        assert_eq!(includes_line(&["A".into()]), Some("Includes A".into()));
+        assert_eq!(
+            includes_line(&["A".into(), "B".into()]),
+            Some("Includes A and B".into())
+        );
+        assert_eq!(
+            includes_line(&["A".into(), "B".into(), "C".into()]),
+            Some("Includes A, B, and C".into())
+        );
+        // Slack names three; a longer list never renders but still joins three.
+        assert_eq!(
+            includes_line(&["A".into(), "B".into(), "C".into(), "D".into()]),
+            Some("Includes A, B, and C".into())
+        );
+    }
+
+    #[test]
+    fn popover_names_recent_authors_then_members() {
+        let fixtures = fixtures::load();
+        let person = |id: &str| User {
+            id: UserId::from(id),
+            real_name: Some(id.to_owned()),
+            ..Default::default()
+        };
+        let bot = User {
+            id: UserId::from("UBOT"),
+            is_bot: true,
+            ..Default::default()
+        };
+        let message = |user: Option<&str>, bot_profile: bool| Message {
+            user: user.map(UserId::from),
+            bot_profile: bot_profile.then(Default::default),
+            ..Default::default()
+        };
+        // Newest last, so the popover reads authors newest first, skipping bots, the
+        // signed-in user and repeats, then tops up from the member list.
+        let history = vec![
+            message(Some("U0ONE"), false),
+            message(Some("UBOT"), false),
+            message(Some("U0TWO"), false),
+            message(None, true),
+            message(Some("U0SELF"), false),
+            message(Some("U0TWO"), false),
+        ];
+        let members = ["U0ONE", "U0THREE"].map(UserId::from).to_vec();
+        let mut fixtures = fixtures;
+        fixtures.self_user = UserId::from("U0SELF");
+        fixtures.users = vec![person("U0ONE"), person("U0TWO"), person("U0THREE"), bot];
+        let names = popover_names(&fixtures, &members, &history);
+        assert_eq!(
+            names,
+            ["U0TWO", "U0ONE", "U0THREE"],
+            "newest author first, then member top-up"
+        );
     }
 }
