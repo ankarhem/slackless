@@ -25,7 +25,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
@@ -41,7 +40,8 @@ use crate::actions;
 use crate::avatars;
 use crate::emoji;
 use crate::fixtures::Fixtures;
-use crate::messages;
+use crate::image_viewer::ImageOrigin;
+use crate::messages::{self, LinkHandler, LinkTarget, THEME_ORDER_STRIDE};
 
 /// `serde_json` through gpui's re-export (the single 1.x version the core crates use): the
 /// GUI crate has no direct dependency, and `Block::Unknown` hands out its `Value`.
@@ -67,6 +67,14 @@ pub struct KitCx<'a> {
     /// Interactive state; `None` renders controls from the payload's initial values only.
     pub kit: Option<&'a Entity<BlockKitState>>,
     pub ts: &'a Ts,
+    /// Routing for this message's text links; with a handler the text is also selectable
+    /// (see [`crate::messages`]).
+    pub links: Option<LinkHandler>,
+    /// The click handler opening the image viewer (the transcript provides it; static
+    /// cards render their images without it).
+    pub image_open: Option<crate::image_viewer::ImageClick>,
+    /// The next selection-order slice handed to a text theme (see [`messages::mrkdwn`]).
+    order: std::cell::Cell<u64>,
     /// Keys handed to inline text renderers, so their element ids stay unique across the
     /// blocks and attachments of one message (GPUI keys a11y nodes by id alone).
     keys: std::cell::Cell<usize>,
@@ -78,8 +86,53 @@ impl<'a> KitCx<'a> {
             fixtures,
             kit,
             ts,
+            links: None,
+            image_open: None,
+            order: std::cell::Cell::new(0),
             keys: std::cell::Cell::new(0),
         }
+    }
+
+    /// Routes this message's text links through `links` (also makes its text selectable).
+    pub fn with_links(mut self, links: LinkHandler) -> Self {
+        self.links = Some(links);
+        self
+    }
+
+    /// Routes this message's image clicks to the image viewer (the transcript provides
+    /// the handler; see [`crate::image_viewer`]).
+    pub fn opening_images(mut self, on_open: crate::image_viewer::ImageClick) -> Self {
+        self.image_open = Some(on_open);
+        self
+    }
+
+    /// A [`KitCx`] for a nested render (an attachment's own blocks): fresh keys, the parent's
+    /// link routing and the selection order continuing after the parent's own text.
+    pub fn nested<'b>(
+        &self,
+        fixtures: &'b Fixtures,
+        kit: Option<&'b Entity<BlockKitState>>,
+        ts: &'b Ts,
+    ) -> KitCx<'b> {
+        KitCx {
+            fixtures,
+            kit,
+            ts,
+            links: self.links.clone(),
+            image_open: self.image_open.clone(),
+            order: std::cell::Cell::new(self.order.get()),
+            keys: std::cell::Cell::new(0),
+        }
+    }
+
+    /// A fresh text-element key plus the selection-order base for one text theme of this
+    /// message: each theme owns [`THEME_ORDER_STRIDE`] paragraph slots of the message's
+    /// document order, so paragraphs of different blocks never interleave.
+    pub fn text_theme(&self) -> (String, u64) {
+        let key = self.text_key();
+        let base = messages::message_order(self.ts) + self.order.get();
+        self.order.set(self.order.get() + THEME_ORDER_STRIDE);
+        (key, base)
     }
 
     /// A fresh text-element key for this message.
@@ -160,6 +213,30 @@ pub fn prepare_inputs(
     }
 }
 
+/// `label` as a clickable link routing through the message's link handler (a permalink
+/// opens in-app; without a handler the URL opens in the browser).
+fn routed_link(
+    id: String,
+    label: String,
+    url: String,
+    kcx: &KitCx,
+    weight: FontWeight,
+    cx: &App,
+) -> gpui_kit::gpui::Stateful<Div> {
+    let target = LinkTarget::Url(url.into());
+    let links = kcx.links.clone();
+    div()
+        .id(SharedString::from(id))
+        .font_weight(weight)
+        .text_color(cx.theme().link)
+        .cursor_pointer()
+        .hover(|el| el.underline())
+        .on_click(move |_, window, cx| {
+            messages::route_link(links.as_ref(), target.clone(), window, cx)
+        })
+        .child(label)
+}
+
 /// The `text` of a text object.
 fn text_of(object: &Json) -> Option<&str> {
     object["text"].as_str()
@@ -170,10 +247,7 @@ fn text_of(object: &Json) -> Option<&str> {
 fn text_object(object: &Json, kcx: &KitCx, muted: bool, cx: &App) -> Option<AnyElement> {
     let text = text_of(object)?;
     if object["type"].as_str() == Some("mrkdwn") {
-        return Some(
-            messages::mrkdwn(text, kcx.fixtures, muted, false, kcx.text_key(), cx)
-                .into_any_element(),
-        );
+        return Some(messages::mrkdwn(text, kcx, muted, false, cx).into_any_element());
     }
     Some(
         div()
@@ -658,7 +732,8 @@ fn text_input(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
 
 /// The image at `url`: a decoded fixture image, or live, the remote image loaded through the
 /// app's HTTP client; a framed placeholder carrying the alt text while there is none (or it
-/// fails to load).
+/// fails to load). Images at least [`OPENABLE_IMAGE`] open the viewer on click when the
+/// transcript provides [`KitCx::image_open`].
 fn picture(
     url: Option<&str>,
     alt: &str,
@@ -680,17 +755,40 @@ fn picture(
         }
         None => None,
     });
-    match source {
-        Some(source) => img(source)
-            .w(px(width))
-            .h(px(height))
-            .object_fit(ObjectFit::Contain)
-            .rounded_md()
-            .with_fallback(placeholder)
-            .into_any_element(),
-        None => placeholder(),
+    let Some(source) = source else {
+        return placeholder();
+    };
+    let image = img(source)
+        .w(px(width))
+        .h(px(height))
+        .object_fit(ObjectFit::Contain)
+        // GPUI clips rectangularly: the img rounds itself (a rounded wrapper does not
+        // round its children).
+        .rounded(px(8.))
+        .with_fallback(placeholder);
+    if let (Some(url), Some(on_open)) = (url, kcx.image_open.clone()) {
+        if width >= OPENABLE_IMAGE {
+            // Slack's `.p-file_image_thumbnail__wrapper`: 8px radius, a 1px border of the
+            // foreground at 13%, and the zoom cursor.
+            let origin = ImageOrigin::Url(url.to_owned());
+            return div()
+                .id(SharedString::from(format!("img-{}", kcx.text_key())))
+                .cursor_pointer()
+                .rounded_lg()
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.foreground.opacity(0.13))
+                .on_click(move |_, window, cx| on_open(origin.clone(), window, cx))
+                .child(image)
+                .into_any_element();
+        }
     }
+    image.into_any_element()
 }
+
+/// Images at least this large (image blocks, unfurl thumbs, attachment previews) open the
+/// viewer on click; the small context/accessory icons stay static.
+const OPENABLE_IMAGE: f32 = 48.;
 
 /// The framed stand-in for a missing image: an image glyph over the alt text.
 fn picture_frame(alt: &str, width: f32, height: f32, (border, bg, fg): (Hsla, Hsla, Hsla)) -> Div {
@@ -826,9 +924,9 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
     let posted_in = attachment
         .channel_id
         .as_ref()
-        .and_then(|channel| fixtures.conversation(channel))
-        .filter(|conversation| conversation.name.is_some())
-        .map(|conversation| {
+        .and_then(|channel| Some((channel, fixtures.conversation(channel)?)))
+        .filter(|(_, conversation)| conversation.name.is_some())
+        .map(|(channel, conversation)| {
             let icon = if conversation.is_archived {
                 IconName::Archive
             } else if conversation.kind() == ConversationKind::PrivateChannel {
@@ -837,11 +935,28 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
                 IconName::Hash
             };
             let name = conversation.name.clone().unwrap_or_default();
+            // Like Slack, the channel the shared message lives in opens it.
+            let channel = channel.clone();
+            let links = kcx.links.clone();
             h_flex()
+                .id(SharedString::from(format!(
+                    "bk-{}-att-{n}-posted-in",
+                    kcx.ts.as_str()
+                )))
                 .gap_1()
                 .items_center()
                 .text_sm()
                 .text_color(muted)
+                .cursor_pointer()
+                .hover(|el| el.underline())
+                .on_click(move |_, window, cx| {
+                    messages::route_link(
+                        links.as_ref(),
+                        LinkTarget::Channel(channel.clone()),
+                        window,
+                        cx,
+                    )
+                })
                 .child(if thread_root {
                     "Thread in"
                 } else {
@@ -855,12 +970,12 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
                 })
         });
     let block_ts = Ts::new(format!("{}-att{n}", kcx.ts.as_str()));
-    let nested = KitCx::new(fixtures, kcx.kit, &block_ts);
+    let nested = kcx.nested(fixtures, kcx.kit, &block_ts);
     let body: Vec<AnyElement> = if attachment.blocks.is_empty() {
         attachment
             .text
             .as_deref()
-            .map(|text| messages::mrkdwn(text, fixtures, false, false, kcx.text_key(), cx))
+            .map(|text| messages::mrkdwn(text, &nested, false, false, cx))
             .map(IntoElement::into_any_element)
             .into_iter()
             .collect()
@@ -907,23 +1022,28 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
             .title_link
             .clone()
             .or_else(|| attachment.from_url.clone());
-        div()
-            .id(SharedString::from(format!(
-                "bk-{}-att-{n}-link",
-                kcx.ts.as_str()
-            )))
-            .font_weight(FontWeight::BOLD)
-            .when_some(url, |title, url| {
-                title
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| cx.open_url(&url))
-            })
-            .child(title)
+        match url {
+            Some(url) => routed_link(
+                format!("bk-{}-att-{n}-link", kcx.ts.as_str()),
+                title,
+                url,
+                kcx,
+                FontWeight::BOLD,
+                cx,
+            ),
+            None => div()
+                .id(SharedString::from(format!(
+                    "bk-{}-att-{n}-link",
+                    kcx.ts.as_str()
+                )))
+                .font_weight(FontWeight::BOLD)
+                .child(title),
+        }
     });
     let description = attachment
         .text
         .as_deref()
-        .map(|text| messages::mrkdwn(text, kcx.fixtures, true, false, kcx.text_key(), cx));
+        .map(|text| messages::mrkdwn(text, kcx, true, false, cx));
     let site = attachment.service_name.clone().map(|name| {
         h_flex()
             .gap_1()
@@ -1002,15 +1122,19 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
     }
     if let Some(title) = &attachment.title {
         body = body.child(match &attachment.title_link {
-            Some(url) => div().font_weight(FontWeight::SEMIBOLD).child(
-                Link::new(SharedString::from(format!(
-                    "bk-{}-att-{n}-title",
-                    kcx.ts.as_str()
-                )))
-                .href(url.clone())
-                .child(title.clone()),
-            ),
-            None => div().font_weight(FontWeight::SEMIBOLD).child(title.clone()),
+            Some(url) => routed_link(
+                format!("bk-{}-att-{n}-title", kcx.ts.as_str()),
+                title.clone(),
+                url.clone(),
+                kcx,
+                FontWeight::SEMIBOLD,
+                cx,
+            )
+            .into_any_element(),
+            None => div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title.clone())
+                .into_any_element(),
         });
     }
     // Slack shows an attachment's blocks instead of its text when it has both.
@@ -1033,14 +1157,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         } else {
             text
         };
-        body = body.child(messages::mrkdwn(
-            shown,
-            fixtures,
-            false,
-            false,
-            kcx.text_key(),
-            cx,
-        ));
+        body = body.child(messages::mrkdwn(shown, kcx, false, false, cx));
         if let Some(kit) = kcx.kit.filter(|_| long).cloned() {
             body = body.child(
                 div()
@@ -1070,14 +1187,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                     cell.child(div().font_weight(FontWeight::BOLD).child(title))
                 })
                 .when_some(field.value.as_deref(), |cell, value| {
-                    cell.child(messages::mrkdwn(
-                        value,
-                        fixtures,
-                        false,
-                        false,
-                        kcx.text_key(),
-                        cx,
-                    ))
+                    cell.child(messages::mrkdwn(value, kcx, false, false, cx))
                 })
         };
         let mut row = h_flex().items_start().gap_4().child(cell(field));
@@ -1089,7 +1199,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         body = body.child(row);
     }
     let block_ts = Ts::new(format!("{}-att{n}", kcx.ts.as_str()));
-    let nested = KitCx::new(fixtures, kcx.kit, &block_ts);
+    let nested = kcx.nested(fixtures, kcx.kit, &block_ts);
     for (ix, nested_block) in attachment.blocks.iter().enumerate() {
         body = body.children(messages::render_block(nested_block, ix, &nested, false, cx));
     }
@@ -1130,14 +1240,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         .gap_1()
         .min_w_0()
         .when_some(attachment.pretext.as_deref(), |card, pretext| {
-            card.child(messages::mrkdwn(
-                pretext,
-                fixtures,
-                false,
-                false,
-                kcx.text_key(),
-                cx,
-            ))
+            card.child(messages::mrkdwn(pretext, kcx, false, false, cx))
         })
         .child(
             h_flex()

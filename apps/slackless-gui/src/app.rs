@@ -244,9 +244,10 @@ use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
 use crate::huddle::{self, HuddleBar, HuddleEvent};
 use crate::huddles::{self, HuddlesEvent, HuddlesView};
+use crate::image_viewer::{ImageViewer, ViewerEvent, ViewerImage};
 use crate::later::{LaterEvent, LaterView, SaveRequest};
 use crate::lists::list_view;
-use crate::messages::{MessageList, MessageListEvent};
+use crate::messages::{LinkTarget, MessageList, MessageListEvent};
 use crate::new_message::{NewMessageEvent, NewMessageView};
 use crate::pins;
 use crate::preferences::{AppearanceMode, Preferences, PreferencesEvent, Section};
@@ -391,6 +392,8 @@ pub struct App {
     /// The emoji picker overlay and, while it is open, its target and anchor point.
     emoji_picker: Entity<EmojiPicker>,
     picker: Option<(PickerTarget, Point<Pixels>)>,
+    /// The image viewer overlay (a message image was clicked); `None` keeps it closed.
+    image_viewer: Option<Entity<ImageViewer>>,
     /// Drafts, scheduled and sent messages; shown in place of the message column while
     /// `drafts_open`.
     drafts: Entity<DraftsView>,
@@ -595,6 +598,8 @@ impl App {
             focus.focus(window, cx);
 
             let this = cx.weak_entity();
+            // A second handle: the search intercept below moves `this` into its closure.
+            let viewer_keys = cx.weak_entity();
             let subscriptions = vec![
                 cx.observe_window_bounds(window, |this, window, cx| {
                     this.save_window_state(window, cx);
@@ -619,6 +624,36 @@ impl App {
                             cx.stop_propagation();
                         }
                     });
+                }),
+                // While the image viewer is open, Escape closes it and the arrows step
+                // through the conversation's images (ahead of any focused field, like the
+                // search panel's keys above).
+                cx.intercept_keystrokes({
+                    move |event, window, cx| {
+                        if event.input_preference == InputPreference::CharacterInput {
+                            return;
+                        }
+                        let _ = viewer_keys.update(cx, |app, cx| {
+                            let Some(viewer) = app.image_viewer.clone() else {
+                                return;
+                            };
+                            match event.keystroke.key.as_str() {
+                                "escape" => {
+                                    app.close_image_viewer(cx);
+                                    cx.stop_propagation();
+                                }
+                                "left" => {
+                                    viewer.update(cx, |viewer, cx| viewer.step(-1, window, cx));
+                                    cx.stop_propagation();
+                                }
+                                "right" => {
+                                    viewer.update(cx, |viewer, cx| viewer.step(1, window, cx));
+                                    cx.stop_propagation();
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
                 }),
                 bridge.subscribe_in(window, cx, |this: &mut App, event, window, cx| {
                     this.on_core_event(event, window, cx);
@@ -969,6 +1004,7 @@ impl App {
                 switcher,
                 emoji_picker,
                 picker: None,
+                image_viewer: None,
                 drafts,
                 drafts_open: false,
                 later,
@@ -1180,6 +1216,40 @@ impl App {
             self.tab = ConversationTab::Messages;
         }
         cx.notify();
+    }
+
+    /// A link in message text was activated. Slack resolves its own targets in-app:
+    /// profiles, channels and threads open their panes, and Slack permalinks open the
+    /// conversation (or thread) instead of the browser; everything else is a web URL.
+    fn open_link(&mut self, target: LinkTarget, _window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Profile(user) => self.open_profile(user, cx),
+            LinkTarget::Channel(channel) if self.fixtures.conversation(&channel).is_some() => {
+                self.select(channel, cx);
+            }
+            LinkTarget::Thread { channel, thread_ts }
+                if self.fixtures.conversation(&channel).is_some() =>
+            {
+                self.open_thread(channel, thread_ts, cx);
+            }
+            LinkTarget::Url(url) => match parse_permalink(&url) {
+                Some(permalink) if self.fixtures.conversation(&permalink.channel).is_some() => {
+                    self.select(permalink.channel.clone(), cx);
+                    match permalink.thread_ts {
+                        Some(thread_ts) => {
+                            self.open_thread(permalink.channel.clone(), thread_ts, cx)
+                        }
+                        None => {
+                            self.messages
+                                .update(cx, |list, cx| list.reveal(&permalink.ts, cx));
+                        }
+                    }
+                }
+                _ => cx.open_url(url.as_ref()),
+            },
+            // An in-app target this workspace does not know: nothing to open.
+            LinkTarget::Channel(_) | LinkTarget::Thread { .. } => {}
+        }
     }
 
     /// A tab row entry was clicked: switch the column, open the channel canvas in Slack's
@@ -1518,6 +1588,44 @@ impl App {
     }
 
     /// Show the emoji picker anchored at `position`, routing the pick to `target`.
+    /// Opens the image viewer over the conversation's images, the clicked one showing.
+    fn open_image_viewer(
+        &mut self,
+        channel: ChannelId,
+        images: Arc<Vec<ViewerImage>>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if images.is_empty() {
+            return;
+        }
+        let label = self
+            .fixtures
+            .conversation(&channel)
+            .map(|conversation| self.fixtures.conversation_label(conversation))
+            .unwrap_or_default();
+        let viewer = ImageViewer::new(self.fixtures.clone(), label, images, index, cx);
+        let subscription = cx.subscribe_in(
+            &viewer,
+            window,
+            |this: &mut App, _, event: &ViewerEvent, _, cx| match event {
+                ViewerEvent::Close => this.close_image_viewer(cx),
+            },
+        );
+        // A replaced viewer drops its subscription with it.
+        self._subscriptions.push(subscription);
+        self.image_viewer = Some(viewer);
+        cx.notify();
+    }
+
+    /// Closes the image viewer, dropping the large rendition it holds.
+    fn close_image_viewer(&mut self, cx: &mut Context<Self>) {
+        if self.image_viewer.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn open_picker(
         &mut self,
         target: PickerTarget,
@@ -3380,6 +3488,21 @@ impl Render for App {
                     },
                 )
             })
+            .when_some(self.image_viewer.clone(), |root, viewer| {
+                // Slack's image viewer: an opaque gray surface covering the window below
+                // the title bar; the panel itself renders the viewer.
+                root.child(
+                    div()
+                        .id("image-viewer-overlay")
+                        .occlude()
+                        .absolute()
+                        .top(px(40.))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(viewer),
+                )
+            })
     }
 }
 
@@ -3952,6 +4075,58 @@ impl App {
 /// The conversation a workspace opens on: its first DM, else its first channel.
 /// The conversation to open: the one most recently read in Slack (live), else the first DM or
 /// channel.
+/// The in-app target of a Slack permalink (`https://<team>.slack.com/archives/...`).
+struct Permalink {
+    channel: ChannelId,
+    /// The message the link points at (the `p<ts>` path segment).
+    ts: Ts,
+    /// The thread the link opens into, when it is a thread link (`?thread_ts=`).
+    thread_ts: Option<Ts>,
+}
+
+/// Parse a Slack permalink; `None` for anything else (or a malformed one).
+fn parse_permalink(url: &str) -> Option<Permalink> {
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut path = base.strip_prefix("https://")?.split('/');
+    let host = path.next()?;
+    if !host.ends_with(".slack.com") {
+        return None;
+    }
+    if path.next()? != "archives" {
+        return None;
+    }
+    let channel = path.next()?.trim();
+    if channel.is_empty() {
+        return None;
+    }
+    let ts = ts_from_permalink(path.next()?.trim())?;
+    let mut permalink = Permalink {
+        channel: ChannelId::from(channel),
+        ts,
+        thread_ts: None,
+    };
+    for (key, value) in query.split('&').filter_map(|pair| pair.split_once('=')) {
+        match key {
+            "thread_ts" => permalink.thread_ts = Some(Ts::new(value)),
+            // A thread link's channel rides the `cid` query parameter (DMs).
+            "cid" => permalink.channel = ChannelId::from(value),
+            _ => {}
+        }
+    }
+    Some(permalink)
+}
+
+/// `p1234567890123456` back to Slack's `ts` (`1234567890.123456`): the permalink form drops
+/// the dot before the six-digit fraction.
+fn ts_from_permalink(digits: &str) -> Option<Ts> {
+    let digits = digits.strip_prefix('p')?;
+    if digits.len() < 7 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (secs, fraction) = digits.split_at(digits.len() - 6);
+    Some(Ts::new(format!("{secs}.{fraction}")))
+}
+
 fn first_conversation(fixtures: &Fixtures) -> ChannelId {
     let last_read = fixtures
         .counts
@@ -4083,6 +4258,12 @@ fn subscribe_workspace(
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
                 MessageListEvent::Changed { channel, change } => this.post_change(channel, change),
                 MessageListEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                MessageListEvent::OpenLink(target) => this.open_link(target.clone(), window, cx),
+                MessageListEvent::OpenImage {
+                    channel,
+                    images,
+                    index,
+                } => this.open_image_viewer(channel.clone(), images.clone(), *index, window, cx),
                 MessageListEvent::Forward(link) => this.open_compose(link, window, cx),
                 MessageListEvent::NeedHistorySince { channel, since } => {
                     this.load_since(channel, *since, cx);
@@ -4119,6 +4300,7 @@ fn subscribe_workspace(
                     cx.notify();
                 }
                 ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                ThreadPanelEvent::OpenLink(target) => this.open_link(target.clone(), window, cx),
                 ThreadPanelEvent::Forward(link) => this.open_compose(link, window, cx),
                 ThreadPanelEvent::Reply {
                     channel,
@@ -4363,4 +4545,35 @@ fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) ->
         .text_color(color)
         .hover(|el| el.bg(hover_bg))
         .child(Icon::new(icon).text_color(color).size(px(16.)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permalinks_parse_into_their_in_app_targets() {
+        let message =
+            parse_permalink("https://acme.slack.com/archives/C0ENG/p17600000000123456").unwrap();
+        assert_eq!(message.channel, ChannelId::from("C0ENG"));
+        assert_eq!(message.ts.as_str(), "17600000000.123456");
+        assert_eq!(message.thread_ts, None);
+
+        // A thread link names its root in `thread_ts`; DM links carry the channel in `cid`.
+        let thread = parse_permalink(
+            "https://acme.slack.com/archives/D0ALICE/p17600000000654321?thread_ts=17600000000.123456&cid=D0ALICE",
+        )
+        .unwrap();
+        assert_eq!(thread.channel, ChannelId::from("D0ALICE"));
+        assert_eq!(
+            thread.thread_ts.as_ref().map(Ts::as_str),
+            Some("17600000000.123456")
+        );
+
+        // Anything else stays a web URL.
+        assert!(parse_permalink("https://github.com/gpui").is_none());
+        assert!(parse_permalink("https://acme.slack.com/help").is_none());
+        assert!(parse_permalink("https://acme.slack.com/archives/C0ENG").is_none());
+        assert!(parse_permalink("https://acme.slack.com/archives/C0ENG/plive").is_none());
+    }
 }

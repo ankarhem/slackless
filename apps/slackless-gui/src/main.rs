@@ -35,6 +35,7 @@ mod files_page;
 mod fixtures;
 mod huddle;
 mod huddles;
+mod image_viewer;
 mod later;
 mod lists;
 mod media;

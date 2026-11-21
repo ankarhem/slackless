@@ -40,13 +40,16 @@ use crate::composer::{AlsoSendTarget, Composer, ComposerEvent};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
-use crate::messages::message_row;
+use crate::messages::{LinkHandler, LinkTarget, message_row_linked};
 use crate::slash::{Invocation, SHRUG, SlashKind};
 
 pub enum ThreadPanelEvent {
     Close,
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
+    /// A link in message text was clicked: profile, channel, thread or URL (permalinks
+    /// resolved in-app by the root).
+    OpenLink(LinkTarget),
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
     /// The user reacted to, edited or deleted a message of the open thread (already shown
@@ -587,9 +590,18 @@ impl ThreadPanel {
         }
 
         let handler: ActionHandler = {
-            let ts = ts.clone();
+            let (this, ts) = (this.clone(), ts.clone());
             Rc::new(move |action, window, cx| {
                 this.update(cx, |panel, cx| panel.run_action(&ts, action, window, cx));
+            })
+        };
+        // The panel's text links route out as one event; the root resolves them.
+        let links: LinkHandler = {
+            let panel = this.clone();
+            Rc::new(move |target, _window, cx| {
+                panel.update(cx, |_, cx| {
+                    cx.emit(ThreadPanelEvent::OpenLink(target.clone()))
+                });
             })
         };
         let saved = self.saved.contains(&ts);
@@ -605,7 +617,7 @@ impl ThreadPanel {
         // interactive chips (toggle + add control) below the card instead.
         let mut display = message.clone();
         let reactions = std::mem::take(&mut display.reactions);
-        let card = message_row(&self.fixtures, &display, Some(&handler), cx);
+        let card = message_row_linked(&self.fixtures, &display, Some(&handler), Some(&links), cx);
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
             .map(|chips| chips.pl(px(TEXT_INSET)));
 

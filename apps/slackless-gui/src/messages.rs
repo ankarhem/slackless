@@ -4,6 +4,12 @@
 //! App-authored Block Kit blocks and legacy attachments render through [`crate::blockkit`];
 //! mrkdwn (fallback text, Block Kit text objects) through [`mrkdwn`].
 //!
+//! Message text participates in the window text selection (gpui-base: the root mounts the
+//! selection layer): each paragraph is one [`SelectableParagraph`], registered in
+//! `ts`-derived document order so drags span paragraphs and messages and Cmd+C copies the
+//! selection as plain text. Links route through [`LinkTarget`] — @mentions open profiles,
+//! #channels open the channel, permalinks open in-app — see the column's link handler.
+//!
 //! Hovering a row reveals the shared action bar and the right-click menu from
 //! [`crate::actions`]: quick reactions, add reaction (emoji picker via the root), reply in
 //! thread, forward, save for later, copy link, mark unread, and in-place edit / delete of the
@@ -25,6 +31,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_kit::component::button::{Button, ButtonRounded};
 use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
@@ -32,11 +39,14 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
-    Font, FontStyle, FontWeight, Hsla, ImageSource, InteractiveElement as _, InteractiveText,
-    IntoElement, ParentElement as _, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement as _, StrikethroughStyle, StyleRefinement, Styled as _, StyledText,
-    Subscription, TextRun, UnderlineStyle, WeakEntity, Window, div, img, px, rgb,
+    Anchor, AnyElement, App, AppContext as _, BorderStyle, Bounds, Context, Corners, CursorStyle,
+    DispatchPhase, Div, Edges, Element, ElementId, Entity, EventEmitter, Focusable as _, Font,
+    FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, ImageSource,
+    InspectorElementId, InteractiveElement as _, InteractiveText, IntoElement, LayoutId,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels, Point,
+    Render, SharedString, Stateful, StatefulInteractiveElement as _, StrikethroughStyle,
+    StyleRefinement, Styled as _, StyledText, Subscription, TextLayout, TextRun, UnderlineStyle,
+    WeakEntity, Window, div, img, px, rgb, transparent_black,
 };
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList, RichTextPreformatted,
@@ -47,6 +57,7 @@ use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChang
 use crate::blockkit::{self, BlockKitState, KitCx};
 use crate::emoji;
 use crate::fixtures::Fixtures;
+use crate::image_viewer::{self, ImageClick, ImageOrigin};
 use crate::later::{Remind, SaveRequest};
 
 /// Avatar chip size in px.
@@ -91,6 +102,70 @@ fn quote_flags() -> RunFlags {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Links in message text (Slack's in-app navigation): message bodies route every link
+// through their column's [`LinkHandler`]; the root resolves profiles, channels, threads
+// and Slack permalinks in the app and opens the rest in the browser.
+// ---------------------------------------------------------------------------
+
+/// Where a link inside message text leads.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkTarget {
+    /// A URL: opened in the browser, or in-app when it is a Slack permalink.
+    Url(SharedString),
+    /// An @user mention: that user's profile.
+    Profile(UserId),
+    /// A #channel mention: the channel.
+    Channel(ChannelId),
+    /// A thread reference (the "replied to a thread" line of a broadcast).
+    Thread { channel: ChannelId, thread_ts: Ts },
+}
+
+/// Routes one link activation out of a message body.
+pub type LinkHandler = Rc<dyn Fn(LinkTarget, &mut Window, &mut App)>;
+
+/// What a link does without a column handler to route it (previews, static cards):
+/// URLs open in the browser, in-app targets do nothing.
+fn open_link_default(target: LinkTarget, cx: &mut App) {
+    if let LinkTarget::Url(url) = target {
+        cx.open_url(url.as_ref());
+    }
+}
+
+/// Activate `target` through `handler`, or the default when there is none.
+pub(crate) fn route_link(
+    handler: Option<&LinkHandler>,
+    target: LinkTarget,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match handler {
+        Some(handler) => handler(target, window, cx),
+        None => open_link_default(target, cx),
+    }
+}
+
+/// Paragraph slots each text theme of one message gets inside the message's selection
+/// document order (see [`message_order`]).
+pub(crate) const THEME_ORDER_STRIDE: u64 = 4096;
+
+/// Selection document order of one message: its `ts` in milliseconds, shifted up to leave
+/// room for the paragraphs inside the message. The transcript reads top-down in
+/// chronological order, so `ts` order is reading order; the shift keeps paragraphs of
+/// adjacent messages from interleaving. See [`SelectableParagraph`].
+pub(crate) fn message_order(ts: &Ts) -> u64 {
+    /// `ts` (`secs.micros`) as milliseconds.
+    fn millis(ts: &Ts) -> Option<u64> {
+        let (secs, fraction) = ts.as_str().split_once('.')?;
+        let millis: u64 = fraction.get(..3)?.parse().ok()?;
+        secs.parse::<u64>()
+            .ok()?
+            .checked_mul(1000)?
+            .checked_add(millis)
+    }
+    millis(ts).unwrap_or(0) << 20
+}
+
 pub enum MessageListEvent {
     OpenThread {
         channel: ChannelId,
@@ -120,6 +195,16 @@ pub enum MessageListEvent {
     },
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
+    /// A link in message text was clicked: profile, channel, thread or URL (permalinks
+    /// resolved in-app by the root).
+    OpenLink(LinkTarget),
+    /// A message image (a file upload, a Block Kit image, an attachment image) was
+    /// clicked: the root opens the image viewer over `images`, at `index`.
+    OpenImage {
+        channel: ChannelId,
+        images: Arc<Vec<image_viewer::ViewerImage>>,
+        index: usize,
+    },
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
     /// "Jump to…" needs history older than the loaded window: the root pages it in until it
@@ -528,6 +613,36 @@ impl MessageList {
         }
     }
 
+    /// A message image was clicked: walk the conversation's messages into the viewer's
+    /// image list and emit it with the clicked one's index; the root opens the viewer.
+    fn open_image(&mut self, ts: &Ts, origin: &ImageOrigin, cx: &mut Context<Self>) {
+        let (images, index) = {
+            let data = self.data.read(cx);
+            let fixtures = data.fixtures.clone();
+            let mut images = Vec::new();
+            let mut index = None;
+            for message in &data.messages {
+                for entry in image_viewer::message_images(&fixtures, message) {
+                    if index.is_none() && &message.ts == ts && &entry.origin == origin {
+                        index = Some(images.len());
+                    }
+                    images.push(entry.image);
+                }
+            }
+            (images, index)
+        };
+        if let Some(index) = index {
+            cx.emit(MessageListEvent::OpenImage {
+                channel: self.channel.clone(),
+                // The viewer is main-thread-only (GPUI): the Arc only shares the list, never
+                // crosses threads.
+                #[allow(clippy::arc_with_non_send_sync)]
+                images: Arc::new(images),
+                index,
+            });
+        }
+    }
+
     /// Slack's Up arrow in an empty composer: edit the signed-in user's newest message here.
     pub fn edit_last_own(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = self.fixtures.self_user.clone();
@@ -582,6 +697,33 @@ impl MessageList {
     pub fn finish_jump(&mut self, cx: &mut Context<Self>) {
         if let Some(since) = self.pending_jump.take() {
             self.scroll_to_time(since, cx);
+        }
+    }
+
+    /// A permalink landed on `ts` (the root's [`LinkTarget::Url`] handling): scroll the
+    /// transcript onto it, asking the root for older history first when the loaded window
+    /// starts after it — the date divider's "Jump to…" machinery.
+    pub fn reveal(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        let since = ts.secs().unwrap_or(0);
+        match self
+            .data
+            .read(cx)
+            .messages
+            .iter()
+            .position(|message| &message.ts >= ts)
+        {
+            Some(ix) => {
+                self.scroller
+                    .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+            }
+            None => {
+                self.pending_jump = Some(since);
+                cx.emit(MessageListEvent::NeedHistorySince {
+                    channel: self.channel.clone(),
+                    since,
+                });
+                self.scroll_to_time(since, cx);
+            }
         }
     }
 
@@ -841,6 +983,15 @@ fn transcript_row(
 
     let author_key = author_key(message);
     let author = author_name(message, fixtures);
+    // Every link in this row's text routes out as one event; the root resolves it.
+    let links: LinkHandler = {
+        let this = this.clone();
+        Rc::new(move |target, _window, cx| {
+            this.update(cx, |_, cx| {
+                cx.emit(MessageListEvent::OpenLink(target.clone()))
+            });
+        })
+    };
 
     let mut row = v_flex().min_w_0();
     if date_break {
@@ -863,7 +1014,7 @@ fn transcript_row(
             .iter()
             .take_while(|next| membership_run(message, next))
             .count();
-        return row.child(membership_line(message, &author, others, store, cx));
+        return row.child(membership_line(message, &author, others, store, &links, cx));
     }
 
     let key = format!("msg-{}", message.ts.as_str());
@@ -872,6 +1023,13 @@ fn transcript_row(
         let ts = message.ts.clone();
         Rc::new(move |action, window, cx| {
             this.update(cx, |list, cx| list.run_action(&ts, action, window, cx));
+        })
+    };
+    let image_open: ImageClick = {
+        let this = this.clone();
+        let ts = message.ts.clone();
+        Rc::new(move |origin, _window, cx| {
+            this.update(cx, |list, cx| list.open_image(&ts, &origin, cx));
         })
     };
 
@@ -896,7 +1054,9 @@ fn transcript_row(
             cx,
         ));
     } else {
-        let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts);
+        let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts)
+            .with_links(links.clone())
+            .opening_images(image_open);
         // The root as loaded here, so an edit to it shows as in Slack; else the copy the
         // broadcast carries.
         let broadcast_root = message
@@ -905,10 +1065,19 @@ fn transcript_row(
             .filter(|_| message.subtype == Some(MessageSubtype::ThreadBroadcast))
             .map(|root| messages.iter().find(|m| m.ts == root.ts).unwrap_or(root));
         if let Some(root) = broadcast_root.filter(|_| !grouped) {
+            // Slack's broadcast reference opens the thread.
+            let (open, channel, thread_ts) =
+                (links.clone(), store.channel.clone(), root.ts.clone());
             body = body.child(
                 h_flex()
+                    .id(SharedString::from(format!(
+                        "broadcast-{}",
+                        message.ts.as_str()
+                    )))
                     .min_w_0()
                     .gap_1()
+                    .cursor_pointer()
+                    .hover(|el| el.underline())
                     .text_color(cx.theme().muted_foreground)
                     .child(div().flex_none().child("replied to a thread:"))
                     .child(
@@ -918,11 +1087,23 @@ fn transcript_row(
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(cx.theme().link)
                             .child(fixtures.preview(root)),
-                    ),
+                    )
+                    .on_click(move |_, window, cx| {
+                        open(
+                            LinkTarget::Thread {
+                                channel: channel.clone(),
+                                thread_ts: thread_ts.clone(),
+                            },
+                            window,
+                            cx,
+                        )
+                    }),
             );
         }
         body = body.child(message_body(message, &kcx, cx));
-        if let Some(files) = crate::files::attachments(fixtures, message, cx) {
+        if let Some(files) =
+            crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx)
+        {
             body = body.child(files);
         }
         body = body.children(actions::reaction_chips(
@@ -1075,16 +1256,32 @@ fn author_name(message: &Message, fixtures: &Fixtures) -> String {
 
 /// One full message card: avatar, author header, rich-text / Block Kit body and static
 /// reaction chips. Shared with the thread panel and search so every column renders messages
-/// identically.
+/// identically. Cards without a link handler stay plain (not selectable, links open as
+/// URLs).
 pub fn message_row(
     fixtures: &Fixtures,
     message: &Message,
     handler: Option<&actions::ActionHandler>,
     cx: &App,
 ) -> Div {
+    message_row_linked(fixtures, message, handler, None, cx)
+}
+
+/// [`message_row`] with its text selectable and links routed through `links` (the thread
+/// panel: its events reach the root without a transcript).
+pub fn message_row_linked(
+    fixtures: &Fixtures,
+    message: &Message,
+    handler: Option<&actions::ActionHandler>,
+    links: Option<&LinkHandler>,
+    cx: &App,
+) -> Div {
     let author_key = author_key(message);
     let author = author_name(message, fixtures);
-    let kcx = KitCx::new(fixtures, None, &message.ts);
+    let kcx = match links.cloned() {
+        Some(links) => KitCx::new(fixtures, None, &message.ts).with_links(links),
+        None => KitCx::new(fixtures, None, &message.ts),
+    };
     let mut body = v_flex()
         .flex_1()
         .min_w_0()
@@ -1099,7 +1296,7 @@ pub fn message_row(
             cx,
         ))
         .child(message_body(message, &kcx, cx));
-    if let Some(files) = crate::files::attachments(fixtures, message, cx) {
+    if let Some(files) = crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx) {
         body = body.child(files);
     }
     let key = format!("row-{}", message.ts.as_str());
@@ -1263,12 +1460,14 @@ fn membership_run(message: &Message, next: &Message) -> bool {
 
 /// Slack's compact join / leave line: a person icon in the avatar gutter, "<name> joined
 /// #channel." ("<name> and N others left #channel." for a run of `others` more) and the
-/// time, all muted.
+/// time, all muted. Like Slack, the name opens that member's profile and the channel the
+/// conversation.
 fn membership_line(
     message: &Message,
     author: &str,
     others: usize,
     store: &MessageData,
+    links: &LinkHandler,
     cx: &App,
 ) -> Div {
     let muted = cx.theme().muted_foreground;
@@ -1281,9 +1480,26 @@ fn membership_line(
         Some(MessageSubtype::ChannelLeave | MessageSubtype::GroupLeave) => "left",
         _ => "joined",
     };
+    // The clickable spans: the member who joined (or the first of a run), then the channel.
+    let member_span = |name: &str| {
+        let id = format!("member-{}", message.ts.as_str());
+        message.user.clone().map_or_else(
+            || div().child(name.to_owned()).into_any_element(),
+            |user| {
+                membership_link(id, name.to_owned(), LinkTarget::Profile(user), links)
+                    .into_any_element()
+            },
+        )
+    };
+    let channel_span = membership_link(
+        format!("channel-{}", message.ts.as_str()),
+        channel.clone(),
+        LinkTarget::Channel(store.channel.clone()),
+        links,
+    );
     h_flex()
         .items_center()
-        .gap_3()
+        .gap_1()
         .py_1()
         .text_sm()
         .text_color(muted)
@@ -1300,11 +1516,44 @@ fn membership_line(
                 ),
         )
         .child(match others {
-            0 => format!("{author} {verb} {channel}."),
-            1 => format!("{author} and 1 other {verb} {channel}."),
-            n => format!("{author} and {n} others {verb} {channel}."),
+            0 => h_flex()
+                .gap_1()
+                .child(member_span(author))
+                .child(verb)
+                .child(channel_span)
+                .child("."),
+            1 => h_flex()
+                .gap_1()
+                .child(member_span(author))
+                .child("and 1 other")
+                .child(verb)
+                .child(channel_span)
+                .child("."),
+            n => h_flex()
+                .gap_1()
+                .child(member_span(author))
+                .child(format!("and {n} others"))
+                .child(verb)
+                .child(channel_span)
+                .child("."),
         })
         .child(div().text_xs().child(format_clock(&message.ts)))
+}
+
+/// One muted, hover-underlined clickable span of a join/leave line.
+fn membership_link(
+    id: String,
+    label: String,
+    target: LinkTarget,
+    links: &LinkHandler,
+) -> Stateful<Div> {
+    let links = links.clone();
+    div()
+        .id(SharedString::from(id))
+        .cursor_pointer()
+        .hover(|el| el.underline())
+        .on_click(move |_, window, cx| links.clone()(target.clone(), window, cx))
+        .child(label)
 }
 
 /// Slack's unread marker: a danger-colored line with the "New" label at its right end.
@@ -1354,15 +1603,28 @@ struct RunTheme {
     code_bg: Hsla,
     /// Inline `code` text (Slack's orange / red, see [`crate::theme::code_foreground`]).
     code_fg: Hsla,
+    /// The window-selection highlight of selectable paragraphs.
+    selection: Hsla,
+    /// Selection document order of this theme's first paragraph; `None` renders plain,
+    /// unselectable text (previews).
+    order: Option<u64>,
+    /// Routing for this text's links; `None` falls back to [`open_link_default`].
+    links: Option<LinkHandler>,
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
-    /// within its message (GPUI keys interaction and accessibility state by the id path).
+    /// within its message (GPUI keys interaction and accessibility state by the id path)
+    /// and counts its selection document order.
     paragraphs: Cell<usize>,
     /// The message this render belongs to; text ids are also unique across messages.
     key: SharedString,
 }
 
 impl RunTheme {
-    fn from_app(cx: &App, key: SharedString) -> Self {
+    fn from_app(
+        cx: &App,
+        key: SharedString,
+        order: Option<u64>,
+        links: Option<LinkHandler>,
+    ) -> Self {
         let theme = cx.theme();
         let base_font = Font {
             family: theme.font_family.clone(),
@@ -1380,10 +1642,24 @@ impl RunTheme {
             mention_bg: theme.accent.opacity(0.25),
             code_bg: theme.secondary,
             code_fg: crate::theme::code_foreground(cx),
+            selection: gpui_kit::base::Theme::global(cx).tokens.colors.selection,
+            order,
+            links,
             base_font,
             paragraphs: Cell::new(0),
             key,
         }
+    }
+
+    /// The theme of selectable message-body text: paragraphs participate in the window
+    /// selection from document order `order` on, links route through `links`.
+    fn body(cx: &App, key: SharedString, order: u64, links: Option<LinkHandler>) -> Self {
+        Self::from_app(cx, key, Some(order), links)
+    }
+
+    /// The theme of preview text: not selectable, links open as URLs.
+    fn plain(cx: &App, key: SharedString) -> Self {
+        Self::from_app(cx, key, None, None)
     }
 
     fn run(
@@ -1448,13 +1724,13 @@ enum Segment {
     Text {
         text: String,
         runs: Vec<TextRun>,
-        links: Vec<(Range<usize>, String)>,
+        links: Vec<(Range<usize>, LinkTarget)>,
     },
     Image(ImageSource),
     /// Slack's chip for a link labelled with its own address: a link icon and the label on a
     /// tinted pill.
     Chip {
-        url: String,
+        url: SharedString,
         label: String,
     },
 }
@@ -1463,7 +1739,7 @@ enum Segment {
 struct ParagraphBuilder {
     text: String,
     runs: Vec<TextRun>,
-    links: Vec<(Range<usize>, String)>,
+    links: Vec<(Range<usize>, LinkTarget)>,
     segments: Vec<Segment>,
 }
 
@@ -1517,12 +1793,30 @@ impl ParagraphBuilder {
         };
         if label != url && address(&label) == address(&url) {
             self.flush();
-            self.segments.push(Segment::Chip { url, label });
+            self.segments.push(Segment::Chip {
+                url: url.into(),
+                label,
+            });
             return;
         }
+        let target = LinkTarget::Url(url.into());
         let start = self.text.len();
         self.push_text(&label, theme, RunFlags::default(), Some(theme.link), None);
-        self.links.push((start..self.text.len(), url));
+        self.links.push((start..self.text.len(), target));
+    }
+
+    /// An in-app mention (an @user or #channel chip): the mention look, clickable through
+    /// its range like a link.
+    fn push_mention(
+        &mut self,
+        label: &str,
+        target: LinkTarget,
+        theme: &RunTheme,
+        bg: Option<Hsla>,
+    ) {
+        let start = self.text.len();
+        self.push_text(label, theme, mention_flags(), Some(theme.link), bg);
+        self.links.push((start..self.text.len(), target));
     }
 
     fn push_image(&mut self, image: ImageSource) {
@@ -1551,6 +1845,10 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
     // theme plus its text (separate themes render separate blocks of one message).
     let paragraph = theme.paragraphs.get();
     theme.paragraphs.set(paragraph + 1);
+    // Message text participates in the window selection (one participant per paragraph,
+    // ordered with the transcript's reading order); preview text stays plain.
+    let order = theme.order.map(|base| base + paragraph as u64);
+    let routed = theme.links.clone();
     // Text wraps only inside a width-constrained block: a lone text run (most paragraphs)
     // renders in a full-width block; runs mixed with inline images shrink to wrap in the row.
     let single = segments.len() == 1;
@@ -1570,16 +1868,28 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                     trim_breaks(&mut text, &mut runs, &mut links)
                 };
                 let element = (!text.is_empty()).then(|| {
+                    if let Some(order) = order {
+                        return SelectableParagraph::new(
+                            paragraph_id(&theme.key, paragraph, n, &text),
+                            text,
+                            runs,
+                            links,
+                            order,
+                            theme,
+                        )
+                        .into_any_element();
+                    }
                     if links.is_empty() {
                         return StyledText::new(text).with_runs(runs).into_any_element();
                     }
-                    let mut hasher = DefaultHasher::new();
-                    text.hash(&mut hasher);
-                    let id = format!("text-{}-{paragraph}-{n}-{:x}", theme.key, hasher.finish());
-                    let (ranges, urls): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+                    let id = paragraph_id(&theme.key, paragraph, n, &text);
+                    let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
                     let styled = StyledText::new(text).with_runs(runs);
-                    InteractiveText::new(SharedString::from(id), styled)
-                        .on_click(ranges, move |ix, _, cx| cx.open_url(&urls[ix]))
+                    let routed = routed.clone();
+                    InteractiveText::new(id, styled)
+                        .on_click(ranges, move |ix, window, cx| {
+                            route_link(routed.as_ref(), targets[ix].clone(), window, cx)
+                        })
                         .into_any_element()
                 });
                 if single {
@@ -1601,6 +1911,8 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
             }
             Segment::Chip { url, label } => {
                 let id = format!("chip-{}-{paragraph}-{n}", theme.key);
+                let target = LinkTarget::Url(url.clone());
+                let routed = routed.clone();
                 row = row.child(
                     h_flex()
                         .id(SharedString::from(id))
@@ -1612,7 +1924,9 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                         .bg(theme.link.opacity(0.1))
                         .text_color(theme.link)
                         .cursor_pointer()
-                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .on_click(move |_, window, cx| {
+                            route_link(routed.as_ref(), target.clone(), window, cx)
+                        })
                         .child(
                             Icon::new(IconName::Link)
                                 .flex_none()
@@ -1627,12 +1941,23 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
     row
 }
 
+/// The stable element id of one rendered paragraph: its position in the message plus a hash
+/// of its text, unique within the message and across messages.
+fn paragraph_id(key: &SharedString, paragraph: usize, n: usize, text: &str) -> ElementId {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    ElementId::Name(SharedString::from(format!(
+        "text-{key}-{paragraph}-{n}-{:x}",
+        hasher.finish()
+    )))
+}
+
 /// Strip one line break from each edge of a text segment (keeping its runs and link ranges in
 /// step) and report which edges had one.
 fn trim_breaks(
     text: &mut String,
     runs: &mut Vec<TextRun>,
-    links: &mut [(Range<usize>, String)],
+    links: &mut [(Range<usize>, LinkTarget)],
 ) -> (bool, bool) {
     let trail = text.ends_with('\n');
     if trail {
@@ -1653,6 +1978,332 @@ fn trim_breaks(
     }
     runs.retain(|run| run.len > 0);
     (lead, trail)
+}
+
+// ---------------------------------------------------------------------------
+// Selectable message text (gpui-base window selection): one paragraph is one participant
+// with its own retained handle, registered in document order so drags span paragraphs and
+// messages of the transcript; copy joins the selected paragraphs with newlines. Link
+// ranges stay clickable (a press without a drag activates one) and underlines on hover.
+// ---------------------------------------------------------------------------
+
+/// One paragraph of message-body text that participates in the window text selection: a
+/// [`StyledText`] with styled runs whose link ranges stay clickable (see
+/// gpui-base's `SelectableText` for the plain-run original, and its `PlainSelectableText`
+/// test element for this registration pattern).
+struct SelectableParagraph {
+    id: ElementId,
+    text: SharedString,
+    styled: StyledText,
+    links: Vec<(Range<usize>, LinkTarget)>,
+    handler: Option<LinkHandler>,
+    document_order: u64,
+    selection: Hsla,
+    link: Hsla,
+}
+
+/// What one paragraph keeps between frames: its selection handle (and the subscription
+/// that redraws the window when a drag moves its selection), the link it hovers and the
+/// link a press started in.
+struct ParagraphState {
+    handle: TextSelectionHandle,
+    hovered_link: Rc<Cell<Option<usize>>>,
+    mouse_down: Rc<Cell<Option<usize>>>,
+    _refresh: Subscription,
+}
+
+impl SelectableParagraph {
+    fn new(
+        id: ElementId,
+        text: String,
+        runs: Vec<TextRun>,
+        links: Vec<(Range<usize>, LinkTarget)>,
+        document_order: u64,
+        theme: &RunTheme,
+    ) -> Self {
+        let text: SharedString = text.into();
+        Self {
+            styled: StyledText::new(text.clone()).with_runs(runs),
+            id,
+            text,
+            links,
+            handler: theme.links.clone(),
+            document_order,
+            selection: theme.selection,
+            link: theme.link,
+        }
+    }
+
+    /// The line-box quads a range covers: one per wrapped line between its ends (gpui-base's
+    /// own selection painting, replicated because it is private there).
+    fn span_quads(
+        start: Point<Pixels>,
+        end: Point<Pixels>,
+        bounds: Bounds<Pixels>,
+        line_height: Pixels,
+    ) -> Vec<Bounds<Pixels>> {
+        if start.y == end.y {
+            return vec![Bounds::from_corners(
+                start,
+                Point::new(end.x, end.y + line_height),
+            )];
+        }
+        let mut quads = vec![Bounds::from_corners(
+            start,
+            Point::new(bounds.right(), start.y + line_height),
+        )];
+        if end.y > start.y + line_height {
+            quads.push(Bounds::from_corners(
+                Point::new(bounds.left(), start.y + line_height),
+                Point::new(bounds.right(), end.y),
+            ));
+        }
+        quads.push(Bounds::from_corners(
+            Point::new(bounds.left(), end.y),
+            Point::new(end.x, end.y + line_height),
+        ));
+        quads
+    }
+
+    /// The selection highlight behind the text.
+    fn paint_selection(&self, layout: &TextLayout, range: Range<usize>, window: &mut Window) {
+        let (Some(start), Some(end)) = (
+            layout.position_for_index(range.start),
+            layout.position_for_index(range.end),
+        ) else {
+            return;
+        };
+        for bounds in Self::span_quads(start, end, layout.bounds(), layout.line_height()) {
+            window.paint_quad(PaintQuad {
+                bounds,
+                background: self.selection.into(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::default(),
+            });
+        }
+    }
+
+    /// Slack's hover affordance on URL links: the hovered link underlines (mentions keep
+    /// their highlight). Painted over the text, so it needs no re-layout.
+    fn paint_hover_underline(&self, layout: &TextLayout, range: Range<usize>, window: &mut Window) {
+        let (Some(start), Some(end)) = (
+            layout.position_for_index(range.start),
+            layout.position_for_index(range.end),
+        ) else {
+            return;
+        };
+        let line_height = layout.line_height();
+        for bounds in Self::span_quads(start, end, layout.bounds(), line_height) {
+            let underline = Bounds::new(
+                Point::new(bounds.origin.x, bounds.bottom() - px(4.)),
+                gpui_kit::gpui::Size::new(bounds.size.width, px(1.)),
+            );
+            window.paint_quad(PaintQuad {
+                bounds: underline,
+                background: self.link.into(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::default(),
+            });
+        }
+    }
+
+    /// The paragraph's link interactions: the pointing cursor over a link, the hover
+    /// underline (with a redraw when the hovered link changes) and the click — a press and
+    /// a release inside one link range, so a drag that selects never activates the link.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_links(
+        &self,
+        global_id: Option<&GlobalElementId>,
+        layout: &TextLayout,
+        hitbox: &Hitbox,
+        window: &mut Window,
+    ) {
+        let hovered_now = layout
+            .index_for_position(window.mouse_position())
+            .ok()
+            .and_then(|ix| self.links.iter().position(|(range, _)| range.contains(&ix)));
+        if hovered_now.is_some() {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        if let Some(ix) = hovered_now {
+            if let Some((range, LinkTarget::Url(_))) = self.links.get(ix) {
+                self.paint_hover_underline(layout, range.clone(), window);
+            }
+        }
+        let (mouse_down, hovered_link) = window.with_element_state::<ParagraphState, _>(
+            global_id.expect("SelectableParagraph must have a stable element id"),
+            |state, _| {
+                let state = state.expect("request_layout retained the paragraph state");
+                let cells = (state.mouse_down.clone(), state.hovered_link.clone());
+                (cells, state)
+            },
+        );
+        let down = {
+            let layout = layout.clone();
+            let mouse_down = mouse_down.clone();
+            let hitbox = hitbox.clone();
+            move |event: &MouseDownEvent, phase, window: &mut Window, _: &mut App| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    if let Ok(ix) = layout.index_for_position(event.position) {
+                        mouse_down.set(Some(ix));
+                    }
+                }
+            }
+        };
+        window.on_mouse_event(down);
+        let up = {
+            let (layout, links, handler) =
+                (layout.clone(), self.links.clone(), self.handler.clone());
+            let hitbox = hitbox.clone();
+            move |event: &MouseUpEvent, phase, window: &mut Window, cx: &mut App| {
+                if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+                    return;
+                }
+                let Some(down) = mouse_down.take() else {
+                    return;
+                };
+                let Ok(release) = layout.index_for_position(event.position) else {
+                    return;
+                };
+                if let Some((_, target)) = links
+                    .iter()
+                    .find(|(range, _)| range.contains(&down) && range.contains(&release))
+                {
+                    route_link(handler.as_ref(), target.clone(), window, cx);
+                }
+            }
+        };
+        window.on_mouse_event(up);
+        let r#move = {
+            let (layout, links) = (layout.clone(), self.links.clone());
+            let hitbox = hitbox.clone();
+            move |event: &MouseMoveEvent, phase, window: &mut Window, _: &mut App| {
+                if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+                    return;
+                }
+                let now = layout
+                    .index_for_position(event.position)
+                    .ok()
+                    .and_then(|ix| links.iter().position(|(range, _)| range.contains(&ix)));
+                if hovered_link.get() != now {
+                    hovered_link.set(now);
+                    window.refresh();
+                }
+            }
+        };
+        window.on_mouse_event(r#move);
+    }
+}
+
+impl gpui_kit::gpui::IntoElement for SelectableParagraph {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SelectableParagraph {
+    type RequestLayoutState = TextSelectionHandle;
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let handle = window.with_element_state(
+            global_id.expect("SelectableParagraph must have a stable element id"),
+            |retained: Option<ParagraphState>, window| {
+                let retained = retained.unwrap_or_else(|| {
+                    let handle = TextSelectionHandle::new(self.text.clone(), cx);
+                    let refresh = handle.refresh_window_on_change(window, cx);
+                    ParagraphState {
+                        handle,
+                        hovered_link: Rc::new(Cell::new(None)),
+                        mouse_down: Rc::new(Cell::new(None)),
+                        _refresh: refresh,
+                    }
+                });
+                (retained.handle.clone(), retained)
+            },
+        );
+        let (layout_id, ()) = self
+            .styled
+            .request_layout(global_id, inspector_id, window, cx);
+        (layout_id, handle)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.styled
+            .prepaint(global_id, inspector_id, bounds, &mut (), window, cx);
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        let registration = TextSelectionRegistration::new(hitbox.clone(), bounds)
+            .with_document_order(self.document_order)
+            .with_text_bounds(vec![bounds])
+            .with_rendered_element(handle, window, cx);
+        handle.register(registration, window, cx);
+        hitbox
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        handle: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let layout = self.styled.layout().clone();
+        #[cfg(test)]
+        tests::record_painted_paragraph(&self.text, &layout);
+        let projection = handle.update_runs(
+            &[
+                TextSelectionRun::new(self.text.clone(), layout.clone(), bounds)
+                    .with_document_order(self.document_order),
+            ],
+            cx,
+        );
+        for range in projection.ranges().iter().flatten().cloned() {
+            self.paint_selection(&layout, range, window);
+        }
+        self.styled.paint(
+            global_id,
+            inspector_id,
+            bounds,
+            &mut (),
+            &mut (),
+            window,
+            cx,
+        );
+        if !self.links.is_empty() {
+            self.paint_links(global_id, &layout, hitbox, window);
+        }
+    }
 }
 
 fn paragraph(
@@ -1694,11 +2345,10 @@ fn push_element(
         }
         RichTextElement::User(el) => {
             let label = format!("@{}", fixtures.mention_name(&el.user_id));
-            builder.push_text(
+            builder.push_mention(
                 &label,
+                LinkTarget::Profile(el.user_id.clone()),
                 theme,
-                mention_flags(),
-                Some(theme.link),
                 Some(theme.mention_bg),
             );
         }
@@ -1707,7 +2357,12 @@ fn push_element(
                 .conversation(&el.channel_id)
                 .map(|conversation| fixtures.conversation_label(conversation))
                 .unwrap_or_else(|| format!("#{}", el.channel_id));
-            builder.push_text(&label, theme, mention_flags(), Some(theme.link), None);
+            builder.push_mention(
+                &label,
+                LinkTarget::Channel(el.channel_id.clone()),
+                theme,
+                None,
+            );
         }
         RichTextElement::Usergroup(_) => {
             builder.push_text(
@@ -1878,6 +2533,34 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
         .trim_end_matches('\n')
         .to_owned();
     let run_len = code.len();
+    // Code blocks select like the paragraphs around them: one participant, its own order.
+    let paragraph = theme.paragraphs.get();
+    theme.paragraphs.set(paragraph + 1);
+    let order = theme.order.map(|base| base + paragraph as u64);
+    let run = theme.run(
+        RunFlags {
+            code: true,
+            ..DEFAULT_FLAGS
+        },
+        // Code blocks keep the body color; only inline code is tinted.
+        Some(theme.foreground),
+        None,
+        run_len,
+    );
+    let text = match order {
+        Some(order) => SelectableParagraph::new(
+            paragraph_id(&theme.key, paragraph, 0, &code),
+            code,
+            vec![run],
+            Vec::new(),
+            order,
+            theme,
+        )
+        .into_any_element(),
+        None => StyledText::new(code)
+            .with_runs(vec![run])
+            .into_any_element(),
+    };
     v_flex()
         .min_w_0()
         .gap_1()
@@ -1898,16 +2581,7 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
                 .bg(theme.code_bg)
                 .px_2()
                 .py_1p5()
-                .child(StyledText::new(code).with_runs(vec![theme.run(
-                    RunFlags {
-                        code: true,
-                        ..DEFAULT_FLAGS
-                    },
-                    // Code blocks keep the body color; only inline code is tinted.
-                    Some(theme.foreground),
-                    None,
-                    run_len,
-                )])),
+                .child(text),
         )
 }
 
@@ -1958,14 +2632,7 @@ fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
         column = column.children(elements);
     }
     if rendered == 0 && !message.text.is_empty() {
-        column = column.child(mrkdwn(
-            &message.text,
-            kcx.fixtures,
-            false,
-            inline_edited,
-            kcx.text_key(),
-            cx,
-        ));
+        column = column.child(mrkdwn(&message.text, kcx, false, inline_edited, cx));
     }
     if edited && !inline_edited {
         let muted = cx.theme().muted_foreground;
@@ -1984,12 +2651,15 @@ pub(crate) fn render_block(
     cx: &App,
 ) -> Vec<AnyElement> {
     match block {
-        Block::RichText(rich) => render_containers(
-            &rich.elements,
-            kcx.fixtures,
-            &RunTheme::from_app(cx, kcx.text_key().into()),
-            edited,
-        ),
+        Block::RichText(rich) => {
+            let (key, order) = kcx.text_theme();
+            render_containers(
+                &rich.elements,
+                kcx.fixtures,
+                &RunTheme::body(cx, key.into(), order, kcx.links.clone()),
+                edited,
+            )
+        }
         Block::Unknown { r#type, raw } => blockkit::block(r#type, raw, ix, kcx, cx)
             .into_iter()
             .collect(),
@@ -2000,16 +2670,11 @@ pub(crate) fn render_block(
 /// per paragraph: `*bold*`, `_italic_`, `~strike~`, `` `code` ``, `<@user>` / `<#channel>` /
 /// `<!here>` chips, `<url|label>` links and `:emoji:` (custom emoji as images). `muted`
 /// renders plain runs in the muted color (Block Kit context blocks). Unknown markup stays
-/// literal.
-pub(crate) fn mrkdwn(
-    text: &str,
-    fixtures: &Fixtures,
-    muted: bool,
-    edited: bool,
-    key: String,
-    cx: &App,
-) -> Div {
-    let mut theme = RunTheme::from_app(cx, key.into());
+/// literal. With a link handler (see [`KitCx`]) the text is selectable and its links route
+/// through it.
+pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, edited: bool, cx: &App) -> Div {
+    let (key, order) = kcx.text_theme();
+    let mut theme = RunTheme::body(cx, key.into(), order, kcx.links.clone());
     if muted {
         theme.foreground = theme.muted;
     }
@@ -2019,13 +2684,19 @@ pub(crate) fn mrkdwn(
     v_flex()
         .min_w_0()
         .children(lines.iter().enumerate().map(|(n, line)| {
-            mrkdwn_line(line, fixtures, &theme, edited && Some(n) == last_text_line)
-                .unwrap_or_else(|| div().h(px(6.)))
+            mrkdwn_line(
+                line,
+                kcx.fixtures,
+                &theme,
+                edited && Some(n) == last_text_line,
+            )
+            .unwrap_or_else(|| div().h(px(6.)))
         }))
 }
 
 /// A one-paragraph mrkdwn preview (the DM list): formatting, links and emoji as the
-/// transcript renders them, plain runs in `color`, line breaks flattened.
+/// transcript renders them, plain runs in `color`, line breaks flattened. Preview text is
+/// not selectable; links open as URLs.
 pub(crate) fn mrkdwn_preview(
     text: &str,
     fixtures: &Fixtures,
@@ -2033,7 +2704,7 @@ pub(crate) fn mrkdwn_preview(
     key: String,
     cx: &App,
 ) -> Div {
-    let mut theme = RunTheme::from_app(cx, key.into());
+    let mut theme = RunTheme::plain(cx, key.into());
     theme.foreground = color;
     mrkdwn_line(&text.replace('\n', " "), fixtures, &theme, false).unwrap_or_else(div)
 }
@@ -2132,11 +2803,10 @@ fn angle_token(
     };
     if let Some(user) = target.strip_prefix('@') {
         let name = format!("@{}", fixtures.mention_name(&UserId::from(user)));
-        builder.push_text(
+        builder.push_mention(
             &name,
+            LinkTarget::Profile(UserId::from(user)),
             theme,
-            mention_flags(),
-            Some(theme.link),
             Some(theme.mention_bg),
         );
     } else if let Some(channel) = target.strip_prefix('#') {
@@ -2148,7 +2818,12 @@ fn angle_token(
                     .map(|conversation| fixtures.conversation_label(conversation))
             })
             .unwrap_or_else(|| format!("#{channel}"));
-        builder.push_text(&name, theme, mention_flags(), Some(theme.link), None);
+        builder.push_mention(
+            &name,
+            LinkTarget::Channel(ChannelId::from(channel)),
+            theme,
+            None,
+        );
     } else if let Some(special) = target.strip_prefix('!') {
         if special.starts_with("date") {
             builder.push_text(
@@ -2509,4 +3184,261 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
         month_shift - 9
     } as u32;
     ((year + i64::from(month <= 2)) as i32, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use gpui_kit::base::TextSelection;
+    use gpui_kit::gpui::{
+        Entity, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, Window, point,
+        px,
+    };
+
+    use super::*;
+
+    // The paragraphs recent frames painted, with their layouts, so tests can find where
+    // rendered text sits (gpui-base's own tests read this off its private window state).
+    thread_local! {
+        static PAINTED: RefCell<Vec<(SharedString, TextLayout)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_painted_paragraph(text: &SharedString, layout: &TextLayout) {
+        PAINTED.with(|painted| painted.borrow_mut().push((text.clone(), layout.clone())));
+    }
+
+    /// The middle of the character at `index` of the painted `text`.
+    fn painted_position(text: &str, index: usize, window: &Window, cx: &App) -> Point<Pixels> {
+        let layout = PAINTED
+            .with(|painted| {
+                painted
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(painted, _)| painted.as_ref() == text)
+                    .map(|(_, layout)| layout.clone())
+            })
+            .unwrap_or_else(|| panic!("{text:?} was not painted"));
+        let position = layout
+            .position_for_index(index)
+            .unwrap_or_else(|| panic!("{text:?} has no character {index}"));
+        let _ = (window, cx);
+        point(position.x + px(1.), position.y + layout.line_height() / 2.)
+    }
+
+    fn selected_text(cx: &mut VisualTestContext) -> String {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            TextSelection::selected_text(window, cx)
+        })
+    }
+
+    fn press_at(
+        text: &str,
+        index: usize,
+        click_count: usize,
+        cx: &mut VisualTestContext,
+    ) -> Point<Pixels> {
+        let position = cx.update(|window, cx| painted_position(text, index, window, cx));
+        cx.simulate_event(gpui_kit::gpui::MouseDownEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count,
+            first_mouse: false,
+        });
+        position
+    }
+
+    fn drag_to(text: &str, index: usize, cx: &mut VisualTestContext) -> Point<Pixels> {
+        let position = cx.update(|window, cx| painted_position(text, index, window, cx));
+        cx.simulate_event(gpui_kit::gpui::MouseMoveEvent {
+            position,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        position
+    }
+
+    fn release_at(position: Point<Pixels>, click_count: usize, cx: &mut VisualTestContext) {
+        cx.simulate_event(gpui_kit::gpui::MouseUpEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count,
+        });
+    }
+
+    /// A transcript of one channel, mounted like the app does (the kit's root mounts the
+    /// selection layer; the harness stands in for it), recording routed links.
+    struct TranscriptHarness {
+        links: Rc<RefCell<Vec<LinkTarget>>>,
+        list: Entity<MessageList>,
+        _subscription: Subscription,
+    }
+
+    impl TranscriptHarness {
+        fn open(channel: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let fixtures = Arc::new(crate::fixtures::load());
+            let list = MessageList::new(fixtures, ChannelId::from(channel), window, cx);
+            let links = Rc::new(RefCell::new(Vec::new()));
+            let subscription = {
+                let links = links.clone();
+                cx.subscribe(&list, move |_, _, event: &MessageListEvent, _| {
+                    if let MessageListEvent::OpenLink(target) = event {
+                        links.borrow_mut().push(target.clone());
+                    }
+                })
+            };
+            Self {
+                links,
+                list,
+                _subscription: subscription,
+            }
+        }
+    }
+
+    impl Render for TranscriptHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(gpui_kit::base::TextSelectionLayer)
+                .child(self.list.clone())
+        }
+    }
+
+    /// The channel's transcript window, drawn once, then `run` with its harness and test
+    /// context (`add_window_view` lends the context only for the borrow).
+    fn with_transcript<R>(
+        channel: &str,
+        cx: &mut TestAppContext,
+        run: impl FnOnce(Entity<TranscriptHarness>, &mut VisualTestContext) -> R,
+    ) -> R {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let (harness, cx) =
+            cx.add_window_view(|window, cx| TranscriptHarness::open(channel, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        run(harness, cx)
+    }
+
+    #[test]
+    fn message_order_separates_messages_and_their_paragraphs() {
+        let first = message_order(&Ts::new("1000000.001100"));
+        let second = message_order(&Ts::new("1000000.002200"));
+        assert!(first < second);
+        // A message owns room for several blocks' worth of paragraphs.
+        assert!(first + THEME_ORDER_STRIDE * 4 < second);
+    }
+
+    #[gpui::test]
+    fn drag_selects_across_paragraphs_and_messages(cx: &mut TestAppContext) {
+        // The deploy report: a rich-text section followed by a code block, then the latency
+        // message's own paragraph.
+        let section = "Deploy of api v2.4 is green on staging: dashboard";
+        let code = "cargo deploy --service api --env staging";
+        let next =
+            "I'm seeing elevated p99 latency on /search since the deploy. Thread for details.";
+        with_transcript("C0ENG", cx, |harness, cx| {
+            // The transcript opens tail-anchored on the huge release report; scroll onto
+            // the deploy report the test drags across.
+            harness.update(cx, |harness, cx| {
+                harness
+                    .list
+                    .update(cx, |list, cx| list.jump(Jump::Beginning, cx));
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let _ = window.draw(cx);
+            });
+            assert_eq!(selected_text(cx), "");
+            assert!(!PAINTED.with(|painted| painted.borrow().is_empty()));
+
+            // Within one message: from the section into its code block.
+            press_at(section, 7, 1, cx);
+            let end = drag_to(code, code.len() - 8, cx);
+            release_at(end, 1, cx);
+            assert_eq!(
+                selected_text(cx),
+                format!("{}\n{}", &section[7..], &code[..code.len() - 8]),
+                "a drag joins the message's paragraphs with a newline"
+            );
+
+            // Across messages: from the code block into the next message's paragraph.
+            press_at(code, 6, 1, cx);
+            let end = drag_to(next, 12, cx);
+            release_at(end, 1, cx);
+            assert_eq!(
+                selected_text(cx),
+                format!("{}\n{}", &code[6..], &next[..12]),
+                "a drag spans messages in reading order"
+            );
+            drop(harness);
+        });
+    }
+
+    #[gpui::test]
+    fn double_click_selects_the_word_under_the_cursor(cx: &mut TestAppContext) {
+        let line = "Count me in.";
+        with_transcript("C0RANDOM", cx, |_, cx| {
+            let word = line.find("me").expect("the word is in the line");
+            let at = press_at(line, word + 1, 2, cx);
+            release_at(at, 2, cx);
+            assert_eq!(selected_text(cx), "me");
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_a_mention_routes_to_the_profile(cx: &mut TestAppContext) {
+        let fixtures = crate::fixtures::load();
+        let line = format!(
+            "@{} anyone up for lunch at the ramen place?",
+            fixtures.mention_name(&UserId::from("U0ME"))
+        );
+        with_transcript("C0RANDOM", cx, |harness, cx| {
+            let at = press_at(&line, 1, 1, cx);
+            release_at(at, 1, cx);
+            assert_eq!(
+                harness.update(cx, |harness, _| harness.links.borrow().clone()),
+                vec![LinkTarget::Profile(UserId::from("U0ME"))],
+                "the @mention chip opens that user's profile"
+            );
+            // The click that opened the link left no selection behind.
+            assert_eq!(selected_text(cx), "");
+        });
+    }
+
+    #[gpui::test]
+    fn a_drag_over_a_link_selects_without_activating_it(cx: &mut TestAppContext) {
+        // "dashboard" links to the grafana URL; dragging across it must select its text
+        // without routing the link.
+        let section = "Deploy of api v2.4 is green on staging: dashboard";
+        with_transcript("C0ENG", cx, |harness, cx| {
+            harness.update(cx, |harness, cx| {
+                harness
+                    .list
+                    .update(cx, |list, cx| list.jump(Jump::Beginning, cx));
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let _ = window.draw(cx);
+            });
+            press_at(section, 40, 1, cx);
+            let end = drag_to(section, section.len(), cx);
+            release_at(end, 1, cx);
+            assert_eq!(selected_text(cx), &section[40..]);
+            assert_eq!(
+                harness.update(cx, |harness, _| harness.links.borrow().clone()),
+                Vec::<LinkTarget>::new(),
+                "a drag that selects text does not open the link it crossed"
+            );
+        });
+    }
 }

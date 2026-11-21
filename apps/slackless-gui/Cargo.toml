@@ -14,3 +14,9 @@ gpui-kit = "0.10.0"
 # Nightly aarch64 ICE workaround (docs/research/gpui-kit-guide.md section 15).
 pathfinder_simd = { version = "0.5", features = ["pf-no-simd"] }
 emojis = "0.9"
+
+[dev-dependencies]
+# Headless window tests: drag selection and link clicks over rendered message text. The
+# engine's test-support only (the kit's would also resolve its optional gpui-fast backend,
+# which needs a proptest this environment's registry lacks).
+gpui = { version = "=0.3.12", package = "gpui-pre", features = ["test-support"] }

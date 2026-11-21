@@ -5,31 +5,38 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
-    App, Div, FontWeight, Hsla, ImageSource, ParentElement as _, SharedString, Styled as _, div,
-    img, px,
+    App, Div, FontWeight, Hsla, ImageSource, InteractiveElement as _, ParentElement as _,
+    SharedString, StatefulInteractiveElement as _, Styled as _, div, img, px,
 };
 use slackless_core::types::{File, Message};
 
 use crate::fixtures::Fixtures;
+use crate::image_viewer::{ImageClick, ImageOrigin};
 
 /// Largest rendered thumbnail box (px); images scale down to fit, keeping their aspect.
 const MAX_THUMB_W: f32 = 360.;
 const MAX_THUMB_H: f32 = 240.;
 const CARD_W: f32 = 340.;
 
-/// The message's attachments, or `None` when it has no files.
-pub fn attachments(fixtures: &Fixtures, message: &Message, cx: &App) -> Option<Div> {
+/// The message's attachments, or `None` when it has no files. `on_open` makes image
+/// attachments open the viewer on click (the transcript provides it; static cards do not).
+pub fn attachments(
+    fixtures: &Fixtures,
+    message: &Message,
+    on_open: Option<&ImageClick>,
+    cx: &App,
+) -> Option<Div> {
     if message.files.is_empty() {
         return None;
     }
     let mut column = v_flex().gap_2().pt_1();
-    for file in &message.files {
+    for (ix, file) in message.files.iter().enumerate() {
         let thumbnail = match fixtures.thumbnails.get(&file.id) {
             Some(image) => Some(ImageSource::Image(image.clone())),
             None => remote_thumbnail(file).map(|url| ImageSource::from(SharedString::from(url))),
         };
         column = column.child(match thumbnail {
-            Some(source) => image_attachment(file, source, cx),
+            Some(source) => image_attachment(file, ix, source, on_open, cx),
             None => file_card(file, cx),
         });
     }
@@ -51,9 +58,37 @@ fn remote_thumbnail(file: &File) -> Option<String> {
         .or_else(|| file.thumb_720.clone())
 }
 
-fn image_attachment(file: &File, image: ImageSource, cx: &App) -> Div {
+fn image_attachment(
+    file: &File,
+    ix: usize,
+    image: ImageSource,
+    on_open: Option<&ImageClick>,
+    cx: &App,
+) -> Div {
     let theme = cx.theme();
     let (w, h) = fit(file.original_w, file.original_h);
+    // Slack's `.p-file_image_thumbnail__wrapper`: an 8px-radius frame with a 1px border of
+    // the foreground at 13% and the zoom cursor; clicking opens the image viewer.
+    let openable = on_open.is_some();
+    let mut frame = div()
+        .id(SharedString::from(format!("file-open-{}", file.id)))
+        .w(px(w))
+        .h(px(h))
+        .rounded_lg()
+        .overflow_hidden()
+        .border_1()
+        .border_color(if openable {
+            theme.foreground.opacity(0.13)
+        } else {
+            theme.border
+        });
+    if let Some(on_open) = on_open {
+        let on_open = on_open.clone();
+        let origin = ImageOrigin::File(ix);
+        frame = frame
+            .cursor_pointer()
+            .on_click(move |_, window, cx| on_open(origin.clone(), window, cx));
+    }
     v_flex()
         .gap_1()
         .child(
@@ -69,16 +104,7 @@ fn image_attachment(file: &File, image: ImageSource, cx: &App) -> Div {
                         .size(px(12.)),
                 ),
         )
-        .child(
-            div()
-                .w(px(w))
-                .h(px(h))
-                .rounded_lg()
-                .overflow_hidden()
-                .border_1()
-                .border_color(theme.border)
-                .child(img(image).size_full()),
-        )
+        .child(frame.child(img(image).size_full().rounded(px(8.))))
 }
 
 fn file_card(file: &File, cx: &App) -> Div {
