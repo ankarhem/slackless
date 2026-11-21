@@ -40,6 +40,7 @@ mod image_viewer;
 mod later;
 mod lists;
 mod media;
+mod menu_bar;
 mod messages;
 mod new_message;
 mod pins;
@@ -85,6 +86,7 @@ fn main() {
         platform::current().set_icon(include_bytes!("../icon.png"));
         gpui_kit::init(cx);
         theme::init(cx);
+        menu_bar::init(cx);
 
         let live = session
             .and_then(|session| CoreBridge::start(session, cx))

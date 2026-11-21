@@ -197,9 +197,13 @@
 //! app.rs
 //!   App::new(Arc<Fixtures>, CoreBridge, &mut Window, &mut gpui::App) -> Entity<App>
 //!   actions: QuickSwitch (cmd-k), OpenPreferences (cmd-,), ShowShortcuts (cmd-/),
-//!   OpenDms (cmd-shift-k), OpenActivity (cmd-shift-a), OpenDrafts (cmd-shift-d),
-//!   OpenChannelBrowser (cmd-shift-l), SetStatus (cmd-shift-y), FocusSearch (cmd-g),
-//!   Workspace1..9 (cmd-1..9)
+//!   OpenDms (cmd-shift-k), OpenActivity (cmd-shift-m, cmd-shift-a), OpenDrafts (cmd-shift-d),
+//!   OpenChannelBrowser (cmd-shift-l), OpenDownloads (cmd-shift-j), SetStatus (cmd-shift-y),
+//!   FocusSearch (cmd-g), NavigateBack / NavigateForward (cmd-[ / cmd-]), NewMessage (cmd-n),
+//!   OpenThreads (cmd-shift-t), OpenPeople (cmd-shift-e), OpenLater, OpenFiles,
+//!   OpenOwnProfile, SwitchWorkspace(index) (cmd-1..9), NextWorkspace / PreviousWorkspace
+//!   (cmd-} / cmd-{), SignOut(index), OpenRecent(ChannelId): the menu bar's items
+//!   (menu_bar.rs), rebuilt by App::update_menus
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -251,6 +255,7 @@ use crate::huddles::{self, HuddlesEvent, HuddlesView};
 use crate::image_viewer::{ImageViewer, ViewerEvent, ViewerImage};
 use crate::later::{LaterEvent, LaterView, SaveRequest};
 use crate::lists::list_view;
+use crate::menu_bar::{self, MenuBar};
 use crate::messages::{LinkTarget, MessageList, MessageListEvent};
 use crate::new_message::{NewMessageEvent, NewMessageView};
 use crate::pins;
@@ -287,17 +292,31 @@ actions!(
         OpenDownloads,
         SetStatus,
         FocusSearch,
-        Workspace1,
-        Workspace2,
-        Workspace3,
-        Workspace4,
-        Workspace5,
-        Workspace6,
-        Workspace7,
-        Workspace8,
-        Workspace9,
+        NewMessage,
+        OpenThreads,
+        OpenLater,
+        OpenFiles,
+        OpenPeople,
+        OpenOwnProfile,
+        NextWorkspace,
+        PreviousWorkspace,
     ]
 );
+
+/// Switch to the workspace at this index (Cmd+1…9, File > Workspace).
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = slackless, no_json)]
+pub struct SwitchWorkspace(pub usize);
+
+/// Sign out of the workspace at this index (the Slackless menu's Sign Out).
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = slackless, no_json)]
+pub struct SignOut(pub usize);
+
+/// Open a recently visited conversation (the History menu).
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = slackless, no_json)]
+pub struct OpenRecent(pub ChannelId);
 
 /// How often due Later reminders are checked.
 const REMINDER_POLL: Duration = Duration::from_secs(10);
@@ -542,6 +561,8 @@ pub struct App {
     forward: Vec<ChannelId>,
     /// Recently left conversations, newest first (the history clock's "Recent" menu).
     recent: Vec<ChannelId>,
+    /// What the menu bar shows, so it is rebuilt only when that changes.
+    menu_bar: Option<MenuBar>,
     /// The user opened a conversation themselves; until then live reloads open the one most
     /// recently read in Slack.
     chosen: bool,
@@ -642,23 +663,30 @@ impl App {
                 KeyBinding::new("cmd-]", NavigateForward, None),
                 KeyBinding::new("cmd-,", OpenPreferences, None),
                 KeyBinding::new("cmd-/", ShowShortcuts, None),
+                KeyBinding::new("cmd-n", NewMessage, None),
                 KeyBinding::new("cmd-shift-k", OpenDms, None),
+                // Slack's Activity shortcut first: the menu bar shows the earliest binding.
+                // Cmd+Shift+A (Slack's All Unreads) opens Activity too, where slackless's
+                // Unreads row leads.
+                KeyBinding::new("cmd-shift-m", OpenActivity, None),
                 KeyBinding::new("cmd-shift-a", OpenActivity, None),
+                KeyBinding::new("cmd-shift-t", OpenThreads, None),
                 KeyBinding::new("cmd-shift-d", OpenDrafts, None),
+                KeyBinding::new("cmd-shift-e", OpenPeople, None),
                 KeyBinding::new("cmd-shift-j", OpenDownloads, None),
                 KeyBinding::new("cmd-shift-l", OpenChannelBrowser, None),
                 KeyBinding::new("cmd-shift-y", SetStatus, None),
                 KeyBinding::new("cmd-g", FocusSearch, None),
-                KeyBinding::new("cmd-1", Workspace1, None),
-                KeyBinding::new("cmd-2", Workspace2, None),
-                KeyBinding::new("cmd-3", Workspace3, None),
-                KeyBinding::new("cmd-4", Workspace4, None),
-                KeyBinding::new("cmd-5", Workspace5, None),
-                KeyBinding::new("cmd-6", Workspace6, None),
-                KeyBinding::new("cmd-7", Workspace7, None),
-                KeyBinding::new("cmd-8", Workspace8, None),
-                KeyBinding::new("cmd-9", Workspace9, None),
+                KeyBinding::new("cmd-}", NextWorkspace, None),
+                KeyBinding::new("cmd-{", PreviousWorkspace, None),
             ]);
+            let workspace_keys = [
+                "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
+            ];
+            cx.bind_keys(
+                (workspace_keys.into_iter().enumerate())
+                    .map(|(ix, keys)| KeyBinding::new(keys, SwitchWorkspace(ix), None)),
+            );
             let focus = cx.focus_handle();
             focus.focus(window, cx);
 
@@ -1137,6 +1165,7 @@ impl App {
                 back: Vec::new(),
                 forward: Vec::new(),
                 recent: restored_recent,
+                menu_bar: None,
                 chosen,
                 focus,
                 workspace_subscriptions,
@@ -1150,8 +1179,35 @@ impl App {
             let channel = app.channel.clone();
             app.load_history(&channel, cx);
             app.sync_composer_placeholder(cx);
+            app.update_menus(cx);
         });
         app
+    }
+
+    /// Rebuild the menu bar when its moving parts change: the workspaces (File > Workspace,
+    /// Sign Out) and the History menu's places, labelled as Slack's.
+    fn update_menus(&mut self, cx: &mut Context<Self>) {
+        /// Slack's History menu lists this many places.
+        const PLACES: usize = 15;
+        let bar = MenuBar {
+            workspaces: (self.fixtures.workspaces.iter())
+                .map(|team| team.name.clone().into())
+                .collect(),
+            recent: (self.recent_entries().into_iter().take(PLACES))
+                .map(|(id, label, icon)| {
+                    let label = match icon {
+                        IconName::Hash => format!("#{label}").into(),
+                        IconName::Lock => format!("#{label} (Private)").into(),
+                        _ => label,
+                    };
+                    (label, id)
+                })
+                .collect(),
+        };
+        if self.menu_bar.as_ref() != Some(&bar) {
+            menu_bar::set(&bar, cx);
+            self.menu_bar = Some(bar);
+        }
     }
 
     /// Put the shown workspace's Later items on its message views' saved markers.
@@ -1702,18 +1758,8 @@ impl App {
                 self.open_downloads(cx);
             }
             UserMenuEvent::SignOut => {
-                // Slack forgets the workspace's session and returns to sign-in; slackless
-                // removes the stored session (Keychain included) and quits, and the next
-                // launch runs the sign-in helper.
                 self.user_menu_open = false;
-                if let Some(team) = self.fixtures.workspaces.get(self.workspace) {
-                    if let Err(e) =
-                        slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
-                    {
-                        eprintln!("slackless: could not remove the stored session ({e})");
-                    }
-                }
-                cx.quit();
+                self.sign_out(self.workspace, cx);
             }
         }
         if !self.user_menu_open {
@@ -1721,6 +1767,20 @@ impl App {
             self.user_menu.update(cx, |menu, cx| menu.closed(cx));
         }
         self.push_self_state(cx);
+    }
+
+    /// Sign out of the workspace at `index`: Slack forgets its session and returns to sign-in;
+    /// slackless removes the stored session (Keychain included) and quits, and the next launch
+    /// runs the sign-in helper.
+    fn sign_out(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(team) = self.fixtures.workspaces.get(index) {
+            if let Err(e) =
+                slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
+            {
+                eprintln!("slackless: could not remove the stored session ({e})");
+            }
+        }
+        cx.quit();
     }
 
     /// The Preferences window in a gpui-kit dialog, optionally at `section`.
@@ -2283,6 +2343,7 @@ impl App {
         if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
             cx.background_executor().spawn(write).detach();
         }
+        self.update_menus(cx);
         self.reload_live(window, cx);
         if self.channel == channel {
             let next = self
@@ -2491,6 +2552,7 @@ impl App {
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
         cx.notify();
+        self.update_menus(cx);
     }
 
     /// Live mode: fold a core event into the views.
@@ -2703,6 +2765,8 @@ impl App {
         }
         self.sync_composer_placeholder(cx);
         self.apply_preferences(window, cx);
+        // Conversation names may have arrived: the History menu shows them.
+        self.update_menus(cx);
         cx.notify();
     }
 
@@ -3002,6 +3066,7 @@ impl App {
         self.sync_composer_placeholder(cx);
         // New thread panels / profile panes pick up Enter-to-send and the self state.
         self.apply_preferences(window, cx);
+        self.update_menus(cx);
     }
 
     /// Header label of a conversation in the shown workspace.
@@ -3703,53 +3768,38 @@ impl Render for App {
                 this.search.read(cx).focus_handle(cx).focus(window, cx);
                 this.open_search_menu(cx);
             }))
-            .on_action(cx.listener(|this, _: &NavigateBack, _, cx| this.go_back(cx)))
-            .on_action(cx.listener(|this, _: &NavigateForward, _, cx| this.go_forward(cx)))
+            // Only with somewhere to go, so the menu bar greys out Back / Forward as Slack's does.
+            .when(!self.back.is_empty(), |root| {
+                root.on_action(cx.listener(|this, _: &NavigateBack, _, cx| this.go_back(cx)))
+            })
+            .when(!self.forward.is_empty(), |root| {
+                root.on_action(cx.listener(|this, _: &NavigateForward, _, cx| this.go_forward(cx)))
+            })
+            .on_action(cx.listener(|this, switch: &SwitchWorkspace, window, cx| {
+                this.switch_workspace(switch.0, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextWorkspace, window, cx| {
+                let count = this.parked.len().max(1);
+                this.switch_workspace((this.workspace + 1) % count, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousWorkspace, window, cx| {
+                let count = this.parked.len().max(1);
+                this.switch_workspace((this.workspace + count - 1) % count, window, cx)
+            }))
             .on_action(
-                cx.listener(|this, _: &Workspace1, window, cx| {
-                    this.switch_workspace(0, window, cx)
-                }),
+                cx.listener(|this, _: &NewMessage, window, cx| this.open_compose("", window, cx)),
             )
+            .on_action(cx.listener(|this, _: &OpenThreads, _, cx| this.open_threads(cx)))
+            .on_action(cx.listener(|this, _: &OpenLater, _, cx| this.open_later(cx)))
+            .on_action(cx.listener(|this, _: &OpenFiles, _, cx| this.open_files(cx)))
+            .on_action(cx.listener(|this, _: &OpenPeople, _, cx| this.open_directory(cx)))
+            .on_action(cx.listener(|this, _: &OpenOwnProfile, _, cx| {
+                this.open_profile(this.fixtures.self_user.clone(), cx)
+            }))
             .on_action(
-                cx.listener(|this, _: &Workspace2, window, cx| {
-                    this.switch_workspace(1, window, cx)
-                }),
+                cx.listener(|this, open: &OpenRecent, _, cx| this.select(open.0.clone(), cx)),
             )
-            .on_action(
-                cx.listener(|this, _: &Workspace3, window, cx| {
-                    this.switch_workspace(2, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Workspace4, window, cx| {
-                    this.switch_workspace(3, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Workspace5, window, cx| {
-                    this.switch_workspace(4, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Workspace6, window, cx| {
-                    this.switch_workspace(5, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Workspace7, window, cx| {
-                    this.switch_workspace(6, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Workspace8, window, cx| {
-                    this.switch_workspace(7, window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &Workspace9, window, cx| {
-                    this.switch_workspace(8, window, cx)
-                }),
-            )
+            .on_action(cx.listener(|this, sign_out: &SignOut, _, cx| this.sign_out(sign_out.0, cx)))
             .relative()
             .size_full()
             .bg(chrome)
