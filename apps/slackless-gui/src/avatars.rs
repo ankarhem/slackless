@@ -85,15 +85,25 @@ fn photo_url(profile: &Profile, size: f32) -> Option<&str> {
     candidates.into_iter().find_map(|url| url.as_deref())
 }
 
+/// Slack's avatar corner radius: 22.2% of the side, between 4px and 12px (`.c-avatar`).
+pub fn avatar_radius(size: f32) -> f32 {
+    (size * 0.2222).clamp(4., 12.)
+}
+
 /// A rounded-square remote image, on the identity color of `key` while it loads.
 fn photo(url: &str, key: &str, size: f32) -> Div {
     div()
         .size(px(size))
         .flex_none()
-        .rounded(px((size / 5.).max(3.)))
+        .rounded(px(avatar_radius(size)))
         .overflow_hidden()
         .bg(theme::avatar_color(key))
-        .child(img(SharedString::from(url.to_owned())).size_full())
+        // GPUI clips square: the image rounds its own corners.
+        .child(
+            img(SharedString::from(url.to_owned()))
+                .size_full()
+                .rounded(px(avatar_radius(size))),
+        )
 }
 
 fn initials_chip(key: &str, label: &str, size: f32) -> Div {
@@ -106,7 +116,7 @@ fn initials_chip(key: &str, label: &str, size: f32) -> Div {
     let chip = div()
         .size(px(size))
         .flex_none()
-        .rounded(px((size / 5.).max(3.)))
+        .rounded(px(avatar_radius(size)))
         .flex()
         .items_center()
         .justify_center()

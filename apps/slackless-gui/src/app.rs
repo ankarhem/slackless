@@ -3959,15 +3959,14 @@ impl App {
         let success = cx.theme().success;
         let huddle_here = self.huddle_here();
 
-        // Channels: the label already carries `# name`; Slack drops the hash behind a channel
-        // icon tile and adds a lock for private channels.
+        // Channels: the label already carries `# name`, which Slack keeps beside the channel
+        // icon tile; a private channel's lock replaces the hash.
         let channel = conversation.filter(|c| {
             matches!(
                 c.kind(),
                 ConversationKind::PublicChannel | ConversationKind::PrivateChannel
             )
         });
-        // Slack's tile shows the emoji of the sidebar section holding the channel, else "#".
         let section_emoji = channel.and_then(|c| {
             self.fixtures
                 .sections
@@ -3979,21 +3978,19 @@ impl App {
                         || self.fixtures.custom_emoji(emoji).is_some()
                 })
         });
-        let channel_tile = channel.map(|_| {
-            let glyph = match section_emoji {
-                Some(emoji) => crate::emoji::emoji_element(emoji, &self.fixtures, px(16.)),
-                None => "#".into_any_element(),
-            };
+        // Slack's tile beside the name shows the emoji of the channel's sidebar section.
+        let channel_tile = section_emoji.map(|emoji| {
+            let glyph = crate::emoji::emoji_element(emoji, &self.fixtures, px(18.));
             h_flex()
                 .id("hdr-channel-tile")
-                .size(px(24.))
+                .size(px(28.))
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .rounded_md()
+                .rounded(px(8.))
                 .bg(cx.theme().secondary)
                 .text_color(muted_foreground)
-                .text_size(px(14.))
+                .text_size(px(16.))
                 .child(glyph)
         });
         let channel_lock = channel.filter(|c| c.is_private).map(|_| {
@@ -4001,7 +3998,7 @@ impl App {
                 .text_color(muted_foreground)
                 .size(px(16.))
         });
-        let header_title = if channel.is_some() {
+        let header_title = if channel.is_some_and(|c| c.is_private) {
             title.strip_prefix("# ").unwrap_or(title).to_owned()
         } else {
             title.to_owned()

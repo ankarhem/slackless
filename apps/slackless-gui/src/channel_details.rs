@@ -967,10 +967,14 @@ pub(crate) fn org_chip(team: &Team, size: f32) -> Div {
         Some(url) => div()
             .size(px(size))
             .flex_none()
-            .rounded(px((size / 5.).max(3.)))
-            .overflow_hidden()
+            .rounded(px(crate::avatars::avatar_radius(size)))
             .bg(crate::theme::avatar_color(team.id.as_str()))
-            .child(img(url).size_full()),
+            // GPUI clips square: the image rounds its own corners.
+            .child(
+                img(url)
+                    .size_full()
+                    .rounded(px(crate::avatars::avatar_radius(size))),
+            ),
         None => {
             let initial = team
                 .name

@@ -75,9 +75,10 @@ impl Render for Composer {
             });
         }
 
-        // Slack's formatting bar: a shaded band across the top of the box.
+        // Slack's formatting bar across the top of the box: a shaded band on light themes, the
+        // box's own raised surface on dark ones.
         let focused = self.input.focus_handle(cx).is_focused(window);
-        let band = cx.theme().secondary;
+        let (surface, band) = crate::theme::composer_surfaces(cx);
         let toolbar = h_flex()
             .items_center()
             .gap_0p5()
@@ -155,7 +156,7 @@ impl Render for Composer {
                     .rounded_lg()
                     .border_1()
                     .border_color(theme.input)
-                    .bg(theme.background)
+                    .bg(surface)
                     .child(toolbar)
                     .child(
                         div()

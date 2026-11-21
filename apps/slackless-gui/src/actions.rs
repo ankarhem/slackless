@@ -393,37 +393,38 @@ pub fn reaction_chips(
         return None;
     }
     let theme = cx.theme();
-    let (link, secondary, secondary_hover, muted) = (
-        theme.link,
-        theme.secondary,
-        theme.secondary_hover,
-        theme.muted_foreground,
-    );
+    let (secondary, secondary_hover, foreground) =
+        (theme.secondary, theme.secondary_hover, theme.foreground);
+    let (reacted_bg, reacted_fg, reacted_ring) = crate::theme::reacted_pill(cx);
     let mut row = h_flex().flex_wrap().items_center().gap_1().pt_1();
     for reaction in reactions {
         let mine = reaction.users.contains(&fixtures.self_user);
+        // Slack's `.c-reaction`: a 24px capsule, filled blue and bold when it includes you.
         let chip = h_flex()
             .id(SharedString::from(format!(
                 "{key}-reaction-{}",
                 reaction.name
             )))
+            .h(px(24.))
             .items_center()
             .gap_1()
-            .px_1p5()
-            .py_0p5()
-            // Slack's pill: blue-washed and outlined when it includes you, gray otherwise.
+            .px_2()
             .rounded_full()
             .text_xs()
             .when(mine, |chip| {
-                chip.border_1().border_color(link).bg(link.opacity(0.1))
+                chip.bg(reacted_bg)
+                    .font_weight(FontWeight::BOLD)
+                    .when_some(reacted_ring, |chip, ring| {
+                        chip.border_1().border_color(ring)
+                    })
             })
             .when(!mine, |chip| {
                 chip.bg(secondary).hover(|chip| chip.bg(secondary_hover))
             })
-            .child(emoji::emoji_element(&reaction.name, fixtures, px(14.)))
+            .child(emoji::emoji_element(&reaction.name, fixtures, px(16.)))
             .child(
                 div()
-                    .text_color(if mine { link } else { muted })
+                    .text_color(if mine { reacted_fg } else { foreground })
                     .child(reaction.count.to_string()),
             )
             .when_some(handler.cloned(), |chip, handler| {
