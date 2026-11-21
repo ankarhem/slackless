@@ -1,4 +1,4 @@
-//! macOS backend: dock badge via AppKit (`objc2`), secrets via the Keychain
+//! macOS backend: dock badge and app icon via AppKit (`objc2`), secrets via the Keychain
 //! (`security-framework`), deep-link schemes read from the bundle's
 //! `Info.plist`. Notifications: bundled builds leave them to GPUI's
 //! `SystemNotification` (`UNUserNotificationCenter`); unbundled dev builds,
@@ -9,14 +9,17 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use dispatch2::DispatchQueue;
+use objc2::AnyThread as _;
 use objc2::MainThreadMarker;
 use objc2::runtime::AnyObject;
-use objc2_app_kit::NSApplication;
-use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSString};
+use objc2_app_kit::{NSApplication, NSImage};
+use objc2_foundation::{NSArray, NSBundle, NSData, NSDictionary, NSString};
 use security_framework::passwords::{self, PasswordOptions};
 
 use crate::deep_link::{self, DeepLink};
-use crate::{BadgeSetter, DeepLinkHandler, Notifier, PlatformError, Result, SecretStore};
+use crate::{
+    BadgeSetter, DeepLinkHandler, IconSetter, Notifier, PlatformError, Result, SecretStore,
+};
 
 /// `errSecItemNotFound`, the documented OSStatus for a missing keychain item.
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
@@ -104,6 +107,16 @@ fn apply_dock_badge(label: Option<&NSString>) {
     let app = NSApplication::sharedApplication(mtm);
     let dock_tile = app.dockTile();
     dock_tile.setBadgeLabel(label);
+}
+
+impl IconSetter for MacPlatform {
+    fn set_icon(&self, png: &[u8]) {
+        let mtm = MainThreadMarker::new().expect("the app icon is set on the main thread");
+        let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png))
+            .expect("the app icon is a PNG AppKit can read");
+        // SAFETY: a non-nil image, set on the main thread.
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+    }
 }
 
 impl SecretStore for MacPlatform {

@@ -6,12 +6,13 @@
 //! |---|---|---|
 //! | [`Notifier`] | post a system notification | unbundled: Notification Center via `osascript`; bundled: left to GPUI's `SystemNotification` (guide §14) |
 //! | [`BadgeSetter`] | dock unread badge | `NSApplication.dockTile.setBadgeLabel` via `objc2` (GPUI has no dock-badge API) |
+//! | [`IconSetter`] | app icon | `NSApplication.setApplicationIconImage` via `objc2` |
 //! | [`SecretStore`] | named secrets | Keychain generic passwords via `security-framework` |
 //! | [`DeepLinkHandler`] | `slack://` and `https://app.slack.com/client` links | bundle `Info.plist` scheme check + the pure [`DeepLink`] parser |
 //!
 //! Other platforms get a compiling, non-OS fallback backend so the crate
-//! builds everywhere; its `SecretStore` is in-process memory, its notifier
-//! and badge setter are no-ops.
+//! builds everywhere; its `SecretStore` is in-process memory, its notifier,
+//! badge setter and icon setter are no-ops.
 //!
 //! A `StatusItem` trait (`NSStatusItem`, guide §14) is planned but not yet
 //! modeled; it will land here alongside [`BadgeSetter`].
@@ -61,6 +62,15 @@ pub trait Notifier {
 /// Calls from non-main threads are dispatched onto the main queue.
 pub trait BadgeSetter {
     fn set_badge(&self, label: Option<&str>);
+}
+
+/// Set the app's dock/taskbar icon from PNG bytes. Call it on the main thread.
+///
+/// macOS: `NSApplication.setApplicationIconImage`. Unbundled runs have no
+/// bundle icon, so this is where they get one; a bundle's icon is replaced
+/// the same way while the app runs.
+pub trait IconSetter {
+    fn set_icon(&self, png: &[u8]);
 }
 
 /// Store, load, and delete a named secret (macOS: Keychain generic password).
@@ -117,7 +127,8 @@ type Platform = fallback::FallbackPlatform;
 /// Nothing touches AppKit until a capability actually needs it, so this is
 /// safe on headless threads too.
 pub fn current()
--> impl Notifier + BadgeSetter + SecretStore + DeepLinkHandler + Send + Sync + 'static {
+-> impl Notifier + BadgeSetter + IconSetter + SecretStore + DeepLinkHandler + Send + Sync + 'static
+{
     Platform::new()
 }
 

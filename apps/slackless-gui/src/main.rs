@@ -68,6 +68,7 @@ use gpui_kit::assets::AllAssets;
 use gpui_kit::component::TitleBar;
 use gpui_kit::gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 use gpui_kit::open_window;
+use slackless_core::platform::{self, IconSetter as _};
 
 use crate::app::App;
 use crate::bridge::CoreBridge;
@@ -80,6 +81,8 @@ fn main() {
     let app = gpui_kit::application().with_assets(AllAssets);
 
     app.run(move |cx| {
+        // The Dock icon: an unbundled run has no bundle to take one from.
+        platform::current().set_icon(include_bytes!("../icon.png"));
         gpui_kit::init(cx);
         theme::init(cx);
 

@@ -1,6 +1,6 @@
 //! Non-macOS fallback backend: compiles everywhere, touches no OS API.
 //!
-//! `Notifier` and `BadgeSetter` are true no-ops until their platform ports
+//! `Notifier`, `BadgeSetter` and `IconSetter` are true no-ops until their platform ports
 //! begin. `SecretStore` keeps secrets in-process only (a `HashMap` behind a
 //! mutex) so the trait contract is exercised without a system keychain;
 //! persistence arrives with each OS backend. `DeepLinkHandler` shares the
@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::deep_link::{self, DeepLink};
-use crate::{BadgeSetter, DeepLinkHandler, Notifier, PlatformError, Result, SecretStore};
+use crate::{
+    BadgeSetter, DeepLinkHandler, IconSetter, Notifier, PlatformError, Result, SecretStore,
+};
 
 /// No-op backend for platforms without a port yet.
 pub struct FallbackPlatform {
@@ -42,6 +44,11 @@ impl Notifier for FallbackPlatform {
 impl BadgeSetter for FallbackPlatform {
     /// No-op: no taskbar badge API is wired for this platform yet.
     fn set_badge(&self, _label: Option<&str>) {}
+}
+
+impl IconSetter for FallbackPlatform {
+    /// No-op: no app icon API is wired for this platform yet.
+    fn set_icon(&self, _png: &[u8]) {}
 }
 
 impl SecretStore for FallbackPlatform {
