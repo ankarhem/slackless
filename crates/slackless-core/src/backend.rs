@@ -166,9 +166,40 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         name: String,
     ) -> impl Future<Output = api::Result<SectionCreated>> + Send;
+    /// Rename a sidebar section (`users.channelSections.set`; `name` and `emoji` must both
+    /// be resent because every omitted key is cleared).
+    fn rename_section(
+        &self,
+        section: String,
+        name: String,
+        emoji: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Delete a sidebar section (`users.channelSections.delete`).
+    fn delete_section(&self, section: String) -> impl Future<Output = api::Result<()>> + Send;
+    /// Move one channel between sections (`users.channelSections.channels.bulkUpdate`):
+    /// `insert` into a target and `remove` from a source, in one call.
+    fn move_channel(
+        &self,
+        insert: Option<(String, ChannelId)>,
+        remove: Option<(String, ChannelId)>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
     fn search(&self, query: String) -> impl Future<Output = api::Result<SearchMessages>> + Send;
     fn mark_read(&self, channel: ChannelId, ts: Ts)
     -> impl Future<Output = api::Result<()>> + Send;
+    /// Follow or unfollow a thread (`subscriptions.thread.add` / `.remove`); `last_read` is
+    /// the thread's read cursor.
+    fn set_thread_subscribed(
+        &self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        last_read: Ts,
+        subscribed: bool,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// A channel's managers (`admin.roles.entity.listAssignments`). Read-only.
+    fn channel_managers(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<Vec<UserId>>> + Send;
     /// A conversation's pinned items (`pins.list`), oldest pin first. Read-only.
     fn pins(&self, channel: ChannelId)
     -> impl Future<Output = api::Result<Vec<PinnedItem>>> + Send;
@@ -385,8 +416,53 @@ impl Backend for SlackApi {
         self.users_channel_sections_create(&name, "").await
     }
 
+    async fn rename_section(
+        &self,
+        section: String,
+        name: String,
+        emoji: String,
+    ) -> api::Result<()> {
+        self.users_channel_sections_set(&section, &name, &emoji)
+            .await
+    }
+
+    async fn delete_section(&self, section: String) -> api::Result<()> {
+        self.users_channel_sections_delete(&section).await
+    }
+
+    async fn move_channel(
+        &self,
+        insert: Option<(String, ChannelId)>,
+        remove: Option<(String, ChannelId)>,
+    ) -> api::Result<()> {
+        self.users_channel_sections_channels_bulk_update(
+            insert
+                .as_ref()
+                .map(|(section, channel)| (section.as_str(), channel.clone())),
+            remove
+                .as_ref()
+                .map(|(section, channel)| (section.as_str(), channel.clone())),
+        )
+        .await
+    }
+
     async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
         self.conversations_mark(&channel, &ts).await
+    }
+
+    async fn set_thread_subscribed(
+        &self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        last_read: Ts,
+        subscribed: bool,
+    ) -> api::Result<()> {
+        self.subscriptions_thread_set(&channel, &thread_ts, &last_read, subscribed)
+            .await
+    }
+
+    async fn channel_managers(&self, channel: ChannelId) -> api::Result<Vec<UserId>> {
+        SlackApi::channel_managers(self, &channel).await
     }
 
     async fn pins(&self, channel: ChannelId) -> api::Result<Vec<PinnedItem>> {

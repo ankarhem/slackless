@@ -656,6 +656,38 @@ impl<B: Backend> Core<B> {
             Command::MarkRead { channel, ts } => self.spawn("conversations.mark", async move {
                 Ok(backend.mark_read(channel, ts).await?)
             }),
+            Command::SetThreadSubscribed {
+                channel,
+                thread_ts,
+                last_read,
+                subscribed,
+            } => {
+                let backfill = self.backfill.clone();
+                let method = if subscribed {
+                    "subscriptions.thread.add"
+                } else {
+                    "subscriptions.thread.remove"
+                };
+                self.spawn(method, async move {
+                    backend
+                        .set_thread_subscribed(
+                            channel.clone(),
+                            thread_ts.clone(),
+                            last_read,
+                            subscribed,
+                        )
+                        .await?;
+                    // The stored root still carries the old follow flag.
+                    backfill.fetch_thread(channel, thread_ts).await
+                });
+            }
+            Command::FetchChannelManagers { channel } => {
+                self.spawn("admin.roles.entity.listAssignments", async move {
+                    let users = backend.channel_managers(channel.clone()).await?;
+                    events.emit(Event::ChannelManagers { channel, users });
+                    Ok(())
+                });
+            }
             Command::FetchThreads => {
                 self.spawn("subscriptions.thread.getView", async move {
                     let view = Box::new(backend.threads_view().await?);
@@ -685,6 +717,79 @@ impl<B: Backend> Core<B> {
             Command::CreateSection { name } => {
                 self.spawn("users.channelSections.create", async move {
                     backend.create_section(name).await?;
+                    let sections = backend.channel_sections().await?;
+                    with_store(&store, move |s| s.replace_sections(&ws, &sections)).await?;
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
+            Command::CreateSectionWithChannel { name, channel } => {
+                self.spawn("users.channelSections.create", async move {
+                    let created = backend.create_section(name).await?;
+                    let section = created.channel_section_id;
+                    // The channel may sit in another section: move, not just add.
+                    let (probe, read_ws) = (channel.clone(), ws.clone());
+                    let source = with_store(&store, move |s| {
+                        s.sections(&read_ws).map(|sections| {
+                            sections
+                                .iter()
+                                .find(|known| known.channel_ids.contains(&probe))
+                                .map(|known| known.id.clone())
+                        })
+                    })
+                    .await?;
+                    backend
+                        .move_channel(
+                            Some((section.clone(), channel.clone())),
+                            source.map(|from| (from, channel.clone())),
+                        )
+                        .await?;
+                    let sections = backend.channel_sections().await?;
+                    with_store(&store, move |s| s.replace_sections(&ws, &sections)).await?;
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
+            Command::RenameSection { section, name } => {
+                self.spawn("users.channelSections.set", async move {
+                    // `.set` clears every omitted key, so the emoji is re-read and resent.
+                    let (read_ws, target) = (ws.clone(), section.clone());
+                    let emoji = with_store(&store, move |s| {
+                        s.sections(&read_ws).map(|sections| {
+                            sections
+                                .iter()
+                                .find(|known| known.id == target)
+                                .map(|known| known.emoji.clone())
+                                .unwrap_or_default()
+                        })
+                    })
+                    .await?;
+                    backend.rename_section(section, name, emoji).await?;
+                    let sections = backend.channel_sections().await?;
+                    with_store(&store, move |s| s.replace_sections(&ws, &sections)).await?;
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
+            Command::DeleteSection { section } => {
+                self.spawn("users.channelSections.delete", async move {
+                    backend.delete_section(section).await?;
+                    let sections = backend.channel_sections().await?;
+                    with_store(&store, move |s| s.replace_sections(&ws, &sections)).await?;
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
+            Command::MoveChannel { channel, from, to } => {
+                self.spawn("users.channelSections.channels.bulkUpdate", async move {
+                    if from != to {
+                        backend
+                            .move_channel(
+                                to.map(|to| (to, channel.clone())),
+                                from.map(|from| (from, channel.clone())),
+                            )
+                            .await?;
+                    }
                     let sections = backend.channel_sections().await?;
                     with_store(&store, move |s| s.replace_sections(&ws, &sections)).await?;
                     events.emit(Event::SidebarChanged);
@@ -1209,6 +1314,10 @@ pub(crate) mod tests {
         /// Sidebar sections served by `channel_sections`; `create_section` appends here.
         sections: Vec<ChannelSection>,
         reply_calls: Vec<(Ts, Option<String>)>,
+        /// `subscriptions.thread.add` / `.remove` asks: thread, read cursor, follow.
+        subscription_calls: Vec<(Ts, Ts, bool)>,
+        /// `admin.roles.entity.listAssignments` answer: the channel's managers.
+        managers: Vec<UserId>,
         rate_limited: u32,
         fail_replies: bool,
         /// `conversations.info` answer; the default echoes the id with `is_archived` set.
@@ -1267,6 +1376,51 @@ pub(crate) mod tests {
         activity_bodies: HashMap<ChannelId, Vec<Message>>,
         /// `activity.markRead`/`markUnread` asks: (read?, entries).
         activity_marks: Vec<(bool, Vec<api::ActivityEntry>)>,
+        /// `users.channelSections.set` asks: (section id, name, emoji).
+        section_renames: Vec<(String, String, String)>,
+        /// `users.channelSections.delete` asks, in order.
+        section_deletes: Vec<String>,
+        /// `users.channelSections.channels.bulkUpdate` asks: (insert, remove).
+        section_moves: Vec<SectionMove>,
+    }
+
+    /// One `users.channelSections.channels.bulkUpdate` ask: its insert and remove sides.
+    type SectionMove = (Option<(String, ChannelId)>, Option<(String, ChannelId)>);
+
+    /// The fake's canned sections: stored order is deliberately not display order (L2
+    /// points at L1), and "Priority" already holds C1.
+    fn base_sections() -> Vec<ChannelSection> {
+        vec![
+            ChannelSection {
+                id: "L1".to_owned(),
+                name: "Channels".to_owned(),
+                kind: SectionKind::Channels,
+                emoji: String::new(),
+                next_id: None,
+                channel_ids: Vec::new(),
+            },
+            ChannelSection {
+                id: "L2".to_owned(),
+                name: "Priority".to_owned(),
+                kind: SectionKind::Standard,
+                emoji: "rocket".to_owned(),
+                next_id: Some("L1".to_owned()),
+                channel_ids: vec![ChannelId::from("C1")],
+            },
+        ]
+    }
+
+    /// The mutable section `id` in `state`, seeding the canned sections first so writes to
+    /// them stick (an empty override means "not yet written", so it falls back to base).
+    fn effective_section<'a>(state: &'a mut FakeState, id: &str) -> &'a mut ChannelSection {
+        if state.sections.is_empty() {
+            state.sections = base_sections();
+        }
+        state
+            .sections
+            .iter_mut()
+            .find(|section| section.id == id)
+            .expect("the canned sections hold the asked id")
     }
 
     impl FakeBackend {
@@ -1463,6 +1617,21 @@ pub(crate) mod tests {
             self.state.lock().unwrap().leave_calls.clone()
         }
 
+        /// `users.channelSections.set` asks so far: (section id, name, emoji).
+        pub fn section_renames(&self) -> Vec<(String, String, String)> {
+            self.state.lock().unwrap().section_renames.clone()
+        }
+
+        /// `users.channelSections.delete` asks so far.
+        pub fn section_deletes(&self) -> Vec<String> {
+            self.state.lock().unwrap().section_deletes.clone()
+        }
+
+        /// `users.channelSections.channels.bulkUpdate` asks so far: (insert, remove).
+        pub fn section_moves(&self) -> Vec<SectionMove> {
+            self.state.lock().unwrap().section_moves.clone()
+        }
+
         /// The recorded `conversations.setTopic` calls.
         pub fn topic_calls(&self) -> Vec<(ChannelId, String)> {
             self.state.lock().unwrap().topic_calls.clone()
@@ -1550,30 +1719,9 @@ pub(crate) mod tests {
         }
 
         async fn channel_sections(&self) -> api::Result<Vec<ChannelSection>> {
-            // Stored order is deliberately not display order: L2 points at L1.
-            let base = || {
-                vec![
-                    ChannelSection {
-                        id: "L1".to_owned(),
-                        name: "Channels".to_owned(),
-                        kind: SectionKind::Channels,
-                        emoji: String::new(),
-                        next_id: None,
-                        channel_ids: Vec::new(),
-                    },
-                    ChannelSection {
-                        id: "L2".to_owned(),
-                        name: "Priority".to_owned(),
-                        kind: SectionKind::Standard,
-                        emoji: "rocket".to_owned(),
-                        next_id: Some("L1".to_owned()),
-                        channel_ids: vec![ChannelId::from("C1")],
-                    },
-                ]
-            };
             let state = self.state.lock().unwrap();
             Ok(if state.sections.is_empty() {
-                base()
+                base_sections()
             } else {
                 state.sections.clone()
             })
@@ -1897,8 +2045,76 @@ pub(crate) mod tests {
             })
         }
 
+        async fn rename_section(
+            &self,
+            section: String,
+            name: String,
+            emoji: String,
+        ) -> api::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .section_renames
+                .push((section.clone(), name.clone(), emoji));
+            let target = effective_section(&mut state, &section);
+            target.name = name;
+            Ok(())
+        }
+
+        async fn delete_section(&self, section: String) -> api::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.section_deletes.push(section.clone());
+            if state.sections.is_empty() {
+                state.sections = base_sections();
+            }
+            state.sections.retain(|known| known.id != section);
+            Ok(())
+        }
+
+        async fn move_channel(
+            &self,
+            insert: Option<(String, ChannelId)>,
+            remove: Option<(String, ChannelId)>,
+        ) -> api::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.section_moves.push((insert.clone(), remove.clone()));
+            if state.sections.is_empty() {
+                state.sections = base_sections();
+            }
+            if let Some((from, channel)) = remove {
+                if let Some(source) = state.sections.iter_mut().find(|s| s.id == from) {
+                    source.channel_ids.retain(|id| *id != channel);
+                }
+            }
+            if let Some((to, channel)) = insert {
+                if let Some(target) = state.sections.iter_mut().find(|s| s.id == to) {
+                    if !target.channel_ids.contains(&channel) {
+                        target.channel_ids.push(channel);
+                    }
+                }
+            }
+            Ok(())
+        }
+
         async fn mark_read(&self, _: ChannelId, _: Ts) -> api::Result<()> {
             Err(ApiError::AuthExpired("invalid_auth".into()))
+        }
+
+        async fn set_thread_subscribed(
+            &self,
+            _: ChannelId,
+            thread_ts: Ts,
+            last_read: Ts,
+            subscribed: bool,
+        ) -> api::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state
+                .subscription_calls
+                .push((thread_ts, last_read, subscribed));
+            Ok(())
+        }
+
+        async fn channel_managers(&self, _: ChannelId) -> api::Result<Vec<UserId>> {
+            Ok(self.state.lock().unwrap().managers.clone())
         }
 
         async fn pins(&self, _: ChannelId) -> api::Result<Vec<PinnedItem>> {
@@ -2242,6 +2458,45 @@ pub(crate) mod tests {
         assert_eq!(
             fake.reply_calls(),
             vec![(Ts::from("5.0"), None), (Ts::from("5.0"), Some("2".into())),]
+        );
+    }
+
+    #[tokio::test]
+    async fn following_a_thread_tells_slack_then_rereads_the_thread() {
+        let fake = FakeBackend::default();
+        fake.push_thread("5.0", 1..=1);
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::SetThreadSubscribed {
+            channel: c1(),
+            thread_ts: Ts::from("5.0"),
+            last_read: Ts::from("5.0.1"),
+            subscribed: true,
+        });
+        // The re-read commits the thread, which is what refreshes the root's follow flag.
+        assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+        assert_eq!(
+            fake.state.lock().unwrap().subscription_calls,
+            vec![(Ts::from("5.0"), Ts::from("5.0.1"), true)]
+        );
+        assert_eq!(fake.reply_calls(), vec![(Ts::from("5.0"), None)]);
+    }
+
+    #[tokio::test]
+    async fn fetching_channel_managers_announces_them() {
+        let fake = FakeBackend::default();
+        fake.state.lock().unwrap().managers = vec![UserId::from("U9")];
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake, Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::FetchChannelManagers { channel: c1() });
+        assert_eq!(
+            next(&mut rx).await,
+            Event::ChannelManagers {
+                channel: c1(),
+                users: vec![UserId::from("U9")],
+            }
         );
     }
 
@@ -3287,5 +3542,133 @@ pub(crate) mod tests {
                 .any(|section| section.id == "LNEW" && section.name == "Quiet"),
             "the created section is back from the section re-read"
         );
+    }
+
+    #[tokio::test]
+    async fn rename_section_resends_the_stored_emoji_and_reloads() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        store
+            .lock()
+            .unwrap()
+            .replace_sections(&TeamId::from("T1"), &base_sections())
+            .unwrap();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::RenameSection {
+            section: "L2".into(),
+            name: "Roadmap".into(),
+        });
+
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        // `.set` clears every omitted key, so the stored emoji rides along with the name.
+        assert_eq!(
+            fake.section_renames(),
+            vec![("L2".to_owned(), "Roadmap".to_owned(), "rocket".to_owned())]
+        );
+        let sections = store.lock().unwrap().sections(&TeamId::from("T1")).unwrap();
+        let renamed = sections.iter().find(|section| section.id == "L2").unwrap();
+        assert_eq!(
+            (renamed.name.as_str(), renamed.emoji.as_str()),
+            ("Roadmap", "rocket")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_section_removes_it_and_reloads() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::DeleteSection {
+            section: "L2".into(),
+        });
+
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        assert_eq!(fake.section_deletes(), vec!["L2".to_owned()]);
+        let sections = store.lock().unwrap().sections(&TeamId::from("T1")).unwrap();
+        assert!(sections.iter().all(|section| section.id != "L2"));
+    }
+
+    #[tokio::test]
+    async fn move_channel_sends_the_remove_side_and_reloads() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        store
+            .lock()
+            .unwrap()
+            .replace_sections(&TeamId::from("T1"), &base_sections())
+            .unwrap();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        // Out of the custom section, back to the Channels bucket: a remove only.
+        core.handle(Command::MoveChannel {
+            channel: c1(),
+            from: Some("L2".into()),
+            to: None,
+        });
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        assert_eq!(
+            fake.section_moves(),
+            vec![(None, Some(("L2".to_owned(), c1())))]
+        );
+        let sections = store.lock().unwrap().sections(&TeamId::from("T1")).unwrap();
+        assert!(
+            sections
+                .iter()
+                .find(|section| section.id == "L2")
+                .unwrap()
+                .channel_ids
+                .is_empty(),
+            "the re-read no longer lists the channel in the section"
+        );
+
+        // Into a custom section: an insert only ("Priority" lost C1 above).
+        core.handle(Command::MoveChannel {
+            channel: c1(),
+            from: None,
+            to: Some("L2".into()),
+        });
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        assert_eq!(
+            fake.section_moves(),
+            vec![
+                (None, Some(("L2".to_owned(), c1()))),
+                (Some(("L2".to_owned(), c1())), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_section_with_channel_moves_the_channel_into_it() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        store
+            .lock()
+            .unwrap()
+            .replace_sections(&TeamId::from("T1"), &base_sections())
+            .unwrap();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::CreateSectionWithChannel {
+            name: "Quiet".into(),
+            channel: c1(),
+        });
+
+        assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+        // The channel sat in "Priority": the move carries a remove beside the insert.
+        assert_eq!(
+            fake.section_moves(),
+            vec![(
+                Some(("LNEW".to_owned(), c1())),
+                Some(("L2".to_owned(), c1()))
+            )]
+        );
+        let sections = store.lock().unwrap().sections(&TeamId::from("T1")).unwrap();
+        let fresh = sections
+            .iter()
+            .find(|section| section.id == "LNEW")
+            .unwrap();
+        assert_eq!(fresh.channel_ids, vec![c1()]);
     }
 }

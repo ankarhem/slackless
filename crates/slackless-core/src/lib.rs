@@ -126,6 +126,20 @@ pub enum Command {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Follow or unfollow a thread (`subscriptions.thread.add` / `.remove`), then read the
+    /// thread again so the stored root carries the new state. `last_read` is the thread's
+    /// read cursor.
+    SetThreadSubscribed {
+        channel: ChannelId,
+        thread_ts: Ts,
+        last_read: Ts,
+        subscribed: bool,
+    },
+    /// Read a channel's managers (`admin.roles.entity.listAssignments`) for its details
+    /// dialog; answered with [`Event::ChannelManagers`].
+    FetchChannelManagers {
+        channel: ChannelId,
+    },
     /// Open (or find) the DM with `user` (`conversations.open`), store it and announce it
     /// with [`Event::ConversationOpened`].
     OpenDm {
@@ -135,6 +149,36 @@ pub enum Command {
     /// sections and announce [`Event::SidebarChanged`].
     CreateSection {
         name: String,
+    },
+    /// Create a sidebar channel section and move `channel` into it in the same round
+    /// (Slack's row-menu "+ Create new section"): `users.channelSections.create`, then a
+    /// `users.channelSections.channels.bulkUpdate` insert into the fresh id, then the
+    /// section re-read and [`Event::SidebarChanged`].
+    CreateSectionWithChannel {
+        name: String,
+        channel: ChannelId,
+    },
+    /// Rename a sidebar section (`users.channelSections.set`). The section's emoji is
+    /// re-read from the store and resent, because the call clears every omitted key; then
+    /// the sections are re-read and [`Event::SidebarChanged`] announced.
+    RenameSection {
+        section: String,
+        name: String,
+    },
+    /// Delete a sidebar section (`users.channelSections.delete`), then re-read the sections
+    /// and announce [`Event::SidebarChanged`]. Its conversations fall back to their default
+    /// buckets.
+    DeleteSection {
+        section: String,
+    },
+    /// Move `channel` between sidebar sections (`users.channelSections.channels.bulkUpdate`,
+    /// one call carrying the insert into `to` and the remove from `from`); `None` on either
+    /// side is the unsectioned default bucket. Then the sections are re-read and
+    /// [`Event::SidebarChanged`] announced.
+    MoveChannel {
+        channel: ChannelId,
+        from: Option<String>,
+        to: Option<String>,
     },
     /// Replace `channel`'s topic (`conversations.setTopic`), merge the returned channel
     /// into the store and announce it with [`Event::Conversations`].
@@ -204,6 +248,11 @@ pub enum Event {
         num_members: Option<u32>,
         num_apps: Option<u32>,
         members: Vec<UserId>,
+    },
+    /// The managers of `channel` ([`Command::FetchChannelManagers`]).
+    ChannelManagers {
+        channel: ChannelId,
+        users: Vec<UserId>,
     },
     /// These users were added or updated in the store.
     UsersChanged(Vec<UserId>),

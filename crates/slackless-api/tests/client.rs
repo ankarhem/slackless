@@ -528,6 +528,85 @@ async fn channel_section_create_sends_name_and_emoji_key() {
 }
 
 #[tokio::test]
+async fn channel_section_set_sends_id_name_and_emoji_together() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.channelSections.set"))
+        .and(body_string_contains("channel_section_id=L2"))
+        .and(body_string_contains("name=Renamed"))
+        .and(body_string_contains("emoji=rocket"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    api.users_channel_sections_set("L2", "Renamed", "rocket")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn channel_section_delete_sends_the_section_id() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.channelSections.delete"))
+        .and(body_string_contains("channel_section_id=L2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    api.users_channel_sections_delete("L2").await.unwrap();
+}
+
+#[tokio::test]
+async fn channel_section_bulk_update_sends_json_sides_and_omits_empty_ones() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.channelSections.channels.bulkUpdate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // A move between sections: insert (target) and remove (source) in one call.
+    api.users_channel_sections_channels_bulk_update(
+        Some(("L2", ChannelId::from("C1"))),
+        Some(("L1", ChannelId::from("C1"))),
+    )
+    .await
+    .unwrap();
+    // A plain add: no remove side at all, as the observed client sends it.
+    api.users_channel_sections_channels_bulk_update(Some(("L2", ChannelId::from("C9"))), None)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    // The sides are JSON strings; compare them parsed (map key order is not part of the wire).
+    let side = |form: &[(String, String)], key: &str| -> Option<serde_json::Value> {
+        field(form, key).map(|value| serde_json::from_str(value).unwrap())
+    };
+    let move_call = form(&requests[0]);
+    assert_eq!(
+        side(&move_call, "insert").unwrap(),
+        json!([{"channel_section_id": "L2", "channel_ids": ["C1"]}])
+    );
+    assert_eq!(
+        side(&move_call, "remove").unwrap(),
+        json!([{"channel_section_id": "L1", "channel_ids": ["C1"]}])
+    );
+    let add_call = form(&requests[1]);
+    assert_eq!(
+        side(&add_call, "insert").unwrap(),
+        json!([{"channel_section_id": "L2", "channel_ids": ["C9"]}])
+    );
+    assert!(
+        field(&add_call, "remove").is_none(),
+        "an empty side is omitted, not sent as []"
+    );
+}
+
+#[tokio::test]
 async fn pins_list_posts_channel_and_parses_message_and_file_items() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))
@@ -566,6 +645,51 @@ async fn pins_list_posts_channel_and_parses_message_and_file_items() {
         pins.items[2].file.is_none(),
         "a file pin without its file stays lenient"
     );
+}
+
+#[tokio::test]
+async fn channel_managers_reads_the_manager_role_on_the_channel() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/admin.roles.entity.listAssignments"))
+        .and(body_string_contains("entity_id=C1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "role_assignments": [
+                {"role_id": "Rl0A", "users": ["U1", "U2"]},
+                {"role_id": "Rl0B", "users": ["U3"]}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let managers = api.channel_managers(&ChannelId::from("C1")).await.unwrap();
+    assert_eq!(managers, [UserId::from("U1"), UserId::from("U2")]);
+}
+
+#[tokio::test]
+async fn thread_subscription_adds_and_removes_with_the_read_cursor() {
+    let (server, api) = setup().await;
+    for endpoint in ["subscriptions.thread.add", "subscriptions.thread.remove"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/api/{endpoint}")))
+            .and(body_string_contains("channel=C1"))
+            .and(body_string_contains("thread_ts=5.0"))
+            .and(body_string_contains("last_read=7.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let (channel, thread, read) = (ChannelId::from("C1"), Ts::from("5.0"), Ts::from("7.0"));
+    api.subscriptions_thread_set(&channel, &thread, &read, true)
+        .await
+        .unwrap();
+    api.subscriptions_thread_set(&channel, &thread, &read, false)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

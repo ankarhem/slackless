@@ -35,6 +35,7 @@ pub mod method {
     pub const ACTIVITY_MARK_READ: &str = "activity.markRead";
     pub const ACTIVITY_MARK_UNREAD: &str = "activity.markUnread";
     pub const ACTIVITY_VIEWS: &str = "activity.views";
+    pub const ADMIN_ROLES_ENTITY_LIST_ASSIGNMENTS: &str = "admin.roles.entity.listAssignments";
     pub const API_FEATURES: &str = "api.features";
     pub const APPS_ACTIONS_LIST: &str = "apps.actions.list";
     pub const APPS_ACTIONS_RUN: &str = "apps.actions.run";

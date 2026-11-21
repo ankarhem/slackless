@@ -619,6 +619,24 @@ struct MemberIdsWire {
     members: Vec<UserId>,
 }
 
+/// `admin.roles.entity.listAssignments`: who holds which role on one entity.
+#[derive(Deserialize)]
+struct RoleAssignmentsWire {
+    #[serde(default)]
+    role_assignments: Vec<RoleAssignmentWire>,
+}
+
+#[derive(Deserialize)]
+struct RoleAssignmentWire {
+    role_id: String,
+    #[serde(default)]
+    users: Vec<UserId>,
+}
+
+/// Slack's channel-manager role, as its client reads it from
+/// `admin.roles.entity.listAssignments`.
+const CHANNEL_MANAGER_ROLE: &str = "Rl0A";
+
 /// `client.dms` answers one DMs-tab row per conversation: the `channel` object with the
 /// row's bare `latest` duplicated beside it.
 #[derive(Deserialize)]
@@ -1115,6 +1133,22 @@ impl SlackApi {
             .await
     }
 
+    /// A channel's managers: the users holding Slack's channel-manager role on it, from
+    /// `admin.roles.entity.listAssignments` (what Slack's channel details read). Read-only.
+    pub async fn channel_managers(&self, channel: &ChannelId) -> Result<Vec<UserId>> {
+        let params = vec![("entity_id", channel.to_string())];
+        let resp = self
+            .call::<RoleAssignmentsWire>(method::ADMIN_ROLES_ENTITY_LIST_ASSIGNMENTS, params)
+            .await?;
+        Ok(resp
+            .data
+            .role_assignments
+            .into_iter()
+            .filter(|assignment| assignment.role_id == CHANNEL_MANAGER_ROLE)
+            .flat_map(|assignment| assignment.users)
+            .collect())
+    }
+
     /// One page of `client.dms`: the DMs-tab list (IMs and MPIMs) with per-DM `is_open`,
     /// closed DMs included (docs/research/api-channels.md, `client.dms`).
     pub async fn client_dms(&self, cursor: Option<String>) -> Result<Page<Conversation>> {
@@ -1159,6 +1193,30 @@ impl SlackApi {
         let params = vec![("channel", channel.to_string()), ("ts", ts.to_string())];
         self.call::<Empty>(method::CONVERSATIONS_MARK, params)
             .await?;
+        Ok(())
+    }
+
+    /// `subscriptions.thread.add` / `subscriptions.thread.remove`: follow or unfollow a
+    /// thread, so its replies notify you and it lists under Threads. `last_read` is the
+    /// thread's read cursor, which Slack's client sends with both.
+    pub async fn subscriptions_thread_set(
+        &self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        last_read: &Ts,
+        subscribed: bool,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("thread_ts", thread_ts.to_string()),
+            ("last_read", last_read.to_string()),
+        ];
+        let method = if subscribed {
+            method::SUBSCRIPTIONS_THREAD_ADD
+        } else {
+            method::SUBSCRIPTIONS_THREAD_REMOVE
+        };
+        self.call::<Empty>(method, params).await?;
         Ok(())
     }
 
@@ -1430,6 +1488,64 @@ impl SlackApi {
             .call(method::USERS_CHANNEL_SECTIONS_CREATE, params)
             .await?
             .data)
+    }
+
+    /// `users.channelSections.set`: renames a section. Every omitted key is CLEARED, so
+    /// `name` and `emoji` must both be sent, with `emoji` read back from
+    /// `users.channelSections.list` (`users.channelSections.update` / `.rename` answer
+    /// `unknown_method`; docs/research/api-channels.md).
+    pub async fn users_channel_sections_set(
+        &self,
+        channel_section_id: &str,
+        name: &str,
+        emoji: &str,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel_section_id", channel_section_id.to_owned()),
+            ("name", name.to_owned()),
+            ("emoji", emoji.to_owned()),
+        ];
+        self.call::<Empty>(method::USERS_CHANNEL_SECTIONS_SET, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `users.channelSections.delete`: deletes a section; its conversations fall back to
+    /// their default buckets.
+    pub async fn users_channel_sections_delete(&self, channel_section_id: &str) -> Result<()> {
+        let params = vec![("channel_section_id", channel_section_id.to_owned())];
+        self.call::<Empty>(method::USERS_CHANNEL_SECTIONS_DELETE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `users.channelSections.channels.bulkUpdate`: moves channels between sections in one
+    /// form-encoded call whose `insert` / `remove` values are JSON strings shaped
+    /// `[{"channel_section_id":"L…","channel_ids":["C…"]}]` (docs/research/api-channels.md).
+    /// A channel already in a section only moves when `remove` (its source) rides along with
+    /// `insert` (its target); each side is omitted when empty, as the observed client does.
+    pub async fn users_channel_sections_channels_bulk_update(
+        &self,
+        insert: Option<(&str, ChannelId)>,
+        remove: Option<(&str, ChannelId)>,
+    ) -> Result<()> {
+        let side = |(section, channel): (&str, ChannelId)| {
+            serde_json::to_string(&serde_json::json!([{
+                "channel_section_id": section,
+                "channel_ids": [channel.as_str()],
+            }]))
+            .unwrap_or_default()
+        };
+        let mut params = Vec::new();
+        if let Some(insert) = insert {
+            params.push(("insert", side(insert)));
+        }
+        if let Some(remove) = remove {
+            params.push(("remove", side(remove)));
+        }
+        self.call::<Empty>(method::USERS_CHANNEL_SECTIONS_CHANNELS_BULK_UPDATE, params)
+            .await?;
+        Ok(())
     }
 
     /// `search.messages` with Slack's query modifier syntax (`in:`, `from:`, `before:`, ...).
