@@ -25,8 +25,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla, ImageSource,
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Window, div, img,
-    px, relative, rgb,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative, rgb,
 };
 use slackless_core::types::{Block, Message, UserId};
 
@@ -607,10 +606,9 @@ impl Render for ImageViewer {
                             .items_center()
                             .justify_center()
                             .child(
-                                img(image.source.clone())
-                                    .size_full()
-                                    .object_fit(ObjectFit::Contain)
-                                    .rounded(px(8.)),
+                                crate::media::Picture::new(image.source.clone())
+                                    .fit(ObjectFit::Contain)
+                                    .radius(px(8.)),
                             ),
                     )
                     .when(multiple, |body| {

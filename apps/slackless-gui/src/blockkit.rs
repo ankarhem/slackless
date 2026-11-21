@@ -32,7 +32,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, Div, Entity, FontWeight, Hsla, ImageSource,
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
 };
 use slackless_core::types::{Attachment, Block, ConversationKind, Message, Ts, UserId};
 
@@ -758,14 +758,14 @@ fn picture(
     let Some(source) = source else {
         return placeholder();
     };
-    let image = img(source)
-        .w(px(width))
-        .h(px(height))
-        .object_fit(ObjectFit::Contain)
-        // GPUI clips rectangularly: the img rounds itself (a rounded wrapper does not
-        // round its children).
-        .rounded(px(8.))
-        .with_fallback(placeholder);
+    let image = div().w(px(width)).h(px(height)).child(
+        crate::media::Picture::new(source)
+            .fit(ObjectFit::Contain)
+            // GPUI clips rectangularly: the picture rounds itself (a rounded wrapper does not
+            // round its children).
+            .radius(px(8.))
+            .fallback(placeholder),
+    );
     if let (Some(url), Some(on_open)) = (url, kcx.image_open.clone()) {
         if width >= OPENABLE_IMAGE {
             // Slack's `.p-file_image_thumbnail__wrapper`: 8px radius, a 1px border of the
@@ -773,6 +773,8 @@ fn picture(
             let origin = ImageOrigin::Url(url.to_owned());
             return div()
                 .id(SharedString::from(format!("img-{}", kcx.text_key())))
+                // Hug the image: a column would stretch the frame to its width.
+                .self_start()
                 .cursor_pointer()
                 .rounded_lg()
                 .overflow_hidden()
@@ -826,7 +828,12 @@ fn image_block(raw: &Json, kcx: &KitCx, cx: &App) -> Div {
                     .child(emoji::replace_shortcodes(title)),
             )
         })
-        .child(picture(raw["image_url"].as_str(), alt, 400., 172., kcx, cx))
+        // Slack shows the image at its own size (scaled into the thumbnail box), left-aligned.
+        .child({
+            let (width, height) =
+                crate::files::fit(raw["image_width"].as_i64(), raw["image_height"].as_i64());
+            picture(raw["image_url"].as_str(), alt, width, height, kcx, cx)
+        })
 }
 
 /// Legacy attachments under the message body, if any.

@@ -30,7 +30,7 @@ use gpui_kit::gpui::{
     AnyElement, AppContext as _, BoxShadow, Context, Entity, EventEmitter, Focusable as _,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
     ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Subscription,
-    UniformListScrollHandle, Window, div, img, point, px, uniform_list,
+    UniformListScrollHandle, Window, div, point, px, uniform_list,
 };
 
 use crate::blockkit::{Json, serde_json};
@@ -535,9 +535,11 @@ pub(crate) fn emoji_element(shortcode: &str, fixtures: &Fixtures, size: Pixels) 
         return div().text_size(size).child(glyph).into_any_element();
     }
     if let Some(image) = fixtures.custom_emoji(base_name(shortcode)) {
-        return img(image.source())
+        // A Picture: animated custom emoji play, as in Slack.
+        return div()
+            .flex_none()
             .size(size)
-            .rounded_sm()
+            .child(crate::media::Picture::new(image.source()).radius(px(2.)))
             .into_any_element();
     }
     div().child(format!(":{shortcode}:")).into_any_element()

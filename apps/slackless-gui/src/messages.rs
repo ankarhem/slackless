@@ -46,7 +46,7 @@ use gpui_kit::gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels, Point,
     Render, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _,
     StrikethroughStyle, StyleRefinement, Styled as _, StyledText, Subscription, TextLayout,
-    TextRun, TransformationMatrix, UnderlineStyle, WeakEntity, Window, deferred, div, img, px, rgb,
+    TextRun, TransformationMatrix, UnderlineStyle, WeakEntity, Window, deferred, div, px, rgb,
     transparent_black,
 };
 use slackless_core::types::rich_text::{
@@ -2222,7 +2222,13 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                 }
             }
             Segment::Image(image) => {
-                row = row.child(img(image).flex_none().size(px(INLINE_EMOJI)).rounded_sm());
+                // A Picture: animated custom emoji play, as in Slack.
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .size(px(INLINE_EMOJI))
+                        .child(crate::media::Picture::new(image).radius(px(2.))),
+                );
                 continue;
             }
             Segment::Chip { url, label } => {

@@ -83,6 +83,8 @@ pub struct File {
     #[serde(default, deserialize_with = "lenient_i64")]
     pub thumb_480_h: Option<i64>,
     #[serde(default)]
+    pub thumb_480_gif: Option<String>,
+    #[serde(default)]
     pub thumb_720: Option<String>,
     #[serde(default)]
     pub thumb_800: Option<String>,

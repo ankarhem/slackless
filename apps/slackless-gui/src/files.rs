@@ -6,7 +6,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
     App, Div, FontWeight, Hsla, ImageSource, InteractiveElement as _, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, img, px,
+    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use slackless_core::types::{File, Message};
 
@@ -43,7 +43,8 @@ pub fn attachments(
     Some(column)
 }
 
-/// A live image's thumbnail URL, sized for the inline preview on a 2x display.
+/// A live image's thumbnail URL, sized for the inline preview on a 2x display; for a GIF its
+/// animated rendition, which Slack plays inline.
 fn remote_thumbnail(file: &File) -> Option<String> {
     if !file
         .mimetype
@@ -52,8 +53,10 @@ fn remote_thumbnail(file: &File) -> Option<String> {
     {
         return None;
     }
-    file.thumb_480
+    file.thumb_480_gif
         .clone()
+        .or_else(|| file.thumb_360_gif.clone())
+        .or_else(|| file.thumb_480.clone())
         .or_else(|| file.thumb_360.clone())
         .or_else(|| file.thumb_720.clone())
 }
@@ -104,7 +107,7 @@ fn image_attachment(
                         .size(px(12.)),
                 ),
         )
-        .child(frame.child(img(image).size_full().rounded(px(8.))))
+        .child(frame.child(crate::media::Picture::new(image).radius(px(8.))))
 }
 
 fn file_card(file: &File, cx: &App) -> Div {
@@ -193,8 +196,9 @@ pub(crate) fn file_icon(file: &File, cx: &App) -> (IconName, Hsla) {
     }
 }
 
-/// Scale `(w, h)` into the thumbnail box, keeping the aspect ratio.
-fn fit(width: Option<i64>, height: Option<i64>) -> (f32, f32) {
+/// Scale `(w, h)` into the thumbnail box, keeping the aspect ratio; smaller images keep
+/// their size.
+pub(crate) fn fit(width: Option<i64>, height: Option<i64>) -> (f32, f32) {
     let (w, h) = match (width, height) {
         (Some(w), Some(h)) if w > 0 && h > 0 => (w as f32, h as f32),
         _ => (MAX_THUMB_W, MAX_THUMB_H),
