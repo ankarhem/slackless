@@ -30,7 +30,8 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
     FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, px,
 };
 use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
@@ -113,6 +114,10 @@ pub struct ThreadPanel {
     /// Messages saved for later (fixture mode: in memory).
     saved: HashSet<Ts>,
     composer: Entity<Composer>,
+    /// The thread body's scroll, so a linked reply can be scrolled into view.
+    scroll: ScrollHandle,
+    /// A reply permalink's message, scrolled into view once it is loaded.
+    reveal: Option<Ts>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -174,6 +179,8 @@ impl ThreadPanel {
                 unread_after: None,
                 saved: HashSet::new(),
                 composer,
+                scroll: ScrollHandle::new(),
+                reveal: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -225,6 +232,14 @@ impl ThreadPanel {
         self.reply_hint = false;
         self.editing = None;
         self.unread_after = None;
+        self.reveal = None;
+        cx.notify();
+    }
+
+    /// Scroll `ts` of the open thread into view once it is loaded, as Slack does for a
+    /// reply's permalink.
+    pub fn reveal(&mut self, ts: Ts, cx: &mut Context<Self>) {
+        self.reveal = Some(ts);
         cx.notify();
     }
 
@@ -775,26 +790,29 @@ impl Render for ThreadPanel {
                 ),
             );
 
-        let mut body = v_flex()
-            .id("thread-body")
-            .flex_1()
-            .min_h_0()
-            .gap_1()
-            .overflow_y_scroll();
+        // The body's rows; `revealed` is the index of the row a permalink asked to show.
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut revealed = None;
         match self.root.as_ref() {
             Some(root) => {
                 if self.unread_after.as_ref() == Some(&root.ts) {
-                    body = body.child(new_messages_divider(cx));
+                    rows.push(new_messages_divider(cx).into_any_element());
                 }
-                body = body.child(self.thread_message_row(root, true, false, cx));
+                if self.reveal.as_ref() == Some(&root.ts) {
+                    revealed = Some(rows.len());
+                }
+                rows.push(
+                    self.thread_message_row(root, true, false, cx)
+                        .into_any_element(),
+                );
                 // Slack's "16 replies ——" rule under the root; none before the first reply.
                 let new_count = self.unread_new_count();
                 let replies = match self.replies.len() {
                     1 => "1 reply".to_owned(),
                     n => format!("{n} replies"),
                 };
-                body = body.when(!self.replies.is_empty(), |body| {
-                    body.child(
+                if !self.replies.is_empty() {
+                    rows.push(
                         h_flex()
                             .items_center()
                             .gap_2()
@@ -810,23 +828,42 @@ impl Render for ThreadPanel {
                                         .child(format!("{new_count} new")),
                                 )
                             })
-                            .child(div().flex_1().h(px(1.)).bg(border)),
-                    )
-                });
+                            .child(div().flex_1().h(px(1.)).bg(border))
+                            .into_any_element(),
+                    );
+                }
                 let mut previous: Option<&Message> = None;
                 for message in &self.replies {
                     let divider = self.unread_after.as_ref() == Some(&message.ts);
                     if divider {
-                        body = body.child(new_messages_divider(cx));
+                        rows.push(new_messages_divider(cx).into_any_element());
                     }
                     let grouped =
                         !divider && previous.is_some_and(|prev| same_group(prev, message));
-                    body = body.child(self.thread_message_row(message, false, grouped, cx));
+                    if self.reveal.as_ref() == Some(&message.ts) {
+                        revealed = Some(rows.len());
+                    }
+                    rows.push(
+                        self.thread_message_row(message, false, grouped, cx)
+                            .into_any_element(),
+                    );
                     previous = Some(message);
                 }
             }
-            None => body = body.child(self.empty_state(cx)),
+            None => rows.push(self.empty_state(cx).into_any_element()),
         }
+        if let Some(ix) = revealed {
+            self.scroll.scroll_to_item(ix);
+            self.reveal = None;
+        }
+        let body = v_flex()
+            .id("thread-body")
+            .flex_1()
+            .min_h_0()
+            .gap_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .children(rows);
 
         let composer_area = v_flex()
             .flex_none()

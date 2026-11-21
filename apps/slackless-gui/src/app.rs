@@ -1339,8 +1339,11 @@ impl App {
                 Some(permalink) if self.fixtures.conversation(&permalink.channel).is_some() => {
                     self.select(permalink.channel.clone(), cx);
                     match permalink.thread_ts {
+                        // A reply's link opens its thread scrolled to the reply, as in Slack.
                         Some(thread_ts) => {
-                            self.open_thread(permalink.channel.clone(), thread_ts, cx)
+                            self.open_thread(permalink.channel.clone(), thread_ts, cx);
+                            self.thread
+                                .update(cx, |panel, cx| panel.reveal(permalink.ts, cx));
                         }
                         None => {
                             self.messages

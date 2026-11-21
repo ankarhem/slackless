@@ -63,6 +63,8 @@ pub struct BlockKitState {
     inputs: HashMap<String, Entity<TextareaState>>,
     /// Attachments whose long text the user expanded ("Show more"), by message and index.
     expanded: HashSet<String>,
+    /// Image blocks the user collapsed with their title's caret, by message and block.
+    collapsed: HashSet<String>,
 }
 
 /// What one message's blocks render with.
@@ -294,15 +296,16 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             .child(emoji::replace_shortcodes(text_of(&raw["text"])?))
             .into_any_element(),
         "image" => image_block(raw, kcx, cx).into_any_element(),
+        // Slack's context row: 20px images and 13px muted text, 4px apart.
         "context" => h_flex()
             .flex_wrap()
             .items_center()
-            .gap_1p5()
-            .text_xs()
+            .gap_1()
+            .text_size(px(13.))
             .text_color(theme.muted_foreground)
             .children(raw["elements"].as_array()?.iter().filter_map(|element| {
                 match element["type"].as_str()? {
-                    "image" => Some(image_element(element, kcx, 16., cx)),
+                    "image" => Some(image_element(element, kcx, 20., cx)),
                     _ => text_object(element, kcx, true, cx),
                 }
             }))
@@ -894,21 +897,58 @@ fn image_element(element: &Json, kcx: &KitCx, size: f32, cx: &App) -> AnyElement
 
 fn image_block(raw: &Json, kcx: &KitCx, cx: &App) -> Div {
     let alt = raw["alt_text"].as_str().unwrap_or_default();
+    let key = format!(
+        "{}-img-{}",
+        kcx.ts.as_str(),
+        raw["block_id"].as_str().unwrap_or_default()
+    );
+    let collapsed = kcx
+        .kit
+        .is_some_and(|kit| kit.read(cx).collapsed.contains(&key));
+    let theme = cx.theme();
+    // Slack pads an image block 4px above and below.
     v_flex()
         .gap_1()
+        .py_1()
         .when_some(text_of(&raw["title"]), |column, title| {
-            column.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(emoji::replace_shortcodes(title)),
-            )
+            // Slack's title row: the muted title and a blue caret, which collapses the image
+            // (and then points right).
+            let row = h_flex()
+                .id(SharedString::from(format!("img-title-{key}")))
+                .gap(px(6.5))
+                .items_center()
+                .text_size(px(13.))
+                .text_color(theme.muted_foreground)
+                .child(emoji::replace_shortcodes(title))
+                .child(div().text_xs().text_color(theme.link).child(if collapsed {
+                    "\u{25B8}"
+                } else {
+                    "\u{25BE}"
+                }));
+            column.child(match kcx.kit.cloned() {
+                Some(kit) => row.cursor_pointer().on_click(move |_, _, cx| {
+                    kit.update(cx, |state, cx| {
+                        if !state.collapsed.remove(&key) {
+                            state.collapsed.insert(key.clone());
+                        }
+                        cx.notify();
+                    });
+                }),
+                None => row,
+            })
         })
         // Slack shows the image at its own size (scaled into the thumbnail box), left-aligned.
-        .child({
+        .when(!collapsed, |column| {
             let (width, height) =
                 crate::files::fit(raw["image_width"].as_i64(), raw["image_height"].as_i64());
-            picture(raw["image_url"].as_str(), alt, width, height, kcx, cx)
+            column.child(picture(
+                raw["image_url"].as_str(),
+                alt,
+                width,
+                height,
+                kcx,
+                cx,
+            ))
         })
 }
 
@@ -917,8 +957,9 @@ pub fn attachments(message: &Message, kcx: &KitCx, cx: &App) -> Option<Div> {
     if message.attachments.is_empty() {
         return None;
     }
+    // Slack's cards sit about 6px under the text above them: the body's gap alone.
     Some(
-        v_flex().gap_2().pt_1().children(
+        v_flex().gap_2().children(
             message
                 .attachments
                 .iter()
@@ -995,15 +1036,18 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
         (Some(user), _) => Some(avatars::user_chip(fixtures, user, 36.)),
         (None, _) => None,
     };
-    let day =
-        attachment_secs(attachment).map(|secs| messages::list_stamp(&Ts::new(secs.to_string())));
-    // Slack names where the shared message lives: "Thread in" for a thread's root, else
-    // "Posted in", with the channel's icon and an "(archived)" mark.
-    let thread_root = attachment
-        .extra
-        .get("is_thread_root_unfurl")
-        .and_then(|value| value.as_bool())
-        == Some(true);
+    let day = attachment_secs(attachment).map(messages::short_date);
+    // Slack names where the shared message lives: "Thread in" for a thread's root, "From a
+    // thread in" for a reply, else "Posted in", with the channel's icon and an "(archived)"
+    // mark.
+    let flag = |key: &str| attachment.extra.get(key).and_then(Json::as_bool) == Some(true);
+    let place = if flag("is_thread_root_unfurl") {
+        "Thread in"
+    } else if flag("is_reply_unfurl") {
+        "From a thread in"
+    } else {
+        "Posted in"
+    };
     let posted_in = attachment
         .channel_id
         .as_ref()
@@ -1028,7 +1072,7 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
                 )))
                 .gap_1()
                 .items_center()
-                .text_sm()
+                .text_size(px(13.))
                 .text_color(muted)
                 .cursor_pointer()
                 .hover(|el| el.underline())
@@ -1040,11 +1084,7 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
                         cx,
                     )
                 })
-                .child(if thread_root {
-                    "Thread in"
-                } else {
-                    "Posted in"
-                })
+                .child(place)
                 .child(Icon::new(icon).text_color(muted).size(px(12.)))
                 .child(if conversation.is_archived {
                     format!("{name} (archived)")
@@ -1076,23 +1116,42 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
         .max_w(px(640.))
         .min_w_0()
         .p_3()
-        .gap_3()
+        .gap_2()
         .rounded_lg()
         .border_1()
         .border_color(theme.border)
+        // Slack's header: the avatar (badged for another organization's member) beside two
+        // 18px lines, name and day over where the message lives, together its height.
         .child(
-            h_flex().gap_2().items_center().children(avatar).child(
-                v_flex()
-                    .min_w_0()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_baseline()
-                            .child(div().font_weight(FontWeight::BOLD).child(name))
-                            .children(day.map(|day| div().text_xs().text_color(muted).child(day))),
+            h_flex()
+                .gap_2()
+                .items_start()
+                .children(avatar.map(|avatar| {
+                    // Slack's card badge is smaller than a message's: ~12px on the 36px
+                    // avatar, the size the helper gives a 28px one.
+                    avatars::with_external_badge(
+                        fixtures,
+                        author.as_ref(),
+                        avatar,
+                        28.,
+                        theme.background,
                     )
-                    .children(posted_in),
-            ),
+                }))
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .line_height(px(18.))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_baseline()
+                                .child(div().font_weight(FontWeight::BOLD).child(name))
+                                .children(
+                                    day.map(|day| div().text_xs().text_color(muted).child(day)),
+                                ),
+                        )
+                        .children(posted_in),
+                ),
         )
         .children(body)
 }

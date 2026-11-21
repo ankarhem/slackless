@@ -46,8 +46,8 @@ use gpui_kit::gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels, Point,
     Render, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _,
     StrikethroughStyle, StyleRefinement, Styled as _, StyledText, Subscription, TextLayout,
-    TextRun, TransformationMatrix, UnderlineStyle, WeakEntity, Window, deferred, div, px, rgb,
-    transparent_black,
+    TextRun, TransformationMatrix, UnderlineStyle, WeakEntity, Window, deferred, div, px, relative,
+    rgb, transparent_black,
 };
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList, RichTextPreformatted,
@@ -101,13 +101,6 @@ const DEFAULT_FLAGS: RunFlags = RunFlags {
 fn mention_flags() -> RunFlags {
     RunFlags {
         semibold: true,
-        ..DEFAULT_FLAGS
-    }
-}
-
-fn quote_flags() -> RunFlags {
-    RunFlags {
-        italic: true,
         ..DEFAULT_FLAGS
     }
 }
@@ -1969,11 +1962,13 @@ enum Segment {
         links: Vec<(Range<usize>, LinkTarget)>,
     },
     Image(ImageSource),
-    /// Slack's chip for a link labelled with its own address: a link icon and the label on a
-    /// tinted pill.
+    /// Slack's chip for a link labelled with its own address (a link icon) or for a link to a
+    /// message (a speech bubble): the icon and the label on a tinted pill.
     Chip {
         url: SharedString,
         label: String,
+        icon: IconName,
+        icon_size: f32,
     },
 }
 
@@ -2035,11 +2030,7 @@ impl ParagraphBuilder {
                 .to_owned()
         };
         if label != url && address(&label) == address(&url) {
-            self.flush();
-            self.segments.push(Segment::Chip {
-                url: url.into(),
-                label,
-            });
+            self.push_chip(url.into(), label, IconName::Link, 12.);
             return;
         }
         let target = LinkTarget::Url(url.into());
@@ -2082,6 +2073,16 @@ impl ParagraphBuilder {
     fn push_image(&mut self, image: ImageSource) {
         self.flush();
         self.segments.push(Segment::Image(image));
+    }
+
+    fn push_chip(&mut self, url: SharedString, label: String, icon: IconName, icon_size: f32) {
+        self.flush();
+        self.segments.push(Segment::Chip {
+            url,
+            label,
+            icon,
+            icon_size,
+        });
     }
 
     fn flush(&mut self) {
@@ -2278,15 +2279,22 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                 );
                 continue;
             }
-            Segment::Chip { url, label } => {
+            Segment::Chip {
+                url,
+                label,
+                icon,
+                icon_size,
+            } => {
                 let id = format!("chip-{}-{}-{n}", theme.key, theme.paragraphs.get());
                 let target = LinkTarget::Url(url.clone());
                 let routed = routed.clone();
                 row = row.child(
+                    // Slack's pill is 1.3em tall, inside the line.
                     h_flex()
                         .id(SharedString::from(id))
                         .min_w_0()
                         .items_center()
+                        .line_height(relative(1.3))
                         .gap_0p5()
                         .px_0p5()
                         .rounded_sm()
@@ -2297,9 +2305,9 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                             route_link(routed.as_ref(), target.clone(), window, cx)
                         })
                         .child(
-                            Icon::new(IconName::Link)
+                            Icon::new(icon)
                                 .flex_none()
-                                .size(px(12.))
+                                .size(px(icon_size))
                                 .text_color(theme.link),
                         )
                         .child(label),
@@ -2962,8 +2970,30 @@ fn push_element(
             );
         }
         RichTextElement::MessageMention(el) => {
-            let label = format!("> {}", el.text.as_deref().unwrap_or("a message"));
-            builder.push_text(&label, theme, quote_flags(), Some(theme.muted), None);
+            // Slack's chip for a link to a message: a speech bubble and "Author in #channel",
+            // opening the message (its thread, for a reply).
+            let author = el
+                .author_id
+                .as_ref()
+                .and_then(|user| fixtures.user(user))
+                .map(|user| fixtures.name_of(user).to_owned());
+            let place = fixtures
+                .conversation(&el.channel_id)
+                .and_then(|conversation| conversation.name.as_ref())
+                .map(|name| format!("#{name}"));
+            let label = match (author, place) {
+                (Some(author), Some(place)) => format!("{author} in {place}"),
+                (Some(label), None) | (None, Some(label)) => label,
+                (None, None) => el.text.clone().unwrap_or_else(|| "a message".to_owned()),
+            };
+            match &el.url {
+                Some(url) => {
+                    builder.push_chip(url.clone().into(), label, IconName::MessageCircle, 15.)
+                }
+                None => {
+                    builder.push_text(&label, theme, RunFlags::default(), Some(theme.link), None)
+                }
+            }
         }
         RichTextElement::AttachmentMention(el) => {
             builder.push_attachment(el.url.clone(), el.text.as_deref().unwrap_or(&el.url), theme);
@@ -3911,18 +3941,40 @@ fn date_label(time: &CivilTime, now: &CivilTime) -> String {
     let weekday = weekday_name(time.day_index);
     let month = MONTH_NAMES[(time.month - 1) as usize];
     let day = time.day;
-    let suffix = match (day % 10, day % 100) {
-        (_, 11..=13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
+    let suffix = ordinal_suffix(day);
     // Slack names the weekday only within the current year: "October 25th, 2022".
     if time.year == now.year {
         format!("{weekday}, {month} {day}{suffix}")
     } else {
         format!("{month} {day}{suffix}, {}", time.year)
+    }
+}
+
+/// `st`, `nd`, `rd` or `th` after `day`.
+fn ordinal_suffix(day: u32) -> &'static str {
+    match (day % 10, day % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    }
+}
+
+/// A shared message's day as Slack's card for it shows it: `Nov 18th`, plus `, 2025` outside
+/// the current year.
+pub(crate) fn short_date(secs: i64) -> String {
+    let time = CivilTime::from_unix(secs);
+    let day = format!(
+        "{} {}{}",
+        MONTHS[(time.month - 1) as usize],
+        time.day,
+        ordinal_suffix(time.day)
+    );
+    if time.year == CivilTime::now().year {
+        day
+    } else {
+        format!("{day}, {}", time.year)
     }
 }
 
