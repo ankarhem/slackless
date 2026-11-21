@@ -2554,16 +2554,11 @@ impl App {
                 if *channel == self.channel {
                     if !members.is_empty() {
                         self.open_members = Some((channel.clone(), members.clone()));
-                        // Members `users.list` leaves out - the other organizations of a Slack
-                        // Connect channel - resolve on demand, the same way unknown DM peers
-                        // do; an ordinary channel's people all sit in the directory already.
-                        if self
-                            .fixtures
-                            .conversation(channel)
-                            .is_some_and(|c| c.is_ext_shared)
-                        {
-                            self.resolve_users(members.iter().cloned());
-                        }
+                        // Members `users.list` leaves out - another organization's people
+                        // (a connect channel's, or guests invited to this one) - resolve on
+                        // demand, the same way unknown DM peers do; the members an ordinary
+                        // channel lists all sit in the directory, so nothing is asked.
+                        self.resolve_users(members.iter().cloned());
                     }
                     self.sync_connect_orgs(cx);
                     // An empty list (the fetch failed) turns the dialog's Members tab from
@@ -2826,17 +2821,17 @@ impl App {
     /// Ask the core to look up `users` the snapshot lacks: members of other organizations,
     /// whom `users.list` leaves out, so they show by name instead of id.
     fn resolve_users(&self, users: impl IntoIterator<Item = UserId>) {
-        // Dedupe before the snapshot lookups: a page names the same few people many times.
-        // One set of the known ids keeps whole member lists (a connect channel's ids) from
-        // scanning the directory per id.
-        let named: HashSet<UserId> = users.into_iter().collect();
-        let known: HashSet<&UserId> = self.fixtures.users.iter().map(|user| &user.id).collect();
-        let missing: Vec<UserId> = named
+        // Dedupe before sending: a page names the same few people many times. Which ids
+        // really need `users.info` (the store holds no full record for them yet) the core
+        // decides, so a boot-only record - a connect channel's external people, or guests -
+        // still gets its full profile asked for.
+        let named: Vec<UserId> = users
             .into_iter()
-            .filter(|user| !known.contains(&user))
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
-        if !missing.is_empty() {
-            self.bridge.send(Command::ResolveUsers(missing));
+        if !named.is_empty() {
+            self.bridge.send(Command::ResolveUsers(named));
         }
     }
 

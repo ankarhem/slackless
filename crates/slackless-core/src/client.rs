@@ -1011,6 +1011,24 @@ impl<B: Backend> Core<B> {
             Arc::clone(&self.teams_asked),
         );
         self.spawn("users.info", async move {
+            // A full record already in the store (users.list or an earlier ask) needs no
+            // call: only the store-unknown ids - another organization's people, guests -
+            // are asked for.
+            let ws_known = ws.clone();
+            let stored = with_store(&store, move |s| {
+                s.users(&ws_known).map(|users| {
+                    users
+                        .into_iter()
+                        .map(|user| user.id)
+                        .collect::<HashSet<UserId>>()
+                })
+            })
+            .await
+            .unwrap_or_default();
+            let ids: Vec<UserId> = ids.into_iter().filter(|id| !stored.contains(id)).collect();
+            if ids.is_empty() {
+                return Ok(());
+            }
             let mut users = Vec::new();
             for id in ids {
                 match backend.user_info(id).await {
@@ -3222,6 +3240,37 @@ pub(crate) mod tests {
         // Asked once per session: a repeat never reaches `users.info` again.
         core.handle(Command::ResolveUsers(vec![ext.clone()]));
         assert_eq!(fake.user_info_calls(), vec![ext]);
+    }
+
+    #[tokio::test]
+    async fn resolve_users_skips_profiles_the_store_already_has() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        // A full record already in the store (a login-time snapshot): passing its id again -
+        // a member list names everyone - asks for nothing.
+        store
+            .lock()
+            .unwrap()
+            .upsert_user(
+                &ws,
+                &User {
+                    id: UserId::from("U1"),
+                    name: "stored".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), ws, events);
+
+        let ext = UserId::from("U9");
+        core.handle(Command::ResolveUsers(vec![UserId::from("U1"), ext.clone()]));
+        assert_eq!(next(&mut rx).await, Event::UsersChanged(vec![ext.clone()]));
+        assert_eq!(
+            fake.user_info_calls(),
+            vec![ext],
+            "only the unknown id is asked"
+        );
     }
 
     #[tokio::test]

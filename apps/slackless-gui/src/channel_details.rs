@@ -1117,7 +1117,7 @@ impl MemberFilter {
     fn keeps(&self, row: &MemberRow) -> bool {
         match self {
             Self::All => true,
-            Self::External => row.team.is_some(),
+            Self::External => row.team.is_some() && !row.guest,
             Self::Managers => row.manager,
             Self::Members => !row.manager && !row.guest && row.team.is_none(),
             Self::Guests => row.guest,
@@ -1138,8 +1138,14 @@ struct FilterChoice {
 /// Guests; then, when external people are listed, the signed-in workspace and each
 /// external organization in row order. Free-standing for the test.
 fn filter_choices(fixtures: &Fixtures, rows: &[MemberRow]) -> Vec<FilterChoice> {
+    // The organization options list only non-guest externals: a guest appears under
+    // Guests alone, never under their organization or "External organizations".
     let mut externals: Vec<&TeamId> = Vec::new();
-    for team in rows.iter().filter_map(|row| row.team.as_ref()) {
+    for team in rows
+        .iter()
+        .filter(|row| !row.guest)
+        .filter_map(|row| row.team.as_ref())
+    {
         if !externals.contains(&team) {
             externals.push(team);
         }
@@ -1486,6 +1492,7 @@ mod tests {
             row(Some("T0ZETA"), false, false),
             row(Some("T0KLARNA"), false, false),
             row(Some("T0ZETA"), false, false),
+            row(Some("T0KLARNA"), false, true),
         ];
         let choices = filter_choices(&fixtures, &rows);
         let got: Vec<(&str, usize)> = choices
@@ -1495,14 +1502,14 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("All", 6),
+                ("All", 7),
                 ("External organizations", 3),
                 ("Channel Managers", 1),
                 ("Members", 1),
-                ("Guests", 1),
+                ("Guests", 2),
                 ("Acme Corp", 3),
                 ("Zeta", 2),
-                ("Klarna", 1),
+                ("Klarna", 2),
             ]
         );
         // An internal channel: neither the external choice nor the "People from" group.

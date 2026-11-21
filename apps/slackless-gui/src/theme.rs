@@ -353,9 +353,14 @@ pub fn connect_bar(cx: &App) -> Hsla {
     cx.theme().background.blend(color(0xFF_A5_00).opacity(0.13))
 }
 
-/// Slack's tint on the channel message whose thread is open beside it (#fffae0 on white).
+/// Slack's tint on the channel message whose thread is open beside it: a warm wash in
+/// light (#fffae0 on white) that barely registers in dark (#171a1e on #1a1d21, measured).
 pub fn thread_root(cx: &App) -> Hsla {
-    cx.theme().background.blend(color(0xFF_DE_30).opacity(0.15))
+    if cx.theme().mode == ThemeMode::Dark {
+        color(0x17_1A_1E)
+    } else {
+        cx.theme().background.blend(color(0xFF_DE_30).opacity(0.15))
+    }
 }
 
 /// Slack's reaction pill that includes you (`.c-reaction--reacted`) as (background, count
