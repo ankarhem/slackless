@@ -1,5 +1,5 @@
 //! The signed-in user's status, presence and Do Not Disturb: the [`StatusPicker`] dialog
-//! (emoji + text + "remove after" + suggested statuses), the [`UserMenu`] dropped from the
+//! (Slack's two steps: pick a suggestion or type, then duration + pause), the [`UserMenu`] dropped from the
 //! title-bar avatar (status, away/active, pause notifications, schedule, profile,
 //! preferences), and [`self_avatar`], the avatar with its presence / DND badge.
 //!
@@ -8,7 +8,7 @@
 //! route these through `users.profile.set`, `users.setPresence` and `dnd.setSnooze`.
 //!
 //! `StatusPicker::new(&mut Window, &mut App) -> Entity<StatusPicker>`
-//! `StatusPicker::edit(&mut self, Option<&UserStatus>, &mut Window, &mut Context<Self>)`
+//! `StatusPicker::edit(&mut self, Option<&UserStatus>, workspace: SharedString, &mut Window, &mut Context<Self>)`
 //! emits `StatusEvent::Save(Option<UserStatus>)` / `StatusEvent::Cancel`
 //! `UserMenu::new(Arc<Fixtures>, &mut App) -> Entity<UserMenu>`
 //! `UserMenu::set_state(&mut self, SelfState, schedule: String, &mut Context<Self>)`
@@ -17,13 +17,15 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Stateful,
+    App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 
@@ -105,11 +107,31 @@ pub struct UserStatus {
     pub text: String,
     /// Index into [`CLEAR_AFTER`].
     pub clear_after: usize,
+    /// Slack's "Pause notifications until status is cleared".
+    pub pause: bool,
 }
 
 impl UserStatus {
     pub fn glyph(&self) -> &'static str {
         emoji_glyph(self.emoji).unwrap_or("\u{1F4AC}")
+    }
+
+    /// When a status set now clears (Unix seconds); `None` for "Don't clear". "Today" ends
+    /// at local midnight, "This week" at the local midnight starting next Monday.
+    pub fn clears_at(&self) -> Option<i64> {
+        let now = now_secs();
+        let offset = local_offset_now();
+        let day = (now + offset).div_euclid(86_400);
+        let midnight = day * 86_400 - offset;
+        match self.clear_after {
+            1 => Some(now + 1_800),
+            2 => Some(now + 3_600),
+            3 => Some(now + 14_400),
+            4 => Some(midnight + 86_400),
+            // 1970-01-01 was a Thursday: (day + 3) % 7 counts days since Monday.
+            5 => Some(midnight + (7 - (day + 3).rem_euclid(7)) * 86_400),
+            _ => None,
+        }
     }
 }
 
@@ -121,6 +143,32 @@ pub struct SelfState {
     pub away: bool,
     /// Notifications paused until this Unix time (`dnd.setSnooze`).
     pub paused_until: Option<i64>,
+    /// Slack's focus mode is on until this Unix time (`i64::MAX`: "Don't turn off").
+    pub focus_until: Option<i64>,
+    /// The focus Duration in effect, an index into [`FOCUS_DURATIONS`].
+    pub focus_preset: usize,
+}
+
+/// Focus mode's Duration choices: label and length in seconds (`None`: "Don't turn off").
+pub const FOCUS_DURATIONS: [(&str, Option<i64>); 4] = [
+    ("30 minutes", Some(1_800)),
+    ("1 hour", Some(3_600)),
+    ("2 hours", Some(7_200)),
+    ("Don\u{2019}t turn off", None),
+];
+
+/// The Duration focus mode starts with, as Slack's does: "Don't turn off".
+pub const FOCUS_UNTIL_OFF: usize = 3;
+
+/// The status focus mode shows while no other is set: Slack's automatic "In focus mode"
+/// with the telescope.
+fn focus_status() -> UserStatus {
+    UserStatus {
+        emoji: "telescope",
+        text: "In focus mode".to_owned(),
+        clear_after: 0,
+        pause: false,
+    }
 }
 
 impl SelfState {
@@ -128,9 +176,56 @@ impl SelfState {
         self.paused_until.is_some_and(|until| until > now_secs())
     }
 
-    /// `Notifications paused until 4:30 PM`.
+    pub fn focused(&self) -> bool {
+        self.focus_until.is_some_and(|until| until > now_secs())
+    }
+
+    /// Turn focus mode on with the Duration [`FOCUS_DURATIONS`]`[preset]`, or re-time it. Like
+    /// Slack it sets the telescope's "In focus mode" status unless a status is already set.
+    pub fn start_focus(&mut self, preset: usize) {
+        let duration = FOCUS_DURATIONS[preset].1;
+        self.focus_preset = preset;
+        self.focus_until = Some(duration.map_or(i64::MAX, |secs| now_secs() + secs));
+        if self.status.is_none() {
+            self.status = Some(focus_status());
+        }
+    }
+
+    /// Turn focus mode off, clearing its automatic status (a status the user set stays).
+    pub fn end_focus(&mut self) {
+        self.focus_until = None;
+        if self.status == Some(focus_status()) {
+            self.status = None;
+        }
+    }
+
+    /// The focus card's subtitle: `Notifications paused` or `Notifications paused until 4:30 PM`.
+    pub fn focus_label(&self) -> String {
+        match self.focus_until.filter(|until| *until != i64::MAX) {
+            Some(until) => format!("Notifications paused until {}", clock(until, None)),
+            None => "Notifications paused".to_owned(),
+        }
+    }
+
+    /// Set (or with `None` clear) the custom status. A status saved with "Pause notifications
+    /// until status is cleared" pauses until it clears (indefinitely for "Don't clear"), and
+    /// replacing or clearing such a status resumes notifications.
+    pub fn set_status(&mut self, status: Option<UserStatus>) {
+        if let Some(new) = status.as_ref().filter(|status| status.pause) {
+            self.paused_until = Some(new.clears_at().unwrap_or(i64::MAX));
+        } else if self.status.as_ref().is_some_and(|old| old.pause) {
+            self.paused_until = None;
+        }
+        self.status = status;
+    }
+
+    /// `Notifications paused until 4:30 PM`, or just `Notifications paused` while paused
+    /// until a status is cleared.
     pub fn pause_label(&self) -> Option<String> {
         let until = self.paused_until.filter(|_| self.paused())?;
+        if until == i64::MAX {
+            return Some("Notifications paused".to_owned());
+        }
         let day = |secs: i64| (secs + local_offset_now()).div_euclid(86_400);
         let when = match day(until) - day(now_secs()) {
             0 => clock(until, None),
@@ -190,12 +285,19 @@ pub enum StatusEvent {
     Cancel,
 }
 
-/// The "Set a status" dialog body.
+/// The "Set a status" dialog body. Like Slack's it has two steps: an empty field over the
+/// workspace's suggestions, then (once a suggestion is picked or text typed) the status with
+/// its Duration select and the pause checkbox.
 pub struct StatusPicker {
     emoji: &'static str,
+    /// An emoji was chosen (or loaded): until then the field shows Slack's smiley outline.
+    emoji_set: bool,
     text: Entity<TextareaState>,
     has_text: bool,
     clear_after: usize,
+    pause: bool,
+    /// The workspace the suggestions are for ("For Norce").
+    workspace: SharedString,
     emoji_open: bool,
     clear_open: bool,
     _subscriptions: Vec<Subscription>,
@@ -225,9 +327,12 @@ impl StatusPicker {
             )];
             StatusPicker {
                 emoji: EMOJI_CHOICES[0],
+                emoji_set: false,
                 text,
                 has_text: false,
                 clear_after: 0,
+                pause: false,
+                workspace: SharedString::default(),
                 emoji_open: false,
                 clear_open: false,
                 _subscriptions: subscriptions,
@@ -235,19 +340,37 @@ impl StatusPicker {
         })
     }
 
-    /// Load `status` (or a blank draft) before the dialog opens.
+    /// Load `status` (or a blank draft) for `workspace` before the dialog opens.
     pub fn edit(
         &mut self,
         status: Option<&UserStatus>,
+        workspace: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (emoji, text, clear_after) = match status {
-            Some(status) => (status.emoji, status.text.clone(), status.clear_after),
-            None => (EMOJI_CHOICES[0], String::new(), 0),
+        self.workspace = workspace;
+        self.load(status, window, cx);
+    }
+
+    /// Put the caret in the status field (once the dialog is up).
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.text.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    fn load(&mut self, status: Option<&UserStatus>, window: &mut Window, cx: &mut Context<Self>) {
+        let (emoji, text, clear_after, pause) = match status {
+            Some(status) => (
+                status.emoji,
+                status.text.clone(),
+                status.clear_after,
+                status.pause,
+            ),
+            None => (EMOJI_CHOICES[0], String::new(), 0, false),
         };
         self.emoji = emoji;
+        self.emoji_set = status.is_some();
         self.clear_after = clear_after;
+        self.pause = pause;
         self.has_text = !text.is_empty();
         self.emoji_open = false;
         self.clear_open = false;
@@ -262,17 +385,19 @@ impl StatusPicker {
             emoji: self.emoji,
             text,
             clear_after: self.clear_after,
+            pause: self.pause,
         });
         cx.emit(StatusEvent::Save(status));
     }
 
     fn pick_suggestion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let (emoji, text, clear_after) = SUGGESTED[ix];
-        self.edit(
+        self.load(
             Some(&UserStatus {
                 emoji,
                 text: text.to_owned(),
                 clear_after,
+                pause: false,
             }),
             window,
             cx,
@@ -281,7 +406,8 @@ impl StatusPicker {
 }
 
 impl Render for StatusPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.text.read(cx).focus_handle(cx).is_focused(window);
         let theme = cx.theme();
         let (border, muted, hover, popover, ring, accent_fg, accent) = (
             theme.input,
@@ -292,7 +418,9 @@ impl Render for StatusPicker {
             theme.sidebar_accent_foreground,
             theme.sidebar_accent,
         );
+        let foreground = theme.foreground;
         let glyph = emoji_glyph(self.emoji).unwrap_or("\u{1F4AC}");
+        let show_glyph = self.emoji_set || self.has_text;
 
         let field = h_flex()
             .items_center()
@@ -301,7 +429,7 @@ impl Render for StatusPicker {
             .py_1()
             .rounded_md()
             .border_1()
-            .border_color(if self.has_text { ring } else { border })
+            .border_color(if focused { ring } else { border })
             .child(
                 div()
                     .id("status-emoji")
@@ -313,7 +441,14 @@ impl Render for StatusPicker {
                     .justify_center()
                     .cursor_pointer()
                     .hover(|el| el.bg(hover))
-                    .child(glyph)
+                    .when(show_glyph, |button| button.child(glyph))
+                    .when(!show_glyph, |button| {
+                        button.child(
+                            Icon::new(IconName::FaceSlightlySmiling)
+                                .text_color(muted)
+                                .size(px(18.)),
+                        )
+                    })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.emoji_open = !this.emoji_open;
                         cx.notify();
@@ -337,8 +472,12 @@ impl Render for StatusPicker {
                         .justify_center()
                         .cursor_pointer()
                         .hover(|el| el.bg(hover))
-                        .child(Icon::new(IconName::X).text_color(muted).size(px(14.)))
-                        .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx))),
+                        .child(
+                            Icon::new(IconName::CircleX)
+                                .text_color(foreground)
+                                .size(px(16.)),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| this.load(None, window, cx))),
                 )
             });
 
@@ -366,6 +505,7 @@ impl Render for StatusPicker {
                         .child(emoji_glyph(code).unwrap_or("?"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.emoji = code;
+                            this.emoji_set = true;
                             this.emoji_open = false;
                             cx.notify();
                         }))
@@ -381,7 +521,7 @@ impl Render for StatusPicker {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(muted)
                         .pb_1()
-                        .child("For Acme Corp"),
+                        .child(format!("For {}", self.workspace)),
                 )
                 .children(
                     SUGGESTED
@@ -403,7 +543,7 @@ impl Render for StatusPicker {
                                 .child(
                                     div()
                                         .text_color(muted)
-                                        .child(format!("\u{2013} {}", CLEAR_AFTER[*clear])),
+                                        .child(format!("\u{2014} {}", CLEAR_AFTER[*clear])),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.pick_suggestion(ix, window, cx)
@@ -412,18 +552,30 @@ impl Render for StatusPicker {
                 )
         });
 
+        // Step two: once there is a status, its Duration and the pause checkbox.
+        let this = cx.entity().downgrade();
+        let pause = Checkbox::new("status-pause")
+            .label("Pause notifications until status is cleared")
+            .checked(self.pause)
+            .on_click(move |checked, _, cx| {
+                this.update(cx, |picker, cx| {
+                    picker.pause = *checked;
+                    cx.notify();
+                })
+                .ok();
+            });
         let clear_select = v_flex()
-            .gap_1()
+            .gap_1p5()
             .child(
                 div()
                     .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Remove status after\u{2026}"),
+                    .font_weight(FontWeight::BOLD)
+                    .child("Duration"),
             )
             .child(
                 h_flex()
                     .id("status-clear-after")
-                    .w(px(240.))
+                    .w_full()
                     .items_center()
                     .justify_between()
                     .px_3()
@@ -447,7 +599,7 @@ impl Render for StatusPicker {
             .when(self.clear_open, |col| {
                 col.child(
                     v_flex()
-                        .w(px(240.))
+                        .w_full()
                         .p_1()
                         .rounded_md()
                         .border_1()
@@ -480,7 +632,7 @@ impl Render for StatusPicker {
             .pt_2()
             .child(
                 Button::new("status-cancel")
-                    .ghost()
+                    .outline()
                     .label("Cancel")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(StatusEvent::Cancel))),
             )
@@ -488,8 +640,12 @@ impl Render for StatusPicker {
                 Button::new("status-save")
                     .primary()
                     .label("Save")
+                    .disabled(!self.has_text)
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             );
+        let details = self
+            .has_text
+            .then(|| v_flex().gap_4().child(clear_select).child(pause));
 
         v_flex()
             .w_full()
@@ -497,7 +653,7 @@ impl Render for StatusPicker {
             .child(field)
             .children(emoji_grid)
             .children(suggestions)
-            .child(clear_select)
+            .children(details)
             .child(footer)
     }
 }
@@ -633,7 +789,11 @@ impl Render for UserMenu {
                     ),
                 None => row
                     .text_color(muted)
-                    .child("\u{1F4AC}")
+                    .child(
+                        Icon::new(IconName::FaceSlightlySmiling)
+                            .text_color(muted)
+                            .size(px(16.)),
+                    )
                     .child("Update your status"),
             })
             .on_click(cx.listener(|_, _, _, cx| cx.emit(UserMenuEvent::EditStatus)));

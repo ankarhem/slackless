@@ -39,6 +39,15 @@ struct UiFont(usize);
 
 impl Global for UiFont {}
 
+/// Focus mode is on: the theme is drained to grayscale, badges included.
+struct Focus(bool);
+
+impl Global for Focus {}
+
+fn focused(cx: &App) -> bool {
+    cx.try_global::<Focus>().is_some_and(|focus| focus.0)
+}
+
 /// The palettes slackless ships.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SlackTheme {
@@ -51,14 +60,6 @@ impl SlackTheme {
         match self {
             SlackTheme::Dark => ThemeMode::Dark,
             SlackTheme::Light => ThemeMode::Light,
-        }
-    }
-
-    /// The other palette.
-    pub fn toggle(self) -> Self {
-        match self {
-            SlackTheme::Dark => SlackTheme::Light,
-            SlackTheme::Light => SlackTheme::Dark,
         }
     }
 }
@@ -94,23 +95,40 @@ pub fn set_font(font: usize, cx: &mut App) {
 
 /// Switch the whole app to `theme` with the default color theme and repaint every window.
 pub fn activate(theme: SlackTheme, cx: &mut App) {
-    activate_with(theme, Palette::Default, cx);
+    activate_with(theme, Palette::Default, false, cx);
 }
 
-/// Switch the whole app to `theme` tinted by the color theme `palette`.
+/// Switch the whole app to `theme` tinted by the color theme `palette`, in focus mode's
+/// grayscale when `focus` is set.
 ///
 /// `Theme::change` loads the registered mode palette; the Slack palette (and the color theme
 /// over it) is applied in a second pass, because a mode change reloads that mode's theme over
 /// same-closure edits.
-pub fn activate_with(theme: SlackTheme, palette: Palette, cx: &mut App) {
+pub fn activate_with(theme: SlackTheme, palette: Palette, focus: bool, cx: &mut App) {
     let mode = theme.mode();
     let family = FONT_FAMILIES[font(cx)];
+    cx.set_global(Focus(focus));
     Theme::change(mode, None, cx);
     Theme::update(cx, |theme| {
         apply(mode.is_dark(), theme);
         tint(palette, mode.is_dark(), theme);
+        if focus {
+            grayscale(theme);
+        }
         theme.font_family = family.into();
     });
+}
+
+/// Slack's focus mode turns the theme grayscale "so badges no longer appear in red (or your
+/// theme color)": the chrome, sidebar and selection lose their hue.
+fn grayscale(theme: &mut Theme) {
+    theme.title_bar = theme.title_bar.grayscale();
+    theme.sidebar = theme.sidebar.grayscale();
+    theme.sidebar_border = theme.sidebar_border.grayscale();
+    theme.sidebar_accent = theme.sidebar_accent.grayscale();
+    theme.sidebar_primary = theme.sidebar_primary.grayscale();
+    theme.sidebar_primary_foreground = theme.sidebar_primary_foreground.grayscale();
+    theme.ring = theme.ring.grayscale();
 }
 
 /// Slack's named color themes (Preferences > Appearance & Themes > Color themes), plus a
@@ -278,10 +296,59 @@ pub fn danger_text(cx: &App) -> Hsla {
 /// on dark ones (measured on Slack 4.53).
 pub fn mention_badge(cx: &App) -> (Hsla, Hsla) {
     let theme = cx.theme();
-    if theme.mode.is_dark() {
+    let (bg, fg) = if theme.mode.is_dark() {
         (color(0xE6_9B_A1), color(0x1A_1D_21))
     } else {
         (theme.danger, theme.danger_foreground)
+    };
+    if focused(cx) {
+        (bg.grayscale(), fg)
+    } else {
+        (bg, fg)
+    }
+}
+
+/// Slack's tab rail fill (`theme-surf-inv-sec`): on dark themes the near-black Slack 4.53
+/// measures (#0E171B, a dark wash over its chrome); on light ones a white wash over the chrome.
+pub fn tab_rail_wash(cx: &App) -> Hsla {
+    if cx.theme().mode.is_dark() {
+        color(0x0E_17_1B)
+    } else {
+        color(0xFF_FF_FF).opacity(0.1)
+    }
+}
+
+/// Where a light-mode Slack panel's shadow (`box-shadow: 0 0 20px rgba(0,0,0,.1)`) falls on the
+/// panel to its left: a strip darkening toward its right edge. GPUI's resizable panels keep
+/// each panel's own shadow inside it, so the neighbor paints the falloff itself.
+pub fn panel_shadow_edge() -> Background {
+    let shade = color(0x00_00_00).opacity(0.05);
+    linear_gradient(
+        90.,
+        linear_color_stop(shade.opacity(0.), 0.),
+        linear_color_stop(shade, 1.),
+    )
+}
+
+/// The composer box's surface and its formatting band (Slack's `.c-wysiwyg_container` and
+/// `__formatting`): one raised surface on dark themes, white under a light gray band on light.
+pub fn composer_surfaces(cx: &App) -> (Hsla, Hsla) {
+    if cx.theme().mode.is_dark() {
+        (color(0x22_24_29), color(0x22_24_29))
+    } else {
+        (color(0xFF_FF_FF), color(0xF8_F8_F8))
+    }
+}
+
+/// Slack's reaction pill that includes you (`.c-reaction--reacted`) as (background, count
+/// color, ring): filled blue under light text on dark themes; a blue wash with blue text and a
+/// blue ring on light ones.
+pub fn reacted_pill(cx: &App) -> (Hsla, Hsla, Option<Hsla>) {
+    let theme = cx.theme();
+    if theme.mode.is_dark() {
+        (color(0x0C_77_A7), theme.foreground, None)
+    } else {
+        (theme.link.opacity(0.1), theme.link, Some(color(0x1D_9B_D1)))
     }
 }
 
@@ -297,6 +364,7 @@ pub fn chrome_glow(cx: &App) -> (Pixels, Background) {
     } else {
         (1400., color(0xF5_FA_FB))
     };
+    let glow = if focused(cx) { glow.grayscale() } else { glow };
     // On a square, a 135deg gradient puts the corner at t = 0.5 - 1/sqrt(2) and the
     // anti-diagonal through (side, 0) at t = 0.5.
     let fill = linear_gradient(
@@ -343,6 +411,11 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.button_danger_foreground = theme.danger_foreground;
         theme.button_danger_hover = theme.danger_hover;
         theme.button_danger_active = theme.danger_active;
+        // Primary buttons ("Save", "Send") are Slack's green, not the kit's foreground fill.
+        theme.button_primary = theme.primary;
+        theme.button_primary_foreground = theme.primary_foreground;
+        theme.button_primary_hover = theme.primary_hover;
+        theme.button_primary_active = theme.primary_active;
         // Slack dims the window behind a modal with a light black wash.
         theme.overlay = color(0x00_00_00).opacity(0.2);
         theme.success = color(0x2B_AC_76); // presence green
@@ -401,6 +474,11 @@ fn apply(dark: bool, theme: &mut Theme) {
         theme.button_danger_foreground = theme.danger_foreground;
         theme.button_danger_hover = theme.danger_hover;
         theme.button_danger_active = theme.danger_active;
+        // Primary buttons ("Save", "Send") are Slack's green, not the kit's foreground fill.
+        theme.button_primary = theme.primary;
+        theme.button_primary_foreground = theme.primary_foreground;
+        theme.button_primary_hover = theme.primary_hover;
+        theme.button_primary_active = theme.primary_active;
         theme.overlay = color(0x00_00_00).opacity(0.2);
         theme.success = color(0x2B_AC_76);
         theme.success_foreground = color(0xFF_FF_FF);

@@ -94,7 +94,7 @@ fn main() {
         }
         if let Some(mode) = bridge.color_mode() {
             let palette = fixtures.palette.unwrap_or(theme::Palette::Default);
-            theme::activate_with(mode.resolve(cx.window_appearance()), palette, cx);
+            theme::activate_with(mode.resolve(cx.window_appearance()), palette, false, cx);
         }
         let fixtures = Arc::new(fixtures);
         // Like Slack, the window fills the screen on first launch and later reopens with the

@@ -379,19 +379,11 @@ impl Preferences {
         &self.settings
     }
 
-    /// Jump to `section` (the DND menu opens Notifications, the theme toggle Appearance).
+    /// Jump to `section` (the DND menu opens Notifications).
     pub fn show(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
         self.open_select = None;
         cx.notify();
-    }
-
-    /// Mirror a theme switch made outside the window (the title-bar toggle).
-    pub fn set_appearance_mode(&mut self, mode: AppearanceMode, cx: &mut Context<Self>) {
-        if self.settings.mode != mode {
-            self.settings.mode = mode;
-            cx.notify();
-        }
     }
 
     /// Start on the remembered Color Mode and Font and the color theme Slack stores for the

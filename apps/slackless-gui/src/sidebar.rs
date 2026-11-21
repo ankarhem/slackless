@@ -1,6 +1,9 @@
-//! Left sidebar: workspace switcher rail with the nav stack (Home / DMs / Activity / Files /
-//! To-dos / Admin), and collapsible Channels / Direct messages sections with unread and
-//! mention count pills (gpui-kit-guide section 3). Counts are derived from the fixture
+//! Left sidebar: Slack's workspace switcher column, the tab rail with the nav stack (Home /
+//! DMs / Activity / Files / To-dos / Admin) and control strip (create, focus mode, avatar),
+//! which the root places itself ([`Sidebar::workspace_switcher`], [`Sidebar::tab_rail`]), and
+//! this view's list column: collapsible Channels / Direct messages sections with unread and
+//! mention count pills (gpui-kit-guide section 3). In focus mode the list drops its bolding
+//! and counts for Slack's subtle dots. Counts are derived from the fixture
 //! history so fixture mode renders exactly what live mode will feed it.
 //!
 //! The rail's DMs destination swaps the list for the DM inbox (a "Direct
@@ -31,6 +34,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
 };
@@ -39,7 +43,7 @@ use gpui_kit::gpui::{
     AnyElement, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, img, point, px,
+    deferred, div, img, point, px, transparent_black,
 };
 use slackless_core::types::{
     ChannelId, ChannelSection, Conversation, ConversationKind, Message, SectionKind, Team, Ts,
@@ -53,7 +57,12 @@ use crate::files_page::FilesSection;
 use crate::fixtures::Fixtures;
 use crate::messages::list_stamp;
 use crate::sidebar_menu::{SectionFormEvent, SectionNameForm, workspace_menu};
-use crate::status::{SelfState, self_avatar};
+use crate::status::{FOCUS_DURATIONS, SelfState, self_avatar};
+
+/// Slack's workspace switcher column, left of the tab rail.
+pub(crate) const SWITCHER_WIDTH: f32 = 60.;
+/// Slack's tab rail.
+const TAB_RAIL_WIDTH: f32 = 70.;
 
 pub enum SidebarEvent {
     SelectConversation(ChannelId),
@@ -77,8 +86,10 @@ pub enum SidebarEvent {
     CreateSection {
         name: String,
     },
-    /// The rail's moon button: switch between the dark and light palette.
-    ToggleTheme,
+    /// The rail's moon: turn focus mode on or off.
+    ToggleFocus,
+    /// The focus card's Duration choice (an index into `status::FOCUS_DURATIONS`).
+    FocusDuration(usize),
     /// The rail's own avatar: open the user menu.
     OpenUserMenu,
     /// The rail's Activity tile (or the Home list's Unreads row): open the Activity page,
@@ -208,6 +219,8 @@ pub struct Sidebar {
     activity_unread: u32,
     /// The signed-in user's status and presence, for the rail avatar.
     self_state: SelfState,
+    /// The pointer is over the focus button / the focus card.
+    focus_hover: (bool, bool),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -291,6 +304,7 @@ impl Sidebar {
                 scroll: ScrollHandle::new(),
                 activity_unread: 0,
                 self_state: SelfState::default(),
+                focus_hover: (false, false),
                 _subscriptions: subscriptions,
             }
         })
@@ -594,27 +608,16 @@ impl Sidebar {
         self.active_nav
     }
 
-    /// The nav rail. Like Slack, Home and DMs get an unread dot, Activity its unread count.
-    fn workspace_rail(
-        &self,
-        home_dot: bool,
-        dm_dot: bool,
-        activity_badge: u32,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        // Owned color copies: `cx.theme()` borrows `cx`, so nothing may outlive the
-        // statement that reads it across the `&mut Context` calls below.
-        let border = cx.theme().sidebar_border;
-        // The rail is transparent over the root's chrome gradient; its tint rings the avatar.
-        let rail_bg = cx.theme().title_bar;
-        let mut rail = v_flex()
+    /// Slack's workspace switcher: the column left of the tab rail with one tile per signed-in
+    /// workspace, the active one ringed.
+    pub(crate) fn workspace_switcher(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
             .flex_none()
             .h_full()
-            .w(px(72.))
+            .w(px(SWITCHER_WIDTH))
             .items_center()
-            .pt_3()
-            .pb_3()
-            .gap_1()
+            .pt(px(6.))
+            .gap_2()
             .children(
                 self.fixtures
                     .workspaces
@@ -623,42 +626,98 @@ impl Sidebar {
                     .map(|(index, team)| self.workspace_tile(index, team, cx))
                     .collect::<Vec<_>>(),
             )
-            .child(div().h(px(6.)));
+    }
+
+    /// Slack's tab rail, the left edge of the workspace panel the root rounds: the nav
+    /// destinations (Home and DMs carry an unread dot, Activity its unread count) over the
+    /// control strip (create, focus mode, the user's avatar).
+    pub(crate) fn tab_rail(&self, cx: &mut Context<Self>) -> Div {
+        let watermark = self.read_watermark();
+        let unread = |conversations: &[Conversation]| {
+            self.total_unread(conversations, watermark.as_ref()).count > 0
+        };
+        let home_dot = unread(&self.fixtures.channels) || unread(&self.joined);
+        let focus = self.self_state.focused();
+        let dm_dot = unread(&self.fixtures.dms);
+        // Owned color copies: `cx.theme()` borrows `cx`, so nothing may outlive the
+        // statement that reads it across the `&mut Context` calls below.
+        let theme = cx.theme();
+        let (outline, dark, avatar_ring) =
+            (theme.sidebar_border, theme.mode.is_dark(), theme.sidebar);
+        let rail_bg = crate::theme::tab_rail_wash(cx);
+        let mut rail = v_flex()
+            .flex_none()
+            .h_full()
+            .w(px(TAB_RAIL_WIDTH))
+            .items_center()
+            .pt_2()
+            .pb(px(20.))
+            .gap_1()
+            .bg(rail_bg)
+            .rounded_tl(px(6.))
+            .rounded_bl(px(6.))
+            // Dark Slack outlines the panel; light Slack ends the rail with a hairline.
+            .when(dark, |rail| {
+                rail.border_t_1()
+                    .border_l_1()
+                    .border_b_1()
+                    .border_color(outline)
+            })
+            .when(!dark, |rail| rail.border_r_1().border_color(outline));
         for item in NavItem::ALL {
             if item == NavItem::Admin {
-                rail = rail.child(div().my_1().w(px(28.)).h(px(1.)).bg(border));
+                rail = rail.child(div().my_1().w(px(28.)).h(px(1.)).bg(outline));
             }
             let (badge, dot) = match item {
                 NavItem::Home => (0, home_dot),
                 NavItem::Dms => (0, dm_dot),
-                NavItem::Activity => (activity_badge, false),
+                NavItem::Activity => (self.activity_unread, false),
                 _ => (0, false),
+            };
+            // Focus mode trades the count for the subtle dot.
+            let (badge, dot) = if focus {
+                (0, badge > 0 || dot)
+            } else {
+                (badge, dot)
             };
             rail = rail.child(self.nav_tile(item, badge, dot, cx));
         }
-        let avatar = self_avatar(&self.fixtures, &self.self_state, 36., rail_bg, cx);
-        rail.child(div().flex_1())
-            .child(self.rail_button("rail-create", IconName::Plus, cx))
-            .child(
-                self.rail_button("rail-theme", IconName::Moon, cx)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ToggleTheme))),
-            )
-            .child(
-                div()
-                    .id("rail-avatar")
-                    .mt_1()
-                    .cursor_pointer()
-                    .child(avatar)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUserMenu))),
-            )
+        let avatar = self_avatar(&self.fixtures, &self.self_state, 36., avatar_ring, cx);
+        rail.child(div().flex_1()).child(
+            v_flex()
+                .items_center()
+                .gap_4()
+                .child(self.rail_button("rail-create", IconName::Plus, false, cx))
+                .child(self.focus_button(cx))
+                .child(
+                    div()
+                        .id("rail-avatar")
+                        .cursor_pointer()
+                        .child(avatar)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUserMenu))),
+                ),
+        )
     }
 
-    /// One 36px round button at the foot of the rail ("+" create, the theme moon).
-    fn rail_button(&self, id: &'static str, icon: IconName, cx: &Context<Self>) -> Stateful<Div> {
+    /// One 36px round control-strip button ("+" create, focus mode's moon); `active` gives
+    /// it Slack's pressed look.
+    fn rail_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        active: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let theme = cx.theme();
-        let fg = theme.sidebar_foreground.opacity(0.8);
-        let bg = theme.sidebar_foreground.opacity(0.12);
-        let hover = theme.sidebar_foreground.opacity(0.2);
+        let (fg, bg) = if active {
+            (theme.muted_foreground, theme.background)
+        } else {
+            (
+                theme.sidebar_foreground.opacity(0.8),
+                theme.sidebar_foreground.opacity(0.3),
+            )
+        };
+        let hover = theme.sidebar_foreground.opacity(0.4);
         div()
             .id(id)
             .size(px(36.))
@@ -669,8 +728,120 @@ impl Sidebar {
             .rounded_full()
             .bg(bg)
             .cursor_pointer()
-            .hover(|button| button.bg(hover))
+            .when(!active, |button| button.hover(|button| button.bg(hover)))
             .child(Icon::new(icon).text_color(fg).size(px(18.)))
+    }
+
+    /// Slack's focus mode control: the moon turns focus mode on and off. Off, its tooltip
+    /// explains it; on, hovering it (or the card) shows the focus card.
+    fn focus_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.self_state.focused();
+        let card_open = focused && (self.focus_hover.0 || self.focus_hover.1);
+        let muted = cx.theme().muted_foreground;
+        let button = self
+            .rail_button("rail-focus", IconName::Moon, focused, cx)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.focus_hover.0 = *hovered;
+                cx.notify();
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.focus_hover = (false, false);
+                cx.emit(SidebarEvent::ToggleFocus);
+            }))
+            .when(!focused, |button| {
+                button.tooltip(move |window, cx| {
+                    Tooltip::element(move |_, _| {
+                        v_flex().child("Turn on focus mode").child(
+                            div()
+                                .text_color(muted)
+                                .child("Pause notifications and reduce badging and bolding."),
+                        )
+                    })
+                    .build(window, cx)
+                })
+            });
+        div().relative().child(button).when(card_open, |anchor| {
+            anchor.child(deferred(self.focus_card(cx)).with_priority(1))
+        })
+    }
+
+    /// The card focus mode shows beside the moon: what is paused and Slack's Duration choices.
+    /// Its transparent left padding bridges the gap to the button, so the pointer can cross it.
+    fn focus_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (popover, border, muted, hover, fg) = (
+            theme.popover,
+            theme.border,
+            theme.muted_foreground,
+            theme.accent,
+            theme.popover_foreground,
+        );
+        let preset = self.self_state.focus_preset;
+        let rows = FOCUS_DURATIONS
+            .iter()
+            .enumerate()
+            .map(|(ix, (label, _))| {
+                h_flex()
+                    .id(("focus-duration", ix))
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(hover))
+                    .child(
+                        div().w(px(16.)).children(
+                            (ix == preset)
+                                .then(|| Icon::new(IconName::Check).text_color(fg).size(px(14.))),
+                        ),
+                    )
+                    .child(*label)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(SidebarEvent::FocusDuration(ix));
+                    }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("focus-card")
+            .absolute()
+            .left(px(36.))
+            .bottom(px(-8.))
+            .pl(px(12.))
+            .occlude()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.focus_hover.1 = *hovered;
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .w(px(260.))
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(border)
+                    .bg(popover)
+                    .shadow_lg()
+                    .text_sm()
+                    .text_color(fg)
+                    .child(
+                        v_flex()
+                            .px_4()
+                            .pb_2()
+                            .child(div().font_weight(FontWeight::BOLD).child("Focus mode"))
+                            .child(div().text_color(muted).child(self.self_state.focus_label())),
+                    )
+                    .child(div().my_1().h(px(1.)).bg(border))
+                    .child(
+                        div()
+                            .px_4()
+                            .py_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child("Duration"),
+                    )
+                    .children(rows),
+            )
     }
 
     fn workspace_tile(
@@ -682,31 +853,51 @@ impl Sidebar {
         let theme = cx.theme();
         let active = index == self.active_workspace;
         let face = match team_icon_url(team) {
-            Some(url) => img(SharedString::from(url)).size_full().into_any_element(),
+            Some(url) => img(SharedString::from(url))
+                .size_full()
+                .rounded(px(8.))
+                .into_any_element(),
             None => div().child(team_initials(&team.name)).into_any_element(),
         };
+        let (tile_bg, tile_fg) = if active {
+            (theme.sidebar_primary, theme.sidebar_primary_foreground)
+        } else {
+            (
+                theme.sidebar_accent.opacity(0.25),
+                theme.sidebar_accent_foreground,
+            )
+        };
+        let ring = theme.sidebar_foreground.opacity(0.7);
+        let hover_ring = theme.sidebar_foreground.opacity(0.3);
+        // Slack rings the active workspace's icon; the others take a faint ring on hover.
         div()
             .id(SharedString::from(format!("workspace-{index}")))
-            .size(px(36.))
+            .size(px(44.))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .rounded_lg()
-            .overflow_hidden()
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .cursor_pointer()
-            .when(active, |tile| {
-                tile.bg(theme.sidebar_primary)
-                    .text_color(theme.sidebar_primary_foreground)
-            })
+            .rounded(px(11.))
+            .border_2()
+            .border_color(if active { ring } else { transparent_black() })
             .when(!active, |tile| {
-                tile.bg(theme.sidebar_accent.opacity(0.25))
-                    .text_color(theme.sidebar_accent_foreground)
-                    .hover(|tile| tile.bg(theme.secondary_hover))
+                tile.hover(|tile| tile.border_color(hover_ring))
             })
-            .child(face)
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(px(34.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .overflow_hidden()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .bg(tile_bg)
+                    .text_color(tile_fg)
+                    .child(face),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 if index != this.active_workspace {
                     cx.emit(SidebarEvent::SwitchWorkspace(index));
@@ -826,7 +1017,7 @@ impl Sidebar {
         let active = self.active_nav == item;
         let ring = theme.sidebar;
         let fg = theme.sidebar_foreground;
-        let tile_bg = theme.sidebar_foreground.opacity(0.16);
+        let tile_bg = theme.sidebar_foreground.opacity(0.32);
         let hover = theme.sidebar_foreground.opacity(0.08);
         let (badge_bg, badge_fg) = crate::theme::mention_badge(cx);
         v_flex()
@@ -1486,7 +1677,9 @@ impl Sidebar {
         let selected = id == self.selected;
         let unread = self.unread_in(conversation, watermark);
         let label = self.fixtures.conversation_label(conversation);
-        let emphasized = selected || unread.count > 0;
+        // Focus mode marks new activity with a subtle dot instead of bolding and counts.
+        let focus = self.self_state.focused();
+        let emphasized = selected || (unread.count > 0 && !focus);
         let color = if selected {
             theme.sidebar_accent_foreground
         } else if emphasized {
@@ -1561,7 +1754,9 @@ impl Sidebar {
                     .size(px(14.)),
             );
         }
-        if unread.mentions > 0 {
+        if focus && unread.count > 0 {
+            row = row.child(focus_dot(cx));
+        } else if unread.mentions > 0 {
             row = row.child(count_pill(unread.mentions, true, cx));
         }
         row.on_click(cx.listener(move |this, _, _, cx| this.select_row(id.clone(), cx)))
@@ -1650,6 +1845,15 @@ impl Sidebar {
         };
         self.scroll.set_offset(point(self.scroll.offset().x, y));
     }
+}
+
+/// Focus mode's subtle unread marker, in place of bolding and count pills.
+fn focus_dot(cx: &gpui_kit::gpui::App) -> Div {
+    div()
+        .flex_none()
+        .size(px(6.))
+        .rounded_full()
+        .bg(cx.theme().sidebar_foreground.opacity(0.6))
 }
 
 /// Slack-style inline count pill: red for mentions (and DM messages), the sidebar's primary
@@ -1836,6 +2040,8 @@ impl Render for Sidebar {
         let sidebar_bg = cx.theme().sidebar;
         let sidebar_border = cx.theme().sidebar_border;
         let sidebar_fg = cx.theme().sidebar_foreground;
+        let dark = cx.theme().mode.is_dark();
+        let focus = self.self_state.focused();
         let watermark = self.read_watermark();
         let channels: Vec<Conversation> = self
             .fixtures
@@ -1884,7 +2090,7 @@ impl Render for Sidebar {
                         "unreads",
                         IconName::Inbox,
                         "Unreads",
-                        total.count > 0,
+                        total.count > 0 && !focus,
                         None,
                         cx,
                     )
@@ -1895,11 +2101,11 @@ impl Render for Sidebar {
                         "threads",
                         IconName::MessageSquareText,
                         "Threads",
-                        self.threads_unread.0,
+                        self.threads_unread.0 && !focus,
                         None,
                         cx,
                     )
-                    .when(self.threads_unread.1 > 0, |row| {
+                    .when(self.threads_unread.1 > 0 && !focus, |row| {
                         row.child(count_pill(self.threads_unread.1, true, cx))
                     })
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenThreads))),
@@ -1965,27 +2171,33 @@ impl Render for Sidebar {
             .size_full()
             .text_color(sidebar_fg)
             .text_sm()
-            .child(self.workspace_rail(
-                channel_unread.count > 0,
-                dm_unread.count > 0,
-                self.activity_unread,
-                cx,
-            ))
             // The Activity page spans the whole main area right of the rail, so its own
             // card replaces this sidebar's list column while it is the active destination.
             .when(self.active_nav != NavItem::Activity, |sidebar| {
                 sidebar.child(
-                    // A relative wrapper, so the pills can float over the list's edges. The
-                    // white card rounds into the tinted window chrome, as Slack's does.
+                    // A relative wrapper, so the pills can float over the list's edges. Dark
+                    // Slack divides it from the conversation with a hairline; light Slack lets
+                    // the conversation's shadow do it.
                     div()
                         .relative()
                         .flex_1()
                         .min_w(px(0.))
                         .h_full()
                         .bg(sidebar_bg)
-                        .rounded_tl(px(10.))
-                        .rounded_tr(px(10.))
+                        .when(dark, |list| list.border_r_1().border_color(sidebar_border))
                         .child(list)
+                        // Light Slack's conversation casts its shadow over the sidebar's edge.
+                        .when(!dark, |list| {
+                            list.child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .w(px(16.))
+                                    .bg(crate::theme::panel_shadow_edge()),
+                            )
+                        })
                         .when_some(below, |list, pill| {
                             list.child(
                                 div()

@@ -217,11 +217,12 @@ use gpui_kit::component::{
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    self, Anchor, AppContext as _, ClipboardItem, Context, Div, Edges, Entity, FocusHandle,
-    Focusable as _, FontWeight, Hsla, InputPreference, InteractiveElement as _, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, ParentElement as _, Pixels, Point, Render,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription,
-    SystemNotification, Window, actions, anchored, deferred, div, point, px,
+    self, Anchor, AnyElement, AppContext as _, BoxShadow, ClipboardItem, Context, Div, Edges,
+    Entity, FocusHandle, Focusable as _, FontWeight, Hsla, InputPreference,
+    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
+    actions, anchored, deferred, div, hsla, point, px,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{self, BadgeSetter, Notifier};
@@ -257,7 +258,9 @@ use crate::search_menu::{SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
 use crate::sidebar::{NavItem, Sidebar, SidebarEvent};
 use crate::slash::{Invocation, SHRUG, SlashKind};
-use crate::status::{SelfState, StatusEvent, StatusPicker, UserMenu, UserMenuEvent};
+use crate::status::{
+    FOCUS_UNTIL_OFF, SelfState, StatusEvent, StatusPicker, UserMenu, UserMenuEvent,
+};
 use crate::switcher::{QuickSwitcher, SwitcherEvent};
 use crate::tab_views::{self, Loaded};
 use crate::tabs::{self, ConversationTab, TabAction};
@@ -295,13 +298,63 @@ actions!(
 /// How often due Later reminders are checked.
 const REMINDER_POLL: Duration = Duration::from_secs(10);
 
-/// Rail + channel sidebar, measured on Slack desktop (69px rail, 318px sidebar).
-const SIDEBAR_WIDTH: Pixels = px(390.);
-/// The rail alone: the Activity page spans the whole main area right of it (the width
-/// `sidebar.rs`'s `workspace_rail` draws).
-const RAIL_WIDTH: Pixels = px(72.);
-/// Rail + the DMs destination's wider DM list, measured on Slack desktop (524px list).
-const DM_LIST_WIDTH: Pixels = px(596.);
+/// The channel sidebar, measured on Slack desktop (318px).
+const SIDEBAR_WIDTH: Pixels = px(318.);
+/// The DMs destination's wider DM list, measured on Slack desktop (524px).
+const DM_LIST_WIDTH: Pixels = px(524.);
+/// The corner radius of Slack's workspace panel (`.p-client_workspace_wrapper`).
+const PANEL_RADIUS: f32 = 6.;
+
+/// A black box shadow (Slack's `box-shadow: <offset> <offset> <blur> rgba(0,0,0,<alpha>)`).
+fn shadow(offset: f32, alpha: f32, blur: f32) -> BoxShadow {
+    BoxShadow {
+        color: hsla(0., 0., 0., alpha),
+        offset: point(px(offset), px(offset)),
+        blur_radius: px(blur),
+        spread_radius: px(0.),
+        inset: false,
+    }
+}
+
+/// One right corner (`top` or bottom) of the workspace panel over a side panel that paints a
+/// square background: GPUI clips rectangularly, so a band whose inner edge is the corner's arc
+/// repaints the window chrome outside it, and dark mode's `outline` is redrawn along it.
+fn corner_cap(top: bool, chrome: Hsla, outline: Option<Hsla>) -> Vec<Div> {
+    let band = PANEL_RADIUS;
+    // Absolute insets start inside the panel's outline.
+    let edge = if outline.is_some() { 1. } else { 0. };
+    let cap = div()
+        .absolute()
+        .right(px(-band - edge))
+        .size(px(2. * (PANEL_RADIUS + band)))
+        .border_r(px(band))
+        .border_color(chrome);
+    let mut caps = vec![if top {
+        cap.top(px(-band - edge))
+            .border_t(px(band))
+            .rounded_tr(px(PANEL_RADIUS + band))
+    } else {
+        cap.bottom(px(-band - edge))
+            .border_b(px(band))
+            .rounded_br(px(PANEL_RADIUS + band))
+    }];
+    if let Some(outline) = outline {
+        let arc = div()
+            .absolute()
+            .right(px(-edge))
+            .size(px(2. * PANEL_RADIUS))
+            .border_r_1()
+            .border_color(outline);
+        caps.push(if top {
+            arc.top(px(-edge)).border_t_1().rounded_tr(px(PANEL_RADIUS))
+        } else {
+            arc.bottom(px(-edge))
+                .border_b_1()
+                .rounded_br(px(PANEL_RADIUS))
+        });
+    }
+    caps
+}
 /// The thread / profile / pins panel, measured on Slack desktop.
 const FLEXPANE_WIDTH: Pixels = px(540.);
 
@@ -352,8 +405,6 @@ pub struct App {
     /// shown one and never-visited ones).
     parked: Vec<Option<Parked>>,
     channel: ChannelId,
-    /// The active Slack palette; toggled from the global bar.
-    theme: SlackTheme,
     sidebar: Entity<Sidebar>,
     messages: Entity<MessageList>,
     composer: Entity<Composer>,
@@ -375,8 +426,9 @@ pub struct App {
     huddle_open: bool,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
-    /// The theme last installed, so unrelated preference edits do not repaint the theme.
-    applied_theme: (SlackTheme, Palette),
+    /// The theme last installed (mode, color theme, focus mode's grayscale), so unrelated
+    /// preference edits do not repaint the theme.
+    applied_theme: (SlackTheme, Palette, bool),
     /// The Color Mode last stored (`None` offline), so only a changed mode is written.
     color_mode: Option<AppearanceMode>,
     /// The profile pane; shown in the right panel while `profile_open` (exclusive with the
@@ -554,9 +606,9 @@ impl App {
                     preferences.update(cx, |prefs, cx| {
                         prefs.set_appearance(mode, palette, font, cx)
                     });
-                    (mode.resolve(window.appearance()), palette)
+                    (mode.resolve(window.appearance()), palette, false)
                 }
-                None => (SlackTheme::Dark, Palette::Default),
+                None => (SlackTheme::Dark, Palette::Default, false),
             };
             let status_picker = StatusPicker::new(window, cx);
             let user_menu = UserMenu::new(fixtures.clone(), cx);
@@ -756,7 +808,7 @@ impl App {
                     window,
                     |this: &mut App, _, event: &StatusEvent, window, cx| {
                         if let StatusEvent::Save(status) = event {
-                            this.self_state.status = status.clone();
+                            this.self_state.set_status(status.clone());
                             this.push_self_state(cx);
                         }
                         window.close_dialog(cx);
@@ -952,7 +1004,10 @@ impl App {
                 loop {
                     cx.background_executor().timer(REMINDER_POLL).await;
                     if this
-                        .update_in(cx, |app, window, cx| app.fire_reminders(window, cx))
+                        .update_in(cx, |app, window, cx| {
+                            app.fire_reminders(window, cx);
+                            app.expire_focus(window, cx);
+                        })
                         .is_err()
                     {
                         break;
@@ -977,7 +1032,6 @@ impl App {
                 workspace: 0,
                 parked,
                 channel,
-                theme: applied_theme.0,
                 sidebar,
                 messages,
                 composer,
@@ -1436,10 +1490,10 @@ impl App {
                 cx.background_executor().spawn(write).detach();
             }
         }
-        if self.applied_theme != (theme, settings.palette) {
-            self.theme = theme;
-            self.applied_theme = (theme, settings.palette);
-            theme::activate_with(theme, settings.palette, cx);
+        let focus = self.self_state.focused();
+        if self.applied_theme != (theme, settings.palette, focus) {
+            self.applied_theme = (theme, settings.palette, focus);
+            theme::activate_with(theme, settings.palette, focus, cx);
         }
         if theme::font(cx) != settings.font {
             theme::set_font(settings.font, cx);
@@ -1459,16 +1513,22 @@ impl App {
         self.push_self_state(cx);
     }
 
-    /// Hand the current status / presence / pause to the views that show it.
-    /// Flip between Slack's dark and light palettes (the rail's moon button).
-    fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = match self.theme.toggle() {
-            SlackTheme::Dark => AppearanceMode::Dark,
-            SlackTheme::Light => AppearanceMode::Light,
-        };
-        self.preferences
-            .update(cx, |prefs, cx| prefs.set_appearance_mode(mode, cx));
+    /// Slack's focus mode (the rail's moon): on with Slack's default "Don't turn off", or off.
+    fn toggle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.self_state.focused() {
+            self.self_state.end_focus();
+        } else {
+            self.self_state.start_focus(FOCUS_UNTIL_OFF);
+        }
         self.apply_preferences(window, cx);
+    }
+
+    /// End a timed focus mode once its Duration ran out (checked on the reminder poll).
+    fn expire_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.self_state.focus_until.is_some() && !self.self_state.focused() {
+            self.self_state.end_focus();
+            self.apply_preferences(window, cx);
+        }
     }
 
     /// The composer prompts with the open conversation's name, as Slack does.
@@ -1497,6 +1557,7 @@ impl App {
             .update(cx, |composer, cx| composer.set_placeholder(placeholder, cx));
     }
 
+    /// Hand the current status / presence / pause / focus mode to the views that show it.
     fn push_self_state(&mut self, cx: &mut Context<Self>) {
         let state = self.self_state.clone();
         self.sidebar
@@ -1520,7 +1581,7 @@ impl App {
                 self.user_menu_open = false;
                 self.open_status_picker(window, cx);
             }
-            UserMenuEvent::ClearStatus => self.self_state.status = None,
+            UserMenuEvent::ClearStatus => self.self_state.set_status(None),
             UserMenuEvent::SetAway(away) => self.self_state.away = *away,
             UserMenuEvent::Pause(until) => {
                 self.self_state.paused_until = *until;
@@ -1564,14 +1625,28 @@ impl App {
 
     fn open_status_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let status = self.self_state.status.clone();
-        self.status_picker
-            .update(cx, |picker, cx| picker.edit(status.as_ref(), window, cx));
+        let workspace = SharedString::from(self.fixtures.workspaces[self.workspace].name.clone());
+        self.status_picker.update(cx, |picker, cx| {
+            picker.edit(status.as_ref(), workspace, window, cx)
+        });
         let picker = self.status_picker.clone();
         window.open_dialog(cx, move |dialog, _, _| {
+            // Slack centers its modal and titles it large and bold.
             dialog
-                .title("Set a status")
-                .w(px(480.))
+                .title(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::BOLD)
+                        .child("Set a status"),
+                )
+                .centered()
+                .w(px(520.))
                 .child(picker.clone())
+        });
+        // Slack opens the dialog with the caret in the status field.
+        let picker = self.status_picker.clone();
+        window.defer(cx, move |window, cx| {
+            picker.update(cx, |picker, cx| picker.focus(window, cx))
         });
     }
 
@@ -3227,44 +3302,75 @@ impl Render for App {
 
         // Slack's DM list is wider than its channel sidebar, and each keeps the width it is
         // dragged to: one resizable layout (and so one remembered width) per destination.
-        // The Activity page replaces the sidebar's list column, so its layout keeps only
-        // the rail's width.
+        // The Activity page replaces the sidebar's list column.
         let nav = self.sidebar.read(cx).active_nav();
         let (layout, sidebar_width) = match nav {
             NavItem::Dms => ("workspace-dms", DM_LIST_WIDTH),
-            NavItem::Activity => ("workspace-activity", RAIL_WIDTH),
+            NavItem::Activity => ("workspace-activity", SIDEBAR_WIDTH),
             _ => ("workspace", SIDEBAR_WIDTH),
         };
-        let sidebar_panel = if nav == NavItem::Activity {
-            resizable_panel().size(sidebar_width).fixed()
-        } else {
-            resizable_panel()
-                .size(sidebar_width)
-                .size_range(px(360.)..px(800.))
-                .fixed()
-        };
-        let mut panels = h_resizable(layout)
-            // Like Slack, opening the thread / profile / pins panel narrows the conversation,
-            // never the sidebar, and resizing the window only resizes the conversation: the
-            // sidebar and the side panel are fixed at the widths Slack gives them.
-            .child(sidebar_panel.child(self.sidebar.clone()))
-            .child(
-                resizable_panel().child(
-                    div()
-                        .size_full()
-                        .bg(background)
-                        .rounded_tl(px(10.))
-                        .rounded_tr(px(10.))
-                        .child(main_column),
-                ),
+        let dark = cx.theme().mode.is_dark();
+        let outline = cx.theme().sidebar_border;
+        let side_panel = self.thread_open || self.profile_open || self.pins_open;
+        // Like Slack, opening the thread / profile / pins panel narrows the conversation,
+        // never the sidebar, and resizing the window only resizes the conversation: the
+        // sidebar and the side panel are fixed at the widths Slack gives them.
+        // Slack draws its own dividers (hairlines in dark mode, shadows in light), so the kit's
+        // handle lines stay unpainted; the handles still resize.
+        let mut panels = h_resizable(layout).with_handle_appearance(Rc::new(
+            |_: &gpui_kit::base::ResizeHandleContext, _: &mut Window, _: &mut gpui::App| {
+                Some(div().into_any_element())
+            },
+        ));
+        if nav != NavItem::Activity {
+            panels = panels.child(
+                resizable_panel()
+                    .size(sidebar_width)
+                    .size_range(px(288.)..px(728.))
+                    .fixed()
+                    .child(self.sidebar.clone()),
             );
+        }
+        let mut panels = panels.child(
+            resizable_panel().child(
+                div()
+                    .relative()
+                    .size_full()
+                    .bg(background)
+                    .when(!side_panel, |column| {
+                        column
+                            .rounded_tr(px(PANEL_RADIUS))
+                            .rounded_br(px(PANEL_RADIUS))
+                    })
+                    .child(main_column)
+                    // Light Slack's side panel casts its shadow over the conversation's edge.
+                    .when(!dark && side_panel, |column| {
+                        column.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .right_0()
+                                .w(px(16.))
+                                .bg(crate::theme::panel_shadow_edge()),
+                        )
+                    }),
+            ),
+        );
+        // Dark Slack's side panel starts with a hairline; light Slack's is lifted by its shadow.
+        let side_pane = |pane: AnyElement| {
+            div()
+                .size_full()
+                .when(dark, |pane| pane.border_l_1().border_color(outline))
+                .child(pane)
+        };
         if self.thread_open {
             panels = panels.child(
                 resizable_panel()
                     .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
                     .fixed()
-                    .child(self.thread.clone()),
+                    .child(side_pane(self.thread.clone().into_any_element())),
             );
         } else if self.profile_open {
             panels = panels.child(
@@ -3272,7 +3378,7 @@ impl Render for App {
                     .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
                     .fixed()
-                    .child(self.profile.clone()),
+                    .child(side_pane(self.profile.clone().into_any_element())),
             );
         } else if self.pins_open {
             let this = cx.weak_entity();
@@ -3302,9 +3408,13 @@ impl Render for App {
                     .size(FLEXPANE_WIDTH)
                     .size_range(px(340.)..px(720.))
                     .fixed()
-                    .child(panel),
+                    .child(side_pane(panel.into_any_element())),
             );
         }
+
+        let (switcher, rail) = self.sidebar.update(cx, |sidebar, cx| {
+            (sidebar.workspace_switcher(cx), sidebar.tab_rail(cx))
+        });
 
         v_flex()
             .id("root")
@@ -3388,7 +3498,46 @@ impl Render for App {
             .text_color(foreground)
             .child(div().absolute().top_0().left_0().size(glow_side).bg(glow))
             .child(title_bar)
-            .child(div().flex_1().min_h_0().w_full().child(panels))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(switcher)
+                    // Slack's workspace panel: the tab rail and the tab panel (sidebar,
+                    // conversation, side panel) in one rounded card inset from the window's
+                    // right and bottom edges, lifted by a shadow in light mode and outlined in
+                    // dark mode.
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .mr_1()
+                            .mb_1()
+                            .rounded(px(PANEL_RADIUS))
+                            .when(!dark, |panel| panel.shadow(vec![shadow(-4., 0.09, 16.)]))
+                            .child(rail)
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .rounded_tr(px(PANEL_RADIUS))
+                                    .rounded_br(px(PANEL_RADIUS))
+                                    .overflow_hidden()
+                                    .when(dark, |panel| panel.border_1().border_color(outline))
+                                    .child(panels)
+                                    .when(side_panel, |panel| {
+                                        let outline = dark.then_some(outline);
+                                        panel
+                                            .children(corner_cap(true, chrome, outline))
+                                            .children(corner_cap(false, chrome, outline))
+                                    }),
+                            ),
+                    ),
+            )
             .when(self.user_menu_open, |root| {
                 root.child(
                     div()
@@ -3407,8 +3556,9 @@ impl Render for App {
                         .id("user-menu")
                         .occlude()
                         .absolute()
-                        .bottom(px(12.))
-                        .left(px(80.))
+                        // Where Slack drops it: beside the tab rail's avatar.
+                        .bottom(px(24.))
+                        .left(px(124.))
                         .child(self.user_menu.clone()),
                 )
             })
@@ -4213,7 +4363,11 @@ fn subscribe_workspace(
                 SidebarEvent::OpenDirectories => this.open_directory(cx),
                 SidebarEvent::OpenCompose => this.open_compose("", window, cx),
                 SidebarEvent::CreateSection { name } => this.create_section(name.clone(), cx),
-                SidebarEvent::ToggleTheme => this.toggle_theme(window, cx),
+                SidebarEvent::ToggleFocus => this.toggle_focus(window, cx),
+                SidebarEvent::FocusDuration(preset) => {
+                    this.self_state.start_focus(*preset);
+                    this.apply_preferences(window, cx);
+                }
                 SidebarEvent::OpenUserMenu => {
                     this.user_menu_open = !this.user_menu_open;
                     cx.notify();
