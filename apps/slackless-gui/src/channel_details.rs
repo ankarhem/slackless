@@ -828,6 +828,18 @@ impl ChannelDetails {
                 .child(placeholder.to_owned())
                 .on_click(cx.listener(move |this, _, window, cx| this.edit(field, window, cx)))
                 .into_any_element()
+        } else if field == EditField::Topic {
+            // The topic is mrkdwn, as in the conversation header.
+            div()
+                .text_sm()
+                .child(crate::messages::mrkdwn_preview(
+                    &value,
+                    &self.fixtures,
+                    muted_foreground,
+                    "details-topic".into(),
+                    cx,
+                ))
+                .into_any_element()
         } else {
             div()
                 .text_sm()

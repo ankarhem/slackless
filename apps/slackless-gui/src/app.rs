@@ -4506,13 +4506,20 @@ impl App {
             .flex_none()
             .child(name)
             .when(!topic.is_empty(), |header| {
+                // Slack renders the topic's mrkdwn: mentions by name, links, emoji.
                 header.child(
                     div()
                         .min_w_0()
                         .truncate()
                         .text_sm()
                         .text_color(muted_foreground)
-                        .child(topic.to_owned()),
+                        .child(crate::messages::mrkdwn_preview(
+                            topic,
+                            &self.fixtures,
+                            muted_foreground,
+                            format!("topic-{title}"),
+                            cx,
+                        )),
                 )
             })
             .child(div().flex_1())
