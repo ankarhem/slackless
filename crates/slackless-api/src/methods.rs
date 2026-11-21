@@ -1273,6 +1273,17 @@ impl SlackApi {
 
     /// `conversations.setTopic`: replace `channel`'s topic; the answer carries the updated
     /// channel object.
+    /// `conversations.join`: the signed-in user joins public `channel`; the answer carries
+    /// the joined channel.
+    pub async fn conversations_join(&self, channel: &ChannelId) -> Result<Conversation> {
+        let params = vec![("channel", channel.to_string())];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_JOIN, params)
+            .await?
+            .data
+            .channel)
+    }
+
     pub async fn conversations_set_topic(
         &self,
         channel: &ChannelId,

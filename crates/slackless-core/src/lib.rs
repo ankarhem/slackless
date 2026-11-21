@@ -58,6 +58,9 @@ pub enum Command {
     /// The user chose "Leave channel": leave it on Slack, then store it as no longer joined
     /// and announce it with [`Event::Conversations`].
     LeaveConversation(ChannelId),
+    /// The user pressed "Join Channel" on a public channel they are not in: join it on Slack,
+    /// store the joined channel and announce it with [`Event::Conversations`].
+    JoinConversation(ChannelId),
     /// The header bell's choice: set `channel`'s notification level on Slack, mirror it into
     /// the stored prefs, then announce [`Event::SidebarChanged`].
     SetNotifyLevel {

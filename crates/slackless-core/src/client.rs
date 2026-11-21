@@ -590,6 +590,15 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::JoinConversation(channel) => {
+                self.spawn("conversations.join", async move {
+                    let mut joined = backend.join_conversation(channel.clone()).await?;
+                    joined.is_member = true;
+                    with_store(&store, move |s| s.upsert_conversation(&ws, &joined)).await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
             Command::SetChannelTopic { channel, topic } => {
                 self.spawn("conversations.setTopic", async move {
                     let updated = backend.set_topic(channel.clone(), topic).await?;
@@ -1924,6 +1933,13 @@ pub(crate) mod tests {
         async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
             self.state.lock().unwrap().leave_calls.push(channel);
             Ok(())
+        }
+
+        async fn join_conversation(&self, channel: ChannelId) -> api::Result<Conversation> {
+            Ok(Conversation {
+                id: channel,
+                ..Default::default()
+            })
         }
 
         async fn set_topic(&self, channel: ChannelId, topic: String) -> api::Result<Conversation> {
@@ -3321,6 +3337,19 @@ pub(crate) mod tests {
         let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
         assert!(!stored.expect("stays stored").is_member, "stored as left");
         assert_eq!(fake.leave_calls(), vec![c1()]);
+    }
+
+    #[tokio::test]
+    async fn join_conversation_stores_it_as_joined_once_slack_confirms() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let ws = TeamId::from("T1");
+        let mut core = Core::new(fake, Arc::clone(&store), ws.clone(), events);
+
+        core.handle(Command::JoinConversation(c1()));
+        assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+        let stored = store.lock().unwrap().conversation(&ws, &c1()).unwrap();
+        assert!(stored.expect("stored").is_member, "stored as joined");
     }
 
     #[tokio::test]

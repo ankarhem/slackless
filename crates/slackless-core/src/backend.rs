@@ -81,6 +81,12 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// The signed-in user joins public `channel` (`conversations.join`); the answer carries
+    /// the joined channel.
+    fn join_conversation(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send;
     /// Replace `channel`'s topic (`conversations.setTopic`); the answer carries the updated
     /// conversation.
     fn set_topic(
@@ -341,6 +347,10 @@ impl Backend for SlackApi {
 
     async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
         self.conversations_leave(&channel).await
+    }
+
+    async fn join_conversation(&self, channel: ChannelId) -> api::Result<Conversation> {
+        self.conversations_join(&channel).await
     }
 
     async fn set_topic(&self, channel: ChannelId, topic: String) -> api::Result<Conversation> {
