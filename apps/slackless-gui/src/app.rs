@@ -486,10 +486,11 @@ pub struct App {
     /// The header members chip's hover: (chip, popover) - Slack keeps the tooltip while the
     /// pointer is over either.
     members_hover: (bool, bool),
-    /// The members popover's "Includes …" names for the open channel, computed when it opens
-    /// (and recomputed after the channel or its history changes) - never per frame. `None`
-    /// until then.
-    members_popover_names: Option<Vec<String>>,
+    /// The open channel's people as Slack names them: its most recent human authors, topped
+    /// up from its members (the members popover's "Includes …" line, the Join card's faces
+    /// and names). Computed when one of those needs them and after the channel or its history
+    /// changes - never per frame. `None` until then.
+    channel_people: Option<Vec<UserId>>,
     /// The connect banner's lines for the open conversation, recomputed when its members or
     /// the snapshot change - never per frame.
     connect_orgs: Vec<channel_details::OrgLine>,
@@ -1131,7 +1132,7 @@ impl App {
                 app_counts: HashMap::new(),
                 open_members: None,
                 members_hover: (false, false),
-                members_popover_names: None,
+                channel_people: None,
                 connect_orgs: Vec::new(),
                 back: Vec::new(),
                 forward: Vec::new(),
@@ -2471,8 +2472,9 @@ impl App {
         self.channel = channel;
         self.open_members = None;
         self.members_hover = (false, false);
-        self.members_popover_names = None;
+        self.channel_people = None;
         self.sync_connect_orgs(cx);
+        self.load_join_people(cx);
         self.close_thread(cx);
         self.tab = ConversationTab::Messages;
         // An open pins panel follows the conversation: fetch the new one's pins.
@@ -2506,8 +2508,9 @@ impl App {
             Event::StoreChanged { channel } => {
                 if *channel == self.channel {
                     self.load_history(channel, cx);
-                    // The members popover names the history's recent authors: stale now.
-                    self.members_popover_names = None;
+                    // The channel's people are the history's recent authors: stale now.
+                    self.channel_people = None;
+                    self.load_join_people(cx);
                 }
                 self.refresh_dm_latest(channel, cx);
                 // The open thread: a fetched replies page landed, or a live reply arrived.
@@ -2956,8 +2959,9 @@ impl App {
         self.workspace = index;
         self.open_members = None;
         self.members_hover = (false, false);
-        self.members_popover_names = None;
+        self.channel_people = None;
         self.sync_connect_orgs(cx);
+        self.load_join_people(cx);
         self.searching = false;
         self.drafts_open = false;
         self.later_open = false;
@@ -3502,10 +3506,18 @@ impl Render for App {
             let column = column.child(tabs).children(bookmark_bar);
             match &self.tab {
                 // The Pins tab keeps the transcript under it; its panel is the right column.
-                ConversationTab::Messages | ConversationTab::Pins => column
-                    .child(div().flex_1().min_h_0().child(self.messages.clone()))
-                    .children(self.dnd_banner(conversation.as_ref(), cx))
-                    .child(self.composer.clone()),
+                ConversationTab::Messages | ConversationTab::Pins => {
+                    let column =
+                        column.child(div().flex_1().min_h_0().child(self.messages.clone()));
+                    // In a public channel the user is not in, Slack's Join card takes the
+                    // composer's place.
+                    match conversation.as_ref().filter(|c| joinable(c)) {
+                        Some(joinable) => column.child(self.join_card(joinable, cx)),
+                        None => column
+                            .children(self.dnd_banner(conversation.as_ref(), cx))
+                            .child(self.composer.clone()),
+                    }
+                }
                 ConversationTab::Canvas => {
                     column.child(div().flex_1().min_h_0().child(canvas_view(cx)))
                 }
@@ -4115,6 +4127,62 @@ impl App {
     /// <Org>" (two organizations by name, more as a count), the count linking to the channel's
     /// details. Built when the members or the snapshot change, never per frame.
     fn connect_bar(&self, cx: &Context<Self>) -> Option<ContextBar> {
+        let (teams, count, rest) = self.connect_line()?;
+        let (app, channel) = (cx.entity().downgrade(), self.channel.clone());
+        Some(Rc::new(move |_, cx| {
+            let (bg, fg, link) = (
+                crate::theme::connect_bar(cx),
+                cx.theme().foreground,
+                cx.theme().link,
+            );
+            let (app, channel) = (app.clone(), channel.clone());
+            h_flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                // Slack's bar shows about 38pt of amber; the composer box covers the rest.
+                .pt(px(10.))
+                .pb(px(10. + composer::BAR_TUCK))
+                .rounded_tl(px(8.))
+                .rounded_tr(px(8.))
+                .bg(bg)
+                .text_size(px(13.))
+                .text_color(fg)
+                .child(org_stack(&teams, bg))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("connect-count")
+                                .flex_none()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(link)
+                                .cursor_pointer()
+                                .hover(|count| count.underline())
+                                .child(count.clone())
+                                .on_click(move |_, window, cx| {
+                                    let _ = app.update(cx, |app, cx| {
+                                        app.open_channel_details(
+                                            &channel,
+                                            channel_details::DetailsTab::About,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                        .child(div().min_w_0().truncate().child(rest.clone())),
+                )
+                .into_any_element()
+        }))
+    }
+
+    /// Slack's Slack Connect line for the open conversation: up to three of the other
+    /// organizations, then "<N> external people" and "are from <Org>" (two organizations by
+    /// name, more as a count). `None` for a channel only this workspace is in.
+    fn connect_line(&self) -> Option<(Vec<Team>, String, String)> {
         let conversation = self.fixtures.conversation(&self.channel)?;
         if !conversation.is_ext_shared {
             return None;
@@ -4156,67 +4224,7 @@ impl App {
             )
         };
         teams.truncate(3);
-        let (app, channel) = (cx.entity().downgrade(), self.channel.clone());
-        Some(Rc::new(move |_, cx| {
-            let (bg, fg, link) = (
-                crate::theme::connect_bar(cx),
-                cx.theme().foreground,
-                cx.theme().link,
-            );
-            let (app, channel) = (app.clone(), channel.clone());
-            h_flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                // Slack's bar shows about 38pt of amber; the composer box covers the rest.
-                .pt(px(10.))
-                .pb(px(10. + composer::BAR_TUCK))
-                .rounded_tl(px(8.))
-                .rounded_tr(px(8.))
-                .bg(bg)
-                .text_size(px(13.))
-                .text_color(fg)
-                // Slack stacks the icons left to right, each ringed in the bar's color.
-                .child(
-                    h_flex()
-                        .flex_none()
-                        .children(teams.iter().enumerate().map(|(ix, team)| {
-                            div()
-                                .when(ix > 0, |chip| chip.ml(px(-7.)))
-                                .p(px(1.))
-                                .rounded(px(5.))
-                                .bg(bg)
-                                .child(channel_details::org_chip(team, 16.))
-                        })),
-                )
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .gap_1()
-                        .child(
-                            div()
-                                .id("connect-count")
-                                .flex_none()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(link)
-                                .cursor_pointer()
-                                .hover(|count| count.underline())
-                                .child(count.clone())
-                                .on_click(move |_, window, cx| {
-                                    let _ = app.update(cx, |app, cx| {
-                                        app.open_channel_details(
-                                            &channel,
-                                            channel_details::DetailsTab::About,
-                                            window,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        )
-                        .child(div().min_w_0().truncate().child(rest.clone())),
-                )
-                .into_any_element()
-        }))
+        Some((teams, count, rest))
     }
 
     /// Recompute [`Self::connect_orgs`] for the open conversation: only a Slack Connect
@@ -4301,19 +4309,19 @@ impl App {
                                     .child("View all members of this channel"),
                             )
                             .children(
-                                includes_line(self.members_popover_names.as_deref().unwrap_or(&[]))
+                                includes_line(&self.people_names())
                                     .map(|line| div().text_color(ink.opacity(0.65)).child(line)),
                             ),
                     ),
             )
     }
 
-    /// The members popover's names for the open channel: fixture mode reads the snapshot's
+    /// The open channel's people ([`Self::channel_people`]): fixture mode reads the snapshot's
     /// loaded history in hand; live mode reads the same local-store history the transcript
     /// opened with, off the UI thread. Cached until the channel or its history changes -
     /// never per frame.
-    fn update_members_popover(&mut self, cx: &mut Context<Self>) {
-        if self.members_popover_names.is_some() {
+    fn load_channel_people(&mut self, cx: &mut Context<Self>) {
+        if self.channel_people.is_some() {
             return;
         }
         let channel = self.channel.clone();
@@ -4325,7 +4333,7 @@ impl App {
                 let history = cx.background_executor().spawn(read).await;
                 this.update(cx, |app, cx| {
                     if app.channel == channel {
-                        app.members_popover_names = Some(app.popover_names(&channel, &history));
+                        app.channel_people = Some(app.people(&channel, &history));
                         if app.members_hover.0 || app.members_hover.1 {
                             cx.notify();
                         }
@@ -4340,20 +4348,172 @@ impl App {
                 .get(&channel)
                 .cloned()
                 .unwrap_or_default();
-            self.members_popover_names = Some(self.popover_names(&channel, &history));
+            self.channel_people = Some(self.people(&channel, &history));
             cx.notify();
         }
     }
 
-    /// The popover's names for `channel` from its loaded history: the most recent distinct
-    /// human authors, newest first, topped up from the member list.
-    fn popover_names(&self, channel: &ChannelId, history: &[Message]) -> Vec<String> {
+    /// `channel`'s people from its loaded history: the most recent distinct human authors,
+    /// newest first, topped up from the member list.
+    fn people(&self, channel: &ChannelId, history: &[Message]) -> Vec<UserId> {
         let conversation = self.fixtures.conversation(channel);
-        popover_names(
+        channel_people(
             &self.fixtures,
             self.member_ids(channel, conversation.unwrap_or(&Conversation::default())),
             history,
         )
+    }
+
+    /// The names of [`Self::channel_people`], as the members popover lists them.
+    fn people_names(&self) -> Vec<String> {
+        self.channel_people
+            .iter()
+            .flatten()
+            .map(|user| self.fixtures.user_name(user).to_owned())
+            .collect()
+    }
+
+    /// Load the open channel's people when it shows the Join card, which names them.
+    fn load_join_people(&mut self, cx: &mut Context<Self>) {
+        if self
+            .fixtures
+            .conversation(&self.channel)
+            .is_some_and(joinable)
+        {
+            self.load_channel_people(cx);
+        }
+    }
+
+    /// Slack's card in place of the composer in a public channel the user is not in: the
+    /// faces of up to three of its people, "Join #name", who is here (two names and how many
+    /// more people, then its apps), a shared channel's Slack Connect line, and the green Join
+    /// Channel button.
+    fn join_card(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (surface, _) = crate::theme::composer_surfaces(cx);
+        let (foreground, muted) = (theme.foreground, theme.muted_foreground);
+        let people = self.channel_people.as_deref().unwrap_or(&[]);
+        // Each face is ringed in the card's color, overlapping the one before by 8px.
+        let faces = h_flex().children(people.iter().take(3).enumerate().map(|(ix, user)| {
+            let face = crate::avatars::with_external_badge(
+                &self.fixtures,
+                Some(user),
+                crate::avatars::user_chip(&self.fixtures, user, 36.),
+                36.,
+                surface,
+            );
+            div()
+                .when(ix > 0, |face| face.ml(px(-12.)))
+                .p(px(2.))
+                .rounded(px(10.))
+                .bg(surface)
+                .child(face)
+        }));
+        let names: Vec<&str> = people
+            .iter()
+            .take(2)
+            .map(|user| self.fixtures.user_name(user))
+            .collect();
+        let humans = self
+            .member_counts
+            .get(&conversation.id)
+            .copied()
+            .or(conversation.num_members)
+            .map_or(names.len(), |count| count as usize);
+        let apps: Vec<&str> = self
+            .member_ids(&conversation.id, conversation)
+            .iter()
+            .filter_map(|member| self.fixtures.user(member))
+            // Slack names the channel's apps, not its workflows' bots, alphabetically.
+            .filter(|user| {
+                let workflow = user.extra.get("is_workflow_bot").and_then(|v| v.as_bool());
+                user.is_bot && !user.deleted && workflow != Some(true)
+            })
+            .map(|user| self.fixtures.name_of(user))
+            .collect();
+        let mut apps = apps;
+        apps.sort_by_key(|name| name.to_lowercase());
+        let who = [
+            who_is_here(&names, humans.saturating_sub(names.len())),
+            apps_also_here(&apps),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+        let external = self.connect_line().map(|(teams, count, rest)| {
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(org_stack(&teams, surface))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(foreground)
+                                .child(count),
+                        )
+                        .child(div().min_w_0().truncate().child(rest)),
+                )
+        });
+        let name = conversation.name.clone().unwrap_or_default();
+        div().w_full().px_4().pb_3().child(
+            h_flex()
+                .w_full()
+                .items_start()
+                .justify_between()
+                .gap_4()
+                .p_4()
+                .rounded_lg()
+                .border_1()
+                .border_color(foreground.opacity(0.15))
+                .bg(surface)
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .text_sm()
+                        .text_color(muted)
+                        // The faces' 2px rings sit in the card's padding, as Slack's do.
+                        .child(faces.ml(px(-2.)).mt(px(-2.)))
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(foreground)
+                                .child(format!("Join # {name}")),
+                        )
+                        .when(!who.is_empty(), |column| column.child(who))
+                        .children(external),
+                )
+                .child(
+                    Button::new("join-channel")
+                        .primary()
+                        .with_size(gpui_kit::component::Size::Large)
+                        .label("Join Channel")
+                        .on_click(cx.listener(|app, _, window, cx| app.join_channel(window, cx))),
+                ),
+        )
+    }
+
+    /// The Join card's button: join the open channel on Slack; the card gives way to the
+    /// composer once the core stores it as joined. Fixture mode logs it.
+    fn join_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixtures.sample {
+            notify(
+                "Join Channel",
+                "Logged. Joining runs against a live workspace.",
+                window,
+                cx,
+            );
+            return;
+        }
+        self.bridge
+            .send(Command::JoinConversation(self.channel.clone()));
     }
 
     /// The conversation header row: star, peer avatar for DMs (presence dot for IMs, stacked
@@ -4460,7 +4620,7 @@ impl App {
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         this.members_hover.0 = *hovered;
                         if *hovered {
-                            this.update_members_popover(cx);
+                            this.load_channel_people(cx);
                         }
                         cx.notify();
                     }))
@@ -5242,12 +5402,65 @@ fn includes_line(names: &[String]) -> Option<String> {
     }
 }
 
-/// The header members popover's names: the most recent distinct human authors of `history`
-/// (newest first, never the signed-in user, never bots), topped up from `members` - the
-/// message list's name resolution ([`Fixtures::user_name`]). Free-standing for the test.
-fn popover_names(fixtures: &Fixtures, members: &[UserId], history: &[Message]) -> Vec<String> {
+/// Slack's stacked organization icons (Slack Connect bar and Join card), left to right, each
+/// ringed in `ring`, the surface behind them.
+fn org_stack(teams: &[Team], ring: Hsla) -> Div {
+    h_flex()
+        .flex_none()
+        .children(teams.iter().enumerate().map(|(ix, team)| {
+            div()
+                .when(ix > 0, |chip| chip.ml(px(-7.)))
+                .p(px(1.))
+                .rounded(px(5.))
+                .bg(ring)
+                .child(channel_details::org_chip(team, 16.))
+        }))
+}
+
+/// Whether `conversation` is a public channel the user is not in, where Slack shows the
+/// Join card instead of the composer.
+fn joinable(conversation: &Conversation) -> bool {
+    conversation.kind() == ConversationKind::PublicChannel
+        && !conversation.is_member
+        && !conversation.is_archived
+}
+
+/// The Join card's "who is here": up to two names, then how many more people.
+fn who_is_here(names: &[&str], more: usize) -> Option<String> {
+    let more_people = |n: usize| match n {
+        1 => "1 more person is".to_owned(),
+        n => format!("{n} more people are"),
+    };
+    Some(match (names, more) {
+        ([], 0) => return None,
+        ([], 1) => "1 person is here.".to_owned(),
+        ([], n) => format!("{n} people are here."),
+        ([a], 0) => format!("{a} is here."),
+        ([a], n) => format!("{a} and {} here.", more_people(n)),
+        ([a, b, ..], 0) => format!("{a} and {b} are here."),
+        ([a, b, ..], n) => format!("{a}, {b}, and {} here.", more_people(n)),
+    })
+}
+
+/// The Join card's apps: "mastermind and norcebot are also here."
+fn apps_also_here(apps: &[&str]) -> Option<String> {
+    match apps {
+        [] => None,
+        [a] => Some(format!("{a} is also here.")),
+        [a, b] => Some(format!("{a} and {b} are also here.")),
+        [a, b, rest @ ..] => Some(format!(
+            "{a}, {b}, and {} more apps are also here.",
+            rest.len()
+        )),
+    }
+}
+
+/// A channel's people as Slack names them: the most recent distinct human authors of
+/// `history` (newest first, never the signed-in user, never bots), topped up from `members`.
+/// Free-standing for the test.
+fn channel_people(fixtures: &Fixtures, members: &[UserId], history: &[Message]) -> Vec<UserId> {
     const LIMIT: usize = 3;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<UserId> = Vec::new();
     let mut seen = HashSet::new();
     let self_user = &fixtures.self_user;
     for message in history.iter().rev() {
@@ -5257,14 +5470,14 @@ fn popover_names(fixtures: &Fixtures, members: &[UserId], history: &[Message]) -
             continue;
         }
         if let Some(user) = message.user.as_ref() {
-            push_popover_name(fixtures, self_user, &mut names, &mut seen, user);
+            push_person(fixtures, self_user, &mut names, &mut seen, user);
             if names.len() == LIMIT {
                 return names;
             }
         }
     }
     for member in members {
-        push_popover_name(fixtures, self_user, &mut names, &mut seen, member);
+        push_person(fixtures, self_user, &mut names, &mut seen, member);
         if names.len() == LIMIT {
             break;
         }
@@ -5272,12 +5485,12 @@ fn popover_names(fixtures: &Fixtures, members: &[UserId], history: &[Message]) -
     names
 }
 
-/// Count `user` toward the popover's names once: only resolved people who are not the
+/// Count `user` toward the channel's people once: only resolved people who are not the
 /// signed-in user.
-fn push_popover_name(
+fn push_person(
     fixtures: &Fixtures,
     self_user: &UserId,
-    names: &mut Vec<String>,
+    names: &mut Vec<UserId>,
     seen: &mut HashSet<UserId>,
     user: &UserId,
 ) {
@@ -5290,7 +5503,7 @@ fn push_popover_name(
     if record.is_bot || record.deleted {
         return;
     }
-    names.push(fixtures.user_name(user).to_owned());
+    names.push(user.clone());
 }
 
 fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) -> Stateful<Div> {
@@ -5359,7 +5572,7 @@ mod tests {
     }
 
     #[test]
-    fn popover_names_recent_authors_then_members() {
+    fn channel_people_recent_authors_then_members() {
         let fixtures = fixtures::load();
         let person = |id: &str| User {
             id: UserId::from(id),
@@ -5390,9 +5603,9 @@ mod tests {
         let mut fixtures = fixtures;
         fixtures.self_user = UserId::from("U0SELF");
         fixtures.users = vec![person("U0ONE"), person("U0TWO"), person("U0THREE"), bot];
-        let names = popover_names(&fixtures, &members, &history);
+        let people = channel_people(&fixtures, &members, &history);
         assert_eq!(
-            names,
+            people.iter().map(UserId::as_str).collect::<Vec<_>>(),
             ["U0TWO", "U0ONE", "U0THREE"],
             "newest author first, then member top-up"
         );
