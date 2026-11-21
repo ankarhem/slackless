@@ -823,6 +823,27 @@ pub fn load() -> Fixtures {
         .reactions
         .push(reaction("shipit", &["U0BOB", "U0ME"]));
     eng.push(release_message(DAY + 1_620));
+    // A blank line inside one rich-text section, the way Slack's API packs it into a
+    // `\n\n`-leading text element (2026-11-21, live norce-partner-announcements data).
+    // Last in the channel so the tail-anchored transcript shows it without jumping.
+    eng.push(msg_rich(
+        "C0ENG",
+        DAY + 1_640,
+        "U0DAN",
+        "Rollout notes:\n\nStage one is done, stage two next.",
+        vec![section(vec![
+            plain("Rollout notes:"),
+            plain("\n\nStage one is done, "),
+            styled(
+                "stage two",
+                TextStyle {
+                    bold: true,
+                    ..Default::default()
+                },
+            ),
+            plain(" next."),
+        ])],
+    ));
     let eng_replies = vec![
         msg(
             "C0ENG",

@@ -2039,14 +2039,115 @@ impl ParagraphBuilder {
     }
 }
 
-fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
-    // Stable across frames and unique within the message: the paragraph's position under this
-    // theme plus its text (separate themes render separate blocks of one message).
+/// One block of a paragraph after splitting at blank-line runs: its text, runs and links
+/// (the same shape [`Segment::Text`] carries).
+type ParagraphBlock = (String, Vec<TextRun>, Vec<(Range<usize>, LinkTarget)>);
+
+/// Slack renders a run of one or more blank lines inside message text as a single short
+/// paragraph break, not an empty text line: the web client emits an 8px block
+/// (`.c-mrkdwn__br { height: 8px; display: block }`) between the pieces. Splits one
+/// paragraph's text (with its byte-offset runs and link ranges) at those runs so the
+/// pieces can stack with the break between them; text without blank lines comes back as
+/// the single block it always was.
+fn paragraph_break_split(
+    text: &str,
+    runs: &[TextRun],
+    links: &[(Range<usize>, LinkTarget)],
+) -> Vec<ParagraphBlock> {
+    let slice_block = |range: Range<usize>| {
+        let block_text = text[range.clone()].to_owned();
+        let mut block_runs = Vec::new();
+        let mut at = 0;
+        for run in runs {
+            let run_range = at..at + run.len;
+            at = run_range.end;
+            let start = run_range.start.max(range.start);
+            let end = run_range.end.min(range.end);
+            if start < end {
+                block_runs.push(TextRun {
+                    len: end - start,
+                    ..run.clone()
+                });
+            }
+        }
+        let block_links = links
+            .iter()
+            .filter_map(|(link, target)| {
+                let start = link.start.max(range.start);
+                let end = link.end.min(range.end);
+                (start < end).then(|| ((start - range.start)..(end - range.start), target.clone()))
+            })
+            .collect();
+        (block_text, block_runs, block_links)
+    };
+
+    let bytes = text.as_bytes();
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    let mut ix = 0;
+    while ix < bytes.len() {
+        if bytes[ix] != b'\n' {
+            ix += 1;
+            continue;
+        }
+        let mut end = ix;
+        while end < bytes.len() && bytes[end] == b'\n' {
+            end += 1;
+        }
+        if end - ix >= 2 {
+            blocks.push(slice_block(start..ix));
+            start = end;
+        }
+        ix = end;
+    }
+    blocks.push(slice_block(start..text.len()));
+    blocks
+}
+
+/// One text piece of a paragraph: selectable in the transcript when `order_base` is set,
+/// plain (links still clickable) otherwise. Takes its own slot of the theme's paragraph
+/// counter, so its id and document order stay unique however many pieces a paragraph
+/// splits into.
+fn text_element(
+    text: String,
+    runs: Vec<TextRun>,
+    links: Vec<(Range<usize>, LinkTarget)>,
+    n: usize,
+    theme: &RunTheme,
+    order_base: Option<u64>,
+    routed: &Option<LinkHandler>,
+) -> AnyElement {
     let paragraph = theme.paragraphs.get();
     theme.paragraphs.set(paragraph + 1);
+    if let Some(base) = order_base {
+        return SelectableParagraph::new(
+            paragraph_id(&theme.key, paragraph, n, &text),
+            text,
+            runs,
+            links,
+            base + paragraph as u64,
+            theme,
+        )
+        .into_any_element();
+    }
+    if links.is_empty() {
+        return StyledText::new(text).with_runs(runs).into_any_element();
+    }
+    let id = paragraph_id(&theme.key, paragraph, n, &text);
+    let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
+    let styled = StyledText::new(text).with_runs(runs);
+    let routed = routed.clone();
+    InteractiveText::new(id, styled)
+        .on_click(ranges, move |ix, window, cx| {
+            route_link(routed.as_ref(), targets[ix].clone(), window, cx)
+        })
+        .into_any_element()
+}
+
+fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
     // Message text participates in the window selection (one participant per paragraph,
     // ordered with the transcript's reading order); preview text stays plain.
-    let order = theme.order.map(|base| base + paragraph as u64);
+    let order_base = theme.order;
     let routed = theme.links.clone();
     // Text wraps only inside a width-constrained block: a lone text run (most paragraphs)
     // renders in a full-width block; runs mixed with inline images shrink to wrap in the row.
@@ -2066,39 +2167,27 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                 } else {
                     trim_breaks(&mut text, &mut runs, &mut links)
                 };
-                let element = (!text.is_empty()).then(|| {
-                    if let Some(order) = order {
-                        return SelectableParagraph::new(
-                            paragraph_id(&theme.key, paragraph, n, &text),
-                            text,
-                            runs,
-                            links,
-                            order,
-                            theme,
-                        )
-                        .into_any_element();
-                    }
-                    if links.is_empty() {
-                        return StyledText::new(text).with_runs(runs).into_any_element();
-                    }
-                    let id = paragraph_id(&theme.key, paragraph, n, &text);
-                    let (ranges, targets): (Vec<_>, Vec<_>) = links.into_iter().unzip();
-                    let styled = StyledText::new(text).with_runs(runs);
-                    let routed = routed.clone();
-                    InteractiveText::new(id, styled)
-                        .on_click(ranges, move |ix, window, cx| {
-                            route_link(routed.as_ref(), targets[ix].clone(), window, cx)
-                        })
-                        .into_any_element()
-                });
-                if single {
-                    return div().w_full().min_w_0().children(element);
+                let blocks = paragraph_break_split(&text, &runs, &links);
+                if single && blocks.len() == 1 {
+                    let (text, runs, links) = blocks.into_iter().next().unwrap();
+                    return div().w_full().min_w_0().child(text_element(
+                        text, runs, links, n, theme, order_base, &routed,
+                    ));
                 }
                 if lead {
                     row = row.child(div().w_full().h_0());
                 }
-                if let Some(element) = element {
-                    row = row.child(div().min_w_0().child(element));
+                for (b, (text, runs, links)) in blocks.into_iter().enumerate() {
+                    // The break between the pieces: Slack's 8px `c-mrkdwn__br` block, which
+                    // the wrap row stacks between the two texts.
+                    if b > 0 {
+                        row = row.child(div().w_full().h(px(8.)));
+                    }
+                    if !text.is_empty() {
+                        let element =
+                            text_element(text, runs, links, n, theme, order_base, &routed);
+                        row = row.child(div().min_w_0().child(element));
+                    }
                 }
                 if trail {
                     row = row.child(div().w_full().h_0());
@@ -2109,7 +2198,7 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                 continue;
             }
             Segment::Chip { url, label } => {
-                let id = format!("chip-{}-{paragraph}-{n}", theme.key);
+                let id = format!("chip-{}-{}-{n}", theme.key, theme.paragraphs.get());
                 let target = LinkTarget::Url(url.clone());
                 let routed = routed.clone();
                 row = row.child(
@@ -3033,17 +3122,28 @@ pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, edited: bool, cx: &Ap
     // The edit marker rides inline at the end of the last line that renders text.
     let lines: Vec<&str> = text.split('\n').collect();
     let last_text_line = lines.iter().rposition(|line| !line.is_empty());
-    v_flex()
-        .min_w_0()
-        .children(lines.iter().enumerate().map(|(n, line)| {
-            mrkdwn_line(
-                line,
-                kcx.fixtures,
-                &theme,
-                edited && Some(n) == last_text_line,
-            )
-            .unwrap_or_else(|| div().h(px(6.)))
-        }))
+    let mut column = v_flex().min_w_0();
+    let mut blank = false;
+    for (n, line) in lines.iter().enumerate() {
+        // A run of blank lines is one 8px break, like the rich-text path's `c-mrkdwn__br`.
+        if line.is_empty() {
+            if !blank {
+                column = column.child(div().h(px(8.)));
+            }
+            blank = true;
+            continue;
+        }
+        blank = false;
+        if let Some(row) = mrkdwn_line(
+            line,
+            kcx.fixtures,
+            &theme,
+            edited && Some(n) == last_text_line,
+        ) {
+            column = column.child(row);
+        }
+    }
+    column
 }
 
 /// A one-paragraph mrkdwn preview (the DM list): formatting, links and emoji as the
@@ -3741,6 +3841,42 @@ mod tests {
                 "a drag spans messages in reading order"
             );
             drop(harness);
+        });
+    }
+
+    #[gpui::test]
+    fn blank_lines_render_as_a_short_paragraph_break(cx: &mut TestAppContext) {
+        // Slack's blank line is an 8px `c-mrkdwn__br` block, not an empty text line
+        // (measured on the official client: line pitch ~22.5px, blank-line pitch ~30px,
+        // CSS height 8px). The fixture's "\n\n" sits inside one run, so splitting at the
+        // break must slice runs and keep styling on both sides.
+        let first = "Rollout notes:";
+        let second = "Stage one is done, stage two next.";
+        with_transcript("C0ENG", cx, |_, cx| {
+            // The blank-line message is the channel's last, so the tail-anchored transcript
+            // paints it without jumping.
+            let (across_break, line_height) = PAINTED.with(|painted| {
+                let painted = painted.borrow();
+                let find = |text: &str| {
+                    painted
+                        .iter()
+                        .rev()
+                        .find(|(painted, _)| painted.as_ref() == text)
+                        .map(|(_, layout)| layout.clone())
+                        .unwrap_or_else(|| panic!("{text:?} was not painted"))
+                };
+                let first = find(first);
+                let second = find(second);
+                let line_height = first.line_height();
+                let across_break = second.position_for_index(0).unwrap().y
+                    - first.position_for_index(0).unwrap().y;
+                (across_break, line_height)
+            });
+            assert_eq!(
+                across_break - (line_height + px(8.)),
+                px(0.),
+                "a blank line is Slack's short 8px break, not an empty text line"
+            );
         });
     }
 
