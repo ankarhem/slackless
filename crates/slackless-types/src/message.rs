@@ -111,6 +111,10 @@ pub struct Message {
     /// Metadata-only messages (`message_changed`, `message_deleted`, ...) that must not render.
     #[serde(default, deserialize_with = "null_default")]
     pub hidden: bool,
+    /// Shown only to the signed-in user ("Only visible to you"), such as Giphy's preview:
+    /// it arrives on the websocket alone and is gone from history after a reload.
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_ephemeral: bool,
     #[serde(default)]
     pub deleted_ts: Option<Ts>,
     #[serde(default)]

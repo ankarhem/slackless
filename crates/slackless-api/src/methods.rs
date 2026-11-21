@@ -15,7 +15,7 @@ use crate::de::{lenient_bool, lenient_u32, lenient_vec, null_default, or_default
 use crate::pagination::{Page, paginate};
 use crate::types::endpoints::method;
 use crate::types::{
-    ApiResponse, Attachment, Block, BotId, ChannelId, ChannelSection, Conversation,
+    ApiResponse, Attachment, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation,
     ConversationKind, DndStatus, Empty, File, Latest, Message, RichTextBlock, SectionKind, Team,
     TeamId, Ts, User, UserId, UserPresence,
 };
@@ -27,6 +27,44 @@ const REASON_MESSAGE_SEND: &str = "webapp_message_send";
 const REASON_REACTION: &str = "changeReactionFromUserAction";
 /// `_x_mode` the web client sends on writes.
 const MODE_ONLINE: &str = "online";
+/// `_x_reason` for slash commands Slack runs.
+const REASON_COMMAND: &str = "executeCommand";
+/// `_x_reason` for Block Kit interactions.
+const REASON_BLOCK_ACTION: &str = "dispatch_action_to_developer";
+
+/// The web client's per-request `client_token`: `web-<unix ms>`.
+fn client_token() -> String {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("web-{}", since_epoch.as_millis())
+}
+
+/// Where a Block Kit action happened, as `blocks.actions`'s `container` names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionContainer {
+    pub channel: ChannelId,
+    pub message_ts: Ts,
+    /// The legacy attachment holding the block (Giphy's preview), by its `id`.
+    pub attachment_id: Option<i64>,
+    pub is_ephemeral: bool,
+}
+
+impl ActionContainer {
+    fn json(&self) -> Value {
+        let (channel, ts) = (self.channel.as_str(), self.message_ts.as_str());
+        match self.attachment_id {
+            Some(id) => serde_json::json!({
+                "type": "message_attachment", "message_ts": ts, "attachment_id": id,
+                "channel_id": channel, "is_ephemeral": self.is_ephemeral,
+            }),
+            None => serde_json::json!({
+                "type": "message", "message_ts": ts, "channel_id": channel,
+                "is_ephemeral": self.is_ephemeral,
+            }),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Request options
@@ -1327,6 +1365,80 @@ impl SlackApi {
             .data;
         posted.client_msg_id = Some(client_msg_id);
         Ok(posted)
+    }
+
+    /// `chat.command` in the web client's wire format: the arguments as one `rich_text` block
+    /// (omitted when there are none) and a fresh client token. Slack answers on the
+    /// websocket: a posted message, an ephemeral (Giphy's preview) or a modal.
+    pub async fn chat_command(
+        &self,
+        channel: &ChannelId,
+        command: &str,
+        args: &str,
+        thread_ts: Option<&Ts>,
+        team: &TeamId,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("command", command.to_owned()),
+            ("disp", command.to_owned()),
+        ];
+        if !args.is_empty() {
+            let blocks: [Block; 1] = [RichTextBlock::plain_text(args.to_owned()).into()];
+            params.push(("blocks", serde_json::to_string(&blocks)?));
+        }
+        params.push(("channel", channel.to_string()));
+        params.push(("client_token", client_token()));
+        if let Some(thread_ts) = thread_ts {
+            params.push(("thread_ts", thread_ts.to_string()));
+        }
+        params.extend([
+            ("team_id", team.to_string()),
+            ("_x_reason", REASON_COMMAND.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ]);
+        self.call::<Empty>(method::CHAT_COMMAND, params).await?;
+        Ok(())
+    }
+
+    /// `blocks.actions`: a Block Kit interaction dispatched to the app (`bot`, `app_id`) that
+    /// posted the message. `action` is the element as the message declared it plus its
+    /// `block_id`. Slack answers on the websocket: the message changed or deleted, a message
+    /// posted.
+    pub async fn blocks_actions(
+        &self,
+        bot: &BotId,
+        app_id: &str,
+        team: &TeamId,
+        action: &Value,
+        container: &ActionContainer,
+    ) -> Result<()> {
+        let params = vec![
+            ("service_id", bot.to_string()),
+            ("app_id", app_id.to_owned()),
+            ("service_team_id", team.to_string()),
+            ("actions", serde_json::to_string(&[action])?),
+            ("container", container.json().to_string()),
+            ("client_token", client_token()),
+            ("state", r#"{"values":{}}"#.to_owned()),
+            ("_x_reason", REASON_BLOCK_ACTION.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::BLOCKS_ACTIONS, params).await?;
+        Ok(())
+    }
+
+    /// `bots.info`: a bot's profile (name, icons, app) for messages that carry only its id.
+    pub async fn bots_info(&self, bot: &BotId) -> Result<BotProfile> {
+        #[derive(Deserialize)]
+        struct BotInfo {
+            bot: BotProfile,
+        }
+        let params = vec![("bot", bot.to_string())];
+        Ok(self
+            .call::<BotInfo>(method::BOTS_INFO, params)
+            .await?
+            .data
+            .bot)
     }
 
     /// `chat.update`: replaces the text and blocks of message `ts`.

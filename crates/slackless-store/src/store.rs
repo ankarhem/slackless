@@ -114,6 +114,17 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets the current state of ephemeral messages ("Only visible to you", like Giphy's
+    /// preview): Slack keeps no copy, so one left from a past session would otherwise show
+    /// forever. Their revisions stay in the log. Returns how many were dropped.
+    pub fn drop_ephemeral(&mut self, workspace: &TeamId) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM message_current
+             WHERE workspace_id = ?1 AND json_extract(json, '$.is_ephemeral') = 1",
+            params![workspace.as_str()],
+        )?)
+    }
+
     /// Records a `message_deleted` as a tombstone revision carrying the prior content
     /// (`previous`, else the current stored state). Nothing is removed.
     ///

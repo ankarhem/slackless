@@ -38,7 +38,7 @@ pub use reducer::apply_event;
 use api::MessageContent;
 use rtm::ConnectionState;
 use store::StoredMessage;
-use types::{ChannelId, File, Presence, Ts, UserId};
+use types::{BotId, ChannelId, File, Presence, TeamId, Ts, UserId};
 
 /// Commands a front-end sends into the core.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +118,28 @@ pub enum Command {
         channel: ChannelId,
         ts: Ts,
         name: String,
+    },
+    /// Run a slash command Slack handles (`chat.command`, e.g. `/giphy`) in `channel`, or in
+    /// the thread at `thread_ts`. Its result arrives on the websocket; a refusal (a command
+    /// the workspace does not have) is announced as [`Event::CommandFailed`].
+    RunCommand {
+        channel: ChannelId,
+        /// With its slash: `/giphy`.
+        command: String,
+        args: String,
+        thread_ts: Option<Ts>,
+    },
+    /// A Block Kit button pressed in a message: dispatch it to the app that posted the
+    /// message (`blocks.actions`). The outcome arrives on the websocket (Giphy's preview
+    /// replaced or deleted, its GIF posted).
+    BlockAction {
+        bot: BotId,
+        app_id: String,
+        /// The team that installed the app; the signed-in workspace when `None`.
+        team: Option<TeamId>,
+        /// The element as the message declared it, plus its `block_id`.
+        action: serde_json::Value,
+        container: api::ActionContainer,
     },
     /// Search with Slack's modifier syntax: local store results first, then Slack's.
     Search(String),
@@ -324,6 +346,9 @@ pub enum Event {
         channel: ChannelId,
         canvas_id: String,
     },
+    /// Slack refused a [`Command::RunCommand`]: the command and Slack's error code
+    /// (`unknown_command` for one the workspace does not have).
+    CommandFailed { command: String, error: String },
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

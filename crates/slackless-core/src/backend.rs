@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use crate::api::{
-    self, ActivityEntry, ActivityFeed, ChannelBookmark, ClientCounts, FilesFilter, HistoryOpts,
-    ListOpts, MessageContent, Page, PinnedItem, PostedMessage, SearchMessages, SearchOpts,
-    SectionCreated, SlackApi, ThreadsView, UserBoot,
+    self, ActionContainer, ActivityEntry, ActivityFeed, ChannelBookmark, ClientCounts, FilesFilter,
+    HistoryOpts, ListOpts, MessageContent, Page, PinnedItem, PostedMessage, SearchMessages,
+    SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
 };
 use crate::types::{
-    ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File, Message, Team,
-    TeamId, Ts, User, UserId, UserPresence,
+    BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File,
+    Message, Team, TeamId, Ts, User, UserId, UserPresence,
 };
 
 /// `conversations.history` page size the core requests (Slack max 999).
@@ -139,6 +139,27 @@ pub trait Backend: Clone + Send + Sync + 'static {
         ts: Ts,
         name: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Run a slash command Slack handles (`chat.command`) in `channel`, or in the thread at
+    /// `thread_ts`; `team` is the signed-in workspace.
+    fn run_command(
+        &self,
+        channel: ChannelId,
+        command: String,
+        args: String,
+        thread_ts: Option<Ts>,
+        team: TeamId,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Dispatch a Block Kit interaction to the app that posted the message (`blocks.actions`).
+    fn block_action(
+        &self,
+        bot: BotId,
+        app_id: String,
+        team: TeamId,
+        action: serde_json::Value,
+        container: ActionContainer,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// A bot's profile (`bots.info`), for messages that carry only its id.
+    fn bot_info(&self, bot: BotId) -> impl Future<Output = api::Result<BotProfile>> + Send;
     /// The followed threads of the Threads view (`subscriptions.thread.getView`), page one.
     fn threads_view(&self) -> impl Future<Output = api::Result<ThreadsView>> + Send;
     /// The Activity view's feed (`activity.feed`), page one; row bodies hydrate separately
@@ -379,6 +400,34 @@ impl Backend for SlackApi {
 
     async fn remove_reaction(&self, channel: ChannelId, ts: Ts, name: String) -> api::Result<()> {
         self.reactions_remove(&channel, &ts, &name).await
+    }
+
+    async fn run_command(
+        &self,
+        channel: ChannelId,
+        command: String,
+        args: String,
+        thread_ts: Option<Ts>,
+        team: TeamId,
+    ) -> api::Result<()> {
+        self.chat_command(&channel, &command, &args, thread_ts.as_ref(), &team)
+            .await
+    }
+
+    async fn block_action(
+        &self,
+        bot: BotId,
+        app_id: String,
+        team: TeamId,
+        action: serde_json::Value,
+        container: ActionContainer,
+    ) -> api::Result<()> {
+        self.blocks_actions(&bot, &app_id, &team, &action, &container)
+            .await
+    }
+
+    async fn bot_info(&self, bot: BotId) -> api::Result<BotProfile> {
+        self.bots_info(&bot).await
     }
 
     async fn search(&self, query: String) -> api::Result<SearchMessages> {

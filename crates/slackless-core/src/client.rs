@@ -17,7 +17,10 @@ use crate::fetcher::Fetcher;
 use crate::rtm::ConnectionState;
 use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
-use crate::types::{ChannelId, ConversationKind, SlackEvent, TeamId, Ts, UserId};
+use crate::types::event::MessageEvent;
+use crate::types::{
+    BotId, BotProfile, ChannelId, ConversationKind, SlackEvent, TeamId, Ts, UserId,
+};
 use crate::unfurl::{Unfurls, event_messages};
 use crate::{Command, Event, apply_event};
 
@@ -258,6 +261,8 @@ pub(crate) struct Core<B: Backend> {
     /// Team ids already sent to `team.info` this session (found or not): each is asked
     /// once. Shared with spawned tasks, which compute the ids off the `&self` borrow.
     teams_asked: Arc<Mutex<HashSet<TeamId>>>,
+    /// Bot profiles read through `bots.info` this session (see `attach_bot_profile`).
+    bots: HashMap<BotId, BotProfile>,
 }
 
 impl<B: Backend> Core<B> {
@@ -289,14 +294,19 @@ impl<B: Backend> Core<B> {
             presence_peers: Arc::new(Mutex::new(Vec::new())),
             users_asked: HashSet::new(),
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
+            bots: HashMap::new(),
         }
     }
 
     /// Startup hydrate: conversations, self, team and prefs from `client.userBoot`, the user
     /// directory, unread counts, then sidebar sections and custom emoji (one
     /// [`Event::SidebarChanged`] at the end). Every step reports its own failure without
-    /// aborting the rest.
+    /// aborting the rest. Ephemeral messages left from a past session are dropped first.
     pub async fn hydrate(&self) {
+        let ws = self.workspace.clone();
+        if let Err(e) = with_store(&self.store, move |s| s.drop_ephemeral(&ws)).await {
+            self.events.report("store", e.into());
+        }
         match self.backend.user_boot().await {
             Ok(boot) => {
                 let team = boot.team.clone();
@@ -641,6 +651,35 @@ impl<B: Backend> Core<B> {
                     Ok(backend.remove_reaction(channel, ts, name).await?)
                 });
             }
+            Command::RunCommand {
+                channel,
+                command,
+                args,
+                thread_ts,
+            } => self.spawn("chat.command", async move {
+                let ran = backend
+                    .run_command(channel, command.clone(), args, thread_ts, ws)
+                    .await;
+                match ran {
+                    Err(ApiError::Slack(error)) => {
+                        events.emit(Event::CommandFailed { command, error });
+                        Ok(())
+                    }
+                    ran => Ok(ran?),
+                }
+            }),
+            Command::BlockAction {
+                bot,
+                app_id,
+                team,
+                action,
+                container,
+            } => self.spawn("blocks.actions", async move {
+                let team = team.unwrap_or(ws);
+                Ok(backend
+                    .block_action(bot, app_id, team, action, container)
+                    .await?)
+            }),
             Command::Search(query) => self.spawn("search", async move {
                 let parsed = SearchQuery::parse(&query);
                 let messages =
@@ -869,10 +908,11 @@ impl<B: Backend> Core<B> {
                 }
                 self.events.emit(Event::Connection(state));
             }
-            RtmEvent::Event(event) => {
+            RtmEvent::Event(mut event) => {
                 if let Some(channel) = refresh_target(&event) {
                     self.refresh_conversation(channel);
                 }
+                self.attach_bot_profile(&mut event).await;
                 self.unfurls.resolve(event_messages(&event));
                 let ws = self.workspace.clone();
                 let changed = with_store(&self.store, move |s| apply_event(s, &ws, event)).await;
@@ -881,6 +921,33 @@ impl<B: Backend> Core<B> {
                 }
             }
         }
+    }
+
+    /// An ephemeral app message (Giphy's preview) carries only its `bot_id`: give it the
+    /// bot's profile (`bots.info`, once per bot per session) so it shows the app's name and
+    /// icon and its buttons know the app to dispatch to.
+    async fn attach_bot_profile(&mut self, event: &mut SlackEvent) {
+        let message = match event {
+            SlackEvent::Message(MessageEvent::Message(message)) => message.as_mut(),
+            SlackEvent::Message(MessageEvent::Changed(changed)) => changed.message.as_mut(),
+            _ => return,
+        };
+        let Some(bot) = message
+            .bot_id
+            .clone()
+            .filter(|_| message.is_ephemeral && message.bot_profile.is_none())
+        else {
+            return;
+        };
+        if !self.bots.contains_key(&bot) {
+            match self.backend.bot_info(bot.clone()).await {
+                Ok(profile) => {
+                    self.bots.insert(bot.clone(), profile);
+                }
+                Err(e) => return self.events.report("bots.info", e.into()),
+            }
+        }
+        message.bot_profile = self.bots.get(&bot).cloned();
     }
 
     /// Re-fetches a conversation whose event carries only its id.
@@ -1987,6 +2054,38 @@ pub(crate) mod tests {
 
         async fn remove_reaction(&self, _: ChannelId, _: Ts, _: String) -> api::Result<()> {
             Ok(())
+        }
+
+        async fn run_command(
+            &self,
+            _: ChannelId,
+            _: String,
+            _: String,
+            _: Option<Ts>,
+            _: TeamId,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn block_action(
+            &self,
+            _: crate::types::BotId,
+            _: String,
+            _: TeamId,
+            _: serde_json::Value,
+            _: api::ActionContainer,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn bot_info(
+            &self,
+            bot: crate::types::BotId,
+        ) -> api::Result<crate::types::BotProfile> {
+            Ok(crate::types::BotProfile {
+                id: bot,
+                ..Default::default()
+            })
         }
 
         async fn search(&self, _: String) -> api::Result<SearchMessages> {
