@@ -730,6 +730,8 @@ impl ThreadPanel {
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
             .map(|chips| chips.pl(px(TEXT_INSET)));
 
+        // Straddling the row's top edge would cut the root's bar off at the panel's top, so
+        // Slack keeps it inside the row, 3pt down.
         let toolbar = actions::hover_toolbar(
             &key,
             &self.fixtures.quick_reactions,
@@ -737,7 +739,8 @@ impl ThreadPanel {
             &handler,
             row_group.clone(),
             cx,
-        );
+        )
+        .when(is_root, |bar| bar.top(px(3.)));
         let menu_handler = handler;
         div()
             .id(SharedString::from(key))
