@@ -23,6 +23,7 @@ mod bridge;
 mod browser;
 mod canvas;
 mod channel_details;
+mod code_font;
 mod compose_targets;
 mod composer;
 mod directory;

@@ -1479,6 +1479,23 @@ fn avatar_gutter(
         .into_any_element()
 }
 
+/// Slack's `.c-app_badge` after an app's name: 10px bold "APP" in the secondary text
+/// color on a 14px tile with 2px corners.
+fn app_badge(cx: &App) -> Div {
+    let theme = cx.theme();
+    h_flex()
+        .flex_none()
+        .h(px(14.))
+        .px(px(3.))
+        .rounded(px(2.))
+        .bg(theme.secondary)
+        .text_color(theme.muted_foreground)
+        .text_size(px(10.))
+        .line_height(px(12.))
+        .font_weight(FontWeight::BOLD)
+        .child("APP")
+}
+
 fn message_header(
     message: &Message,
     author: &str,
@@ -1523,6 +1540,7 @@ fn message_header(
                     message.user.as_ref(),
                     handler,
                 ))
+                .when(message.bot_id.is_some(), |name| name.child(app_badge(cx)))
                 .children(status),
         )
         .child(div().text_xs().text_color(muted).child(stamp))
@@ -1759,7 +1777,11 @@ struct RunFlags {
 /// Theme-resolved fonts and colors shared by every run of one message render.
 struct RunTheme {
     base_font: Font,
+    /// Code blocks' face, sized by the block.
     mono_font: Font,
+    /// Inline code's face: smaller glyphs at the body size (see
+    /// [`crate::theme::INLINE_CODE_FAMILY`]).
+    code_font: Font,
     foreground: Hsla,
     muted: Hsla,
     border: Hsla,
@@ -1802,6 +1824,10 @@ impl RunTheme {
                 family: theme.mono_font_family.clone(),
                 ..base_font.clone()
             },
+            code_font: Font {
+                family: crate::theme::inline_code_family(cx),
+                ..base_font.clone()
+            },
             foreground: theme.foreground,
             muted: theme.muted_foreground,
             border: theme.border,
@@ -1838,7 +1864,7 @@ impl RunTheme {
         len: usize,
     ) -> TextRun {
         let mut font = if run_flags.code {
-            self.mono_font.clone()
+            self.code_font.clone()
         } else {
             self.base_font.clone()
         };
@@ -1952,7 +1978,8 @@ impl ParagraphBuilder {
     /// A link inside the paragraph's text: a link-colored run, clickable through its range.
     /// Like Slack, a URL posted bare shows as itself, scheme and all, while a link labelled
     /// with its own address minus the scheme (`github.com/…`) gets the tinted chip look.
-    fn push_link(&mut self, url: String, label: String, theme: &RunTheme) {
+    /// `run` is the label's styling (Slack bolds `<url|*Error*>` and links inside `*…*`).
+    fn push_link(&mut self, url: String, label: String, run: RunFlags, theme: &RunTheme) {
         let address = |s: &str| {
             s.split_once("://")
                 .map_or(s, |(_, rest)| rest)
@@ -1969,7 +1996,7 @@ impl ParagraphBuilder {
         }
         let target = LinkTarget::Url(url.into());
         let start = self.text.len();
-        self.push_text(&label, theme, RunFlags::default(), Some(theme.link), None);
+        self.push_text(&label, theme, run, Some(theme.link), None);
         self.links.push((start..self.text.len(), target));
     }
 
@@ -2291,6 +2318,9 @@ struct SelectableParagraph {
     /// Inline code spans, outlined like Slack's `.c-mrkdwn__code` (a run-level background
     /// cannot carry a border).
     code: Vec<Range<usize>>,
+    /// Run backgrounds (inline code, mentions, app chips), painted under the selection: as
+    /// run backgrounds GPUI paints them with the text, over the highlight.
+    washes: Vec<(Range<usize>, Hsla)>,
     code_border: Hsla,
     /// App chips' icon slots ([`APP_ICON_SLOT`]): text offsets the icons are painted at.
     icons: Vec<usize>,
@@ -2310,34 +2340,38 @@ impl SelectableParagraph {
     fn new(
         id: ElementId,
         text: String,
-        runs: Vec<TextRun>,
+        mut runs: Vec<TextRun>,
         links: Vec<(Range<usize>, LinkTarget)>,
         document_order: u64,
         theme: &RunTheme,
     ) -> Self {
         let text: SharedString = text.into();
-        // Inline code is the mono run with a wash; code blocks carry no run background. An
-        // app chip's icon slot is its own run on the link wash.
+        // Inline code is the inline-code run with a wash; code blocks carry no run
+        // background. An app chip's icon slot is its own run on the link wash.
         let mut code: Vec<Range<usize>> = Vec::new();
+        let mut washes = Vec::new();
         let mut icons = Vec::new();
         let mut at = 0;
-        for run in &runs {
+        for run in &mut runs {
             let span = at..at + run.len;
             at = span.end;
-            if run.background_color == Some(theme.link_wash)
-                && text.get(span.clone()) == Some(APP_ICON_SLOT)
-            {
+            let Some(wash) = run.background_color.take() else {
+                continue;
+            };
+            if wash == theme.link_wash && text.get(span.clone()) == Some(APP_ICON_SLOT) {
                 icons.push(span.start);
             }
-            if run.background_color.is_some() && run.font.family == theme.mono_font.family {
+            if run.font.family == theme.code_font.family {
                 match code.last_mut() {
                     Some(last) if last.end == span.start => last.end = span.end,
-                    _ => code.push(span),
+                    _ => code.push(span.clone()),
                 }
             }
+            washes.push((span, wash));
         }
         Self {
             code,
+            washes,
             icons,
             code_border: theme.foreground.opacity(0.13),
             styled: StyledText::new(text.clone()).with_runs(runs),
@@ -2385,7 +2419,7 @@ impl SelectableParagraph {
     /// Slack's inline-code outline: a 1px 13% foreground ring with 3px corners, a little
     /// wider than the glyphs and a little shorter than the line.
     fn paint_code_outline(&self, layout: &TextLayout, range: Range<usize>, window: &mut Window) {
-        for bounds in self.code_quads(layout, range) {
+        for bounds in self.range_quads(layout, range) {
             let outline = Bounds::from_corners(
                 Point::new(bounds.left() - px(2.), bounds.top() + px(1.)),
                 Point::new(bounds.right() + px(2.), bounds.bottom() - px(1.)),
@@ -2425,9 +2459,29 @@ impl SelectableParagraph {
         }
     }
 
-    /// The boxes an inline-code range covers, one per wrapped line, each ending where that
-    /// line's text ends (a selection instead runs on to the paragraph's edge).
-    fn code_quads(&self, layout: &TextLayout, range: Range<usize>) -> Vec<Bounds<Pixels>> {
+    /// A run wash under the text, laid out as GPUI lays out a run background.
+    fn paint_wash(
+        &self,
+        layout: &TextLayout,
+        range: Range<usize>,
+        wash: Hsla,
+        window: &mut Window,
+    ) {
+        for bounds in self.range_quads(layout, range) {
+            window.paint_quad(PaintQuad {
+                bounds,
+                background: wash.into(),
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: BorderStyle::default(),
+            });
+        }
+    }
+
+    /// The boxes a text range covers, one per wrapped line, each ending where that line's
+    /// text ends (a selection instead runs on to the paragraph's edge).
+    fn range_quads(&self, layout: &TextLayout, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         let (Some(start), Some(end)) = (
             layout.position_for_index(range.start),
             layout.position_for_index(range.end),
@@ -2689,6 +2743,9 @@ impl Element for SelectableParagraph {
             ],
             cx,
         );
+        for (range, wash) in &self.washes {
+            self.paint_wash(&layout, range.clone(), *wash, window);
+        }
         for range in projection.ranges().iter().flatten().cloned() {
             self.paint_selection(&layout, range, window);
         }
@@ -2762,7 +2819,7 @@ fn push_element(
             if run.code {
                 builder.push_text(&label, theme, run, None, Some(theme.code_bg));
             } else {
-                builder.push_link(el.url.clone(), label, theme);
+                builder.push_link(el.url.clone(), label, run, theme);
             }
         }
         RichTextElement::User(el) => {
@@ -2964,15 +3021,26 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
             RichTextElement::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
-        .collect::<String>()
-        .trim_end_matches('\n')
-        .to_owned();
+        .collect::<String>();
+    code_block(
+        code.trim_end_matches('\n').to_owned(),
+        block
+            .language
+            .clone()
+            .filter(|language| !language.is_empty()),
+        theme,
+    )
+}
+
+/// Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground ring with 4px
+/// corners, 32px kept clear at the right for the copy button a hover shows there.
+fn code_block(code: String, language: Option<String>, theme: &RunTheme) -> Div {
     let run_len = code.len();
     // Code blocks select like the paragraphs around them: one participant, its own order.
     let paragraph = theme.paragraphs.get();
     theme.paragraphs.set(paragraph + 1);
     let order = theme.order.map(|base| base + paragraph as u64);
-    let run = theme.run(
+    let mut run = theme.run(
         RunFlags {
             code: true,
             ..DEFAULT_FLAGS
@@ -2982,6 +3050,38 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
         None,
         run_len,
     );
+    // The block's own 12px sizes it; the smaller inline face is for body-size text.
+    run.font = theme.mono_font.clone();
+    let group = SharedString::from(format!("code-{}-{paragraph}", theme.key));
+    let hover_bg = theme.foreground.opacity(0.08);
+    let copy = div()
+        .id(SharedString::from(format!(
+            "copy-{}-{paragraph}",
+            theme.key
+        )))
+        .absolute()
+        .top(px(3.))
+        .right(px(3.))
+        .size(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .opacity(0.)
+        .group_hover(group.clone(), |button| button.opacity(1.))
+        .hover(move |button| button.bg(hover_bg))
+        .on_click({
+            let code = code.clone();
+            move |_, _, cx| {
+                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(code.clone()))
+            }
+        })
+        .child(
+            Icon::new(IconName::Copy)
+                .size(px(14.))
+                .text_color(theme.muted),
+        );
     let text = match order {
         Some(order) => SelectableParagraph::new(
             paragraph_id(&theme.key, paragraph, 0, &code),
@@ -2999,19 +3099,13 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
     v_flex()
         .min_w_0()
         .gap_1()
-        .when_some(
-            block
-                .language
-                .clone()
-                .filter(|language| !language.is_empty()),
-            |column, language| {
-                column.child(div().text_xs().text_color(theme.muted).child(language))
-            },
-        )
+        .when_some(language, |column, language| {
+            column.child(div().text_xs().text_color(theme.muted).child(language))
+        })
         .child(
-            // Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground
-            // ring with 4px corners.
             div()
+                .group(group)
+                .relative()
                 .w_full()
                 .min_w_0()
                 .rounded(px(4.))
@@ -3019,9 +3113,11 @@ fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div {
                 .border_color(theme.foreground.opacity(0.13))
                 .bg(theme.code_bg)
                 .p_2()
+                .pr(px(32.))
                 .text_size(px(12.))
                 .line_height(px(18.))
-                .child(text),
+                .child(text)
+                .child(copy),
         )
 }
 
@@ -3119,10 +3215,67 @@ pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, edited: bool, cx: &Ap
     if muted {
         theme.foreground = theme.muted;
     }
-    // The edit marker rides inline at the end of the last line that renders text.
+    let pieces = mrkdwn_fences(text);
+    let mut column = v_flex().min_w_0();
+    for (n, (fenced, piece)) in pieces.iter().enumerate() {
+        column = if *fenced {
+            column.child(
+                div()
+                    .my_1()
+                    .child(code_block(unescape(piece), None, &theme)),
+            )
+        } else {
+            mrkdwn_lines(
+                column,
+                piece,
+                kcx.fixtures,
+                &theme,
+                edited && n + 1 == pieces.len(),
+            )
+        };
+    }
+    // A body ending in a pre block puts the edit marker on its own line after it.
+    if edited && pieces.last().is_some_and(|(fenced, _)| *fenced) {
+        column = column.child(div().text_xs().text_color(theme.muted).child("(edited)"));
+    }
+    column
+}
+
+/// mrkdwn split at its ``` fences into `(fenced, text)` pieces: Slack renders fenced text
+/// as a pre block, raw, dropping the line break just inside and outside each fence. An
+/// unclosed fence stays literal; empty text pieces are left out.
+fn mrkdwn_fences(text: &str) -> Vec<(bool, &str)> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find("```") {
+        let inner = &rest[open + 3..];
+        let Some(close) = inner.find("```") else {
+            break;
+        };
+        let before = &rest[..open];
+        pieces.push((false, before.strip_suffix('\n').unwrap_or(before)));
+        let code = &inner[..close];
+        let code = code.strip_prefix('\n').unwrap_or(code);
+        pieces.push((true, code.strip_suffix('\n').unwrap_or(code)));
+        let after = &inner[close + 3..];
+        rest = after.strip_prefix('\n').unwrap_or(after);
+    }
+    pieces.push((false, rest));
+    pieces.retain(|(fenced, piece)| *fenced || !piece.is_empty());
+    pieces
+}
+
+/// Lines of mrkdwn text into `column`; with `edited`, the edit marker rides inline at the
+/// end of the last line that renders text.
+fn mrkdwn_lines(
+    mut column: Div,
+    text: &str,
+    fixtures: &Fixtures,
+    theme: &RunTheme,
+    edited: bool,
+) -> Div {
     let lines: Vec<&str> = text.split('\n').collect();
     let last_text_line = lines.iter().rposition(|line| !line.is_empty());
-    let mut column = v_flex().min_w_0();
     let mut blank = false;
     for (n, line) in lines.iter().enumerate() {
         // A run of blank lines is one 8px break, like the rich-text path's `c-mrkdwn__br`.
@@ -3134,12 +3287,7 @@ pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, edited: bool, cx: &Ap
             continue;
         }
         blank = false;
-        if let Some(row) = mrkdwn_line(
-            line,
-            kcx.fixtures,
-            &theme,
-            edited && Some(n) == last_text_line,
-        ) {
+        if let Some(row) = mrkdwn_line(line, fixtures, theme, edited && Some(n) == last_text_line) {
             column = column.child(row);
         }
     }
@@ -3177,7 +3325,7 @@ fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme, edited: bool) 
         } else if run.code {
             None
         } else if marker == '<' {
-            angle_token(&mut builder, rest, fixtures, theme)
+            angle_token(&mut builder, rest, fixtures, theme, run)
         } else {
             emoji_token(&mut builder, rest, fixtures, theme, run)
         };
@@ -3240,12 +3388,14 @@ fn toggle_marker(run: &mut RunFlags, marker: char, prev: Option<char>, after: &s
     starts_word && opens
 }
 
-/// A `<...>` token at the start of `rest`: user / channel / special mentions and links.
+/// A `<...>` token at the start of `rest`: user / channel / special mentions and links. A
+/// link takes the surrounding styling `run` plus its label's own.
 fn angle_token(
     builder: &mut ParagraphBuilder,
     rest: &str,
     fixtures: &Fixtures,
     theme: &RunTheme,
+    run: RunFlags,
 ) -> Option<usize> {
     let close = rest.find('>')?;
     let inner = &rest[1..close];
@@ -3298,11 +3448,33 @@ fn angle_token(
             );
         }
     } else if target.contains("://") || target.starts_with("mailto:") {
-        builder.push_link(unescape(target), unescape(label.unwrap_or(target)), theme);
+        let (label, run) = styled_label(label.unwrap_or(target), run);
+        builder.push_link(unescape(target), unescape(label), run, theme);
     } else {
         return None;
     }
     Some(close + 1)
+}
+
+/// A link label's own styling: Slack renders `<url|*TypeError*>` as a bold link. Markers
+/// wrapping the whole label add their style to `run`; any others stay literal.
+fn styled_label(mut label: &str, mut run: RunFlags) -> (&str, RunFlags) {
+    while let Some(marker) = label
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '*' | '_' | '~'))
+    {
+        if label.len() < 3 || !label.ends_with(marker) {
+            break;
+        }
+        match marker {
+            '*' => run.bold = true,
+            '_' => run.italic = true,
+            _ => run.strike = true,
+        }
+        label = &label[1..label.len() - 1];
+    }
+    (label, run)
 }
 
 /// A `:shortcode:` at the start of `rest`: a glyph run, or a custom emoji image.
@@ -3844,6 +4016,33 @@ mod tests {
         });
     }
 
+    #[test]
+    fn mrkdwn_fences_split_pre_blocks_out_of_the_text() {
+        // Sentry's alert section: the whole text is one fence.
+        assert_eq!(
+            mrkdwn_fences("```undefined is not an object```"),
+            vec![(true, "undefined is not an object")]
+        );
+        assert_eq!(
+            mrkdwn_fences("Run:\n```\ncargo test\n```\nthen ship"),
+            vec![(false, "Run:"), (true, "cargo test"), (false, "then ship")]
+        );
+        assert_eq!(mrkdwn_fences("a ``` b"), vec![(false, "a ``` b")]);
+    }
+
+    #[test]
+    fn link_labels_take_the_styles_wrapping_them() {
+        let (label, run) = styled_label("*TypeError*", RunFlags::default());
+        assert_eq!(label, "TypeError");
+        assert!(run.bold && !run.italic);
+        let (label, run) = styled_label("_*both*_", RunFlags::default());
+        assert_eq!(label, "both");
+        assert!(run.bold && run.italic);
+        let (label, run) = styled_label("a *b*", RunFlags::default());
+        assert_eq!(label, "a *b*");
+        assert!(!run.bold);
+    }
+
     #[gpui::test]
     fn blank_lines_render_as_a_short_paragraph_break(cx: &mut TestAppContext) {
         // Slack's blank line is an 8px `c-mrkdwn__br` block, not an empty text line
@@ -3852,7 +4051,7 @@ mod tests {
         // break must slice runs and keep styling on both sides.
         let first = "Rollout notes:";
         let second = "Stage one is done, stage two next.";
-        with_transcript("C0ENG", cx, |_, cx| {
+        with_transcript("C0ENG", cx, |_, _| {
             // The blank-line message is the channel's last, so the tail-anchored transcript
             // paints it without jumping.
             let (across_break, line_height) = PAINTED.with(|painted| {

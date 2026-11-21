@@ -13,7 +13,8 @@ use std::borrow::Cow;
 
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
 use gpui_kit::gpui::{
-    App, Background, Global, Hsla, Pixels, linear_color_stop, linear_gradient, px, rgb,
+    App, Background, Global, Hsla, Pixels, SharedString, linear_color_stop, linear_gradient, px,
+    rgb,
 };
 
 /// Slack's Font choices slackless can show (Preferences > Appearance > Font): Lato, Slack's
@@ -33,6 +34,26 @@ pub const FONT_FAMILIES: [&str; 5] = ["Arial", "Comic Sans MS", "Georgia", "Lato
 
 /// Lato, Slack's default font.
 pub const DEFAULT_FONT: usize = 3;
+
+/// Inline code's face: Monaco (Slack's code font) with its em grown so its glyphs come out at
+/// 6/7 of the body size, 12px in the 14px body: the size Slack's and our pre blocks use.
+pub const INLINE_CODE_FAMILY: &str = "Slackless Inline Code";
+
+const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
+
+/// Whether [`INLINE_CODE_FAMILY`] loaded (it is built from the system's Monaco).
+struct InlineCode(bool);
+
+impl Global for InlineCode {}
+
+/// The family inline code renders in: the smaller face when it loaded, else the theme's mono.
+pub fn inline_code_family(cx: &App) -> SharedString {
+    if cx.try_global::<InlineCode>().is_some_and(|loaded| loaded.0) {
+        INLINE_CODE_FAMILY.into()
+    } else {
+        cx.theme().mono_font_family.clone()
+    }
+}
 
 /// The Font in effect, re-applied whenever a theme change reloads the kit's own.
 struct UiFont(usize);
@@ -75,6 +96,16 @@ pub fn init(cx: &mut App) {
     if let Err(e) = cx.text_system().add_fonts(lato.map(Cow::Borrowed).to_vec()) {
         eprintln!("slackless: could not load Lato ({e})");
     }
+    let inline_code = std::fs::read(MONACO)
+        .ok()
+        .and_then(|monaco| crate::code_font::scaled(&monaco, INLINE_CODE_FAMILY, 6. / 7.));
+    let loaded = inline_code.is_some_and(|font| {
+        cx.text_system()
+            .add_fonts(vec![Cow::Owned(font)])
+            .inspect_err(|e| eprintln!("slackless: could not load the inline code face ({e})"))
+            .is_ok()
+    });
+    cx.set_global(InlineCode(loaded));
     activate(SlackTheme::Dark, cx);
 }
 
