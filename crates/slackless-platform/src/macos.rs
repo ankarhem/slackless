@@ -1,4 +1,4 @@
-//! macOS backend: dock badge and app icon via AppKit (`objc2`), secrets via the Keychain
+//! macOS backend: dock badge, app icon and About panel via AppKit (`objc2`), secrets via the Keychain
 //! (`security-framework`), deep-link schemes read from the bundle's
 //! `Info.plist`. Notifications: bundled builds leave them to GPUI's
 //! `SystemNotification` (`UNUserNotificationCenter`); unbundled dev builds,
@@ -12,13 +12,16 @@ use dispatch2::DispatchQueue;
 use objc2::AnyThread as _;
 use objc2::MainThreadMarker;
 use objc2::runtime::AnyObject;
-use objc2_app_kit::{NSApplication, NSImage};
-use objc2_foundation::{NSArray, NSBundle, NSData, NSDictionary, NSString};
+use objc2_app_kit::{NSAboutPanelOptionApplicationIcon, NSApplication, NSImage};
+use objc2_foundation::{
+    NSArray, NSBundle, NSData, NSDictionary, NSNumber, NSString, NSUserDefaults,
+};
 use security_framework::passwords::{self, PasswordOptions};
 
 use crate::deep_link::{self, DeepLink};
 use crate::{
-    BadgeSetter, DeepLinkHandler, IconSetter, Notifier, PlatformError, Result, SecretStore,
+    AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
+    Result, SecretStore,
 };
 
 /// `errSecItemNotFound`, the documented OSStatus for a missing keychain item.
@@ -116,6 +119,34 @@ impl IconSetter for MacPlatform {
             .expect("the app icon is a PNG AppKit can read");
         // SAFETY: a non-nil image, set on the main thread.
         unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+    }
+}
+
+impl AboutPanel for MacPlatform {
+    fn show_about(&self) {
+        let mtm = MainThreadMarker::new().expect("the About panel opens on the main thread");
+        let app = NSApplication::sharedApplication(mtm);
+        // Unbundled, the standard panel shows the executable folder's icon: hand it the app's.
+        let Some(icon) = app.applicationIconImage() else {
+            return app.orderFrontStandardAboutPanel(None);
+        };
+        let icon: &AnyObject = &icon;
+        // SAFETY: an AppKit constant, read on the main thread.
+        let key = unsafe { NSAboutPanelOptionApplicationIcon };
+        let options = NSDictionary::from_slices(&[key], &[icon]);
+        // SAFETY: an About panel option key to an NSImage, the dictionary the method takes.
+        unsafe { app.orderFrontStandardAboutPanelWithOptions(&options) };
+    }
+}
+
+impl FullScreenItem for MacPlatform {
+    fn drop_system_full_screen_item(&self) {
+        let key = NSString::from_str("NSFullScreenMenuItemEverywhere");
+        let off = NSNumber::numberWithBool(false);
+        let off: &AnyObject = &off;
+        let defaults = NSDictionary::from_slices(&[&*key], &[off]);
+        // SAFETY: NSString keys to an NSNumber, the dictionary registerDefaults: takes.
+        unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
     }
 }
 

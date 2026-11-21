@@ -7,12 +7,14 @@
 //! | [`Notifier`] | post a system notification | unbundled: Notification Center via `osascript`; bundled: left to GPUI's `SystemNotification` (guide §14) |
 //! | [`BadgeSetter`] | dock unread badge | `NSApplication.dockTile.setBadgeLabel` via `objc2` (GPUI has no dock-badge API) |
 //! | [`IconSetter`] | app icon | `NSApplication.setApplicationIconImage` via `objc2` |
+//! | [`AboutPanel`] | the app's About window | `NSApplication.orderFrontStandardAboutPanel` |
+//! | [`FullScreenItem`] | the menu bar's full-screen item | `NSFullScreenMenuItemEverywhere` registered off |
 //! | [`SecretStore`] | named secrets | Keychain generic passwords via `security-framework` |
 //! | [`DeepLinkHandler`] | `slack://` and `https://app.slack.com/client` links | bundle `Info.plist` scheme check + the pure [`DeepLink`] parser |
 //!
 //! Other platforms get a compiling, non-OS fallback backend so the crate
 //! builds everywhere; its `SecretStore` is in-process memory, its notifier,
-//! badge setter and icon setter are no-ops.
+//! badge setter, icon setter, About panel and full-screen item are no-ops.
 //!
 //! A `StatusItem` trait (`NSStatusItem`, guide §14) is planned but not yet
 //! modeled; it will land here alongside [`BadgeSetter`].
@@ -73,6 +75,24 @@ pub trait IconSetter {
     fn set_icon(&self, png: &[u8]);
 }
 
+/// Show the system About window: the app's icon, name and version. Call it on the
+/// main thread.
+///
+/// macOS: `NSApplication.orderFrontStandardAboutPanel`, which reads the name and
+/// version from the app's Info.plist (embedded in the binary for unbundled runs).
+pub trait AboutPanel {
+    fn show_about(&self);
+}
+
+/// Leave the menu bar's full-screen item to the app, whose menus carry their own (Slack's
+/// Toggle Full Screen). Call it before the menus are set.
+///
+/// macOS: AppKit adds "Enter Full Screen" to the View menu unless the
+/// `NSFullScreenMenuItemEverywhere` default is off; it is registered off, not persisted.
+pub trait FullScreenItem {
+    fn drop_system_full_screen_item(&self);
+}
+
 /// Store, load, and delete a named secret (macOS: Keychain generic password).
 ///
 /// Secrets are addressed by a `service` (the app/workspace scope) plus a
@@ -126,9 +146,16 @@ type Platform = fallback::FallbackPlatform;
 /// Cheap to construct and `Send + Sync`; construct it once and share it.
 /// Nothing touches AppKit until a capability actually needs it, so this is
 /// safe on headless threads too.
-pub fn current()
--> impl Notifier + BadgeSetter + IconSetter + SecretStore + DeepLinkHandler + Send + Sync + 'static
-{
+pub fn current() -> impl Notifier
++ BadgeSetter
++ IconSetter
++ AboutPanel
++ FullScreenItem
++ SecretStore
++ DeepLinkHandler
++ Send
++ Sync
++ 'static {
     Platform::new()
 }
 

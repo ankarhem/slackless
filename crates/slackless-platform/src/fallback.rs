@@ -1,8 +1,8 @@
 //! Non-macOS fallback backend: compiles everywhere, touches no OS API.
 //!
-//! `Notifier`, `BadgeSetter` and `IconSetter` are true no-ops until their platform ports
-//! begin. `SecretStore` keeps secrets in-process only (a `HashMap` behind a
-//! mutex) so the trait contract is exercised without a system keychain;
+//! `Notifier`, `BadgeSetter`, `IconSetter`, `AboutPanel` and `FullScreenItem` are true
+//! no-ops until their platform ports begin. `SecretStore` keeps secrets in-process only
+//! (a `HashMap` behind a mutex) so the trait contract is exercised without a system keychain;
 //! persistence arrives with each OS backend. `DeepLinkHandler` shares the
 //! pure parser in [`crate::deep_link`]; nothing can be registered with an OS.
 
@@ -11,7 +11,8 @@ use std::sync::Mutex;
 
 use crate::deep_link::{self, DeepLink};
 use crate::{
-    BadgeSetter, DeepLinkHandler, IconSetter, Notifier, PlatformError, Result, SecretStore,
+    AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
+    Result, SecretStore,
 };
 
 /// No-op backend for platforms without a port yet.
@@ -49,6 +50,16 @@ impl BadgeSetter for FallbackPlatform {
 impl IconSetter for FallbackPlatform {
     /// No-op: no app icon API is wired for this platform yet.
     fn set_icon(&self, _png: &[u8]) {}
+}
+
+impl AboutPanel for FallbackPlatform {
+    /// No-op: no About window is wired for this platform yet.
+    fn show_about(&self) {}
+}
+
+impl FullScreenItem for FallbackPlatform {
+    /// No-op: no system menu items to hold back on this platform yet.
+    fn drop_system_full_screen_item(&self) {}
 }
 
 impl SecretStore for FallbackPlatform {
