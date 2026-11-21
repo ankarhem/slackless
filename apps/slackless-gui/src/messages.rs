@@ -45,8 +45,8 @@ use gpui_kit::gpui::{
     InspectorElementId, InteractiveElement as _, InteractiveText, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels, Point,
     Render, SharedString, Stateful, StatefulInteractiveElement as _, StrikethroughStyle,
-    StyleRefinement, Styled as _, StyledText, Subscription, TextLayout, TextRun, UnderlineStyle,
-    WeakEntity, Window, div, img, px, rgb, transparent_black,
+    StyleRefinement, Styled as _, StyledText, Subscription, TextLayout, TextRun,
+    TransformationMatrix, UnderlineStyle, WeakEntity, Window, div, img, px, rgb, transparent_black,
 };
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList, RichTextPreformatted,
@@ -62,6 +62,10 @@ use crate::later::{Remind, SaveRequest};
 
 /// Avatar chip size in px.
 const AVATAR_SIZE: f32 = 36.;
+/// How far Slack sets a message's avatar below the top of its header line (px): the avatar's
+/// top sits a few px above the name's capitals, 8px into the row (measured, channel and
+/// thread alike).
+const AVATAR_TOP: f32 = 5.;
 /// Horizontal gutter around the transcript (px); overrides the scroller's 12px default.
 const GUTTER: f32 = 16.;
 /// Space the scroller inserts between consecutive rows (px); dividers add their own padding.
@@ -70,6 +74,11 @@ const ROW_GAP: f32 = 2.;
 const GROUP_WINDOW_SECS: i64 = 300;
 /// Inline custom-emoji image size in a text line (px).
 const INLINE_EMOJI: f32 = 18.;
+/// The room an app chip's text leaves for its icon: five no-break spaces, about the icon and
+/// Slack's gap after it at body size (an em space measured narrower in Lato).
+const APP_ICON_SLOT: &str = "\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}";
+/// An app chip's icon size (px).
+const APP_ICON: f32 = 13.;
 /// Rows from the top within which scrolling asks for the next older page: close enough that
 /// the page lands before the reader reaches the edge.
 const NEAR_TOP_ROWS: usize = 2;
@@ -1239,17 +1248,14 @@ fn transcript_row(
             )
             .into_any_element()
     } else {
-        profile_link(
-            crate::avatars::with_external_badge(
-                fixtures,
-                message.user.as_ref(),
-                crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
-                AVATAR_SIZE,
-                cx.theme().background,
-            ),
-            format!("{key}-avatar"),
-            message.user.as_ref(),
+        avatar_gutter(
+            fixtures,
+            message,
+            &author_key,
+            &author,
+            &key,
             Some(&handler),
+            cx,
         )
     };
 
@@ -1410,18 +1416,7 @@ pub fn message_row_linked(
             .text_color(cx.theme().muted_foreground)
             .child(format_clock(&message.ts))
             .into_any_element(),
-        None => profile_link(
-            crate::avatars::with_external_badge(
-                fixtures,
-                message.user.as_ref(),
-                crate::avatars::author_avatar(fixtures, message, &author_key, &author, AVATAR_SIZE),
-                AVATAR_SIZE,
-                cx.theme().background,
-            ),
-            format!("{key}-avatar"),
-            message.user.as_ref(),
-            handler,
-        ),
+        None => avatar_gutter(fixtures, message, &author_key, &author, &key, handler, cx),
     };
     h_flex()
         .items_start()
@@ -1451,6 +1446,36 @@ fn profile_link(
         .on_click(move |_, window, cx| {
             handler(MessageAction::OpenProfile(user.clone()), window, cx)
         })
+        .into_any_element()
+}
+
+/// A message's avatar gutter: the author's avatar (badged when they are from another
+/// organization) as a link to their profile, [`AVATAR_TOP`] down like Slack's.
+fn avatar_gutter(
+    fixtures: &Fixtures,
+    message: &Message,
+    author_key: &str,
+    author: &str,
+    key: &str,
+    handler: Option<&actions::ActionHandler>,
+    cx: &App,
+) -> AnyElement {
+    let avatar = crate::avatars::with_external_badge(
+        fixtures,
+        message.user.as_ref(),
+        crate::avatars::author_avatar(fixtures, message, author_key, author, AVATAR_SIZE),
+        AVATAR_SIZE,
+        cx.theme().background,
+    );
+    div()
+        .flex_none()
+        .mt(px(AVATAR_TOP))
+        .child(profile_link(
+            avatar,
+            format!("{key}-avatar"),
+            message.user.as_ref(),
+            handler,
+        ))
         .into_any_element()
 }
 
@@ -1740,6 +1765,8 @@ struct RunTheme {
     border: Hsla,
     link: Hsla,
     mention_bg: Hsla,
+    /// Slack's tint behind chip links: address-labelled links and app chips.
+    link_wash: Hsla,
     code_bg: Hsla,
     /// Inline `code` text (Slack's orange / red, see [`crate::theme::code_foreground`]).
     code_fg: Hsla,
@@ -1780,6 +1807,7 @@ impl RunTheme {
             border: theme.border,
             link: theme.link,
             mention_bg: theme.accent.opacity(0.25),
+            link_wash: theme.link.opacity(0.1),
             code_bg: theme.secondary,
             code_fg: crate::theme::code_foreground(cx),
             selection: gpui_kit::base::Theme::global(cx).tokens.colors.selection,
@@ -1959,6 +1987,23 @@ impl ParagraphBuilder {
         self.links.push((start..self.text.len(), target));
     }
 
+    /// An app's inline link chip (`attachment_mention`, e.g. a Jira issue): its title on the
+    /// link wash after a slot the paragraph paints the app icon into, one clickable range.
+    fn push_attachment(&mut self, url: String, label: &str, theme: &RunTheme) {
+        let start = self.text.len();
+        for text in [APP_ICON_SLOT, label] {
+            self.push_text(
+                text,
+                theme,
+                RunFlags::default(),
+                Some(theme.link),
+                Some(theme.link_wash),
+            );
+        }
+        self.links
+            .push((start..self.text.len(), LinkTarget::Url(url.into())));
+    }
+
     fn push_image(&mut self, image: ImageSource) {
         self.flush();
         self.segments.push(Segment::Image(image));
@@ -2075,7 +2120,7 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                         .gap_0p5()
                         .px_0p5()
                         .rounded_sm()
-                        .bg(theme.link.opacity(0.1))
+                        .bg(theme.link_wash)
                         .text_color(theme.link)
                         .cursor_pointer()
                         .on_click(move |_, window, cx| {
@@ -2158,6 +2203,8 @@ struct SelectableParagraph {
     /// cannot carry a border).
     code: Vec<Range<usize>>,
     code_border: Hsla,
+    /// App chips' icon slots ([`APP_ICON_SLOT`]): text offsets the icons are painted at.
+    icons: Vec<usize>,
 }
 
 /// What one paragraph keeps between frames: its selection handle (and the subscription
@@ -2180,12 +2227,19 @@ impl SelectableParagraph {
         theme: &RunTheme,
     ) -> Self {
         let text: SharedString = text.into();
-        // Inline code is the mono run with a wash; code blocks carry no run background.
+        // Inline code is the mono run with a wash; code blocks carry no run background. An
+        // app chip's icon slot is its own run on the link wash.
         let mut code: Vec<Range<usize>> = Vec::new();
+        let mut icons = Vec::new();
         let mut at = 0;
         for run in &runs {
             let span = at..at + run.len;
             at = span.end;
+            if run.background_color == Some(theme.link_wash)
+                && text.get(span.clone()) == Some(APP_ICON_SLOT)
+            {
+                icons.push(span.start);
+            }
             if run.background_color.is_some() && run.font.family == theme.mono_font.family {
                 match code.last_mut() {
                     Some(last) if last.end == span.start => last.end = span.end,
@@ -2195,6 +2249,7 @@ impl SelectableParagraph {
         }
         Self {
             code,
+            icons,
             code_border: theme.foreground.opacity(0.13),
             styled: StyledText::new(text.clone()).with_runs(runs),
             id,
@@ -2254,6 +2309,30 @@ impl SelectableParagraph {
                 border_color: self.code_border,
                 border_style: BorderStyle::default(),
             });
+        }
+    }
+
+    /// An app chip's icon in its slot at `ix`, centered on the line in the link color. Slack
+    /// draws the app's own glyph (Jira's mark); the bundled link glyph stands in for it.
+    fn paint_app_icon(&self, layout: &TextLayout, ix: usize, window: &mut Window, cx: &App) {
+        let Some(at) = layout.position_for_index(ix) else {
+            return;
+        };
+        let side = px(APP_ICON);
+        let bounds = Bounds::new(
+            Point::new(at.x + px(1.), at.y + (layout.line_height() - side) / 2.),
+            gpui_kit::gpui::Size::new(side, side),
+        );
+        let icon = IconName::Link.path();
+        if let Err(e) = window.paint_svg(
+            bounds,
+            icon.clone(),
+            None,
+            TransformationMatrix::unit(),
+            self.link,
+            cx,
+        ) {
+            eprintln!("slackless: could not paint the {icon} icon ({e})");
         }
     }
 
@@ -2536,6 +2615,9 @@ impl Element for SelectableParagraph {
         for range in &self.code {
             self.paint_code_outline(&layout, range.clone(), window);
         }
+        for &ix in &self.icons {
+            self.paint_app_icon(&layout, ix, window, cx);
+        }
         // Selectable text takes the text cursor, as in Slack; links switch it to a hand.
         let over_link = layout
             .index_for_position(window.mouse_position())
@@ -2682,6 +2764,9 @@ fn push_element(
         RichTextElement::MessageMention(el) => {
             let label = format!("> {}", el.text.as_deref().unwrap_or("a message"));
             builder.push_text(&label, theme, quote_flags(), Some(theme.muted), None);
+        }
+        RichTextElement::AttachmentMention(el) => {
+            builder.push_attachment(el.url.clone(), el.text.as_deref().unwrap_or(&el.url), theme);
         }
         RichTextElement::Canvas(_) => {
             builder.push_text(

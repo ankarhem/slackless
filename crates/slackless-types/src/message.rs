@@ -286,7 +286,8 @@ mod tests {
               {"type": "usergroup", "usergroup_id": "S0111"},
               {"type": "broadcast", "range": "here"},
               {"type": "date", "timestamp": 1700000000, "format": "{date_short}", "fallback": "Nov 14"},
-              {"type": "color", "value": "#FF0000"}
+              {"type": "color", "value": "#FF0000"},
+              {"type": "attachment_mention", "url": "https://example.atlassian.net/browse/X-1", "text": "X-1 title", "app_id": "A0JIRA", "icon_name": "brand-jira-filled"}
             ]},
             {"type": "rich_text_list", "style": "ordered", "indent": 0, "border": 0, "elements": [
               {"type": "rich_text_section", "elements": [{"type": "text", "text": "one"}]},

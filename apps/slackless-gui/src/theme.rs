@@ -348,16 +348,21 @@ pub fn composer_surfaces(cx: &App) -> (Hsla, Hsla) {
 }
 
 /// Slack's Slack Connect context bar over the composer: an amber wash over the message pane
-/// (#fff2df on white).
+/// (#fff2df on white); on dark themes the deep amber Slack also tints an open thread's root
+/// with (#2b1f04, measured on Slack 4.53).
 pub fn connect_bar(cx: &App) -> Hsla {
-    cx.theme().background.blend(color(0xFF_A5_00).opacity(0.13))
+    if cx.theme().mode.is_dark() {
+        color(0x2B_1F_04)
+    } else {
+        cx.theme().background.blend(color(0xFF_A5_00).opacity(0.13))
+    }
 }
 
 /// Slack's tint on the channel message whose thread is open beside it: a warm wash in
-/// light (#fffae0 on white) that barely registers in dark (#171a1e on #1a1d21, measured).
+/// light (#fffae0 on white), the Slack Connect bar's amber in dark.
 pub fn thread_root(cx: &App) -> Hsla {
-    if cx.theme().mode == ThemeMode::Dark {
-        color(0x17_1A_1E)
+    if cx.theme().mode.is_dark() {
+        connect_bar(cx)
     } else {
         cx.theme().background.blend(color(0xFF_DE_30).opacity(0.15))
     }

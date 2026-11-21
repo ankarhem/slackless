@@ -5,6 +5,7 @@
 //! Every level has an `Unknown` catch-all so a new element type never fails a message.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::de::null_default;
 use crate::ids::{ChannelId, FileId, TeamId, Ts, UserId, UsergroupId};
@@ -127,6 +128,7 @@ tagged_enum! {
         "color" => Color(ColorElement),
         "message_mention" => MessageMention(MessageMentionElement),
         "canvas" => Canvas(CanvasElement),
+        "attachment_mention" => AttachmentMention(AttachmentMentionElement),
     }
 }
 
@@ -270,4 +272,18 @@ pub struct MessageMentionElement {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CanvasElement {
     pub file_id: FileId,
+}
+
+/// A link an app unfurls inline (a Jira issue, say): the page's title as a chip.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentMentionElement {
+    #[serde(default, deserialize_with = "null_default")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<TextStyle>,
+    /// The app's ids, icon and the source message (`app_id`, `icon_url`, `channel_id`, ...).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
