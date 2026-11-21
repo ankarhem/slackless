@@ -7,9 +7,10 @@
 //! `actions`, and `input`. Interactive elements are real gpui-kit widgets: `Button`s (primary /
 //! danger / link styles), dropdown menus for `static_select` / `users_select` /
 //! `conversations_select` / `overflow` / `datepicker` / `timepicker`, `Checkbox` and `Radio`
-//! groups, and `Textarea`s for text inputs. Fixture mode has no app backend, so an
-//! interaction updates the local [`BlockKitState`] (selection, checks, drafts) and is logged
-//! to stderr with a toast instead of sending `block_actions`.
+//! groups, and `Textarea`s for text inputs. An interaction updates the local
+//! [`BlockKitState`] (selection, checks, drafts); a button press in live mode goes to the app
+//! that posted the message (`blocks.actions`, see [`BlockDispatch`]), and fixture mode logs it
+//! to stderr with a toast.
 //!
 //! Legacy attachments render Slack's way: a color bar (hex or `good`/`warning`/`danger`)
 //! beside pretext, author, linked title, mrkdwn text, short/long fields, nested blocks, an
@@ -34,7 +35,10 @@ use gpui_kit::gpui::{
     InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
 };
-use slackless_core::types::{Attachment, Block, ConversationKind, Message, Ts, UserId};
+use slackless_core::api::ActionContainer;
+use slackless_core::types::{
+    Attachment, Block, BotId, ChannelId, ConversationKind, Message, TeamId, Ts, UserId,
+};
 
 use crate::actions;
 use crate::avatars;
@@ -73,6 +77,11 @@ pub struct KitCx<'a> {
     /// The click handler opening the image viewer (the transcript provides it; static
     /// cards render their images without it).
     pub image_open: Option<crate::image_viewer::ImageClick>,
+    /// Where this message's button presses go (the transcript's and thread panel's message
+    /// actions); without it a press is only logged.
+    pub on_action: Option<actions::ActionHandler>,
+    /// The legacy attachment these blocks sit in, by its `id` (a button's container names it).
+    attachment: Option<i64>,
     /// The next selection-order slice handed to a text theme (see [`messages::mrkdwn`]).
     order: std::cell::Cell<u64>,
     /// Keys handed to inline text renderers, so their element ids stay unique across the
@@ -88,9 +97,18 @@ impl<'a> KitCx<'a> {
             ts,
             links: None,
             image_open: None,
+            on_action: None,
+            attachment: None,
             order: std::cell::Cell::new(0),
             keys: std::cell::Cell::new(0),
         }
+    }
+
+    /// Routes this message's button presses through `on_action`, as
+    /// [`MessageAction::BlockAction`](actions::MessageAction::BlockAction).
+    pub fn dispatching_actions(mut self, on_action: actions::ActionHandler) -> Self {
+        self.on_action = Some(on_action);
+        self
     }
 
     /// Routes this message's text links through `links` (also makes its text selectable).
@@ -120,6 +138,8 @@ impl<'a> KitCx<'a> {
             ts,
             links: self.links.clone(),
             image_open: self.image_open.clone(),
+            on_action: self.on_action.clone(),
+            attachment: self.attachment,
             order: std::cell::Cell::new(self.order.get()),
             keys: std::cell::Cell::new(0),
         }
@@ -298,7 +318,7 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
                     .enumerate()
                     .map(|(n, element)| {
                         let key = control_key(kcx.ts, raw, ix, element, n);
-                        block_element(element, key, kcx, cx)
+                        block_element(element, raw, key, kcx, cx)
                     }),
             )
             .into_any_element(),
@@ -341,7 +361,7 @@ fn section(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
         let rendered = if element["type"].as_str() == Some("image") {
             image_element(element, kcx, 72., cx)
         } else {
-            block_element(element, key, kcx, cx)
+            block_element(element, raw, key, kcx, cx)
         };
         div().flex_none().child(rendered)
     });
@@ -377,7 +397,7 @@ fn input_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                     label.child(div().text_xs().text_color(muted).child("(optional)"))
                 }),
         )
-        .child(block_element(element, key, kcx, cx))
+        .child(block_element(element, raw, key, kcx, cx))
         .when_some(text_of(&raw["hint"]), |column, hint| {
             column.child(div().text_xs().text_color(muted).child(hint.to_owned()))
         })
@@ -443,11 +463,59 @@ fn log_action(key: &str, detail: &str, window: &mut Window, cx: &mut App) {
     actions::notify("Block Kit action", format!("{detail} ({key})"), window, cx);
 }
 
-/// One interactive (or image) element inside `actions`, an accessory or an `input`.
-fn block_element(element: &Json, key: String, kcx: &KitCx, cx: &App) -> AnyElement {
+/// A button press nothing dispatches (fixture mode, or a message naming no app): log it.
+pub(crate) fn log_button(action: &Json, window: &mut Window, cx: &mut App) {
+    let label = emoji::replace_shortcodes(text_of(&action["text"]).unwrap_or("Button"));
+    let value = action["value"].as_str().unwrap_or_default();
+    log_action(
+        action["action_id"].as_str().unwrap_or_default(),
+        &format!("pressed \u{201C}{label}\u{201D} (value {value})"),
+        window,
+        cx,
+    );
+}
+
+/// A button press bound for `blocks.actions`: the app that posted the message and where the
+/// element sits.
+pub struct BlockDispatch {
+    pub bot: BotId,
+    pub app_id: String,
+    pub team: Option<TeamId>,
+    /// The element as the message declared it, plus its `block_id`.
+    pub action: Json,
+    pub container: ActionContainer,
+}
+
+impl BlockDispatch {
+    /// For a button pressed in `message` of `channel` (inside the legacy attachment
+    /// `attachment`); `None` when the message names no app to receive it.
+    pub fn new(
+        message: &Message,
+        channel: &ChannelId,
+        action: Json,
+        attachment: Option<i64>,
+    ) -> Option<Self> {
+        let profile = message.bot_profile.as_ref()?;
+        Some(Self {
+            bot: message.bot_id.clone()?,
+            app_id: profile.app_id.clone()?,
+            team: profile.team_id.clone(),
+            action,
+            container: ActionContainer {
+                channel: channel.clone(),
+                message_ts: message.ts.clone(),
+                attachment_id: attachment,
+                is_ephemeral: message.is_ephemeral,
+            },
+        })
+    }
+}
+
+/// One interactive (or image) element of `block` (its `actions`, accessory or `input`).
+fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> AnyElement {
     let kind = element["type"].as_str().unwrap_or_default();
     match kind {
-        "button" => button(element, key).into_any_element(),
+        "button" => button(element, block, key, kcx).into_any_element(),
         "static_select" | "external_select" | "multi_static_select" | "multi_external_select" => {
             select(element, key, options(element), kcx, cx)
         }
@@ -520,10 +588,16 @@ fn block_element(element: &Json, key: String, kcx: &KitCx, cx: &App) -> AnyEleme
     }
 }
 
-fn button(element: &Json, key: String) -> Button {
+/// A button: a link button opens its URL; any other press goes to the message's action
+/// handler with the element and its `block_id` (logged when there is none).
+fn button(element: &Json, block: &Json, key: String, kcx: &KitCx) -> Button {
     let label = emoji::replace_shortcodes(text_of(&element["text"]).unwrap_or("Button"));
     let url = element["url"].as_str().map(str::to_owned);
-    let value = element["value"].as_str().unwrap_or_default().to_owned();
+    let mut action = element.clone();
+    if let Some(block_id) = block["block_id"].as_str() {
+        action["block_id"] = block_id.into();
+    }
+    let (on_action, attachment) = (kcx.on_action.clone(), kcx.attachment);
     let button = Button::new(SharedString::from(format!("bk-{key}")))
         .with_size(Size::Small)
         .label(label.clone());
@@ -534,14 +608,16 @@ fn button(element: &Json, key: String) -> Button {
     };
     button
         .when_some(url.clone(), |button, _| button.icon(IconName::ExternalLink))
-        .on_click(move |_, window, cx| match &url {
-            Some(url) => cx.open_url(url),
-            None => log_action(
-                &key,
-                &format!("pressed \u{201C}{label}\u{201D} (value {value})"),
-                window,
-                cx,
-            ),
+        .on_click(move |_, window, cx| match (&url, &on_action) {
+            (Some(url), _) => cx.open_url(url),
+            (None, Some(on_action)) => {
+                let action = actions::MessageAction::BlockAction {
+                    action: action.clone(),
+                    attachment,
+                };
+                on_action(action, window, cx);
+            }
+            (None, None) => log_button(&action, window, cx),
         })
 }
 
@@ -977,7 +1053,9 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
                 })
         });
     let block_ts = Ts::new(format!("{}-att{n}", kcx.ts.as_str()));
-    let nested = kcx.nested(fixtures, kcx.kit, &block_ts);
+    let mut nested = kcx.nested(fixtures, kcx.kit, &block_ts);
+    // A shared message's buttons belong to the original message, not this one.
+    nested.on_action = None;
     let body: Vec<AnyElement> = if attachment.blocks.is_empty() {
         attachment
             .text
@@ -1206,7 +1284,8 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         body = body.child(row);
     }
     let block_ts = Ts::new(format!("{}-att{n}", kcx.ts.as_str()));
-    let nested = kcx.nested(fixtures, kcx.kit, &block_ts);
+    let mut nested = kcx.nested(fixtures, kcx.kit, &block_ts);
+    nested.attachment = attachment.id;
     for (ix, nested_block) in attachment.blocks.iter().enumerate() {
         body = body.children(messages::render_block(nested_block, ix, &nested, false, cx));
     }

@@ -1,7 +1,8 @@
 //! Built-in slash commands (docs/research/api-apps-blocks.md): the composer's autocomplete
-//! menu lists [`BUILTINS`], and a draft starting with `/name` is parsed into an
-//! [`Invocation`] instead of being sent as a message. Dispatch lives in the root (`app.rs`);
-//! fixture mode runs the commands that only touch local state and logs the rest.
+//! menu lists [`BUILTINS`] (plus `/giphy`, which Slack runs), and a draft starting with
+//! `/name` is parsed into an [`Invocation`] instead of being sent as a message. Dispatch lives
+//! in the root (`app.rs`): live mode hands `/giphy` and commands slackless does not know to
+//! Slack; fixture mode runs the commands that only touch local state and logs the rest.
 
 /// One built-in command, as the autocomplete menu shows it.
 pub struct SlashCommand {
@@ -26,9 +27,10 @@ pub enum SlashKind {
     Shrug,
     Collapse,
     Msg,
+    Giphy,
 }
 
-pub const BUILTINS: [SlashCommand; 11] = [
+pub const BUILTINS: [SlashCommand; 12] = [
     SlashCommand {
         kind: SlashKind::Away,
         name: "away",
@@ -46,6 +48,12 @@ pub const BUILTINS: [SlashCommand; 11] = [
         name: "dnd",
         usage: "[some description of time]",
         description: "Pause notifications or set your do not disturb schedule",
+    },
+    SlashCommand {
+        kind: SlashKind::Giphy,
+        name: "giphy",
+        usage: "[text]",
+        description: "Post a random gif to channel",
     },
     SlashCommand {
         kind: SlashKind::Invite,

@@ -813,7 +813,7 @@ impl App {
                             .messages
                             .update(cx, |list, cx| list.edit_last_own(window, cx)),
                         ComposerEvent::SlashCommand(invocation) => {
-                            this.run_slash(invocation, window, cx);
+                            this.run_slash(invocation, None, window, cx);
                         }
                         ComposerEvent::Schedule { text, when } => {
                             this.schedule(text.clone(), *when, window, cx);
@@ -919,7 +919,8 @@ impl App {
                             this.open_picker(PickerTarget::ThreadsComposer, *position, window, cx);
                         }
                         ThreadsEvent::SlashCommand(invocation) => {
-                            this.run_slash(invocation, window, cx)
+                            let thread = this.threads.read(cx).active_thread();
+                            this.run_slash(invocation, thread, window, cx)
                         }
                         ThreadsEvent::Close => {
                             this.threads_open = false;
@@ -1026,7 +1027,7 @@ impl App {
                             this.open_picker(PickerTarget::ComposeView, *position, window, cx);
                         }
                         NewMessageEvent::SlashCommand(invocation) => {
-                            this.run_slash(invocation, window, cx)
+                            this.run_slash(invocation, None, window, cx)
                         }
                         NewMessageEvent::Close => {
                             this.compose_open = false;
@@ -1856,6 +1857,13 @@ impl App {
                 channel,
                 ts: ts.clone(),
             },
+            MessageChange::BlockAction(dispatch) => Command::BlockAction {
+                bot: dispatch.bot.clone(),
+                app_id: dispatch.app_id.clone(),
+                team: dispatch.team.clone(),
+                action: dispatch.action.clone(),
+                container: dispatch.container.clone(),
+            },
         });
     }
 
@@ -2512,6 +2520,15 @@ impl App {
             Event::AuthExpired(error) => eprintln!(
                 "slackless: Slack rejected the saved session ({error}); sign in again with `slackless-gui --sign-in`"
             ),
+            Event::CommandFailed { command, error } if error == "unknown_command" => notify(
+                "Unknown command",
+                format!("{command} is not a valid command."),
+                window,
+                cx,
+            ),
+            Event::CommandFailed { command, error } => {
+                notify(command, format!("Slack refused it ({error})."), window, cx)
+            }
             Event::Error(error) => eprintln!("slackless: {error}"),
             Event::Presence { users, presence } => {
                 // Every snapshot shares this map: update it in place and repaint, with no
@@ -3264,9 +3281,33 @@ impl App {
             .update(cx, |drafts, cx| drafts.record_sent(entry, cx));
     }
 
-    /// Dispatch a slash command. Fixture mode runs the ones that only touch local state
-    /// (/shrug, /away, /status) and logs the rest with a toast.
-    fn run_slash(&mut self, invocation: &Invocation, window: &mut Window, cx: &mut Context<Self>) {
+    /// Dispatch a slash command typed in the main composer, or in the reply composer of
+    /// `thread`. Live mode hands `/giphy` and commands slackless does not know to Slack
+    /// (`chat.command`; the result arrives on the websocket). Fixture mode runs the ones that
+    /// only touch local state (/shrug, /away, /status) and logs the rest with a toast.
+    fn run_slash(
+        &mut self,
+        invocation: &Invocation,
+        thread: Option<(ChannelId, Ts)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let remote = invocation
+            .command
+            .is_none_or(|command| command.kind == SlashKind::Giphy);
+        if remote && !self.fixtures.sample {
+            let (channel, thread_ts) = match thread {
+                Some((channel, thread_ts)) => (channel, Some(thread_ts)),
+                None => (self.channel.clone(), None),
+            };
+            self.bridge.send(Command::RunCommand {
+                channel,
+                command: format!("/{}", invocation.name),
+                args: invocation.args.clone(),
+                thread_ts,
+            });
+            return;
+        }
         let Some(command) = invocation.command else {
             notify(
                 "Unknown command",
@@ -4949,7 +4990,8 @@ fn subscribe_workspace(
                     });
                 }
                 ThreadPanelEvent::SlashCommand(invocation) => {
-                    this.run_slash(invocation, window, cx)
+                    let thread = this.thread.read(cx).open_thread();
+                    this.run_slash(invocation, thread, window, cx)
                 }
                 ThreadPanelEvent::Later(request) => this.save_for_later(request, cx),
                 ThreadPanelEvent::Changed { channel, change } => this.post_change(channel, change),

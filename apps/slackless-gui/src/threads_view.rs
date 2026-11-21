@@ -25,6 +25,7 @@ use gpui_kit::gpui::{
     Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::{MessageContent, ThreadsView as SlackThreads};
+use slackless_core::types::{ChannelId, Ts};
 
 use crate::composer::{Composer, ComposerEvent};
 use crate::fixtures::Fixtures;
@@ -153,6 +154,12 @@ impl ThreadsView {
     ) {
         self.composer
             .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
+    }
+
+    /// The thread the reply composer is docked to, where a slash command typed there runs.
+    pub fn active_thread(&self) -> Option<(ChannelId, Ts)> {
+        let card = self.cards.get(self.active?)?;
+        Some((card.channel.clone(), card.thread_ts.clone()))
     }
 
     fn reply(&mut self, content: MessageContent, cx: &mut Context<Self>) {

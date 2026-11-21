@@ -55,7 +55,7 @@ use slackless_core::types::rich_text::{
 use slackless_core::types::{Block, ChannelId, Message, MessageSubtype, TextStyle, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
-use crate::blockkit::{self, BlockKitState, KitCx};
+use crate::blockkit::{self, BlockDispatch, BlockKitState, KitCx};
 use crate::emoji;
 use crate::fixtures::Fixtures;
 use crate::image_viewer::{self, ImageClick, ImageOrigin};
@@ -623,6 +623,22 @@ impl MessageList {
                 });
             }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
+            MessageAction::BlockAction { action, attachment } => {
+                let live = !self.fixtures.sample;
+                let dispatch = self
+                    .current_mut(ts)
+                    .and_then(|message| {
+                        BlockDispatch::new(message, &channel, action.clone(), attachment)
+                    })
+                    .filter(|_| live);
+                match dispatch {
+                    Some(dispatch) => cx.emit(MessageListEvent::Changed {
+                        channel,
+                        change: MessageChange::BlockAction(dispatch),
+                    }),
+                    None => blockkit::log_button(&action, window, cx),
+                }
+            }
         }
     }
 
@@ -1077,7 +1093,8 @@ fn transcript_row(
     } else {
         let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts)
             .with_links(links.clone())
-            .opening_images(image_open);
+            .opening_images(image_open)
+            .dispatching_actions(handler.clone());
         // The root as loaded here, so an edit to it shows as in Slack; else the copy the
         // broadcast carries.
         let broadcast_root = message
@@ -1283,6 +1300,9 @@ fn transcript_row(
         .when(saved, |card| {
             card.bg(saved_bg).child(actions::saved_banner(cx))
         })
+        .when(message.is_ephemeral, |card| {
+            card.child(actions::ephemeral_banner(cx))
+        })
         .when(thread_open, |card| card.bg(thread_bg))
         .when(!saved && !thread_open, |card| {
             card.hover(|card| card.bg(hover_bg))
@@ -1342,6 +1362,11 @@ fn author_name(message: &Message, fixtures: &Fixtures) -> String {
         .as_ref()
         .map(|user| fixtures.user_name(user).to_owned())
         .or_else(|| message.username.clone())
+        // An app message without a username (Giphy's preview) goes by its bot's name.
+        .or_else(|| {
+            let name = &message.bot_profile.as_ref()?.name;
+            (!name.is_empty()).then(|| name.clone())
+        })
         .unwrap_or_else(|| author_key(message))
 }
 
@@ -1375,6 +1400,10 @@ pub fn message_row_linked(
     let kcx = match links.cloned() {
         Some(links) => KitCx::new(fixtures, None, &message.ts).with_links(links),
         None => KitCx::new(fixtures, None, &message.ts),
+    };
+    let kcx = match handler {
+        Some(handler) => kcx.dispatching_actions(handler.clone()),
+        None => kcx,
     };
     let mut body = v_flex()
         .flex_1()
@@ -1419,12 +1448,20 @@ pub fn message_row_linked(
             .into_any_element(),
         None => avatar_gutter(fixtures, message, &author_key, &author, &key, handler, cx),
     };
-    h_flex()
+    let row = h_flex()
         .items_start()
         .gap_3()
         .min_w_0()
         .child(gutter)
-        .child(body)
+        .child(body);
+    if message.is_ephemeral {
+        v_flex()
+            .min_w_0()
+            .child(actions::ephemeral_banner(cx))
+            .child(row)
+    } else {
+        row
+    }
 }
 
 /// `element` as a link to `user`'s profile, like Slack's message avatars and names; plain
@@ -1541,7 +1578,17 @@ fn message_header(
                     message.user.as_ref(),
                     handler,
                 ))
-                .when(message.bot_id.is_some(), |name| name.child(app_badge(cx)))
+                // An app's own post; a person's post made through an app (`/giphy`) keeps
+                // their name unbadged, as in Slack.
+                .when(
+                    message.bot_id.is_some()
+                        && message
+                            .user
+                            .as_ref()
+                            .and_then(|user| fixtures.user(user))
+                            .is_none_or(|user| user.is_bot),
+                    |name| name.child(app_badge(cx)),
+                )
                 .children(status),
         )
         .child(div().text_xs().text_color(muted).child(stamp))

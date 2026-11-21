@@ -63,6 +63,12 @@ pub enum MessageAction {
     CopyText,
     /// The author's avatar or name was clicked: show their profile.
     OpenProfile(UserId),
+    /// A Block Kit button was pressed: the element as the message declared it plus its
+    /// `block_id`, and the `id` of the legacy attachment holding it (Giphy's preview).
+    BlockAction {
+        action: crate::blockkit::Json,
+        attachment: Option<i64>,
+    },
 }
 
 /// Which actions apply to one message.
@@ -480,6 +486,19 @@ pub fn saved_banner(cx: &App) -> Div {
         .child("Saved for later")
 }
 
+/// Slack's "Only visible to you" marker above an ephemeral message (Giphy's preview).
+pub fn ephemeral_banner(cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    h_flex()
+        .items_center()
+        .gap_1()
+        .pb_0p5()
+        .text_xs()
+        .text_color(muted)
+        .child(Icon::new(IconName::Eye).text_color(muted).size(px(12.)))
+        .child("Only visible to you")
+}
+
 /// The inline edit draft replacing an edited row: a label, the framed textarea and
 /// Cancel/Save buttons (Save disabled while the draft is empty).
 pub fn edit_box(
@@ -677,6 +696,8 @@ pub enum MessageChange {
     Delete {
         ts: Ts,
     },
+    /// A Block Kit button press for the app that posted the message (`blocks.actions`).
+    BlockAction(crate::blockkit::BlockDispatch),
 }
 
 /// Apply a local edit: new text (re-rendered as one plain rich-text block, as the web client

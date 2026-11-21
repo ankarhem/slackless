@@ -36,6 +36,7 @@ use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
+use crate::blockkit::BlockDispatch;
 use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, ContextBar};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
@@ -458,6 +459,20 @@ impl ThreadPanel {
                 });
             }
             MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
+            MessageAction::BlockAction { action, attachment } => {
+                let live = !self.fixtures.sample;
+                let channel = self.thread.as_ref().map(|(channel, _)| channel.clone());
+                let dispatch = channel
+                    .zip(self.message_at_mut(ts))
+                    .and_then(|(channel, message)| {
+                        BlockDispatch::new(message, &channel, action.clone(), attachment)
+                    })
+                    .filter(|_| live);
+                match dispatch {
+                    Some(dispatch) => self.post(MessageChange::BlockAction(dispatch), cx),
+                    None => crate::blockkit::log_button(&action, window, cx),
+                }
+            }
         }
     }
 
