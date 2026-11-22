@@ -262,7 +262,7 @@ use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
 use crate::composer::{self, Composer, ComposerEvent, ContextBar, Placeholder, TypingNames};
 use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
-use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
+use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent, PickerTab};
 use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
 use crate::hover_card;
@@ -1083,6 +1083,15 @@ impl App {
                         ComposerEvent::OpenEmojiPicker(position) => {
                             this.open_picker(PickerTarget::Composer, *position, window, cx);
                         }
+                        ComposerEvent::OpenGifPicker(position) => {
+                            this.open_picker_tab(
+                                PickerTarget::Composer,
+                                *position,
+                                PickerTab::Gifs,
+                                window,
+                                cx,
+                            );
+                        }
                         // The message list has no way in to start an edit from outside yet;
                         // the thread panel handles this for its own composer.
                         ComposerEvent::EditLast => this
@@ -1106,6 +1115,15 @@ impl App {
                     window,
                     |this: &mut App, _, event: &EmojiPickerEvent, window, cx| match event {
                         EmojiPickerEvent::Pick(choice) => this.pick_emoji(choice, window, cx),
+                        EmojiPickerEvent::PickGif(url) => this.pick_gif(url, window, cx),
+                        EmojiPickerEvent::RunGiphy(query) => this.run_giphy(query, window, cx),
+                        EmojiPickerEvent::SearchGifs(query) => {
+                            if !this.fixtures.sample {
+                                this.bridge.send(Command::SearchGifs {
+                                    query: query.clone(),
+                                });
+                            }
+                        }
                         EmojiPickerEvent::ToneChanged(tone) => {
                             if let Some(write) = this.bridge.remember_emoji_tone(*tone) {
                                 cx.background_executor().spawn(write).detach();
@@ -1236,6 +1254,15 @@ impl App {
                         }
                         ThreadsEvent::PickEmoji(position) => {
                             this.open_picker(PickerTarget::ThreadsComposer, *position, window, cx);
+                        }
+                        ThreadsEvent::PickGif(position) => {
+                            this.open_picker_tab(
+                                PickerTarget::ThreadsComposer,
+                                *position,
+                                PickerTab::Gifs,
+                                window,
+                                cx,
+                            );
                         }
                         ThreadsEvent::SlashCommand(invocation) => {
                             let thread = this.threads.read(cx).active_thread();
@@ -1397,6 +1424,15 @@ impl App {
                         }
                         NewMessageEvent::PickEmoji(position) => {
                             this.open_picker(PickerTarget::ComposeView, *position, window, cx);
+                        }
+                        NewMessageEvent::PickGif(position) => {
+                            this.open_picker_tab(
+                                PickerTarget::ComposeView,
+                                *position,
+                                PickerTab::Gifs,
+                                window,
+                                cx,
+                            );
                         }
                         NewMessageEvent::SlashCommand(invocation) => {
                             this.run_slash(invocation, None, window, cx)
@@ -2361,9 +2397,24 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_picker_tab(target, position, PickerTab::Emoji, window, cx);
+    }
+
+    fn open_picker_tab(
+        &mut self,
+        target: PickerTarget,
+        position: Point<Pixels>,
+        tab: PickerTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let show_gifs = !matches!(
+            target,
+            PickerTarget::Message { .. } | PickerTarget::ThreadMessage(_)
+        );
         self.picker = Some((target, position));
         self.emoji_picker
-            .update(cx, |picker, cx| picker.open(window, cx));
+            .update(cx, |picker, cx| picker.open_tab(tab, show_gifs, window, cx));
         cx.notify();
     }
 
@@ -2440,6 +2491,8 @@ impl App {
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
+        self.emoji_picker
+            .update(cx, |picker, cx| picker.release_gifs(window, cx));
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2531,6 +2584,65 @@ impl App {
         if let Some(write) = self.bridge.remember_frequent_emoji(&frequent) {
             cx.background_executor().spawn(write).detach();
         }
+        cx.notify();
+    }
+
+    /// Route a GIF chosen from the GIFs tab: send its URL into the active channel or thread.
+    fn pick_gif(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, _)) = self.picker.take() else {
+            return;
+        };
+        self.emoji_picker
+            .update(cx, |picker, cx| picker.release_gifs(window, cx));
+        let content = MessageContent::plain(url.to_owned());
+        match target {
+            PickerTarget::ThreadComposer => {
+                if let Some((channel, thread_ts)) = self.thread.read(cx).open_thread() {
+                    self.bridge.send(Command::SendMessage {
+                        channel,
+                        content,
+                        thread_ts: Some(thread_ts),
+                        broadcast: false,
+                    });
+                }
+            }
+            PickerTarget::ThreadsComposer => {
+                if let Some((channel, thread_ts)) = self.threads.read(cx).active_thread() {
+                    self.bridge.send(Command::SendMessage {
+                        channel,
+                        content,
+                        thread_ts: Some(thread_ts),
+                        broadcast: false,
+                    });
+                }
+            }
+            _ => self.send(content, window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Route a Giphy query from the GIFs tab through Slack's `/giphy` command.
+    fn run_giphy(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, _)) = self.picker.take() else {
+            return;
+        };
+        self.emoji_picker
+            .update(cx, |picker, cx| picker.release_gifs(window, cx));
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            cx.notify();
+            return;
+        }
+        let Some(invocation) = crate::slash::parse(&format!("/giphy {trimmed}")) else {
+            cx.notify();
+            return;
+        };
+        let thread = match target {
+            PickerTarget::ThreadComposer => self.thread.read(cx).open_thread(),
+            PickerTarget::ThreadsComposer => self.threads.read(cx).active_thread(),
+            _ => None,
+        };
+        self.run_slash(&invocation, thread, window, cx);
         cx.notify();
     }
 
@@ -3550,6 +3662,11 @@ impl App {
             Event::Usergroups(groups) => {
                 self.usergroups = groups.clone();
                 self.reload_live(window, cx);
+            }
+            Event::GifResults { query, gifs } => {
+                self.emoji_picker.update(cx, |picker, cx| {
+                    picker.set_gif_results(query, gifs.clone(), cx);
+                });
             }
             _ => {}
         }
@@ -6914,6 +7031,15 @@ fn subscribe_workspace(
                 }
                 ThreadPanelEvent::PickEmoji(position) => {
                     this.open_picker(PickerTarget::ThreadComposer, *position, window, cx);
+                }
+                ThreadPanelEvent::PickGif(position) => {
+                    this.open_picker_tab(
+                        PickerTarget::ThreadComposer,
+                        *position,
+                        PickerTab::Gifs,
+                        window,
+                        cx,
+                    );
                 }
                 ThreadPanelEvent::PickEditEmoji(position) => {
                     this.open_picker(PickerTarget::ThreadEdit, *position, window, cx);

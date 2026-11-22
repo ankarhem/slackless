@@ -101,6 +101,8 @@ pub enum ThreadPanelEvent {
     /// The reply composer's emoji button asked for the picker; picks come back through
     /// [`ThreadPanel::insert_emoji`].
     PickEmoji(Point<Pixels>),
+    /// `+` -> `GIF` in the reply composer: open the picker on the GIFs tab.
+    PickGif(Point<Pixels>),
     /// The inline edit composer's emoji button asked for the picker; picks come back through
     /// [`ThreadPanel::insert_edit_emoji`].
     PickEditEmoji(Point<Pixels>),
@@ -171,6 +173,9 @@ impl ThreadPanel {
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(ThreadPanelEvent::PickEmoji(*position));
                         }
+                        ComposerEvent::OpenGifPicker(position) => {
+                            cx.emit(ThreadPanelEvent::PickGif(*position));
+                        }
                         ComposerEvent::SlashCommand(invocation) => {
                             match invocation.command.map(|command| command.kind) {
                                 Some(SlashKind::Shrug) if invocation.args.is_empty() => {
@@ -197,7 +202,8 @@ impl ThreadPanel {
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(ThreadPanelEvent::PickEditEmoji(*position));
                         }
-                        ComposerEvent::SlashCommand(_)
+                        ComposerEvent::OpenGifPicker(_)
+                        | ComposerEvent::SlashCommand(_)
                         | ComposerEvent::SubmitWithFiles { .. }
                         | ComposerEvent::Schedule { .. }
                         | ComposerEvent::EditLast

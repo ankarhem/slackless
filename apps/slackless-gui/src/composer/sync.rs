@@ -42,10 +42,12 @@ impl Composer {
         self.was_focused = true;
         let selection = self.input.read(cx).selected_range();
         let mut closed_colon = false;
+        let mut typed_backtick = false;
         let diverged = match event.edits() {
             [(edit, _)] if lines_up(text, edit, after.len()) => {
                 let typed = after.slice(edit.start_byte..edit.new_end_byte).to_string();
                 closed_colon = typed == ":";
+                typed_backtick = typed == "`";
                 self.editor
                     .user_edit(edit.start_byte..edit.old_end_byte, &typed, selection)
             }
@@ -56,13 +58,56 @@ impl Composer {
         if !self.edit_mode && !self.editor.doc().text().is_empty() {
             self.note_typing(cx);
         }
-        let converted = closed_colon && self.convert_typed_emoji();
+        let converted = (closed_colon && self.convert_typed_emoji())
+            || (typed_backtick && self.auto_open_code_block());
         if diverged || converted {
             self.push(window, cx);
         } else {
             self.sync_presentation(cx);
         }
         self.changed(cx);
+    }
+
+    /// Slack turns typing three backticks (` ``` `) at the start of a line into a fenced code
+    /// block immediately with the caret placed inside it, ready to type code. Only fires when
+    /// the third backtick opens an unclosed fence (never when closing an existing block).
+    fn auto_open_code_block(&mut self) -> bool {
+        let selection = self.editor.selection();
+        if !selection.is_empty() {
+            return false;
+        }
+        let caret = selection.start;
+        let doc = self.editor.doc();
+        let parsed = doc.parse();
+        let line = parsed.line_at(caret);
+        if line.kind != Some(LineKind::Fence) || caret != line.end {
+            return false;
+        }
+        if &doc.text()[line.start..line.end] != "```" {
+            return false;
+        }
+        // Only auto-wrap when this line is an unclosed opening fence (odd number of fences in
+        // the document and even number of fences before this line).
+        let fences_before = parsed
+            .lines
+            .iter()
+            .take_while(|other| other.start < line.start)
+            .filter(|other| other.kind == Some(LineKind::Fence))
+            .count();
+        let total_fences = parsed
+            .lines
+            .iter()
+            .filter(|other| other.kind == Some(LineKind::Fence))
+            .count();
+        if fences_before % 2 != 0 || total_fences % 2 == 0 {
+            return false;
+        }
+        let line_start = line.start;
+        self.editor.insert_text("\n\n```");
+        // Move caret onto the empty code line right after ` ```\n `.
+        let inside = line_start + 4;
+        self.editor.select(inside..inside);
+        true
     }
 
     /// Slack turns a typed `:shortcode:` into its emoji as the closing colon is typed (a

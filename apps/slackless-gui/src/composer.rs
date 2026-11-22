@@ -29,10 +29,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::input::{InputEditsEvent, InputState, TextareaState};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{InputEditsEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Image,
-    ImageFormat, PathPromptOptions, Pixels, Point, SharedString, Subscription, Window,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
+    Image, ImageFormat, ParentElement as _, PathPromptOptions, Pixels, Point, SharedString,
+    Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::MessageContent;
 use slackless_core::types::Message;
@@ -64,6 +67,8 @@ pub enum ComposerEvent {
     },
     /// The emoji button was clicked at this window position.
     OpenEmojiPicker(Point<Pixels>),
+    /// `+` -> `GIF` was clicked: open the picker directly on the GIFs tab.
+    OpenGifPicker(Point<Pixels>),
     /// A `/command` draft was sent (composer already cleared).
     SlashCommand(Invocation),
     /// The draft, as mrkdwn, was scheduled for later (composer already cleared).
@@ -179,6 +184,10 @@ pub struct Composer {
     also_send: Option<(AlsoSendTarget, bool)>,
     /// Whether the top formatting toolbar is visible (toggled by the `Aa` button).
     show_toolbar: bool,
+    /// Whether the bottom-left `+` attachments/shortcuts dropdown menu is open (`+` -> `×`).
+    plus_open: bool,
+    /// Timestamp of the last `+` toggle, so double-clicking `+` uploads directly like Slack.
+    plus_last_click: Option<Instant>,
     /// Inline edit mode for an existing message: omits outer padding and notification bar,
     /// shows `+`, `Aa`, `☺` on the left and `Cancel` / `Save` on the right, and emits
     /// [`ComposerEvent::Cancel`] on Esc.
@@ -273,6 +282,8 @@ impl Composer {
                 scheduling: !edit_mode,
                 also_send: None,
                 show_toolbar: true,
+                plus_open: false,
+                plus_last_click: None,
                 edit_mode,
                 attachments: Vec::new(),
                 next_paste_id: 1,
@@ -427,6 +438,137 @@ impl Composer {
         self.reset(window, cx);
         self.changed(cx);
         Some(doc)
+    }
+
+    /// Track `+` dropdown open state (`+` -> `×`) and trigger direct file upload on double-click,
+    /// matching Slack's `"Tip: double click to upload"`.
+    pub(super) fn on_plus_open_change(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.plus_open = open;
+        let now = Instant::now();
+        if !open
+            && self
+                .plus_last_click
+                .is_some_and(|prev| now.duration_since(prev) <= Duration::from_millis(380))
+        {
+            self.plus_last_click = None;
+            self.pick_files(cx);
+        } else if open {
+            self.plus_last_click = Some(now);
+        }
+        cx.notify();
+    }
+
+    /// Open Slack's `"Create a text snippet"` dialog (`+` -> `Text snippet` or `Cmd+Shift+Enter`),
+    /// staging the snippet as an attached text/code file ready to upload.
+    pub(super) fn open_text_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit_mode {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        let filename = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("snippet.txt")
+                .auto_grow(1, 1)
+        });
+        let body = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Paste or type your snippet...")
+                .auto_grow(6, 14)
+        });
+        body.read(cx).focus_handle(cx).focus(window, cx);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, bg) = (theme.border, theme.muted_foreground, theme.background);
+            let (filename, body, this) = (filename.clone(), body.clone(), this.clone());
+            dialog.title("Create a text snippet").w(px(520.)).child(
+                v_flex()
+                    .gap_3()
+                    .p_4()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("Filename"),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(bg)
+                                    .child(
+                                        Textarea::new(&filename).appearance(false).bordered(false),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("Content"),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(bg)
+                                    .child(Textarea::new(&body).appearance(false).bordered(false)),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("snippet-cancel")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("snippet-create")
+                                    .primary()
+                                    .with_size(Size::Small)
+                                    .label("Create snippet")
+                                    .on_click(move |_, window, cx| {
+                                        let content = body.read(cx).value().to_string();
+                                        if content.trim().is_empty() {
+                                            return;
+                                        }
+                                        let raw_name = filename.read(cx).value().trim().to_owned();
+                                        let name = if raw_name.is_empty() {
+                                            "snippet.txt".to_owned()
+                                        } else if raw_name.contains('.') {
+                                            raw_name
+                                        } else {
+                                            format!("{raw_name}.txt")
+                                        };
+                                        if let Some(this) = this.upgrade() {
+                                            this.update(cx, |composer, cx| {
+                                                composer.attachments.push(PendingAttachment {
+                                                    filename: name,
+                                                    bytes: content.into_bytes(),
+                                                    preview: None,
+                                                });
+                                                cx.notify();
+                                            });
+                                        }
+                                        window.close_dialog(cx);
+                                    }),
+                            ),
+                    ),
+            )
+        });
     }
 
     /// Open the OS file picker and stage every chosen file as a pending attachment.

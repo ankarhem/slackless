@@ -67,8 +67,9 @@ pub(super) const TOOLBAR: [Slot; 14] = [
     Slot::Tool("fmt-divider", IconName::SeparatorHorizontal, Tool::Divider),
 ];
 
-/// The popover over a toolbar button: Slack's title and its individual keycap chips for the
-/// 9 shortcut buttons (none on `¶▾`, Code block, or Divider).
+/// The popover over a toolbar button: Slack's title and its individual keycap chips
+/// (verified against official Slack macOS: 10 shortcut buttons + single-row `"Divider"`;
+/// `¶▾` has no hover tooltip).
 fn slot_tip(tool: Tool) -> Option<(&'static str, &'static [&'static str])> {
     Some(match tool {
         Tool::Style(style) if style == Style::BOLD => ("Bold", &["⌘", "B"]),
@@ -80,25 +81,22 @@ fn slot_tip(tool: Tool) -> Option<(&'static str, &'static [&'static str])> {
         Tool::Block(LineKind::Bullet) => ("Bulleted list", &["⌘", "Shift", "8"]),
         Tool::Block(LineKind::Quote) => ("Blockquote", &["⌘", "Shift", "9"]),
         Tool::Style(style) if style == Style::CODE => ("Code", &["⌘", "Shift", "C"]),
+        Tool::Block(LineKind::Code) => ("Code block", &["⌘", "Option", "Shift", "C"]),
+        Tool::Divider => ("Divider", &[]),
         Tool::Style(_)
         | Tool::Block(
-            LineKind::Code
-            | LineKind::Fence
-            | LineKind::Soft
-            | LineKind::Heading(_)
-            | LineKind::Divider,
+            LineKind::Fence | LineKind::Soft | LineKind::Heading(_) | LineKind::Divider,
         )
         | Tool::Mention
         | Tool::Slash
         | Tool::Clear
         | Tool::Heading(_)
-        | Tool::Paragraph
-        | Tool::Divider => return None,
+        | Tool::Paragraph => return None,
     })
 }
 
-/// Slack's centered 2-row hover popover: bold title on row 1, individual bordered keycap
-/// chips on row 2.
+/// Slack's centered hover popover: bold title on row 1, and optional bordered keycap chips
+/// on row 2 when `keys` is non-empty.
 fn tip_view(
     label: &'static str,
     keys: &'static [&'static str],
@@ -119,12 +117,9 @@ fn tip_view(
             .px_1()
             .py_0p5()
             .child(div().text_xs().font_weight(FontWeight::BOLD).child(label))
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_1p5()
-                    .children(keys.iter().map(|key| {
+            .when(!keys.is_empty(), |col| {
+                col.child(h_flex().items_center().justify_center().gap_1p5().children(
+                    keys.iter().map(|key| {
                         div()
                             .min_w(px(20.))
                             .h(px(20.))
@@ -140,8 +135,30 @@ fn tip_view(
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(chip_fg)
                             .child(*key)
-                    })),
-            )
+                    }),
+                ))
+            })
+    })
+    .build(window, cx)
+}
+
+/// Slack's 2-line centered hover popover with a bold title and plain-text hint below it
+/// (e.g. `+` button: `"Attach"` / `"Tip: double click to upload"`).
+fn tip_sub(
+    label: &'static str,
+    subtitle: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyView {
+    Tooltip::element(move |_, cx| {
+        let fg = cx.theme().popover_foreground;
+        v_flex()
+            .items_center()
+            .gap_0p5()
+            .px_1()
+            .py_0p5()
+            .child(div().text_xs().font_weight(FontWeight::BOLD).child(label))
+            .child(div().text_xs().text_color(fg.opacity(0.85)).child(subtitle))
     })
     .build(window, cx)
 }
@@ -335,13 +352,28 @@ impl Composer {
     }
 
     /// The chevron beside Send: Slack's "Schedule for later" menu.
-    fn schedule_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn schedule_button(&self, can_send: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
-        Button::new("schedule")
-            .ghost()
+        let theme = cx.theme();
+        let icon_color = if can_send {
+            theme.primary_foreground
+        } else {
+            theme.muted_foreground
+        };
+        let trigger = Button::new("schedule")
+            .when(can_send, |btn| btn.primary())
+            .when(!can_send, |btn| btn.ghost().opacity(0.5))
             .with_size(Size::XSmall)
-            .icon(IconName::ChevronDown)
-            .tooltip("Schedule for later")
+            .h(px(28.))
+            .w(px(26.))
+            .p_0()
+            .rounded_none()
+            .rounded_r_sm()
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .text_color(icon_color)
+                    .size(px(14.)),
+            )
             .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
                 for when in SendLater::ALL {
                     let this = this.clone();
@@ -359,7 +391,149 @@ impl Composer {
                     );
                 }
                 menu
+            });
+        div()
+            .id("schedule-tip")
+            .when(can_send, |el| {
+                el.tooltip(|window, cx| tip_view("Schedule for later", &[], window, cx))
             })
+            .child(trigger)
+    }
+
+    /// Slack's bottom-left `+` button (turning to `×` while open) and its upward dropdown menu:
+    /// File/canvas/list (with blue `New` pill), GIF, Text snippet (`⌘⇧Enter`), Workflow, and
+    /// Upload from your computer (`⌘O`). Double-clicking `+` opens the OS file picker directly.
+    fn plus_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (muted, secondary) = (theme.muted_foreground, theme.secondary);
+        let plus_icon = if self.plus_open {
+            IconName::X
+        } else {
+            IconName::Plus
+        };
+        let this = cx.entity().downgrade();
+        let this_open = this.clone();
+        let trigger = Button::new("act-plus")
+            .ghost()
+            .with_size(Size::XSmall)
+            .size(px(26.))
+            .p_0()
+            .rounded_full()
+            .bg(secondary)
+            .child(Icon::new(plus_icon).text_color(muted).size(px(15.)))
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let make_row = |icon: IconName,
+                                label: &'static str,
+                                badge: Option<&'static str>,
+                                shortcut: Option<&'static str>| {
+                    PopupMenuItem::element(move |_, cx| {
+                        let theme = cx.theme();
+                        let (fg, muted) = (theme.popover_foreground, theme.muted_foreground);
+                        h_flex()
+                            .w(px(260.))
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2p5()
+                                    .child(Icon::new(icon).size(px(16.)).text_color(fg))
+                                    .child(div().text_sm().text_color(fg).child(label)),
+                            )
+                            .when_some(badge, |row, text| {
+                                let (bg, fg) = crate::theme::new_badge(cx);
+                                row.child(
+                                    div()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .bg(bg)
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(fg)
+                                        .child(text),
+                                )
+                            })
+                            .when_some(shortcut, |row, keys| {
+                                row.child(div().text_xs().text_color(muted).child(keys))
+                            })
+                    })
+                };
+                let t1 = this.clone();
+                let t2 = this.clone();
+                let t3 = this.clone();
+                let t4 = this.clone();
+                let t5 = this.clone();
+                menu.item(
+                    make_row(IconName::Files, "File, canvas, or list", Some("New"), None).on_click(
+                        move |_, _, cx| {
+                            if let Some(this) = t1.upgrade() {
+                                this.update(cx, |composer, cx| composer.pick_files(cx));
+                            }
+                        },
+                    ),
+                )
+                .item(make_row(IconName::Sticker, "GIF", None, None).on_click(
+                    move |_, window, cx| {
+                        let pos = window.mouse_position();
+                        if let Some(this) = t2.upgrade() {
+                            this.update(cx, |_, cx| {
+                                cx.emit(ComposerEvent::OpenGifPicker(pos));
+                            });
+                        }
+                    },
+                ))
+                .item(
+                    make_row(IconName::FileType, "Text snippet", None, Some("⌘⇧Enter")).on_click(
+                        move |_, window, cx| {
+                            if let Some(this) = t3.upgrade() {
+                                this.update(cx, |composer, cx| {
+                                    composer.open_text_snippet(window, cx);
+                                });
+                            }
+                        },
+                    ),
+                )
+                .item(make_row(IconName::Play, "Workflow", None, None).on_click(
+                    move |_, window, cx| {
+                        if let Some(this) = t4.upgrade() {
+                            this.update(cx, |composer, cx| {
+                                composer.run(Tool::Slash, window, cx);
+                            });
+                        }
+                    },
+                ))
+                .item(
+                    make_row(
+                        IconName::LaptopMinimal,
+                        "Upload from your computer",
+                        None,
+                        Some("⌘O"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        if let Some(this) = t5.upgrade() {
+                            this.update(cx, |composer, cx| composer.pick_files(cx));
+                        }
+                    }),
+                )
+            })
+            .on_open_change(move |open, _, cx| {
+                if let Some(this) = this_open.upgrade() {
+                    this.update(cx, |composer, cx| {
+                        composer.on_plus_open_change(*open, cx);
+                    });
+                }
+            });
+        div()
+            .id("act-plus-tip")
+            .when(!self.plus_open, |el| {
+                el.tooltip(|window, cx| {
+                    tip_sub("Attach", "Tip: double click to upload", window, cx)
+                })
+            })
+            .child(trigger)
+            .into_any_element()
     }
 
     /// Staged attachment chips / image thumbnails rendered inside the composer above the action row.
@@ -446,13 +620,19 @@ impl Composer {
         let theme = cx.theme();
         let (muted, border, hover) = (theme.muted_foreground, theme.border, theme.secondary_hover);
         let secondary = theme.secondary;
-        let (primary, primary_foreground) = (theme.primary, theme.primary_foreground);
+        let (primary, primary_foreground, primary_hover) =
+            (theme.primary, theme.primary_foreground, theme.primary_hover);
         let can_send =
             !self.editor.doc().is_blank() || (!self.edit_mode && !self.attachments.is_empty());
         let icon = |name: IconName| Icon::new(name).text_color(muted).size(px(15.));
         let separator = || div().w(px(1.)).h(px(16.)).rounded_full().bg(border);
         // Window chrome: Slack's controls for features slackless does not have yet.
-        let chrome = |id, label: AnyElement| control(id).text_color(muted).child(label);
+        let chrome = |id, label: AnyElement, tip: &'static str| {
+            control(id)
+                .text_color(muted)
+                .tooltip(move |window, cx| tip_view(tip, &[], window, cx))
+                .child(label)
+        };
         let button = |id, label: AnyElement| {
             control(id)
                 .cursor_pointer()
@@ -466,49 +646,69 @@ impl Composer {
             .when(self.show_toolbar, |el| el.underline())
             .child("Aa")
             .into_any_element();
+        let format_tip = if self.show_toolbar {
+            "Hide formatting"
+        } else {
+            "Show formatting"
+        };
         let smiley = icon(IconName::FaceSlightlySmiling).into_any_element();
         let tools = h_flex()
             .items_center()
             .gap_0p5()
             .child(if self.edit_mode {
-                chrome("act-plus", icon(IconName::Plus).into_any_element())
+                control("act-plus")
                     .rounded_full()
                     .bg(secondary)
+                    .text_color(muted)
+                    .tooltip(|window, cx| {
+                        tip_sub("Attach", "Tip: double click to upload", window, cx)
+                    })
+                    .child(icon(IconName::Plus))
+                    .into_any_element()
             } else {
-                button("act-plus", icon(IconName::Plus).into_any_element())
-                    .rounded_full()
-                    .bg(secondary)
-                    .tooltip(|window, cx| Tooltip::new("Attach files").build(window, cx))
-                    .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)))
+                self.plus_button(cx)
             })
             .child(
-                button("act-format", aa).on_click(cx.listener(|this, _, _, cx| {
-                    this.show_toolbar = !this.show_toolbar;
-                    cx.notify();
-                })),
+                button("act-format", aa)
+                    .tooltip(move |window, cx| tip_view(format_tip, &[], window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_toolbar = !this.show_toolbar;
+                        cx.notify();
+                    })),
             )
-            .child(button("act-emoji", smiley).on_click(cx.listener(
-                |_, event: &ClickEvent, _, cx| {
-                    cx.emit(ComposerEvent::OpenEmojiPicker(event.position()));
-                },
-            )))
+            .child(
+                button("act-emoji", smiley)
+                    .tooltip(|window, cx| tip_view("Add emoji and GIFs", &[], window, cx))
+                    .on_click(cx.listener(|_, event: &ClickEvent, _, cx| {
+                        cx.emit(ComposerEvent::OpenEmojiPicker(event.position()));
+                    })),
+            )
             .when(!self.edit_mode, |row| {
                 row.child(
-                    button("act-mention", icon(IconName::AtSign).into_any_element()).on_click(
-                        cx.listener(|this, _, window, cx| this.run(Tool::Mention, window, cx)),
-                    ),
+                    button("act-mention", icon(IconName::AtSign).into_any_element())
+                        .tooltip(|window, cx| tip_view("Mention someone", &[], window, cx))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.run(Tool::Mention, window, cx)),
+                        ),
                 )
                 .child(separator())
                 .child(chrome(
                     "act-video",
                     icon(IconName::Video).into_any_element(),
+                    "Record video clip",
                 ))
-                .child(chrome("act-mic", icon(IconName::Mic).into_any_element()))
+                .child(chrome(
+                    "act-mic",
+                    icon(IconName::Mic).into_any_element(),
+                    "Record audio clip",
+                ))
                 .child(separator())
                 .child(
-                    button("act-slash", icon(IconName::SquareSlash).into_any_element()).on_click(
-                        cx.listener(|this, _, window, cx| this.run(Tool::Slash, window, cx)),
-                    ),
+                    button("act-slash", icon(IconName::SquareSlash).into_any_element())
+                        .tooltip(|window, cx| tip_view("Run shortcut", &[], window, cx))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.run(Tool::Slash, window, cx)),
+                        ),
                 )
             });
         let right = if self.edit_mode {
@@ -531,11 +731,19 @@ impl Composer {
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                 )
         } else {
+            let send_keys: &'static [&'static str] = if self.enter_sends {
+                &["Return"]
+            } else {
+                &["⌘", "Return"]
+            };
+            let scheduling = self.scheduling;
             let send = div()
                 .id("send")
                 .flex_none()
-                .size(px(28.))
-                .rounded_sm()
+                .h(px(28.))
+                .w(px(32.))
+                .when(scheduling, |el| el.rounded_l_sm())
+                .when(!scheduling, |el| el.rounded_sm())
                 .flex()
                 .items_center()
                 .justify_center()
@@ -543,7 +751,8 @@ impl Composer {
                     if can_send {
                         send.cursor_pointer()
                             .bg(primary)
-                            .hover(|el| el.opacity(0.9))
+                            .hover(move |el| el.bg(primary_hover))
+                            .tooltip(move |window, cx| tip_view("Send now", send_keys, window, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
                     } else {
                         send.opacity(0.5)
@@ -552,13 +761,16 @@ impl Composer {
                 .child(
                     Icon::new(IconName::Send)
                         .text_color(if can_send { primary_foreground } else { muted })
-                        .size(px(16.)),
+                        .size(px(15.)),
                 );
-            h_flex()
-                .items_center()
-                .gap_0p5()
-                .child(send)
-                .when(self.scheduling, |row| row.child(self.schedule_button(cx)))
+            h_flex().items_center().child(send).when(scheduling, |row| {
+                row.child(div().w(px(1.)).h(px(28.)).bg(if can_send {
+                    primary_foreground.opacity(0.25)
+                } else {
+                    border.opacity(0.4)
+                }))
+                .child(self.schedule_button(can_send, cx))
+            })
         };
         h_flex()
             .items_center()
@@ -596,29 +808,29 @@ mod tests {
     }
 
     #[test]
-    fn hover_popovers_cover_exactly_the_nine_shortcut_buttons() {
-        let tipped: Vec<&'static str> = TOOLBAR
+    fn hover_popovers_cover_all_eleven_toolbar_tools() {
+        let tipped: Vec<(&'static str, &'static [&'static str])> = TOOLBAR
             .iter()
             .filter_map(|slot| match slot {
-                Slot::Tool(_, _, tool) => slot_tip(*tool).map(|(label, _)| label),
+                Slot::Tool(_, _, tool) => slot_tip(*tool),
                 Slot::Divider | Slot::Styles => None,
             })
             .collect();
         assert_eq!(
             tipped,
             [
-                "Bold",
-                "Italic",
-                "Underline",
-                "Strikethrough",
-                "Link",
-                "Ordered list",
-                "Bulleted list",
-                "Blockquote",
-                "Code",
+                ("Bold", &["⌘", "B"][..]),
+                ("Italic", &["⌘", "I"][..]),
+                ("Underline", &["⌘", "U"][..]),
+                ("Strikethrough", &["⌘", "Shift", "X"][..]),
+                ("Link", &["⌘", "Shift", "U"][..]),
+                ("Ordered list", &["⌘", "Shift", "7"][..]),
+                ("Bulleted list", &["⌘", "Shift", "8"][..]),
+                ("Blockquote", &["⌘", "Shift", "9"][..]),
+                ("Code", &["⌘", "Shift", "C"][..]),
+                ("Code block", &["⌘", "Option", "Shift", "C"][..]),
+                ("Divider", &[][..]),
             ]
         );
-        assert!(slot_tip(Tool::Block(LineKind::Code)).is_none());
-        assert!(slot_tip(Tool::Divider).is_none());
     }
 }

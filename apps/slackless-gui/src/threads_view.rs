@@ -53,6 +53,7 @@ pub enum ThreadsEvent {
     },
     /// The reply composer's emoji button asked for the picker.
     PickEmoji(Point<Pixels>),
+    PickGif(Point<Pixels>),
     /// A slash command other than /shrug, which replies here; the root dispatches it.
     SlashCommand(Invocation),
     Close,
@@ -92,6 +93,9 @@ impl ThreadsView {
                     }
                     ComposerEvent::OpenEmojiPicker(position) => {
                         cx.emit(ThreadsEvent::PickEmoji(*position));
+                    }
+                    ComposerEvent::OpenGifPicker(position) => {
+                        cx.emit(ThreadsEvent::PickGif(*position));
                     }
                     ComposerEvent::SlashCommand(invocation) => {
                         match invocation.command.map(|command| command.kind) {

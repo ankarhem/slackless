@@ -13,6 +13,7 @@ use std::ops::Range;
 
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{InlineToken, InlineTokenContext, InputContent, TextDecoration};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement as _,
     ParentElement as _, SharedString, StrikethroughStyle, Styled as _, UnderlineStyle, div, px,
@@ -36,6 +37,8 @@ const ORDERED: &str = "ordered";
 const QUOTE: &str = "quote";
 const SOFT: &str = "soft";
 const DIVIDER: &str = "divider";
+const CODE_OPEN: &str = "code-open:";
+const CODE_CLOSE: &str = "code-close";
 
 impl Directory for Fixtures {
     fn mention(&self, id: &UserId) -> String {
@@ -78,6 +81,8 @@ pub(super) struct Palette {
     link: Hsla,
     code: Hsla,
     code_background: Hsla,
+    code_block_fg: Hsla,
+    code_block_bg: Hsla,
     syntax: Hsla,
 }
 
@@ -87,6 +92,8 @@ impl Palette {
             link: cx.theme().link,
             code: crate::theme::code_foreground(cx),
             code_background: cx.theme().secondary,
+            code_block_fg: cx.theme().foreground,
+            code_block_bg: crate::theme::code_block_background(cx),
             syntax: cx.theme().muted_foreground.opacity(0.6),
         }
     }
@@ -94,6 +101,16 @@ impl Palette {
     fn syntax_style(self) -> HighlightStyle {
         HighlightStyle {
             color: Some(self.syntax),
+            ..HighlightStyle::default()
+        }
+    }
+
+    /// Fenced code blocks (` ``` `) keep neutral body foreground (never inline code's orange)
+    /// over a recessed contrasting background, matching Slack's composer and sent pre blocks.
+    fn code_block_style(self) -> HighlightStyle {
+        HighlightStyle {
+            color: Some(self.code_block_fg),
+            background_color: Some(self.code_block_bg),
             ..HighlightStyle::default()
         }
     }
@@ -168,13 +185,27 @@ pub(super) fn project(
 
     // 2. Block prefixes and inline constructs: reveal muted markdown when touched by the
     //    caret while focused, otherwise collapse into Live Preview tokens.
-    let code_attrs = Attrs {
-        style: Style::CODE,
-        link: None,
-    };
+    let mut in_code_fence = false;
     for line in &parsed.lines {
         let line_range = line.start..line.end;
         let line_active = touches(&line_range);
+
+        if line.kind == Some(LineKind::Fence) {
+            let opening = !in_code_fence;
+            in_code_fence = !in_code_fence;
+            if line_active || splits_selection(&line.prefix) {
+                decorations.push(TextDecoration::new(
+                    line.prefix.clone(),
+                    palette.syntax_style(),
+                ));
+            } else if opening {
+                let lang = text[line.prefix.clone()].trim_start_matches('`').trim();
+                raw_tokens.push((line.prefix.clone(), format!("{CODE_OPEN}{lang}").into()));
+            } else {
+                raw_tokens.push((line.prefix.clone(), CODE_CLOSE.into()));
+            }
+            continue;
+        }
 
         if !line.prefix.is_empty() {
             let block_token = match line.kind {
@@ -202,12 +233,12 @@ pub(super) fn project(
             if !line.content.is_empty() {
                 decorations.push(TextDecoration::new(
                     line.content.clone(),
-                    palette.highlight(&code_attrs, None),
+                    palette.code_block_style(),
                 ));
             }
             continue;
         }
-        if matches!(line.kind, Some(LineKind::Fence | LineKind::Divider)) {
+        if matches!(line.kind, Some(LineKind::Divider)) {
             continue;
         }
 
@@ -346,6 +377,7 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
     let theme = cx.theme();
     let token = context.token();
     let height = context.line_height();
+    let selected = context.is_selected();
     let slot = |width: f32| {
         div()
             .flex_none()
@@ -353,6 +385,7 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             .w(px(width))
             .flex()
             .items_center()
+            .when(selected, |el| el.bg(theme.selection))
     };
     let heading_badge = |label: &'static str| {
         div()
@@ -361,6 +394,7 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             .pr_1p5()
             .flex()
             .items_center()
+            .when(selected, |el| el.bg(theme.selection))
             .child(
                 div()
                     .px_1()
@@ -379,6 +413,8 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             )
             .into_any_element()
     };
+    let code_bg = crate::theme::code_block_background(cx);
+    let code_border = theme.foreground.opacity(0.15);
     match token.id().as_ref() {
         HIDE => slot(0.).into_any_element(),
         H1 => heading_badge("H1"),
@@ -397,6 +433,7 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             .flex()
             .items_center()
             .justify_end()
+            .when(selected, |el| el.bg(theme.selection))
             .text_color(theme.muted_foreground)
             .child(SharedString::from(token.text().trim_end().to_owned()))
             .into_any_element(),
@@ -410,38 +447,99 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             .h(height)
             .flex()
             .items_center()
+            .when(selected, |el| el.bg(theme.selection))
             .child(div().w_full().h(px(1.)).bg(theme.border))
             .into_any_element(),
-        id => match id.strip_prefix(EMOJI) {
-            Some(shortcode) => div()
-                .flex_none()
-                .h(height)
-                .flex()
-                .items_center()
-                .child(emoji::emoji_element(shortcode, fixtures, height * 0.72))
-                .into_any_element(),
-            None => {
-                let background = if context.is_selected() {
-                    theme.selection
-                } else {
-                    theme.accent.opacity(0.25)
-                };
+        CODE_CLOSE => div()
+            .flex_none()
+            .w(px(360.))
+            .h(height)
+            .flex()
+            .items_start()
+            .when(selected, |el| el.bg(theme.selection))
+            .child(
                 div()
+                    .w_full()
+                    .h(px(8.))
+                    .rounded_b(px(4.))
+                    .border_b_1()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(code_border)
+                    .bg(code_bg),
+            )
+            .into_any_element(),
+        id => {
+            if let Some(lang) = id.strip_prefix(CODE_OPEN) {
+                let cap = if lang.is_empty() {
+                    div()
+                        .w_full()
+                        .h(px(8.))
+                        .rounded_t(px(4.))
+                        .border_t_1()
+                        .border_l_1()
+                        .border_r_1()
+                        .border_color(code_border)
+                        .bg(code_bg)
+                } else {
+                    div()
+                        .w_full()
+                        .h(px(18.))
+                        .px_2()
+                        .rounded_t(px(4.))
+                        .border_t_1()
+                        .border_l_1()
+                        .border_r_1()
+                        .border_color(code_border)
+                        .bg(code_bg)
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.))
+                        .text_color(theme.muted_foreground.opacity(0.75))
+                        .child(SharedString::from(lang.to_owned()))
+                };
+                return div()
+                    .flex_none()
+                    .w(px(360.))
+                    .h(height)
+                    .flex()
+                    .items_end()
+                    .when(selected, |el| el.bg(theme.selection))
+                    .child(cap)
+                    .into_any_element();
+            }
+            match id.strip_prefix(EMOJI) {
+                Some(shortcode) => div()
                     .flex_none()
                     .h(height)
                     .flex()
                     .items_center()
-                    .child(
-                        div()
-                            .px(px(2.))
-                            .rounded_sm()
-                            .bg(background)
-                            .text_color(theme.link)
-                            .child(token.text().clone()),
-                    )
-                    .into_any_element()
+                    .when(selected, |el| el.bg(theme.selection))
+                    .child(emoji::emoji_element(shortcode, fixtures, height * 0.72))
+                    .into_any_element(),
+                None => {
+                    let background = if selected {
+                        theme.selection
+                    } else {
+                        theme.accent.opacity(0.25)
+                    };
+                    div()
+                        .flex_none()
+                        .h(height)
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .px(px(2.))
+                                .rounded_sm()
+                                .bg(background)
+                                .text_color(theme.link)
+                                .child(token.text().clone()),
+                        )
+                        .into_any_element()
+                }
             }
-        },
+        }
     }
 }
 
@@ -455,6 +553,8 @@ mod tests {
             link: hsla(0.6, 0.8, 0.5, 1.0),
             code: hsla(0.0, 0.7, 0.5, 1.0),
             code_background: hsla(0.0, 0.0, 0.2, 1.0),
+            code_block_fg: hsla(0.0, 0.0, 0.85, 1.0),
+            code_block_bg: hsla(0.0, 0.0, 0.12, 1.0),
             syntax: hsla(0.0, 0.0, 0.5, 0.6),
         }
     }
@@ -582,6 +682,42 @@ mod tests {
                 .iter()
                 .any(|d| d.range.start <= 8 && d.range.end > 8 && d.style.font_weight.is_some()),
             "revealed `*` delimiter inside heading keeps regular syntax weight"
+        );
+    }
+
+    #[test]
+    fn live_preview_renders_code_blocks_with_neutral_text_and_collapsed_fences() {
+        let doc = Doc::from("```\nwrong\n```");
+        let palette = test_palette();
+
+        // Caret inside code body (`wrong` is bytes 4..9): fences collapse into top/bottom caps,
+        // and code body uses neutral `code_block_fg` + `code_block_bg` (NOT inline-code orange).
+        let (content, decorations) = project(&doc, &(6..6), true, palette);
+        assert_eq!(
+            token_ids(&content),
+            vec![
+                ("code-open:".into(), "```".into()),
+                ("code-close".into(), "```".into()),
+            ]
+        );
+        let body = decorations
+            .iter()
+            .find(|d| d.range == (4..9))
+            .expect("code block line should be decorated");
+        assert_eq!(body.style.color, Some(palette.code_block_fg));
+        assert_ne!(body.style.color, Some(palette.code));
+        assert_eq!(body.style.background_color, Some(palette.code_block_bg));
+
+        // Caret on opening fence line (0..3): opening fence reveals in syntax color; closing stays collapsed.
+        let (content, decorations) = project(&doc, &(2..2), true, palette);
+        assert_eq!(
+            token_ids(&content),
+            vec![("code-close".into(), "```".into())]
+        );
+        assert!(
+            decorations
+                .iter()
+                .any(|d| d.range == (0..3) && d.style.color == Some(palette.syntax))
         );
     }
 }

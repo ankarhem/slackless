@@ -146,6 +146,8 @@ impl Composer {
     pub(super) fn on_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.link_open {
             self.apply_link(window, cx);
+        } else if action.secondary && action.shift && !self.edit_mode {
+            self.open_text_snippet(window, cx);
         } else if action.secondary {
             self.submit(window, cx);
         } else if let Some(ix) = self.menu_pick(action) {
@@ -250,6 +252,16 @@ impl Composer {
     ) {
         let modifiers = event.keystroke.modifiers;
         if self.link_open || !modifiers.secondary(cx) {
+            return;
+        }
+        if !self.edit_mode
+            && matches!(
+                (event.keystroke.key.as_str(), modifiers.shift, modifiers.alt),
+                ("o", false, false)
+            )
+        {
+            cx.stop_propagation();
+            self.pick_files(cx);
             return;
         }
         // With Shift (and Alt) held the platform may report the shifted character.

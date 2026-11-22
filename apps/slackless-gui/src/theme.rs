@@ -311,6 +311,26 @@ pub fn code_foreground(cx: &App) -> Hsla {
     }
 }
 
+/// Recessed background for triple-backtick code blocks inside the composer: clearly distinct
+/// from [`composer_surfaces`] in both dark and light mode.
+pub fn code_block_background(cx: &App) -> Hsla {
+    if cx.theme().mode.is_dark() {
+        color(0x1A_1D_21)
+    } else {
+        color(0xF4_F4_F5)
+    }
+}
+
+/// Slack's blue `"New"` badge pill shown in menus (e.g. `+` -> `File, canvas, or list`) as
+/// `(background, foreground)`.
+pub fn new_badge(cx: &App) -> (Hsla, Hsla) {
+    if cx.theme().mode.is_dark() {
+        (color(0x10_23_4B), color(0x9D_C3_FF))
+    } else {
+        (color(0xE3_EE_FF), color(0x12_64_A3))
+    }
+}
+
 /// Slack's destructive text ("Delete message..."): the danger red on light themes, a light
 /// rose on dark ones.
 pub fn danger_text(cx: &App) -> Hsla {

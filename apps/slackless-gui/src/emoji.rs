@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
@@ -28,10 +29,12 @@ use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, AppContext as _, BoxShadow, Context, Entity, EventEmitter, Focusable as _,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render,
-    ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Subscription,
-    UniformListScrollHandle, Window, div, point, px, uniform_list,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Pixels,
+    Render, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Subscription, Task, UniformListScrollHandle, Window, div, img, point, px,
+    rgb, uniform_list,
 };
+use slackless_core::api::GifItem;
 
 use crate::blockkit::{Json, serde_json};
 use crate::fixtures::Fixtures;
@@ -673,6 +676,30 @@ pub(crate) fn skin_tone_from_prefs(prefs: &Json) -> u8 {
         .unwrap_or(1)
 }
 
+/// Top-level tab of the emoji / GIF picker (Slack's `Emoji` | `GIFs` switcher).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PickerTab {
+    Emoji,
+    Gifs,
+}
+
+/// Curated Giphy mood/reaction presets shown only in offline/fixture mode (when signed into a
+/// live workspace, the GIFs tab loads Slack's real `gif.featured` and `gif.search` endpoints).
+const GIF_PRESETS: [(&str, &str, u32); 12] = [
+    ("Celebrate", "🎉", 0x5B2C6F),
+    ("Applause", "👏", 0x1B4F72),
+    ("Thumbs up", "👍", 0x145A32),
+    ("Laugh", "😂", 0x7D6608),
+    ("Yes", "🙌", 0x0E6251),
+    ("Thank you", "🙏", 0x641E16),
+    ("Mind blown", "🤯", 0x4A235A),
+    ("Shrug", "🤷", 0x2E4053),
+    ("Popcorn", "🍿", 0x7E5109),
+    ("Dancing", "💃", 0x78281F),
+    ("High five", "✋", 0x1F618D),
+    ("Facepalm", "🤦", 0x424949),
+];
+
 /// A picked emoji: the shortcode as Slack names it (tone suffix included) and its glyph;
 /// `glyph` is `None` for workspace custom emoji, which only exist as images.
 #[derive(Clone)]
@@ -683,6 +710,12 @@ pub struct EmojiChoice {
 
 pub enum EmojiPickerEvent {
     Pick(EmojiChoice),
+    /// A GIF tile from `gif.featured` / `gif.search` was clicked: send its URL.
+    PickGif(String),
+    /// Request featured GIFs (`""`) or search GIFs (`query`) from Slack's `gif.*` API.
+    SearchGifs(String),
+    /// Run `/giphy <query>` in fixture/fallback mode.
+    RunGiphy(String),
     ToneChanged(u8),
 }
 
@@ -695,8 +728,29 @@ enum Row {
 pub struct EmojiPicker {
     fixtures: Arc<Fixtures>,
     search: Entity<TextareaState>,
-    /// Lowercased search text; non-empty replaces the sections with the matches.
+    /// Active top tab (`Emoji` or `GIFs`).
+    tab: PickerTab,
+    /// Whether the top `Emoji` | `GIFs` tab switcher is shown (true for composers, false for
+    /// message reactions).
+    show_gifs: bool,
+    /// Lowercased search text for Emoji (spaces normalized to `_`).
     query: String,
+    /// Raw trimmed search text for GIFs.
+    gif_query: String,
+    /// Live GIF results returned by Slack's `gif.featured` / `gif.search` endpoints.
+    gif_results: Vec<GifItem>,
+    /// Last query whose results are currently in `gif_results` (`None` before first load).
+    gif_loaded_query: Option<String>,
+    /// Preview URLs that should have their decoded frames & GPU textures evicted on the next
+    /// render (when a new search replaces old results or hover moves off an animated GIF).
+    stale_gif_urls: Vec<String>,
+    /// Index of the GIF tile currently under the pointer (the only tile animating at once).
+    hovered_gif: Option<usize>,
+    /// Animated `preview_url` currently decoded for `hovered_gif`, evicted as soon as hover moves.
+    active_anim_url: Option<String>,
+    gif_grid: UniformListScrollHandle,
+    gif_loading: bool,
+    gif_debounce: Option<Task<()>>,
     /// Slack skin tone, 1 (default) to 6.
     tone: u8,
     tones_open: bool,
@@ -718,6 +772,18 @@ pub struct EmojiPicker {
 
 impl EventEmitter<EmojiPickerEvent> for EmojiPicker {}
 
+/// Evict a single GIF URL's decoded frames and Metal textures from GPUI's window & asset cache.
+fn evict_gif_asset(url: &str, window: &mut Window, cx: &mut gpui_kit::gpui::App) {
+    let source = ImageSource::from(url.to_owned());
+    if let ImageSource::Resource(ref resource) = source {
+        if let Some(Ok(data)) = window.get_asset::<gpui_kit::gpui::ImgResourceLoader>(resource, cx)
+        {
+            let _ = window.drop_image(data);
+        }
+    }
+    source.remove_asset(cx);
+}
+
 impl EmojiPicker {
     pub fn new(
         fixtures: Arc<Fixtures>,
@@ -735,23 +801,44 @@ impl EmojiPicker {
                 window,
                 |this: &mut EmojiPicker, search, event: &InputEvent, _, cx| match event {
                     InputEvent::Change => {
-                        let query = search
-                            .read(cx)
-                            .value()
-                            .trim()
-                            .to_lowercase()
-                            .replace(' ', "_");
-                        if query != this.query {
-                            this.query = query;
-                            this.rebuild();
-                            cx.notify();
+                        let raw = search.read(cx).value().trim().to_owned();
+                        match this.tab {
+                            PickerTab::Emoji => {
+                                let query = raw.to_lowercase().replace(' ', "_");
+                                if query != this.query {
+                                    this.query = query;
+                                    this.rebuild();
+                                    cx.notify();
+                                }
+                            }
+                            PickerTab::Gifs => {
+                                if raw != this.gif_query {
+                                    this.gif_query = raw;
+                                    this.request_gifs(true, cx);
+                                    cx.notify();
+                                }
+                            }
                         }
                     }
-                    InputEvent::PressEnter { .. } => {
-                        if let Some(first) = this.first_cell().cloned() {
-                            this.pick(first, cx);
+                    InputEvent::PressEnter { .. } => match this.tab {
+                        PickerTab::Emoji => {
+                            if let Some(first) = this.first_cell().cloned() {
+                                this.pick(first, cx);
+                            }
                         }
-                    }
+                        PickerTab::Gifs => {
+                            if let Some(first) = this.gif_results.first().cloned() {
+                                cx.emit(EmojiPickerEvent::PickGif(first.url));
+                            } else {
+                                let query = this.gif_query.trim().to_owned();
+                                if !query.is_empty() {
+                                    cx.emit(EmojiPickerEvent::RunGiphy(query));
+                                } else if let Some((preset, _, _)) = GIF_PRESETS.first() {
+                                    cx.emit(EmojiPickerEvent::RunGiphy((*preset).to_owned()));
+                                }
+                            }
+                        }
+                    },
                     _ => {}
                 },
             )];
@@ -767,7 +854,18 @@ impl EmojiPicker {
                 tone: fixtures.skin_tone,
                 fixtures,
                 search,
+                tab: PickerTab::Emoji,
+                show_gifs: false,
                 query: String::new(),
+                gif_query: String::new(),
+                gif_results: Vec::new(),
+                gif_loaded_query: None,
+                stale_gif_urls: Vec::new(),
+                hovered_gif: None,
+                active_anim_url: None,
+                gif_grid: UniformListScrollHandle::new(),
+                gif_loading: false,
+                gif_debounce: None,
                 tones_open: false,
                 frequent,
                 rows: Vec::new(),
@@ -782,15 +880,119 @@ impl EmojiPicker {
         })
     }
 
-    /// Reset to the top of the grid with an empty, focused search.
-    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Reset to the top of the grid with an empty, focused search on `tab`.
+    pub fn open_tab(
+        &mut self,
+        tab: PickerTab,
+        show_gifs: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_gifs = show_gifs;
+        self.tab = if show_gifs { tab } else { PickerTab::Emoji };
         self.query.clear();
+        self.gif_query.clear();
         self.tones_open = false;
         self.rebuild();
-        self.search
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        let placeholder = match self.tab {
+            PickerTab::Emoji => "Search all emoji",
+            PickerTab::Gifs => "Search all GIFs on Giphy",
+        };
+        self.search.update(cx, |state, cx| {
+            state.set_placeholder(placeholder, window, cx);
+            state.set_value("", window, cx);
+        });
         self.search.read(cx).focus_handle(cx).focus(window, cx);
+        if self.tab == PickerTab::Gifs {
+            self.request_gifs(false, cx);
+        }
         cx.notify();
+    }
+
+    /// Receive GIF results from Slack's `gif.featured` / `gif.search` backend.
+    pub fn set_gif_results(&mut self, query: &str, gifs: Vec<GifItem>, cx: &mut Context<Self>) {
+        if query.trim() != self.gif_query.trim() {
+            return;
+        }
+        self.hovered_gif = None;
+        if let Some(anim) = self.active_anim_url.take() {
+            self.stale_gif_urls.push(anim);
+        }
+        for old in self.gif_results.drain(..) {
+            if !gifs.iter().any(|g| g.still_url == old.still_url) {
+                self.stale_gif_urls.push(old.still_url);
+            }
+            if !gifs.iter().any(|g| g.preview_url == old.preview_url) {
+                self.stale_gif_urls.push(old.preview_url);
+            }
+        }
+        self.gif_loading = false;
+        self.gif_loaded_query = Some(self.gif_query.trim().to_owned());
+        self.gif_results = gifs;
+        self.gif_grid.scroll_to_item_strict(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Evict all decoded GIF frames and Metal GPU textures when the picker closes or leaves
+    /// the GIFs tab so memory returns to baseline and zero animation timers stay alive.
+    pub fn release_gifs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.gif_debounce = None;
+        self.gif_loading = false;
+        self.gif_loaded_query = None;
+        self.hovered_gif = None;
+        if let Some(anim) = self.active_anim_url.take() {
+            evict_gif_asset(&anim, window, cx);
+        }
+        for url in self.stale_gif_urls.drain(..) {
+            evict_gif_asset(&url, window, cx);
+        }
+        for gif in self.gif_results.drain(..) {
+            evict_gif_asset(&gif.still_url, window, cx);
+            if gif.preview_url != gif.still_url {
+                evict_gif_asset(&gif.preview_url, window, cx);
+            }
+        }
+    }
+
+    fn switch_tab(&mut self, tab: PickerTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        if self.tab == PickerTab::Gifs {
+            self.release_gifs(window, cx);
+        }
+        self.open_tab(tab, self.show_gifs, window, cx);
+    }
+
+    fn request_gifs(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        if self.fixtures.sample {
+            self.gif_loading = false;
+            self.gif_debounce = None;
+            return;
+        }
+        let query = self.gif_query.trim().to_owned();
+        if self.gif_loaded_query.as_deref() == Some(query.as_str()) && !self.gif_results.is_empty()
+        {
+            self.gif_loading = false;
+            self.gif_debounce = None;
+            return;
+        }
+        self.gif_loading = true;
+        if !debounce {
+            self.gif_debounce = None;
+            cx.emit(EmojiPickerEvent::SearchGifs(query));
+            return;
+        }
+        self.gif_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let _ = this.update(cx, |picker, cx| {
+                if picker.gif_query.trim() == query {
+                    cx.emit(EmojiPickerEvent::SearchGifs(query));
+                }
+            });
+        }));
     }
 
     /// Restore locally persisted frequent emoji and/or skin tone at launch.
@@ -1056,10 +1258,263 @@ impl EmojiPicker {
                 }
             }))
     }
+    /// Virtualized 3-column GIF rows: each tile renders its lightweight single-frame
+    /// `still_url` (`tinygifpreview`, ~20 KB / 160 KB decoded, 0% idle CPU), and only the
+    /// hovered tile overlays its animated `preview_url` (`tinygif`), evicting the previous
+    /// animated texture as soon as hover moves so memory stays bounded.
+    fn render_gif_rows(&self, range: Range<usize>, cx: &Context<Self>) -> Vec<AnyElement> {
+        const GIF_COLS: usize = 3;
+        let secondary = cx.theme().secondary;
+        let tile = px(100.);
+        range
+            .filter_map(|row_ix| {
+                let start = row_ix * GIF_COLS;
+                let slice = self.gif_results.get(start..)?;
+                let items = &slice[..slice.len().min(GIF_COLS)];
+                Some(
+                    h_flex()
+                        .id(("gif-row", row_ix))
+                        .h(px(108.))
+                        .pb_2()
+                        .gap_2()
+                        .children(items.iter().enumerate().map(|(col, gif)| {
+                            let idx = start + col;
+                            let url = gif.url.clone();
+                            let title = SharedString::from(gif.title.clone());
+                            let is_hovered = self.hovered_gif == Some(idx);
+                            let anim_url = gif.preview_url.clone();
+                            div()
+                                .id(("gif-item", idx))
+                                .relative()
+                                .w(tile)
+                                .h(tile)
+                                .rounded_md()
+                                .overflow_hidden()
+                                .bg(secondary)
+                                .cursor_pointer()
+                                .hover(|el| el.opacity(0.92))
+                                .when(!gif.title.is_empty(), |el| {
+                                    el.tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(title.clone())
+                                            .build(window, cx)
+                                    })
+                                })
+                                .child(
+                                    img(gif.still_url.clone())
+                                        .size_full()
+                                        .object_fit(ObjectFit::Cover)
+                                        .rounded(px(6.)),
+                                )
+                                .when(is_hovered && gif.preview_url != gif.still_url, |el| {
+                                    el.child(
+                                        div().absolute().inset_0().child(
+                                            crate::media::Picture::new(gif.preview_url.clone())
+                                                .fit(ObjectFit::Cover)
+                                                .radius(px(6.)),
+                                        ),
+                                    )
+                                })
+                                .on_hover(cx.listener(move |this, inside: &bool, _, cx| {
+                                    if *inside {
+                                        if this.hovered_gif != Some(idx) {
+                                            if let Some(prev) =
+                                                this.active_anim_url.replace(anim_url.clone())
+                                            {
+                                                if prev != anim_url {
+                                                    this.stale_gif_urls.push(prev);
+                                                }
+                                            }
+                                            this.hovered_gif = Some(idx);
+                                            cx.notify();
+                                        }
+                                    } else if this.hovered_gif == Some(idx) {
+                                        this.hovered_gif = None;
+                                        if let Some(prev) = this.active_anim_url.take() {
+                                            this.stale_gif_urls.push(prev);
+                                        }
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(EmojiPickerEvent::PickGif(url.clone()));
+                                }))
+                        }))
+                        .into_any_element(),
+                )
+            })
+            .collect()
+    }
+
+    /// The 3-column GIFs tab content, matching Slack's `"Search all GIFs on Giphy"` grid.
+    fn render_gifs_body(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (border, secondary, hover, foreground, muted) = (
+            theme.border,
+            theme.secondary,
+            theme.secondary_hover,
+            theme.foreground,
+            theme.muted_foreground,
+        );
+        let tile_w = px(100.);
+        let tile_h = px(100.);
+        let body_h = px(GRID_HEIGHT + 86.);
+
+        if self.gif_loading {
+            return div()
+                .id("gif-grid-loading")
+                .h(body_h)
+                .px_4()
+                .pt_3()
+                .pb_3()
+                .flex()
+                .flex_wrap()
+                .content_start()
+                .gap_2()
+                .children((0usize..9).map(|ix| {
+                    div()
+                        .id(("gif-skel", ix))
+                        .w(tile_w)
+                        .h(tile_h)
+                        .rounded_md()
+                        .bg(secondary)
+                }))
+                .into_any_element();
+        }
+
+        if !self.gif_results.is_empty() {
+            let row_count = self.gif_results.len().div_ceil(3);
+            return uniform_list(
+                "gif-grid",
+                row_count,
+                cx.processor(|this, range: Range<usize>, _, cx| this.render_gif_rows(range, cx)),
+            )
+            .h(body_h)
+            .px_4()
+            .pt_3()
+            .pb_2()
+            .track_scroll(&self.gif_grid)
+            .into_any_element();
+        }
+
+        if !self.fixtures.sample && self.gif_loaded_query.is_some() {
+            return div()
+                .id("gif-grid-empty")
+                .h(body_h)
+                .p_4()
+                .text_sm()
+                .text_color(muted)
+                .child(format!("No GIFs match \u{201C}{}\u{201D}", self.gif_query))
+                .into_any_element();
+        }
+
+        let needle = self.gif_query.trim().to_lowercase();
+        let presets: Vec<_> = GIF_PRESETS
+            .iter()
+            .copied()
+            .filter(|(label, _, _)| needle.is_empty() || label.to_lowercase().contains(&needle))
+            .collect();
+        let query_banner = (!needle.is_empty()).then(|| {
+            let query = self.gif_query.trim().to_owned();
+            let display = SharedString::from(format!("Send /giphy \u{201C}{query}\u{201D}"));
+            h_flex()
+                .id("gif-run-query")
+                .w_full()
+                .px_3()
+                .py_2()
+                .mb_2()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(secondary)
+                .cursor_pointer()
+                .hover(|el| el.bg(hover))
+                .items_center()
+                .justify_between()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Sticker)
+                                .size(px(15.))
+                                .text_color(foreground),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(foreground)
+                                .child(display),
+                        ),
+                )
+                .child(div().text_xs().text_color(muted).child("Return"))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(EmojiPickerEvent::RunGiphy(query.clone()));
+                }))
+        });
+
+        v_flex()
+            .id("gif-grid-presets")
+            .h(body_h)
+            .px_4()
+            .pt_3()
+            .pb_3()
+            .overflow_y_scroll()
+            .children(query_banner)
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(
+                        presets
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ix, (label, glyph, tint))| {
+                                let bg = Hsla::from(rgb(tint)).opacity(if theme.mode.is_dark() {
+                                    0.85
+                                } else {
+                                    0.9
+                                });
+                                let fg = Hsla::from(rgb(0xFF_FF_FF));
+                                v_flex()
+                                    .id(("gif-preset", ix))
+                                    .w(tile_w)
+                                    .h(px(74.))
+                                    .rounded_md()
+                                    .bg(bg)
+                                    .cursor_pointer()
+                                    .hover(|el| el.opacity(0.88))
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_1()
+                                    .child(div().text_size(px(22.)).child(glyph))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(fg)
+                                            .child(label),
+                                    )
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(EmojiPickerEvent::RunGiphy(label.to_owned()));
+                                    }))
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for EmojiPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.stale_gif_urls.is_empty() {
+            let stale = std::mem::take(&mut self.stale_gif_urls);
+            window.defer(cx, move |window, cx| {
+                for url in stale {
+                    evict_gif_asset(&url, window, cx);
+                }
+            });
+        }
         let theme = cx.theme();
         let border = theme.border;
         let input_border = theme.input;
@@ -1070,6 +1525,130 @@ impl Render for EmojiPicker {
         let foreground = theme.foreground;
         let hover = theme.secondary_hover;
         let active_bg = theme.secondary_active;
+
+        // Top `Emoji` | `GIFs` switcher matching official Slack's picker header.
+        let top_tabs = self.show_gifs.then(|| {
+            let emoji_active = self.tab == PickerTab::Emoji;
+            let gifs_active = self.tab == PickerTab::Gifs;
+            let transparent = Hsla::transparent_black();
+            let emoji_accent = Hsla::from(rgb(0xEC_B2_2E));
+            h_flex()
+                .w_full()
+                .h(px(44.))
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .id("picker-tab-emoji")
+                        .flex_1()
+                        .h_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .border_b_2()
+                        .border_color(if emoji_active {
+                            foreground
+                        } else {
+                            transparent
+                        })
+                        .when(!emoji_active, |el| el.hover(|el| el.bg(hover.opacity(0.4))))
+                        .child(
+                            Icon::new(IconName::FaceSlightlySmiling)
+                                .size(px(16.))
+                                .text_color(if emoji_active { emoji_accent } else { muted }),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if emoji_active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(if emoji_active { foreground } else { muted })
+                                .child("Emoji"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.switch_tab(PickerTab::Emoji, window, cx);
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .id("picker-tab-gifs")
+                        .flex_1()
+                        .h_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .border_b_2()
+                        .border_color(if gifs_active { foreground } else { transparent })
+                        .when(!gifs_active, |el| el.hover(|el| el.bg(hover.opacity(0.4))))
+                        .child(
+                            Icon::new(IconName::Sticker)
+                                .size(px(16.))
+                                .text_color(if gifs_active { foreground } else { muted }),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(if gifs_active {
+                                    FontWeight::SEMIBOLD
+                                } else {
+                                    FontWeight::MEDIUM
+                                })
+                                .text_color(if gifs_active { foreground } else { muted })
+                                .child("GIFs"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.switch_tab(PickerTab::Gifs, window, cx);
+                        })),
+                )
+        });
+
+        // The search field in Slack's focus ring: the accent border inside a soft halo.
+        let focused = self.search.read(cx).focus_handle(cx).is_focused(window);
+        let search = h_flex()
+            .mx_4()
+            .mt_3()
+            .h(px(36.))
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(if focused { ring } else { input_border })
+            .when(focused, |field| {
+                field.shadow(vec![BoxShadow {
+                    color: ring.opacity(0.3),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(3.),
+                    inset: false,
+                }])
+            })
+            .bg(background)
+            .child(
+                div().flex_1().min_w_0().text_sm().child(
+                    Textarea::new(&self.search)
+                        .appearance(false)
+                        .bordered(false),
+                ),
+            );
+
+        if self.tab == PickerTab::Gifs {
+            return v_flex()
+                .id("emoji-picker")
+                .w(px(PICKER_WIDTH))
+                .rounded_lg()
+                .border_1()
+                .border_color(border)
+                .bg(background)
+                .shadow_lg()
+                .text_color(foreground)
+                .children(top_tabs)
+                .child(search)
+                .child(self.render_gifs_body(cx));
+        }
 
         // Slack's category row: outline icons, the section in view (or the one clicked) boxed.
         let active = self.active_tab();
@@ -1101,34 +1680,6 @@ impl Render for EmojiPicker {
                         }))
                 }),
         );
-
-        // The search field in Slack's focus ring: the accent border inside a soft halo.
-        let focused = self.search.read(cx).focus_handle(cx).is_focused(window);
-        let search = h_flex()
-            .mx_4()
-            .mt_3()
-            .h(px(36.))
-            .items_center()
-            .rounded_lg()
-            .border_1()
-            .border_color(if focused { ring } else { input_border })
-            .when(focused, |field| {
-                field.shadow(vec![BoxShadow {
-                    color: ring.opacity(0.3),
-                    offset: point(px(0.), px(0.)),
-                    blur_radius: px(0.),
-                    spread_radius: px(3.),
-                    inset: false,
-                }])
-            })
-            .bg(background)
-            .child(
-                div().flex_1().min_w_0().text_sm().child(
-                    Textarea::new(&self.search)
-                        .appearance(false)
-                        .bordered(false),
-                ),
-            );
 
         let grid = if self.rows.is_empty() {
             div()
@@ -1259,6 +1810,7 @@ impl Render for EmojiPicker {
             .bg(background)
             .shadow_lg()
             .text_color(foreground)
+            .children(top_tabs)
             .child(tabs)
             .child(search)
             .child(grid)

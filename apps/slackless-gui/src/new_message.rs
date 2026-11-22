@@ -50,6 +50,7 @@ pub enum NewMessageEvent {
     },
     /// The composer's emoji button asked for the picker.
     PickEmoji(Point<Pixels>),
+    PickGif(Point<Pixels>),
     /// A slash command; the root dispatches it.
     SlashCommand(Invocation),
     Close,
@@ -113,6 +114,9 @@ impl NewMessageView {
                         }
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(NewMessageEvent::PickEmoji(*position));
+                        }
+                        ComposerEvent::OpenGifPicker(position) => {
+                            cx.emit(NewMessageEvent::PickGif(*position));
                         }
                         ComposerEvent::SlashCommand(invocation) => {
                             // /shrug posts right away, like Slack's.

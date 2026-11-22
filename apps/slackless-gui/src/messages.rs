@@ -317,7 +317,8 @@ impl MessageList {
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(MessageListEvent::PickEditEmoji(*position));
                         }
-                        ComposerEvent::SlashCommand(_)
+                        ComposerEvent::OpenGifPicker(_)
+                        | ComposerEvent::SlashCommand(_)
                         | ComposerEvent::SubmitWithFiles { .. }
                         | ComposerEvent::Schedule { .. }
                         | ComposerEvent::EditLast
