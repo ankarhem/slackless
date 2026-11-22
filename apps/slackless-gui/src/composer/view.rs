@@ -6,9 +6,10 @@ use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::{ActiveTheme as _, Icon, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Context, Div, ExternalPaths, Focusable as _, FontWeight, HighlightStyle,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    Styled as _, StyledText, Window, div, px, relative, rems,
+    AnyElement, App, BorderStyle, Bounds, ContentMask, Context, Corners, Div, Edges, ExternalPaths,
+    Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, PaintQuad,
+    ParentElement as _, Render, SharedString, Stateful, Styled as _, StyledText, Window, canvas,
+    div, point, px, relative, rems,
 };
 
 use super::tokens::{self, Palette};
@@ -153,6 +154,7 @@ impl Render for Composer {
                             .child(name),
                     )
             });
+        let code_backdrop = self.code_block_backdrop(editor_focused, cx);
         let theme = cx.theme();
         div()
             .key_context("Composer")
@@ -201,6 +203,7 @@ impl Render for Composer {
                             .min_w_0()
                             .px_2()
                             .py_1()
+                            .children(code_backdrop)
                             .child(draft)
                             .children(private_prompt),
                     )
@@ -213,6 +216,116 @@ impl Render for Composer {
 }
 
 impl Composer {
+    /// Paint full-width rounded Slack code-block containers behind the transparent `Textarea`.
+    /// Because GPUI runs `prepaint` across the whole tree before any `paint`, the sibling
+    /// textarea has already stored this frame's `last_layout`/`last_bounds` by the time this
+    /// canvas paints underneath the text, selection, and caret.
+    fn code_block_backdrop(&self, editor_focused: bool, cx: &App) -> Option<AnyElement> {
+        let blocks =
+            tokens::code_blocks(self.editor.doc(), &self.editor.selection(), editor_focused);
+        if blocks.is_empty() {
+            return None;
+        }
+        let input = self.input.clone();
+        let code_bg = crate::theme::code_block_background(cx);
+        let code_border = cx.theme().foreground.opacity(0.13);
+        Some(
+            canvas(
+                |_, _, _| {},
+                move |canvas_bounds, _, window, cx| {
+                    let state = input.read(cx);
+                    let Some(text_bounds) = state.text_bounds() else {
+                        return;
+                    };
+                    let input_bounds = state.input_bounds();
+                    // Outset 8px into the textarea's 20px side padding so code text sits
+                    // cleanly 8px inside the rounded border (matching sent `pre` blocks).
+                    let outset_x = px(8.);
+                    let box_left =
+                        (text_bounds.left() - outset_x).max(canvas_bounds.left() + px(4.));
+                    let box_right =
+                        (text_bounds.right() + outset_x).min(canvas_bounds.right() - px(4.));
+                    if box_right <= box_left {
+                        return;
+                    }
+                    let clip_top = input_bounds.top().max(canvas_bounds.top());
+                    let clip_bottom = input_bounds.bottom().min(canvas_bounds.bottom());
+                    if clip_bottom <= clip_top {
+                        return;
+                    }
+                    let clip = Bounds::from_corners(
+                        point(box_left - px(1.), clip_top),
+                        point(box_right + px(1.), clip_bottom),
+                    );
+                    let pad_y = px(8.);
+                    let active_pad_y = px(2.);
+
+                    window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                        for block in &blocks {
+                            let open_b = state.range_to_bounds(&block.open_line);
+                            let close_b = block
+                                .close_line
+                                .as_ref()
+                                .and_then(|r| state.range_to_bounds(r));
+                            let first_body_b = block
+                                .body_lines
+                                .iter()
+                                .find_map(|r| state.range_to_bounds(r));
+                            let last_body_b = block
+                                .body_lines
+                                .iter()
+                                .rev()
+                                .find_map(|r| state.range_to_bounds(r));
+
+                            if open_b.is_none() && close_b.is_none() && first_body_b.is_none() {
+                                continue;
+                            }
+
+                            let top_y = match open_b {
+                                Some(b) if block.open_collapsed_empty => {
+                                    (b.bottom() - pad_y).max(b.top())
+                                }
+                                Some(b) => b.top() - active_pad_y,
+                                None => clip.top() - pad_y,
+                            };
+
+                            let bottom_y = if block.close_line.is_some() {
+                                match close_b {
+                                    Some(b) if block.close_collapsed => {
+                                        (b.top() + pad_y).min(b.bottom())
+                                    }
+                                    Some(b) => b.bottom() + active_pad_y,
+                                    None => clip.bottom() + pad_y,
+                                }
+                            } else {
+                                match last_body_b.or(open_b) {
+                                    Some(b) => b.bottom() + pad_y,
+                                    None => clip.bottom() + pad_y,
+                                }
+                            };
+
+                            let bottom_y = bottom_y.max(top_y + px(16.));
+                            window.paint_quad(PaintQuad {
+                                bounds: Bounds::from_corners(
+                                    point(box_left, top_y),
+                                    point(box_right, bottom_y),
+                                ),
+                                corner_radii: Corners::all(px(4.)),
+                                background: code_bg.into(),
+                                border_widths: Edges::all(px(1.)),
+                                border_color: code_border,
+                                border_style: BorderStyle::default(),
+                            });
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .inset_0()
+            .into_any_element(),
+        )
+    }
+
     /// Slack's notification bar under the box (`.p-notification_bar`): a 24px strip that
     /// says who is typing, in 0.7em muted text with the names in bold.
     fn notification_bar(&self, cx: &App) -> Div {

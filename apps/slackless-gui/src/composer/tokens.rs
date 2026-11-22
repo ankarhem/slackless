@@ -75,6 +75,76 @@ fn atom_token_id(atom: &Atom) -> SharedString {
     }
 }
 
+/// Fenced code block geometry for painting a full-width rounded backdrop behind the
+/// textarea in [`super::view`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CodeBlockSpan {
+    /// Byte range of the opening fence line (` ``` ` or ` ```lang `).
+    pub open_line: Range<usize>,
+    /// True when the opening fence is collapsed and has no language label (so its line is
+    /// hidden and the backdrop starts 8px above the code body instead of at the top of the
+    /// hidden fence row).
+    pub open_collapsed_empty: bool,
+    /// Byte ranges (`line.start..line.end`) of every code body line inside the block.
+    pub body_lines: Vec<Range<usize>>,
+    /// Byte range of the closing fence line (` ``` `), when the block is closed.
+    pub close_line: Option<Range<usize>>,
+    /// True when the closing fence is collapsed (so the backdrop ends 8px below the code
+    /// body instead of at the bottom of the hidden fence row).
+    pub close_collapsed: bool,
+}
+
+/// Collect all fenced code blocks in `doc` with their fence-collapse state for the current
+/// `selection` and `focused` state.
+pub(super) fn code_blocks(
+    doc: &Doc,
+    selection: &Range<usize>,
+    focused: bool,
+) -> Vec<CodeBlockSpan> {
+    let text = doc.text();
+    let parsed = doc.parse();
+    let touches = |range: &Range<usize>| {
+        focused && selection.end >= range.start && selection.start <= range.end
+    };
+    let splits_selection = |range: &Range<usize>| {
+        (range.start < selection.start && selection.start < range.end)
+            || (range.start < selection.end && selection.end < range.end)
+    };
+
+    let mut blocks = Vec::new();
+    let mut current: Option<CodeBlockSpan> = None;
+
+    for line in &parsed.lines {
+        let line_range = line.start..line.end;
+        let line_active = touches(&line_range);
+
+        if line.kind == Some(LineKind::Fence) {
+            if let Some(mut open) = current.take() {
+                open.close_collapsed = !(line_active || splits_selection(&line.prefix));
+                open.close_line = Some(line_range);
+                blocks.push(open);
+            } else {
+                let lang = text[line.prefix.clone()].trim_start_matches('`').trim();
+                let collapsed = !(line_active || splits_selection(&line.prefix));
+                current = Some(CodeBlockSpan {
+                    open_line: line_range,
+                    open_collapsed_empty: collapsed && lang.is_empty(),
+                    body_lines: Vec::new(),
+                    close_line: None,
+                    close_collapsed: false,
+                });
+            }
+        } else if let Some(open) = current.as_mut() {
+            open.body_lines.push(line_range);
+        }
+    }
+
+    if let Some(open) = current {
+        blocks.push(open);
+    }
+    blocks
+}
+
 /// The theme colors Live Preview draws with.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Palette {
@@ -82,7 +152,6 @@ pub(super) struct Palette {
     code: Hsla,
     code_background: Hsla,
     code_block_fg: Hsla,
-    code_block_bg: Hsla,
     syntax: Hsla,
 }
 
@@ -93,7 +162,6 @@ impl Palette {
             code: crate::theme::code_foreground(cx),
             code_background: cx.theme().secondary,
             code_block_fg: cx.theme().foreground,
-            code_block_bg: crate::theme::code_block_background(cx),
             syntax: cx.theme().muted_foreground.opacity(0.6),
         }
     }
@@ -105,12 +173,12 @@ impl Palette {
         }
     }
 
-    /// Fenced code blocks (` ``` `) keep neutral body foreground (never inline code's orange)
-    /// over a recessed contrasting background, matching Slack's composer and sent pre blocks.
+    /// Fenced code blocks (` ``` `) keep neutral body foreground (never inline code's orange).
+    /// Their full-width rounded container is painted behind the textarea in `view.rs` so blank
+    /// lines and ragged line endings never break the box.
     fn code_block_style(self) -> HighlightStyle {
         HighlightStyle {
             color: Some(self.code_block_fg),
-            background_color: Some(self.code_block_bg),
             ..HighlightStyle::default()
         }
     }
@@ -413,10 +481,8 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             )
             .into_any_element()
     };
-    let code_bg = crate::theme::code_block_background(cx);
-    let code_border = theme.foreground.opacity(0.15);
     match token.id().as_ref() {
-        HIDE => slot(0.).into_any_element(),
+        HIDE | CODE_CLOSE => slot(0.).into_any_element(),
         H1 => heading_badge("H1"),
         H2 => heading_badge("H2"),
         H3 => heading_badge("H3"),
@@ -450,62 +516,20 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             .when(selected, |el| el.bg(theme.selection))
             .child(div().w_full().h(px(1.)).bg(theme.border))
             .into_any_element(),
-        CODE_CLOSE => div()
-            .flex_none()
-            .w(px(360.))
-            .h(height)
-            .flex()
-            .items_start()
-            .when(selected, |el| el.bg(theme.selection))
-            .child(
-                div()
-                    .w_full()
-                    .h(px(8.))
-                    .rounded_b(px(4.))
-                    .border_b_1()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(code_border)
-                    .bg(code_bg),
-            )
-            .into_any_element(),
         id => {
             if let Some(lang) = id.strip_prefix(CODE_OPEN) {
-                let cap = if lang.is_empty() {
-                    div()
-                        .w_full()
-                        .h(px(8.))
-                        .rounded_t(px(4.))
-                        .border_t_1()
-                        .border_l_1()
-                        .border_r_1()
-                        .border_color(code_border)
-                        .bg(code_bg)
-                } else {
-                    div()
-                        .w_full()
-                        .h(px(18.))
-                        .px_2()
-                        .rounded_t(px(4.))
-                        .border_t_1()
-                        .border_l_1()
-                        .border_r_1()
-                        .border_color(code_border)
-                        .bg(code_bg)
-                        .flex()
-                        .items_center()
-                        .text_size(px(10.))
-                        .text_color(theme.muted_foreground.opacity(0.75))
-                        .child(SharedString::from(lang.to_owned()))
-                };
+                if lang.is_empty() {
+                    return slot(0.).into_any_element();
+                }
                 return div()
                     .flex_none()
-                    .w(px(360.))
                     .h(height)
                     .flex()
-                    .items_end()
+                    .items_center()
                     .when(selected, |el| el.bg(theme.selection))
-                    .child(cap)
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground.opacity(0.75))
+                    .child(SharedString::from(lang.to_owned()))
                     .into_any_element();
             }
             match id.strip_prefix(EMOJI) {
@@ -554,7 +578,6 @@ mod tests {
             code: hsla(0.0, 0.7, 0.5, 1.0),
             code_background: hsla(0.0, 0.0, 0.2, 1.0),
             code_block_fg: hsla(0.0, 0.0, 0.85, 1.0),
-            code_block_bg: hsla(0.0, 0.0, 0.12, 1.0),
             syntax: hsla(0.0, 0.0, 0.5, 0.6),
         }
     }
@@ -690,8 +713,8 @@ mod tests {
         let doc = Doc::from("```\nwrong\n```");
         let palette = test_palette();
 
-        // Caret inside code body (`wrong` is bytes 4..9): fences collapse into top/bottom caps,
-        // and code body uses neutral `code_block_fg` + `code_block_bg` (NOT inline-code orange).
+        // Caret inside code body (`wrong` is bytes 4..9): fences collapse, and code body uses
+        // neutral `code_block_fg` with no per-glyph background (backdrop is painted full-width).
         let (content, decorations) = project(&doc, &(6..6), true, palette);
         assert_eq!(
             token_ids(&content),
@@ -706,7 +729,13 @@ mod tests {
             .expect("code block line should be decorated");
         assert_eq!(body.style.color, Some(palette.code_block_fg));
         assert_ne!(body.style.color, Some(palette.code));
-        assert_eq!(body.style.background_color, Some(palette.code_block_bg));
+        assert_eq!(body.style.background_color, None);
+
+        let blocks = code_blocks(&doc, &(6..6), true);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].open_collapsed_empty);
+        assert!(blocks[0].close_collapsed);
+        assert_eq!(blocks[0].body_lines, vec![4..9]);
 
         // Caret on opening fence line (0..3): opening fence reveals in syntax color; closing stays collapsed.
         let (content, decorations) = project(&doc, &(2..2), true, palette);
@@ -719,5 +748,15 @@ mod tests {
                 .iter()
                 .any(|d| d.range == (0..3) && d.style.color == Some(palette.syntax))
         );
+        let blocks = code_blocks(&doc, &(2..2), true);
+        assert!(!blocks[0].open_collapsed_empty);
+        assert!(blocks[0].close_collapsed);
+
+        // Language-tagged fence keeps its top row inside the backdrop even when caret is in body.
+        let tagged = Doc::from("```rust\nlet x = 1;\n```");
+        let blocks = code_blocks(&tagged, &(10..10), true);
+        assert_eq!(blocks.len(), 1);
+        assert!(!blocks[0].open_collapsed_empty);
+        assert!(blocks[0].close_collapsed);
     }
 }
