@@ -63,6 +63,12 @@ impl Doc {
                 }
                 Some(LineKind::Soft) => out.push_str(SOFT_INDENT),
                 Some(LineKind::Quote) => out.push_str("&gt; "),
+                Some(LineKind::Heading(level)) => {
+                    for _ in 0..level.max(1) {
+                        out.push('#');
+                    }
+                    out.push(' ');
+                }
                 None => {}
             }
             self.write_inline(line.content, &mut out);

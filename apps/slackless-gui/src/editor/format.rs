@@ -1,4 +1,5 @@
-//! Inline formatting: toggling bold, italic, strikethrough and code, and linking text.
+//! Inline formatting: toggling bold, italic, underline, strikethrough and code, clearing it
+//! all, and linking text.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -36,6 +37,23 @@ impl Editor {
         self.history.checkpoint(&self.now);
         self.now.doc.map_attrs(range, |attrs| Attrs {
             style: toggled(attrs.style),
+            link: attrs.link.clone(),
+        });
+    }
+
+    /// Clear every inline format from the selection (Slack's Clear formatting), or from what
+    /// is typed next when nothing is selected. Links and line kinds are kept.
+    pub fn clear_styles(&mut self) {
+        let range = self.now.selection.clone();
+        if range.is_empty() {
+            if let Some(style) = self.pending {
+                self.pending = Some(style.without(Style::INLINE));
+            }
+            return;
+        }
+        self.history.checkpoint(&self.now);
+        self.now.doc.map_attrs(range, |attrs| Attrs {
+            style: attrs.style.without(Style::INLINE),
             link: attrs.link.clone(),
         });
     }

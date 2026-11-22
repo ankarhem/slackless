@@ -20,6 +20,7 @@ const ORDERED: &str = "ordered";
 const QUOTE: &str = "quote";
 const CODE: &str = "code";
 const SOFT: &str = "soft";
+const HEADING: &str = "heading";
 
 impl Directory for Fixtures {
     fn mention(&self, id: &UserId) -> String {
@@ -50,6 +51,7 @@ fn token_id(atom: &Atom) -> SharedString {
         Atom::Marker(LineKind::Quote) => QUOTE.into(),
         Atom::Marker(LineKind::Code) => CODE.into(),
         Atom::Marker(LineKind::Soft) => SOFT.into(),
+        Atom::Marker(LineKind::Heading(_)) => HEADING.into(),
     }
 }
 
@@ -103,11 +105,19 @@ impl Palette {
             font_weight: has(Style::BOLD).then_some(FontWeight::BOLD),
             font_style: has(Style::ITALIC).then_some(FontStyle::Italic),
             background_color: has(Style::CODE).then_some(self.code_background),
-            underline: is_link.then_some(UnderlineStyle {
-                thickness: px(1.),
-                color: Some(self.link),
-                wavy: false,
-            }),
+            underline: if is_link {
+                Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(self.link),
+                    wavy: false,
+                })
+            } else {
+                has(Style::UNDERLINE).then_some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                })
+            },
             strikethrough: has(Style::STRIKE).then_some(StrikethroughStyle {
                 thickness: px(1.),
                 color: None,
@@ -135,7 +145,20 @@ pub(super) fn decorations(doc: &Doc, palette: Palette) -> Vec<TextDecoration> {
         .map(|placed| placed.range.end..doc.line_end(placed.range.end))
         .filter(|line| !line.is_empty())
         .map(|line| TextDecoration::new(line, palette.highlight(&code)));
-    let mut decorations: Vec<_> = spans.chain(code_lines).collect();
+    // A heading line is drawn semibold in the draft (the engine cannot change a run's font
+    // size; the posted message shows the heading's true size).
+    let heading = Attrs {
+        style: Style::BOLD,
+        link: None,
+    };
+    let heading_lines = doc
+        .atoms()
+        .iter()
+        .filter(|placed| matches!(placed.atom, Atom::Marker(LineKind::Heading(_))))
+        .map(|placed| placed.range.end..doc.line_end(placed.range.end))
+        .filter(|line| !line.is_empty())
+        .map(|line| TextDecoration::new(line, palette.highlight(&heading)));
+    let mut decorations: Vec<_> = spans.chain(code_lines).chain(heading_lines).collect();
     decorations.sort_by_key(|decoration| decoration.range.start);
     decorations
 }
@@ -177,6 +200,7 @@ pub(super) fn render(context: &InlineTokenContext, fixtures: &Fixtures, cx: &App
             .child(div().w(px(2.)).h_full().bg(theme.border))
             .into_any_element(),
         SOFT => slot(20.).into_any_element(),
+        HEADING => slot(0.).into_any_element(),
         id => match id.strip_prefix(EMOJI) {
             Some(shortcode) => div()
                 .flex_none()

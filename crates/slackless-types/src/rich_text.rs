@@ -56,12 +56,23 @@ tagged_enum! {
         "rich_text_list" => List(RichTextList),
         "rich_text_quote" => Quote(RichTextQuote),
         "rich_text_preformatted" => Preformatted(RichTextPreformatted),
+        "rich_text_header" => Header(RichTextHeader),
     }
 }
 
 /// A paragraph of inline elements.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RichTextSection {
+    #[serde(default, deserialize_with = "null_default")]
+    pub elements: Vec<RichTextElement>,
+}
+
+/// A heading paragraph (the composer's Big / Medium / Small heading). `level` is 1 (big) to
+/// 3 (small); Slack reads a missing level as 2.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RichTextHeader {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
     #[serde(default, deserialize_with = "null_default")]
     pub elements: Vec<RichTextElement>,
 }

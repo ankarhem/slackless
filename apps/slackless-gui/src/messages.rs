@@ -3067,6 +3067,22 @@ fn render_containers(
                 RichTextContainer::Preformatted(preformatted) => {
                     Some(render_code(preformatted, theme).into_any_element())
                 }
+                RichTextContainer::Header(header) => {
+                    paragraph(&header.elements, fixtures, theme, false).map(|paragraph| {
+                        // Slack's heading scale over the 15px body (level 2 when unset).
+                        let (size, line) = match header.level.unwrap_or(2).clamp(1, 3) {
+                            1 => (30., 38.),
+                            2 => (22., 30.),
+                            _ => (18., 26.),
+                        };
+                        div()
+                            .text_size(px(size))
+                            .line_height(px(line))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(paragraph)
+                            .into_any_element()
+                    })
+                }
                 _ => None,
             }
         })

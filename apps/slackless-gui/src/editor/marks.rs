@@ -17,6 +17,11 @@ impl Style {
     pub const ITALIC: Style = Style(1 << 1);
     pub const STRIKE: Style = Style(1 << 2);
     pub const CODE: Style = Style(1 << 3);
+    pub const UNDERLINE: Style = Style(1 << 4);
+
+    /// Every inline format at once (clear formatting).
+    pub const INLINE: Style =
+        Style(Self::BOLD.0 | Self::ITALIC.0 | Self::STRIKE.0 | Self::CODE.0 | Self::UNDERLINE.0);
 
     pub const fn contains(self, other: Style) -> bool {
         self.0 & other.0 == other.0
@@ -75,6 +80,8 @@ pub enum LineKind {
     Code,
     /// A further line of the list item above it (Shift+Enter inside an item).
     Soft,
+    /// A Big / Medium / Small heading line, `level` 1 to 3.
+    Heading(u8),
 }
 
 impl LineKind {
@@ -85,7 +92,7 @@ impl LineKind {
             LineKind::Bullet => "\u{2022} ",
             LineKind::Ordered => "1. ",
             LineKind::Quote => "> ",
-            LineKind::Code | LineKind::Soft => "  ",
+            LineKind::Code | LineKind::Soft | LineKind::Heading(_) => "  ",
         }
     }
 }

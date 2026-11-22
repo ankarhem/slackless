@@ -70,6 +70,7 @@ const GROUPS: [(&str, &[Shortcut]); 4] = [
         &[
             (&["\u{2318}", "B"], "Bold", true),
             (&["\u{2318}", "I"], "Italic", true),
+            (&["\u{2318}", "U"], "Underline", true),
             (&["\u{2318}", "\u{21e7}", "X"], "Strikethrough", true),
             (&["\u{2318}", "\u{21e7}", "C"], "Code", true),
             (
@@ -77,6 +78,7 @@ const GROUPS: [(&str, &[Shortcut]); 4] = [
                 "Code block",
                 true,
             ),
+            (&["\u{2318}", "\\"], "Clear formatting", true),
             (&["\u{2318}", "\u{21e7}", "U"], "Link", true),
             (&["\u{2318}", "\u{21e7}", "7"], "Numbered list", true),
             (&["\u{2318}", "\u{21e7}", "8"], "Bulleted list", true),

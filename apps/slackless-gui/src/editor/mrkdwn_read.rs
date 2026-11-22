@@ -36,12 +36,21 @@ pub fn from_mrkdwn(text: &str, names: &dyn Directory) -> Doc {
                 is_open: true,
                 number: 0,
             },
-            Some((LineKind::Quote | LineKind::Code, _)) | None => List::default(),
+            Some((LineKind::Quote | LineKind::Code | LineKind::Heading(_), _)) | None => {
+                List::default()
+            }
         };
         match kind {
             Some((LineKind::Code, prefix)) => in_code = reader.code_line(&raw[prefix..]),
             Some((LineKind::Quote, prefix)) => {
                 reader.begin_line(Some(LineKind::Quote), LineKind::Quote.marker_text());
+                reader.inline(raw, prefix..raw.len(), &PLAIN);
+            }
+            Some((LineKind::Heading(level), prefix)) => {
+                reader.begin_line(
+                    Some(LineKind::Heading(level)),
+                    LineKind::Heading(level).marker_text(),
+                );
                 reader.inline(raw, prefix..raw.len(), &PLAIN);
             }
             Some((LineKind::Soft, prefix)) => {
@@ -78,6 +87,12 @@ fn line_kind(raw: &str, list: &List) -> Option<(LineKind, usize)> {
     }
     if raw.starts_with("&gt; ") {
         return Some((LineKind::Quote, "&gt; ".len()));
+    }
+    for level in 1..=3 {
+        let marker = "#".repeat(level as usize) + " ";
+        if raw.starts_with(&marker) {
+            return Some((LineKind::Heading(level), marker.len()));
+        }
     }
     if raw.starts_with(LineKind::Bullet.marker_text()) {
         return Some((LineKind::Bullet, LineKind::Bullet.marker_text().len()));

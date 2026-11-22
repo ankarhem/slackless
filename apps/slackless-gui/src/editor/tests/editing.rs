@@ -2,6 +2,8 @@
 
 use super::{span, type_text, typed};
 use crate::editor::marks::{Attrs, Span, Style};
+use crate::editor::state::Editor;
+use slackless_core::types::{RichTextContainer, RichTextElement, TextStyle};
 
 #[test]
 fn toggling_a_format_on_a_selection_formats_exactly_that_range_and_back() {
@@ -14,6 +16,40 @@ fn toggling_a_format_on_a_selection_formats_exactly_that_range_and_back() {
 
     editor.toggle_style(Style::BOLD);
     assert!(editor.doc().spans().is_empty());
+}
+
+#[test]
+fn clearing_formats_strips_every_inline_format_and_serializes_underline() {
+    let mut editor = typed("hello world");
+    editor.select(0..5);
+
+    editor.toggle_style(Style::BOLD);
+    editor.toggle_style(Style::UNDERLINE);
+    assert_eq!(
+        editor.doc().spans(),
+        [span(0..5, Style::BOLD.with(Style::UNDERLINE))]
+    );
+
+    // An underlined run serializes its style; a cleared one does not.
+    let wire = |editor: &Editor| match &editor.doc().to_rich_text().elements.first() {
+        Some(RichTextContainer::Section(section)) => match section.elements.first() {
+            Some(RichTextElement::Text(text)) => text.style,
+            _ => None,
+        },
+        _ => None,
+    };
+    let underlined = wire(&editor);
+    editor.clear_styles();
+    assert!(editor.doc().spans().is_empty());
+    assert_eq!(
+        underlined,
+        Some(TextStyle {
+            bold: true,
+            underline: true,
+            ..TextStyle::default()
+        })
+    );
+    assert_eq!(wire(&editor), None);
 }
 
 #[test]

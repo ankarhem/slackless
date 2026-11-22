@@ -23,6 +23,12 @@ pub(super) enum Tool {
     Mention,
     /// Start a slash command.
     Slash,
+    /// Clear every inline format from the selection.
+    Clear,
+    /// A heading level 1 to 3 (big, medium, small).
+    Heading(u8),
+    /// Back to plain paragraphs (clears headings).
+    Paragraph,
 }
 
 impl Composer {
@@ -32,7 +38,8 @@ impl Composer {
             Tool::Style(style) => self.editor.active_style().contains(style),
             Tool::Block(kind) => self.editor.active_block() == Some(kind),
             Tool::Link => self.editor.active_link().is_some(),
-            Tool::Mention | Tool::Slash => false,
+            Tool::Mention | Tool::Slash | Tool::Clear | Tool::Paragraph => false,
+            Tool::Heading(level) => self.editor.active_block() == Some(LineKind::Heading(level)),
         }
     }
 
@@ -52,6 +59,9 @@ impl Composer {
                     .insert_text(if follows_text { " @" } else { "@" });
             }
             Tool::Slash => self.editor.insert_text("/"),
+            Tool::Clear => self.editor.clear_styles(),
+            Tool::Heading(level) => self.editor.toggle_block(LineKind::Heading(level)),
+            Tool::Paragraph => self.editor.paragraph(),
         }
         self.push(window, cx);
         self.focus_input(window, cx);
@@ -220,9 +230,9 @@ impl Composer {
         cx.stop_propagation();
     }
 
-    /// Slack's formatting shortcuts: Cmd+B, Cmd+I, Cmd+Shift+X (strikethrough), Cmd+Shift+C
-    /// (code), Cmd+Shift+U (link), Cmd+Shift+7/8/9 (ordered list, bullets, quote) and
-    /// Cmd+Alt+Shift+C (code block).
+    /// Slack's formatting shortcuts: Cmd+B, Cmd+I, Cmd+U (underline), Cmd+Shift+X
+    /// (strikethrough), Cmd+Shift+C (code), Cmd+Shift+U (link), Cmd+Shift+7/8/9 (ordered list,
+    /// bullets, quote), Cmd+Alt+Shift+C (code block) and Cmd+\ (clear formatting).
     pub(super) fn on_key(
         &mut self,
         event: &KeyDownEvent,
@@ -237,6 +247,8 @@ impl Composer {
         let tool = match (event.keystroke.key.as_str(), modifiers.shift, modifiers.alt) {
             ("b", false, false) => Tool::Style(Style::BOLD),
             ("i", false, false) => Tool::Style(Style::ITALIC),
+            ("u", false, false) => Tool::Style(Style::UNDERLINE),
+            ("\\", false, false) => Tool::Clear,
             ("x", true, false) => Tool::Style(Style::STRIKE),
             ("c", true, false) => Tool::Style(Style::CODE),
             ("u", true, false) => Tool::Link,

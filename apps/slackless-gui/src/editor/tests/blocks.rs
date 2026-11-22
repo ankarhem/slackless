@@ -3,7 +3,8 @@
 use slackless_core::types::RichTextContainer;
 use slackless_core::types::rich_text::{ListStyle, RichTextList};
 
-use super::{kinds, plain, section, type_text, typed};
+use super::{Names, kinds, plain, section, type_text, typed};
+use crate::editor::from_mrkdwn;
 use crate::editor::marks::LineKind;
 
 #[test]
@@ -158,4 +159,35 @@ fn a_block_button_toggles_every_selected_line() {
 
     editor.toggle_block(LineKind::Ordered);
     assert_eq!(editor.doc().text(), "a\nb\nc");
+}
+
+#[test]
+fn a_heading_line_serializes_as_a_header_container_and_round_trips() {
+    let mut editor = typed("title\nbody");
+    editor.select(0..5);
+    editor.toggle_block(LineKind::Heading(1));
+    assert_eq!(editor.active_block(), Some(LineKind::Heading(1)));
+
+    // The wire: a rich_text_header of level 1, then the plain paragraph.
+    use slackless_core::types::rich_text::RichTextHeader;
+    assert_eq!(
+        editor.doc().to_rich_text().elements,
+        vec![
+            RichTextContainer::Header(RichTextHeader {
+                level: Some(1),
+                elements: vec![plain("title")],
+            }),
+            section(vec![plain("body")]),
+        ]
+    );
+
+    // A draft round-trips through mrkdwn's "#" form.
+    let draft = editor.doc().to_mrkdwn();
+    assert_eq!(draft, "# title\nbody");
+    assert_eq!(from_mrkdwn(&draft, &Names).to_mrkdwn(), draft);
+
+    // The dropdown's Paragraph clears the heading; lists and quotes stay.
+    editor.select(0..5);
+    editor.paragraph();
+    assert_eq!(editor.active_block(), None);
 }

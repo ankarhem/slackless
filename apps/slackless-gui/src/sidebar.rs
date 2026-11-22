@@ -3222,6 +3222,10 @@ fn container_mentions_user(container: &RichTextContainer, user: &UserId) -> bool
             .elements
             .iter()
             .any(|element| element_mentions_user(element, user)),
+        RichTextContainer::Header(header) => header
+            .elements
+            .iter()
+            .any(|element| element_mentions_user(element, user)),
         RichTextContainer::Unknown { .. } => false,
     }
 }

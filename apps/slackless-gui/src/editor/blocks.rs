@@ -11,6 +11,37 @@ impl Editor {
         self.now.doc.line(self.now.selection.start).kind
     }
 
+    /// The dropdown's Paragraph: clear the heading of every selected heading line (lists,
+    /// quotes and code blocks are block styles of their own and stay).
+    pub fn paragraph(&mut self) {
+        let doc = &self.now.doc;
+        let selection = self.now.selection.clone();
+        let mut starts = vec![doc.line_start(selection.start)];
+        while let Some(end) = starts
+            .last()
+            .map(|start| doc.line_end(*start))
+            .filter(|end| *end < selection.end)
+        {
+            starts.push(end + 1);
+        }
+        let headings: Vec<usize> = starts
+            .into_iter()
+            .filter(|start| {
+                doc.line(*start)
+                    .kind
+                    .is_some_and(|kind| matches!(kind, LineKind::Heading(_)))
+            })
+            .collect();
+        if headings.is_empty() {
+            return;
+        }
+        self.history.checkpoint(&self.now);
+        for start in headings.into_iter().rev() {
+            self.set_kind(start, None);
+        }
+        self.renumber();
+    }
+
     /// Put every selected line in a `kind` block, or back to paragraphs when all are in one.
     pub fn toggle_block(&mut self, kind: LineKind) {
         self.history.checkpoint(&self.now);
@@ -46,8 +77,10 @@ impl Editor {
         match (kind, is_empty) {
             (LineKind::Soft, true) => self.set_kind(line.start, Some(self.item_kind(line.start))),
             (_, true) => self.set_kind(line.start, None),
-            (LineKind::Soft, false) => self.break_line(self.item_kind(line.start)),
-            (_, false) => self.break_line(kind),
+            (LineKind::Soft, false) => self.break_line(Some(self.item_kind(line.start))),
+            // Enter ends a heading: the next line is a plain paragraph.
+            (LineKind::Heading(_), false) => self.break_line(None),
+            (_, false) => self.break_line(Some(kind)),
         }
         self.renumber();
         true
@@ -59,10 +92,10 @@ impl Editor {
         let kind = match self.active_block() {
             None => return false,
             Some(LineKind::Bullet | LineKind::Ordered | LineKind::Soft) => LineKind::Soft,
-            Some(kind @ (LineKind::Quote | LineKind::Code)) => kind,
+            Some(kind @ (LineKind::Quote | LineKind::Code | LineKind::Heading(_))) => kind,
         };
         self.history.checkpoint(&self.now);
-        self.break_line(kind);
+        self.break_line(Some(kind));
         true
     }
 
@@ -78,12 +111,12 @@ impl Editor {
         self.select(line.start - 1..line.start - 1)
     }
 
-    /// Break the line at the selection; the new line opens with a `kind` marker.
-    fn break_line(&mut self, kind: LineKind) {
+    /// Break the line at the selection; the new line opens with a `kind` marker, or none.
+    fn break_line(&mut self, kind: Option<LineKind>) {
         let range = self.now.selection.clone();
         let next = range.start + 1;
         self.replace(range, "\n", &PLAIN);
-        self.set_kind(next, Some(kind));
+        self.set_kind(next, kind);
     }
 
     /// The list a soft line continues: the kind of the nearest item above it.
@@ -94,7 +127,7 @@ impl Editor {
             match doc.marker(start) {
                 Some((LineKind::Soft, _)) => {}
                 Some((kind @ (LineKind::Bullet | LineKind::Ordered), _)) => return kind,
-                Some((LineKind::Quote | LineKind::Code, _)) | None => break,
+                Some((LineKind::Quote | LineKind::Code | LineKind::Heading(_), _)) | None => break,
             }
         }
         LineKind::Bullet
@@ -155,7 +188,12 @@ impl Editor {
                     }
                 }
                 Some((LineKind::Soft, _)) => {}
-                Some((LineKind::Bullet | LineKind::Quote | LineKind::Code, _)) | None => number = 0,
+                // A heading also ends an ordered run.
+                Some((
+                    LineKind::Bullet | LineKind::Quote | LineKind::Code | LineKind::Heading(_),
+                    _,
+                ))
+                | None => number = 0,
             }
             let end = self.now.doc.line_end(start);
             if end == self.now.doc.text().len() {

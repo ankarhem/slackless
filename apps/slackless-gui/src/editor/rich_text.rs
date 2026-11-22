@@ -5,8 +5,8 @@
 use std::ops::Range;
 
 use slackless_core::types::rich_text::{
-    BroadcastElement, ChannelElement, EmojiElement, LinkElement, ListStyle, RichTextList,
-    RichTextPreformatted, RichTextQuote, RichTextSection, TextElement, UserElement,
+    BroadcastElement, ChannelElement, EmojiElement, LinkElement, ListStyle, RichTextHeader,
+    RichTextList, RichTextPreformatted, RichTextQuote, RichTextSection, TextElement, UserElement,
 };
 use slackless_core::types::{RichTextBlock, RichTextContainer, RichTextElement, TextStyle};
 
@@ -31,6 +31,11 @@ impl Doc {
                 }
                 (Some(LineKind::Code), Some(RichTextContainer::Preformatted(code))) => {
                     extend_line(&mut code.elements, elements);
+                }
+                (Some(LineKind::Heading(level)), Some(RichTextContainer::Header(header)))
+                    if header.level == Some(level) =>
+                {
+                    extend_line(&mut header.elements, elements);
                 }
                 (Some(LineKind::Soft), Some(RichTextContainer::List(list))) => {
                     if let Some(RichTextContainer::Section(item)) = list.elements.last_mut() {
@@ -63,6 +68,12 @@ impl Doc {
                         elements,
                         border: Some(0),
                         language: None,
+                    }));
+                }
+                (Some(LineKind::Heading(level)), _) => {
+                    containers.push(RichTextContainer::Header(RichTextHeader {
+                        level: Some(level),
+                        elements,
                     }));
                 }
                 // A soft line with no item above it reads as a paragraph.
@@ -182,7 +193,11 @@ fn url_start(text: &str) -> Option<usize> {
 fn list_style(kind: LineKind) -> ListStyle {
     match kind {
         LineKind::Ordered => ListStyle::Ordered,
-        LineKind::Bullet | LineKind::Quote | LineKind::Code | LineKind::Soft => ListStyle::Bullet,
+        LineKind::Bullet
+        | LineKind::Quote
+        | LineKind::Code
+        | LineKind::Soft
+        | LineKind::Heading(_) => ListStyle::Bullet,
     }
 }
 
@@ -202,6 +217,7 @@ fn text_style(style: Style) -> Option<TextStyle> {
         bold: style.contains(Style::BOLD),
         italic: style.contains(Style::ITALIC),
         strike: style.contains(Style::STRIKE),
+        underline: style.contains(Style::UNDERLINE),
         code: style.contains(Style::CODE),
         ..TextStyle::default()
     })
@@ -226,6 +242,7 @@ fn emoji(shortcode: &str, style: Option<TextStyle>) -> RichTextElement {
 fn prune(containers: &mut Vec<RichTextContainer>) {
     containers.retain_mut(|container| match container {
         RichTextContainer::Section(section) => !section.elements.is_empty(),
+        RichTextContainer::Header(header) => !header.elements.is_empty(),
         RichTextContainer::Quote(quote) => !quote.elements.is_empty(),
         RichTextContainer::Preformatted(code) => !code.elements.is_empty(),
         RichTextContainer::List(list) => {
