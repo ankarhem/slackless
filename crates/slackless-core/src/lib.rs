@@ -369,6 +369,8 @@ pub enum Command {
         name: String,
         value: String,
     },
+    /// Fetch one user's full profile including custom fields & pronouns (`users.profile.get` + `team.profile.get`).
+    FetchUserProfile(UserId),
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -531,6 +533,12 @@ pub enum Event {
         channel: ChannelId,
         participants: Vec<UserId>,
         ended: bool,
+    },
+    /// Hydrated custom profile fields and pronouns for `user` (`users.profile.get` + `team.profile.get`).
+    UserProfileLoaded {
+        user: UserId,
+        pronouns: Option<String>,
+        fields: Vec<(String, String)>,
     },
     /// A non-fatal failure worth surfacing.
     Error(String),

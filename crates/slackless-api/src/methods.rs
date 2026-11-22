@@ -1701,6 +1701,53 @@ impl SlackApi {
             .user)
     }
 
+    /// `users.profile.get`: one user's full profile including custom `fields` and `pronouns`.
+    pub async fn users_profile_get(&self, user: &UserId) -> Result<slackless_types::Profile> {
+        #[derive(Deserialize)]
+        struct Wire {
+            profile: slackless_types::Profile,
+        }
+        let params = vec![
+            ("user", user.to_string()),
+            ("include_labels", "true".to_owned()),
+        ];
+        Ok(self
+            .call::<Wire>(method::USERS_PROFILE_GET, params)
+            .await?
+            .data
+            .profile)
+    }
+
+    /// `team.profile.get`: workspace custom profile field definitions (`id` -> `label`).
+    pub async fn team_profile_get(&self) -> Result<HashMap<String, String>> {
+        #[derive(Deserialize)]
+        struct FieldDef {
+            id: String,
+            #[serde(default)]
+            label: String,
+        }
+        #[derive(Deserialize)]
+        struct ProfileDef {
+            #[serde(default, deserialize_with = "lenient_vec")]
+            fields: Vec<FieldDef>,
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            profile: ProfileDef,
+        }
+        let wire = self
+            .call::<Wire>(method::TEAM_PROFILE_GET, Vec::new())
+            .await?
+            .data;
+        Ok(wire
+            .profile
+            .fields
+            .into_iter()
+            .filter(|f| !f.label.is_empty())
+            .map(|f| (f.id, f.label))
+            .collect())
+    }
+
     /// `dnd.info`: one user's do-not-disturb schedule and snooze state. Read-only.
     pub async fn dnd_info(&self, user: &UserId) -> Result<DndStatus> {
         let params = vec![("user", user.to_string())];

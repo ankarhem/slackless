@@ -82,9 +82,16 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
     ),
     (
         "Take actions on messages",
-        // Slack's message focus: the last message the mouse hovered, acted on only while
-        // no field holds the focus (messages.rs focus_action).
+        // Slack's message focus: hovered or keyboard-selected with Up/Down while no field
+        // holds the focus (messages.rs focus_action / step_focus).
         &[
+            (
+                &["\u{2191}", "\u{2193}"],
+                "Browse messages / activity items",
+                true,
+            ),
+            (&["\u{2190}"], "Exit open thread back to channel", true),
+            (&["Home", "End"], "Jump to oldest / newest message", true),
             (&["E"], "Edit message", true),
             (&["\u{232b}"], "Delete message", true),
             (&["T", "\u{2192}"], "Open or reply in thread", true),

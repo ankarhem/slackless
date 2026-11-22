@@ -336,6 +336,12 @@ actions!(
         PrevNavTab,
         FocusNextPane,
         FocusPrevPane,
+        BrowseUp,
+        BrowseDown,
+        BrowseOpen,
+        ExitThread,
+        JumpToOldest,
+        JumpToNewest,
         ZoomIn,
         ZoomOut,
         ActualSize,
@@ -926,6 +932,12 @@ impl App {
                 KeyBinding::new("u", FocusMarkMessageUnread, OUTSIDE_INPUT),
                 KeyBinding::new("m", FocusRemindMe, OUTSIDE_INPUT),
                 KeyBinding::new("r", FocusReact, OUTSIDE_INPUT),
+                KeyBinding::new("up", BrowseUp, OUTSIDE_INPUT),
+                KeyBinding::new("down", BrowseDown, OUTSIDE_INPUT),
+                KeyBinding::new("enter", BrowseOpen, OUTSIDE_INPUT),
+                KeyBinding::new("left", ExitThread, OUTSIDE_INPUT),
+                KeyBinding::new("home", JumpToOldest, OUTSIDE_INPUT),
+                KeyBinding::new("end", JumpToNewest, OUTSIDE_INPUT),
             ]);
             let workspace_keys = [
                 "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
@@ -2119,12 +2131,62 @@ impl App {
                             }
                         }
                     }
-                    _ => cx.open_url(url.as_ref()),
+                    _ => self.open_external_url(url.as_ref(), window, cx),
                 }
             }
             // An in-app target this workspace does not know: nothing to open.
             LinkTarget::Channel(_) | LinkTarget::Thread { .. } => {}
         }
+    }
+
+    /// Open an external browser URL, prompting first when `Settings.warn_external` is enabled
+    /// and the URL looks suspicious (non-HTTPS, punycode `xn--`, credential `@`, or IP host).
+    fn open_external_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let warn = self.preferences.read(cx).settings().warn_external && is_suspicious_url(url);
+        if !warn {
+            cx.open_url(url);
+            return;
+        }
+        let target = url.to_owned();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let open_target = target.clone();
+            dialog
+                .title("Open external link?")
+                .w(px(460.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(div().text_sm().text_color(muted).child(
+                            "This link uses an unencrypted or unusual address. Verify the destination before opening it:",
+                        ))
+                        .child(
+                            div()
+                                .p_2()
+                                .rounded_md()
+                                .bg(cx.theme().secondary)
+                                .text_xs()
+                                .child(target.clone()),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("ext-url-cancel").label("Cancel").on_click(
+                                    |_, window, cx| window.close_dialog(cx),
+                                ))
+                                .child(
+                                    Button::new("ext-url-open")
+                                        .primary()
+                                        .label("Open link")
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            cx.open_url(&open_target);
+                                        }),
+                                ),
+                        ),
+                )
+        });
     }
 
     /// Route a `slack://`, `https://app.slack.com/client/...`, or `https://*.slack.com/archives/...`
@@ -2473,6 +2535,7 @@ impl App {
                 .then(|| std::path::PathBuf::from(&settings.download_dir)),
             cx,
         );
+        crate::media::set_ask_download_location(settings.ask_download_location, cx);
         let nav_prefs = crate::sidebar::NavPrefs {
             show_home: settings.show_home,
             show_dms: settings.show_dms,
@@ -2561,6 +2624,9 @@ impl App {
                             sync_pref("sidebar_theme", theme_name.to_owned());
                         }
                     }
+                }
+                if prev.launch_at_login != settings.launch_at_login {
+                    sync_launch_at_login(settings.launch_at_login);
                 }
                 self.saved_settings = Some(settings.clone());
                 if let Some(write) = self.bridge.remember_settings(&settings) {
@@ -4064,6 +4130,9 @@ impl App {
     fn open_profile(&mut self, user: UserId, cx: &mut Context<Self>) {
         self.close_hover_card(cx);
         let over_thread = self.thread_open;
+        if !self.fixtures.sample {
+            self.bridge.send(Command::FetchUserProfile(user.clone()));
+        }
         self.profile
             .update(cx, |profile, cx| profile.open(user, over_thread, cx));
         self.profile_open = true;
@@ -4536,6 +4605,19 @@ impl App {
 
     /// The header's search icon: the top search field scoped to this channel, like Slack's
     /// "Search in #channel".
+    /// Whether the main center column is currently showing the conversation transcript.
+    fn showing_transcript(&self) -> bool {
+        !self.searching
+            && !self.drafts_open
+            && !self.later_open
+            && !self.threads_open
+            && !self.unreads_open
+            && !self.huddles_open
+            && !self.directory_open
+            && !self.compose_open
+            && !self.activity_open
+    }
+
     fn search_in_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scope = if self.preferences.read(cx).settings().search_in_channel {
             self.fixtures
@@ -5377,6 +5459,15 @@ impl App {
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
                 cx.notify();
+            }
+            Event::UserProfileLoaded {
+                user,
+                pronouns,
+                fields,
+            } => {
+                self.profile.update(cx, |profile, cx| {
+                    profile.set_user_profile(user.clone(), pronouns.clone(), fields.clone(), cx);
+                });
             }
             _ => {}
         }
@@ -7433,6 +7524,48 @@ impl Render for App {
             }))
             .on_action(cx.listener(|this, _: &FocusPrevPane, window, cx| {
                 this.cycle_pane_focus(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &BrowseUp, _, cx| {
+                if this.activity_open {
+                    this.activity.update(cx, |a, cx| a.step(false, cx));
+                } else if this.showing_transcript() {
+                    this.messages.update(cx, |m, cx| m.step_focus(false, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &BrowseDown, _, cx| {
+                if this.activity_open {
+                    this.activity.update(cx, |a, cx| a.step(true, cx));
+                } else if this.showing_transcript() {
+                    this.messages.update(cx, |m, cx| m.step_focus(true, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &BrowseOpen, window, cx| {
+                if this.activity_open {
+                    this.activity.update(cx, |a, cx| a.open_selected(cx));
+                } else if this.showing_transcript() {
+                    this.focus_message(MessageAction::ReplyInThread, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ExitThread, window, cx| {
+                if this.thread_open {
+                    this.thread_open = false;
+                    this.messages
+                        .update(cx, |list, cx| list.set_open_thread(None, cx));
+                    this.focus.focus(window, cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &JumpToOldest, _, cx| {
+                if this.showing_transcript() {
+                    this.messages
+                        .update(cx, |m, cx| m.jump(crate::messages::Jump::Beginning, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &JumpToNewest, _, cx| {
+                if this.showing_transcript() {
+                    this.messages
+                        .update(cx, |m, cx| m.jump(crate::messages::Jump::Recent, cx));
+                }
             }))
             .relative()
             .size_full()
@@ -9574,6 +9707,72 @@ pub(crate) fn parse_local_schedule(date_str: &str, time_str: &str) -> Option<u64
     let utc = date.unix_start() + hour * 3_600 + min * 60 - offset;
     let now = now_secs() as i64;
     (utc > now + 30).then_some(utc as u64)
+}
+
+/// Heuristic for external link warning (`Preferences -> Advanced -> Warn me about potentially
+/// malicious links`): flags non-HTTPS links, credentialed URLs (`user@host`), punycode IDN
+/// hosts (`xn--`), or raw IPv4 hosts.
+fn is_suspicious_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") {
+        return true;
+    }
+    let Some(rest) = lower.strip_prefix("https://") else {
+        return !lower.starts_with("mailto:");
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return true;
+    }
+    let host = authority.split(':').next().unwrap_or("");
+    if host.contains("xn--") {
+        return true;
+    }
+    !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+}
+
+/// Enable or disable Launch at login on macOS via a standard user LaunchAgent plist
+/// (`~/Library/LaunchAgents/dev.slackless.gui.plist`). No-op on other OSes.
+fn sync_launch_at_login(enabled: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(home).join("Library/LaunchAgents");
+        let plist = dir.join("dev.slackless.gui.plist");
+        if !enabled {
+            let _ = std::fs::remove_file(plist);
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let exe_str = exe.to_string_lossy();
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+\t<key>Label</key>\n\
+\t<string>dev.slackless.gui</string>\n\
+\t<key>ProgramArguments</key>\n\
+\t<array>\n\
+\t\t<string>{exe_str}</string>\n\
+\t</array>\n\
+\t<key>RunAtLoad</key>\n\
+\t<true/>\n\
+</dict>\n\
+</plist>\n"
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(plist, xml);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = enabled;
+    }
 }
 
 /// A 28px square chrome icon button.

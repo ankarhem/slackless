@@ -266,18 +266,25 @@ fn text_of(object: &Json) -> Option<&str> {
     object["text"].as_str()
 }
 
+/// Decode Slack HTML entities (`&amp;`, `&lt;`, `&gt;`) and substitute `:shortcode:` emoji
+/// unless Preferences -> Messages & media -> Emoji text mode is enabled.
+fn plain_label(text: &str, cx: &App) -> String {
+    let decoded = messages::unescape(text);
+    if crate::preferences::display_prefs(cx).emoji_text_mode {
+        decoded
+    } else {
+        emoji::replace_shortcodes(&decoded)
+    }
+}
+
 /// A text object rendered by its type: mrkdwn through the shared renderer, plain_text with
-/// emoji shortcodes substituted.
+/// HTML entities decoded and emoji shortcodes substituted.
 fn text_object(object: &Json, kcx: &KitCx, muted: bool, cx: &App) -> Option<AnyElement> {
     let text = text_of(object)?;
     if object["type"].as_str() == Some("mrkdwn") {
         return Some(messages::mrkdwn(text, kcx, muted, false, cx).into_any_element());
     }
-    Some(
-        div()
-            .child(emoji::replace_shortcodes(text))
-            .into_any_element(),
-    )
+    Some(div().child(plain_label(text, cx)).into_any_element())
 }
 
 /// One top-level (or attachment) block that is not `rich_text`.
@@ -295,9 +302,10 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             .pt_1()
             .text_lg()
             .font_weight(FontWeight::BOLD)
-            .child(emoji::replace_shortcodes(text_of(&raw["text"])?))
+            .child(plain_label(text_of(&raw["text"])?, cx))
             .into_any_element(),
         "image" => image_block(raw, kcx, cx).into_any_element(),
+        "table" => table_block(raw, ix, kcx, cx).into_any_element(),
         // Slack's context row: 20px images and 13px muted text, 4px apart.
         "context" => h_flex()
             .flex_wrap()
@@ -338,6 +346,83 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             .into_any_element(),
     };
     Some(element)
+}
+
+/// Slack's Block Kit `table` block: first row tinted as a header, column alignment from
+/// `column_settings`, each cell either `raw_text` or nested `rich_text`.
+fn table_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (border, header_bg, fg) = (theme.border, theme.secondary, theme.foreground);
+    let alignments: Vec<&str> = raw["column_settings"]
+        .as_array()
+        .map(|cols| {
+            cols.iter()
+                .map(|c| c["align"].as_str().unwrap_or("left"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows = raw["rows"].as_array();
+    let mut table = v_flex()
+        .w_full()
+        .max_w(px(760.))
+        .my_1()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .overflow_hidden()
+        .text_xs()
+        .text_color(fg);
+    if let Some(rows) = rows {
+        for (r_ix, row) in rows.iter().enumerate() {
+            let Some(cells) = row.as_array() else {
+                continue;
+            };
+            let is_header = r_ix == 0;
+            let mut row_el = h_flex()
+                .w_full()
+                .items_stretch()
+                .when(is_header, |r| {
+                    r.bg(header_bg).font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(r_ix > 0, |r| r.border_t_1().border_color(border));
+            for (c_ix, cell) in cells.iter().enumerate() {
+                let align = alignments.get(c_ix).copied().unwrap_or("left");
+                let content: AnyElement = match cell["type"].as_str() {
+                    Some("rich_text") => {
+                        if let Ok(block) = serde_json::from_value::<Block>(cell.clone()) {
+                            let cell_ts =
+                                Ts::new(format!("{}-t{ix}r{r_ix}c{c_ix}", kcx.ts.as_str()));
+                            let nested = kcx.nested(kcx.fixtures, kcx.kit, &cell_ts);
+                            v_flex()
+                                .min_w_0()
+                                .children(messages::render_block(&block, 0, &nested, false, cx))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .child(plain_label(cell["text"].as_str().unwrap_or_default(), cx))
+                                .into_any_element()
+                        }
+                    }
+                    _ => div()
+                        .child(plain_label(cell["text"].as_str().unwrap_or_default(), cx))
+                        .into_any_element(),
+                };
+                row_el = row_el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px_2p5()
+                        .py_1p5()
+                        .when(c_ix > 0, |c| c.border_l_1().border_color(border))
+                        .when(align == "right", |c| c.flex().justify_end())
+                        .when(align == "center", |c| c.flex().justify_center())
+                        .child(content),
+                );
+            }
+            table = table.child(row_el);
+        }
+    }
+    table
 }
 
 fn section(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
@@ -516,13 +601,43 @@ impl BlockDispatch {
     }
 }
 
+/// Build a Slack `blocks.actions` payload from `element` + `block["block_id"]`.
+fn action_base(element: &Json, block: &Json) -> Json {
+    let mut action = element.clone();
+    if let Some(block_id) = block["block_id"].as_str() {
+        action["block_id"] = block_id.into();
+    }
+    action
+}
+
+/// Dispatch `action` through the message's live `blocks.actions` handler when present, else log it.
+fn dispatch_action(
+    action: Json,
+    on_action: Option<&actions::ActionHandler>,
+    attachment: Option<i64>,
+    key: &str,
+    detail: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(on_action) = on_action {
+        on_action(
+            actions::MessageAction::BlockAction { action, attachment },
+            window,
+            cx,
+        );
+    } else {
+        log_action(key, detail, window, cx);
+    }
+}
+
 /// One interactive (or image) element of `block` (its `actions`, accessory or `input`).
 fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> AnyElement {
     let kind = element["type"].as_str().unwrap_or_default();
     match kind {
         "button" => button(element, block, key, kcx).into_any_element(),
         "static_select" | "external_select" | "multi_static_select" | "multi_external_select" => {
-            select(element, key, options(element), kcx, cx)
+            select(element, block, key, options(element), kcx, cx)
         }
         "users_select" | "multi_users_select" => {
             let users = kcx
@@ -531,7 +646,7 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
                 .iter()
                 .map(|user| (user.display_name().to_owned(), user.id.to_string()))
                 .collect();
-            select(element, key, users, kcx, cx)
+            select(element, block, key, users, kcx, cx)
         }
         "conversations_select"
         | "channels_select"
@@ -548,9 +663,9 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
                     )
                 })
                 .collect();
-            select(element, key, channels, kcx, cx)
+            select(element, block, key, channels, kcx, cx)
         }
-        "overflow" => overflow(element, key).into_any_element(),
+        "overflow" => overflow(element, block, key, kcx).into_any_element(),
         "datepicker" => {
             let days = (0..14)
                 .map(|day| messages::iso_date(messages::now_secs() + day * 86_400))
@@ -558,8 +673,10 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
                 .collect();
             picker(
                 element,
+                block,
                 key,
                 "initial_date",
+                "selected_date",
                 IconName::Calendar,
                 days,
                 kcx,
@@ -573,16 +690,18 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
                 .collect();
             picker(
                 element,
+                block,
                 key,
                 "initial_time",
+                "selected_time",
                 IconName::Clock,
                 times,
                 kcx,
                 cx,
             )
         }
-        "checkboxes" => checkboxes(element, key, kcx, cx).into_any_element(),
-        "radio_buttons" => radios(element, key, kcx, cx).into_any_element(),
+        "checkboxes" => checkboxes(element, block, key, kcx, cx).into_any_element(),
+        "radio_buttons" => radios(element, block, key, kcx, cx).into_any_element(),
         "image" => image_element(element, kcx, 20., cx),
         kind if TEXT_INPUTS.contains(&kind) => text_input(element, &key, kcx, cx),
         other => div()
@@ -626,9 +745,11 @@ fn button(element: &Json, block: &Json, key: String, kcx: &KitCx) -> Button {
         })
 }
 
-/// A select menu: an outlined button showing the choice, opening a checked option list.
+/// A select menu: an outlined button showing the choice, opening a checked option list and
+/// dispatching live `blocks.actions` with Slack's wire selection field.
 fn select(
     element: &Json,
+    block: &Json,
     key: String,
     options: Vec<(String, String)>,
     kcx: &KitCx,
@@ -648,15 +769,58 @@ fn select(
         .as_ref()
         .and_then(|value| options.iter().find(|(_, option)| option == value))
         .map_or(placeholder, |(label, _)| label.clone());
-    dropdown(key, label, None, options, selected, kcx.kit.cloned()).into_any_element()
+    let base = action_base(element, block);
+    let kind = element["type"].as_str().unwrap_or_default().to_owned();
+    dropdown(
+        key,
+        label,
+        None,
+        options,
+        selected,
+        kcx.kit.cloned(),
+        kcx.on_action.clone(),
+        kcx.attachment,
+        move |text, value| {
+            let mut action = base.clone();
+            match kind.as_str() {
+                "users_select" => action["selected_user"] = value.into(),
+                "multi_users_select" => action["selected_users"] = serde_json::json!([value]),
+                "conversations_select" => action["selected_conversation"] = value.into(),
+                "multi_conversations_select" => {
+                    action["selected_conversations"] = serde_json::json!([value]);
+                }
+                "channels_select" => action["selected_channel"] = value.into(),
+                "multi_channels_select" => {
+                    action["selected_channels"] = serde_json::json!([value]);
+                }
+                "multi_static_select" | "multi_external_select" => {
+                    action["selected_options"] = serde_json::json!([{
+                        "text": { "type": "plain_text", "text": text },
+                        "value": value,
+                    }]);
+                }
+                _ => {
+                    action["selected_option"] = serde_json::json!({
+                        "text": { "type": "plain_text", "text": text },
+                        "value": value,
+                    });
+                }
+            }
+            action
+        },
+    )
+    .into_any_element()
 }
 
 /// Date / time pickers: the chosen value (or `initial_field`) on a button with `icon`, the
 /// next values in a checked menu.
+#[allow(clippy::too_many_arguments)]
 fn picker(
     element: &Json,
+    block: &Json,
     key: String,
     initial_field: &str,
+    selected_field: &'static str,
     icon: IconName,
     options: Vec<(String, String)>,
     kcx: &KitCx,
@@ -668,9 +832,26 @@ fn picker(
         .clone()
         .or_else(|| text_of(&element["placeholder"]).map(str::to_owned))
         .unwrap_or_else(|| "Select".to_owned());
-    dropdown(key, label, Some(icon), options, selected, kcx.kit.cloned()).into_any_element()
+    let base = action_base(element, block);
+    dropdown(
+        key,
+        label,
+        Some(icon),
+        options,
+        selected,
+        kcx.kit.cloned(),
+        kcx.on_action.clone(),
+        kcx.attachment,
+        move |_, value| {
+            let mut action = base.clone();
+            action[selected_field] = value.into();
+            action
+        },
+    )
+    .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dropdown(
     key: String,
     label: String,
@@ -678,7 +859,11 @@ fn dropdown(
     options: Vec<(String, String)>,
     selected: Option<String>,
     kit: Option<Entity<BlockKitState>>,
+    on_action: Option<actions::ActionHandler>,
+    attachment: Option<i64>,
+    build_action: impl Fn(&str, &str) -> Json + 'static,
 ) -> impl IntoElement {
+    let build_action = std::rc::Rc::new(build_action);
     Button::new(SharedString::from(format!("bk-{key}")))
         .outline()
         .with_size(Size::Small)
@@ -687,14 +872,25 @@ fn dropdown(
         .dropdown_caret(true)
         .dropdown_menu(move |mut menu, _, _| {
             for (text, value) in &options {
-                let (kit, key, value) = (kit.clone(), key.clone(), value.clone());
+                let (kit, key, value, text_s) =
+                    (kit.clone(), key.clone(), value.clone(), text.clone());
+                let (on_action, build) = (on_action.clone(), build_action.clone());
                 let detail = format!("selected \u{201C}{text}\u{201D}");
                 menu = menu.item(
                     PopupMenuItem::new(text.clone())
                         .checked(selected.as_ref() == Some(&value))
                         .on_click(move |_, window, cx| {
                             set_choice(kit.as_ref(), &key, &value, cx);
-                            log_action(&key, &detail, window, cx);
+                            let payload = build(&text_s, &value);
+                            dispatch_action(
+                                payload,
+                                on_action.as_ref(),
+                                attachment,
+                                &key,
+                                &detail,
+                                window,
+                                cx,
+                            );
                         }),
                 );
             }
@@ -702,27 +898,44 @@ fn dropdown(
         })
 }
 
-/// The `...` overflow menu: each option is an action, not a selection.
-fn overflow(element: &Json, key: String) -> impl IntoElement {
+/// The `...` overflow menu: each option dispatches a live `blocks.actions` event.
+fn overflow(element: &Json, block: &Json, key: String, kcx: &KitCx) -> impl IntoElement {
     let options = options(element);
+    let base = action_base(element, block);
+    let (on_action, attachment) = (kcx.on_action.clone(), kcx.attachment);
     Button::new(SharedString::from(format!("bk-{key}")))
         .ghost()
         .with_size(Size::Small)
         .icon(IconName::Ellipsis)
         .dropdown_menu(move |mut menu, _, _| {
             for (text, value) in &options {
-                let key = key.clone();
+                let (key, base, on_action) = (key.clone(), base.clone(), on_action.clone());
+                let (text_s, value_s) = (text.clone(), value.clone());
                 let detail = format!("chose \u{201C}{text}\u{201D} (value {value})");
-                menu = menu.item(
-                    PopupMenuItem::new(text.clone())
-                        .on_click(move |_, window, cx| log_action(&key, &detail, window, cx)),
-                );
+                menu = menu.item(PopupMenuItem::new(text.clone()).on_click(
+                    move |_, window, cx| {
+                        let mut payload = base.clone();
+                        payload["selected_option"] = serde_json::json!({
+                            "text": { "type": "plain_text", "text": text_s },
+                            "value": value_s,
+                        });
+                        dispatch_action(
+                            payload,
+                            on_action.as_ref(),
+                            attachment,
+                            &key,
+                            &detail,
+                            window,
+                            cx,
+                        );
+                    },
+                ));
             }
             menu
         })
 }
 
-fn checkboxes(element: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
+fn checkboxes(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
     let initial: HashSet<String> = element["initial_options"]
         .as_array()
         .into_iter()
@@ -733,16 +946,24 @@ fn checkboxes(element: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
         .kit
         .and_then(|kit| kit.read(cx).checked.get(&key).cloned())
         .unwrap_or_else(|| initial.clone());
+    let base = action_base(element, block);
+    let all_options = options(element);
     v_flex()
         .gap_1p5()
-        .children(options(element).into_iter().map(|(text, value)| {
+        .children(all_options.clone().into_iter().map(|(text, value)| {
             let is_checked = checked.contains(&value);
             let (kit, key, initial) = (kcx.kit.cloned(), key.clone(), initial.clone());
+            let (on_action, attachment, base, opts) = (
+                kcx.on_action.clone(),
+                kcx.attachment,
+                base.clone(),
+                all_options.clone(),
+            );
             Checkbox::new(SharedString::from(format!("bk-{key}-{value}")))
                 .label(text.clone())
                 .checked(is_checked)
                 .on_click(move |now: &bool, window, cx| {
-                    if let Some(kit) = &kit {
+                    let selected_set = if let Some(kit) = &kit {
                         kit.update(cx, |state, cx| {
                             let set = state
                                 .checked
@@ -754,31 +975,80 @@ fn checkboxes(element: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
                                 set.remove(&value);
                             }
                             cx.notify();
-                        });
-                    }
+                            set.clone()
+                        })
+                    } else {
+                        let mut set = initial.clone();
+                        if *now {
+                            set.insert(value.clone());
+                        } else {
+                            set.remove(&value);
+                        }
+                        set
+                    };
+                    let mut payload = base.clone();
+                    payload["selected_options"] = Json::Array(
+                        opts.iter()
+                            .filter(|(_, v)| selected_set.contains(v))
+                            .map(|(t, v)| {
+                                serde_json::json!({
+                                    "text": { "type": "plain_text", "text": t },
+                                    "value": v,
+                                })
+                            })
+                            .collect(),
+                    );
                     let verb = if *now { "checked" } else { "unchecked" };
-                    log_action(&key, &format!("{verb} \u{201C}{text}\u{201D}"), window, cx);
+                    dispatch_action(
+                        payload,
+                        on_action.as_ref(),
+                        attachment,
+                        &key,
+                        &format!("{verb} \u{201C}{text}\u{201D}"),
+                        window,
+                        cx,
+                    );
                 })
         }))
 }
 
-fn radios(element: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
+fn radios(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
     let selected = choice(kcx, &key, cx).or_else(|| {
         element["initial_option"]["value"]
             .as_str()
             .map(str::to_owned)
     });
+    let base = action_base(element, block);
     v_flex()
         .gap_1p5()
         .children(options(element).into_iter().map(|(text, value)| {
             let checked = selected.as_ref() == Some(&value);
-            let (kit, key) = (kcx.kit.cloned(), key.clone());
+            let (kit, key, base, on_action, attachment) = (
+                kcx.kit.cloned(),
+                key.clone(),
+                base.clone(),
+                kcx.on_action.clone(),
+                kcx.attachment,
+            );
             Radio::new(SharedString::from(format!("bk-{key}-{value}")))
                 .label(text.clone())
                 .checked(checked)
                 .on_click(move |_, window, cx| {
                     set_choice(kit.as_ref(), &key, &value, cx);
-                    log_action(&key, &format!("chose \u{201C}{text}\u{201D}"), window, cx);
+                    let mut payload = base.clone();
+                    payload["selected_option"] = serde_json::json!({
+                        "text": { "type": "plain_text", "text": text },
+                        "value": value,
+                    });
+                    dispatch_action(
+                        payload,
+                        on_action.as_ref(),
+                        attachment,
+                        &key,
+                        &format!("chose \u{201C}{text}\u{201D}"),
+                        window,
+                        cx,
+                    );
                 })
         }))
 }
@@ -1192,7 +1462,8 @@ fn message_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> D
 fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div {
     let theme = cx.theme();
     let (border, muted) = (theme.border, theme.muted_foreground);
-    let title = attachment.title.clone().map(|title| {
+    let title = attachment.title.as_deref().map(|title| {
+        let title = plain_label(title, cx);
         let url = attachment
             .title_link
             .clone()
@@ -1219,7 +1490,7 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
         .text
         .as_deref()
         .map(|text| messages::mrkdwn(text, kcx, true, false, cx));
-    let site = attachment.service_name.clone().map(|name| {
+    let site = attachment.service_name.as_deref().map(|name| {
         h_flex()
             .gap_1()
             .items_center()
@@ -1233,7 +1504,7 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
                         .rounded_sm(),
                 )
             })
-            .child(name)
+            .child(plain_label(name, cx))
     });
     let is_video_unfurl = attachment.extra.contains_key("video_html")
         || attachment.extra.contains_key("video_html_width");
@@ -1366,10 +1637,11 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
     let fixtures = kcx.fixtures;
     let mut body = v_flex().flex_1().min_w_0().gap_1();
     if let Some(author) = &attachment.author_name {
+        let author_text = plain_label(author, cx);
         let label = match &attachment.author_link {
             Some(url) => routed_link(
                 format!("bk-{}-att-{n}-author", kcx.ts.as_str()),
-                author.clone(),
+                author_text,
                 url.clone(),
                 kcx,
                 FontWeight::SEMIBOLD,
@@ -1380,7 +1652,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
             None => div()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(author.clone())
+                .child(author_text)
                 .into_any_element(),
         };
         body = body.child(
@@ -1399,10 +1671,11 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         );
     }
     if let Some(title) = &attachment.title {
+        let title_text = plain_label(title, cx);
         body = body.child(match &attachment.title_link {
             Some(url) => routed_link(
                 format!("bk-{}-att-{n}-title", kcx.ts.as_str()),
-                title.clone(),
+                title_text,
                 url.clone(),
                 kcx,
                 FontWeight::SEMIBOLD,
@@ -1411,7 +1684,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
             .into_any_element(),
             None => div()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(title.clone())
+                .child(title_text)
                 .into_any_element(),
         });
     }
@@ -1461,8 +1734,12 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .when_some(field.title.clone(), |cell, title| {
-                    cell.child(div().font_weight(FontWeight::BOLD).child(title))
+                .when_some(field.title.as_deref(), |cell, title| {
+                    cell.child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .child(plain_label(title, cx)),
+                    )
                 })
                 .when_some(field.value.as_deref(), |cell, value| {
                     cell.child(messages::mrkdwn(value, kcx, false, false, cx))
@@ -1507,7 +1784,10 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
     let stamp = attachment_secs(attachment);
     if attachment.footer.is_some() || stamp.is_some() {
         let footer = [
-            attachment.footer.as_deref().map(link_labels),
+            attachment
+                .footer
+                .as_deref()
+                .map(|f| plain_label(&link_labels(f), cx)),
             stamp.map(|secs| messages::day_and_time(&Ts::new(secs.to_string()))),
         ]
         .into_iter()

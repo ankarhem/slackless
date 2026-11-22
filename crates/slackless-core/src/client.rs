@@ -1208,6 +1208,44 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::FetchUserProfile(user) => {
+                self.spawn("users.profile.get", async move {
+                    let (profile, labels) = tokio::join!(
+                        backend.user_profile(user.clone()),
+                        backend.team_profile_fields(),
+                    );
+                    let profile = profile?;
+                    let labels = labels.unwrap_or_default();
+                    let pronouns = profile.pronouns.clone().filter(|p| !p.trim().is_empty());
+                    let mut fields = Vec::new();
+                    if let Some(map) = profile.fields.as_ref().and_then(|v| v.as_object()) {
+                        for (id, entry) in map {
+                            let val = entry
+                                .get("value")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .unwrap_or_default();
+                            if val.is_empty() {
+                                continue;
+                            }
+                            let label = entry
+                                .get("label")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned)
+                                .or_else(|| labels.get(id).cloned())
+                                .unwrap_or_else(|| id.clone());
+                            fields.push((label, val.to_owned()));
+                        }
+                    }
+                    events.emit(Event::UserProfileLoaded {
+                        user,
+                        pronouns,
+                        fields,
+                    });
+                    Ok(())
+                });
+            }
             Command::CreateChannel {
                 name,
                 is_private,
@@ -3143,6 +3181,14 @@ pub(crate) mod tests {
 
         async fn set_user_pref(&self, _name: String, _value: String) -> api::Result<()> {
             Ok(())
+        }
+
+        async fn user_profile(&self, _user: UserId) -> api::Result<slackless_types::Profile> {
+            Ok(slackless_types::Profile::default())
+        }
+
+        async fn team_profile_fields(&self) -> api::Result<HashMap<String, String>> {
+            Ok(HashMap::new())
         }
     }
 

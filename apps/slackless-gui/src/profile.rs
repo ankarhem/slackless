@@ -9,6 +9,7 @@
 //! emits `ProfileEvent::Close` / `ProfileEvent::Back` / `ProfileEvent::Message(UserId)` /
 //! `ProfileEvent::EditStatus`
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -38,12 +39,19 @@ pub enum ProfileEvent {
     EditProfile,
 }
 
+struct LoadedProfile {
+    pronouns: Option<String>,
+    fields: Vec<(String, String)>,
+}
+
 pub struct ProfilePanel {
     fixtures: Arc<Fixtures>,
     user: Option<UserId>,
     /// Opened over another pane: the header leads with Slack's back chevron.
     back: bool,
     self_state: SelfState,
+    /// Live-hydrated pronouns & custom fields from `users.profile.get` + `team.profile.get`.
+    loaded_profiles: HashMap<UserId, LoadedProfile>,
 }
 
 impl EventEmitter<ProfileEvent> for ProfilePanel {}
@@ -55,7 +63,21 @@ impl ProfilePanel {
             user: None,
             back: false,
             self_state: SelfState::default(),
+            loaded_profiles: HashMap::new(),
         })
+    }
+
+    /// Store live custom fields & pronouns hydrated from `users.profile.get`.
+    pub fn set_user_profile(
+        &mut self,
+        user: UserId,
+        pronouns: Option<String>,
+        fields: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.loaded_profiles
+            .insert(user, LoadedProfile { pronouns, fields });
+        cx.notify();
     }
 
     /// Live refresh: the shown profile stays open, drawn from `fixtures`.
@@ -199,6 +221,20 @@ impl Render for ProfilePanel {
         };
         let is_self = user.id == self.fixtures.self_user;
         let extras = self.fixtures.profile_extras.get(&user.id);
+        let loaded = self.loaded_profiles.get(&user.id);
+        let pronouns = loaded
+            .and_then(|p| p.pronouns.clone())
+            .or_else(|| {
+                user.profile
+                    .pronouns
+                    .clone()
+                    .filter(|p| !p.trim().is_empty())
+            })
+            .or_else(|| extras.and_then(|e| e.pronouns.clone()));
+        let custom_fields: Vec<(String, String)> = match loaded {
+            Some(p) if !p.fields.is_empty() => p.fields.clone(),
+            _ => extras.map(|e| e.fields.clone()).unwrap_or_default(),
+        };
         // The name messages show the person by (full or display name, per the workspace).
         let name = self.fixtures.name_of(&user).to_owned();
         let real_name = user
@@ -351,26 +387,23 @@ impl Render for ProfilePanel {
                             .child(div().text_sm().text_color(link).child(phone))
                     }),
             );
-        let about =
-            v_flex()
-                .gap_2()
-                // Like Slack, the section only shows when it has something in it.
-                .when(
-                    user.tz_label.is_some() || extras.is_some_and(|e| !e.fields.is_empty()),
-                    |about| about.child(section("About me")),
-                )
-                .children(user.tz_label.clone().map(|zone| {
-                    v_flex()
-                        .child(div().text_xs().text_color(muted).child("Time zone"))
-                        .child(div().text_sm().child(zone))
-                }))
-                .children(extras.into_iter().flat_map(|e| e.fields.iter()).map(
-                    |(label, value)| {
-                        v_flex()
-                            .child(div().text_xs().text_color(muted).child(label.clone()))
-                            .child(div().text_sm().child(value.clone()))
-                    },
-                ));
+        let about = v_flex()
+            .gap_2()
+            // Like Slack, the section only shows when it has something in it.
+            .when(
+                user.tz_label.is_some() || !custom_fields.is_empty(),
+                |about| about.child(section("About me")),
+            )
+            .children(user.tz_label.clone().map(|zone| {
+                v_flex()
+                    .child(div().text_xs().text_color(muted).child("Time zone"))
+                    .child(div().text_sm().child(zone))
+            }))
+            .children(custom_fields.into_iter().map(|(label, value)| {
+                v_flex()
+                    .child(div().text_xs().text_color(muted).child(label))
+                    .child(div().text_sm().child(value))
+            }));
 
         let body = v_flex()
             .id("profile-body")
@@ -393,11 +426,7 @@ impl Render for ProfilePanel {
                                     .font_weight(FontWeight::BOLD)
                                     .child(name.clone()),
                             )
-                            .children(
-                                extras
-                                    .and_then(|e| e.pronouns.clone())
-                                    .map(|p| div().text_sm().text_color(muted).child(p)),
-                            ),
+                            .children(pronouns.map(|p| div().text_sm().text_color(muted).child(p))),
                     )
                     .when(!real_name.is_empty() && real_name != name, |col| {
                         col.child(div().text_sm().text_color(muted).child(real_name.clone()))

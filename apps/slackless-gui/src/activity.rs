@@ -155,6 +155,8 @@ pub struct ActivityFeed {
     filter: Filter,
     unreads_only: bool,
     load: Load,
+    /// Keyboard-selected visible row index (`Up` / `Down` / `Enter` in Activity).
+    selected: Option<usize>,
 }
 
 impl EventEmitter<ActivityEvent> for ActivityFeed {}
@@ -173,7 +175,34 @@ impl ActivityFeed {
             filter: Filter::All,
             unreads_only: false,
             load: Load::Idle,
+            selected: None,
         })
+    }
+
+    /// Move keyboard selection up or down across visible Activity items (`F-SHELL-276`).
+    pub fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let vis = self.visible();
+        if vis.is_empty() {
+            self.selected = None;
+            return;
+        }
+        let next = match self.selected {
+            Some(pos) if forward => (pos + 1).min(vis.len() - 1),
+            Some(pos) => pos.saturating_sub(1),
+            None => 0,
+        };
+        self.selected = Some(next);
+        cx.notify();
+    }
+
+    /// Open the currently keyboard-selected Activity item (`Enter`).
+    pub fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let vis = self.visible();
+        if let Some(pos) = self.selected {
+            if let Some(&ix) = vis.get(pos) {
+                self.open(ix, cx);
+            }
+        }
     }
 
     /// Snapshot refresh: the fixture workspace rebuilds its rows; a live snapshot never
@@ -299,6 +328,11 @@ impl ActivityFeed {
             .map(|message| message.text.clone())
             .unwrap_or_else(|| item.text.clone());
         let group = SharedString::from(format!("activity-group-{ix}"));
+        let is_selected = self
+            .selected
+            .and_then(|pos| self.visible().get(pos).copied())
+            == Some(ix);
+        let ring = cx.theme().ring;
         h_flex()
             .id(("activity-row", ix))
             .group(group.clone())
@@ -309,6 +343,9 @@ impl ActivityFeed {
             // Slack separates the items with hairlines.
             .border_b_1()
             .border_color(border)
+            .when(is_selected, |row| {
+                row.bg(hover).border_l_2().border_color(ring)
+            })
             .cursor_pointer()
             .hover(|row| row.bg(hover))
             .child(author_avatar(

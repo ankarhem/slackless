@@ -288,6 +288,8 @@ pub struct Settings {
     pub show_workspace_rail: bool,
     /// Custom download folder path (empty string uses `~/Downloads`).
     pub download_dir: String,
+    /// Prompt for a save location before every file download (`F-SHELL-190`).
+    pub ask_download_location: bool,
 }
 
 /// Active rendering preferences cached as a GPUI global so every message list, thread panel,
@@ -434,6 +436,7 @@ impl Default for Settings {
             excluded_channels: String::new(),
             show_workspace_rail: true,
             download_dir: String::new(),
+            ask_download_location: false,
         }
     }
 }
@@ -1525,6 +1528,12 @@ impl Preferences {
                         })),
                 )
             });
+        let ask_dl = self.checkbox(
+            "adv-dl-ask",
+            "Ask where to save each file before downloading",
+            |s| &mut s.ask_download_location,
+            cx,
+        );
         v_flex()
             .child(self.group(
                 "Search",
@@ -1539,7 +1548,7 @@ impl Preferences {
             .child(self.group(
                 "Download location",
                 Some("Where files downloaded from Slack are saved."),
-                download_row,
+                v_flex().gap_2().child(download_row).child(ask_dl),
                 cx,
             ))
             .child(self.group(

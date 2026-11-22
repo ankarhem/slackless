@@ -849,9 +849,38 @@ impl MessageList {
         }
     }
 
-    /// The focused message, if the mouse has hovered the transcript.
+    /// The focused message, if the mouse has hovered or keyboard focus stepped into the transcript.
     pub fn focused(&self, cx: &App) -> Option<Ts> {
         self.data.read(cx).active.clone()
+    }
+
+    /// Move keyboard focus up (`forward == false`) or down (`forward == true`) one message row
+    /// in the transcript (`F-SHELL-273`), scrolling the newly focused message into view.
+    pub fn step_focus(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let next = {
+            let data = self.data.read(cx);
+            let len = data.messages.len();
+            if len == 0 {
+                return;
+            }
+            let current = data
+                .active
+                .as_ref()
+                .and_then(|ts| data.messages.iter().position(|m| &m.ts == ts));
+            let ix = match current {
+                Some(ix) if forward => (ix + 1).min(len - 1),
+                Some(ix) => ix.saturating_sub(1),
+                None => len - 1,
+            };
+            (ix, data.messages[ix].ts.clone())
+        };
+        let (ix, ts) = next;
+        self.data.update(cx, |data, _| {
+            data.active = Some(ts);
+        });
+        self.scroller
+            .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -927,6 +956,7 @@ impl MessageList {
                     .update(cx, |scroller, cx| scroller.scroll_to_end(cx));
                 return;
             }
+            Jump::Yesterday => now - DAY,
             Jump::LastWeek => now - 7 * DAY,
             Jump::LastMonth => now - 30 * DAY,
             Jump::Beginning => 0,
@@ -1628,6 +1658,10 @@ fn transcript_row(
                 })
                 .when(highlighted, |card| card.bg(editing_bg))
                 .when(!highlighted && thread_open, |card| card.bg(thread_bg))
+                .when(
+                    !highlighted && !thread_open && store.active.as_ref() == Some(&message.ts),
+                    |card| card.bg(hover_bg),
+                )
                 .when(!saved && !highlighted && !thread_open, |card| {
                     card.hover(|card| card.bg(hover_bg))
                 })
@@ -1997,6 +2031,7 @@ fn message_header(
 #[derive(Clone, Copy)]
 pub enum Jump {
     Recent,
+    Yesterday,
     LastWeek,
     LastMonth,
     Beginning,
@@ -2048,6 +2083,7 @@ fn date_divider(label: String, key: String, list: WeakEntity<MessageList>, cx: &
                 menu = menu.label("Jump to…");
                 for (jump, text) in [
                     (Jump::Recent, "Most recent"),
+                    (Jump::Yesterday, "Yesterday"),
                     (Jump::LastWeek, "Last week"),
                     (Jump::LastMonth, "Last month"),
                     (Jump::Beginning, "The very beginning"),
@@ -4007,7 +4043,16 @@ fn mrkdwn_fences(text: &str) -> Vec<(bool, &str)> {
     pieces
 }
 
-/// Lines of mrkdwn text into `column`; with `edited`, the edit marker rides inline at the
+/// Strip a Slack mrkdwn blockquote prefix (`>` or `&gt;`) and one optional following space.
+fn strip_quote_prefix(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix("&gt;")
+        .or_else(|| line.strip_prefix('>'))?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// Lines of mrkdwn text into `column`, grouping consecutive `>` / `&gt;` blockquote lines
+/// behind a Slack-style left quote bar; with `edited`, the edit marker rides inline at the
 /// end of the last line that renders text.
 fn mrkdwn_lines(
     mut column: Div,
@@ -4019,19 +4064,49 @@ fn mrkdwn_lines(
     let lines: Vec<&str> = text.split('\n').collect();
     let last_text_line = lines.iter().rposition(|line| !line.is_empty());
     let mut blank = false;
-    for (n, line) in lines.iter().enumerate() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         // A run of blank lines is one 8px break, like the rich-text path's `c-mrkdwn__br`.
         if line.is_empty() {
             if !blank {
                 column = column.child(div().h(px(8.)));
             }
             blank = true;
+            i += 1;
             continue;
         }
         blank = false;
-        if let Some(row) = mrkdwn_line(line, fixtures, theme, edited && Some(n) == last_text_line) {
+        if strip_quote_prefix(line).is_some() {
+            let mut quote_col = v_flex().flex_1().min_w_0();
+            while i < lines.len() {
+                let Some(inner) = strip_quote_prefix(lines[i]) else {
+                    break;
+                };
+                if inner.is_empty() {
+                    quote_col = quote_col.child(div().h(px(6.)));
+                } else if let Some(row) =
+                    mrkdwn_line(inner, fixtures, theme, edited && Some(i) == last_text_line)
+                {
+                    quote_col = quote_col.child(row);
+                }
+                i += 1;
+            }
+            column = column.child(
+                h_flex()
+                    .my_0p5()
+                    .gap_2p5()
+                    .items_stretch()
+                    .min_w_0()
+                    .child(div().flex_none().w(px(4.)).rounded_full().bg(theme.border))
+                    .child(quote_col),
+            );
+            continue;
+        }
+        if let Some(row) = mrkdwn_line(line, fixtures, theme, edited && Some(i) == last_text_line) {
             column = column.child(row);
         }
+        i += 1;
     }
     column
 }
@@ -4090,7 +4165,7 @@ fn mrkdwn_line(line: &str, fixtures: &Fixtures, theme: &RunTheme, edited: bool) 
 }
 
 /// `text` with Slack's three mrkdwn HTML escapes undone.
-fn unescape(text: &str) -> String {
+pub(crate) fn unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")

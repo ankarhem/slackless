@@ -92,6 +92,8 @@ pub struct Profile {
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
+    pub pronouns: Option<String>,
+    #[serde(default)]
     pub email: Option<String>,
     #[serde(default)]
     pub phone: Option<String>,

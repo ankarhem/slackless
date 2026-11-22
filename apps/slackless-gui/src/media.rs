@@ -90,6 +90,7 @@ struct DownloadRegistry {
     next_id: usize,
     items: Vec<DownloadRecord>,
     custom_dir: Option<PathBuf>,
+    ask_each_time: bool,
 }
 
 impl Global for DownloadRegistry {}
@@ -98,6 +99,12 @@ impl Global for DownloadRegistry {}
 pub fn set_download_dir(dir: Option<PathBuf>, cx: &mut App) {
     let reg = cx.default_global::<DownloadRegistry>();
     reg.custom_dir = dir;
+}
+
+/// Whether clicking Download prompts for a save location per file (`F-SHELL-190`).
+pub fn set_ask_download_location(ask: bool, cx: &mut App) {
+    let reg = cx.default_global::<DownloadRegistry>();
+    reg.ask_each_time = ask;
 }
 
 /// Active download directory (custom preference if set, else `~/Downloads`).
@@ -154,6 +161,13 @@ pub fn open_local_file(path: &Path) {
 /// Download `url` into ~/Downloads as `name` (`name (1).png` when that is taken), track it in
 /// the in-app Downloads list, and notify when it finishes.
 pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
+    if cx
+        .try_global::<DownloadRegistry>()
+        .is_some_and(|reg| reg.ask_each_time)
+    {
+        download_as(url, name, window, cx);
+        return;
+    }
     let Some(fetcher) = cx.try_global::<Downloader>().map(|d| d.0.clone()) else {
         crate::actions::notify(
             "Download",

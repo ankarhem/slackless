@@ -398,6 +398,15 @@ pub trait Backend: Clone + Send + Sync + 'static {
         name: String,
         value: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Fetch a user's full profile including custom `fields` and `pronouns` (`users.profile.get`).
+    fn user_profile(
+        &self,
+        user: UserId,
+    ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send;
+    /// Fetch workspace custom profile field definitions (`team.profile.get`).
+    fn team_profile_fields(
+        &self,
+    ) -> impl Future<Output = api::Result<HashMap<String, String>>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -887,5 +896,13 @@ impl Backend for SlackApi {
 
     async fn set_user_pref(&self, name: String, value: String) -> api::Result<()> {
         SlackApi::users_prefs_set(self, &name, &value).await
+    }
+
+    async fn user_profile(&self, user: UserId) -> api::Result<slackless_types::Profile> {
+        SlackApi::users_profile_get(self, &user).await
+    }
+
+    async fn team_profile_fields(&self) -> api::Result<HashMap<String, String>> {
+        SlackApi::team_profile_get(self).await
     }
 }
