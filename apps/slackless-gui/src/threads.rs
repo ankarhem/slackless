@@ -41,7 +41,7 @@ use crate::composer::{
 };
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
-use crate::later::{Remind, SaveRequest};
+use crate::later::SaveRequest;
 use crate::messages::{LinkHandler, LinkTarget, editing_avatar, message_row_linked, same_group};
 use crate::slash::{Invocation, SHRUG, SlashKind};
 
@@ -396,7 +396,7 @@ impl ThreadPanel {
         &mut self,
         ts: &Ts,
         saved: bool,
-        remind: Option<Remind>,
+        due: Option<u64>,
         title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -418,7 +418,7 @@ impl ThreadPanel {
                 .unwrap_or_default(),
             text: fixtures.preview(message),
             saved,
-            due: remind.map(|remind| remind.at(crate::drafts::now_secs())),
+            due,
         };
         actions::notify(title, request.text.clone(), window, cx);
         cx.emit(ThreadPanelEvent::Later(request));
@@ -578,7 +578,31 @@ impl ThreadPanel {
             }
             MessageAction::RemindMe(remind) => {
                 let title = format!("Reminder set: {}", remind.label().to_lowercase());
-                self.save_for_later(ts, true, Some(remind), &title, window, cx);
+                self.save_for_later(
+                    ts,
+                    true,
+                    Some(remind.at(crate::drafts::now_secs())),
+                    &title,
+                    window,
+                    cx,
+                );
+            }
+            MessageAction::RemindCustom => {
+                let this = cx.entity().downgrade();
+                let ts = ts.clone();
+                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
+                    let _ = this.update(cx, |panel, cx| {
+                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
+                        panel.save_for_later(
+                            &ts,
+                            true,
+                            Some(due),
+                            &format!("Reminder set: {when}"),
+                            window,
+                            cx,
+                        );
+                    });
+                });
             }
             MessageAction::MarkUnread => self.mark_unread(ts.clone(), cx),
             MessageAction::Edit => self.begin_edit(ts.clone(), window, cx),

@@ -252,6 +252,26 @@ impl CoreBridge {
         })
     }
 
+    /// Live mode: a read of up to `limit` newest undeleted messages authored by `user` across
+    /// all stored conversations (for Drafts & sent -> Sent). `None` offline.
+    pub fn recent_sent(
+        &self,
+        user: slackless_core::types::UserId,
+        limit: usize,
+    ) -> Option<impl Future<Output = Vec<slackless_core::store::StoredMessage>> + Send + 'static>
+    {
+        let team = self.session.as_ref()?.team_id.clone();
+        let store = self.store.clone()?;
+        Some(async move {
+            let Ok(store) = store.lock() else {
+                return Vec::new();
+            };
+            store
+                .recent_messages_by_user(&team, &user, limit)
+                .unwrap_or_default()
+        })
+    }
+
     /// Live mode: a read of one thread's stored history (root + replies, oldest first,
     /// without deleted messages) to run off the UI thread. `None` offline.
     pub fn thread(

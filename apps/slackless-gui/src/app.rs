@@ -248,8 +248,8 @@ use slackless_core::types::{
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
 use crate::actions::{
-    FocusDeleteMessage, FocusEditMessage, FocusForwardMessage, FocusMarkMessageUnread, FocusReact,
-    FocusRemindMe, FocusReplyInThread, FocusSaveMessage, FocusTogglePin, MessageAction,
+    self, FocusDeleteMessage, FocusEditMessage, FocusForwardMessage, FocusMarkMessageUnread,
+    FocusReact, FocusRemindMe, FocusReplyInThread, FocusSaveMessage, FocusTogglePin, MessageAction,
     MessageChange, notify,
 };
 use crate::activity::{ActivityEvent, ActivityFeed};
@@ -312,10 +312,13 @@ actions!(
         NewMessage,
         OpenThreads,
         OpenUnreads,
+        OpenHome,
         OpenLater,
         OpenFiles,
         OpenPeople,
         OpenOwnProfile,
+        CreateChannelAction,
+        JumpToUnread,
         NextWorkspace,
         PreviousWorkspace,
         PreviousConversation,
@@ -326,6 +329,7 @@ actions!(
         MarkAllRead,
         SearchConversation,
         ToggleWorkspaceRail,
+        ToggleRightPane,
         ZoomIn,
         ZoomOut,
         ActualSize,
@@ -467,6 +471,15 @@ enum PickerTarget {
     ThreadMessage(Ts),
 }
 
+/// Which right-hand panel was last closed by `ToggleRightPane` (`Cmd+.`) so pressing it
+/// again restores the same panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RightPane {
+    Thread,
+    Profile,
+    Pins,
+}
+
 pub struct App {
     /// The shown workspace's fixtures.
     fixtures: Arc<Fixtures>,
@@ -523,6 +536,8 @@ pub struct App {
     /// thread panel).
     profile: Entity<ProfilePanel>,
     profile_open: bool,
+    /// Last right-hand panel hidden by `ToggleRightPane` (`Cmd+.`), restored on the next toggle.
+    last_right_pane: Option<RightPane>,
     /// The signed-in user's status, presence and notification pause.
     self_state: SelfState,
     status_picker: Entity<StatusPicker>,
@@ -831,6 +846,8 @@ impl App {
             crate::actions::bind_menu_keys(cx);
             cx.bind_keys([
                 KeyBinding::new("cmd-k", QuickSwitch, None),
+                KeyBinding::new("cmd-j", JumpToUnread, None),
+                KeyBinding::new("cmd-shift-h", OpenHome, None),
                 KeyBinding::new("cmd-[", NavigateBack, None),
                 KeyBinding::new("cmd-]", NavigateForward, None),
                 KeyBinding::new("cmd-,", OpenPreferences, None),
@@ -850,6 +867,7 @@ impl App {
                 KeyBinding::new("cmd-g", FocusSearch, None),
                 KeyBinding::new("cmd-f", SearchConversation, None),
                 KeyBinding::new("cmd-shift-s", ToggleWorkspaceRail, None),
+                KeyBinding::new("cmd-.", ToggleRightPane, None),
                 // Slack's View menu shows Cmd++; Cmd+= (no Shift) zooms in too.
                 KeyBinding::new("cmd-+", ZoomIn, None),
                 KeyBinding::new("cmd-=", ZoomIn, None),
@@ -1617,6 +1635,7 @@ impl App {
                 details,
                 pending_dm: None,
                 pins_open: false,
+                last_right_pane: None,
                 pins: HashMap::new(),
                 bookmarks: HashMap::new(),
                 files: HashMap::new(),
@@ -1961,9 +1980,14 @@ impl App {
         }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_workspace_badges(badges, cx));
-        if self.badge != Some(total_dock) {
-            self.badge = Some(total_dock);
-            let label = (total_dock > 0).then(|| total_dock.to_string());
+        let effective_dock = if self.preferences.read(cx).settings().show_dock_badge {
+            total_dock
+        } else {
+            0
+        };
+        if self.badge != Some(effective_dock) {
+            self.badge = Some(effective_dock);
+            let label = (effective_dock > 0).then(|| effective_dock.to_string());
             self.os.set_badge(label.as_deref());
         }
     }
@@ -2268,6 +2292,16 @@ impl App {
         let remote_auto = settings.remote_search_auto;
         self.results
             .update(cx, |view, _| view.set_remote_auto(remote_auto));
+        let nav_prefs = crate::sidebar::NavPrefs {
+            show_home: settings.show_home,
+            show_dms: settings.show_dms,
+            show_activity: settings.show_activity,
+            show_files: settings.show_files,
+            show_later: settings.show_later,
+            icons_only: settings.tab_style == 1,
+        };
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_nav_prefs(nav_prefs, cx));
         if self
             .saved_settings
             .as_ref()
@@ -2279,6 +2313,7 @@ impl App {
             }
         }
         self.push_self_state(cx);
+        self.sync_badge(cx);
     }
 
     /// Slack's focus mode (the rail's moon): on with Slack's default "Don't turn off", or off.
@@ -2312,6 +2347,481 @@ impl App {
         });
         self.apply_preferences(window, cx);
         cx.notify();
+    }
+
+    /// Hide the open right sidebar (thread, profile, or pins) or restore the last hidden one
+    /// (`Cmd+.` / View > Toggle Right Sidebar).
+    fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+        if self.thread_open {
+            self.last_right_pane = Some(RightPane::Thread);
+            self.thread_open = false;
+        } else if self.profile_open {
+            self.last_right_pane = Some(RightPane::Profile);
+            self.profile_open = false;
+        } else if self.pins_open {
+            self.last_right_pane = Some(RightPane::Pins);
+            self.pins_open = false;
+        } else {
+            match self.last_right_pane {
+                Some(RightPane::Thread) if self.thread.read(cx).open_thread().is_some() => {
+                    self.thread_open = true;
+                }
+                Some(RightPane::Profile) => {
+                    self.profile_open = true;
+                }
+                Some(RightPane::Pins) => {
+                    self.pins_open = true;
+                }
+                _ => {
+                    self.pins_open = true;
+                    if !self.fixtures.sample && !self.pins.contains_key(&self.channel) {
+                        self.bridge.send(Command::LoadPins(self.channel.clone()));
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Jump to the oldest unread message in the current conversation, or step to the next
+    /// unread conversation if there are none here (`Cmd+J`).
+    fn jump_to_unread(&mut self, cx: &mut Context<Self>) {
+        let jumped = self.messages.update(cx, |list, cx| list.jump_to_unread(cx));
+        if !jumped {
+            self.step_conversation(true, true, cx);
+        }
+    }
+
+    /// Return to the Home navigation tab and current conversation (`Cmd+Shift+H`).
+    fn open_home(&mut self, cx: &mut Context<Self>) {
+        self.activity_open = false;
+        self.close_full_column_views(cx);
+        self.sidebar.update(cx, |sidebar, cx| sidebar.show_home(cx));
+        cx.notify();
+    }
+
+    /// Open Slack's "Create a channel" dialog (`conversations.create` + optional purpose).
+    fn open_create_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let name_state = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("e.g. plan-budget")
+                .auto_grow(1, 1)
+        });
+        let purpose_state = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("What is this channel about? (optional)")
+                .auto_grow(1, 3)
+        });
+        let is_private = cx.new(|_| false);
+        name_state.read(cx).focus_handle(cx).focus(window, cx);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, bg, fg, accent) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.background,
+                theme.foreground,
+                theme.sidebar_accent,
+            );
+            let private_now = *is_private.read(cx);
+            let raw_name = name_state.read(cx).value().to_string();
+            let slug = channel_details::normalize_channel_slug(&raw_name);
+            let preview = if slug.is_empty() {
+                String::new()
+            } else if private_now {
+                format!("Will create private channel #{slug}")
+            } else {
+                format!("Will create public channel #{slug}")
+            };
+            let (name_s, purpose_s, priv_s, this_create) = (
+                name_state.clone(),
+                purpose_state.clone(),
+                is_private.clone(),
+                this.clone(),
+            );
+            let priv_pub = is_private.clone();
+            let priv_prv = is_private.clone();
+            dialog.title("Create a channel").w(px(460.)).child(
+                v_flex()
+                    .gap_3()
+                    .p_4()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("Name"),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(bg)
+                                    .child(
+                                        Textarea::new(&name_state)
+                                            .appearance(false)
+                                            .bordered(false),
+                                    ),
+                            )
+                            .when(!preview.is_empty(), |col| {
+                                col.child(div().text_xs().text_color(muted).child(preview))
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("Visibility"),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .id("create-ch-public")
+                                            .flex_1()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(if !private_now { accent } else { border })
+                                            .cursor_pointer()
+                                            .text_sm()
+                                            .text_color(fg)
+                                            .child(Icon::new(IconName::Hash).size(px(14.)))
+                                            .child("Public")
+                                            .on_click(move |_, _, cx| {
+                                                priv_pub.update(cx, |v, cx| {
+                                                    *v = false;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .id("create-ch-private")
+                                            .flex_1()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(if private_now { accent } else { border })
+                                            .cursor_pointer()
+                                            .text_sm()
+                                            .text_color(fg)
+                                            .child(Icon::new(IconName::Lock).size(px(14.)))
+                                            .child("Private")
+                                            .on_click(move |_, _, cx| {
+                                                priv_prv.update(cx, |v, cx| {
+                                                    *v = true;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(muted)
+                                    .child("Description"),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(bg)
+                                    .child(
+                                        Textarea::new(&purpose_state)
+                                            .appearance(false)
+                                            .bordered(false),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("create-ch-cancel")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("create-ch-submit")
+                                    .primary()
+                                    .with_size(Size::Small)
+                                    .label("Create")
+                                    .on_click(move |_, window, cx| {
+                                        let slug = channel_details::normalize_channel_slug(
+                                            name_s.read(cx).value().as_ref(),
+                                        );
+                                        if slug.is_empty() {
+                                            actions::notify(
+                                                "Enter a channel name",
+                                                "Channel names use lowercase letters, numbers, and hyphens.",
+                                                window,
+                                                cx,
+                                            );
+                                            return;
+                                        }
+                                        let purpose =
+                                            purpose_s.read(cx).value().trim().to_owned();
+                                        let is_private = *priv_s.read(cx);
+                                        window.close_dialog(cx);
+                                        let _ = this_create.update(cx, |app, cx| {
+                                            app.bridge.send(Command::CreateChannel {
+                                                name: slug.clone(),
+                                                is_private,
+                                                purpose: (!purpose.is_empty()).then_some(purpose),
+                                            });
+                                            actions::notify(
+                                                "Creating channel",
+                                                format!("#{slug}"),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+        });
+    }
+
+    /// Open a colleague multi-picker dialog to invite people into a channel (`conversations.invite`)
+    /// or add people to a DM / start a group DM (`conversations.open`).
+    fn open_add_people(&mut self, channel: ChannelId, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let fixtures = self.fixtures.clone();
+        let conv = fixtures.conversation(&channel).cloned();
+        let is_dm = conv.as_ref().is_some_and(|c| c.is_im || c.is_mpim);
+        let existing: HashSet<UserId> = if is_dm {
+            let mut set = HashSet::new();
+            set.insert(fixtures.self_user.clone());
+            if let Some(c) = &conv {
+                if let Some(u) = &c.user {
+                    set.insert(u.clone());
+                }
+                set.extend(c.members.iter().cloned());
+            }
+            if let Some((open_ch, members)) = &self.open_members {
+                if *open_ch == channel {
+                    set.extend(members.iter().cloned());
+                }
+            }
+            set
+        } else {
+            self.open_members
+                .as_ref()
+                .filter(|(c, _)| *c == channel)
+                .map(|(_, m)| m.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        let candidates: Vec<(UserId, String, String)> = fixtures
+            .users
+            .iter()
+            .filter(|u| !u.deleted && !u.is_bot && u.id.as_str() != "USLACKBOT")
+            .filter(|u| !existing.contains(&u.id))
+            .map(|u| {
+                let name = fixtures.name_of(u).to_owned();
+                let key = format!("{} {}", name.to_lowercase(), u.name.to_lowercase());
+                (u.id.clone(), name, key)
+            })
+            .collect();
+        let filter_state = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Search people by name…")
+                .auto_grow(1, 1)
+        });
+        let selected = cx.new(|_| Vec::<UserId>::new());
+        filter_state.read(cx).focus_handle(cx).focus(window, cx);
+        let title = if is_dm {
+            "Add people to this DM".to_owned()
+        } else {
+            format!("Add people to {}", self.label(&channel))
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, bg, fg, hover, accent) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.background,
+                theme.foreground,
+                theme.accent,
+                theme.sidebar_accent,
+            );
+            let needle = filter_state.read(cx).value().trim().to_lowercase();
+            let picked = selected.read(cx).clone();
+            let rows: Vec<_> = candidates
+                .iter()
+                .filter(|(_, _, key)| needle.is_empty() || key.contains(&needle))
+                .take(25)
+                .enumerate()
+                .map(|(ix, (uid, name, _))| {
+                    let on = picked.contains(uid);
+                    let uid_click = uid.clone();
+                    let sel_click = selected.clone();
+                    h_flex()
+                        .id(("add-people-row", ix))
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .py_1p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(on, |r| r.bg(accent.opacity(0.18)))
+                        .hover(|r| r.bg(hover))
+                        .child(div().text_sm().text_color(fg).child(name.clone()))
+                        .when(on, |r| {
+                            r.child(Icon::new(IconName::Check).size(px(14.)).text_color(accent))
+                        })
+                        .on_click(move |_, _, cx| {
+                            sel_click.update(cx, |list, cx| {
+                                if let Some(pos) = list.iter().position(|id| id == &uid_click) {
+                                    list.remove(pos);
+                                } else {
+                                    list.push(uid_click.clone());
+                                }
+                                cx.notify();
+                            });
+                        })
+                })
+                .collect();
+            let count = picked.len();
+            let (sel_submit, ch_submit, this_submit, existing_submit) = (
+                selected.clone(),
+                channel.clone(),
+                this.clone(),
+                existing.clone(),
+            );
+            dialog.title(title.clone()).w(px(440.)).child(
+                v_flex()
+                    .gap_3()
+                    .p_4()
+                    .child(
+                        div()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(bg)
+                            .child(
+                                Textarea::new(&filter_state)
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .id("add-people-list")
+                            .max_h(px(280.))
+                            .overflow_y_scroll()
+                            .gap_0p5()
+                            .when(rows.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .py_4()
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("No matching people to add."),
+                                )
+                            })
+                            .children(rows),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(div().text_xs().text_color(muted).child(if count == 0 {
+                                "Select one or more people".to_owned()
+                            } else {
+                                format!("{count} selected")
+                            }))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("add-people-cancel")
+                                            .outline()
+                                            .with_size(Size::Small)
+                                            .label("Cancel")
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .child(
+                                        Button::new("add-people-confirm")
+                                            .primary()
+                                            .with_size(Size::Small)
+                                            .label(if is_dm { "Open group DM" } else { "Add" })
+                                            .on_click(move |_, window, cx| {
+                                                let chosen = sel_submit.read(cx).clone();
+                                                if chosen.is_empty() {
+                                                    return;
+                                                }
+                                                window.close_dialog(cx);
+                                                let _ = this_submit.update(cx, |app, cx| {
+                                                    if is_dm {
+                                                        let mut users: Vec<UserId> =
+                                                            existing_submit
+                                                                .iter()
+                                                                .filter(|id| {
+                                                                    **id != app.fixtures.self_user
+                                                                })
+                                                                .cloned()
+                                                                .collect();
+                                                        for u in chosen {
+                                                            if !users.contains(&u) {
+                                                                users.push(u);
+                                                            }
+                                                        }
+                                                        app.bridge.send(Command::OpenDm { users });
+                                                    } else {
+                                                        let n = chosen.len();
+                                                        app.bridge.send(Command::InviteToChannel {
+                                                            channel: ch_submit.clone(),
+                                                            users: chosen,
+                                                        });
+                                                        actions::notify(
+                                                            "Added people",
+                                                            format!(
+                                                                "Invited {n} {} to channel",
+                                                                if n == 1 {
+                                                                    "person"
+                                                                } else {
+                                                                    "people"
+                                                                }
+                                                            ),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    ),
+            )
+        });
     }
 
     /// Sync the signed-in user's custom status (or clear it with `None`) to Slack via
@@ -2993,7 +3503,16 @@ impl App {
                         }),
                 );
             }
-            menu
+            let messages = self.messages.downgrade();
+            menu.separator().item(
+                PopupMenuItem::new("Custom\u{2026}")
+                    .icon(IconName::Calendar)
+                    .on_click(move |_, window, cx| {
+                        let _ = messages.update(cx, |list, cx| {
+                            list.focus_action(MessageAction::RemindCustom, window, cx)
+                        });
+                    }),
+            )
         });
         menu.focus_handle(cx).focus(window, cx);
         let subscription = cx.subscribe_in(
@@ -3453,6 +3972,71 @@ impl App {
             ChannelDetailsEvent::Leave(channel) => {
                 window.close_dialog(cx);
                 self.leave(channel.clone(), window, cx);
+            }
+            ChannelDetailsEvent::Rename { channel, name } => {
+                self.bridge.send(Command::RenameChannel {
+                    channel: channel.clone(),
+                    name: name.clone(),
+                });
+                actions::notify("Renamed channel", format!("#{name}"), window, cx);
+            }
+            ChannelDetailsEvent::Archive(channel) => {
+                window.close_dialog(cx);
+                let this = cx.weak_entity();
+                let ch = channel.clone();
+                let label = self.label(&ch);
+                window.open_dialog(cx, move |dialog, _, cx| {
+                    let muted = cx.theme().muted_foreground;
+                    let (this, ch) = (this.clone(), ch.clone());
+                    dialog.title(format!("Archive {label}?")).w(px(420.)).child(
+                        v_flex()
+                            .gap_3()
+                            .p_4()
+                            .child(div().text_sm().text_color(muted).child(
+                                "Archiving stops new messages from being posted. Message history remains searchable and the channel can be unarchived later.",
+                            ))
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("archive-cancel")
+                                            .outline()
+                                            .with_size(Size::Small)
+                                            .label("Cancel")
+                                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                                    )
+                                    .child(
+                                        Button::new("archive-confirm")
+                                            .danger()
+                                            .with_size(Size::Small)
+                                            .label("Archive channel")
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                let _ = this.update(cx, |app, cx| {
+                                                    app.bridge
+                                                        .send(Command::ArchiveChannel(ch.clone()));
+                                                    actions::notify(
+                                                        "Channel archived",
+                                                        app.label(&ch),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    )
+                });
+            }
+            ChannelDetailsEvent::Unarchive(channel) => {
+                window.close_dialog(cx);
+                self.bridge.send(Command::UnarchiveChannel(channel.clone()));
+                actions::notify("Channel unarchived", self.label(channel), window, cx);
+            }
+            ChannelDetailsEvent::AddPeople(channel) => {
+                window.close_dialog(cx);
+                self.open_add_people(channel.clone(), window, cx);
             }
             ChannelDetailsEvent::SetTopic { channel, topic } => {
                 self.bridge.send(Command::SetChannelTopic {
@@ -4005,6 +4589,69 @@ impl App {
                         .unwrap_or_else(PoisonError::into_inner)
                         .extend(users.iter().map(|u| (u.clone(), presence.clone())));
                 }
+            }
+            Event::MessagePosted { channel, message } => {
+                let settings = self.preferences.read(cx).settings().clone();
+                if self.self_state.paused() || !settings.notifications_allowed_now() {
+                    return;
+                }
+                let snap = self
+                    .parked_bridges
+                    .get(ws_index)
+                    .and_then(Option::as_ref)
+                    .and_then(|b| b.snapshot(&HashMap::new()));
+                let Some(snap) = snap else {
+                    return;
+                };
+                if message.user.as_ref() == Some(&snap.self_user) {
+                    return;
+                }
+                let level = snap.notify_levels.get(channel).copied();
+                if level == Some(NotifyLevel::Muted) {
+                    return;
+                }
+                let Some(conv) = snap.conversation(channel) else {
+                    return;
+                };
+                let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
+                let mentioned = mentions_me(&message.text, &snap.self_user, &settings.keywords);
+                let wanted = match (level, settings.notify_level) {
+                    (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,
+                    (_, 0) => true,
+                    _ => false,
+                };
+                if !wanted {
+                    return;
+                }
+                let ws_name = self
+                    .live_teams
+                    .get(ws_index)
+                    .map(|t| t.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "Slack".to_owned());
+                let sender = message
+                    .user
+                    .as_ref()
+                    .map(|u| snap.user_name(u).to_owned())
+                    .unwrap_or_default();
+                let text = if settings.show_preview {
+                    snap.plain_text(message)
+                } else {
+                    "New message".to_owned()
+                };
+                let (title, body) = match conv.kind() {
+                    ConversationKind::Im => (format!("{ws_name} — {sender}"), text),
+                    ConversationKind::Mpim => (
+                        format!("{ws_name} — {}", snap.conversation_label(conv)),
+                        format!("{sender}: {text}"),
+                    ),
+                    _ => (
+                        format!("{ws_name} — #{}", conv.name.as_deref().unwrap_or_default()),
+                        format!("{sender}: {text}"),
+                    ),
+                };
+                let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
+                self.system_notification(&tag, &title, &body, cx);
             }
             Event::HuddleUpdated {
                 channel,
@@ -5141,6 +5788,40 @@ impl App {
         self.searching = false;
         if !self.fixtures.sample {
             self.bridge.send(Command::LoadScheduledMessages);
+            if let Some(read) = self.bridge.recent_sent(self.fixtures.self_user.clone(), 50) {
+                let workspace = self.workspace;
+                let fixtures = self.fixtures.clone();
+                let drafts = self.drafts.downgrade();
+                cx.spawn(async move |_, cx| {
+                    let stored = cx.background_executor().spawn(read).await;
+                    let entries: Vec<Entry> = stored
+                        .into_iter()
+                        .filter_map(|row| {
+                            let text = fixtures.plain_text(&row.message);
+                            if text.trim().is_empty() {
+                                return None;
+                            }
+                            let label = fixtures
+                                .conversation(&row.channel)
+                                .map(|c| fixtures.conversation_label(c))
+                                .unwrap_or_else(|| row.channel.to_string());
+                            let at = row.message.ts.secs().unwrap_or(0).max(0) as u64;
+                            Some(Entry {
+                                id: None,
+                                workspace,
+                                channel: row.channel,
+                                label,
+                                text,
+                                at,
+                            })
+                        })
+                        .collect();
+                    let _ = drafts.update(cx, |view, cx| {
+                        view.set_stored_sent(workspace, entries, cx);
+                    });
+                })
+                .detach();
+            }
         }
         cx.notify();
     }
@@ -6257,6 +6938,12 @@ impl Render for App {
             }))
             .on_action(cx.listener(|this, _: &ToggleWorkspaceRail, window, cx| {
                 this.toggle_workspace_rail(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleRightPane, _, cx| this.toggle_right_pane(cx)))
+            .on_action(cx.listener(|this, _: &JumpToUnread, _, cx| this.jump_to_unread(cx)))
+            .on_action(cx.listener(|this, _: &OpenHome, _, cx| this.open_home(cx)))
+            .on_action(cx.listener(|this, _: &CreateChannelAction, window, cx| {
+                this.open_create_channel(window, cx)
             }))
             .relative()
             .size_full()
@@ -7686,6 +8373,7 @@ fn subscribe_workspace(
             |this: &mut App, _, event: &SidebarEvent, window, cx| match event {
                 SidebarEvent::SelectConversation(channel) => this.select(channel.clone(), cx),
                 SidebarEvent::BrowseChannels => this.open_browser(window, cx),
+                SidebarEvent::CreateChannel => this.open_create_channel(window, cx),
                 SidebarEvent::SwitchWorkspace(index) => this.switch_workspace(*index, window, cx),
                 SidebarEvent::OpenDrafts => this.open_drafts(cx),
                 SidebarEvent::OpenLater => this.open_later(cx),
@@ -8291,8 +8979,20 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
     (year as i32, m as u32, d as u32)
 }
 
+/// Default `(YYYY-MM-DD, HH:MM)` local strings ~1 hour from now for custom schedule/reminder dialogs.
+pub(crate) fn default_custom_datetime() -> (String, String) {
+    let local = now_secs() as i64 + crate::messages::local_offset_now() + 3_600;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    (
+        format!("{y:04}-{m:02}-{d:02}"),
+        format!("{:02}:{:02}", secs / 3_600, (secs % 3_600) / 60),
+    )
+}
+
 /// Parse a local `YYYY-MM-DD` date and `HH:MM` (24-hour) time into a future unix timestamp.
-fn parse_local_schedule(date_str: &str, time_str: &str) -> Option<u64> {
+pub(crate) fn parse_local_schedule(date_str: &str, time_str: &str) -> Option<u64> {
     let date = slackless_core::store::Date::parse(date_str)?;
     let (h_str, m_str) = time_str.split_once(':')?;
     let hour: i64 = h_str.trim().parse().ok()?;

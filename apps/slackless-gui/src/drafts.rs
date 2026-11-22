@@ -216,6 +216,30 @@ impl DraftsView {
         cx.notify();
     }
 
+    /// Merge persisted recent sent messages from the local SQLite store for `workspace`,
+    /// deduplicating against in-session entries and sorting newest first.
+    pub fn set_stored_sent(
+        &mut self,
+        workspace: usize,
+        stored: Vec<Entry>,
+        cx: &mut Context<Self>,
+    ) {
+        for entry in stored {
+            let duplicate = self.sent.iter().any(|existing| {
+                existing.workspace == workspace
+                    && existing.channel == entry.channel
+                    && existing.text == entry.text
+                    && existing.at.abs_diff(entry.at) <= 5
+            });
+            if !duplicate {
+                self.sent.push(entry);
+            }
+        }
+        self.sent.sort_by_key(|a| std::cmp::Reverse(a.at));
+        self.sent.truncate(100);
+        cx.notify();
+    }
+
     pub fn show(&mut self, tab: DraftsTab, cx: &mut Context<Self>) {
         self.tab = tab;
         cx.notify();

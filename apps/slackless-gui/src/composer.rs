@@ -34,8 +34,9 @@ use gpui_kit::component::input::{InputEditsEvent, InputState, Textarea, Textarea
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
-    Image, ImageFormat, ParentElement as _, PathPromptOptions, Pixels, Point, SharedString,
-    Styled as _, Subscription, Window, div, px,
+    Image, ImageFormat, InteractiveElement as _, ParentElement as _, PathPromptOptions, Pixels,
+    Point, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    px,
 };
 use slackless_core::api::{GifItem, MessageContent};
 use slackless_core::types::Message;
@@ -516,98 +517,155 @@ impl Composer {
                 .auto_grow(6, 14)
         });
         body.read(cx).focus_handle(cx).focus(window, cx);
+        const LANGUAGES: [(&str, &str); 9] = [
+            ("Plain text", "txt"),
+            ("Rust", "rs"),
+            ("TypeScript", "ts"),
+            ("Python", "py"),
+            ("JSON", "json"),
+            ("SQL", "sql"),
+            ("Bash", "sh"),
+            ("Markdown", "md"),
+            ("Go", "go"),
+        ];
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
-            let (border, muted, bg) = (theme.border, theme.muted_foreground, theme.background);
+            let (border, muted, bg, secondary, fg) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.background,
+                theme.secondary,
+                theme.foreground,
+            );
             let (filename, body, this) = (filename.clone(), body.clone(), this.clone());
-            dialog.title("Create a text snippet").w(px(520.)).child(
-                v_flex()
-                    .gap_3()
-                    .p_4()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(muted)
-                                    .child("Filename"),
-                            )
-                            .child(
-                                div()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(bg)
-                                    .child(
-                                        Textarea::new(&filename).appearance(false).bordered(false),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(muted)
-                                    .child("Content"),
-                            )
-                            .child(
-                                div()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(bg)
-                                    .child(Textarea::new(&body).appearance(false).bordered(false)),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("snippet-cancel")
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .label("Cancel")
-                                    .on_click(|_, window, cx| window.close_dialog(cx)),
-                            )
-                            .child(
-                                Button::new("snippet-create")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .label("Create snippet")
-                                    .on_click(move |_, window, cx| {
-                                        let content = body.read(cx).value().to_string();
-                                        if content.trim().is_empty() {
-                                            return;
-                                        }
-                                        let raw_name = filename.read(cx).value().trim().to_owned();
-                                        let name = if raw_name.is_empty() {
-                                            "snippet.txt".to_owned()
-                                        } else if raw_name.contains('.') {
-                                            raw_name
-                                        } else {
-                                            format!("{raw_name}.txt")
-                                        };
-                                        if let Some(this) = this.upgrade() {
-                                            this.update(cx, |composer, cx| {
-                                                composer.attachments.push(PendingAttachment {
-                                                    filename: name,
-                                                    bytes: content.into_bytes(),
-                                                    preview: None,
+            let lang_pills =
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(LANGUAGES.iter().enumerate().map(|(ix, &(label, ext))| {
+                        let filename = filename.clone();
+                        div()
+                            .id(("snippet-lang", ix))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(border)
+                            .bg(secondary)
+                            .text_xs()
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|el| el.bg(theme.accent))
+                            .child(label)
+                            .on_click(move |_, window, cx| {
+                                filename.update(cx, |state, cx| {
+                                    let cur = state.value().trim().to_owned();
+                                    let stem = cur
+                                        .rsplit_once('.')
+                                        .map(|(s, _)| s)
+                                        .unwrap_or(cur.as_str());
+                                    let stem = if stem.is_empty() { "snippet" } else { stem };
+                                    state.set_value(format!("{stem}.{ext}"), window, cx);
+                                });
+                            })
+                    }));
+            dialog
+                .title("Create a text or code snippet")
+                .w(px(540.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .p_4()
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child("Filename"),
+                                )
+                                .child(
+                                    div()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(bg)
+                                        .child(
+                                            Textarea::new(&filename)
+                                                .appearance(false)
+                                                .bordered(false),
+                                        ),
+                                )
+                                .child(lang_pills),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child("Content"),
+                                )
+                                .child(
+                                    div()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(bg)
+                                        .child(
+                                            Textarea::new(&body).appearance(false).bordered(false),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    Button::new("snippet-cancel")
+                                        .outline()
+                                        .with_size(Size::Small)
+                                        .label("Cancel")
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("snippet-create")
+                                        .primary()
+                                        .with_size(Size::Small)
+                                        .label("Create snippet")
+                                        .on_click(move |_, window, cx| {
+                                            let content = body.read(cx).value().to_string();
+                                            if content.trim().is_empty() {
+                                                return;
+                                            }
+                                            let raw_name =
+                                                filename.read(cx).value().trim().to_owned();
+                                            let name = if raw_name.is_empty() {
+                                                "snippet.txt".to_owned()
+                                            } else if raw_name.contains('.') {
+                                                raw_name
+                                            } else {
+                                                format!("{raw_name}.txt")
+                                            };
+                                            if let Some(this) = this.upgrade() {
+                                                this.update(cx, |composer, cx| {
+                                                    composer.attachments.push(PendingAttachment {
+                                                        filename: name,
+                                                        bytes: content.into_bytes(),
+                                                        preview: None,
+                                                    });
+                                                    cx.notify();
                                                 });
-                                                cx.notify();
-                                            });
-                                        }
-                                        window.close_dialog(cx);
-                                    }),
-                            ),
-                    ),
-            )
+                                            }
+                                            window.close_dialog(cx);
+                                        }),
+                                ),
+                        ),
+                )
         });
     }
 

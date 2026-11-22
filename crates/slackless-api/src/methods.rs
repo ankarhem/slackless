@@ -1372,6 +1372,71 @@ impl SlackApi {
             .channel)
     }
 
+    /// `conversations.create`: create a new public or private channel.
+    pub async fn conversations_create(&self, name: &str, is_private: bool) -> Result<Conversation> {
+        let params = vec![
+            ("name", name.to_owned()),
+            (
+                "is_private",
+                if is_private { "true" } else { "false" }.to_owned(),
+            ),
+        ];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_CREATE, params)
+            .await?
+            .data
+            .channel)
+    }
+
+    /// `conversations.rename`: rename an existing channel.
+    pub async fn conversations_rename(
+        &self,
+        channel: &ChannelId,
+        name: &str,
+    ) -> Result<Conversation> {
+        let params = vec![("channel", channel.to_string()), ("name", name.to_owned())];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_RENAME, params)
+            .await?
+            .data
+            .channel)
+    }
+
+    /// `conversations.archive`: archive an active channel.
+    pub async fn conversations_archive(&self, channel: &ChannelId) -> Result<()> {
+        let params = vec![("channel", channel.to_string())];
+        self.call::<Empty>(method::CONVERSATIONS_ARCHIVE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `conversations.unarchive`: restore an archived channel.
+    pub async fn conversations_unarchive(&self, channel: &ChannelId) -> Result<()> {
+        let params = vec![("channel", channel.to_string())];
+        self.call::<Empty>(method::CONVERSATIONS_UNARCHIVE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `conversations.invite`: invite one or more users into `channel`.
+    pub async fn conversations_invite(
+        &self,
+        channel: &ChannelId,
+        users: &[UserId],
+    ) -> Result<Conversation> {
+        let joined = users
+            .iter()
+            .map(UserId::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = vec![("channel", channel.to_string()), ("users", joined)];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_INVITE, params)
+            .await?
+            .data
+            .channel)
+    }
+
     /// `team.info`: one workspace's record, by team id. Reaches the other organizations of a
     /// Slack Connect channel, which `client.userBoot` never carries.
     pub async fn team_info(&self, team: &TeamId) -> Result<Team> {

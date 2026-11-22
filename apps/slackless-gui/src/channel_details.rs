@@ -44,6 +44,14 @@ const PAD: f32 = 28.;
 pub enum ChannelDetailsEvent {
     /// "Leave channel": the root reuses its leave path, then closes the dialog.
     Leave(ChannelId),
+    /// A channel rename save: the root posts it to the core (`conversations.rename`).
+    Rename { channel: ChannelId, name: String },
+    /// Archive an active channel (`conversations.archive`).
+    Archive(ChannelId),
+    /// Unarchive an archived channel (`conversations.unarchive`).
+    Unarchive(ChannelId),
+    /// Open the "Add people" picker for this channel or DM.
+    AddPeople(ChannelId),
     /// A topic save: the root posts it to the core (`conversations.setTopic`).
     SetTopic { channel: ChannelId, topic: String },
     /// A description save: the root posts it to the core (`conversations.setPurpose`).
@@ -102,6 +110,7 @@ struct MemberRow {
 /// Which About card is being edited.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum EditField {
+    Name,
     Topic,
     Description,
 }
@@ -135,6 +144,7 @@ pub struct ChannelDetails {
     /// The About card being edited, with its draft.
     editing: Option<Editing>,
     /// Saves applied here while the core confirms them (a live reload overwrites them).
+    local_name: Option<String>,
     local_topic: Option<String>,
     local_purpose: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -169,6 +179,7 @@ impl ChannelDetails {
                 member_filter: MemberFilter::All,
                 filter,
                 editing: None,
+                local_name: None,
                 local_topic: None,
                 local_purpose: None,
                 _subscriptions: subscriptions,
@@ -202,6 +213,7 @@ impl ChannelDetails {
         self.tab = tab;
         self.editing = None;
         self.member_filter = MemberFilter::All;
+        self.local_name = None;
         self.local_topic = None;
         self.local_purpose = None;
         cx.notify();
@@ -355,16 +367,22 @@ impl ChannelDetails {
     fn edit(&mut self, field: EditField, window: &mut Window, cx: &mut Context<Self>) {
         let conversation = self.conversation().cloned().unwrap_or_default();
         let initial = match field {
+            EditField::Name => self
+                .local_name
+                .clone()
+                .or_else(|| conversation.name.clone())
+                .unwrap_or_default(),
             EditField::Topic => self.topic(&conversation),
             EditField::Description => self.purpose(&conversation),
         };
         let draft = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder(match field {
+                    EditField::Name => "channel-name",
                     EditField::Topic => "Add a topic",
                     EditField::Description => "Add a description",
                 })
-                .auto_grow(1, 3)
+                .auto_grow(1, if field == EditField::Name { 1 } else { 3 })
         });
         if !initial.is_empty() {
             draft.update(cx, |state, cx| state.set_value(initial, window, cx));
@@ -380,6 +398,16 @@ impl ChannelDetails {
         };
         let text = editing.draft.read(cx).value().trim().to_owned();
         match editing.field {
+            EditField::Name => {
+                let slug = normalize_channel_slug(&text);
+                if !slug.is_empty() {
+                    self.local_name = Some(slug.clone());
+                    cx.emit(ChannelDetailsEvent::Rename {
+                        channel: self.channel.clone(),
+                        name: slug,
+                    });
+                }
+            }
             EditField::Topic => {
                 self.local_topic = Some(text.clone());
                 cx.emit(ChannelDetailsEvent::SetTopic {
@@ -521,6 +549,17 @@ impl Render for ChannelDetails {
                             ),
                         );
                     let filter_select = self.filter_select(cx);
+                    let add_channel = self.channel.clone();
+                    let add_people = Button::new("details-add-people")
+                        .outline()
+                        .flex_none()
+                        .h(px(36.))
+                        .rounded(px(8.))
+                        .icon(IconName::UserPlus)
+                        .label("Add people")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ChannelDetailsEvent::AddPeople(add_channel.clone()));
+                        }));
                     v_flex()
                         .flex_1()
                         .min_h_0()
@@ -534,7 +573,8 @@ impl Render for ChannelDetails {
                                 .border_b_1()
                                 .border_color(border)
                                 .child(find_people)
-                                .child(filter_select),
+                                .child(filter_select)
+                                .child(add_people),
                         )
                         .child(v_flex().flex_1().min_h_0().child(
                             if let Some(note) = self.member_note(matching.is_empty(), filtering) {
@@ -646,7 +686,12 @@ impl ChannelDetails {
     /// The About tab: Slack's cards.
     fn about_tab(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
-        let (border, muted_foreground) = (theme.border, theme.muted_foreground);
+        let (border, muted_foreground, link_color, accent_color) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.link,
+            theme.accent,
+        );
         let conversation = self.conversation().cloned().unwrap_or_default();
         let mut cards = v_flex()
             .id("details-about")
@@ -657,25 +702,73 @@ impl ChannelDetails {
             .gap_2()
             .overflow_y_scroll();
 
-        // Channel name: Slack adds the privacy note under private channels' names.
-        let name = format!("# {}", conversation.name.as_deref().unwrap_or_default());
-        let mut name_card = card("Channel name", None, border);
-        if conversation.is_private {
-            name_card = name_card.child(
-                div()
-                    .text_xs()
-                    .text_color(muted_foreground)
-                    .child("Only visible to your organization"),
-            );
-        }
-        cards = cards.child(
-            name_card.child(
+        // Channel name: editable on channels other than #general, with Slack's privacy note on private channels.
+        let is_channel = !conversation.is_im && !conversation.is_mpim;
+        let can_manage = is_channel && !conversation.is_general;
+        let raw_name = self
+            .local_name
+            .clone()
+            .or_else(|| conversation.name.clone())
+            .unwrap_or_default();
+        let name = format!("# {raw_name}");
+        let editing_name = self
+            .editing
+            .as_ref()
+            .filter(|e| e.field == EditField::Name)
+            .map(|e| e.draft.clone());
+        let name_card = if let Some(draft) = editing_name {
+            card("Channel name", None, border)
+                .child(Textarea::new(&draft))
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_2()
+                        .child(
+                            Button::new("details-save-Name")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Save")
+                                .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
+                        )
+                        .child(
+                            Button::new("details-cancel-Name")
+                                .ghost()
+                                .with_size(Size::Small)
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.editing = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+        } else {
+            let edit_name = can_manage.then(|| {
+                Button::new("details-edit-Name")
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .label("Edit")
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.edit(EditField::Name, window, cx)),
+                    )
+                    .into_any_element()
+            });
+            let mut c = card("Channel name", edit_name, border);
+            if conversation.is_private {
+                c = c.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_foreground)
+                        .child("Only visible to your organization"),
+                );
+            }
+            c.child(
                 div()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(name),
-            ),
-        );
+            )
+        };
+        cards = cards.child(name_card);
 
         // Topic and description: the cards Slack lets a member edit.
         cards = cards.child(self.field_card(
@@ -738,6 +831,47 @@ impl ChannelDetails {
                     cx.emit(ChannelDetailsEvent::Leave(channel.clone()))
                 })),
         );
+
+        // Archive / Unarchive channel (on non-general channels).
+        if can_manage {
+            let archived = conversation.is_archived;
+            let arch_channel = self.channel.clone();
+            let danger = crate::theme::danger_text(cx);
+            cards = cards.child(
+                h_flex()
+                    .id("details-archive")
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if archived { link_color } else { danger })
+                    .hover(move |row| {
+                        row.bg(if archived {
+                            accent_color
+                        } else {
+                            danger.alpha(0.12)
+                        })
+                    })
+                    .child(Icon::new(IconName::Archive).size(px(16.)))
+                    .child(if archived {
+                        "Unarchive channel"
+                    } else {
+                        "Archive channel"
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        if archived {
+                            cx.emit(ChannelDetailsEvent::Unarchive(arch_channel.clone()));
+                        } else {
+                            cx.emit(ChannelDetailsEvent::Archive(arch_channel.clone()));
+                        }
+                    })),
+            );
+        }
 
         // Organizations, on a Slack Connect channel: one row per organization (`rebuild`
         // builds the lines for shared channels only).
@@ -817,6 +951,7 @@ impl ChannelDetails {
             .on_click(cx.listener(move |this, _, window, cx| this.edit(field, window, cx)));
         let content = if value.is_empty() {
             let add_id = match field {
+                EditField::Name => "details-add-name",
                 EditField::Topic => "details-add-topic",
                 EditField::Description => "details-add-description",
             };
@@ -983,6 +1118,25 @@ impl ChannelDetails {
                 cx.emit(ChannelDetailsEvent::OpenProfile(open.clone()))
             }))
     }
+}
+
+/// Normalize user input into a valid Slack channel slug (lowercase letters, digits, hyphens/underscores, max 80 chars).
+pub fn normalize_channel_slug(raw: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in raw.trim().trim_start_matches('#').chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if (ch == '-' || ch.is_whitespace()) && !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+        if out.len() >= 80 {
+            break;
+        }
+    }
+    out.trim_end_matches('-').to_owned()
 }
 
 /// A Slack details card: the bold label (with the card's action, Slack's "Edit", at its

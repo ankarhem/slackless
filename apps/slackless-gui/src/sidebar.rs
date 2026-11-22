@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -45,7 +45,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, AppContext as _, Context, DismissEvent, Div, Edges, Entity, EventEmitter,
+    Anchor, AnyElement, AppContext as _, Context, DismissEvent, Div, Edges, Entity, EventEmitter,
     Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, PathBuilder, Pixels, Point, Render, ScrollHandle, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, anchored, canvas,
@@ -79,6 +79,8 @@ pub enum SidebarEvent {
     SelectConversation(ChannelId),
     /// The "Add channels" row: open the channel browser.
     BrowseChannels,
+    /// Create a new public or private channel (`conversations.create`).
+    CreateChannel,
     /// A workspace tile in the rail was clicked (index into `Fixtures::workspaces`).
     SwitchWorkspace(usize),
     /// The "Drafts & sent" row.
@@ -205,6 +207,43 @@ impl NavItem {
     ];
 }
 
+/// Navigation rail visibility and label style driven by Preferences -> Navigation (`F-SHELL-062`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NavPrefs {
+    pub show_home: bool,
+    pub show_dms: bool,
+    pub show_activity: bool,
+    pub show_files: bool,
+    pub show_later: bool,
+    pub icons_only: bool,
+}
+
+impl Default for NavPrefs {
+    fn default() -> Self {
+        Self {
+            show_home: true,
+            show_dms: true,
+            show_activity: true,
+            show_files: true,
+            show_later: true,
+            icons_only: false,
+        }
+    }
+}
+
+impl NavPrefs {
+    fn shows(self, item: NavItem) -> bool {
+        match item {
+            NavItem::Home => self.show_home,
+            NavItem::Dms => self.show_dms,
+            NavItem::Activity => self.show_activity,
+            NavItem::Files => self.show_files,
+            NavItem::Todos => self.show_later,
+            NavItem::Agents | NavItem::Admin => true,
+        }
+    }
+}
+
 /// Unread/mention badge summary for one tile in the workspace switcher rail (`F-CORE-006`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct WorkspaceBadge {
@@ -303,6 +342,8 @@ pub struct Sidebar {
     activity_unread: u32,
     /// Per-workspace unread / mention badges shown on the workspace switcher rail tiles.
     workspace_badges: Vec<WorkspaceBadge>,
+    /// Navigation rail visibility and label style from Preferences -> Navigation.
+    nav_prefs: NavPrefs,
     /// The signed-in user's status and presence, for the rail avatar.
     self_state: SelfState,
     /// The pointer is over the focus button / the focus card.
@@ -420,6 +461,7 @@ impl Sidebar {
                 org_tip_delay: None,
                 activity_unread: 0,
                 workspace_badges: Vec::new(),
+                nav_prefs: NavPrefs::default(),
                 self_state: SelfState::default(),
                 focus_hover: (false, false),
                 _subscriptions: subscriptions,
@@ -567,6 +609,19 @@ impl Sidebar {
             self.workspace_badges = badges;
             cx.notify();
         }
+    }
+
+    /// Apply Preferences -> Navigation visibility and label style to the left nav rail.
+    pub fn set_nav_prefs(&mut self, prefs: NavPrefs, cx: &mut Context<Self>) {
+        if self.nav_prefs != prefs {
+            self.nav_prefs = prefs;
+            cx.notify();
+        }
+    }
+
+    /// Switch the sidebar back to the Home navigation tab (`Cmd+Shift+H`).
+    pub fn show_home(&mut self, cx: &mut Context<Self>) {
+        self.show_nav(NavItem::Home, cx);
     }
 
     /// Mark `channel` as having a live huddle (`None`: no huddle anywhere).
@@ -1314,6 +1369,9 @@ impl Sidebar {
             })
             .when(!dark, |rail| rail.border_r_1().border_color(outline));
         for item in NavItem::ALL {
+            if !self.nav_prefs.shows(item) {
+                continue;
+            }
             if item == NavItem::Admin {
                 rail = rail.child(div().my_1().w(px(28.)).h(px(1.)).bg(outline));
             }
@@ -1332,11 +1390,74 @@ impl Sidebar {
             rail = rail.child(self.nav_tile(item, badge, dot, cx));
         }
         let avatar = self_avatar(&self.fixtures, &self.self_state, 36., avatar_ring, cx);
+        let create_this = cx.entity().downgrade();
+        let create_fill = crate::theme::rail_fill(cx);
+        let sidebar_fg = cx.theme().sidebar_foreground;
+        let create_fg = sidebar_fg.opacity(0.8);
+        let create_bg = sidebar_fg.opacity(create_fill);
+        let create_btn = Button::new("rail-create")
+            .ghost()
+            .with_size(Size::Small)
+            .size(px(36.))
+            .p_0()
+            .rounded_full()
+            .bg(create_bg)
+            .child(
+                Icon::new(IconName::Plus)
+                    .text_color(create_fg)
+                    .size(px(18.)),
+            )
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let t1 = create_this.clone();
+                let t2 = create_this.clone();
+                let t3 = create_this.clone();
+                let t4 = create_this.clone();
+                menu.label("Create")
+                    .item(
+                        PopupMenuItem::new("New message")
+                            .icon(IconName::SquarePen)
+                            .on_click(move |_, _, cx| {
+                                if let Some(this) = t1.upgrade() {
+                                    this.update(cx, |_, cx| cx.emit(SidebarEvent::OpenCompose));
+                                }
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Create a channel")
+                            .icon(IconName::Hash)
+                            .on_click(move |_, _, cx| {
+                                if let Some(this) = t2.upgrade() {
+                                    this.update(cx, |_, cx| cx.emit(SidebarEvent::CreateChannel));
+                                }
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Browse channels")
+                            .icon(IconName::Compass)
+                            .on_click(move |_, _, cx| {
+                                if let Some(this) = t3.upgrade() {
+                                    this.update(cx, |_, cx| cx.emit(SidebarEvent::BrowseChannels));
+                                }
+                            }),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Create a channel section")
+                            .icon(IconName::FolderPlus)
+                            .on_click(move |_, window, cx| {
+                                if let Some(this) = t4.upgrade() {
+                                    this.update(cx, |sidebar, cx| {
+                                        sidebar.open_section_dialog(window, cx);
+                                    });
+                                }
+                            }),
+                    )
+            });
         rail.child(div().flex_1()).child(
             v_flex()
                 .items_center()
                 .gap_4()
-                .child(self.rail_button("rail-create", IconName::Plus, false, cx))
+                .child(create_btn)
                 .child(self.focus_button(cx))
                 .child(
                     div()
@@ -1769,16 +1890,18 @@ impl Sidebar {
                         )
                     }),
             )
-            .child(
-                div()
-                    .w_full()
-                    .px_1()
-                    .text_center()
-                    .text_size(px(11.))
-                    .line_height(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(item.label()),
-            )
+            .when(!self.nav_prefs.icons_only, |tile| {
+                tile.child(
+                    div()
+                        .w_full()
+                        .px_1()
+                        .text_center()
+                        .text_size(px(11.))
+                        .line_height(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(item.label()),
+                )
+            })
             .on_click(cx.listener(move |this, _, _, cx| match item {
                 // Both destinations' pages live in the root, which opens them.
                 NavItem::Activity => cx.emit(SidebarEvent::OpenActivity),

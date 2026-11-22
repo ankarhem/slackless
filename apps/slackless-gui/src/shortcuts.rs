@@ -19,6 +19,8 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
         "Navigation",
         &[
             (&["\u{2318}", "K"], "Jump to a conversation", true),
+            (&["\u{2318}", "J"], "Jump to unread messages", true),
+            (&["\u{2318}", "\u{21e7}", "H"], "Open Home", true),
             (&["\u{2318}", "\u{21e7}", "K"], "Open direct messages", true),
             (&["\u{2318}", "\u{21e7}", "M"], "Open activity", true),
             (&["\u{2318}", "\u{21e7}", "A"], "Open All unreads", true),
@@ -53,6 +55,11 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
         "Messages",
         &[
             (&["\u{2318}", "N"], "New message", true),
+            (
+                &["\u{2318}", "\u{21e7}", "\u{21b5}"],
+                "Create a text or code snippet",
+                true,
+            ),
             (&["\u{21b5}"], "Send message", true),
             (&["\u{21e7}", "\u{21b5}"], "New line in message", true),
             (&["/"], "Slash commands (at the start of a message)", true),
@@ -107,6 +114,12 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
         &[
             (&["\u{2318}", ","], "Preferences", true),
             (&["\u{2318}", "\u{21e7}", "Y"], "Set a status", true),
+            (
+                &["\u{2318}", "\u{21e7}", "S"],
+                "Toggle workspace switcher",
+                true,
+            ),
+            (&["\u{2318}", "."], "Toggle right sidebar", true),
             (&["\u{2318}", "/"], "Keyboard shortcuts", true),
             (&["\u{2303}", "\u{2318}", "F"], "Toggle full screen", true),
             (&["\u{2318}", "+ / -"], "Zoom in / out", true),

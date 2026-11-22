@@ -231,6 +231,31 @@ pub enum Command {
         channel: ChannelId,
         purpose: String,
     },
+    /// Create a public or private channel (`conversations.create`), optionally set its
+    /// description (`conversations.setPurpose`), store it, and open it via
+    /// [`Event::ConversationOpened`].
+    CreateChannel {
+        name: String,
+        is_private: bool,
+        purpose: Option<String>,
+    },
+    /// Rename `channel` (`conversations.rename`), store the updated record and announce
+    /// [`Event::Conversations`].
+    RenameChannel {
+        channel: ChannelId,
+        name: String,
+    },
+    /// Archive `channel` (`conversations.archive`), update the stored record and announce
+    /// [`Event::Conversations`].
+    ArchiveChannel(ChannelId),
+    /// Unarchive `channel` (`conversations.unarchive`), update the stored record and announce
+    /// [`Event::Conversations`].
+    UnarchiveChannel(ChannelId),
+    /// Invite `users` into `channel` (`conversations.invite`), then refresh channel members.
+    InviteToChannel {
+        channel: ChannelId,
+        users: Vec<UserId>,
+    },
     /// Send a typing indicator.
     Typing {
         channel: ChannelId,

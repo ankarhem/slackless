@@ -213,6 +213,7 @@ pub struct Settings {
     pub sound: usize,
     pub show_preview: bool,
     pub mute_sounds: bool,
+    pub show_dock_badge: bool,
     pub schedule_enabled: bool,
     pub schedule_days: usize,
     pub schedule_start: usize,
@@ -307,6 +308,7 @@ impl Default for Settings {
             sound: 0,
             show_preview: true,
             mute_sounds: false,
+            show_dock_badge: true,
             schedule_enabled: true,
             schedule_days: 1,
             schedule_start: 9,
@@ -314,7 +316,7 @@ impl Default for Settings {
             show_home: true,
             show_dms: true,
             show_activity: true,
-            show_files: false,
+            show_files: true,
             show_later: true,
             tab_style: 0,
             show: 0,
@@ -791,6 +793,12 @@ impl Preferences {
             |s| &mut s.mute_sounds,
             cx,
         );
+        let dock_badge = self.checkbox(
+            "notify-dock-badge",
+            "Show a badge on Slack's icon to indicate new activity",
+            |s| &mut s.show_dock_badge,
+            cx,
+        );
         v_flex()
             .child(self.group("Notify me about\u{2026}", None, v_flex().gap_2().child(level).child(mobile).child(threads), cx))
             .child(self.group(
@@ -812,7 +820,12 @@ impl Preferences {
             .child(self.group(
                 "Sound & appearance",
                 None,
-                v_flex().gap_3().child(self.labeled("Notification sound (messages)", sound)).child(preview).child(mute),
+                v_flex()
+                    .gap_3()
+                    .child(self.labeled("Notification sound (messages)", sound))
+                    .child(preview)
+                    .child(mute)
+                    .child(dock_badge),
                 cx,
             ))
     }

@@ -61,6 +61,8 @@ pub enum MessageAction {
     SaveForLater,
     /// Save for later with a reminder ("Remind me about this").
     RemindMe(Remind),
+    /// Save for later with a user-entered custom local date/time reminder.
+    RemindCustom,
     MarkUnread,
     Edit,
     Delete,
@@ -464,7 +466,12 @@ pub fn actions_menu(
                 MessageAction::RemindMe(preset),
             ));
         }
-        menu
+        menu.separator().item(menu_item(
+            "Custom\u{2026}",
+            IconName::Calendar,
+            handler,
+            MessageAction::RemindCustom,
+        ))
     });
 
     let mut reminders =

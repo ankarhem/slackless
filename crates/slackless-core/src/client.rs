@@ -481,6 +481,17 @@ impl<B: Backend> Core<B> {
         // asks for it with bodies when it opens).
         self.fetch_activity(false);
         self.fetch_saved();
+        if let Some(me) = self.self_user_id.lock().ok().and_then(|g| g.clone()) {
+            let (backend, events) = (self.backend.clone(), self.events.clone());
+            self.spawn("dnd.info (self)", async move {
+                if let Ok(status) = backend.dnd_info(me).await {
+                    if status.snooze_enabled {
+                        events.emit(Event::SelfDndUpdated(status));
+                    }
+                }
+                Ok(())
+            });
+        }
     }
 
     /// Later / Saved items (`saved.list` across active, completed, and archived tabs), hydrated
@@ -1191,6 +1202,92 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::CreateChannel {
+                name,
+                is_private,
+                purpose,
+            } => {
+                self.spawn("conversations.create", async move {
+                    let mut created = backend.create_channel(name, is_private).await?;
+                    let id = created.id.clone();
+                    if let Some(purpose) = purpose.filter(|p| !p.trim().is_empty()) {
+                        if let Ok(updated) = backend.set_purpose(id.clone(), purpose).await {
+                            created = updated;
+                        }
+                    }
+                    created.is_member = true;
+                    let for_store = created.clone();
+                    with_store(&store, move |s| s.upsert_conversation(&ws, &for_store)).await?;
+                    events.emit(Event::Conversations(vec![id.clone()]));
+                    events.emit(Event::ConversationOpened(id));
+                    Ok(())
+                });
+            }
+            Command::RenameChannel { channel, name } => {
+                self.spawn("conversations.rename", async move {
+                    let updated = backend.rename_channel(channel.clone(), name).await?;
+                    with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
+            Command::ArchiveChannel(channel) => {
+                self.spawn("conversations.archive", async move {
+                    backend.archive_channel(channel.clone()).await?;
+                    let id = channel.clone();
+                    with_store(&store, move |s| {
+                        if let Some(mut conv) = s.conversation(&ws, &id)? {
+                            conv.is_archived = true;
+                            s.upsert_conversation(&ws, &conv)?;
+                        }
+                        Ok::<_, StoreError>(())
+                    })
+                    .await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
+            Command::UnarchiveChannel(channel) => {
+                self.spawn("conversations.unarchive", async move {
+                    backend.unarchive_channel(channel.clone()).await?;
+                    let id = channel.clone();
+                    with_store(&store, move |s| {
+                        if let Some(mut conv) = s.conversation(&ws, &id)? {
+                            conv.is_archived = false;
+                            s.upsert_conversation(&ws, &conv)?;
+                        }
+                        Ok::<_, StoreError>(())
+                    })
+                    .await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
+            Command::InviteToChannel { channel, users } => {
+                if !users.is_empty() {
+                    self.spawn("conversations.invite", async move {
+                        let updated = backend.invite_to_channel(channel.clone(), users).await?;
+                        let ws_merge = ws.clone();
+                        with_store(&store, move |s| s.merge_conversation(&ws_merge, &updated))
+                            .await?;
+                        if let Ok(members) = backend.conversation_members(channel.clone()).await {
+                            let for_counts = members.clone();
+                            let counts =
+                                with_store(&store, move |s| s.member_counts(&ws, &for_counts))
+                                    .await
+                                    .ok();
+                            events.emit(Event::ConversationInfo {
+                                channel: channel.clone(),
+                                num_members: counts.map(|c| c.humans),
+                                num_apps: counts.map(|c| c.apps),
+                                members,
+                            });
+                        }
+                        events.emit(Event::Conversations(vec![channel]));
+                        Ok(())
+                    });
+                }
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -1219,6 +1316,21 @@ impl<B: Backend> Core<B> {
                 self.events.emit(Event::Connection(state));
             }
             RtmEvent::Event(mut event) => {
+                match &event {
+                    SlackEvent::DndUpdated(ev) => {
+                        self.events
+                            .emit(Event::SelfDndUpdated(ev.dnd_status.clone()));
+                    }
+                    SlackEvent::DndUpdatedUser(ev) => {
+                        if let Some(user) = &ev.user {
+                            self.events.emit(Event::DndPaused {
+                                user: user.clone(),
+                                paused: ev.dnd_status.paused(now_secs()),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
                 if matches!(&event, SlackEvent::EmojiChanged(_)) {
                     let (backend, store, ws, events) = (
                         self.backend.clone(),
@@ -2974,6 +3086,53 @@ pub(crate) mod tests {
 
         async fn set_presence(&self, _away: bool) -> api::Result<()> {
             Ok(())
+        }
+
+        async fn create_channel(
+            &self,
+            name: String,
+            is_private: bool,
+        ) -> api::Result<Conversation> {
+            Ok(Conversation {
+                id: ChannelId::from("CNEW1"),
+                name: Some(name),
+                is_channel: !is_private,
+                is_group: is_private,
+                is_private,
+                is_member: true,
+                ..Default::default()
+            })
+        }
+
+        async fn rename_channel(
+            &self,
+            channel: ChannelId,
+            name: String,
+        ) -> api::Result<Conversation> {
+            Ok(Conversation {
+                id: channel,
+                name: Some(name),
+                ..Default::default()
+            })
+        }
+
+        async fn archive_channel(&self, _channel: ChannelId) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn unarchive_channel(&self, _channel: ChannelId) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn invite_to_channel(
+            &self,
+            channel: ChannelId,
+            _users: Vec<UserId>,
+        ) -> api::Result<Conversation> {
+            Ok(Conversation {
+                id: channel,
+                ..Default::default()
+            })
         }
     }
 

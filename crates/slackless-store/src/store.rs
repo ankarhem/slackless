@@ -573,6 +573,26 @@ impl Store {
             .collect())
     }
 
+    /// Up to `limit` newest undeleted messages sent by `user` across all conversations in
+    /// `workspace`, newest first (used to populate Drafts & sent -> Sent across restarts).
+    pub fn recent_messages_by_user(
+        &self,
+        workspace: &TeamId,
+        user: &UserId,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT channel_id, json, deleted FROM message_current
+             WHERE workspace_id = ?1 AND user_id = ?2 AND deleted = 0
+             ORDER BY ts_key DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![workspace.as_str(), user.as_str(), limit as i64],
+            raw_row,
+        )?;
+        collect(rows)
+    }
+
     /// Which of `channels` have at least one stored message, deleted ones included: the
     /// DM-list preview backfill fetches only the conversations this leaves out.
     pub fn channels_with_messages(
@@ -1889,6 +1909,30 @@ mod tests {
             ..Default::default()
         };
         assert!(found(nobody).is_empty());
+    }
+
+    #[test]
+    fn recent_messages_by_user_returns_newest_undeleted_for_user() {
+        let mut store = Store::open_in_memory().unwrap();
+        let m1 = msg("1700000001.000100", "U1", "first");
+        let m2 = msg("1700000002.000100", "U2", "other user");
+        let m3 = msg("1700000003.000100", "U1", "second");
+        let m4 = msg("1700000004.000100", "U1", "deleted one");
+        store.upsert_message(&ws(), &general(), &m1).unwrap();
+        store.upsert_message(&ws(), &general(), &m2).unwrap();
+        store
+            .upsert_message(&ws(), &ChannelId::from("C2"), &m3)
+            .unwrap();
+        store.upsert_message(&ws(), &general(), &m4).unwrap();
+        store
+            .record_deletion(&ws(), &general(), &m4.ts, None, Some(&m4))
+            .unwrap();
+
+        let rows = store
+            .recent_messages_by_user(&ws(), &UserId::from("U1"), 10)
+            .unwrap();
+        let texts: Vec<&str> = rows.iter().map(|r| r.message.text.as_str()).collect();
+        assert_eq!(texts, ["second", "first"]);
     }
 
     #[test]

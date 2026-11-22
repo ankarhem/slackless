@@ -61,7 +61,7 @@ use crate::emoji::{self, EmojiChoice};
 use crate::fixtures::Fixtures;
 use crate::hover_card::{self, Trigger};
 use crate::image_viewer::{self, ImageClick, ImageOrigin};
-use crate::later::{Remind, SaveRequest};
+use crate::later::SaveRequest;
 
 /// Avatar chip size in px.
 const AVATAR_SIZE: f32 = 36.;
@@ -668,7 +668,31 @@ impl MessageList {
             }
             MessageAction::RemindMe(remind) => {
                 let title = format!("Reminder set: {}", remind.label().to_lowercase());
-                self.save_for_later(ts, true, Some(remind), &title, window, cx);
+                self.save_for_later(
+                    ts,
+                    true,
+                    Some(remind.at(crate::drafts::now_secs())),
+                    &title,
+                    window,
+                    cx,
+                );
+            }
+            MessageAction::RemindCustom => {
+                let this = cx.entity().downgrade();
+                let ts = ts.clone();
+                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
+                    let _ = this.update(cx, |list, cx| {
+                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
+                        list.save_for_later(
+                            &ts,
+                            true,
+                            Some(due),
+                            &format!("Reminder set: {when}"),
+                            window,
+                            cx,
+                        );
+                    });
+                });
             }
             MessageAction::MarkUnread => self.mark_unread(ts, cx),
             MessageAction::Edit => self.begin_edit(ts, window, cx),
@@ -897,6 +921,30 @@ impl MessageList {
         self.scroll_to_time(since, cx);
     }
 
+    /// Jump to the first unread message in the open conversation (`Cmd+J`). Returns `true`
+    /// when an unread message was found and scrolled into view.
+    pub fn jump_to_unread(&mut self, cx: &mut Context<Self>) -> bool {
+        let target = {
+            let data = self.data.read(cx);
+            let Some(last_read) = data.last_read.as_ref() else {
+                return false;
+            };
+            data.messages
+                .iter()
+                .enumerate()
+                .find(|(_, m)| m.ts > *last_read)
+                .map(|(ix, m)| (ix, m.ts.clone()))
+        };
+        if let Some((ix, ts)) = target {
+            self.scroller
+                .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+            self.flash_highlight(ts, cx);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The jump's older history landed (or ran out): scroll to its target and highlight it.
     pub fn finish_jump(&mut self, cx: &mut Context<Self>) {
         if let Some(ts) = self.pending_highlight.take() {
@@ -1023,7 +1071,7 @@ impl MessageList {
         &mut self,
         ts: &Ts,
         saved: bool,
-        remind: Option<Remind>,
+        due: Option<u64>,
         title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1045,7 +1093,7 @@ impl MessageList {
                 .unwrap_or_default(),
             text: self.fixtures.preview(message),
             saved,
-            due: remind.map(|remind| remind.at(crate::drafts::now_secs())),
+            due,
         };
         actions::notify(title, request.text.clone(), window, cx);
         cx.emit(MessageListEvent::Later(request));

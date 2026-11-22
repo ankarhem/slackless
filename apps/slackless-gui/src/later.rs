@@ -17,13 +17,16 @@ use std::collections::HashSet;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Sizable as _, Size, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::api::SavedMark;
 use slackless_core::types::{ChannelId, Ts};
@@ -34,6 +37,133 @@ use crate::fixtures::Fixtures;
 const DAY: u64 = 86_400;
 const HOUR: u64 = 3_600;
 const MINUTE: u64 = 60;
+
+/// Open a local date/time dialog for setting a custom reminder due time (`YYYY-MM-DD`, `HH:MM`).
+pub fn open_custom_remind_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    on_confirm: impl Fn(u64, &mut Window, &mut App) + 'static,
+) {
+    let on_confirm = std::rc::Rc::new(on_confirm);
+    let (default_date, default_time) = crate::app::default_custom_datetime();
+    let date_state = cx.new(|cx| {
+        let mut s = TextareaState::new(window, cx)
+            .placeholder("YYYY-MM-DD")
+            .auto_grow(1, 1);
+        s.set_value(default_date, window, cx);
+        s
+    });
+    let time_state = cx.new(|cx| {
+        let mut s = TextareaState::new(window, cx)
+            .placeholder("HH:MM")
+            .auto_grow(1, 1);
+        s.set_value(default_time, window, cx);
+        s
+    });
+    time_state.read(cx).focus_handle(cx).focus(window, cx);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (border, muted, bg) = (theme.border, theme.muted_foreground, theme.background);
+        let (date_state, time_state, on_confirm) =
+            (date_state.clone(), time_state.clone(), on_confirm.clone());
+        dialog.title("Set a custom reminder").w(px(400.)).child(
+            v_flex()
+                .gap_3()
+                .p_4()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Enter a local date (YYYY-MM-DD) and 24-hour time (HH:MM)."),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child("Date"),
+                                )
+                                .child(
+                                    div()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(bg)
+                                        .child(
+                                            Textarea::new(&date_state)
+                                                .appearance(false)
+                                                .bordered(false),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .w(px(120.))
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child("Time"),
+                                )
+                                .child(
+                                    div()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(border)
+                                        .bg(bg)
+                                        .child(
+                                            Textarea::new(&time_state)
+                                                .appearance(false)
+                                                .bordered(false),
+                                        ),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("remind-custom-cancel")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("remind-custom-save")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Set reminder")
+                                .on_click(move |_, window, cx| {
+                                    let d = date_state.read(cx).value().to_string();
+                                    let t = time_state.read(cx).value().to_string();
+                                    let Some(at) = crate::app::parse_local_schedule(&d, &t) else {
+                                        crate::actions::notify(
+                                            "Invalid date or time",
+                                            "Use YYYY-MM-DD and HH:MM in the future.",
+                                            window,
+                                            cx,
+                                        );
+                                        return;
+                                    };
+                                    window.close_dialog(cx);
+                                    on_confirm(at, window, cx);
+                                }),
+                        ),
+                ),
+        )
+    });
+}
 
 /// The "Remind me about this" presets offered on messages and Later items.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -437,6 +567,18 @@ impl LaterView {
                         },
                     ));
                 }
+                let custom_this = this.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::new("Custom\u{2026}")
+                        .icon(IconName::Calendar)
+                        .on_click(move |_, window, cx| {
+                            let this = custom_this.clone();
+                            open_custom_remind_dialog(window, cx, move |due, _, cx| {
+                                this.update(cx, |view, cx| view.set_due(ix, Some(due), cx))
+                                    .ok();
+                            });
+                        }),
+                );
                 if has_due {
                     let this = this.clone();
                     menu = menu.separator().item(

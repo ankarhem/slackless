@@ -17,11 +17,11 @@ use slackless_core::platform::{self, AboutPanel as _, FullScreenItem as _};
 use slackless_core::types::ChannelId;
 
 use crate::app::{
-    ActualSize, FocusSearch, NavigateBack, NavigateForward, NewMessage, NextWorkspace,
-    OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads, OpenDrafts, OpenFiles, OpenLater,
-    OpenOwnProfile, OpenPeople, OpenPreferences, OpenRecent, OpenThreads, OpenUnreads,
-    PreviousWorkspace, QuickSwitch, SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace,
-    ToggleWorkspaceRail, ZoomIn, ZoomOut,
+    ActualSize, CreateChannelAction, FocusSearch, JumpToUnread, NavigateBack, NavigateForward,
+    NewMessage, NextWorkspace, OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads,
+    OpenDrafts, OpenFiles, OpenHome, OpenLater, OpenOwnProfile, OpenPeople, OpenPreferences,
+    OpenRecent, OpenThreads, OpenUnreads, PreviousWorkspace, QuickSwitch, SearchConversation,
+    ShowShortcuts, SignOut, SwitchWorkspace, ToggleRightPane, ToggleWorkspaceRail, ZoomIn, ZoomOut,
 };
 
 actions!(
@@ -109,6 +109,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("New Message", NewMessage),
+            MenuItem::action("Create a Channel\u{2026}", CreateChannelAction),
             MenuItem::separator(),
             MenuItem::submenu(
                 Menu::new("Workspace").items(
@@ -137,6 +138,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Workspace Switcher", ToggleWorkspaceRail),
+            MenuItem::action("Toggle Right Sidebar", ToggleRightPane),
             MenuItem::action("Toggle Full Screen", ToggleFullScreen),
             MenuItem::separator(),
             MenuItem::action("Actual Size", ActualSize),
@@ -145,9 +147,11 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
         ]),
         Menu::new("Go").items([
             MenuItem::action("Switch to Channel", QuickSwitch),
+            MenuItem::action("Jump to Unread", JumpToUnread),
             MenuItem::separator(),
             MenuItem::submenu(Menu::new("History").items(back_forward())),
             MenuItem::separator(),
+            MenuItem::action("Home", OpenHome),
             MenuItem::action("Threads", OpenThreads),
             MenuItem::action("All Unreads", OpenUnreads),
             MenuItem::action("All DMs", OpenDms),

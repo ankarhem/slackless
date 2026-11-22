@@ -125,6 +125,7 @@ pub mod method {
     pub const CONVERSATIONS_SET_PURPOSE: &str = "conversations.setPurpose";
     pub const CONVERSATIONS_SET_TOPIC: &str = "conversations.setTopic";
     pub const CONVERSATIONS_TEAM_CONNECTIONS: &str = "conversations.teamConnections";
+    pub const CONVERSATIONS_UNARCHIVE: &str = "conversations.unarchive";
     pub const CONVERSATIONS_UPDATE_TAB: &str = "conversations.updateTab";
     pub const CONVERSATIONS_VALIDATE_NAME: &str = "conversations.validateName";
     pub const CONVERSATIONS_VIEW: &str = "conversations.view";

@@ -369,6 +369,29 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send;
     /// Manually set presence active or away (`presence.set`).
     fn set_presence(&self, away: bool) -> impl Future<Output = api::Result<()>> + Send;
+    /// Create a new public or private channel (`conversations.create`).
+    fn create_channel(
+        &self,
+        name: String,
+        is_private: bool,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Rename a channel (`conversations.rename`).
+    fn rename_channel(
+        &self,
+        channel: ChannelId,
+        name: String,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Archive a channel (`conversations.archive`).
+    fn archive_channel(&self, channel: ChannelId) -> impl Future<Output = api::Result<()>> + Send;
+    /// Unarchive a channel (`conversations.unarchive`).
+    fn unarchive_channel(&self, channel: ChannelId)
+    -> impl Future<Output = api::Result<()>> + Send;
+    /// Invite users to a channel (`conversations.invite`).
+    fn invite_to_channel(
+        &self,
+        channel: ChannelId,
+        users: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -830,5 +853,29 @@ impl Backend for SlackApi {
 
     async fn set_presence(&self, away: bool) -> api::Result<()> {
         SlackApi::presence_set(self, away).await
+    }
+
+    async fn create_channel(&self, name: String, is_private: bool) -> api::Result<Conversation> {
+        SlackApi::conversations_create(self, &name, is_private).await
+    }
+
+    async fn rename_channel(&self, channel: ChannelId, name: String) -> api::Result<Conversation> {
+        SlackApi::conversations_rename(self, &channel, &name).await
+    }
+
+    async fn archive_channel(&self, channel: ChannelId) -> api::Result<()> {
+        SlackApi::conversations_archive(self, &channel).await
+    }
+
+    async fn unarchive_channel(&self, channel: ChannelId) -> api::Result<()> {
+        SlackApi::conversations_unarchive(self, &channel).await
+    }
+
+    async fn invite_to_channel(
+        &self,
+        channel: ChannelId,
+        users: Vec<UserId>,
+    ) -> api::Result<Conversation> {
+        SlackApi::conversations_invite(self, &channel, &users).await
     }
 }
