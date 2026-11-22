@@ -67,6 +67,10 @@ pub struct BlockKitState {
     collapsed: HashSet<String>,
     /// Link unfurl cards the user dismissed locally, by message ts and attachment index.
     dismissed_unfurls: HashSet<String>,
+    /// Datepicker keys whose monthly calendar grid is currently expanded (`F-COLLAB-745`).
+    open_calendars: HashSet<String>,
+    /// Currently browsed `(year, month)` per datepicker key (1-based month).
+    calendar_months: HashMap<String, (i32, u32)>,
 }
 
 /// What one message's blocks render with.
@@ -666,27 +670,14 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
             select(element, block, key, channels, kcx, cx)
         }
         "overflow" => overflow(element, block, key, kcx).into_any_element(),
-        "datepicker" => {
-            let days = (0..14)
-                .map(|day| messages::iso_date(messages::now_secs() + day * 86_400))
-                .map(|date| (date.clone(), date))
-                .collect();
-            picker(
-                element,
-                block,
-                key,
-                "initial_date",
-                "selected_date",
-                IconName::Calendar,
-                days,
-                kcx,
-                cx,
-            )
-        }
+        "datepicker" => datepicker(element, block, key, kcx, cx),
         "timepicker" => {
-            let times = (8..=18)
-                .map(|hour| format!("{hour:02}:00"))
-                .map(|t| (t.clone(), t))
+            let times = (0..24)
+                .flat_map(|hour| [0u32, 15, 30, 45].into_iter().map(move |min| (hour, min)))
+                .map(|(hour, min)| {
+                    let t = format!("{hour:02}:{min:02}");
+                    (t.clone(), t)
+                })
                 .collect();
             picker(
                 element,
@@ -942,6 +933,278 @@ fn select(
         },
     )
     .into_any_element()
+}
+
+fn parse_iso_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = s.split('-');
+    let y = parts.next()?.parse::<i32>().ok()?;
+    let m = parts.next()?.parse::<u32>().ok()?;
+    let d = parts.next()?.parse::<u32>().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        Some((y, m, d))
+    } else {
+        None
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 30,
+    }
+}
+
+/// Day of week for `year-month-day` (0 = Sunday .. 6 = Saturday), Sakamoto's algorithm.
+fn weekday_sunday0(year: i32, month: u32, day: u32) -> u32 {
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    ((y + y / 4 - y / 100 + y / 400 + T[(month - 1) as usize] + day as i32).rem_euclid(7)) as u32
+}
+
+fn month_name(month: u32) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    NAMES
+        .get((month.saturating_sub(1)) as usize)
+        .copied()
+        .unwrap_or("")
+}
+
+/// Interactive monthly calendar grid date picker (`F-COLLAB-745`).
+fn datepicker(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> AnyElement {
+    let selected =
+        choice(kcx, &key, cx).or_else(|| element["initial_date"].as_str().map(str::to_owned));
+    let today_iso = messages::iso_date(messages::now_secs());
+    let (today_y, today_m, _) = parse_iso_ymd(&today_iso).unwrap_or((2026, 1, 1));
+    let default_ym = selected
+        .as_deref()
+        .and_then(parse_iso_ymd)
+        .map(|(y, m, _)| (y, m))
+        .unwrap_or((today_y, today_m));
+    let is_open = kcx
+        .kit
+        .is_some_and(|kit| kit.read(cx).open_calendars.contains(&key));
+    let (view_y, view_m) = kcx
+        .kit
+        .and_then(|kit| kit.read(cx).calendar_months.get(&key).copied())
+        .unwrap_or(default_ym);
+    let label = selected
+        .clone()
+        .or_else(|| text_of(&element["placeholder"]).map(str::to_owned))
+        .unwrap_or_else(|| "Select a date".to_owned());
+
+    let theme = cx.theme();
+    let (border, popover, muted, hover, primary, primary_fg, fg) = (
+        theme.border,
+        theme.popover,
+        theme.muted_foreground,
+        theme.accent,
+        theme.primary,
+        theme.primary_foreground,
+        theme.foreground,
+    );
+    let kit_toggle = kcx.kit.cloned();
+    let key_toggle = key.clone();
+    let trigger = Button::new(SharedString::from(format!("bk-{key}")))
+        .outline()
+        .with_size(Size::Small)
+        .icon(IconName::Calendar)
+        .label(label)
+        .dropdown_caret(true)
+        .on_click(move |_, _, cx| {
+            if let Some(kit) = &kit_toggle {
+                kit.update(cx, |state, cx| {
+                    if !state.open_calendars.insert(key_toggle.clone()) {
+                        state.open_calendars.remove(&key_toggle);
+                    }
+                    state
+                        .calendar_months
+                        .entry(key_toggle.clone())
+                        .or_insert(default_ym);
+                    cx.notify();
+                });
+            }
+        });
+
+    if !is_open {
+        return trigger.into_any_element();
+    }
+
+    let first_dow = weekday_sunday0(view_y, view_m, 1) as usize;
+    let total_days = days_in_month(view_y, view_m) as usize;
+    let (prev_y, prev_m) = if view_m == 1 {
+        (view_y - 1, 12)
+    } else {
+        (view_y, view_m - 1)
+    };
+    let (next_y, next_m) = if view_m == 12 {
+        (view_y + 1, 1)
+    } else {
+        (view_y, view_m + 1)
+    };
+    let base = action_base(element, block);
+    let mut cells: Vec<Option<u32>> = vec![None; first_dow];
+    cells.extend((1..=total_days as u32).map(Some));
+    while cells.len() % 7 != 0 {
+        cells.push(None);
+    }
+
+    let kit_prev = kcx.kit.cloned();
+    let key_prev = key.clone();
+    let kit_next = kcx.kit.cloned();
+    let key_next = key.clone();
+    let mut grid = v_flex()
+        .w(px(236.))
+        .p_2()
+        .gap_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(popover)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    Button::new(SharedString::from(format!("bk-cal-prev-{key}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::ChevronLeft)
+                        .on_click(move |_, _, cx| {
+                            if let Some(kit) = &kit_prev {
+                                kit.update(cx, |state, cx| {
+                                    state
+                                        .calendar_months
+                                        .insert(key_prev.clone(), (prev_y, prev_m));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(format!("{} {view_y}", month_name(view_m))),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("bk-cal-next-{key}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::ChevronRight)
+                        .on_click(move |_, _, cx| {
+                            if let Some(kit) = &kit_next {
+                                kit.update(cx, |state, cx| {
+                                    state
+                                        .calendar_months
+                                        .insert(key_next.clone(), (next_y, next_m));
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                ),
+        )
+        .child(
+            h_flex().gap_0p5().children(
+                ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+                    .into_iter()
+                    .map(|wd| {
+                        div()
+                            .w(px(30.))
+                            .text_center()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(wd)
+                    }),
+            ),
+        );
+
+    for week in cells.chunks(7) {
+        let mut row = h_flex().gap_0p5();
+        for cell in week {
+            if let Some(day) = *cell {
+                let iso = format!("{view_y:04}-{view_m:02}-{day:02}");
+                let is_selected = selected.as_deref() == Some(iso.as_str());
+                let is_today = iso == today_iso;
+                let (kit, key_c, base, on_action, attachment) = (
+                    kcx.kit.cloned(),
+                    key.clone(),
+                    base.clone(),
+                    kcx.on_action.clone(),
+                    kcx.attachment,
+                );
+                let iso_click = iso.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("bk-cal-{key}-{iso}")))
+                        .w(px(30.))
+                        .h(px(26.))
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .cursor_pointer()
+                        .when(is_selected, |el| {
+                            el.bg(primary)
+                                .text_color(primary_fg)
+                                .font_weight(FontWeight::BOLD)
+                        })
+                        .when(!is_selected && is_today, |el| {
+                            el.border_1().border_color(primary).text_color(fg)
+                        })
+                        .when(!is_selected, |el| el.hover(|h| h.bg(hover)))
+                        .child(day.to_string())
+                        .on_click(move |_, window, cx| {
+                            if let Some(kit) = &kit {
+                                kit.update(cx, |state, cx| {
+                                    state.choices.insert(key_c.clone(), iso_click.clone());
+                                    state.open_calendars.remove(&key_c);
+                                    cx.notify();
+                                });
+                            }
+                            let mut payload = base.clone();
+                            payload["selected_date"] = iso_click.clone().into();
+                            dispatch_action(
+                                payload,
+                                on_action.as_ref(),
+                                attachment,
+                                &key_c,
+                                &format!("selected \u{201C}{iso_click}\u{201D}"),
+                                window,
+                                cx,
+                            );
+                        }),
+                );
+            } else {
+                row = row.child(div().w(px(30.)).h(px(26.)));
+            }
+        }
+        grid = grid.child(row);
+    }
+
+    v_flex()
+        .gap_1()
+        .child(trigger)
+        .child(grid)
+        .into_any_element()
 }
 
 /// Date / time pickers: the chosen value (or `initial_field`) on a button with `icon`, the
@@ -2093,6 +2356,148 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         } else {
             body.into_any_element()
         })
+}
+
+/// Prepare text input controls for raw modal JSON blocks (`views.open`, `F-COLLAB-725`).
+pub fn prepare_raw_inputs(
+    kit: &Entity<BlockKitState>,
+    ts: &Ts,
+    raw_blocks: &[Json],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let synthetic = Message {
+        ts: ts.clone(),
+        blocks: raw_blocks
+            .iter()
+            .map(|raw| Block::Unknown {
+                r#type: raw["type"].as_str().unwrap_or_default().to_owned(),
+                raw: raw.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    prepare_inputs(kit, &synthetic, window, cx);
+}
+
+/// Render raw Block Kit JSON blocks (used by interactive app modals from `views.open`).
+pub fn render_raw_blocks(raw_blocks: &[Json], kcx: &KitCx, cx: &App) -> Div {
+    let mut column = v_flex().gap_3().w_full().min_w_0();
+    for (ix, raw) in raw_blocks.iter().enumerate() {
+        let r#type = raw["type"].as_str().unwrap_or_default();
+        if let Some(el) = block(r#type, raw, ix, kcx, cx) {
+            column = column.child(el);
+        }
+    }
+    column
+}
+
+/// Collect Slack `state.values` from modal `input` blocks and validate required / typed inputs.
+pub fn collect_modal_state(
+    ts: &Ts,
+    raw_blocks: &[Json],
+    kit: &Entity<BlockKitState>,
+    cx: &App,
+) -> Result<Json, String> {
+    let mut values = serde_json::Map::new();
+    let state = kit.read(cx);
+    for (ix, raw) in raw_blocks.iter().enumerate() {
+        if raw["type"].as_str() != Some("input") {
+            continue;
+        }
+        let element = &raw["element"];
+        let kind = element["type"].as_str().unwrap_or_default();
+        let block_id = raw["block_id"]
+            .as_str()
+            .map_or_else(|| ix.to_string(), str::to_owned);
+        let action_id = element["action_id"]
+            .as_str()
+            .map_or_else(|| "0".to_owned(), str::to_owned);
+        let optional = raw["optional"].as_bool().unwrap_or(false);
+        let label = text_of(&raw["label"]).unwrap_or(&block_id);
+        let key = control_key(ts, raw, ix, element, 0);
+
+        let entry = if TEXT_INPUTS.contains(&kind) {
+            let val = state
+                .inputs
+                .get(&key)
+                .map(|i| i.read(cx).value().to_string())
+                .or_else(|| element["initial_value"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            if !optional && val.trim().is_empty() {
+                return Err(format!("{label} is required."));
+            }
+            if let Some(err) = validate_text_input(element, &val) {
+                return Err(format!("{label}: {err}"));
+            }
+            serde_json::json!({ "type": kind, "value": val })
+        } else if kind == "datepicker" {
+            let val = state
+                .choices
+                .get(&key)
+                .cloned()
+                .or_else(|| element["initial_date"].as_str().map(str::to_owned));
+            if !optional && val.is_none() {
+                return Err(format!("{label} is required."));
+            }
+            serde_json::json!({ "type": kind, "selected_date": val })
+        } else if kind == "timepicker" {
+            let val = state
+                .choices
+                .get(&key)
+                .cloned()
+                .or_else(|| element["initial_time"].as_str().map(str::to_owned));
+            if !optional && val.is_none() {
+                return Err(format!("{label} is required."));
+            }
+            serde_json::json!({ "type": kind, "selected_time": val })
+        } else if kind == "checkboxes" || kind.starts_with("multi_") {
+            let selected = state.checked.get(&key).cloned().unwrap_or_default();
+            if !optional && selected.is_empty() {
+                return Err(format!("{label} is required."));
+            }
+            let arr: Vec<Json> = selected
+                .into_iter()
+                .map(|v| serde_json::json!({ "value": v }))
+                .collect();
+            serde_json::json!({ "type": kind, "selected_options": arr })
+        } else {
+            let val = state
+                .choices
+                .get(&key)
+                .cloned()
+                .or_else(|| {
+                    element["initial_option"]["value"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .or_else(|| element["initial_user"].as_str().map(str::to_owned))
+                .or_else(|| element["initial_conversation"].as_str().map(str::to_owned))
+                .or_else(|| element["initial_channel"].as_str().map(str::to_owned));
+            if !optional && val.is_none() {
+                return Err(format!("{label} is required."));
+            }
+            match kind {
+                "users_select" => serde_json::json!({ "type": kind, "selected_user": val }),
+                "conversations_select" => {
+                    serde_json::json!({ "type": kind, "selected_conversation": val })
+                }
+                "channels_select" => serde_json::json!({ "type": kind, "selected_channel": val }),
+                _ => serde_json::json!({
+                    "type": kind,
+                    "selected_option": val.map(|v| serde_json::json!({ "value": v })),
+                }),
+            }
+        };
+
+        let block_map = values
+            .entry(block_id)
+            .or_insert_with(|| Json::Object(serde_json::Map::new()));
+        if let Some(obj) = block_map.as_object_mut() {
+            obj.insert(action_id, entry);
+        }
+    }
+    Ok(Json::Object(values))
 }
 
 #[cfg(test)]

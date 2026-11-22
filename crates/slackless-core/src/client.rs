@@ -1246,6 +1246,22 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SubmitModal {
+                view_id,
+                hash,
+                state_values,
+            } => {
+                self.spawn("views.submit", async move {
+                    backend.views_submit(view_id, hash, state_values).await?;
+                    Ok(())
+                });
+            }
+            Command::CloseModal { view_id, hash } => {
+                self.spawn("views.close", async move {
+                    backend.views_close(view_id, hash).await?;
+                    Ok(())
+                });
+            }
             Command::CreateChannel {
                 name,
                 is_private,
@@ -1423,6 +1439,21 @@ impl<B: Backend> Core<B> {
                                 self.events.emit(Event::UsersChanged(vec![id]));
                             }
                         }
+                    } else if matches!(
+                        r#type.as_str(),
+                        "view_opened" | "view_open" | "view_updated" | "view_update"
+                    ) {
+                        let view = raw.get("view").cloned().unwrap_or_else(|| raw.clone());
+                        self.events.emit(Event::ModalOpened(view));
+                    } else if matches!(r#type.as_str(), "view_closed" | "view_close") {
+                        let id = raw
+                            .get("view")
+                            .and_then(|v| v.get("id"))
+                            .or_else(|| raw.get("view_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        self.events.emit(Event::ModalClosed(id));
                     } else if matches!(
                         r#type.as_str(),
                         "sh_room_join" | "sh_room_update" | "sh_room_leave"
@@ -3189,6 +3220,19 @@ pub(crate) mod tests {
 
         async fn team_profile_fields(&self) -> api::Result<HashMap<String, String>> {
             Ok(HashMap::new())
+        }
+
+        async fn views_submit(
+            &self,
+            _view_id: String,
+            _hash: Option<String>,
+            _state_values: serde_json::Value,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn views_close(&self, _view_id: String, _hash: Option<String>) -> api::Result<()> {
+            Ok(())
         }
     }
 

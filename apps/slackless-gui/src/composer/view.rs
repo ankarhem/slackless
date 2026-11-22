@@ -8,8 +8,8 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, BorderStyle, Bounds, ContentMask, Context, Corners, Div, Edges, ExternalPaths,
     Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, PaintQuad,
-    ParentElement as _, Render, SharedString, Stateful, Styled as _, StyledText, Window, canvas,
-    div, point, px, relative, rems,
+    ParentElement as _, Render, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, StyledText, Window, canvas, div, point, px, relative, rems,
 };
 
 use super::tokens::{self, Palette};
@@ -108,6 +108,83 @@ impl Render for Composer {
                 )
         });
         let attachments = self.attachments_strip(cx);
+        let upload_warning = self.upload_warning.clone().map(|msg| {
+            let danger = cx.theme().danger;
+            h_flex()
+                .px_3()
+                .py_1()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .text_xs()
+                .text_color(danger)
+                .child(msg)
+                .child(
+                    div()
+                        .id("composer-upload-warn-close")
+                        .cursor_pointer()
+                        .child("\u{2715}")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.upload_warning = None;
+                            cx.notify();
+                        })),
+                )
+        });
+        let spell_bar =
+            self.spell_guesses
+                .clone()
+                .filter(|_| focused)
+                .map(|(range, word, guesses)| {
+                    let theme = cx.theme();
+                    let (muted, border, hover, fg) = (
+                        theme.muted_foreground,
+                        theme.border,
+                        theme.accent,
+                        theme.foreground,
+                    );
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .text_xs()
+                        .border_t_1()
+                        .border_color(border.opacity(0.6))
+                        .child(div().text_color(muted).child("Spelling:"))
+                        .children(guesses.into_iter().enumerate().map(|(ix, guess)| {
+                            let range_c = range.clone();
+                            let guess_c = guess.clone();
+                            div()
+                                .id(("spell-fix", ix))
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(border)
+                                .text_color(fg)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(hover))
+                                .child(guess)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.apply_spelling_fix(range_c.clone(), &guess_c, window, cx);
+                                }))
+                        }))
+                        .child(
+                            div()
+                                .id("spell-learn")
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .text_color(muted)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(hover).text_color(fg))
+                                .child(format!("Learn \u{201C}{word}\u{201D}"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.learn_spelling_word(&word, cx);
+                                })),
+                        )
+                });
         let also_send = self.also_send_row(cx);
         let actions = self.action_row(cx);
         let overlay = if self.link_open {
@@ -208,6 +285,8 @@ impl Render for Composer {
                             .children(private_prompt),
                     )
                     .children(attachments)
+                    .children(upload_warning)
+                    .children(spell_bar)
                     .children(also_send)
                     .child(actions),
             )

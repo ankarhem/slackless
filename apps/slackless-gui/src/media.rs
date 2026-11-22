@@ -321,6 +321,7 @@ pub fn download_as(url: String, name: String, window: &mut Window, cx: &mut App)
 pub struct AudioSnapshot {
     pub loading: bool,
     pub playing: bool,
+    pub paused: bool,
     pub elapsed_ms: u64,
     pub duration_ms: Option<u64>,
 }
@@ -329,6 +330,8 @@ struct ActiveAudio {
     file_id: String,
     child: Option<Child>,
     started: Option<Instant>,
+    paused_at: Option<Instant>,
+    accumulated_ms: u64,
     duration_ms: Option<u64>,
     loading: bool,
 }
@@ -358,16 +361,71 @@ pub fn audio_state(file_id: &str, cx: &App) -> Option<AudioSnapshot> {
     if active.file_id != file_id {
         return None;
     }
-    let elapsed_ms = active
-        .started
-        .map(|s| s.elapsed().as_millis() as u64)
-        .unwrap_or(0);
+    let elapsed_ms = active.accumulated_ms
+        + if active.paused_at.is_some() {
+            0
+        } else {
+            active
+                .started
+                .map(|s| s.elapsed().as_millis() as u64)
+                .unwrap_or(0)
+        };
     Some(AudioSnapshot {
         loading: active.loading,
-        playing: active.child.is_some(),
+        playing: active.child.is_some() && active.paused_at.is_none(),
+        paused: active.child.is_some() && active.paused_at.is_some(),
         elapsed_ms,
         duration_ms: active.duration_ms,
     })
+}
+
+/// Pause or resume the currently active audio clip without restarting (`F-CORE-126`).
+pub fn toggle_pause_audio(file_id: &str, window: &mut Window, cx: &mut App) {
+    let player = cx.default_global::<MediaPlayer>();
+    let Some(active) = player.audio.as_mut() else {
+        return;
+    };
+    if active.file_id != file_id {
+        return;
+    }
+    let Some(child) = active.child.as_ref() else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGSTOP: i32 = 17;
+        const SIGCONT: i32 = 19;
+        let pid = child.id() as i32;
+        if active.paused_at.is_some() {
+            // SAFETY: sending SIGCONT to our own spawned audio child process.
+            unsafe { kill(pid, SIGCONT) };
+            active.paused_at = None;
+            active.started = Some(Instant::now());
+        } else {
+            if let Some(started) = active.started.take() {
+                active.accumulated_ms = active
+                    .accumulated_ms
+                    .saturating_add(started.elapsed().as_millis() as u64);
+            }
+            active.paused_at = Some(Instant::now());
+            // SAFETY: sending SIGSTOP to our own spawned audio child process.
+            unsafe { kill(pid, SIGSTOP) };
+        }
+        window.refresh();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (child, window);
+    }
+}
+
+/// Stop any active audio playback immediately.
+pub fn stop_audio(window: &mut Window, cx: &mut App) {
+    stop_active_audio(cx.default_global::<MediaPlayer>());
+    window.refresh();
 }
 
 /// Whether `file_id` is currently buffering for video playback.
@@ -411,13 +469,12 @@ pub fn toggle_audio(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let already_playing = cx
+    let already_active = cx
         .try_global::<MediaPlayer>()
         .and_then(|p| p.audio.as_ref())
-        .is_some_and(|active| active.file_id == file_id);
-    if already_playing {
-        stop_active_audio(cx.default_global::<MediaPlayer>());
-        window.refresh();
+        .is_some_and(|active| active.file_id == file_id && active.child.is_some());
+    if already_active {
+        toggle_pause_audio(&file_id, window, cx);
         return;
     }
     stop_active_audio(cx.default_global::<MediaPlayer>());
@@ -434,6 +491,8 @@ pub fn toggle_audio(
         file_id: file_id.clone(),
         child: None,
         started: None,
+        paused_at: None,
+        accumulated_ms: 0,
         duration_ms,
         loading: true,
     });

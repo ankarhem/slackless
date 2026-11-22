@@ -371,6 +371,17 @@ pub enum Command {
     },
     /// Fetch one user's full profile including custom fields & pronouns (`users.profile.get` + `team.profile.get`).
     FetchUserProfile(UserId),
+    /// Submit an interactive Block Kit modal (`views.submit`).
+    SubmitModal {
+        view_id: String,
+        hash: Option<String>,
+        state_values: serde_json::Value,
+    },
+    /// Dismiss an interactive Block Kit modal (`views.close`).
+    CloseModal {
+        view_id: String,
+        hash: Option<String>,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -540,6 +551,10 @@ pub enum Event {
         pronouns: Option<String>,
         fields: Vec<(String, String)>,
     },
+    /// An app opened or updated an interactive Block Kit modal (`view_opened` / `view_updated`).
+    ModalOpened(serde_json::Value),
+    /// An app closed an interactive Block Kit modal (`view_closed`).
+    ModalClosed(String),
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

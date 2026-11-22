@@ -468,6 +468,7 @@ fn audio_card(file: &File, cx: &App) -> Div {
     let id_str = file.id.to_string();
     let state = crate::media::audio_state(&id_str, cx);
     let playing = state.as_ref().is_some_and(|s| s.playing);
+    let paused = state.as_ref().is_some_and(|s| s.paused);
     let loading = state.as_ref().is_some_and(|s| s.loading);
     let duration_ms = state
         .as_ref()
@@ -475,19 +476,22 @@ fn audio_card(file: &File, cx: &App) -> Div {
         .or_else(|| media_duration_ms(file));
     let elapsed_ms = state.as_ref().map(|s| s.elapsed_ms).unwrap_or(0);
     let progress = match duration_ms {
-        Some(total) if total > 0 && playing => (elapsed_ms as f32 / total as f32).clamp(0., 1.),
+        Some(total) if total > 0 && (playing || paused) => {
+            (elapsed_ms as f32 / total as f32).clamp(0., 1.)
+        }
         _ => 0.,
     };
     let status_text = if loading {
         "Loading audio\u{2026}".to_owned()
-    } else if playing {
+    } else if playing || paused {
+        let prefix = if paused { "Paused \u{b7} " } else { "" };
         match duration_ms {
             Some(total) => format!(
-                "{} / {}",
+                "{prefix}{} / {}",
                 format_duration(elapsed_ms),
                 format_duration(total)
             ),
-            None => format!("Playing \u{b7} {}", format_duration(elapsed_ms)),
+            None => format!("{prefix}{}", format_duration(elapsed_ms)),
         }
     } else {
         let kind = file
@@ -516,10 +520,30 @@ fn audio_card(file: &File, cx: &App) -> Div {
     let name = file_name(file);
     let ext = file_ext(file, "m4a");
     let play_icon = if playing {
-        IconName::Square
+        IconName::Pause
     } else {
         IconName::Play
     };
+    let stop_btn = (playing || paused).then(|| {
+        div()
+            .id(SharedString::from(format!("audio-stop-{}", file.id)))
+            .size(px(28.))
+            .flex_none()
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|b| b.bg(theme.secondary_hover))
+            .child(
+                Icon::new(IconName::Square)
+                    .text_color(theme.muted_foreground)
+                    .size(px(13.)),
+            )
+            .on_click(move |_, window, cx| {
+                crate::media::stop_audio(window, cx);
+            })
+    });
     let mut play_btn = div()
         .id(SharedString::from(format!("audio-play-{}", file.id)))
         .size(px(36.))
@@ -617,6 +641,7 @@ fn audio_card(file: &File, cx: &App) -> Div {
                         .child(status_text),
                 ),
         )
+        .children(stop_btn)
         .children(dl_btn)
 }
 

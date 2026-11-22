@@ -240,7 +240,8 @@ use gpui_kit::gpui::{
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{
-    self, BadgeSetter, Notifier, SoundPlayer, StatusBarAction, StatusBarItem, StatusBarState,
+    self, AttentionRequester, BadgeSetter, Notifier, SoundPlayer, StatusBarAction, StatusBarItem,
+    StatusBarState,
 };
 use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{
@@ -439,9 +440,9 @@ fn corner_cap(top: bool, chrome: Hsla, outline: Option<Hsla>) -> Vec<Div> {
 /// The thread / profile / pins panel, measured on Slack desktop.
 const FLEXPANE_WIDTH: Pixels = px(540.);
 
-/// The OS integration the root uses: system notifications, dock badge, sounds and menu-bar icon.
-trait Os: Notifier + BadgeSetter + SoundPlayer + StatusBarItem {}
-impl<T: Notifier + BadgeSetter + SoundPlayer + StatusBarItem> Os for T {}
+/// The OS integration the root uses: system notifications, dock badge, attention bounce, sounds and menu-bar icon.
+trait Os: Notifier + BadgeSetter + SoundPlayer + StatusBarItem + AttentionRequester {}
+impl<T: Notifier + BadgeSetter + SoundPlayer + StatusBarItem + AttentionRequester> Os for T {}
 
 /// The per-workspace views: rebuilt from that workspace's fixtures, parked while another
 /// workspace is shown.
@@ -2047,6 +2048,10 @@ impl App {
             actions: Vec::new(),
         });
         self.os.notify(title, body);
+        let bounce = self.preferences.read(cx).settings().bounce_dock;
+        if bounce && is_direct_or_mention && !self.window_active {
+            self.os.request_attention(false);
+        }
         self.play_notification_sound_kind(is_direct_or_mention, cx);
     }
 
@@ -2657,8 +2662,10 @@ impl App {
             }
         }
         let enter_sends = settings.enter_sends;
-        self.composer
-            .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+        self.composer.update(cx, |composer, cx| {
+            composer.set_enter_sends(enter_sends, cx);
+            composer.set_spellcheck(settings.spellcheck, settings.spellcheck_language(), cx);
+        });
         self.messages
             .update(cx, |list, cx| list.set_enter_sends(enter_sends, cx));
         self.thread
@@ -2785,11 +2792,21 @@ impl App {
     }
 
     /// Slack's focus mode (the rail's moon): on with Slack's default "Don't turn off", or off.
+    /// Syncs DND snooze & automatic focus status with Slack in live mode (`F-SHELL-036`).
     fn toggle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.self_state.focused() {
             self.self_state.end_focus();
+            if !self.fixtures.sample {
+                self.bridge.send(Command::EndDndSnooze);
+                self.send_status_to_slack(self.self_state.status.as_ref());
+            }
         } else {
             self.self_state.start_focus(FOCUS_UNTIL_OFF);
+            if !self.fixtures.sample {
+                // Default 8-hour DND snooze for indefinite focus mode.
+                self.bridge.send(Command::SetDndSnooze { minutes: 480 });
+                self.send_status_to_slack(self.self_state.status.as_ref());
+            }
         }
         self.apply_preferences(window, cx);
     }
@@ -5685,8 +5702,116 @@ impl App {
                     profile.set_user_profile(user.clone(), pronouns.clone(), fields.clone(), cx);
                 });
             }
+            Event::ModalOpened(view) => self.open_block_modal(view.clone(), window, cx),
+            Event::ModalClosed(_) => window.close_dialog(cx),
             _ => {}
         }
+    }
+
+    /// Render an app-opened Block Kit modal (`views.open`) and submit via `views.submit` (`F-COLLAB-725`).
+    fn open_block_modal(
+        &mut self,
+        view: crate::blockkit::Json,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view_id = view["id"].as_str().unwrap_or_default().to_owned();
+        if view_id.is_empty() {
+            return;
+        }
+        let hash = view["hash"].as_str().map(str::to_owned);
+        let title = view["title"]["text"]
+            .as_str()
+            .unwrap_or("App modal")
+            .to_owned();
+        let submit_label = view["submit"]["text"].as_str().map(str::to_owned);
+        let close_label = view["close"]["text"]
+            .as_str()
+            .unwrap_or("Cancel")
+            .to_owned();
+        let notify_on_close = view["notify_on_close"].as_bool().unwrap_or(false);
+        let raw_blocks: Vec<crate::blockkit::Json> =
+            view["blocks"].as_array().cloned().unwrap_or_default();
+        let ts = Ts::from(format!("modal-{view_id}"));
+        let kit = cx.new(|_| crate::blockkit::BlockKitState::default());
+        crate::blockkit::prepare_raw_inputs(&kit, &ts, &raw_blocks, window, cx);
+        let fixtures = self.fixtures.clone();
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let kcx = crate::blockkit::KitCx::new(&fixtures, Some(&kit), &ts);
+            let body = crate::blockkit::render_raw_blocks(&raw_blocks, &kcx, cx);
+            let this_close = this.clone();
+            let (close_id, close_hash) = (view_id.clone(), hash.clone());
+            let mut footer = h_flex().justify_end().gap_2().pt_3().child(
+                Button::new("modal-close")
+                    .outline()
+                    .label(close_label.clone())
+                    .on_click(move |_, window, cx| {
+                        if notify_on_close {
+                            if let Some(app) = this_close.upgrade() {
+                                app.update(cx, |app, _| {
+                                    app.bridge.send(Command::CloseModal {
+                                        view_id: close_id.clone(),
+                                        hash: close_hash.clone(),
+                                    });
+                                });
+                            }
+                        }
+                        window.close_dialog(cx);
+                    }),
+            );
+            if let Some(submit_text) = &submit_label {
+                let (this_submit, kit_submit, ts_submit, blocks_submit, sub_id, sub_hash) = (
+                    this.clone(),
+                    kit.clone(),
+                    ts.clone(),
+                    raw_blocks.clone(),
+                    view_id.clone(),
+                    hash.clone(),
+                );
+                footer = footer.child(
+                    Button::new("modal-submit")
+                        .primary()
+                        .label(submit_text.clone())
+                        .on_click(
+                            move |_, window, cx| match crate::blockkit::collect_modal_state(
+                                &ts_submit,
+                                &blocks_submit,
+                                &kit_submit,
+                                cx,
+                            ) {
+                                Ok(state_values) => {
+                                    if let Some(app) = this_submit.upgrade() {
+                                        app.update(cx, |app, _| {
+                                            app.bridge.send(Command::SubmitModal {
+                                                view_id: sub_id.clone(),
+                                                hash: sub_hash.clone(),
+                                                state_values,
+                                            });
+                                        });
+                                    }
+                                    window.close_dialog(cx);
+                                }
+                                Err(err) => {
+                                    notify("Missing or invalid field", err, window, cx);
+                                }
+                            },
+                        ),
+                );
+            }
+            dialog.title(title.clone()).w(px(540.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .id("modal-blocks-body")
+                            .max_h(px(460.))
+                            .overflow_y_scroll()
+                            .child(body),
+                    )
+                    .child(footer),
+            )
+        });
     }
 
     /// Live mode: rebuild the workspace views from a fresh store snapshot after its
@@ -6280,17 +6405,22 @@ impl App {
         wanted
     }
 
-    /// Play the notification sound chosen in Preferences, unless sounds are muted.
+    /// Play the notification sound chosen in Preferences, unless muted or in quiet hours / DND (`F-SHELL-180`).
     fn play_notification_sound_kind(&mut self, is_direct_or_mention: bool, cx: &mut Context<Self>) {
         let settings = self.preferences.read(cx).settings();
+        if settings.mute_sounds
+            || self.self_state.paused()
+            || self.self_state.focused()
+            || !settings.notifications_allowed_now()
+        {
+            return;
+        }
         let choice = if is_direct_or_mention {
             settings.dm_sound
         } else {
             settings.sound
         };
-        if !settings.mute_sounds {
-            self.play_sound(choice, cx);
-        }
+        self.play_sound(choice, cx);
     }
 
     /// Play Preferences' sound `choice` ("None" plays nothing): fetched from Slack's CDN
@@ -6482,6 +6612,21 @@ impl App {
         }
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
+        // Apply per-workspace color theme palette (`F-SHELL-076`).
+        let ws_palette = self
+            .bridge
+            .settings()
+            .map(|s| s.palette)
+            .or(self.fixtures.palette);
+        if let Some(palette) = ws_palette {
+            self.preferences.update(cx, |prefs, cx| {
+                let mut next = prefs.settings().clone();
+                if next.palette != palette {
+                    next.palette = palette;
+                    prefs.load_settings(next, window, cx);
+                }
+            });
+        }
         // New thread panels / profile panes pick up Enter-to-send and the self state.
         self.apply_preferences(window, cx);
         self.update_menus(cx);
@@ -7275,6 +7420,25 @@ impl App {
         if files.is_empty() {
             return;
         }
+        let (valid_files, oversized): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|f| (f.bytes.len() as u64) <= composer::MAX_UPLOAD_BYTES);
+        if !oversized.is_empty() {
+            let names: Vec<_> = oversized.iter().map(|f| f.filename.as_str()).collect();
+            notify(
+                "File too large",
+                format!(
+                    "Skipped {} (exceeds Slack's 1 GB upload limit).",
+                    names.join(", ")
+                ),
+                window,
+                cx,
+            );
+        }
+        if valid_files.is_empty() {
+            return;
+        }
+        let files = valid_files;
         if self.bridge.store().is_some() {
             let count = files.len();
             let uploads = files

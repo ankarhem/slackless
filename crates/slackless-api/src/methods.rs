@@ -1557,6 +1557,43 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app (`F-COLLAB-725`).
+    pub async fn views_submit(
+        &self,
+        view_id: &str,
+        hash: Option<&str>,
+        state_values: &Value,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("view_id", view_id.to_owned()),
+            (
+                "state",
+                serde_json::json!({ "values": state_values }).to_string(),
+            ),
+            ("client_token", client_token()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(hash) = hash {
+            params.push(("hash", hash.to_owned()));
+        }
+        self.call::<Empty>(method::VIEWS_SUBMIT, params).await?;
+        Ok(())
+    }
+
+    /// `views.close`: notify Slack that the user dismissed a Block Kit modal (`notify_on_close`).
+    pub async fn views_close(&self, view_id: &str, hash: Option<&str>) -> Result<()> {
+        let mut params = vec![
+            ("view_id", view_id.to_owned()),
+            ("client_token", client_token()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(hash) = hash {
+            params.push(("hash", hash.to_owned()));
+        }
+        self.call::<Empty>(method::VIEWS_CLOSE, params).await?;
+        Ok(())
+    }
+
     /// `bots.info`: a bot's profile (name, icons, app) for messages that carry only its id.
     pub async fn bots_info(&self, bot: &BotId) -> Result<BotProfile> {
         #[derive(Deserialize)]

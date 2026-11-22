@@ -181,6 +181,35 @@ pub trait StatusBarItem {
     fn take_status_bar_action(&self) -> Option<StatusBarAction>;
 }
 
+/// Request user attention in the OS dock / taskbar (`F-SHELL-175`).
+///
+/// macOS: `NSApplication.requestUserAttention` (informational bounce once, or critical bounce
+/// until activated).
+pub trait AttentionRequester {
+    fn request_attention(&self, critical: bool);
+}
+
+/// A misspelled word span returned by [`SpellChecker`] (UTF-8 byte offsets into the checked text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Misspelling {
+    pub range: std::ops::Range<usize>,
+}
+
+/// Native OS spellchecker (`F-SHELL-098`, `F-SHELL-099`).
+///
+/// macOS: `NSSpellChecker.sharedSpellChecker`.
+pub trait SpellChecker {
+    /// Return UTF-8 byte ranges of misspelled words in `text`. `language` is an optional Apple /
+    /// BCP-47 language code (e.g. `"en_US"`, `"sv"`); `None` uses OS automatic detection.
+    fn check_spelling(&self, text: &str, language: Option<&str>) -> Vec<Misspelling>;
+
+    /// Suggested replacements for a misspelled word.
+    fn spelling_guesses(&self, word: &str, language: Option<&str>) -> Vec<String>;
+
+    /// Add `word` to the user's OS dictionary ("Learn Spelling").
+    fn learn_word(&self, word: &str);
+}
+
 #[cfg(target_os = "macos")]
 type Platform = macos::MacPlatform;
 #[cfg(not(target_os = "macos"))]
@@ -200,6 +229,8 @@ pub fn current() -> impl Notifier
 + SecretStore
 + DeepLinkHandler
 + StatusBarItem
++ AttentionRequester
++ SpellChecker
 + Send
 + Sync
 + 'static {
@@ -217,6 +248,7 @@ mod tests {
     fn current_is_constructible_and_safe_to_call() {
         let platform = current();
         assert_eq!(platform.take_link(), None);
+        assert_eq!(platform.take_status_bar_action(), None);
     }
 
     /// Keychain round-trip: store → load → delete → gone.

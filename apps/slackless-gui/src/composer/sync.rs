@@ -14,6 +14,7 @@ use gpui_kit::component::input::{
     InlineTokenError, InputContent, InputEdit, InputEditsEvent, TextareaState,
 };
 use gpui_kit::gpui::{Context, Entity, EntityInputHandler as _, Window};
+use slackless_core::platform::SpellChecker as _;
 
 use super::Composer;
 use super::menu::Menu;
@@ -175,6 +176,96 @@ impl Composer {
         self.sync_presentation(cx);
     }
 
+    /// Re-run OS spellchecking on plain prose spans (skipping code blocks, inline code,
+    /// semantic atoms, and URLs) and compute replacement suggestions when the caret is on a
+    /// misspelled word (`F-SHELL-098`, `099`).
+    pub(super) fn refresh_spellcheck(&mut self) {
+        if !self.spellcheck {
+            self.misspellings.clear();
+            self.spell_guesses = None;
+            return;
+        }
+        let doc = self.editor.doc();
+        let text = doc.text();
+        if text.trim().is_empty() || text.starts_with('/') {
+            self.misspellings.clear();
+            self.spell_guesses = None;
+            return;
+        }
+        let parsed = doc.parse();
+        let mut skip: Vec<Range<usize>> = doc.atoms().iter().map(|a| a.range.clone()).collect();
+        for line in &parsed.lines {
+            if matches!(line.kind, Some(LineKind::Fence | LineKind::Code)) {
+                skip.push(line.start..line.end);
+            } else {
+                for run in parsed.styled_runs(line) {
+                    if run.attrs.style.contains(Style::CODE) || run.attrs.link.is_some() {
+                        skip.push(run.range);
+                    }
+                }
+            }
+        }
+        let checker = slackless_core::platform::current();
+        let raw = checker.check_spelling(text, self.spellcheck_lang);
+        self.misspellings = raw
+            .into_iter()
+            .map(|m| m.range)
+            .filter(|r| {
+                let word = &text[r.clone()];
+                !word.contains("://")
+                    && !word.starts_with('@')
+                    && !word.starts_with('#')
+                    && !word.starts_with(':')
+                    && !skip.iter().any(|s| r.start < s.end && s.start < r.end)
+            })
+            .collect();
+        self.update_spell_guesses();
+    }
+
+    pub(super) fn update_spell_guesses(&mut self) {
+        if !self.spellcheck || self.misspellings.is_empty() {
+            self.spell_guesses = None;
+            return;
+        }
+        let caret = self.editor.selection().start;
+        let text = self.editor.doc().text();
+        let hit = self
+            .misspellings
+            .iter()
+            .find(|r| caret >= r.start && caret <= r.end)
+            .cloned();
+        self.spell_guesses = hit.and_then(|range| {
+            let word = text.get(range.clone())?.to_owned();
+            let checker = slackless_core::platform::current();
+            let guesses = checker.spelling_guesses(&word, self.spellcheck_lang);
+            Some((range, word, guesses))
+        });
+    }
+
+    /// Replace a misspelled word range with a chosen spelling suggestion.
+    pub(super) fn apply_spelling_fix(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = range.start + replacement.len();
+        self.editor.user_edit(range, replacement, end..end);
+        self.refresh_spellcheck();
+        self.push(window, cx);
+        self.changed(cx);
+    }
+
+    /// Teach the OS spellchecker `word` and clear its underline.
+    pub(super) fn learn_spelling_word(&mut self, word: &str, cx: &mut Context<Self>) {
+        let checker = slackless_core::platform::current();
+        checker.learn_word(word);
+        self.refresh_spellcheck();
+        self.sync_presentation(cx);
+        cx.notify();
+    }
+
     /// The draft or the caret changed: reopen or close the completion menu.
     pub(super) fn changed(&mut self, cx: &mut Context<Self>) {
         self.menu = match Menu::at_caret(&self.editor, &self.fixtures) {
@@ -184,16 +275,24 @@ impl Composer {
                 menu
             }
         };
+        self.update_spell_guesses();
         cx.notify();
     }
 
     /// Show the editor's document in the textarea: its text (one replacement over what
     /// differs), Live Preview tokens, decorations, and selection.
     pub(super) fn push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_spellcheck();
         let doc = self.editor.doc();
         let selection = self.editor.selection();
         let palette = Palette::of(cx);
-        let (content, decorations) = tokens::project(doc, &selection, self.was_focused, palette);
+        let (content, decorations) = tokens::project(
+            doc,
+            &selection,
+            self.was_focused,
+            palette,
+            &self.misspellings,
+        );
         self.input.update(cx, |state, cx| {
             let shown = state.text().to_string();
             let is_new_text = shown != doc.text();
@@ -225,10 +324,17 @@ impl Composer {
     /// Refill the textarea from the editor wholesale (a loaded or cleared draft): its own
     /// edit history starts over.
     pub(super) fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_spellcheck();
         let doc = self.editor.doc();
         let selection = self.editor.selection();
         let palette = Palette::of(cx);
-        let (content, decorations) = tokens::project(doc, &selection, self.was_focused, palette);
+        let (content, decorations) = tokens::project(
+            doc,
+            &selection,
+            self.was_focused,
+            palette,
+            &self.misspellings,
+        );
         self.input.update(cx, |state, cx| {
             state.set_value(content, window, cx);
             state.set_decorations(decorations, cx);
@@ -241,10 +347,17 @@ impl Composer {
     /// Refresh Live Preview tokens and decorations in place without touching the text buffer
     /// (after typing, cursor movement, focus change, or theme change).
     pub(super) fn sync_presentation(&mut self, cx: &mut Context<Self>) {
+        self.refresh_spellcheck();
         let doc = self.editor.doc();
         let selection = self.editor.selection();
         let palette = Palette::of(cx);
-        let (content, decorations) = tokens::project(doc, &selection, self.was_focused, palette);
+        let (content, decorations) = tokens::project(
+            doc,
+            &selection,
+            self.was_focused,
+            palette,
+            &self.misspellings,
+        );
         self.input.update(cx, |state, cx| {
             if *state.text() == doc.text() {
                 if let Err(InlineTokenError::SplitsSelection) = state.set_tokens(content, cx) {

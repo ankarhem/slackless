@@ -11,8 +11,9 @@ use std::sync::Mutex;
 
 use crate::deep_link::{self, DeepLink};
 use crate::{
-    AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
-    Result, SecretStore, SoundPlayer, StatusBarAction, StatusBarItem, StatusBarState,
+    AboutPanel, AttentionRequester, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter,
+    Misspelling, Notifier, PlatformError, Result, SecretStore, SoundPlayer, SpellChecker,
+    StatusBarAction, StatusBarItem, StatusBarState,
 };
 
 /// No-op backend for platforms without a port yet.
@@ -126,4 +127,20 @@ impl StatusBarItem for FallbackPlatform {
     fn take_status_bar_action(&self) -> Option<StatusBarAction> {
         None
     }
+}
+
+impl AttentionRequester for FallbackPlatform {
+    fn request_attention(&self, _critical: bool) {}
+}
+
+impl SpellChecker for FallbackPlatform {
+    fn check_spelling(&self, _text: &str, _language: Option<&str>) -> Vec<Misspelling> {
+        Vec::new()
+    }
+
+    fn spelling_guesses(&self, _word: &str, _language: Option<&str>) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn learn_word(&self, _word: &str) {}
 }

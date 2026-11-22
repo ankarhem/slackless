@@ -407,6 +407,19 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn team_profile_fields(
         &self,
     ) -> impl Future<Output = api::Result<HashMap<String, String>>> + Send;
+    /// Submit a Block Kit modal view (`views.submit`).
+    fn views_submit(
+        &self,
+        view_id: String,
+        hash: Option<String>,
+        state_values: serde_json::Value,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Close a Block Kit modal view (`views.close`).
+    fn views_close(
+        &self,
+        view_id: String,
+        hash: Option<String>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -904,5 +917,18 @@ impl Backend for SlackApi {
 
     async fn team_profile_fields(&self) -> api::Result<HashMap<String, String>> {
         SlackApi::team_profile_get(self).await
+    }
+
+    async fn views_submit(
+        &self,
+        view_id: String,
+        hash: Option<String>,
+        state_values: serde_json::Value,
+    ) -> api::Result<()> {
+        SlackApi::views_submit(self, &view_id, hash.as_deref(), &state_values).await
+    }
+
+    async fn views_close(&self, view_id: String, hash: Option<String>) -> api::Result<()> {
+        SlackApi::views_close(self, &view_id, hash.as_deref()).await
     }
 }

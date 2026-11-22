@@ -49,6 +49,9 @@ use crate::slash::{self, Invocation};
 use menu::Menu;
 use tokens::Palette;
 
+/// Slack's per-file upload cap (1 GiB, `F-CORE-123`).
+pub const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// A file or clipboard image staged in the composer, waiting to upload on send.
 #[derive(Clone)]
 pub struct PendingAttachment {
@@ -197,6 +200,13 @@ pub struct Composer {
     edit_mode: bool,
     /// Files and pasted images staged for upload on send.
     attachments: Vec<PendingAttachment>,
+    /// Friendly warning when a chosen/dropped file exceeds Slack's 1 GB upload cap (`F-CORE-123`).
+    upload_warning: Option<String>,
+    /// Native OS spellchecking (`F-SHELL-098`, `F-SHELL-099`).
+    spellcheck: bool,
+    spellcheck_lang: Option<&'static str>,
+    misspellings: Vec<Range<usize>>,
+    spell_guesses: Option<(Range<usize>, String, Vec<String>)>,
     /// A GIF selected from the GIFs picker, staged in the composer until send or removal.
     pending_gif: Option<GifItem>,
     /// Removed/replaced staged GIF URLs awaiting GPU texture eviction on the next render.
@@ -294,6 +304,11 @@ impl Composer {
                 plus_last_click: None,
                 edit_mode,
                 attachments: Vec::new(),
+                upload_warning: None,
+                spellcheck: true,
+                spellcheck_lang: None,
+                misspellings: Vec::new(),
+                spell_guesses: None,
                 pending_gif: None,
                 stale_gif_urls: Vec::new(),
                 next_paste_id: 1,
@@ -369,6 +384,23 @@ impl Composer {
         self.enter_sends = enter_sends;
         self.input
             .update(cx, |state, cx| state.set_submit_on_enter(enter_sends, cx));
+    }
+
+    /// Enable/disable native OS spellchecking and pick its language (`F-SHELL-098`, `099`).
+    pub fn set_spellcheck(
+        &mut self,
+        enabled: bool,
+        language: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.spellcheck == enabled && self.spellcheck_lang == language {
+            return;
+        }
+        self.spellcheck = enabled;
+        self.spellcheck_lang = language;
+        self.refresh_spellcheck();
+        self.sync_presentation(cx);
+        cx.notify();
     }
 
     /// The current draft serialized for local persistence (mrkdwn + `<u>` underline).
@@ -694,19 +726,15 @@ impl Composer {
         if self.edit_mode || paths.is_empty() {
             return;
         }
+        self.upload_warning = None;
         cx.spawn(async move |this, cx| {
-            let loaded = cx
+            let (loaded, rejected) = cx
                 .background_executor()
                 .spawn(async move {
                     let mut out = Vec::new();
+                    let mut too_big = Vec::new();
                     for path in paths {
                         if !path.is_file() {
-                            continue;
-                        }
-                        let Ok(bytes) = std::fs::read(&path) else {
-                            continue;
-                        };
-                        if bytes.is_empty() {
                             continue;
                         }
                         let filename = path
@@ -714,6 +742,18 @@ impl Composer {
                             .and_then(|n| n.to_str())
                             .unwrap_or("file")
                             .to_owned();
+                        if let Ok(meta) = std::fs::metadata(&path) {
+                            if meta.len() > MAX_UPLOAD_BYTES {
+                                too_big.push(filename);
+                                continue;
+                            }
+                        }
+                        let Ok(bytes) = std::fs::read(&path) else {
+                            continue;
+                        };
+                        if bytes.is_empty() {
+                            continue;
+                        }
                         let preview = image_format_for_ext(&path)
                             .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
                         out.push(PendingAttachment {
@@ -722,14 +762,20 @@ impl Composer {
                             preview,
                         });
                     }
-                    out
+                    (out, too_big)
                 })
                 .await;
-            if loaded.is_empty() {
+            if loaded.is_empty() && rejected.is_empty() {
                 return;
             }
             let _ = this.update(cx, |composer, cx| {
                 composer.attachments.extend(loaded);
+                if !rejected.is_empty() {
+                    composer.upload_warning = Some(format!(
+                        "Skipped {} (exceeds Slack's 1 GB per-file upload limit).",
+                        rejected.join(", ")
+                    ));
+                }
                 cx.notify();
             });
         })

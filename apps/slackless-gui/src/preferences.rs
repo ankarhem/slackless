@@ -222,6 +222,8 @@ pub struct Settings {
     pub show_dock_badge: bool,
     /// Show a badge dot on any unread message, not only DMs & mentions (`F-SHELL-178`).
     pub badge_on_unreads: bool,
+    /// Bounce the dock icon on mentions & DMs while window is inactive (`F-SHELL-175`).
+    pub bounce_dock: bool,
     pub schedule_enabled: bool,
     pub schedule_days: usize,
     pub schedule_start: usize,
@@ -390,6 +392,7 @@ impl Default for Settings {
             mute_sounds: false,
             show_dock_badge: true,
             badge_on_unreads: false,
+            bounce_dock: true,
             schedule_enabled: true,
             schedule_days: 1,
             schedule_start: 9,
@@ -454,6 +457,12 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Apple / BCP-47 language tag for the chosen language preference (`F-SHELL-099`).
+    pub fn spellcheck_language(&self) -> Option<&'static str> {
+        const CODES: [&str; 7] = ["en_US", "en_GB", "sv", "de", "fr", "es", "ja"];
+        CODES.get(self.language).copied()
+    }
+
     /// Manual UTC offset in seconds when `timezone_auto` is off (`None` = system timezone).
     pub fn timezone_offset_secs(&self) -> Option<i64> {
         if self.timezone_auto {
@@ -938,6 +947,12 @@ impl Preferences {
             |s| &mut s.badge_on_unreads,
             cx,
         );
+        let bounce_dock = self.checkbox(
+            "notify-bounce-dock",
+            "Bounce the dock icon for mentions & direct messages",
+            |s| &mut s.bounce_dock,
+            cx,
+        );
         v_flex()
             .child(self.group(
                 "Notify me about\u{2026}",
@@ -976,7 +991,8 @@ impl Preferences {
                     .child(preview)
                     .child(mute)
                     .child(dock_badge)
-                    .child(badge_unreads),
+                    .child(badge_unreads)
+                    .child(bounce_dock),
                 cx,
             ))
     }

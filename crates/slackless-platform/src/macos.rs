@@ -15,19 +15,21 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAboutPanelOptionApplicationIcon, NSApplication, NSImage, NSMenu, NSMenuItem, NSSound,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAboutPanelOptionApplicationIcon, NSApplication, NSImage, NSMenu, NSMenuItem,
+    NSRequestUserAttentionType, NSSound, NSSpellChecker, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{
-    NSArray, NSBundle, NSData, NSDictionary, NSInteger, NSNumber, NSObject, NSSize, NSString,
-    NSUserDefaults,
+    NSArray, NSBundle, NSData, NSDictionary, NSInteger, NSNotFound, NSNumber, NSObject, NSRange,
+    NSSize, NSString, NSUserDefaults,
 };
 use security_framework::passwords::{self, PasswordOptions};
 
 use crate::deep_link::{self, DeepLink};
 use crate::{
-    AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
-    Result, SecretStore, SoundPlayer, StatusBarAction, StatusBarItem, StatusBarState,
+    AboutPanel, AttentionRequester, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter,
+    Misspelling, Notifier, PlatformError, Result, SecretStore, SoundPlayer, SpellChecker,
+    StatusBarAction, StatusBarItem, StatusBarState,
 };
 
 /// `errSecItemNotFound`, the documented OSStatus for a missing keychain item.
@@ -445,4 +447,122 @@ fn apply_status_bar(icon_png: Option<&[u8]>, state: &StatusBarState) {
 
         live.item.setMenu(Some(&menu));
     });
+}
+
+impl AttentionRequester for MacPlatform {
+    fn request_attention(&self, critical: bool) {
+        let apply = move || {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let app = NSApplication::sharedApplication(mtm);
+            let kind = if critical {
+                NSRequestUserAttentionType::CriticalRequest
+            } else {
+                NSRequestUserAttentionType::InformationalRequest
+            };
+            let _ = app.requestUserAttention(kind);
+        };
+        if MainThreadMarker::new().is_some() {
+            apply();
+        } else {
+            DispatchQueue::main().exec_async(apply);
+        }
+    }
+}
+
+/// Convert a UTF-16 code-unit offset into a UTF-8 byte offset inside `text`.
+fn utf16_to_utf8_offset(text: &str, utf16_offset: usize) -> Option<usize> {
+    let mut u16_pos = 0usize;
+    for (byte_ix, ch) in text.char_indices() {
+        if u16_pos == utf16_offset {
+            return Some(byte_ix);
+        }
+        u16_pos += ch.len_utf16();
+        if u16_pos > utf16_offset {
+            return None;
+        }
+    }
+    (u16_pos == utf16_offset).then_some(text.len())
+}
+
+impl SpellChecker for MacPlatform {
+    fn check_spelling(&self, text: &str, language: Option<&str>) -> Vec<Misspelling> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let Some(_mtm) = MainThreadMarker::new() else {
+            return Vec::new();
+        };
+        let checker = NSSpellChecker::sharedSpellChecker();
+        let ns_text = NSString::from_str(text);
+        let ns_lang = language.map(NSString::from_str);
+        let total_u16 = text.encode_utf16().count();
+        let mut offset: usize = 0;
+        let mut out = Vec::new();
+        while offset < total_u16 {
+            // SAFETY: valid NSString pointers, null wordCount out-param allowed by AppKit.
+            let found = unsafe {
+                checker.checkSpellingOfString_startingAt_language_wrap_inSpellDocumentWithTag_wordCount(
+                    &ns_text,
+                    offset as NSInteger,
+                    ns_lang.as_deref(),
+                    false,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if found.location == NSNotFound as usize || found.length == 0 || found.location < offset
+            {
+                break;
+            }
+            let end_u16 = found.location.saturating_add(found.length);
+            if let (Some(start), Some(end)) = (
+                utf16_to_utf8_offset(text, found.location),
+                utf16_to_utf8_offset(text, end_u16),
+            ) {
+                if start < end {
+                    out.push(Misspelling { range: start..end });
+                }
+            }
+            offset = end_u16.max(offset + 1);
+            if out.len() >= 64 {
+                break;
+            }
+        }
+        out
+    }
+
+    fn spelling_guesses(&self, word: &str, language: Option<&str>) -> Vec<String> {
+        if word.trim().is_empty() {
+            return Vec::new();
+        }
+        let Some(_mtm) = MainThreadMarker::new() else {
+            return Vec::new();
+        };
+        let checker = NSSpellChecker::sharedSpellChecker();
+        let ns_word = NSString::from_str(word);
+        let ns_lang = language.map(NSString::from_str);
+        let range = NSRange::new(0, word.encode_utf16().count());
+        let Some(guesses) = checker.guessesForWordRange_inString_language_inSpellDocumentWithTag(
+            range,
+            &ns_word,
+            ns_lang.as_deref(),
+            0,
+        ) else {
+            return Vec::new();
+        };
+        guesses.iter().take(5).map(|s| s.to_string()).collect()
+    }
+
+    fn learn_word(&self, word: &str) {
+        if word.trim().is_empty() {
+            return;
+        }
+        let Some(_mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let checker = NSSpellChecker::sharedSpellChecker();
+        checker.learnWord(&NSString::from_str(word));
+    }
 }
