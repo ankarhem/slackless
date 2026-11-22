@@ -177,13 +177,16 @@ pub struct SearchOpts {
     pub highlight: bool,
 }
 
-/// Body of a message to send or edit: fallback `text` plus Block Kit `blocks`.
+/// Body of a message to send or edit: fallback `text`, Block Kit `blocks`, and optional
+/// `attachments` (such as a GIF picked from the composer's GIFs tab).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageContent {
     /// Plain-text fallback (notifications, search, old clients).
     pub text: String,
     /// Usually one `rich_text` block, as the web client sends.
     pub blocks: Vec<Block>,
+    /// Optional attachments (e.g. Slack's block-only GIF image attachment).
+    pub attachments: Vec<Attachment>,
 }
 
 impl MessageContent {
@@ -194,6 +197,7 @@ impl MessageContent {
         Self {
             blocks: vec![RichTextBlock::plain_text(text.clone()).into()],
             text,
+            attachments: Vec::new(),
         }
     }
 
@@ -201,6 +205,9 @@ impl MessageContent {
         params.push(("text", self.text.clone()));
         if !self.blocks.is_empty() {
             params.push(("blocks", serde_json::to_string(&self.blocks)?));
+        }
+        if !self.attachments.is_empty() {
+            params.push(("attachments", serde_json::to_string(&self.attachments)?));
         }
         Ok(())
     }
@@ -2245,10 +2252,38 @@ pub struct GifItem {
     pub title: String,
     /// Single-frame 200w still thumbnail (`media_formats.tinygifpreview.url`) for cheap grid rendering.
     pub still_url: String,
-    /// Animated 200w thumbnail URL (`media_formats.tinygif.url`) played on hover.
+    /// Animated 200w thumbnail URL (`media_formats.tinygif.url`) played on hover and sent as the
+    /// `image` block's `image_url`, matching official Slack's `chat.postMessage` payload.
     pub preview_url: String,
-    /// Shareable Giphy URL (`url`) to send in a message, falling back to full GIF media URL.
+    /// Shareable Giphy URL (`url`), falling back to full GIF media URL.
     pub url: String,
+}
+
+impl GifItem {
+    /// Build the exact Block Kit `image` attachment official Slack sends via `chat.postMessage`
+    /// when posting a GIF selected from the composer's GIFs tab.
+    pub fn to_attachment(&self) -> Attachment {
+        let alt_text = if self.title.trim().is_empty() {
+            "GIF"
+        } else {
+            self.title.as_str()
+        };
+        let block = Block::from_value(serde_json::json!({
+            "type": "image",
+            "image_url": self.preview_url,
+            "alt_text": alt_text,
+            "title": {
+                "type": "plain_text",
+                "text": "GIF",
+                "emoji": true
+            }
+        }));
+        Attachment {
+            fallback: Some("shared a GIF".to_owned()),
+            blocks: vec![block],
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2756,6 +2791,23 @@ mod tests {
         assert_eq!(
             parsed[0].url,
             "https://giphy.com/gifs/will-smith-R7m04yMaGWVeE"
+        );
+        let attachment = parsed[0].to_attachment();
+        assert_eq!(
+            serde_json::to_value(&attachment).unwrap(),
+            serde_json::json!({
+                "fallback": "shared a GIF",
+                "blocks": [{
+                    "type": "image",
+                    "image_url": "https://media2.giphy.com/media/R7m04yMaGWVeE/200w.webp",
+                    "alt_text": "Will Smith Mib GIF",
+                    "title": {
+                        "type": "plain_text",
+                        "text": "GIF",
+                        "emoji": true
+                    }
+                }]
+            })
         );
     }
 }

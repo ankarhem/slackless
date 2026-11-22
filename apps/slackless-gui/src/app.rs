@@ -1115,7 +1115,7 @@ impl App {
                     window,
                     |this: &mut App, _, event: &EmojiPickerEvent, window, cx| match event {
                         EmojiPickerEvent::Pick(choice) => this.pick_emoji(choice, window, cx),
-                        EmojiPickerEvent::PickGif(url) => this.pick_gif(url, window, cx),
+                        EmojiPickerEvent::PickGif(gif) => this.pick_gif(gif, window, cx),
                         EmojiPickerEvent::RunGiphy(query) => this.run_giphy(query, window, cx),
                         EmojiPickerEvent::SearchGifs(query) => {
                             if !this.fixtures.sample {
@@ -2587,36 +2587,38 @@ impl App {
         cx.notify();
     }
 
-    /// Route a GIF chosen from the GIFs tab: send its URL into the active channel or thread.
-    fn pick_gif(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Route a GIF chosen from the GIFs tab: stage it inside the active composer (matching
+    /// official Slack, where clicking a GIF attaches it to the draft rather than sending).
+    fn pick_gif(
+        &mut self,
+        gif: &slackless_core::api::GifItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((target, _)) = self.picker.take() else {
             return;
         };
         self.emoji_picker
             .update(cx, |picker, cx| picker.release_gifs(window, cx));
-        let content = MessageContent::plain(url.to_owned());
         match target {
+            PickerTarget::Composer => {
+                self.composer.update(cx, |composer, cx| {
+                    composer.stage_gif(gif.clone(), window, cx)
+                });
+            }
             PickerTarget::ThreadComposer => {
-                if let Some((channel, thread_ts)) = self.thread.read(cx).open_thread() {
-                    self.bridge.send(Command::SendMessage {
-                        channel,
-                        content,
-                        thread_ts: Some(thread_ts),
-                        broadcast: false,
-                    });
-                }
+                self.thread
+                    .update(cx, |thread, cx| thread.stage_gif(gif.clone(), window, cx));
             }
             PickerTarget::ThreadsComposer => {
-                if let Some((channel, thread_ts)) = self.threads.read(cx).active_thread() {
-                    self.bridge.send(Command::SendMessage {
-                        channel,
-                        content,
-                        thread_ts: Some(thread_ts),
-                        broadcast: false,
-                    });
-                }
+                self.threads
+                    .update(cx, |view, cx| view.stage_gif(gif.clone(), window, cx));
             }
-            _ => self.send(content, window, cx),
+            PickerTarget::ComposeView => {
+                self.compose
+                    .update(cx, |view, cx| view.stage_gif(gif.clone(), window, cx));
+            }
+            _ => {}
         }
         cx.notify();
     }
@@ -4989,19 +4991,29 @@ impl App {
 
     fn deliver_send(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         let channel = self.channel.clone();
-        // The local echo shows the same blocks the message posts with.
+        // The local echo shows the same blocks & attachments the message posts with.
         let mut message = self
             .fixtures
             .local_message(&channel, content.text.clone(), None);
         message.blocks = content.blocks.clone();
+        message.attachments = content.attachments.clone();
         self.messages
             .update(cx, |list, cx| list.append(channel.clone(), message, cx));
+        let sent_text = if content.text.is_empty() {
+            content
+                .attachments
+                .first()
+                .and_then(|a| a.fallback.clone())
+                .unwrap_or_default()
+        } else {
+            content.text.clone()
+        };
         let entry = Entry {
             id: None,
             workspace: self.workspace,
             channel: channel.clone(),
             label: self.label(&channel),
-            text: content.text.clone(),
+            text: sent_text,
             at: now_secs(),
         };
         self.drafts
@@ -5057,6 +5069,7 @@ impl App {
             let mut message = self.fixtures.local_message(&channel, text, thread_ts);
             if let Some(content) = content {
                 message.blocks = content.blocks;
+                message.attachments = content.attachments;
             }
             message.files = files
                 .into_iter()

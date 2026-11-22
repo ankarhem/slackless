@@ -536,82 +536,137 @@ impl Composer {
             .into_any_element()
     }
 
-    /// Staged attachment chips / image thumbnails rendered inside the composer above the action row.
+    /// Staged attachment chips / image thumbnails / GIF preview rendered inside the composer
+    /// above the action row.
     pub(super) fn attachments_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
-        if self.attachments.is_empty() {
+        if self.attachments.is_empty() && self.pending_gif.is_none() {
             return None;
         }
         let theme = cx.theme();
-        let (border, secondary, foreground, muted) = (
+        let (border, secondary, foreground, muted, popover, popover_fg) = (
             theme.border,
             theme.secondary,
             theme.foreground,
             theme.muted_foreground,
+            theme.popover,
+            theme.popover_foreground,
         );
-        Some(h_flex().flex_wrap().gap_2().px_3().pb_1p5().children(
-            self.attachments.iter().enumerate().map(|(ix, file)| {
-                let thumb = match &file.preview {
-                    Some(preview) => img(ImageSource::Image(preview.clone()))
-                        .size(px(36.))
-                        .rounded_sm()
-                        .object_fit(ObjectFit::Cover)
-                        .flex_none()
-                        .into_any_element(),
-                    None => div()
-                        .size(px(36.))
-                        .flex_none()
-                        .rounded_sm()
+        let gif_card = self.pending_gif.as_ref().map(|gif| {
+            div()
+                .id("staged-gif-card")
+                .group("staged-gif")
+                .relative()
+                .flex_none()
+                .size(px(62.))
+                .child(
+                    div()
+                        .size_full()
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(foreground.opacity(0.12))
                         .bg(secondary)
+                        .child(
+                            crate::media::Picture::new(gif.preview_url.clone())
+                                .fit(ObjectFit::Cover)
+                                .radius(px(8.)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("staged-gif-rm")
+                        .absolute()
+                        .top(px(-6.))
+                        .right(px(-6.))
+                        .size(px(20.))
+                        .rounded_full()
+                        .bg(popover)
+                        .border_1()
+                        .border_color(foreground.opacity(0.22))
+                        .shadow_sm()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(Icon::new(IconName::File).size(px(18.)).text_color(muted))
-                        .into_any_element(),
-                };
-                h_flex()
-                    .id(("attach-chip", ix))
-                    .items_center()
-                    .gap_2()
-                    .pl_1p5()
-                    .pr_1()
-                    .py_1()
-                    .max_w(px(220.))
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .bg(secondary.opacity(0.6))
-                    .child(thumb)
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(foreground)
-                                    .child(file.filename.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(super::format_bytes(file.bytes.len())),
-                            ),
-                    )
-                    .child(
-                        Button::new(("attach-rm", ix))
-                            .ghost()
-                            .with_size(Size::XSmall)
-                            .icon(IconName::X)
-                            .tooltip("Remove attachment")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_attachment(ix, cx);
-                            })),
-                    )
-            }),
-        ))
+                        .cursor_pointer()
+                        .invisible()
+                        .group_hover("staged-gif", |el| el.visible())
+                        .tooltip(|window, cx| tip_view("Remove GIF", &[], window, cx))
+                        .child(Icon::new(IconName::X).size(px(12.)).text_color(popover_fg))
+                        .on_click(cx.listener(|this, _, _, cx| this.remove_gif(cx))),
+                )
+        });
+        Some(
+            h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .when(self.pending_gif.is_some(), |el| el.pt_1p5())
+                .pb_1p5()
+                .children(gif_card)
+                .children(self.attachments.iter().enumerate().map(|(ix, file)| {
+                    let thumb = match &file.preview {
+                        Some(preview) => img(ImageSource::Image(preview.clone()))
+                            .size(px(36.))
+                            .rounded_sm()
+                            .object_fit(ObjectFit::Cover)
+                            .flex_none()
+                            .into_any_element(),
+                        None => div()
+                            .size(px(36.))
+                            .flex_none()
+                            .rounded_sm()
+                            .bg(secondary)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::File).size(px(18.)).text_color(muted))
+                            .into_any_element(),
+                    };
+                    h_flex()
+                        .id(("attach-chip", ix))
+                        .items_center()
+                        .gap_2()
+                        .pl_1p5()
+                        .pr_1()
+                        .py_1()
+                        .max_w(px(220.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(secondary.opacity(0.6))
+                        .child(thumb)
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(foreground)
+                                        .child(file.filename.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(super::format_bytes(file.bytes.len())),
+                                ),
+                        )
+                        .child(
+                            Button::new(("attach-rm", ix))
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::X)
+                                .tooltip("Remove attachment")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_attachment(ix, cx);
+                                })),
+                        )
+                })),
+        )
     }
 
     /// Slack's always-visible row under the draft: attach, format, emoji, mention, clips and
@@ -622,8 +677,8 @@ impl Composer {
         let secondary = theme.secondary;
         let (primary, primary_foreground, primary_hover) =
             (theme.primary, theme.primary_foreground, theme.primary_hover);
-        let can_send =
-            !self.editor.doc().is_blank() || (!self.edit_mode && !self.attachments.is_empty());
+        let can_send = !self.editor.doc().is_blank()
+            || (!self.edit_mode && (!self.attachments.is_empty() || self.pending_gif.is_some()));
         let icon = |name: IconName| Icon::new(name).text_color(muted).size(px(15.));
         let separator = || div().w(px(1.)).h(px(16.)).rounded_full().bg(border);
         // Window chrome: Slack's controls for features slackless does not have yet.

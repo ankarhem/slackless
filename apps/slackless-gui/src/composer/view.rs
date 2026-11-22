@@ -47,6 +47,9 @@ impl Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for stale in self.stale_gif_urls.drain(..) {
+            crate::emoji::evict_gif_asset(&stale, window, cx);
+        }
         if let Some(placeholder) = self.pending_placeholder.take() {
             let placeholder = match placeholder {
                 Placeholder::Text(text) => {

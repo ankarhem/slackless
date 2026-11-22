@@ -185,6 +185,17 @@ impl NewMessageView {
         self.composer
             .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
+
+    /// Stage a GIF pick inside the composer.
+    pub fn stage_gif(
+        &mut self,
+        gif: slackless_core::api::GifItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer
+            .update(cx, |composer, cx| composer.stage_gif(gif, window, cx));
+    }
 }
 
 impl Render for NewMessageView {

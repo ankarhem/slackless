@@ -2227,6 +2227,8 @@ pub(crate) mod tests {
             let message = Message {
                 ts: ts.clone(),
                 text: content.text,
+                blocks: content.blocks,
+                attachments: content.attachments,
                 ..Default::default()
             };
             Ok(PostedMessage {

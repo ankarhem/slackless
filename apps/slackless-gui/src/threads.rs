@@ -393,6 +393,17 @@ impl ThreadPanel {
             .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
 
+    /// Stage a GIF pick inside the reply composer.
+    pub fn stage_gif(
+        &mut self,
+        gif: slackless_core::api::GifItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer
+            .update(cx, |composer, cx| composer.stage_gif(gif, window, cx));
+    }
+
     /// Up in the empty reply box: edit the signed-in user's latest reply in this thread.
     fn edit_last_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = &self.fixtures.self_user;
@@ -441,6 +452,7 @@ impl ThreadPanel {
             self.fixtures
                 .local_message(&channel, content.text.clone(), Some(thread_ts.clone()));
         message.blocks = content.blocks.clone();
+        message.attachments = content.attachments.clone();
         self.replies.push(message);
         self.reply_hint = false;
         let broadcast = self

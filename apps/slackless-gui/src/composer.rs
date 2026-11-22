@@ -37,7 +37,7 @@ use gpui_kit::gpui::{
     Image, ImageFormat, ParentElement as _, PathPromptOptions, Pixels, Point, SharedString,
     Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::api::MessageContent;
+use slackless_core::api::{GifItem, MessageContent};
 use slackless_core::types::Message;
 
 use crate::drafts::SendLater;
@@ -194,6 +194,10 @@ pub struct Composer {
     edit_mode: bool,
     /// Files and pasted images staged for upload on send.
     attachments: Vec<PendingAttachment>,
+    /// A GIF selected from the GIFs picker, staged in the composer until send or removal.
+    pending_gif: Option<GifItem>,
+    /// Removed/replaced staged GIF URLs awaiting GPU texture eviction on the next render.
+    stale_gif_urls: Vec<String>,
     /// Counter for naming pasted clipboard images (`image-1.png`, `image-2.png`, ...).
     next_paste_id: usize,
     /// Who the notification bar says is typing.
@@ -210,6 +214,7 @@ fn content(doc: &Doc) -> MessageContent {
     MessageContent {
         text: doc.to_mrkdwn(),
         blocks: vec![doc.to_rich_text().into()],
+        attachments: Vec::new(),
     }
 }
 
@@ -286,6 +291,8 @@ impl Composer {
                 plus_last_click: None,
                 edit_mode,
                 attachments: Vec::new(),
+                pending_gif: None,
+                stale_gif_urls: Vec::new(),
                 next_paste_id: 1,
                 typing: None,
                 typing_sent: None,
@@ -371,6 +378,9 @@ impl Composer {
         self.editor.load(from_mrkdwn(draft, &*self.fixtures));
         self.is_stale = true;
         self.link_open = false;
+        if let Some(old) = self.pending_gif.take() {
+            self.stale_gif_urls.push(old.preview_url);
+        }
         self.changed(cx);
     }
 
@@ -406,6 +416,34 @@ impl Composer {
         self.focus_input(window, cx);
         self.push(window, cx);
         self.changed(cx);
+    }
+
+    /// Stage a GIF selected from the GIFs picker inside the composer (matching Slack's
+    /// single-GIF staging card: picking another GIF replaces the previous one) and focus
+    /// the draft so pressing Enter sends immediately or lets the user add text first.
+    pub fn stage_gif(&mut self, gif: GifItem, window: &mut Window, cx: &mut Context<Self>) {
+        if self.edit_mode {
+            return;
+        }
+        if let Some(old) = self.pending_gif.replace(gif) {
+            if self
+                .pending_gif
+                .as_ref()
+                .is_none_or(|cur| cur.preview_url != old.preview_url)
+            {
+                self.stale_gif_urls.push(old.preview_url);
+            }
+        }
+        self.was_focused = true;
+        self.focus_input(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn remove_gif(&mut self, cx: &mut Context<Self>) {
+        if let Some(old) = self.pending_gif.take() {
+            self.stale_gif_urls.push(old.preview_url);
+            cx.notify();
+        }
     }
 
     pub(crate) fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -675,13 +713,41 @@ impl Composer {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.edit_mode && !self.attachments.is_empty() {
             let files = std::mem::take(&mut self.attachments);
+            let gif = self.pending_gif.take();
             let doc = self.take(window, cx);
+            let msg = match (doc, gif) {
+                (Some(doc), Some(gif)) => {
+                    let mut c = content(&doc);
+                    c.attachments.push(gif.to_attachment());
+                    Some(c)
+                }
+                (Some(doc), None) => Some(content(&doc)),
+                (None, Some(gif)) => Some(MessageContent {
+                    text: String::new(),
+                    blocks: Vec::new(),
+                    attachments: vec![gif.to_attachment()],
+                }),
+                (None, None) => None,
+            };
             cx.emit(ComposerEvent::SubmitWithFiles {
-                content: doc.as_ref().map(content),
+                content: msg,
                 files,
             });
             cx.notify();
             return;
+        }
+        if !self.edit_mode {
+            if let Some(gif) = self.pending_gif.take() {
+                let doc = self.take(window, cx);
+                let mut msg = match doc {
+                    Some(doc) => content(&doc),
+                    None => MessageContent::default(),
+                };
+                msg.attachments.push(gif.to_attachment());
+                cx.emit(ComposerEvent::Submit(msg));
+                cx.notify();
+                return;
+            }
         }
         let Some(doc) = self.take(window, cx) else {
             return;

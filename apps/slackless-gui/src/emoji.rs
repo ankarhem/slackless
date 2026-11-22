@@ -710,8 +710,8 @@ pub struct EmojiChoice {
 
 pub enum EmojiPickerEvent {
     Pick(EmojiChoice),
-    /// A GIF tile from `gif.featured` / `gif.search` was clicked: send its URL.
-    PickGif(String),
+    /// A GIF tile from `gif.featured` / `gif.search` was clicked: stage it in the composer.
+    PickGif(GifItem),
     /// Request featured GIFs (`""`) or search GIFs (`query`) from Slack's `gif.*` API.
     SearchGifs(String),
     /// Run `/giphy <query>` in fixture/fallback mode.
@@ -773,7 +773,7 @@ pub struct EmojiPicker {
 impl EventEmitter<EmojiPickerEvent> for EmojiPicker {}
 
 /// Evict a single GIF URL's decoded frames and Metal textures from GPUI's window & asset cache.
-fn evict_gif_asset(url: &str, window: &mut Window, cx: &mut gpui_kit::gpui::App) {
+pub(crate) fn evict_gif_asset(url: &str, window: &mut Window, cx: &mut gpui_kit::gpui::App) {
     let source = ImageSource::from(url.to_owned());
     if let ImageSource::Resource(ref resource) = source {
         if let Some(Ok(data)) = window.get_asset::<gpui_kit::gpui::ImgResourceLoader>(resource, cx)
@@ -828,7 +828,7 @@ impl EmojiPicker {
                         }
                         PickerTab::Gifs => {
                             if let Some(first) = this.gif_results.first().cloned() {
-                                cx.emit(EmojiPickerEvent::PickGif(first.url));
+                                cx.emit(EmojiPickerEvent::PickGif(first));
                             } else {
                                 let query = this.gif_query.trim().to_owned();
                                 if !query.is_empty() {
@@ -1279,7 +1279,7 @@ impl EmojiPicker {
                         .gap_2()
                         .children(items.iter().enumerate().map(|(col, gif)| {
                             let idx = start + col;
-                            let url = gif.url.clone();
+                            let picked = gif.clone();
                             let title = SharedString::from(gif.title.clone());
                             let is_hovered = self.hovered_gif == Some(idx);
                             let anim_url = gif.preview_url.clone();
@@ -1336,7 +1336,7 @@ impl EmojiPicker {
                                     }
                                 }))
                                 .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(EmojiPickerEvent::PickGif(url.clone()));
+                                    cx.emit(EmojiPickerEvent::PickGif(picked.clone()));
                                 }))
                         }))
                         .into_any_element(),

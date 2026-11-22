@@ -184,63 +184,84 @@ pub struct BotIcons {
     pub emoji: Option<String>,
 }
 
-/// A legacy attachment; today mostly server-side link unfurls (`from_url` set) and app cards.
+/// A legacy attachment; today mostly server-side link unfurls (`from_url` set), app cards,
+/// and block-only attachments such as picker GIFs.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
-    #[serde(default, deserialize_with = "lenient_i64")]
+    #[serde(
+        default,
+        deserialize_with = "lenient_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
     /// Hex color (with or without `#`) or `good`/`warning`/`danger`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pretext: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_link: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author_icon: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_link: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumb_url: Option<String>,
     /// The unfurled URL.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_url: Option<String>,
     /// A shared-message unfurl (`is_msg_unfurl`): the conversation the shared message lives
     /// in, so the UI can name "Thread in <channel>" even when it is not in the local store.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<ChannelId>,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "is_false"
+    )]
     pub is_msg_unfurl: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_icon: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer_icon: Option<String>,
     /// Number or string depending on the producer.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<Value>,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub fields: Vec<AttachmentField>,
-    #[serde(default, deserialize_with = "null_default")]
+    #[serde(
+        default,
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub blocks: Vec<Block>,
     /// Fields this crate does not model (`actions`, `mrkdwn_in`, ...), preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A title/value pair inside an attachment.

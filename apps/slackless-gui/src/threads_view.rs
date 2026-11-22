@@ -180,6 +180,17 @@ impl ThreadsView {
             .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
 
+    /// Stage a GIF pick inside the reply composer.
+    pub fn stage_gif(
+        &mut self,
+        gif: slackless_core::api::GifItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer
+            .update(cx, |composer, cx| composer.stage_gif(gif, window, cx));
+    }
+
     /// The thread the reply composer is docked to, where a slash command typed there runs.
     pub fn active_thread(&self) -> Option<(ChannelId, Ts)> {
         let card = self.cards.get(self.active?)?;
@@ -200,6 +211,7 @@ impl ThreadsView {
             Some(card.thread_ts.clone()),
         );
         message.blocks = content.blocks.clone();
+        message.attachments = content.attachments.clone();
         card.replies.push(message);
         card.reply_total += 1;
         cx.emit(ThreadsEvent::Reply {

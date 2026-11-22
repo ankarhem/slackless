@@ -1381,13 +1381,24 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         );
     }
 
+    // Pure block attachments without a color (such as picker GIFs) render flush-left with no
+    // vertical color bar, matching official Slack.
+    let has_bar = attachment.color.is_some()
+        || attachment.blocks.is_empty()
+        || attachment.author_name.is_some()
+        || attachment.title.is_some()
+        || attachment.text.is_some()
+        || !attachment.fields.is_empty()
+        || attachment.image_url.is_some()
+        || attachment.footer.is_some();
+
     v_flex()
         .gap_1()
         .min_w_0()
         .when_some(attachment.pretext.as_deref(), |card, pretext| {
             card.child(messages::mrkdwn(pretext, kcx, false, false, cx))
         })
-        .child(
+        .child(if has_bar {
             h_flex()
                 .items_stretch()
                 .gap_3()
@@ -1399,6 +1410,9 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                         .rounded_full()
                         .bg(bar_color(attachment.color.as_deref(), cx)),
                 )
-                .child(body),
-        )
+                .child(body)
+                .into_any_element()
+        } else {
+            body.into_any_element()
+        })
 }
