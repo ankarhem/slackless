@@ -44,6 +44,25 @@ pub struct Revision {
     pub message: Message,
 }
 
+/// Summary metrics for the local SQLite database (`Preferences -> Advanced -> Local storage`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreStats {
+    pub messages: u64,
+    pub revisions: u64,
+    pub conversations: u64,
+    pub users: u64,
+    pub offline_queued: u64,
+    pub page_count: u64,
+    pub page_size: u64,
+}
+
+impl StoreStats {
+    /// Total allocated SQLite database bytes (`page_count * page_size`).
+    pub fn db_bytes(&self) -> u64 {
+        self.page_count.saturating_mul(self.page_size)
+    }
+}
+
 /// Durable local-first message store; the rendering source of truth.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -932,6 +951,101 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(args), raw_row)?;
         collect(rows)
+    }
+
+    /// Summary statistics for `workspace` and overall SQLite database footprint.
+    pub fn stats(&self, workspace: &TeamId) -> Result<StoreStats> {
+        let ws = workspace.as_str();
+        let messages: i64 = self.conn.query_row(
+            "SELECT count(*) FROM message_current WHERE workspace_id = ?1",
+            params![ws],
+            |r| r.get(0),
+        )?;
+        let revisions: i64 = self.conn.query_row(
+            "SELECT count(*) FROM message_revision WHERE workspace_id = ?1",
+            params![ws],
+            |r| r.get(0),
+        )?;
+        let conversations: i64 = self.conn.query_row(
+            "SELECT count(*) FROM conversation WHERE workspace_id = ?1",
+            params![ws],
+            |r| r.get(0),
+        )?;
+        let users: i64 = self.conn.query_row(
+            "SELECT count(*) FROM \"user\" WHERE workspace_id = ?1",
+            params![ws],
+            |r| r.get(0),
+        )?;
+        let offline_queued: i64 = self.conn.query_row(
+            "SELECT count(*) FROM offline_queue WHERE workspace_id = ?1",
+            params![ws],
+            |r| r.get(0),
+        )?;
+        let page_count: i64 = self
+            .conn
+            .pragma_query_value(None, "page_count", |r| r.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .pragma_query_value(None, "page_size", |r| r.get(0))?;
+        Ok(StoreStats {
+            messages: messages.max(0) as u64,
+            revisions: revisions.max(0) as u64,
+            conversations: conversations.max(0) as u64,
+            users: users.max(0) as u64,
+            offline_queued: offline_queued.max(0) as u64,
+            page_count: page_count.max(0) as u64,
+            page_size: page_size.max(0) as u64,
+        })
+    }
+
+    /// Checkpoint WAL, compact unused pages (`VACUUM`), and refresh query planner statistics.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             VACUUM;
+             PRAGMA optimize;",
+        )?;
+        Ok(())
+    }
+
+    /// Append a serialized offline mutation payload for `workspace`, returning its row id.
+    pub fn enqueue_offline(&self, workspace: &TeamId, payload: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO offline_queue (workspace_id, payload, created_at) VALUES (?1, ?2, ?3)",
+            params![workspace.as_str(), payload, now_secs()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// List persisted offline mutations for `workspace` in FIFO order `(id, payload)`.
+    pub fn list_offline(&self, workspace: &TeamId) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, payload FROM offline_queue WHERE workspace_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Remove one persisted offline mutation by row id (after flush or user discard).
+    pub fn delete_offline(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM offline_queue WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Remove all persisted offline mutations for `workspace`.
+    pub fn clear_offline(&self, workspace: &TeamId) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM offline_queue WHERE workspace_id = ?1",
+            params![workspace.as_str()],
+        )?;
+        Ok(())
     }
 }
 
@@ -1943,5 +2057,35 @@ mod tests {
         );
         assert_eq!(ts_key(&Ts::from("1700000000.1")), 1_700_000_000_100_000);
         assert_eq!(ts_key(&Ts::from("1700000000")), 1_700_000_000_000_000);
+    }
+
+    #[test]
+    fn stats_vacuum_and_offline_queue_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        let m1 = msg("1700000001.000100", "U1", "hello storage");
+        store.upsert_message(&ws(), &general(), &m1).unwrap();
+        let id1 = store.enqueue_offline(&ws(), "{\"a\":1}").unwrap();
+        let id2 = store.enqueue_offline(&ws(), "{\"b\":2}").unwrap();
+        assert!(id2 > id1);
+
+        let stats = store.stats(&ws()).unwrap();
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.revisions, 1);
+        assert_eq!(stats.offline_queued, 2);
+        assert!(stats.db_bytes() > 0);
+
+        assert_eq!(
+            store.list_offline(&ws()).unwrap(),
+            vec![(id1, "{\"a\":1}".to_owned()), (id2, "{\"b\":2}".to_owned())]
+        );
+        store.delete_offline(id1).unwrap();
+        assert_eq!(
+            store.list_offline(&ws()).unwrap(),
+            vec![(id2, "{\"b\":2}".to_owned())]
+        );
+        store.clear_offline(&ws()).unwrap();
+        assert!(store.list_offline(&ws()).unwrap().is_empty());
+
+        store.vacuum().unwrap();
     }
 }

@@ -473,6 +473,7 @@ struct Parked {
     active_huddles: HashMap<ChannelId, Vec<UserId>>,
     connection: Option<slackless_core::rtm::ConnectionState>,
     offline_queued: usize,
+    failed_mutations: Vec<slackless_core::FailedMutation>,
     member_counts: HashMap<ChannelId, u32>,
     app_counts: HashMap<ChannelId, u32>,
     history_complete: HashSet<ChannelId>,
@@ -678,6 +679,8 @@ pub struct App {
     connection: Option<slackless_core::rtm::ConnectionState>,
     /// Live mode: outgoing mutations buffered while offline, waiting to flush on reconnect.
     offline_queued: usize,
+    /// Live mode: offline mutations that failed to flush and await user Retry or Discard.
+    failed_mutations: Vec<slackless_core::FailedMutation>,
     /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.
     usergroups: Vec<Usergroup>,
     /// Live mode: workspace slash commands from `client.appCommands`, injected into snapshots.
@@ -1259,6 +1262,8 @@ impl App {
                     |this: &mut App, _, event: &PreferencesEvent, window, cx| match event {
                         PreferencesEvent::Changed => this.apply_preferences(window, cx),
                         PreferencesEvent::ResetCache => this.confirm_reset_cache(window, cx),
+                        PreferencesEvent::CompactStorage => this.compact_storage(window, cx),
+                        PreferencesEvent::PruneMediaCache => this.prune_media_cache(window, cx),
                     },
                 ),
                 cx.observe_window_appearance(window, |this: &mut App, window, cx| {
@@ -1748,6 +1753,7 @@ impl App {
                 peer_dnd_paused: HashMap::new(),
                 connection: None,
                 offline_queued: 0,
+                failed_mutations: Vec::new(),
                 usergroups: Vec::new(),
                 app_commands: Vec::new(),
                 visits: HashMap::new(),
@@ -3996,10 +4002,15 @@ impl App {
         self.push_self_state(cx);
     }
 
-    /// Sign out of the workspace at `index`: Slack forgets its session and returns to sign-in;
-    /// slackless removes the stored session (Keychain included) and quits, and the next launch
-    /// runs the sign-in helper.
+    /// Sign out of the workspace at `index`: revokes the token server-side (`auth.revoke`,
+    /// `F-CORE-009`), removes the stored session (Keychain included), and quits so the next
+    /// launch runs the sign-in helper.
     fn sign_out(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == self.workspace {
+            self.bridge.send(Command::SignOut);
+        } else if let Some(Some(bridge)) = self.parked_bridges.get(index) {
+            bridge.send(Command::SignOut);
+        }
         if let Some(team) = self.fixtures.workspaces.get(index) {
             if let Err(e) =
                 slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
@@ -4017,6 +4028,7 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_storage_stats(cx);
         if let Some(section) = section {
             self.preferences
                 .update(cx, |prefs, cx| prefs.show(section, cx));
@@ -4990,6 +5002,118 @@ impl App {
         });
     }
 
+    /// Gather SQLite & media cache metrics for the active workspace and push them into
+    /// `Preferences -> Advanced -> Local storage & maintenance`.
+    fn refresh_storage_stats(&self, cx: &mut Context<Self>) {
+        fn dir_bytes(dir: &std::path::Path) -> u64 {
+            std::fs::read_dir(dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        }
+        let info = self
+            .bridge
+            .store()
+            .zip(self.bridge.team_id())
+            .and_then(|(store, team)| {
+                let stats = store.lock().ok()?.stats(team).ok()?;
+                let media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
+                    .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
+                Some(crate::preferences::StorageInfo {
+                    messages: stats.messages,
+                    revisions: stats.revisions,
+                    conversations: stats.conversations,
+                    users: stats.users,
+                    offline_queued: stats.offline_queued,
+                    db_bytes: stats.db_bytes(),
+                    media_cache_bytes,
+                })
+            });
+        self.preferences
+            .update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA optimize;` on the active workspace store.
+    fn compact_storage(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((store, team)) = self.bridge.store().zip(self.bridge.team_id()) else {
+            notify(
+                "No local database",
+                "Compact is available in live workspaces.",
+                window,
+                cx,
+            );
+            return;
+        };
+        let before = store
+            .lock()
+            .ok()
+            .and_then(|s| s.stats(team).ok())
+            .map(|s| s.db_bytes())
+            .unwrap_or(0);
+        let res = store.lock().ok().map(|s| s.vacuum());
+        match res {
+            Some(Ok(())) => {
+                let after = store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.stats(team).ok())
+                    .map(|s| s.db_bytes())
+                    .unwrap_or(0);
+                self.refresh_storage_stats(cx);
+                let saved = before.saturating_sub(after);
+                let msg = if saved > 0 {
+                    format!("Reclaimed {} KiB and optimized FTS5 indexes.", saved / 1024)
+                } else {
+                    "Database is already compact; FTS5 statistics refreshed.".to_owned()
+                };
+                notify("Database compacted", msg, window, cx);
+            }
+            Some(Err(err)) => {
+                notify("Compact failed", err.to_string(), window, cx);
+            }
+            None => {
+                notify(
+                    "Compact failed",
+                    "Could not acquire database lock.",
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Prune temporary downloaded media cache files (`slackless-media` + `slackless-audio`).
+    fn prune_media_cache(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut removed = 0u64;
+        for folder in ["slackless-media", "slackless-audio"] {
+            let dir = std::env::temp_dir().join(folder);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                            removed = removed.saturating_add(meta.len());
+                        }
+                    }
+                }
+            }
+        }
+        self.refresh_storage_stats(cx);
+        let msg = if removed > 0 {
+            format!(
+                "Removed {} KiB of cached media files.",
+                (removed / 1024).max(1)
+            )
+        } else {
+            "Media cache was already clean.".to_owned()
+        };
+        notify("Media cache pruned", msg, window, cx);
+    }
+
     /// Search messages for `query`, showing results in place of the message column. The
     /// pill's Enter and the dropdown's rows both land here; the dropdown's filter chips
     /// (and only its non-empty query) narrow the run and join its history.
@@ -5388,6 +5512,13 @@ impl App {
                     parked.offline_queued = *count;
                 }
             }
+            Event::OfflineMutationFailed(failed) => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    if !parked.failed_mutations.iter().any(|m| m.id == failed.id) {
+                        parked.failed_mutations.push(failed.clone());
+                    }
+                }
+            }
             Event::Presence { users, presence } => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     parked
@@ -5659,6 +5790,12 @@ impl App {
             Event::OfflineQueueChanged(count) => {
                 self.offline_queued = *count;
                 cx.notify();
+            }
+            Event::OfflineMutationFailed(failed) => {
+                if !self.failed_mutations.iter().any(|m| m.id == failed.id) {
+                    self.failed_mutations.push(failed.clone());
+                    cx.notify();
+                }
             }
             Event::SelfDndUpdated(status) => {
                 self.self_state.paused_until = status
@@ -6629,6 +6766,7 @@ impl App {
                     active_huddles: HashMap::new(),
                     connection: None,
                     offline_queued: 0,
+                    failed_mutations: Vec::new(),
                     member_counts: HashMap::new(),
                     app_counts: HashMap::new(),
                     history_complete: HashSet::new(),
@@ -6650,6 +6788,7 @@ impl App {
             active_huddles: mem::replace(&mut self.active_huddles, incoming.active_huddles),
             connection: mem::replace(&mut self.connection, incoming.connection),
             offline_queued: mem::replace(&mut self.offline_queued, incoming.offline_queued),
+            failed_mutations: mem::replace(&mut self.failed_mutations, incoming.failed_mutations),
             member_counts: mem::replace(&mut self.member_counts, incoming.member_counts),
             app_counts: mem::replace(&mut self.app_counts, incoming.app_counts),
             history_complete: mem::replace(&mut self.history_complete, incoming.history_complete),
@@ -7678,6 +7817,7 @@ impl Render for App {
             let column = v_flex()
                 .size_full()
                 .children(self.connection_banner(cx))
+                .children(self.failed_mutations_banner(cx))
                 .child(header);
             let column = match (&self.huddle, self.huddle_open) {
                 (Some((_, bar)), true) => column.child(bar.clone()),
@@ -8580,6 +8720,98 @@ impl App {
                         .text_color(theme.warning),
                 )
                 .child(div().text_xs().text_color(theme.foreground).child(text)),
+        )
+    }
+
+    /// Clickable Retry / Discard bar shown when one or more persisted offline mutations failed
+    /// while flushing after reconnect.
+    fn failed_mutations_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        if self.failed_mutations.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (danger, fg, muted) = (theme.danger, theme.foreground, theme.muted_foreground);
+        let rows: Vec<_> =
+            self.failed_mutations
+                .iter()
+                .map(|item| {
+                    let retry_id = item.id;
+                    let discard_id = item.id;
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .size(px(14.))
+                                        .text_color(danger),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(fg)
+                                        .child(format!("Failed to send: {}", item.summary)),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("({})", item.error)),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "offline-retry-{retry_id}"
+                                    )))
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .label("Retry")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.failed_mutations.retain(|m| m.id != retry_id);
+                                        this.bridge.send(Command::RetryOfflineMutation(retry_id));
+                                        cx.notify();
+                                    })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "offline-discard-{discard_id}"
+                                    )))
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .label("Discard")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.failed_mutations.retain(|m| m.id != discard_id);
+                                        this.bridge
+                                            .send(Command::DiscardOfflineMutation(discard_id));
+                                        cx.notify();
+                                    })),
+                                ),
+                        )
+                })
+                .collect();
+        Some(
+            v_flex()
+                .flex_none()
+                .gap_1()
+                .px_4()
+                .py_1p5()
+                .bg(danger.opacity(0.14))
+                .border_b_1()
+                .border_color(danger.opacity(0.35))
+                .children(rows),
         )
     }
 

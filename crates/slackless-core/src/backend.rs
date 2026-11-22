@@ -463,6 +463,8 @@ pub trait Backend: Clone + Send + Sync + 'static {
         value: String,
         container: ActionContainer,
     ) -> impl Future<Output = api::Result<Vec<(String, String)>>> + Send;
+    /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
+    fn auth_revoke(&self) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -1025,5 +1027,9 @@ impl Backend for SlackApi {
             &bot, &app_id, &team, &action_id, &block_id, &value, &container,
         )
         .await
+    }
+
+    async fn auth_revoke(&self) -> api::Result<()> {
+        SlackApi::auth_revoke(self).await
     }
 }

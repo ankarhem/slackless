@@ -23,7 +23,84 @@ use crate::types::{
     Ts, UserId,
 };
 use crate::unfurl::{Unfurls, event_messages};
-use crate::{Command, Event, apply_event};
+use crate::{Command, Event, FailedMutation, apply_event};
+
+/// Serializable offline mutation stored in SQLite `offline_queue` until flushed on reconnect.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum QueuedMutation {
+    SendMessage {
+        channel: ChannelId,
+        content: crate::api::MessageContent,
+        thread_ts: Option<Ts>,
+        broadcast: bool,
+    },
+    AddReaction {
+        channel: ChannelId,
+        ts: Ts,
+        name: String,
+    },
+    RemoveReaction {
+        channel: ChannelId,
+        ts: Ts,
+        name: String,
+    },
+    MarkRead {
+        channel: ChannelId,
+        ts: Ts,
+    },
+}
+
+impl QueuedMutation {
+    fn from_command(command: &Command) -> Option<Self> {
+        match command {
+            Command::SendMessage {
+                channel,
+                content,
+                thread_ts,
+                broadcast,
+            } => Some(Self::SendMessage {
+                channel: channel.clone(),
+                content: content.clone(),
+                thread_ts: thread_ts.clone(),
+                broadcast: *broadcast,
+            }),
+            Command::AddReaction { channel, ts, name } => Some(Self::AddReaction {
+                channel: channel.clone(),
+                ts: ts.clone(),
+                name: name.clone(),
+            }),
+            Command::RemoveReaction { channel, ts, name } => Some(Self::RemoveReaction {
+                channel: channel.clone(),
+                ts: ts.clone(),
+                name: name.clone(),
+            }),
+            Command::MarkRead { channel, ts } => Some(Self::MarkRead {
+                channel: channel.clone(),
+                ts: ts.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn summary(&self) -> String {
+        match self {
+            Self::SendMessage { content, .. } => {
+                let text = content.text.trim();
+                let preview: String = text.chars().take(48).collect();
+                if text.chars().count() > 48 {
+                    format!("Message \"{preview}…\"")
+                } else if preview.is_empty() {
+                    "Message".to_owned()
+                } else {
+                    format!("Message \"{preview}\"")
+                }
+            }
+            Self::AddReaction { name, .. } => format!("Reaction :{name}:"),
+            Self::RemoveReaction { name, .. } => format!("Remove reaction :{name}:"),
+            Self::MarkRead { channel, .. } => format!("Mark read ({channel})"),
+        }
+    }
+}
 
 /// The store shared between the core (writer) and front-ends (readers).
 ///
@@ -270,12 +347,27 @@ pub(crate) struct Core<B: Backend> {
     cloud_draft_ids: Arc<Mutex<HashMap<ChannelId, String>>>,
     /// Whether the RTM websocket is currently disconnected or reconnecting.
     is_offline: bool,
-    /// Outgoing mutations buffered while `is_offline`, flushed FIFO on reconnect.
-    offline_queue: VecDeque<Command>,
+    /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
+    offline_queue: VecDeque<(i64, QueuedMutation)>,
 }
 
 impl<B: Backend> Core<B> {
     pub fn new(backend: B, store: SharedStore, workspace: TeamId, events: Emitter) -> Self {
+        let persisted: VecDeque<(i64, QueuedMutation)> = store
+            .lock()
+            .ok()
+            .and_then(|s| s.list_offline(&workspace).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(id, payload)| {
+                serde_json::from_str::<QueuedMutation>(&payload)
+                    .ok()
+                    .map(|m| (id, m))
+            })
+            .collect();
+        if !persisted.is_empty() {
+            events.emit(Event::OfflineQueueChanged(persisted.len()));
+        }
         let unfurls = Unfurls::new(
             backend.clone(),
             Arc::clone(&store),
@@ -307,7 +399,7 @@ impl<B: Backend> Core<B> {
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
-            offline_queue: VecDeque::new(),
+            offline_queue: persisted,
         }
     }
 
@@ -592,19 +684,20 @@ impl<B: Backend> Core<B> {
     }
 
     pub fn handle(&mut self, command: Command) {
-        if self.is_offline
-            && matches!(
-                command,
-                Command::SendMessage { .. }
-                    | Command::AddReaction { .. }
-                    | Command::RemoveReaction { .. }
-                    | Command::MarkRead { .. }
-            )
-        {
-            self.offline_queue.push_back(command);
-            self.events
-                .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
-            return;
+        if self.is_offline {
+            if let Some(mutation) = QueuedMutation::from_command(&command) {
+                let payload = serde_json::to_string(&mutation).unwrap_or_default();
+                let id = self
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.enqueue_offline(&self.workspace, &payload).ok())
+                    .unwrap_or(0);
+                self.offline_queue.push_back((id, mutation));
+                self.events
+                    .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
+                return;
+            }
         }
         let backend = self.backend.clone();
         let store = Arc::clone(&self.store);
@@ -1457,9 +1550,96 @@ impl<B: Backend> Core<B> {
                     });
                 }
             }
+            Command::RetryOfflineMutation(id) => {
+                let found = self
+                    .store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.list_offline(&self.workspace).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(row_id, _)| *row_id == id)
+                    .and_then(|(_, payload)| serde_json::from_str::<QueuedMutation>(&payload).ok());
+                if let Some(mutation) = found {
+                    self.flush_queued_mutation(id, mutation);
+                }
+            }
+            Command::DiscardOfflineMutation(id) => {
+                self.offline_queue.retain(|(row_id, _)| *row_id != id);
+                if let Ok(s) = self.store.lock() {
+                    let _ = s.delete_offline(id);
+                }
+                self.events
+                    .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
+            }
+            Command::SignOut => {
+                self.spawn("auth.revoke", async move {
+                    let _ = backend.auth_revoke().await;
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
+    }
+
+    /// Execute one persisted offline mutation; deletes the SQLite row on success or emits
+    /// [`Event::OfflineMutationFailed`] on failure so the user can retry or discard it.
+    fn flush_queued_mutation(&self, id: i64, mutation: QueuedMutation) {
+        let backend = self.backend.clone();
+        let store = Arc::clone(&self.store);
+        let ws = self.workspace.clone();
+        let events = self.events.clone();
+        let unfurls = self.unfurls.clone();
+        let summary = mutation.summary();
+        tokio::spawn(async move {
+            let outcome: Result<(), CoreError> = async {
+                match mutation {
+                    QueuedMutation::SendMessage {
+                        channel,
+                        content,
+                        thread_ts,
+                        broadcast,
+                    } => {
+                        let posted = backend
+                            .post_message(channel.clone(), content, thread_ts, broadcast)
+                            .await?;
+                        if let Some(message) = posted.message {
+                            unfurls.resolve(std::slice::from_ref(&message));
+                            let target = channel.clone();
+                            with_store(&store, move |s| s.upsert_message(&ws, &target, &message))
+                                .await?;
+                            events.emit(Event::StoreChanged { channel });
+                        }
+                    }
+                    QueuedMutation::AddReaction { channel, ts, name } => {
+                        backend.add_reaction(channel, ts, name).await?;
+                    }
+                    QueuedMutation::RemoveReaction { channel, ts, name } => {
+                        backend.remove_reaction(channel, ts, name).await?;
+                    }
+                    QueuedMutation::MarkRead { channel, ts } => {
+                        backend.mark_read(channel, ts).await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            match outcome {
+                Ok(()) => {
+                    if id > 0 {
+                        let _ = with_store(&store, move |s| s.delete_offline(id)).await;
+                    }
+                }
+                Err(err) => {
+                    events.emit(Event::OfflineMutationFailed(FailedMutation {
+                        id,
+                        summary,
+                        error: err.to_string(),
+                    }));
+                }
+            }
+        });
     }
 
     /// Starts (or restarts) the backfill of `channel`, newest page first.
@@ -1484,10 +1664,11 @@ impl<B: Backend> Core<B> {
                         self.is_offline = false;
                         self.subscribe_dm_presence();
                         if !self.offline_queue.is_empty() {
-                            let queued: Vec<Command> = self.offline_queue.drain(..).collect();
+                            let queued: Vec<(i64, QueuedMutation)> =
+                                self.offline_queue.drain(..).collect();
                             self.events.emit(Event::OfflineQueueChanged(0));
-                            for cmd in queued {
-                                self.handle(cmd);
+                            for (id, mutation) in queued {
+                                self.flush_queued_mutation(id, mutation);
                             }
                         }
                     }
@@ -2216,6 +2397,8 @@ pub(crate) mod tests {
         mark_calls: Vec<(ChannelId, Ts)>,
         /// `chat.postMessage` asks, in order.
         posted_messages: Vec<(ChannelId, String)>,
+        /// When true, `post_message` fails with a Slack error (for offline retry tests).
+        fail_post_message: bool,
         /// `reactions.add` asks, in order.
         reaction_adds: Vec<(ChannelId, Ts, String)>,
         /// `client.dms` answer.
@@ -2849,11 +3032,15 @@ pub(crate) mod tests {
             _thread_ts: Option<Ts>,
             _broadcast: bool,
         ) -> api::Result<PostedMessage> {
-            self.state
-                .lock()
-                .unwrap()
-                .posted_messages
-                .push((channel.clone(), content.text.clone()));
+            {
+                let mut state = self.state.lock().unwrap();
+                if state.fail_post_message {
+                    return Err(ApiError::Slack("ratelimited".into()));
+                }
+                state
+                    .posted_messages
+                    .push((channel.clone(), content.text.clone()));
+            }
             let ts = Ts::from("100.0");
             let message = Message {
                 ts: ts.clone(),
@@ -3426,6 +3613,10 @@ pub(crate) mod tests {
             _container: api::ActionContainer,
         ) -> api::Result<Vec<(String, String)>> {
             Ok(Vec::new())
+        }
+
+        async fn auth_revoke(&self) -> api::Result<()> {
+            Ok(())
         }
     }
 
@@ -5215,14 +5406,18 @@ pub(crate) mod tests {
         core.on_rtm(RtmEvent::State(connected.clone())).await;
         assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
         assert_eq!(next(&mut rx).await, Event::Connection(connected));
-        // Wait for the spawned SendMessage (`StoreChanged`) and MarkRead (`AuthExpired` in FakeBackend).
+        // Wait for the spawned SendMessage (`StoreChanged`) and failed MarkRead (`OfflineMutationFailed`).
         let mut saw_store_changed = false;
+        let mut failed_id = None;
         for _ in 0..2 {
-            if next(&mut rx).await == (Event::StoreChanged { channel: c1() }) {
-                saw_store_changed = true;
+            match next(&mut rx).await {
+                Event::StoreChanged { channel } if channel == c1() => saw_store_changed = true,
+                Event::OfflineMutationFailed(failed) => failed_id = Some(failed.id),
+                _ => {}
             }
         }
         assert!(saw_store_changed);
+        assert!(failed_id.is_some());
         // Yield briefly so the reaction task finishes too.
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5237,5 +5432,75 @@ pub(crate) mod tests {
             vec![(c1(), Ts::from("100.0"), "thumbsup".to_owned())]
         );
         assert_eq!(state.mark_calls, vec![(c1(), Ts::from("100.0"))]);
+    }
+
+    #[tokio::test]
+    async fn offline_queue_persists_across_restart_and_retries_or_discards() {
+        let fake = FakeBackend::default();
+        fake.state.lock().unwrap().fail_post_message = true;
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        let offline = ConnectionState::Disconnected {
+            reason: "offline".into(),
+        };
+        core.on_rtm(RtmEvent::State(offline.clone())).await;
+        assert_eq!(next(&mut rx).await, Event::Connection(offline));
+
+        core.handle(Command::SendMessage {
+            channel: c1(),
+            content: MessageContent::plain("survives restart"),
+            thread_ts: None,
+            broadcast: false,
+        });
+        assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+
+        // Simulate app restart sharing the same SQLite store.
+        drop(core);
+        let (tx2, mut rx2) = mpsc::unbounded();
+        let mut core2 = Core::new(
+            fake.clone(),
+            Arc::clone(&store),
+            TeamId::from("T1"),
+            Emitter(tx2),
+        );
+        // Core::new announces the restored persisted queue count immediately.
+        assert_eq!(next(&mut rx2).await, Event::OfflineQueueChanged(1));
+
+        // Reconnect while post_message is still failing -> emits OfflineMutationFailed and keeps row.
+        let connected = ConnectionState::Connected {
+            fast_reconnect: false,
+        };
+        core2.on_rtm(RtmEvent::State(connected.clone())).await;
+        assert_eq!(next(&mut rx2).await, Event::OfflineQueueChanged(0));
+        assert_eq!(next(&mut rx2).await, Event::Connection(connected));
+        let failed = match next(&mut rx2).await {
+            Event::OfflineMutationFailed(f) => f,
+            other => panic!("expected OfflineMutationFailed, got {other:?}"),
+        };
+        assert!(failed.summary.contains("survives restart"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_offline(&TeamId::from("T1"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Now backend recovers -> RetryOfflineMutation succeeds and removes the SQLite row.
+        fake.state.lock().unwrap().fail_post_message = false;
+        core2.handle(Command::RetryOfflineMutation(failed.id));
+        assert_eq!(next(&mut rx2).await, Event::StoreChanged { channel: c1() });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .list_offline(&TeamId::from("T1"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

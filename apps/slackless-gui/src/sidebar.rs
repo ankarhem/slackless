@@ -2580,6 +2580,21 @@ impl Sidebar {
                             label.trim_start_matches("# ").to_lowercase()
                         });
                     }
+                    SectionSort::Priority => {
+                        rows.sort_by_key(|c| {
+                            let u = self.unread_in(c, watermark);
+                            let latest = self
+                                .fixtures
+                                .counts
+                                .get(&c.id)
+                                .and_then(|n| n.latest.clone());
+                            (
+                                std::cmp::Reverse(u.mentions),
+                                std::cmp::Reverse(u.count > 0),
+                                std::cmp::Reverse(latest),
+                            )
+                        });
+                    }
                 }
             }
             let (title, leading) = section_title(section, &self.fixtures);

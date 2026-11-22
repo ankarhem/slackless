@@ -251,14 +251,15 @@ impl SectionFilter {
     }
 }
 
-/// Slack's per-section "Sort" choice (Slack also offers "Priority", which orders by
-/// relevance scores slackless does not store, so it is left out rather than shown dead).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Slack's per-section "Sort" choice (`F-CORE-020`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SectionSort {
     /// Alphabetical; the built-in default for everything but the DMs bucket.
     Alpha,
     /// Newest activity first; the DMs bucket's built-in default.
     Recency,
+    /// Priority: unread mentions first, then unread channels, then most recent activity.
+    Priority,
 }
 
 /// Everything a section's menus need, gathered once when the menu opens.
@@ -683,6 +684,7 @@ fn sort_submenu(
     for (choice, icon) in [
         (SectionSort::Alpha, IconName::ArrowDownAZ),
         (SectionSort::Recency, IconName::Clock),
+        (SectionSort::Priority, IconName::Sparkles),
     ] {
         let this = sidebar.clone();
         let key = key.clone();
@@ -690,6 +692,7 @@ fn sort_submenu(
             PopupMenuItem::new(match choice {
                 SectionSort::Alpha => "A-Z",
                 SectionSort::Recency => "Recency",
+                SectionSort::Priority => "Priority",
             })
             .icon(icon)
             .checked(choice == current)

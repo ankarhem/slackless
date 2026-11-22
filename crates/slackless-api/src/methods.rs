@@ -179,7 +179,7 @@ pub struct SearchOpts {
 
 /// Body of a message to send or edit: fallback `text`, Block Kit `blocks`, and optional
 /// `attachments` (such as a GIF picked from the composer's GIFs tab).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MessageContent {
     /// Plain-text fallback (notifications, search, old clients).
     pub text: String,
@@ -1050,6 +1050,12 @@ impl SlackApi {
     /// `auth.test`: validates the session and says who/where we are.
     pub async fn auth_test(&self) -> Result<AuthTest> {
         Ok(self.call(method::AUTH_TEST, Vec::new()).await?.data)
+    }
+
+    /// `auth.revoke`: revokes the current token server-side on sign-out (`F-CORE-009`).
+    pub async fn auth_revoke(&self) -> Result<()> {
+        let _: serde_json::Value = self.call(method::AUTH_REVOKE, Vec::new()).await?.data;
+        Ok(())
     }
 
     /// `client.userBoot` (cold boot): self, team, channels, IMs, priorities, prefs.

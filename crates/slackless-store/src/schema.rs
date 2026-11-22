@@ -161,7 +161,18 @@ CREATE TABLE local_state (
 ) WITHOUT ROWID;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+/// Version 4: durable offline mutation queue surviving restarts until flushed on reconnect.
+const V4: &str = r#"
+CREATE TABLE offline_queue (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX offline_queue_ws ON offline_queue (workspace_id, id);
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

@@ -34,6 +34,38 @@ pub enum PreferencesEvent {
     Changed,
     /// User asked to reset the local SQLite & media cache in Preferences -> Advanced.
     ResetCache,
+    /// User asked to compact/VACUUM the active workspace's local SQLite store.
+    CompactStorage,
+    /// User asked to prune cached media/temp files on disk.
+    PruneMediaCache,
+}
+
+/// Snapshot of local SQLite & media cache metrics shown in Preferences -> Advanced.
+#[derive(Clone, Default)]
+pub struct StorageInfo {
+    pub messages: u64,
+    pub revisions: u64,
+    pub conversations: u64,
+    pub users: u64,
+    pub offline_queued: u64,
+    pub db_bytes: u64,
+    pub media_cache_bytes: u64,
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Slack's Color Mode: Light / Dark / System (follow the computer).
@@ -507,6 +539,7 @@ pub struct Preferences {
     excluded_channels: Entity<TextareaState>,
     custom_sidebar_hex: Entity<TextareaState>,
     custom_accent_hex: Entity<TextareaState>,
+    storage_stats: Option<StorageInfo>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -574,9 +607,16 @@ impl Preferences {
                 excluded_channels,
                 custom_sidebar_hex,
                 custom_accent_hex,
+                storage_stats: None,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Update the local SQLite & media cache metrics shown in Preferences -> Advanced.
+    pub fn set_storage_stats(&mut self, stats: Option<StorageInfo>, cx: &mut Context<Self>) {
+        self.storage_stats = stats;
+        cx.notify();
     }
 
     pub fn settings(&self) -> &Settings {
@@ -1627,11 +1667,67 @@ impl Preferences {
                     .appearance(false)
                     .bordered(false),
             );
+        let compact_db = Button::new("adv-compact-db")
+            .outline()
+            .with_size(Size::Small)
+            .label("Compact database (VACUUM)")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::CompactStorage)));
+        let prune_media = Button::new("adv-prune-media")
+            .outline()
+            .with_size(Size::Small)
+            .label("Prune media cache")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::PruneMediaCache)));
         let reset_cache = Button::new("adv-reset-cache")
             .outline()
             .with_size(Size::Small)
             .label("Clear local cache & reload")
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ResetCache)));
+        let storage_summary = {
+            let muted = cx.theme().muted_foreground;
+            let border = cx.theme().border;
+            let card_bg = cx.theme().secondary.opacity(0.35);
+            let body = match &self.storage_stats {
+                Some(st) => v_flex()
+                    .gap_1()
+                    .child(
+                        div().text_sm().child(format!(
+                            "SQLite database: {} · Media cache: {}",
+                            format_bytes(st.db_bytes),
+                            format_bytes(st.media_cache_bytes),
+                        )),
+                    )
+                    .child(div().text_xs().text_color(muted).child(format!(
+                        "{} messages ({} revisions) · {} conversations · {} users · {} queued offline",
+                        st.messages,
+                        st.revisions,
+                        st.conversations,
+                        st.users,
+                        st.offline_queued,
+                    ))),
+                None => v_flex().child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Local SQLite metrics are shown when connected to a live workspace."),
+                ),
+            };
+            v_flex()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(body)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(compact_db)
+                        .child(prune_media)
+                        .child(reset_cache),
+                )
+        };
         let dl_label = if self.settings.download_dir.is_empty() {
             "~/Downloads (default)".to_owned()
         } else {
@@ -1734,8 +1830,13 @@ impl Preferences {
                     .child(menu_bar)
                     .child(close_tray)
                     .child(hardware)
-                    .child(debug)
-                    .child(div().pt_1().child(reset_cache)),
+                    .child(debug),
+                cx,
+            ))
+            .child(self.group(
+                "Local storage & maintenance",
+                Some("Durable local-first SQLite history & FTS5 search index for the active workspace."),
+                storage_summary,
                 cx,
             ))
     }

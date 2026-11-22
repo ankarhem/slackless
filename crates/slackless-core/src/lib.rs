@@ -412,6 +412,12 @@ pub enum Command {
         view_id: String,
         hash: Option<String>,
     },
+    /// Retry a persisted offline mutation that previously failed to flush.
+    RetryOfflineMutation(i64),
+    /// Discard a persisted offline mutation from SQLite.
+    DiscardOfflineMutation(i64),
+    /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
+    SignOut,
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -594,6 +600,17 @@ pub enum Event {
     },
     /// Number of outgoing commands buffered while offline, waiting to flush on reconnect.
     OfflineQueueChanged(usize),
+    /// A queued offline mutation failed while flushing on reconnect; stays persisted until
+    /// retried via [`Command::RetryOfflineMutation`] or discarded via [`Command::DiscardOfflineMutation`].
+    OfflineMutationFailed(FailedMutation),
     /// A non-fatal failure worth surfacing.
     Error(String),
+}
+
+/// An offline-queued mutation that failed to flush on reconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedMutation {
+    pub id: i64,
+    pub summary: String,
+    pub error: String,
 }
