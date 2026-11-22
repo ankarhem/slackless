@@ -251,6 +251,30 @@ impl NavPrefs {
     }
 }
 
+/// Home sidebar display preferences driven by Preferences -> Home (`F-CORE-024`, `F-SHELL-066`, `F-SHELL-072`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HomePrefs {
+    pub show: usize,
+    pub sort: usize,
+    pub unreads_section: bool,
+    pub separate_private: bool,
+    pub profile_photos: bool,
+    pub compact: bool,
+}
+
+impl Default for HomePrefs {
+    fn default() -> Self {
+        Self {
+            show: 0,
+            sort: 0,
+            unreads_section: false,
+            separate_private: false,
+            profile_photos: true,
+            compact: false,
+        }
+    }
+}
+
 /// Unread/mention badge summary for one tile in the workspace switcher rail (`F-CORE-006`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct WorkspaceBadge {
@@ -351,6 +375,8 @@ pub struct Sidebar {
     workspace_badges: Vec<WorkspaceBadge>,
     /// Navigation rail visibility and label style from Preferences -> Navigation.
     nav_prefs: NavPrefs,
+    /// Home sidebar filter, sort, photo, and row-density preferences from Preferences -> Home.
+    home_prefs: HomePrefs,
     /// The signed-in user's status and presence, for the rail avatar.
     self_state: SelfState,
     /// The pointer is over the focus button / the focus card.
@@ -368,16 +394,8 @@ impl Sidebar {
         cx: &mut gpui_kit::gpui::App,
     ) -> Entity<Sidebar> {
         cx.new(|cx| {
-            let find = cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Find a conversation…")
-                    .auto_grow(1, 1)
-            });
-            let dm_find = cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Find a DM…")
-                    .auto_grow(1, 1)
-            });
+            let find = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1));
+            let dm_find = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1));
             let section_form = SectionNameForm::new(window, cx);
             let collapsed = fixtures
                 .collapsed_sections
@@ -469,6 +487,7 @@ impl Sidebar {
                 activity_unread: 0,
                 workspace_badges: Vec::new(),
                 nav_prefs: NavPrefs::default(),
+                home_prefs: HomePrefs::default(),
                 self_state: SelfState::default(),
                 focus_hover: (false, false),
                 _subscriptions: subscriptions,
@@ -623,6 +642,48 @@ impl Sidebar {
         if self.nav_prefs != prefs {
             self.nav_prefs = prefs;
             cx.notify();
+        }
+    }
+
+    /// Apply Preferences -> Home display, density, and sorting preferences.
+    pub fn set_home_prefs(&mut self, prefs: HomePrefs, cx: &mut Context<Self>) {
+        if self.home_prefs != prefs {
+            self.home_prefs = prefs;
+            cx.notify();
+        }
+    }
+
+    /// Cycle through visible navigation rail tabs (`Ctrl+Tab` / `Ctrl+Shift+Tab`).
+    pub fn cycle_nav(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let visible: Vec<NavItem> = [
+            NavItem::Home,
+            NavItem::Dms,
+            NavItem::Activity,
+            NavItem::Files,
+            NavItem::Todos,
+        ]
+        .into_iter()
+        .filter(|&item| self.nav_prefs.shows(item))
+        .collect();
+        if visible.len() < 2 {
+            return;
+        }
+        let pos = visible
+            .iter()
+            .position(|&item| item == self.active_nav)
+            .unwrap_or(0);
+        let next = if forward {
+            (pos + 1) % visible.len()
+        } else {
+            (pos + visible.len() - 1) % visible.len()
+        };
+        let target = visible[next];
+        self.show_nav(target, cx);
+        match target {
+            NavItem::Activity => cx.emit(SidebarEvent::OpenActivity),
+            NavItem::Files => cx.emit(SidebarEvent::OpenFiles),
+            NavItem::Todos => cx.emit(SidebarEvent::OpenLater),
+            _ => {}
         }
     }
 
@@ -1357,8 +1418,11 @@ impl Sidebar {
         // Owned color copies: `cx.theme()` borrows `cx`, so nothing may outlive the
         // statement that reads it across the `&mut Context` calls below.
         let theme = cx.theme();
-        let (outline, dark, avatar_ring) =
-            (theme.sidebar_border, theme.mode.is_dark(), theme.sidebar);
+        let (outline, dark, avatar_ring) = (
+            theme.sidebar_border,
+            crate::theme::sidebar_is_dark(cx),
+            theme.sidebar,
+        );
         let rail_bg = crate::theme::tab_rail_wash(cx);
         let mut rail = v_flex()
             .flex_none()
@@ -1774,7 +1838,7 @@ impl Sidebar {
         let theme = cx.theme();
         let team = &self.fixtures.workspaces[self.active_workspace];
         let dim = theme.sidebar_foreground.opacity(0.6);
-        let hover = theme.accent;
+        let hover = theme.sidebar_foreground.opacity(0.08);
         // Slack's "Norce ⌄": the chevron rides right after the name, the icons sit right.
         h_flex()
             .flex_none()
@@ -1840,8 +1904,15 @@ impl Sidebar {
     /// One of the sidebar's slim find fields: the Home list's "Find a conversation…" or the
     /// DM list's "Find a DM…". Slack's field is a slim 28px box led by its text-search glyph.
     fn find_field(&self, field: &Entity<TextareaState>, cx: &Context<Self>) -> Div {
+        let fg = cx.theme().sidebar_foreground;
         let border = cx.theme().sidebar_border;
-        let dim = cx.theme().sidebar_foreground.opacity(0.6);
+        let dim = fg.opacity(0.65);
+        let empty = field.read(cx).value().is_empty();
+        let placeholder = if *field == self.dm_find {
+            "Find a DM"
+        } else {
+            "Find a conversation\u{2026}"
+        };
         // Slack's field is a slim 28px box led by its text-search glyph.
         h_flex()
             .mx_2()
@@ -1855,6 +1926,7 @@ impl Sidebar {
             .rounded_md()
             .border_1()
             .border_color(border)
+            .text_color(fg)
             .child(
                 Icon::new(IconName::TextSearch)
                     .text_color(dim)
@@ -1862,9 +1934,22 @@ impl Sidebar {
             )
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .text_size(px(13.))
+                    .text_color(fg)
+                    .when(empty, |wrap| {
+                        wrap.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .text_color(dim)
+                                .child(placeholder),
+                        )
+                    })
                     .child(Textarea::new(field).appearance(false).bordered(false)),
             )
     }
@@ -2303,24 +2388,93 @@ impl Sidebar {
     ) -> Vec<(AnyElement, ListChild)> {
         self.rows.borrow_mut().clear();
         let sections: Vec<ChannelSection> = self.section_set();
+        let home_keep = |c: &Conversation| -> bool {
+            if c.id == self.selected {
+                return true;
+            }
+            match self.home_prefs.show {
+                1 => self.unread_in(c, watermark).count > 0,
+                2 => self.unread_in(c, watermark).mentions > 0,
+                _ => true,
+            }
+        };
+        let mut list = Vec::new();
+        if self.home_prefs.unreads_section {
+            let unread_all: Vec<Conversation> = channels
+                .iter()
+                .chain(&self.fixtures.dms)
+                .filter(|c| self.unread_in(c, watermark).count > 0)
+                .cloned()
+                .collect();
+            if !unread_all.is_empty() {
+                list.extend(self.section(
+                    "home-unreads-section".into(),
+                    ("Unreads", None),
+                    &unread_all,
+                    watermark,
+                    None,
+                    cx,
+                ));
+            }
+        }
         if sections.is_empty() {
-            let mut children = self.section(
-                "channels".into(),
-                ("Channels", None),
-                channels,
-                watermark,
-                None,
-                cx,
-            );
-            children.extend(self.section(
+            let filtered_ch: Vec<Conversation> =
+                channels.iter().filter(|c| home_keep(c)).cloned().collect();
+            let filtered_dm: Vec<Conversation> = self
+                .fixtures
+                .dms
+                .iter()
+                .filter(|c| home_keep(c))
+                .cloned()
+                .collect();
+            if self.home_prefs.separate_private {
+                let public: Vec<Conversation> = filtered_ch
+                    .iter()
+                    .filter(|c| !c.is_private)
+                    .cloned()
+                    .collect();
+                let private: Vec<Conversation> = filtered_ch
+                    .iter()
+                    .filter(|c| c.is_private)
+                    .cloned()
+                    .collect();
+                list.extend(self.section(
+                    "channels".into(),
+                    ("Channels", None),
+                    &public,
+                    watermark,
+                    None,
+                    cx,
+                ));
+                if !private.is_empty() {
+                    list.extend(self.section(
+                        "private-channels".into(),
+                        ("Private channels", None),
+                        &private,
+                        watermark,
+                        None,
+                        cx,
+                    ));
+                }
+            } else {
+                list.extend(self.section(
+                    "channels".into(),
+                    ("Channels", None),
+                    &filtered_ch,
+                    watermark,
+                    None,
+                    cx,
+                ));
+            }
+            list.extend(self.section(
                 "dms".into(),
                 ("Direct messages", None),
-                &self.fixtures.dms,
+                &filtered_dm,
                 watermark,
                 None,
                 cx,
             ));
-            return children;
+            return list;
         }
         // Slack fills External connections itself, from the externally shared channels.
         let connect = sections
@@ -2354,7 +2508,6 @@ impl Sidebar {
                 .chain(&self.fixtures.dms)
                 .find(|conversation| conversation.id == *id)
         };
-        let mut list = Vec::new();
         for section in &sections {
             let mut rows: Vec<Conversation> = match section.kind {
                 SectionKind::Channels => channels
@@ -2382,27 +2535,51 @@ impl Sidebar {
                     .cloned()
                     .collect(),
             };
+            rows.retain(&home_keep);
             if rows.is_empty() && !builtin(&section.kind) {
                 continue;
             }
-            // The section's sort: its own choice, else DMs by latest activity and
-            // everything else by name.
+            // The section's sort: its own choice, else Home preference (Recent / Priority / Alpha).
             let section_key: SharedString = section.id.clone().into();
-            match self.section_sort(&section_key, section.kind == SectionKind::DirectMessages) {
-                SectionSort::Recency => {
-                    let latest = |c: &Conversation| {
-                        self.fixtures
+            let default_recent =
+                section.kind == SectionKind::DirectMessages || self.home_prefs.sort == 1;
+            let sort =
+                if self.home_prefs.sort == 2 && !self.section_sorts.contains_key(&section_key) {
+                    // Priority: mentions first, then unreads, then recency.
+                    rows.sort_by_key(|c| {
+                        let u = self.unread_in(c, watermark);
+                        let latest = self
+                            .fixtures
                             .counts
                             .get(&c.id)
-                            .and_then(|n| n.latest.clone())
-                    };
-                    rows.sort_by_key(|c| std::cmp::Reverse(latest(c)));
-                }
-                SectionSort::Alpha => {
-                    rows.sort_by_cached_key(|c| {
-                        let label = self.fixtures.conversation_label(c);
-                        label.trim_start_matches("# ").to_lowercase()
+                            .and_then(|n| n.latest.clone());
+                        (
+                            std::cmp::Reverse(u.mentions),
+                            std::cmp::Reverse(u.count > 0),
+                            std::cmp::Reverse(latest),
+                        )
                     });
+                    None
+                } else {
+                    Some(self.section_sort(&section_key, default_recent))
+                };
+            if let Some(sort) = sort {
+                match sort {
+                    SectionSort::Recency => {
+                        let latest = |c: &Conversation| {
+                            self.fixtures
+                                .counts
+                                .get(&c.id)
+                                .and_then(|n| n.latest.clone())
+                        };
+                        rows.sort_by_key(|c| std::cmp::Reverse(latest(c)));
+                    }
+                    SectionSort::Alpha => {
+                        rows.sort_by_cached_key(|c| {
+                            let label = self.fixtures.conversation_label(c);
+                            label.trim_start_matches("# ").to_lowercase()
+                        });
+                    }
                 }
             }
             let (title, leading) = section_title(section, &self.fixtures);
@@ -2420,12 +2597,14 @@ impl Sidebar {
 
     /// "Add channels" under the channel list: opens the channel browser.
     fn add_channels_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let dim = cx.theme().sidebar_foreground.opacity(0.6);
-        let hover = cx.theme().accent;
-        let tile = cx.theme().secondary;
+        let fg = cx.theme().sidebar_foreground;
+        let dim = fg.opacity(0.6);
+        let hover = fg.opacity(0.08);
+        let tile = fg.opacity(0.14);
+        let row_h = if self.home_prefs.compact { 24. } else { 28. };
         h_flex()
             .id("browse-channels")
-            .h(px(28.))
+            .h(px(row_h))
             .pl(px(24.))
             .pr_2()
             .gap_2()
@@ -2620,7 +2799,7 @@ impl Sidebar {
     fn dm_header(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let dim = theme.sidebar_foreground.opacity(0.6);
-        let hover = theme.accent;
+        let hover = theme.sidebar_foreground.opacity(0.08);
         let border = theme.sidebar_border;
         let toggle = cx.weak_entity();
         let on_unreads = move |checked: &bool, _: &mut Window, cx: &mut gpui_kit::gpui::App| {
@@ -2706,7 +2885,7 @@ impl Sidebar {
         // Slack's DM list marks the open DM with a gray wash and keeps its text colors.
         let selected_bg = theme.sidebar.blend(theme.sidebar_foreground.opacity(0.1));
         let ring = if selected { selected_bg } else { theme.sidebar };
-        let hover = theme.accent;
+        let hover = theme.sidebar_foreground.opacity(0.08);
         // The self-DM reads "Name (you)" here, "(you)" in regular weight, as Slack's DM list
         // shows it; every other surface keeps the plain label.
         let label = self.fixtures.conversation_label(dm);
@@ -2827,18 +3006,25 @@ impl Sidebar {
                 label.strip_prefix("# ").map(str::to_owned).unwrap_or(label),
             ),
             ConversationKind::Im | ConversationKind::Mpim => (
-                conversation_avatar(
-                    &self.fixtures,
-                    conversation,
-                    20.,
-                    if selected {
-                        theme.sidebar_accent
-                    } else {
-                        theme.sidebar
-                    },
-                    cx,
-                )
-                .into_any_element(),
+                if self.home_prefs.profile_photos {
+                    conversation_avatar(
+                        &self.fixtures,
+                        conversation,
+                        if self.home_prefs.compact { 18. } else { 20. },
+                        if selected {
+                            theme.sidebar_accent
+                        } else {
+                            theme.sidebar
+                        },
+                        cx,
+                    )
+                    .into_any_element()
+                } else {
+                    Icon::new(IconName::User)
+                        .text_color(color)
+                        .size(px(15.))
+                        .into_any_element()
+                },
                 label.clone(),
             ),
             ConversationKind::PublicChannel => (
@@ -2853,9 +3039,11 @@ impl Sidebar {
             ),
         };
 
+        let row_h = if self.home_prefs.compact { 24. } else { 28. };
+        let row_hover = theme.sidebar_foreground.opacity(0.08);
         let mut row = h_flex()
             .id(SharedString::from(format!("conversation-{id}")))
-            .h(px(28.))
+            .h(px(row_h))
             .ml(px(2.))
             .mr(px(2.))
             .pl(px(22.))
@@ -2866,7 +3054,7 @@ impl Sidebar {
             .text_color(color)
             .cursor_pointer()
             .when(selected, |row| row.bg(theme.sidebar_accent))
-            .when(!selected, |row| row.hover(|row| row.bg(theme.accent)))
+            .when(!selected, |row| row.hover(|row| row.bg(row_hover)))
             .child(leading);
         let name = div().truncate().font_weight(weight).child(label);
         row = if shared {
@@ -3506,7 +3694,6 @@ impl Render for Sidebar {
         let sidebar_bg = cx.theme().sidebar;
         let sidebar_border = cx.theme().sidebar_border;
         let sidebar_fg = cx.theme().sidebar_foreground;
-        let dark = cx.theme().mode.is_dark();
         let focus = self.self_state.focused();
         let watermark = self.read_watermark();
         let channels: Vec<Conversation> = self
@@ -3632,6 +3819,7 @@ impl Render for Sidebar {
             }
         };
 
+        let dark_sidebar = crate::theme::sidebar_is_dark(cx);
         h_flex()
             .relative()
             .size_full()
@@ -3642,18 +3830,20 @@ impl Render for Sidebar {
             .when(self.active_nav != NavItem::Activity, |sidebar| {
                 sidebar.child(
                     // A relative wrapper, so the pills can float over the list's edges. Dark
-                    // Slack divides it from the conversation with a hairline; light Slack lets
-                    // the conversation's shadow do it.
+                    // or tinted sidebars divide from the conversation with a hairline; light
+                    // default Slack lets the conversation's shadow do it.
                     div()
                         .relative()
                         .flex_1()
                         .min_w(px(0.))
                         .h_full()
                         .bg(sidebar_bg)
-                        .when(dark, |list| list.border_r_1().border_color(sidebar_border))
+                        .when(dark_sidebar, |list| {
+                            list.border_r_1().border_color(sidebar_border)
+                        })
                         .child(list)
-                        // Light Slack's conversation casts its shadow over the sidebar's edge.
-                        .when(!dark, |list| {
+                        // Light Slack's conversation casts its shadow over the light sidebar's edge.
+                        .when(!dark_sidebar, |list| {
                             list.child(
                                 div()
                                     .absolute()

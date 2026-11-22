@@ -647,15 +647,21 @@ fn open_store(session: &Session) -> Option<Store> {
     }
 }
 
-/// The durable store lives under the platform's application-data directory, one database per
-/// workspace (the store location stays a front-end decision, per slackless-core's docs).
-fn default_store_path(team_id: &TeamId) -> Option<PathBuf> {
+/// Directory holding per-workspace SQLite stores.
+pub fn store_dir() -> Option<PathBuf> {
     let mut path = PathBuf::from(std::env::var_os("HOME")?);
     if cfg!(target_os = "macos") {
         path.push("Library/Application Support/slackless");
     } else {
         path.push(".local/share/slackless");
     }
+    Some(path)
+}
+
+/// The durable store lives under the platform's application-data directory, one database per
+/// workspace (the store location stays a front-end decision, per slackless-core's docs).
+fn default_store_path(team_id: &TeamId) -> Option<PathBuf> {
+    let mut path = store_dir()?;
     path.push(format!("{team_id}.sqlite"));
     Some(path)
 }

@@ -98,6 +98,8 @@ pub struct SearchView {
     remote_files_pages: usize,
     remote_files_loading: bool,
     remote_files_error: Option<String>,
+    /// Channel names excluded from default local search results (Preferences -> Advanced).
+    excluded_channels: Vec<String>,
 }
 
 impl EventEmitter<SearchEvent> for SearchView {}
@@ -137,7 +139,17 @@ impl SearchView {
             remote_files_pages: 0,
             remote_files_loading: false,
             remote_files_error: None,
+            excluded_channels: Vec::new(),
         })
+    }
+
+    /// Honor Preferences → Advanced → Search exclusions (comma-separated channel names).
+    pub fn set_excluded_channels(&mut self, csv: &str) {
+        self.excluded_channels = csv
+            .split(',')
+            .map(|s| s.trim().trim_start_matches('#').to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
     }
 
     /// Live refresh: the query and its results stay; names come from `fixtures`.
@@ -210,6 +222,12 @@ impl SearchView {
                 .filters
                 .exclude_channels
                 .extend(self.filters.exclude_channels.iter().cloned());
+            if parsed.filters.in_channels.is_empty() {
+                parsed
+                    .filters
+                    .exclude_channels
+                    .extend(self.excluded_channels.iter().cloned());
+            }
             parsed
                 .filters
                 .from_users

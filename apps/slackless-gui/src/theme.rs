@@ -65,8 +65,39 @@ struct Focus(bool);
 
 impl Global for Focus {}
 
+/// Active window chrome modifiers installed alongside the color theme.
+#[derive(Clone, Copy)]
+struct ThemeChrome {
+    palette: Palette,
+    darker_sidebars: bool,
+    window_gradient: bool,
+}
+
+impl Default for ThemeChrome {
+    fn default() -> Self {
+        Self {
+            palette: Palette::Default,
+            darker_sidebars: false,
+            window_gradient: true,
+        }
+    }
+}
+
+impl Global for ThemeChrome {}
+
 fn focused(cx: &App) -> bool {
     cx.try_global::<Focus>().is_some_and(|focus| focus.0)
+}
+
+fn chrome_state(cx: &App) -> ThemeChrome {
+    cx.try_global::<ThemeChrome>().copied().unwrap_or_default()
+}
+
+/// Whether the sidebar and window chrome currently have a dark surface (either Dark mode,
+/// any tinted named/custom theme, or Darker sidebars in Light mode).
+pub fn sidebar_is_dark(cx: &App) -> bool {
+    let chrome = chrome_state(cx);
+    cx.theme().mode.is_dark() || chrome.palette != Palette::Default || chrome.darker_sidebars
 }
 
 /// The palettes slackless ships.
@@ -126,23 +157,35 @@ pub fn set_font(font: usize, cx: &mut App) {
 
 /// Switch the whole app to `theme` with the default color theme and repaint every window.
 pub fn activate(theme: SlackTheme, cx: &mut App) {
-    activate_with(theme, Palette::Default, false, cx);
+    activate_with(theme, Palette::Default, false, true, false, cx);
 }
 
-/// Switch the whole app to `theme` tinted by the color theme `palette`, in focus mode's
-/// grayscale when `focus` is set.
+/// Switch the whole app to `theme` tinted by the color theme `palette`, honoring
+/// `darker_sidebars`, `window_gradient`, and focus mode's grayscale when `focus` is set.
 ///
 /// `Theme::change` loads the registered mode palette; the Slack palette (and the color theme
 /// over it) is applied in a second pass, because a mode change reloads that mode's theme over
 /// same-closure edits.
-pub fn activate_with(theme: SlackTheme, palette: Palette, focus: bool, cx: &mut App) {
+pub fn activate_with(
+    theme: SlackTheme,
+    palette: Palette,
+    darker_sidebars: bool,
+    window_gradient: bool,
+    focus: bool,
+    cx: &mut App,
+) {
     let mode = theme.mode();
     let family = FONT_FAMILIES[font(cx)];
     cx.set_global(Focus(focus));
+    cx.set_global(ThemeChrome {
+        palette,
+        darker_sidebars,
+        window_gradient,
+    });
     Theme::change(mode, None, cx);
     Theme::update(cx, |theme| {
         apply(mode.is_dark(), theme);
-        tint(palette, mode.is_dark(), theme);
+        tint(palette, mode.is_dark(), darker_sidebars, theme);
         if focus {
             grayscale(theme);
         }
@@ -214,12 +257,12 @@ impl Palette {
         match self {
             Palette::Default => None,
             Palette::Aubergine => Some((0x3F_0E_40, 0x11_64_A3)),
-            Palette::Clementine => Some((0x7A_2E_12, 0xE8_71_2D)),
+            Palette::Clementine => Some((0x7A_2E_12, 0xC7_51_14)),
             Palette::Banana => Some((0x5C_4A_12, 0xD9_A5_19)),
-            Palette::Jade => Some((0x0B_3B_2E, 0x2B_AC_76)),
-            Palette::Lagoon => Some((0x0F_3D_5C, 0x2D_9E_E0)),
-            Palette::Barbra => Some((0x5A_18_40, 0xE0_1E_5A)),
-            Palette::MoodIndigo => Some((0x1F_2A_4D, 0x5B_6C_FF)),
+            Palette::Jade => Some((0x0B_3B_2E, 0x1B_7A_56)),
+            Palette::Lagoon => Some((0x0F_3D_5C, 0x1D_78_B4)),
+            Palette::Barbra => Some((0x5A_18_40, 0xC9_18_5B)),
+            Palette::MoodIndigo => Some((0x1F_2A_4D, 0x4E_5F_E6)),
             Palette::Custom { sidebar, accent } => Some((
                 CUSTOM_SIDEBARS[sidebar % CUSTOM_SIDEBARS.len()],
                 CUSTOM_ACCENTS[accent % CUSTOM_ACCENTS.len()],
@@ -242,12 +285,28 @@ impl Palette {
         }
     }
 
-    /// The swatch shown for this theme in the picker: its sidebar color, or the current
-    /// sidebar token for the default theme.
-    pub fn swatch(self, current_sidebar: Hsla) -> (Hsla, Hsla) {
+    /// Slack's `sidebar_theme` wire name for `users.prefs.set`.
+    pub fn slack_pref_name(self) -> Option<&'static str> {
+        match self {
+            Palette::Default => Some("default"),
+            Palette::Aubergine => Some("aubergine"),
+            Palette::Clementine => Some("clementine"),
+            Palette::Banana => Some("banana"),
+            Palette::Jade => Some("jade"),
+            Palette::Lagoon => Some("lagoon"),
+            Palette::Barbra => Some("barbra"),
+            Palette::MoodIndigo => Some("mood_indigo"),
+            Palette::Custom { .. } => None,
+        }
+    }
+
+    /// The swatch shown for this theme in the picker: its sidebar and accent colors, or
+    /// Slack's untinted Light/Dark default colors for [`Palette::Default`].
+    pub fn swatch(self, dark: bool) -> (Hsla, Hsla) {
         match self.colors() {
             Some((sidebar, accent)) => (color(sidebar), color(accent)),
-            None => (current_sidebar, color(0x11_64_A3)),
+            None if dark => (color(0x13_18_1D), color(0x05_66_96)),
+            None => (color(0xEB_F0_F5), color(0x11_64_A3)),
         }
     }
 }
@@ -276,26 +335,71 @@ pub fn swatch_color(hex: u32) -> Hsla {
     color(hex)
 }
 
-/// Lay a color theme over the base palette: the sidebar takes the theme's color (with light
-/// text on it in both modes) and selection / focus use its accent.
-fn tint(palette: Palette, dark: bool, theme: &mut Theme) {
-    let Some((sidebar, accent)) = palette.colors() else {
+/// Pick a legible foreground (`#1D1C1D` vs `#FFFFFF`) for a hex accent fill using relative
+/// sRGB luminance so bright accents like Banana stay high-contrast everywhere.
+fn contrasting_foreground(hex: u32) -> Hsla {
+    let r = ((hex >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((hex >> 8) & 0xFF) as f32 / 255.0;
+    let b = (hex & 0xFF) as f32 / 255.0;
+    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if luma > 0.58 {
+        color(0x1D_1C_1D)
+    } else {
+        color(0xFF_FF_FF)
+    }
+}
+
+/// Lay a color theme (and optional `darker_sidebars`) over the base palette: the top chrome,
+/// rail, and sidebar all share the theme's hue with crisp contrast in both Light and Dark mode.
+fn tint(palette: Palette, dark: bool, darker_sidebars: bool, theme: &mut Theme) {
+    let Some((sidebar_hex, accent_hex)) = palette.colors() else {
+        if darker_sidebars {
+            if dark {
+                theme.sidebar = color(0x0E_11_15);
+                theme.title_bar = color(0x05_0F_18);
+                theme.sidebar_border = color(0x1E_22_28);
+            } else {
+                theme.sidebar = color(0x1E_23_29);
+                theme.title_bar = color(0x14_18_1E);
+                theme.title_bar_border = color(0x0D_10_14);
+                theme.sidebar_border = color(0x2F_36_3F);
+                theme.sidebar_foreground = color(0xF2_F2_F2);
+                theme.sidebar_primary = color(0xFF_FF_FF);
+                theme.sidebar_primary_foreground = color(0x1E_23_29);
+            }
+        }
         return;
     };
-    let sidebar = color(sidebar);
-    // Dark mode keeps the sidebar subdued so it does not outshine the message column.
-    theme.sidebar = if dark {
-        sidebar.blend(color(0x1A_1D_21).opacity(0.35))
+    let base = color(sidebar_hex);
+    let accent = color(accent_hex);
+    let accent_fg = contrasting_foreground(accent_hex);
+    if dark {
+        // Dark mode blends the theme hue into dark charcoal so it stays cohesive with the
+        // message canvas without washing out contrast, matching official Slack Dark themes.
+        let mix = if darker_sidebars { 0.68 } else { 0.48 };
+        theme.sidebar = base.blend(color(0x13_15_19).opacity(mix));
+        theme.title_bar = base.blend(color(0x0B_0D_10).opacity((mix + 0.14).min(0.84)));
+        theme.title_bar_border = theme.title_bar.blend(color(0x00_00_00).opacity(0.35));
+        theme.sidebar_foreground = color(0xEB_EC_EE);
+        theme.sidebar_border = theme.sidebar.blend(color(0xFF_FF_FF).opacity(0.12));
     } else {
-        sidebar
-    };
-    theme.sidebar_foreground = color(0xF2_F2_F2);
-    theme.sidebar_border = sidebar.blend(color(0x00_00_00).opacity(0.25));
-    theme.sidebar_accent = color(accent);
-    theme.sidebar_accent_foreground = color(0xFF_FF_FF);
+        // Light mode shows the full signature Slack sidebar color with a slightly deeper chrome
+        // band behind the title bar and workspace rail.
+        theme.sidebar = if darker_sidebars {
+            base.blend(color(0x0B_0D_10).opacity(0.32))
+        } else {
+            base
+        };
+        theme.title_bar = theme.sidebar.blend(color(0x00_00_00).opacity(0.22));
+        theme.title_bar_border = theme.title_bar.blend(color(0x00_00_00).opacity(0.25));
+        theme.sidebar_foreground = color(0xF2_F2_F2);
+        theme.sidebar_border = theme.sidebar.blend(color(0xFF_FF_FF).opacity(0.15));
+    }
+    theme.sidebar_accent = accent;
+    theme.sidebar_accent_foreground = accent_fg;
     theme.sidebar_primary = color(0xFF_FF_FF);
-    theme.sidebar_primary_foreground = sidebar;
-    theme.ring = color(accent);
+    theme.sidebar_primary_foreground = theme.sidebar;
+    theme.ring = accent;
 }
 
 fn color(hex: u32) -> Hsla {
@@ -359,21 +463,26 @@ pub fn mention_badge(cx: &App) -> (Hsla, Hsla) {
     }
 }
 
-/// Slack's tab rail fill (`theme-surf-inv-sec`): on dark themes the near-black Slack 4.53
-/// measures (#0E171B, a dark wash over its chrome); on light ones a near-opaque white panel
-/// (measured at 90% over the chrome's blue, top and bottom).
+/// Slack's tab rail fill (`theme-surf-inv-sec`): for the default theme, Slack 4.53's measured
+/// near-black (#0E171B) in dark mode or 90% white in light mode; for tinted themes and Darker
+/// sidebars, a slightly deeper shade of the sidebar so the rail always matches the theme hue.
 pub fn tab_rail_wash(cx: &App) -> Hsla {
-    if cx.theme().mode.is_dark() {
-        color(0x0E_17_1B)
+    let chrome = chrome_state(cx);
+    if chrome.palette == Palette::Default && !chrome.darker_sidebars {
+        if cx.theme().mode.is_dark() {
+            color(0x0E_17_1B)
+        } else {
+            color(0xFF_FF_FF).opacity(0.9)
+        }
     } else {
-        color(0xFF_FF_FF).opacity(0.9)
+        cx.theme().sidebar.blend(color(0x00_00_00).opacity(0.20))
     }
 }
 
-/// The rail's fills over that wash as the sidebar foreground's opacity: the active tile and
-/// the round control buttons measure 30% on dark themes and 13% on light ones.
+/// The rail's fills over that wash as the sidebar foreground's opacity: darker/tinted rails
+/// take a stronger translucent tile fill than the light white rail.
 pub fn rail_fill(cx: &App) -> f32 {
-    if cx.theme().mode.is_dark() { 0.3 } else { 0.13 }
+    if sidebar_is_dark(cx) { 0.25 } else { 0.13 }
 }
 
 /// Where a light-mode Slack panel's shadow (`box-shadow: 0 0 20px rgba(0,0,0,.1)`) falls on the
@@ -448,10 +557,32 @@ pub fn reacted_pill(cx: &App) -> (Hsla, Hsla, Option<Hsla>) {
 /// falloff near the corner. A square keeps GPUI's aspect-scaled gradient math exact.
 pub fn chrome_glow(cx: &App) -> (Pixels, Background) {
     let theme = cx.theme();
-    let (side, glow) = if theme.mode.is_dark() {
-        (900., color(0x33_3B_40))
+    let chrome = chrome_state(cx);
+    if !chrome.window_gradient {
+        let clear = theme.title_bar.opacity(0.);
+        return (
+            px(0.),
+            linear_gradient(
+                135.,
+                linear_color_stop(clear, 0.),
+                linear_color_stop(clear, 1.),
+            ),
+        );
+    }
+    let (side, glow) = if chrome.palette == Palette::Default && !chrome.darker_sidebars {
+        if theme.mode.is_dark() {
+            (900., color(0x33_3B_40))
+        } else {
+            (1400., color(0xF5_FA_FB))
+        }
     } else {
-        (1400., color(0xF5_FA_FB))
+        // Tinted themes derive their corner highlight from the chrome itself so the glow
+        // stays harmoniously matched to Aubergine, Jade, Lagoon, Clementine, etc.
+        let lift = if theme.mode.is_dark() { 0.16 } else { 0.22 };
+        (
+            1000.,
+            theme.title_bar.blend(color(0xFF_FF_FF).opacity(lift)),
+        )
     };
     let glow = if focused(cx) { glow.grayscale() } else { glow };
     // On a square, a 135deg gradient puts the corner at t = 0.5 - 1/sqrt(2) and the

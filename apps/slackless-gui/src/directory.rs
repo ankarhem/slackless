@@ -52,6 +52,8 @@ pub struct DirectoryView {
     filter: Entity<TextareaState>,
     /// Channels joined from this directory during the session.
     joined: HashSet<ChannelId>,
+    /// Expanded user group id showing clickable member and default channel chips.
+    expanded_group: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -79,6 +81,7 @@ impl DirectoryView {
                 tab: DirectoryTab::People,
                 filter,
                 joined: HashSet::new(),
+                expanded_group: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -103,6 +106,19 @@ impl DirectoryView {
     pub(super) fn join(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.joined.insert(channel.clone());
         cx.emit(DirectoryEvent::Join(channel));
+        cx.notify();
+    }
+
+    pub(super) fn is_group_expanded(&self, id: &str) -> bool {
+        self.expanded_group.as_deref() == Some(id)
+    }
+
+    pub(super) fn toggle_group(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.expanded_group.as_deref() == Some(id.as_str()) {
+            self.expanded_group = None;
+        } else {
+            self.expanded_group = Some(id);
+        }
         cx.notify();
     }
 }

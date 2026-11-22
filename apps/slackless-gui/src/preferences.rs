@@ -32,6 +32,8 @@ use crate::theme::{self, CUSTOM_ACCENTS, CUSTOM_SIDEBARS, Palette, SlackTheme};
 pub enum PreferencesEvent {
     /// Some setting changed; read [`Preferences::settings`].
     Changed,
+    /// User asked to reset the local SQLite & media cache in Preferences -> Advanced.
+    ResetCache,
 }
 
 /// Slack's Color Mode: Light / Dark / System (follow the computer).
@@ -208,11 +210,13 @@ const OPEN_LINKS: [&str; 3] = ["Default browser", "Safari", "Firefox"];
 #[serde(default)]
 pub struct Settings {
     // Notifications
+    pub desktop_notifications: bool,
     pub notify_level: usize,
     pub mobile_different: bool,
     pub thread_replies: bool,
     pub keywords: String,
     pub sound: usize,
+    pub dm_sound: usize,
     pub show_preview: bool,
     pub mute_sounds: bool,
     pub show_dock_badge: bool,
@@ -233,9 +237,12 @@ pub struct Settings {
     pub unreads_section: bool,
     pub separate_private: bool,
     pub profile_photos: bool,
+    pub sidebar_compact: bool,
     // Appearance & Themes
     pub mode: AppearanceMode,
     pub palette: Palette,
+    pub window_gradient: bool,
+    pub darker_sidebars: bool,
     pub font: usize,
     pub skin_tone: usize,
     pub jumbomoji: bool,
@@ -244,6 +251,7 @@ pub struct Settings {
     pub density: usize,
     pub names: usize,
     pub clock_24h: bool,
+    pub emoji_text_mode: bool,
     pub inline_media: bool,
     pub link_previews: bool,
     pub large_files: bool,
@@ -272,6 +280,10 @@ pub struct Settings {
     pub open_links: usize,
     /// Opt-in: automatically query Slack's remote search alongside instant local FTS5.
     pub remote_search_auto: bool,
+    /// Whether `Cmd+F` scopes search to the open conversation (`true`) or searches all of Slack (`false`).
+    pub search_in_channel: bool,
+    /// Comma-separated channel names excluded from default local search results.
+    pub excluded_channels: String,
     /// Whether the leftmost workspace switcher rail is shown (`Cmd+Shift+S`).
     pub show_workspace_rail: bool,
     /// Custom download folder path (empty string uses `~/Downloads`).
@@ -287,6 +299,7 @@ pub struct DisplayPrefs {
     pub display_names_only: bool,
     pub jumbomoji: bool,
     pub convert_emoticons: bool,
+    pub emoji_text_mode: bool,
     pub inline_media: bool,
     pub link_previews: bool,
     pub underline_links: bool,
@@ -300,6 +313,7 @@ impl Default for DisplayPrefs {
             display_names_only: false,
             jumbomoji: true,
             convert_emoticons: true,
+            emoji_text_mode: false,
             inline_media: true,
             link_previews: true,
             underline_links: false,
@@ -320,6 +334,7 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         display_names_only: settings.names == 1,
         jumbomoji: settings.jumbomoji,
         convert_emoticons: settings.convert_emoticons,
+        emoji_text_mode: settings.emoji_text_mode,
         inline_media: settings.inline_media,
         link_previews: settings.link_previews,
         underline_links: settings.underline_links,
@@ -354,11 +369,13 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            desktop_notifications: true,
             notify_level: 1,
             mobile_different: false,
             thread_replies: true,
             keywords: "deploy, incident".to_owned(),
             sound: 0,
+            dm_sound: 0,
             show_preview: true,
             mute_sounds: false,
             show_dock_badge: true,
@@ -377,8 +394,11 @@ impl Default for Settings {
             unreads_section: false,
             separate_private: false,
             profile_photos: true,
+            sidebar_compact: false,
             mode: AppearanceMode::Dark,
             palette: Palette::Default,
+            window_gradient: true,
+            darker_sidebars: false,
             font: theme::DEFAULT_FONT,
             skin_tone: 0,
             jumbomoji: true,
@@ -386,6 +406,7 @@ impl Default for Settings {
             density: 0,
             names: 0,
             clock_24h: false,
+            emoji_text_mode: false,
             inline_media: true,
             link_previews: true,
             large_files: true,
@@ -409,6 +430,8 @@ impl Default for Settings {
             debug_logging: false,
             open_links: 0,
             remote_search_auto: false,
+            search_in_channel: true,
+            excluded_channels: String::new(),
             show_workspace_rail: true,
             download_dir: String::new(),
         }
@@ -439,6 +462,7 @@ pub struct Preferences {
     /// The select whose option list is expanded, by id.
     open_select: Option<&'static str>,
     keywords: Entity<TextareaState>,
+    excluded_channels: Entity<TextareaState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -455,21 +479,41 @@ impl Preferences {
                 state.set_value(settings.keywords.clone(), window, cx);
                 state
             });
-            let subscriptions = vec![cx.subscribe_in(
-                &keywords,
-                window,
-                |this: &mut Preferences, keywords, event: &InputEvent, _, cx| {
-                    if let InputEvent::Change = event {
-                        this.settings.keywords = keywords.read(cx).value().to_string();
-                        cx.emit(PreferencesEvent::Changed);
-                    }
-                },
-            )];
+            let excluded_channels = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("e.g. random, alerts, noisy-bot")
+                    .auto_grow(1, 2);
+                state.set_value(settings.excluded_channels.clone(), window, cx);
+                state
+            });
+            let subscriptions = vec![
+                cx.subscribe_in(
+                    &keywords,
+                    window,
+                    |this: &mut Preferences, keywords, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.keywords = keywords.read(cx).value().to_string();
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
+                cx.subscribe_in(
+                    &excluded_channels,
+                    window,
+                    |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.excluded_channels = field.read(cx).value().to_string();
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
+            ];
             Preferences {
                 section: Section::Notifications,
                 settings,
                 open_select: None,
                 keywords,
+                excluded_channels,
                 _subscriptions: subscriptions,
             }
         })
@@ -487,9 +531,12 @@ impl Preferences {
         cx: &mut Context<Self>,
     ) {
         let keywords = settings.keywords.clone();
+        let excluded = settings.excluded_channels.clone();
         self.settings = settings;
         self.keywords
             .update(cx, |state, cx| state.set_value(keywords, window, cx));
+        self.excluded_channels
+            .update(cx, |state, cx| state.set_value(excluded, window, cx));
         cx.notify();
     }
 
@@ -794,6 +841,12 @@ impl Preferences {
     }
 
     fn notifications(&mut self, cx: &mut Context<Self>) -> Div {
+        let desktop = self.checkbox(
+            "notify-desktop",
+            "Enable desktop notifications",
+            |s| &mut s.desktop_notifications,
+            cx,
+        );
         let level = self.radios("notify-level", &NOTIFY_LEVELS, |s| &mut s.notify_level, cx);
         let mobile = self.checkbox(
             "notify-mobile",
@@ -836,6 +889,7 @@ impl Preferences {
         let start = self.select("schedule-start", &HOURS, |s| &mut s.schedule_start, cx);
         let end = self.select("schedule-end", &HOURS, |s| &mut s.schedule_end, cx);
         let sound = self.select("notify-sound", &SOUNDS, |s| &mut s.sound, cx);
+        let dm_sound = self.select("notify-dm-sound", &SOUNDS, |s| &mut s.dm_sound, cx);
         let preview = self.checkbox(
             "notify-preview",
             "Include a preview of the message in each notification",
@@ -855,7 +909,17 @@ impl Preferences {
             cx,
         );
         v_flex()
-            .child(self.group("Notify me about\u{2026}", None, v_flex().gap_2().child(level).child(mobile).child(threads), cx))
+            .child(self.group(
+                "Notify me about\u{2026}",
+                None,
+                v_flex()
+                    .gap_2()
+                    .child(desktop)
+                    .child(level)
+                    .child(mobile)
+                    .child(threads),
+                cx,
+            ))
             .child(self.group(
                 "My keywords",
                 Some("You'll be notified whenever someone says one of your keywords."),
@@ -877,7 +941,8 @@ impl Preferences {
                 None,
                 v_flex()
                     .gap_3()
-                    .child(self.labeled("Notification sound (messages)", sound))
+                    .child(self.labeled("Notification sound (channels)", sound))
+                    .child(self.labeled("Notification sound (DMs & mentions)", dm_sound))
                     .child(preview)
                     .child(mute)
                     .child(dock_badge),
@@ -931,6 +996,12 @@ impl Preferences {
             |s| &mut s.profile_photos,
             cx,
         );
+        let compact_rows = self.checkbox(
+            "home-compact",
+            "Use compact sidebar rows",
+            |s| &mut s.sidebar_compact,
+            cx,
+        );
         v_flex()
             .child(
                 self.group(
@@ -943,17 +1014,24 @@ impl Preferences {
                     cx,
                 ),
             )
-            .child(self.group(
-                "Organization",
-                None,
-                v_flex().gap_1().child(unreads).child(private).child(photos),
-                cx,
-            ))
+            .child(
+                self.group(
+                    "Organization",
+                    None,
+                    v_flex()
+                        .gap_1()
+                        .child(unreads)
+                        .child(private)
+                        .child(photos)
+                        .child(compact_rows),
+                    cx,
+                ),
+            )
     }
 
     fn appearance(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (border, ring, sidebar) = (theme.border, theme.ring, theme.sidebar);
+        let (border, ring, is_dark) = (theme.border, theme.ring, theme.mode.is_dark());
         // Slack's Color Mode: three equal buttons in a row, icon beside the label, the chosen
         // one ringed in the accent.
         let mode = self.settings.mode;
@@ -994,7 +1072,7 @@ impl Preferences {
                 .flex_wrap()
                 .gap_3()
                 .children(Palette::NAMED.iter().enumerate().map(|(ix, &choice)| {
-                    let (side, accent) = choice.swatch(sidebar);
+                    let (side, accent) = choice.swatch(is_dark);
                     self.swatch_card(
                         ("palette", ix),
                         choice.name(),
@@ -1060,6 +1138,18 @@ impl Preferences {
                 swatch_row("custom-accent", &CUSTOM_ACCENTS, custom_accent, cx),
             ));
 
+        let gradient = self.checkbox(
+            "appearance-gradient",
+            "Window gradient",
+            |s| &mut s.window_gradient,
+            cx,
+        );
+        let darker = self.checkbox(
+            "appearance-darker-sidebars",
+            "Darker sidebars",
+            |s| &mut s.darker_sidebars,
+            cx,
+        );
         let font = self.select("appearance-font", &theme::FONT_LABELS, |s| &mut s.font, cx);
         let skin = self.radios("appearance-skin", &SKIN_TONES, |s| &mut s.skin_tone, cx);
         let jumbo = self.checkbox(
@@ -1078,7 +1168,12 @@ impl Preferences {
         v_flex()
             .child(self.group("Font", None, font, cx))
             .child(self.group("Color Mode", Some("Choose if Slack's appearance should be light or dark, or follow your computer's settings."), modes, cx))
-            .child(self.group("Slack themes", Some("Single-color themes that tint your sidebar and highlights."), named, cx))
+            .child(self.group(
+                "Slack themes",
+                Some("Single-color themes that tint your sidebar, chrome, and highlights."),
+                v_flex().gap_3().child(named).child(h_flex().gap_5().child(gradient).child(darker)),
+                cx,
+            ))
             .child(self.group("Custom theme", Some("Build your own: pick a sidebar and an accent color."), custom, cx))
             .child(self.group(
                 "Emoji",
@@ -1156,6 +1251,12 @@ impl Preferences {
             |s| &mut s.clock_24h,
             cx,
         );
+        let emoji_text = self.checkbox(
+            "msg-emoji-text",
+            "Display emoji as plain text (:smile:)",
+            |s| &mut s.emoji_text_mode,
+            cx,
+        );
         let enter = self.radio_rows(
             "msg-enter",
             &ENTER_OPTIONS,
@@ -1189,12 +1290,18 @@ impl Preferences {
         );
         v_flex()
             .child(self.group("Message theme", None, density, cx))
-            .child(self.group(
-                "Names & timestamps",
-                None,
-                v_flex().gap_2().child(names).child(clock24),
-                cx,
-            ))
+            .child(
+                self.group(
+                    "Names & timestamps",
+                    None,
+                    v_flex()
+                        .gap_2()
+                        .child(names)
+                        .child(clock24)
+                        .child(emoji_text),
+                    cx,
+                ),
+            )
             .child(self.group(
                 "When writing a message, press Enter to\u{2026}",
                 None,
@@ -1330,6 +1437,31 @@ impl Preferences {
             |s| &mut s.remote_search_auto,
             cx,
         );
+        let search_in_ch = self.checkbox(
+            "adv-search-in-channel",
+            "\u{2318}F searches the current conversation instead of all of Slack",
+            |s| &mut s.search_in_channel,
+            cx,
+        );
+        let excluded_border = cx.theme().input;
+        let excluded_input = div()
+            .w(px(420.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(excluded_border)
+            .text_sm()
+            .child(
+                Textarea::new(&self.excluded_channels)
+                    .appearance(false)
+                    .bordered(false),
+            );
+        let reset_cache = Button::new("adv-reset-cache")
+            .outline()
+            .with_size(Size::Small)
+            .label("Clear local cache & reload")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ResetCache)));
         let dl_label = if self.settings.download_dir.is_empty() {
             "~/Downloads (default)".to_owned()
         } else {
@@ -1397,7 +1529,11 @@ impl Preferences {
             .child(self.group(
                 "Search",
                 Some("Local search is instant and works offline. Enable remote search when you want older history, unjoined channels, and server-indexed files automatically."),
-                remote_search,
+                v_flex()
+                    .gap_2()
+                    .child(remote_search)
+                    .child(search_in_ch)
+                    .child(self.labeled("Exclude these channels from local search", excluded_input)),
                 cx,
             ))
             .child(self.group(
@@ -1416,7 +1552,12 @@ impl Preferences {
             .child(self.group(
                 "App",
                 None,
-                v_flex().gap_1().child(login).child(hardware).child(debug),
+                v_flex()
+                    .gap_2()
+                    .child(login)
+                    .child(hardware)
+                    .child(debug)
+                    .child(div().pt_1().child(reset_cache)),
                 cx,
             ))
     }

@@ -272,50 +272,155 @@ pub(super) fn usergroup_row(
     } else {
         format!("{desc} · {count} members{members_preview}")
     };
-    h_flex()
-        .id(("directory-usergroup", ix))
-        .items_center()
-        .gap_3()
-        .px_4()
-        .py_2()
+    let default_channels: Vec<ChannelId> = group
+        .extra
+        .get("prefs")
+        .and_then(|p| p.get("channels"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(ChannelId::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let expanded = view.is_group_expanded(group.id.as_str());
+    let toggle_id = group.id.to_string();
+    let chip_bg = theme.secondary;
+    let chip_hover = theme.secondary_hover;
+    let details = expanded.then(|| {
+        let mut panel = v_flex().pl(px(56.)).pr_4().pb_3().gap_2();
+        if !user_ids.is_empty() {
+            let member_chips =
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(user_ids.iter().enumerate().map(|(m_ix, uid)| {
+                        let open_uid = uid.clone();
+                        let label = fixtures.user_name(uid).to_owned();
+                        h_flex()
+                            .id(("ug-member", ix * 1000 + m_ix))
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(chip_bg)
+                            .hover(|el| el.bg(chip_hover))
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(foreground)
+                            .child(user_chip(fixtures, uid, 16.))
+                            .child(label)
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(DirectoryEvent::OpenProfile(open_uid.clone()));
+                            }))
+                    }));
+            panel = panel
+                .child(div().text_xs().text_color(muted).child("Members"))
+                .child(member_chips);
+        }
+        if !default_channels.is_empty() {
+            let ch_chips = div().flex().flex_wrap().gap_1p5().children(
+                default_channels.iter().enumerate().map(|(c_ix, ch_id)| {
+                    let open_ch = ch_id.clone();
+                    let label = fixtures
+                        .conversation(ch_id)
+                        .and_then(|c| c.name.as_deref())
+                        .map(|n| format!("#{n}"))
+                        .unwrap_or_else(|| ch_id.to_string());
+                    div()
+                        .id(("ug-channel", ix * 1000 + c_ix))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_full()
+                        .bg(chip_bg)
+                        .hover(|el| el.bg(chip_hover))
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(link)
+                        .child(label)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(DirectoryEvent::Open(open_ch.clone()));
+                        }))
+                }),
+            );
+            panel = panel
+                .child(div().text_xs().text_color(muted).child("Default channels"))
+                .child(ch_chips);
+        }
+        if user_ids.is_empty() && default_channels.is_empty() {
+            panel = panel.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("No member list available for this group."),
+            );
+        }
+        panel
+    });
+    v_flex()
         .border_b_1()
         .border_color(border)
-        .hover(|row| row.bg(hover))
         .child(
-            div()
-                .size(px(32.))
-                .flex_none()
-                .rounded_md()
-                .bg(link.opacity(0.14))
-                .flex()
+            h_flex()
+                .id(("directory-usergroup", ix))
                 .items_center()
-                .justify_center()
-                .child(Icon::new(IconName::Users).text_color(link).size(px(16.))),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
+                .gap_3()
+                .px_4()
+                .py_2()
+                .cursor_pointer()
+                .hover(|row| row.bg(hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_group(toggle_id.clone(), cx);
+                }))
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .items_baseline()
-                        .child(
-                            div()
-                                .truncate()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(foreground)
-                                .child(group.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(link)
-                                .child(format!("@{}", group.handle)),
-                        ),
+                    div()
+                        .size(px(32.))
+                        .flex_none()
+                        .rounded_md()
+                        .bg(link.opacity(0.14))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::Users).text_color(link).size(px(16.))),
                 )
-                .child(div().truncate().text_xs().text_color(muted).child(subtitle)),
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_baseline()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(foreground)
+                                        .child(group.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_xs()
+                                        .text_color(link)
+                                        .child(format!("@{}", group.handle)),
+                                ),
+                        )
+                        .child(div().truncate().text_xs().text_color(muted).child(subtitle)),
+                )
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(px(14.))
+                    .text_color(muted),
+                ),
         )
+        .children(details)
         .into_any_element()
 }

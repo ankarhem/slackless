@@ -179,12 +179,22 @@ fn main() {
             zoom::set_level(level, cx);
         }
         if let Some(mode) = bridge.color_mode() {
-            let palette = bridge
-                .settings()
+            let saved = bridge.settings();
+            let palette = saved
+                .as_ref()
                 .map(|s| s.palette)
                 .or(fixtures.palette)
                 .unwrap_or(theme::Palette::Default);
-            theme::activate_with(mode.resolve(cx.window_appearance()), palette, false, cx);
+            let darker_sidebars = saved.as_ref().is_some_and(|s| s.darker_sidebars);
+            let window_gradient = saved.as_ref().is_none_or(|s| s.window_gradient);
+            theme::activate_with(
+                mode.resolve(cx.window_appearance()),
+                palette,
+                darker_sidebars,
+                window_gradient,
+                false,
+                cx,
+            );
         }
         let fixtures = Arc::new(fixtures);
         // Like Slack, the window fills the screen on first launch and later reopens with the

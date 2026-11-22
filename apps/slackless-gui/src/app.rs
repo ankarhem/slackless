@@ -332,6 +332,10 @@ actions!(
         ToggleRightPane,
         PopOutConversation,
         UnsendLastMessage,
+        NextNavTab,
+        PrevNavTab,
+        FocusNextPane,
+        FocusPrevPane,
         ZoomIn,
         ZoomOut,
         ActualSize,
@@ -527,9 +531,11 @@ pub struct App {
     active_huddles: HashMap<ChannelId, Vec<UserId>>,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
-    /// The theme last installed (mode, color theme, focus mode's grayscale), so unrelated
-    /// preference edits do not repaint the theme.
-    applied_theme: (SlackTheme, Palette, bool),
+    /// The theme last installed (mode, color theme, darker sidebars, window gradient, focus
+    /// mode's grayscale), so unrelated preference edits do not repaint the theme.
+    applied_theme: (SlackTheme, Palette, bool, bool, bool),
+    /// Current pane index for F6 / Shift+F6 focus cycling (0=sidebar, 1=transcript, 2=composer, 3=right).
+    pane_focus: usize,
     /// The Color Mode last stored (`None` offline), so only a changed mode is written.
     color_mode: Option<AppearanceMode>,
     /// The full Preferences snapshot last persisted (`None` offline), avoiding redundant writes.
@@ -799,9 +805,19 @@ impl App {
                         s.font = font;
                         s.zoom = zoom;
                     }
-                    (mode.resolve(window.appearance()), palette, false)
+                    let darker = restored_settings
+                        .as_ref()
+                        .is_some_and(|s| s.darker_sidebars);
+                    let gradient = restored_settings.as_ref().is_none_or(|s| s.window_gradient);
+                    (
+                        mode.resolve(window.appearance()),
+                        palette,
+                        darker,
+                        gradient,
+                        false,
+                    )
                 }
-                None => (SlackTheme::Dark, Palette::Default, false),
+                None => (SlackTheme::Dark, Palette::Default, false, true, false),
             };
             let saved_settings = if bridge.store().is_some() {
                 Some(restored_settings.unwrap_or_else(|| preferences.read(cx).settings().clone()))
@@ -871,6 +887,10 @@ impl App {
                 KeyBinding::new("cmd-shift-s", ToggleWorkspaceRail, None),
                 KeyBinding::new("cmd-.", ToggleRightPane, None),
                 KeyBinding::new("cmd-shift-backspace", UnsendLastMessage, None),
+                KeyBinding::new("ctrl-tab", NextNavTab, None),
+                KeyBinding::new("ctrl-shift-tab", PrevNavTab, None),
+                KeyBinding::new("f6", FocusNextPane, None),
+                KeyBinding::new("shift-f6", FocusPrevPane, None),
                 // Slack's View menu shows Cmd++; Cmd+= (no Shift) zooms in too.
                 KeyBinding::new("cmd-+", ZoomIn, None),
                 KeyBinding::new("cmd-=", ZoomIn, None),
@@ -1175,14 +1195,21 @@ impl App {
                             if let Some(write) = this.bridge.remember_emoji_tone(*tone) {
                                 cx.background_executor().spawn(write).detach();
                             }
+                            if !this.fixtures.sample {
+                                this.bridge.send(Command::SetUserPref {
+                                    name: "preferred_skin_tone".to_owned(),
+                                    value: (*tone).to_string(),
+                                });
+                            }
                         }
                     },
                 ),
                 cx.subscribe_in(
                     &preferences,
                     window,
-                    |this: &mut App, _, _: &PreferencesEvent, window, cx| {
-                        this.apply_preferences(window, cx);
+                    |this: &mut App, _, event: &PreferencesEvent, window, cx| match event {
+                        PreferencesEvent::Changed => this.apply_preferences(window, cx),
+                        PreferencesEvent::ResetCache => this.confirm_reset_cache(window, cx),
                     },
                 ),
                 cx.observe_window_appearance(window, |this: &mut App, window, cx| {
@@ -1613,6 +1640,7 @@ impl App {
                 active_huddles: HashMap::new(),
                 preferences,
                 applied_theme,
+                pane_focus: 2,
                 color_mode,
                 saved_settings,
                 profile,
@@ -1878,6 +1906,17 @@ impl App {
     /// A system notification (a macOS banner) with the notification sound, as Slack's desktop
     /// notifications come.
     fn system_notification(&mut self, tag: &str, title: &str, body: &str, cx: &mut Context<Self>) {
+        self.system_notification_kind(tag, title, body, false, cx);
+    }
+
+    fn system_notification_kind(
+        &mut self,
+        tag: &str,
+        title: &str,
+        body: &str,
+        is_direct_or_mention: bool,
+        cx: &mut Context<Self>,
+    ) {
         cx.show_system_notification(SystemNotification {
             tag: tag.to_owned().into(),
             title: title.to_owned().into(),
@@ -1885,7 +1924,7 @@ impl App {
             actions: Vec::new(),
         });
         self.os.notify(title, body);
-        self.play_notification_sound(cx);
+        self.play_notification_sound_kind(is_direct_or_mention, cx);
     }
 
     /// A notification mirrored as an in-app toast (Later reminders).
@@ -2382,9 +2421,23 @@ impl App {
             }
         }
         let focus = self.self_state.focused();
-        if self.applied_theme != (theme, settings.palette, focus) {
-            self.applied_theme = (theme, settings.palette, focus);
-            theme::activate_with(theme, settings.palette, focus, cx);
+        let theme_key = (
+            theme,
+            settings.palette,
+            settings.darker_sidebars,
+            settings.window_gradient,
+            focus,
+        );
+        if self.applied_theme != theme_key {
+            self.applied_theme = theme_key;
+            theme::activate_with(
+                theme,
+                settings.palette,
+                settings.darker_sidebars,
+                settings.window_gradient,
+                focus,
+                cx,
+            );
         }
         if crate::zoom::set_level(settings.zoom, cx) {
             if let Some(write) = self.bridge.remember_zoom(settings.zoom) {
@@ -2409,8 +2462,11 @@ impl App {
         self.compose
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
         let remote_auto = settings.remote_search_auto;
-        self.results
-            .update(cx, |view, _| view.set_remote_auto(remote_auto));
+        let excluded_channels = settings.excluded_channels.clone();
+        self.results.update(cx, |view, _| {
+            view.set_remote_auto(remote_auto);
+            view.set_excluded_channels(&excluded_channels);
+        });
         crate::preferences::set_display_prefs(&settings, cx);
         crate::media::set_download_dir(
             (!settings.download_dir.is_empty())
@@ -2425,11 +2481,21 @@ impl App {
             show_later: settings.show_later,
             icons_only: settings.tab_style == 1,
         };
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.set_nav_prefs(nav_prefs, cx));
+        let home_prefs = crate::sidebar::HomePrefs {
+            show: settings.show,
+            sort: settings.sort,
+            unreads_section: settings.unreads_section,
+            separate_private: settings.separate_private,
+            profile_photos: settings.profile_photos,
+            compact: settings.sidebar_compact,
+        };
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_nav_prefs(nav_prefs, cx);
+            sidebar.set_home_prefs(home_prefs, cx);
+        });
         if let Some(prev) = self.saved_settings.as_ref() {
             if *prev != settings {
-                // Cloud pref write-back (`users.prefs.set`) for display preferences that changed.
+                // Cloud pref write-back (`users.prefs.set`) for display, emoji, and notification prefs.
                 if !self.fixtures.sample {
                     let sync_pref = |name: &str, value: String| {
                         self.bridge.send(Command::SetUserPref {
@@ -2449,6 +2515,9 @@ impl App {
                     if prev.convert_emoticons != settings.convert_emoticons {
                         sync_pref("convert_emoticons", settings.convert_emoticons.to_string());
                     }
+                    if prev.emoji_text_mode != settings.emoji_text_mode {
+                        sync_pref("emoji_only_text", settings.emoji_text_mode.to_string());
+                    }
                     if prev.underline_links != settings.underline_links {
                         sync_pref("underline_links", settings.underline_links.to_string());
                     }
@@ -2464,7 +2533,33 @@ impl App {
                         );
                     }
                     if prev.skin_tone != settings.skin_tone {
-                        sync_pref("emoji_skin_tone", (settings.skin_tone + 1).to_string());
+                        sync_pref(
+                            "preferred_skin_tone",
+                            format!("skin-tone-{}", settings.skin_tone + 1),
+                        );
+                    }
+                    if prev.keywords != settings.keywords {
+                        sync_pref("highlight_words", settings.keywords.clone());
+                    }
+                    if prev.schedule_enabled != settings.schedule_enabled {
+                        sync_pref("dnd_enabled", settings.schedule_enabled.to_string());
+                    }
+                    if prev.schedule_start != settings.schedule_start {
+                        sync_pref(
+                            "dnd_end_hour",
+                            format!("{:02}:00", settings.schedule_start % 24),
+                        );
+                    }
+                    if prev.schedule_end != settings.schedule_end {
+                        sync_pref(
+                            "dnd_start_hour",
+                            format!("{:02}:00", settings.schedule_end % 24),
+                        );
+                    }
+                    if prev.palette != settings.palette {
+                        if let Some(theme_name) = settings.palette.slack_pref_name() {
+                            sync_pref("sidebar_theme", theme_name.to_owned());
+                        }
                     }
                 }
                 self.saved_settings = Some(settings.clone());
@@ -3883,6 +3978,22 @@ impl App {
         if let Some(write) = self.bridge.remember_frequent_emoji(&frequent) {
             cx.background_executor().spawn(write).detach();
         }
+        if !self.fixtures.sample && !frequent.is_empty() {
+            let mut map = crate::blockkit::serde_json::Map::new();
+            let total = frequent.len();
+            for (ix, name) in frequent.iter().take(24).enumerate() {
+                map.insert(
+                    name.clone(),
+                    crate::blockkit::serde_json::json!((total - ix) as u64),
+                );
+            }
+            if let Ok(encoded) = crate::blockkit::serde_json::to_string(&map) {
+                self.bridge.send(Command::SetUserPref {
+                    name: "emoji_use".to_owned(),
+                    value: encoded,
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -4426,21 +4537,97 @@ impl App {
     /// The header's search icon: the top search field scoped to this channel, like Slack's
     /// "Search in #channel".
     fn search_in_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let scope = self
-            .fixtures
-            .conversation(&self.channel)
-            .filter(|c| {
-                matches!(
-                    c.kind(),
-                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
-                )
-            })
-            .and_then(|c| c.name.as_deref())
-            .map(|name| format!("in:#{name} "))
-            .unwrap_or_default();
+        let scope = if self.preferences.read(cx).settings().search_in_channel {
+            self.fixtures
+                .conversation(&self.channel)
+                .filter(|c| {
+                    matches!(
+                        c.kind(),
+                        ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+                    )
+                })
+                .and_then(|c| c.name.as_deref())
+                .map(|name| format!("in:#{name} "))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         self.search
             .update(cx, |search, cx| search.set_value(scope, window, cx));
         self.search.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    /// Cycle keyboard focus between app panes (`F6` / `Shift+F6`).
+    fn cycle_pane_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let has_right = self.thread_open || self.profile_open || self.pins_open;
+        let count = if has_right { 4 } else { 3 };
+        self.pane_focus = if forward {
+            (self.pane_focus + 1) % count
+        } else {
+            (self.pane_focus + count - 1) % count
+        };
+        match self.pane_focus {
+            0 => self.sidebar.update(cx, |s, cx| s.focus_find(window, cx)),
+            1 => self.focus.focus(window, cx),
+            2 => self.composer.update(cx, |c, cx| c.focus_input(window, cx)),
+            _ => self.focus.focus(window, cx),
+        }
+    }
+
+    /// Confirm and clear local SQLite message cache (`Preferences -> Advanced -> Clear local cache`).
+    fn confirm_reset_cache(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title("Clear local cache?")
+                .w(px(420.))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .child(div().text_color(muted).child(
+                            "Removes cached search & message data from disk (your signed-in sessions stay intact). Relaunch slackless to re-sync fresh history.",
+                        ))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("reset-cache-cancel").label("Cancel").on_click(
+                                    |_, window, cx| window.close_dialog(cx),
+                                ))
+                                .child(
+                                    Button::new("reset-cache-confirm")
+                                        .danger()
+                                        .label("Clear cache")
+                                        .on_click(|_, window, cx| {
+                                            window.close_dialog(cx);
+                                            if let Some(dir) = crate::bridge::store_dir() {
+                                                if let Ok(entries) = std::fs::read_dir(&dir) {
+                                                    for entry in entries.flatten() {
+                                                        let path = entry.path();
+                                                        let name = path
+                                                            .file_name()
+                                                            .and_then(|n| n.to_str())
+                                                            .unwrap_or_default();
+                                                        if name.ends_with(".sqlite")
+                                                            || name.ends_with(".sqlite-wal")
+                                                            || name.ends_with(".sqlite-shm")
+                                                        {
+                                                            let _ = std::fs::remove_file(path);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            notify(
+                                                "Cache cleared",
+                                                "Restart slackless to re-sync from Slack.".to_owned(),
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                ),
+                        ),
+                )
+        });
     }
 
     /// Search messages for `query`, showing results in place of the message column. The
@@ -4847,7 +5034,10 @@ impl App {
             }
             Event::MessagePosted { channel, message } => {
                 let settings = self.preferences.read(cx).settings().clone();
-                if self.self_state.paused() || !settings.notifications_allowed_now() {
+                if !settings.desktop_notifications
+                    || self.self_state.paused()
+                    || !settings.notifications_allowed_now()
+                {
                     return;
                 }
                 let snap = self
@@ -4906,7 +5096,7 @@ impl App {
                     ),
                 };
                 let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
-                self.system_notification(&tag, &title, &body, cx);
+                self.system_notification_kind(&tag, &title, &body, dm || mentioned, cx);
             }
             Event::HuddleUpdated {
                 channel,
@@ -5699,8 +5889,16 @@ impl App {
                 format!("{sender}: {text}"),
             ),
         };
+        let is_dm_or_mention = matches!(
+            conversation.kind(),
+            ConversationKind::Im | ConversationKind::Mpim
+        ) || mentions_me(
+            &message.text,
+            &self.fixtures.self_user,
+            &self.preferences.read(cx).settings().keywords,
+        );
         let tag = format!("msg:{channel}:{}", message.ts);
-        self.system_notification(&tag, &title, &body, cx);
+        self.system_notification_kind(&tag, &title, &body, is_dm_or_mention, cx);
     }
 
     /// Slack's desktop notification rules for a message just posted: never your own, while
@@ -5719,7 +5917,8 @@ impl App {
     ) -> bool {
         let me = &self.fixtures.self_user;
         let settings = self.preferences.read(cx).settings();
-        if message.user.as_ref() == Some(me)
+        if !settings.desktop_notifications
+            || message.user.as_ref() == Some(me)
             || self.self_state.paused()
             || !settings.notifications_allowed_now()
         {
@@ -5772,10 +5971,14 @@ impl App {
     }
 
     /// Play the notification sound chosen in Preferences, unless sounds are muted.
-    fn play_notification_sound(&mut self, cx: &mut Context<Self>) {
+    fn play_notification_sound_kind(&mut self, is_direct_or_mention: bool, cx: &mut Context<Self>) {
         let settings = self.preferences.read(cx).settings();
-        let (muted, choice) = (settings.mute_sounds, settings.sound);
-        if !muted {
+        let choice = if is_direct_or_mention {
+            settings.dm_sound
+        } else {
+            settings.sound
+        };
+        if !settings.mute_sounds {
             self.play_sound(choice, cx);
         }
     }
@@ -7219,6 +7422,18 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &UnsendLastMessage, window, cx| {
                 this.unsend_last_message(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NextNavTab, _, cx| {
+                this.sidebar.update(cx, |s, cx| s.cycle_nav(true, cx));
+            }))
+            .on_action(cx.listener(|this, _: &PrevNavTab, _, cx| {
+                this.sidebar.update(cx, |s, cx| s.cycle_nav(false, cx));
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextPane, window, cx| {
+                this.cycle_pane_focus(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPrevPane, window, cx| {
+                this.cycle_pane_focus(false, window, cx);
+            }))
             .relative()
             .size_full()
             .bg(chrome)
@@ -7467,21 +7682,25 @@ impl App {
     /// centered search pill, and the workspace chip, theme toggle and help on the right —
     /// the reference screenshot's top row.
     fn global_bar(&mut self, cx: &mut Context<Self>) -> TitleBar {
-        let muted_foreground = cx.theme().muted_foreground;
-        // Slack's pill is a translucent shade of the chrome, not a bordered field.
-        let pill = cx.theme().foreground.opacity(0.08);
-        let accent = cx.theme().accent;
+        // The top bar sits directly over `title_bar` chrome (which may be dark-tinted even in
+        // Light mode under Aubergine/Jade/Clementine/etc. or Darker sidebars), so all icons,
+        // text, and translucent pill washes derive from `sidebar_foreground`.
+        let chrome_fg = cx.theme().sidebar_foreground;
+        let chrome_muted = chrome_fg.opacity(0.75);
+        let pill = chrome_fg.opacity(0.14);
+        let chrome_hover = chrome_fg.opacity(0.12);
 
         let this = cx.entity().downgrade();
         let recent = self.recent_entries();
         let nav = h_flex()
             .items_center()
             .gap_1()
+            .text_color(chrome_fg)
             .child(
                 Button::new("nav-back")
                     .ghost()
                     .with_size(Size::Small)
-                    .icon(IconName::ArrowLeft)
+                    .icon(Icon::new(IconName::ArrowLeft).text_color(chrome_muted))
                     .tooltip("Back")
                     .disabled(self.back.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
@@ -7490,7 +7709,7 @@ impl App {
                 Button::new("nav-forward")
                     .ghost()
                     .with_size(Size::Small)
-                    .icon(IconName::ArrowRight)
+                    .icon(Icon::new(IconName::ArrowRight).text_color(chrome_muted))
                     .tooltip("Forward")
                     .disabled(self.forward.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
@@ -7499,7 +7718,7 @@ impl App {
                 Button::new("nav-history")
                     .ghost()
                     .with_size(Size::Small)
-                    .icon(IconName::Clock)
+                    .icon(Icon::new(IconName::Clock).text_color(chrome_muted))
                     .tooltip("History")
                     .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
                         menu = menu.label("Recent");
@@ -7538,6 +7757,7 @@ impl App {
                     .px_2()
                     .rounded(px(6.))
                     .bg(pill)
+                    .text_color(chrome_fg)
                     // Like Slack, a click anywhere on the pill focuses search (and never
                     // drags the window, as the rest of the title bar does) and opens the
                     // dropdown under it.
@@ -7552,23 +7772,30 @@ impl App {
                     )
                     .child(
                         Icon::new(IconName::Search)
-                            .text_color(muted_foreground)
+                            .text_color(chrome_muted)
                             .size(px(14.)),
                     )
                     .child(
                         // While the dropdown is open the field renders inside the panel;
-                        // the pill keeps its box so the bar does not shift.
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .when(!self.search_menu_open, |field| {
-                                field.child(
-                                    Textarea::new(&self.search)
-                                        .appearance(false)
-                                        .bordered(false),
-                                )
-                            }),
+                        // when closed, show the query or placeholder directly in chrome colors so
+                        // Light mode + tinted dark chrome never shows low-contrast dark placeholder text.
+                        {
+                            let current = self.search.read(cx).value().to_string();
+                            let empty = current.is_empty();
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .text_color(if empty { chrome_muted } else { chrome_fg })
+                                .when(!self.search_menu_open, |field| {
+                                    field.child(if empty {
+                                        SEARCH_PLACEHOLDER.to_owned()
+                                    } else {
+                                        current
+                                    })
+                                })
+                        },
                     ),
             );
 
@@ -7588,11 +7815,11 @@ impl App {
             .h(px(28.))
             .rounded_sm()
             .cursor_pointer()
-            .hover(|el| el.bg(accent))
+            .hover(move |el| el.bg(chrome_hover))
             .child(div().text_base().child(status_glyph))
             .child(
                 Icon::new(IconName::ChevronDown)
-                    .text_color(muted_foreground)
+                    .text_color(chrome_muted)
                     .size(px(12.)),
             )
             .on_click(cx.listener(|this, _, window, cx| this.open_status_picker(window, cx)));
@@ -7629,8 +7856,8 @@ impl App {
                                 chrome_icon(
                                     "help",
                                     IconName::CircleQuestionMark,
-                                    muted_foreground,
-                                    accent,
+                                    chrome_muted,
+                                    chrome_hover,
                                 )
                                 .on_click(cx.listener(
                                     |this, _, window, cx| this.open_shortcuts(window, cx),

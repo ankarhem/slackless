@@ -2247,6 +2247,8 @@ struct RunTheme {
     links: Option<LinkHandler>,
     /// Always underline website links (Preferences > Accessibility > Underline links).
     underline_links: bool,
+    /// Render emoji as plain `:shortcode:` text (Preferences > Messages & media).
+    emoji_text_mode: bool,
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
     /// within its message (GPUI keys interaction and accessibility state by the id path)
     /// and counts its selection document order.
@@ -2288,6 +2290,7 @@ impl RunTheme {
             order,
             links,
             underline_links: crate::preferences::display_prefs(cx).underline_links,
+            emoji_text_mode: crate::preferences::display_prefs(cx).emoji_text_mode,
             base_font,
             paragraphs: Cell::new(0),
             key,
@@ -3403,19 +3406,24 @@ fn push_element(
             );
         }
         RichTextElement::Emoji(el) => {
-            let glyph = el
-                .unicode
-                .as_deref()
-                .and_then(unicode_glyph)
-                .or_else(|| emoji::display_glyph(&el.name));
-            match (glyph, fixtures.custom_emoji(&el.name)) {
-                (Some(glyph), _) => {
-                    builder.push_text(&glyph, theme, flags(el.style.as_ref()), None, None);
-                }
-                (None, Some(image)) => builder.push_image(image.source()),
-                (None, None) => {
-                    let literal = format!(":{}:", el.name);
-                    builder.push_text(&literal, theme, flags(el.style.as_ref()), None, None);
+            if theme.emoji_text_mode {
+                let literal = format!(":{}:", el.name);
+                builder.push_text(&literal, theme, flags(el.style.as_ref()), None, None);
+            } else {
+                let glyph = el
+                    .unicode
+                    .as_deref()
+                    .and_then(unicode_glyph)
+                    .or_else(|| emoji::display_glyph(&el.name));
+                match (glyph, fixtures.custom_emoji(&el.name)) {
+                    (Some(glyph), _) => {
+                        builder.push_text(&glyph, theme, flags(el.style.as_ref()), None, None);
+                    }
+                    (None, Some(image)) => builder.push_image(image.source()),
+                    (None, None) => {
+                        let literal = format!(":{}:", el.name);
+                        builder.push_text(&literal, theme, flags(el.style.as_ref()), None, None);
+                    }
                 }
             }
         }
@@ -3878,8 +3886,10 @@ fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
     let edited = message.edited.is_some();
     let inline_edited = edited && body_ends_in_text(message);
     let attachments = blockkit::attachments(message, kcx, cx);
-    // Jumbomoji: when enabled and the message is 1..=5 emoji only, render them large (32px).
-    if crate::preferences::display_prefs(cx).jumbomoji
+    // Jumbomoji: when enabled (and not in plain-text emoji mode) and the message is 1..=5 emoji only, render them large (32px).
+    let display = crate::preferences::display_prefs(cx);
+    if display.jumbomoji
+        && !display.emoji_text_mode
         && !has_kit
         && message.attachments.is_empty()
         && message.files.is_empty()
@@ -4217,6 +4227,9 @@ fn emoji_token(
     theme: &RunTheme,
     run: RunFlags,
 ) -> Option<usize> {
+    if theme.emoji_text_mode {
+        return None;
+    }
     let (len, code) = emoji::parse_shortcode(rest)?;
     match emoji::display_glyph(&code) {
         Some(glyph) => builder.push_text(&glyph, theme, run, None, None),

@@ -65,6 +65,8 @@ pub struct BlockKitState {
     expanded: HashSet<String>,
     /// Image blocks the user collapsed with their title's caret, by message and block.
     collapsed: HashSet<String>,
+    /// Link unfurl cards the user dismissed locally, by message ts and attachment index.
+    dismissed_unfurls: HashSet<String>,
 }
 
 /// What one message's blocks render with.
@@ -962,7 +964,21 @@ pub fn attachments(message: &Message, kcx: &KitCx, cx: &App) -> Option<Div> {
         .attachments
         .iter()
         .enumerate()
-        .filter(|(_, attachment)| show_previews || !is_page_preview_attachment(attachment))
+        .filter(|(n, attachment)| {
+            if !show_previews && is_page_preview_attachment(attachment) {
+                return false;
+            }
+            if is_page_preview_attachment(attachment) {
+                let key = format!("{}-unfurl-{n}", kcx.ts.as_str());
+                if kcx
+                    .kit
+                    .is_some_and(|kit| kit.read(cx).dismissed_unfurls.contains(&key))
+                {
+                    return false;
+                }
+            }
+            true
+        })
         .map(|(n, attachment)| attachment_card(attachment, n, kcx, cx))
         .collect();
     if cards.is_empty() {
@@ -1281,7 +1297,33 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
                 .border_color(border)
                 .child(inner)
         });
+    let dismiss = kcx.kit.cloned().map(|kit| {
+        let key = format!("{}-unfurl-{n}", kcx.ts.as_str());
+        let hover = theme.accent;
+        let fg = theme.foreground;
+        div()
+            .id(SharedString::from(format!("bk-{key}-dismiss")))
+            .absolute()
+            .top_1p5()
+            .right_1p5()
+            .size(px(20.))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_color(muted)
+            .hover(move |b| b.bg(hover).text_color(fg))
+            .child(Icon::new(IconName::X).size(px(12.)))
+            .on_click(move |_, _, cx| {
+                kit.update(cx, |state, cx| {
+                    state.dismissed_unfurls.insert(key.clone());
+                    cx.notify();
+                });
+            })
+    });
     h_flex()
+        .relative()
         .max_w(px(640.))
         .min_w_0()
         .items_stretch()
@@ -1293,12 +1335,14 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
                 .flex_1()
                 .min_w_0()
                 .p_3()
+                .pr_7()
                 .gap_1()
                 .children(title)
                 .children(description)
                 .children(site),
         )
         .children(thumb)
+        .children(dismiss)
 }
 
 fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div {
@@ -1440,6 +1484,23 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
     }
     if let Some(url) = attachment.image_url.as_deref() {
         body = body.child(picture(Some(url), "attachment image", 360., 160., kcx, cx));
+    }
+    // Legacy attachment fallback text (`F-COLLAB-655`) when rich fields are all absent.
+    let empty_rich = attachment.title.is_none()
+        && attachment.text.is_none()
+        && attachment.pretext.is_none()
+        && attachment.fields.is_empty()
+        && attachment.blocks.is_empty()
+        && attachment.image_url.is_none();
+    if empty_rich {
+        if let Some(fallback) = attachment
+            .fallback
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            body = body.child(messages::mrkdwn(fallback, kcx, false, false, cx));
+        }
     }
     // Slack's footer line: the footer icon, then "<footer> | Yesterday at 9:25 AM", its
     // links shown as their labels.

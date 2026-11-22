@@ -49,6 +49,8 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
             ),
             (&["\u{2318}", "1\u{2026}9"], "Switch workspace", true),
             (&["\u{2318}", "{ / }"], "Previous / next workspace", true),
+            (&["\u{2303}", "Tab"], "Next / previous navigation tab", true),
+            (&["F6"], "Cycle focus between panes", true),
         ],
     ),
     (
