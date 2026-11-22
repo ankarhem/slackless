@@ -23,8 +23,8 @@ pub use error::ApiError;
 pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
     AuthTest, BookmarksList, CanvasCreated, ChannelBookmark, ClientCounts, ConversationCounts,
-    ConversationView, FilesFilter, HistoryOpts, ListOpts, MessageContent, PinnedItem, PinsList,
-    PostedMessage, ScheduledMessage, ScheduledMessageCreated, SearchChannel, SearchMatch,
+    ConversationView, FilesFilter, GifItem, HistoryOpts, ListOpts, MessageContent, PinnedItem,
+    PinsList, PostedMessage, ScheduledMessage, ScheduledMessageCreated, SearchChannel, SearchMatch,
     SearchMessages, SearchOpts, SearchPagination, SearchSort, SectionCreated, ThreadCounts,
     ThreadSubscription, ThreadsView, UploadFile, UploadSlot, UserBoot,
 };

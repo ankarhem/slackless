@@ -2238,6 +2238,127 @@ fn message_row(
     Some(item)
 }
 
+/// One GIF item returned by Slack's `gif.featured` / `gif.search` picker endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GifItem {
+    pub id: String,
+    pub title: String,
+    /// Single-frame 200w still thumbnail (`media_formats.tinygifpreview.url`) for cheap grid rendering.
+    pub still_url: String,
+    /// Animated 200w thumbnail URL (`media_formats.tinygif.url`) played on hover.
+    pub preview_url: String,
+    /// Shareable Giphy URL (`url`) to send in a message, falling back to full GIF media URL.
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct GifMediaFormat {
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Deserialize, Default)]
+struct GifMediaFormats {
+    gif: Option<GifMediaFormat>,
+    tinygif: Option<GifMediaFormat>,
+    tinygifpreview: Option<GifMediaFormat>,
+    gifpreview: Option<GifMediaFormat>,
+}
+
+#[derive(Deserialize)]
+struct WireGif {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    content_description: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    media_formats: GifMediaFormats,
+}
+
+#[derive(Deserialize)]
+struct GifListData {
+    #[serde(default)]
+    gifs: Vec<WireGif>,
+}
+
+fn parse_gif_list(data: GifListData) -> Vec<GifItem> {
+    data.gifs
+        .into_iter()
+        .filter_map(|gif| {
+            let preview_url = [
+                gif.media_formats.tinygif.as_ref().map(|m| m.url.as_str()),
+                gif.media_formats
+                    .tinygifpreview
+                    .as_ref()
+                    .map(|m| m.url.as_str()),
+                gif.media_formats.gif.as_ref().map(|m| m.url.as_str()),
+                gif.media_formats
+                    .gifpreview
+                    .as_ref()
+                    .map(|m| m.url.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|u| !u.is_empty())?
+            .to_owned();
+            let still_url = [
+                gif.media_formats
+                    .tinygifpreview
+                    .as_ref()
+                    .map(|m| m.url.as_str()),
+                gif.media_formats
+                    .gifpreview
+                    .as_ref()
+                    .map(|m| m.url.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|u| !u.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| preview_url.clone());
+            let url = if !gif.url.is_empty() {
+                gif.url
+            } else {
+                gif.media_formats
+                    .gif
+                    .map(|m| m.url)
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| preview_url.clone())
+            };
+            Some(GifItem {
+                id: gif.id,
+                title: gif.content_description,
+                still_url,
+                preview_url,
+                url,
+            })
+        })
+        .collect()
+}
+
+impl SlackApi {
+    /// Featured/trending GIFs for Slack's emoji/GIF picker (`gif.featured`).
+    pub async fn gif_featured(&self, limit: u32) -> Result<Vec<GifItem>> {
+        let resp: ApiResponse<GifListData> = self
+            .call(method::GIF_FEATURED, vec![("limit", limit.to_string())])
+            .await?;
+        Ok(parse_gif_list(resp.data))
+    }
+
+    /// Search GIFs for Slack's emoji/GIF picker (`gif.search`).
+    pub async fn gif_search(&self, query: &str, limit: u32) -> Result<Vec<GifItem>> {
+        let resp: ApiResponse<GifListData> = self
+            .call(
+                method::GIF_SEARCH,
+                vec![("query", query.to_owned()), ("limit", limit.to_string())],
+            )
+            .await?;
+        Ok(parse_gif_list(resp.data))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2595,5 +2716,46 @@ mod tests {
                 messages.first().map(|m| m.text.len()).unwrap_or(0)
             );
         }
+    }
+
+    #[test]
+    fn parses_gif_featured_and_search_wire_payload() {
+        let wire: GifListData = serde_json::from_value(serde_json::json!({
+            "gifs": [
+                {
+                    "id": "R7m04yMaGWVeE",
+                    "content_description": "Will Smith Mib GIF",
+                    "url": "https://giphy.com/gifs/will-smith-R7m04yMaGWVeE",
+                    "media_formats": {
+                        "tinygif": { "url": "https://media2.giphy.com/media/R7m04yMaGWVeE/200w.webp" },
+                        "tinygifpreview": { "url": "https://media2.giphy.com/media/R7m04yMaGWVeE/200w_s.gif" },
+                        "gif": { "url": "https://media2.giphy.com/media/R7m04yMaGWVeE/giphy.webp" }
+                    }
+                },
+                {
+                    "id": "empty_should_skip",
+                    "content_description": "",
+                    "url": "",
+                    "media_formats": {}
+                }
+            ]
+        }))
+        .unwrap();
+        let parsed = parse_gif_list(wire);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "R7m04yMaGWVeE");
+        assert_eq!(parsed[0].title, "Will Smith Mib GIF");
+        assert_eq!(
+            parsed[0].still_url,
+            "https://media2.giphy.com/media/R7m04yMaGWVeE/200w_s.gif"
+        );
+        assert_eq!(
+            parsed[0].preview_url,
+            "https://media2.giphy.com/media/R7m04yMaGWVeE/200w.webp"
+        );
+        assert_eq!(
+            parsed[0].url,
+            "https://giphy.com/gifs/will-smith-R7m04yMaGWVeE"
+        );
     }
 }

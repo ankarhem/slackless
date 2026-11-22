@@ -300,6 +300,17 @@ pub trait Backend: Clone + Send + Sync + 'static {
         content: Option<MessageContent>,
         files: Vec<UploadFile>,
     ) -> impl Future<Output = api::Result<Vec<File>>> + Send;
+    /// Featured/trending GIFs for the composer picker (`gif.featured`).
+    fn gif_featured(
+        &self,
+        limit: u32,
+    ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send;
+    /// Search GIFs for the composer picker (`gif.search`).
+    fn gif_search(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -673,5 +684,13 @@ impl Backend for SlackApi {
         files: Vec<UploadFile>,
     ) -> api::Result<Vec<File>> {
         SlackApi::upload_files(self, &channel, thread_ts.as_ref(), content.as_ref(), &files).await
+    }
+
+    async fn gif_featured(&self, limit: u32) -> api::Result<Vec<api::GifItem>> {
+        SlackApi::gif_featured(self, limit).await
+    }
+
+    async fn gif_search(&self, query: String, limit: u32) -> api::Result<Vec<api::GifItem>> {
+        SlackApi::gif_search(self, &query, limit).await
     }
 }

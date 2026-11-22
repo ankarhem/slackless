@@ -1010,6 +1010,23 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SearchGifs { query } => {
+                let method = if query.trim().is_empty() {
+                    "gif.featured"
+                } else {
+                    "gif.search"
+                };
+                self.spawn(method, async move {
+                    let trimmed = query.trim().to_owned();
+                    let gifs = if trimmed.is_empty() {
+                        backend.gif_featured(24).await?
+                    } else {
+                        backend.gif_search(trimmed.clone(), 24).await?
+                    };
+                    events.emit(Event::GifResults { query, gifs });
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -2556,6 +2573,14 @@ pub(crate) mod tests {
                     ..Default::default()
                 })
                 .collect())
+        }
+
+        async fn gif_featured(&self, _limit: u32) -> api::Result<Vec<api::GifItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn gif_search(&self, _query: String, _limit: u32) -> api::Result<Vec<api::GifItem>> {
+            Ok(Vec::new())
         }
     }
 

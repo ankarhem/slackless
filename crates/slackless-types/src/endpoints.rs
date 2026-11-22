@@ -174,6 +174,8 @@ pub mod method {
     pub const FILES_UPLOAD: &str = "files.upload";
     pub const FUNCTIONS_WORKFLOWS_GET: &str = "functions.workflows.get";
     pub const FUNCTIONS_WORKFLOWS_LIST: &str = "functions.workflows.list";
+    pub const GIF_FEATURED: &str = "gif.featured";
+    pub const GIF_SEARCH: &str = "gif.search";
     pub const HUDDLES_INFO: &str = "huddles.info";
     pub const IM_LIST: &str = "im.list";
     pub const LISTS_ADD_TO_LIST: &str = "lists.addToList";

@@ -286,6 +286,11 @@ pub enum Command {
         content: Option<MessageContent>,
         files: Vec<api::UploadFile>,
     },
+    /// Fetch GIFs for the composer picker: featured/trending (`gif.featured`) when `query`
+    /// is empty, or search (`gif.search`) when non-empty.
+    SearchGifs {
+        query: String,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -415,6 +420,11 @@ pub enum Event {
     FilesUploaded { channel: ChannelId, count: usize },
     /// Active `@handle` user groups from `usergroups.list`.
     Usergroups(Vec<types::Usergroup>),
+    /// Featured or searched GIFs for the composer picker (`gif.featured` / `gif.search`).
+    GifResults {
+        query: String,
+        gifs: Vec<api::GifItem>,
+    },
     /// A non-fatal failure worth surfacing.
     Error(String),
 }
