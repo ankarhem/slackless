@@ -28,6 +28,7 @@
 //! rows use `sidebar_accent`, hover rows the theme's neutral hover wash (`accent`). The only
 //! derived colors are opacity steps of `sidebar_foreground` for idle rows and icons.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -266,6 +267,9 @@ pub struct Sidebar {
     /// Fixture mode's notification-level overrides (a live write lands through the store's
     /// prefs on the next snapshot).
     notify_override: HashMap<ChannelId, NotifyLevel>,
+    /// The Home list's conversation rows as last laid out, top to bottom, each with whether
+    /// it is unread: what Opt+Up/Down and Opt+Shift+Up/Down step through ([`Self::step`]).
+    rows: RefCell<Vec<(ChannelId, bool)>>,
     /// The open "More conversations" popover.
     section_search: Option<SectionSearch>,
     /// Whether the press on a "More conversations" button found its popover open: the press
@@ -393,6 +397,7 @@ impl Sidebar {
                 section_sorts: HashMap::new(),
                 local_sections: None,
                 notify_override: HashMap::new(),
+                rows: RefCell::default(),
 
                 section_search: None,
                 search_was_open: false,
@@ -1155,6 +1160,21 @@ impl Sidebar {
         total
     }
 
+    /// The conversation row above (`forward` false) or below `from` in the Home list as laid
+    /// out, or the nearest unread one with `unread_only` (Slack's Opt+Up/Down and
+    /// Opt+Shift+Up/Down); from a conversation not in the list, the first or last match.
+    pub fn step(&self, from: &ChannelId, forward: bool, unread_only: bool) -> Option<ChannelId> {
+        let rows = self.rows.borrow();
+        let at = rows.iter().position(|(id, _)| id == from);
+        let pick = |row: &&(ChannelId, bool)| !unread_only || row.1;
+        let found = if forward {
+            rows.iter().skip(at.map_or(0, |at| at + 1)).find(pick)
+        } else {
+            rows[..at.unwrap_or(rows.len())].iter().rev().find(pick)
+        };
+        found.map(|(id, _)| id.clone())
+    }
+
     /// Conversations with unread messages, in sidebar row order: the search pill's
     /// dropdown "Unreads & drafts" section (the root adds drafted conversations).
     pub fn unread_ids(&self) -> Vec<ChannelId> {
@@ -1720,6 +1740,9 @@ impl Sidebar {
             if !listed {
                 continue;
             }
+            self.rows
+                .borrow_mut()
+                .push((conversation.id.clone(), unread.count > 0));
             let kind = if unread.count > 0 {
                 ListChild::Unread(unread.mentions > 0)
             } else {
@@ -2015,6 +2038,7 @@ impl Sidebar {
         watermark: Option<&Ts>,
         cx: &mut Context<Self>,
     ) -> Vec<(AnyElement, ListChild)> {
+        self.rows.borrow_mut().clear();
         let sections: Vec<ChannelSection> = self.section_set();
         if sections.is_empty() {
             let mut children = self.section(

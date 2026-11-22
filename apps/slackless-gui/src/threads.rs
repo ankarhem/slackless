@@ -38,7 +38,7 @@ use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
 use crate::blockkit::BlockDispatch;
-use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, ContextBar};
+use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, ContextBar, TypingNames};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
@@ -47,6 +47,8 @@ use crate::slash::{Invocation, SHRUG, SlashKind};
 
 pub enum ThreadPanelEvent {
     Close,
+    /// The user is typing a reply: the root tells the thread.
+    Typing,
     /// A message's avatar or name was clicked: show that user's profile.
     OpenProfile(UserId),
     /// A thread image was clicked: the root opens the image viewer over the thread's
@@ -168,6 +170,7 @@ impl ThreadPanel {
                         // Scheduling is turned off in the reply composer.
                         ComposerEvent::Schedule { .. } => {}
                         ComposerEvent::EditLast => this.edit_last_reply(window, cx),
+                        ComposerEvent::Typing => cx.emit(ThreadPanelEvent::Typing),
                     },
                 ),
                 // The edit box's Save button tracks whether the draft is empty.
@@ -251,6 +254,12 @@ impl ThreadPanel {
     }
 
     /// `(channel, root ts)` of the open thread.
+    /// Show who is typing in the open thread under the reply box.
+    pub fn set_typing(&self, typing: Option<TypingNames>, cx: &mut App) {
+        self.composer
+            .update(cx, |composer, cx| composer.set_typing(typing, cx));
+    }
+
     pub fn open_thread(&self) -> Option<(ChannelId, Ts)> {
         self.thread.clone()
     }

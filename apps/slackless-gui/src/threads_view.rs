@@ -90,7 +90,9 @@ impl ThreadsView {
                     }
                     // Scheduling is turned off in the reply composer, and a card has no single
                     // "last message" for Up to edit.
-                    ComposerEvent::Schedule { .. } | ComposerEvent::EditLast => {}
+                    ComposerEvent::Schedule { .. }
+                    | ComposerEvent::EditLast
+                    | ComposerEvent::Typing => {}
                 },
             )];
             ThreadsView {

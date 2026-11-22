@@ -14,6 +14,10 @@ gpui-kit = "0.10.0"
 # Nightly aarch64 ICE workaround (docs/research/gpui-kit-guide.md section 15).
 pathfinder_simd = { version = "0.5", features = ["pf-no-simd"] }
 emojis = "0.9"
+# The zoom platform wrapper (zoom.rs) names these types from GPUI's platform traits.
+raw-window-handle = "0.6"
+smallvec = "1"
+futures.workspace = true
 
 [dev-dependencies]
 # Headless window tests: drag selection and link clicks over rendered message text. The

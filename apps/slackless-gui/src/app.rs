@@ -210,11 +210,11 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{Escape as InputEscape, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, TitleBar, WindowExt as _, h_flex,
@@ -230,7 +230,7 @@ use gpui_kit::gpui::{
     actions, anchored, deferred, div, hsla, point, px, relative,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
-use slackless_core::platform::{self, BadgeSetter, Notifier};
+use slackless_core::platform::{self, BadgeSetter, Notifier, SoundPlayer};
 use slackless_core::types::{
     ChannelId, Conversation, ConversationKind, File, Message, Team, Ts, UserId,
 };
@@ -244,7 +244,7 @@ use crate::bridge::CoreBridge;
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
 use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
-use crate::composer::{self, Composer, ComposerEvent, ContextBar, Placeholder};
+use crate::composer::{self, Composer, ComposerEvent, ContextBar, Placeholder, TypingNames};
 use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
@@ -300,6 +300,16 @@ actions!(
         OpenOwnProfile,
         NextWorkspace,
         PreviousWorkspace,
+        PreviousConversation,
+        NextConversation,
+        PreviousUnread,
+        NextUnread,
+        MarkConversationRead,
+        MarkAllRead,
+        SearchConversation,
+        ZoomIn,
+        ZoomOut,
+        ActualSize,
     ]
 );
 
@@ -320,6 +330,12 @@ pub struct OpenRecent(pub ChannelId);
 
 /// How often due Later reminders are checked.
 const REMINDER_POLL: Duration = Duration::from_secs(10);
+
+/// How long a typing announcement shows: Slack's receivers drop it after 5 s.
+const TYPING_TTL: Duration = Duration::from_secs(5);
+
+/// Who is typing where (conversation, thread), each until their announcement runs out.
+type Typing = HashMap<(ChannelId, Option<Ts>), Vec<(UserId, Instant)>>;
 
 /// The channel sidebar, measured on Slack desktop (318px).
 const SIDEBAR_WIDTH: Pixels = px(318.);
@@ -382,8 +398,8 @@ fn corner_cap(top: bool, chrome: Hsla, outline: Option<Hsla>) -> Vec<Div> {
 const FLEXPANE_WIDTH: Pixels = px(540.);
 
 /// The OS integration the root uses: system notifications and the dock badge.
-trait Os: Notifier + BadgeSetter {}
-impl<T: Notifier + BadgeSetter> Os for T {}
+trait Os: Notifier + BadgeSetter + SoundPlayer {}
+impl<T: Notifier + BadgeSetter + SoundPlayer> Os for T {}
 
 /// The per-workspace views: rebuilt from that workspace's fixtures, parked while another
 /// workspace is shown.
@@ -563,6 +579,15 @@ pub struct App {
     recent: Vec<ChannelId>,
     /// What the menu bar shows, so it is rebuilt only when that changes.
     menu_bar: Option<MenuBar>,
+    typing: Typing,
+    /// Wakes when the next typing announcement runs out.
+    typing_expiry: gpui::Task<()>,
+    /// The notification sound last fetched: its Preferences choice and bytes.
+    sound: Option<(usize, Vec<u8>)>,
+    /// A notification sound being fetched.
+    sound_fetch: gpui::Task<()>,
+    /// The sound Preferences last applied: picking another plays it, as in Slack.
+    sound_choice: Option<usize>,
     /// The user opened a conversation themselves; until then live reloads open the one most
     /// recently read in Slack.
     chosen: bool,
@@ -629,6 +654,12 @@ impl App {
                 .filter(|channel| fixtures.conversation(channel).is_some())
                 .collect();
             let preferences = Preferences::new(window, cx);
+            // The zoom `main` applied from the remembered level, shown in the select.
+            let factor = cx.global::<crate::zoom::Zoom>().factor();
+            let zoom = (crate::zoom::FACTORS.iter())
+                .position(|level| *level == factor)
+                .unwrap_or(crate::zoom::ACTUAL_SIZE);
+            preferences.update(cx, |prefs, cx| prefs.set_zoom(zoom, cx));
             // Live: the remembered Color Mode over Slack's color theme, as `main` installed it
             // before the first frame. The sample workspace keeps its dark reference look.
             let color_mode = bridge.color_mode();
@@ -677,8 +708,20 @@ impl App {
                 KeyBinding::new("cmd-shift-l", OpenChannelBrowser, None),
                 KeyBinding::new("cmd-shift-y", SetStatus, None),
                 KeyBinding::new("cmd-g", FocusSearch, None),
+                KeyBinding::new("cmd-f", SearchConversation, None),
+                // Slack's View menu shows Cmd++; Cmd+= (no Shift) zooms in too.
+                KeyBinding::new("cmd-+", ZoomIn, None),
+                KeyBinding::new("cmd-=", ZoomIn, None),
+                KeyBinding::new("cmd--", ZoomOut, None),
+                KeyBinding::new("cmd-0", ActualSize, None),
                 KeyBinding::new("cmd-}", NextWorkspace, None),
                 KeyBinding::new("cmd-{", PreviousWorkspace, None),
+                KeyBinding::new("alt-up", PreviousConversation, None),
+                KeyBinding::new("alt-down", NextConversation, None),
+                KeyBinding::new("alt-shift-up", PreviousUnread, None),
+                KeyBinding::new("alt-shift-down", NextUnread, None),
+                KeyBinding::new("escape", MarkConversationRead, None),
+                KeyBinding::new("shift-escape", MarkAllRead, None),
             ]);
             let workspace_keys = [
                 "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
@@ -847,6 +890,10 @@ impl App {
                         ComposerEvent::Schedule { text, when } => {
                             this.schedule(text.clone(), *when, window, cx);
                         }
+                        ComposerEvent::Typing => this.bridge.send(Command::Typing {
+                            channel: this.channel.clone(),
+                            thread_ts: None,
+                        }),
                     },
                 ),
                 cx.subscribe_in(
@@ -1166,6 +1213,11 @@ impl App {
                 forward: Vec::new(),
                 recent: restored_recent,
                 menu_bar: None,
+                typing: HashMap::new(),
+                typing_expiry: gpui::Task::ready(()),
+                sound: None,
+                sound_fetch: gpui::Task::ready(()),
+                sound_choice: None,
                 chosen,
                 focus,
                 workspace_subscriptions,
@@ -1256,9 +1308,20 @@ impl App {
         }
     }
 
-    /// A native notification, delivered once whichever way the app runs: GPUI's
-    /// `SystemNotification` when bundled, the platform notifier when unbundled (see
-    /// `slackless_platform::Notifier`); mirrored as an in-app toast.
+    /// A system notification (a macOS banner) with the notification sound, as Slack's desktop
+    /// notifications come.
+    fn system_notification(&mut self, tag: &str, title: &str, body: &str, cx: &mut Context<Self>) {
+        cx.show_system_notification(SystemNotification {
+            tag: tag.to_owned().into(),
+            title: title.to_owned().into(),
+            body: body.to_owned().into(),
+            actions: Vec::new(),
+        });
+        self.os.notify(title, body);
+        self.play_notification_sound(cx);
+    }
+
+    /// A notification mirrored as an in-app toast (Later reminders).
     fn post_notification(
         &mut self,
         tag: &str,
@@ -1267,13 +1330,7 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.show_system_notification(SystemNotification {
-            tag: tag.to_owned().into(),
-            title: title.to_owned().into(),
-            body: body.to_owned().into(),
-            actions: Vec::new(),
-        });
-        self.os.notify(title, body);
+        self.system_notification(tag, title, body, cx);
         notify(title, body.to_owned(), window, cx);
     }
 
@@ -1356,6 +1413,7 @@ impl App {
         if self.tab == ConversationTab::Pins {
             self.tab = ConversationTab::Messages;
         }
+        self.show_typing(cx);
         cx.notify();
     }
 
@@ -1589,6 +1647,14 @@ impl App {
     /// tinted by the color theme), Enter-to-send, and the schedule shown in the user menu.
     fn apply_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = self.preferences.read(cx).settings().clone();
+        // Slack plays a sound when it is picked in Preferences.
+        if self
+            .sound_choice
+            .replace(settings.sound)
+            .is_some_and(|before| before != settings.sound)
+        {
+            self.play_sound(settings.sound, cx);
+        }
         let theme = settings.mode.resolve(window.appearance());
         if self
             .color_mode
@@ -1603,6 +1669,11 @@ impl App {
         if self.applied_theme != (theme, settings.palette, focus) {
             self.applied_theme = (theme, settings.palette, focus);
             theme::activate_with(theme, settings.palette, focus, cx);
+        }
+        if crate::zoom::set_level(settings.zoom, cx) {
+            if let Some(write) = self.bridge.remember_zoom(settings.zoom) {
+                cx.background_executor().spawn(write).detach();
+            }
         }
         if theme::font(cx) != settings.font {
             theme::set_font(settings.font, cx);
@@ -2553,6 +2624,7 @@ impl App {
         self.sync_composer_placeholder(cx);
         cx.notify();
         self.update_menus(cx);
+        self.show_typing(cx);
     }
 
     /// Live mode: fold a core event into the views.
@@ -2603,6 +2675,14 @@ impl App {
             ),
             Event::CommandFailed { command, error } => {
                 notify(command, format!("Slack refused it ({error})."), window, cx)
+            }
+            Event::Typing {
+                channel,
+                user,
+                thread_ts,
+            } => self.someone_typing(channel, user, thread_ts.as_ref(), cx),
+            Event::MessagePosted { channel, message } => {
+                self.message_posted(channel, message, window, cx)
             }
             Event::Error(error) => eprintln!("slackless: {error}"),
             Event::Presence { users, presence } => {
@@ -2979,6 +3059,317 @@ impl App {
         });
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.mark_read(channel.clone(), cx));
+    }
+
+    /// Slack's Opt+Up/Down (any row) and Opt+Shift+Up/Down (unread rows): open the sidebar
+    /// conversation above or below the open one.
+    fn step_conversation(&mut self, forward: bool, unread_only: bool, cx: &mut Context<Self>) {
+        let next = self
+            .sidebar
+            .read(cx)
+            .step(&self.channel, forward, unread_only);
+        if let Some(next) = next {
+            self.select(next, cx);
+        }
+    }
+
+    /// Esc: mark the open conversation read up to its newest message.
+    fn mark_open_read(&mut self, cx: &mut Context<Self>) {
+        let channel = self.channel.clone();
+        if let Some(newest) = self.messages.read(cx).newest_ts() {
+            self.mark_read(&channel, newest, cx);
+        }
+    }
+
+    /// Shift+Esc: ask first while Preferences > Mark as read prompts to confirm (on by
+    /// default), then mark everything read.
+    fn request_mark_all_read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.preferences.read(cx).settings().confirm_mark_all {
+            return self.mark_all_read(cx);
+        }
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let this = this.clone();
+            dialog
+                .title("Mark all messages as read?")
+                .w(px(440.))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .child(div().text_color(muted).child(
+                            "Every channel, direct message and thread will be marked as read.",
+                        ))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("mark-all-cancel")
+                                        .label("Cancel")
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("mark-all-confirm")
+                                        .primary()
+                                        .label("Mark all as read")
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ =
+                                                this.update(cx, |app, cx| app.mark_all_read(cx));
+                                        }),
+                                ),
+                        ),
+                )
+        });
+    }
+
+    /// Cmd+= / Cmd+- step Preferences' zoom a level up or down (`None`, Cmd+0: 100%), which
+    /// applies it.
+    fn step_zoom(&mut self, step: Option<isize>, cx: &mut Context<Self>) {
+        let level = self.preferences.read(cx).settings().zoom;
+        let next = match step {
+            Some(step) => level
+                .saturating_add_signed(step)
+                .min(crate::zoom::FACTORS.len() - 1),
+            None => crate::zoom::ACTUAL_SIZE,
+        };
+        self.preferences
+            .update(cx, |prefs, cx| prefs.set_zoom(next, cx));
+    }
+
+    /// Shift+Esc: Slack marks every conversation and thread read (`users.markAllRead`); the
+    /// sidebar un-bolds at once and the core's fresh counts follow.
+    fn mark_all_read(&mut self, cx: &mut Context<Self>) {
+        self.bridge.send(Command::MarkAllRead);
+        for counts in self.counts.values_mut() {
+            counts.has_unreads = false;
+            counts.mention_count = 0;
+        }
+        let unread = self.sidebar.read(cx).unread_ids();
+        self.sidebar.update(cx, |sidebar, cx| {
+            for channel in unread {
+                sidebar.mark_read(channel, cx);
+            }
+        });
+    }
+
+    /// Someone started or kept typing: show them until [`TYPING_TTL`] after their last
+    /// announcement, as Slack does. The user's own typing (from another client) is not shown.
+    fn someone_typing(
+        &mut self,
+        channel: &ChannelId,
+        user: &UserId,
+        thread_ts: Option<&Ts>,
+        cx: &mut Context<Self>,
+    ) {
+        if *user == self.fixtures.self_user {
+            return;
+        }
+        let typists = self
+            .typing
+            .entry((channel.clone(), thread_ts.cloned()))
+            .or_default();
+        typists.retain(|(typist, _)| typist != user);
+        typists.push((user.clone(), Instant::now() + TYPING_TTL));
+        self.expire_typing(cx);
+    }
+
+    /// Drop typists whose announcement ran out, show who is left, and wake again when the
+    /// next announcement runs out.
+    fn expire_typing(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        for typists in self.typing.values_mut() {
+            typists.retain(|(_, until)| *until > now);
+        }
+        self.typing.retain(|_, typists| !typists.is_empty());
+        self.show_typing(cx);
+        let next = self
+            .typing
+            .values()
+            .flatten()
+            .map(|(_, until)| *until)
+            .min();
+        self.typing_expiry = match next {
+            Some(next) => cx.spawn(async move |this, cx| {
+                let wait = next.saturating_duration_since(Instant::now());
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |app, cx| app.expire_typing(cx));
+            }),
+            None => gpui::Task::ready(()),
+        };
+    }
+
+    /// Put who is typing under the open conversation's box and the open thread's reply box.
+    fn show_typing(&self, cx: &mut Context<Self>) {
+        let names = |key: (ChannelId, Option<Ts>)| {
+            let names: Vec<SharedString> = (self.typing.get(&key).into_iter().flatten())
+                .map(|(user, _)| self.fixtures.user_name(user).to_owned().into())
+                .collect();
+            TypingNames::of(&names)
+        };
+        let here = names((self.channel.clone(), None));
+        self.composer
+            .update(cx, |composer, cx| composer.set_typing(here, cx));
+        let open = self.thread.read(cx).open_thread();
+        let in_thread = open.and_then(|(channel, ts)| names((channel, Some(ts))));
+        self.thread
+            .update(cx, |thread, cx| thread.set_typing(in_thread, cx));
+    }
+
+    /// A message was just posted: its author stops typing there, and Slack's desktop
+    /// notification rules decide whether it gets a banner and the notification sound.
+    fn message_posted(
+        &mut self,
+        channel: &ChannelId,
+        message: &Message,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(author) = &message.user {
+            let thread = message.thread_ts.clone().filter(|ts| *ts != message.ts);
+            if let Some(typists) = self.typing.get_mut(&(channel.clone(), thread)) {
+                typists.retain(|(typist, _)| typist != author);
+            }
+            self.expire_typing(cx);
+        }
+        if !self.should_notify(channel, message, window, cx) {
+            return;
+        }
+        let Some(conversation) = self.fixtures.conversation(channel) else {
+            return;
+        };
+        let sender = match &message.user {
+            Some(user) => self.fixtures.user_name(user).to_owned(),
+            None => (message.bot_profile.as_ref())
+                .map(|bot| bot.name.clone())
+                .unwrap_or_default(),
+        };
+        let text = if self.preferences.read(cx).settings().show_preview {
+            self.fixtures.plain_text(message)
+        } else {
+            "New message".to_owned()
+        };
+        let (title, body) = match conversation.kind() {
+            ConversationKind::Im => (sender, text),
+            ConversationKind::Mpim => (
+                self.fixtures.conversation_label(conversation),
+                format!("{sender}: {text}"),
+            ),
+            _ => (
+                format!("#{}", conversation.name.clone().unwrap_or_default()),
+                format!("{sender}: {text}"),
+            ),
+        };
+        let tag = format!("message-{channel}-{}", message.ts);
+        self.system_notification(&tag, &title, &body, cx);
+    }
+
+    /// Slack's desktop notification rules for a message just posted: never your own, while
+    /// notifications are paused or outside the notification schedule, or for the
+    /// conversation (or thread) on screen in the focused window; never in a muted
+    /// conversation; otherwise by the conversation's level (its bell menu choice, else
+    /// Preferences > Notifications): every message, or direct messages, mentions and
+    /// keywords. A thread reply that is neither a DM nor mentions you notifies only under
+    /// "replies to threads I'm following", for a thread you started.
+    fn should_notify(
+        &self,
+        channel: &ChannelId,
+        message: &Message,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> bool {
+        let me = &self.fixtures.self_user;
+        let settings = self.preferences.read(cx).settings();
+        if message.user.as_ref() == Some(me)
+            || self.self_state.paused()
+            || !settings.notifications_allowed_now()
+        {
+            return false;
+        }
+        let reply = message
+            .thread_ts
+            .as_ref()
+            .is_some_and(|ts| *ts != message.ts);
+        let on_screen = if reply {
+            self.thread_open
+                && self
+                    .thread
+                    .read(cx)
+                    .open_thread()
+                    .is_some_and(|(open, ts)| {
+                        open == *channel && message.thread_ts.as_ref() == Some(&ts)
+                    })
+        } else {
+            self.channel == *channel
+        };
+        if on_screen && window.is_window_active() {
+            return false;
+        }
+        let level = self.fixtures.notify_levels.get(channel).copied();
+        if level == Some(NotifyLevel::Muted) {
+            return false;
+        }
+        let dm = self
+            .fixtures
+            .conversation(channel)
+            .is_some_and(|conversation| {
+                matches!(
+                    conversation.kind(),
+                    ConversationKind::Im | ConversationKind::Mpim
+                )
+            });
+        let mentioned = mentions_me(&message.text, me, &settings.keywords);
+        let wanted = match (level, settings.notify_level) {
+            (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,
+            (_, 0) => true,
+            _ => false,
+        };
+        if reply && !dm && !mentioned {
+            return wanted
+                && settings.thread_replies
+                && message.parent_user_id.as_ref() == Some(me);
+        }
+        wanted
+    }
+
+    /// Play the notification sound chosen in Preferences, unless sounds are muted.
+    fn play_notification_sound(&mut self, cx: &mut Context<Self>) {
+        let settings = self.preferences.read(cx).settings();
+        let (muted, choice) = (settings.mute_sounds, settings.sound);
+        if !muted {
+            self.play_sound(choice, cx);
+        }
+    }
+
+    /// Play Preferences' sound `choice` ("None" plays nothing): fetched from Slack's CDN
+    /// through the core the first time, then kept for the next notifications.
+    fn play_sound(&mut self, choice: usize, cx: &mut Context<Self>) {
+        let Some(url) = crate::preferences::SOUND_FILES
+            .get(choice)
+            .copied()
+            .flatten()
+        else {
+            return;
+        };
+        if let Some((cached, data)) = &self.sound {
+            if *cached == choice {
+                self.os.play_sound(data);
+                return;
+            }
+        }
+        let Some(fetch) = crate::media::fetch(url.to_owned(), cx) else {
+            return;
+        };
+        self.sound_fetch = cx.spawn(async move |this, cx| match fetch.await {
+            Ok(data) => {
+                let _ = this.update(cx, |app, _| {
+                    app.os.play_sound(&data);
+                    app.sound = Some((choice, data));
+                });
+            }
+            Err(e) => eprintln!("slackless: notification sound not loaded ({e})"),
+        });
     }
 
     /// Put `views` on screen as the workspace views; returns the ones they replace.
@@ -3800,6 +4191,35 @@ impl Render for App {
                 cx.listener(|this, open: &OpenRecent, _, cx| this.select(open.0.clone(), cx)),
             )
             .on_action(cx.listener(|this, sign_out: &SignOut, _, cx| this.sign_out(sign_out.0, cx)))
+            .on_action(cx.listener(|this, _: &PreviousConversation, _, cx| {
+                this.step_conversation(false, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextConversation, _, cx| {
+                this.step_conversation(true, false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousUnread, _, cx| {
+                this.step_conversation(false, true, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &NextUnread, _, cx| this.step_conversation(true, true, cx)),
+            )
+            .on_action(cx.listener(|this, _: &MarkConversationRead, _, cx| this.mark_open_read(cx)))
+            // A focused field passes Esc on when it has nothing to close (the composer's menu,
+            // extra cursors): that marks the conversation read too, as in Slack, and Esc still
+            // reaches the listeners outside the root (an open dialog's).
+            .on_action(cx.listener(|this, _: &InputEscape, _, cx| {
+                this.mark_open_read(cx);
+                cx.propagate();
+            }))
+            .on_action(cx.listener(|this, _: &MarkAllRead, window, cx| {
+                this.request_mark_all_read(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.step_zoom(Some(1), cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.step_zoom(Some(-1), cx)))
+            .on_action(cx.listener(|this, _: &ActualSize, _, cx| this.step_zoom(None, cx)))
+            .on_action(cx.listener(|this, _: &SearchConversation, window, cx| {
+                this.search_in_conversation(window, cx)
+            }))
             .relative()
             .size_full()
             .bg(chrome)
@@ -5195,6 +5615,14 @@ fn subscribe_workspace(
                     cx.notify();
                 }
                 ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
+                ThreadPanelEvent::Typing => {
+                    if let Some((channel, ts)) = this.thread.read(cx).open_thread() {
+                        this.bridge.send(Command::Typing {
+                            channel,
+                            thread_ts: Some(ts),
+                        });
+                    }
+                }
                 ThreadPanelEvent::OpenLink(target) => this.open_link(target.clone(), window, cx),
                 ThreadPanelEvent::OpenImage {
                     channel,
@@ -5298,7 +5726,8 @@ fn subscribe_workspace(
 /// opens the shortcuts sheet, `=drafts` Drafts & sent, `=side` the second workspace and
 /// `=slash` the composer's slash menu. `=later` opens Later, `=pins` the pins panel,
 /// `=activity` the Activity page, `=files` the Files view (`=files:canvases` / `=files:lists`
-/// on that page), and `=notify` posts a test system notification.
+/// on that page), `=notify` posts a test system notification, `=typing` shows two people typing
+/// in the open conversation and `=message` delivers a demo direct message.
 fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>) {
     let Ok(demo) = std::env::var("SLACKLESS_GUI_DEMO") else {
         return;
@@ -5343,6 +5772,8 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
             | "details"
             | "wsmenu"
             | "notify"
+            | "typing"
+            | "message"
     ) {
         let this = cx.weak_entity();
         window.defer(cx, move |window, cx| {
@@ -5400,6 +5831,49 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                         window,
                         cx,
                     ),
+                    "typing" => {
+                        // Two DM partners typing in the open conversation, re-announced as
+                        // Slack's clients do while someone keeps typing.
+                        let typists: Vec<UserId> = (app.fixtures.dms.iter())
+                            .filter_map(|dm| dm.user.clone())
+                            .take(2)
+                            .collect();
+                        cx.spawn(async move |this, cx| {
+                            loop {
+                                let typing = this.update(cx, |app, cx| {
+                                    let channel = app.channel.clone();
+                                    for user in &typists {
+                                        app.someone_typing(&channel, user, None, cx);
+                                    }
+                                });
+                                if typing.is_err() {
+                                    break;
+                                }
+                                cx.background_executor().timer(Duration::from_secs(3)).await;
+                            }
+                        })
+                        .detach();
+                    }
+                    "message" => {
+                        // A direct message arriving live: Slack's notification rules, banner
+                        // and sound.
+                        let dm = (app.fixtures.dms.iter())
+                            .find(|dm| {
+                                dm.id != app.channel
+                                    && dm.user.as_ref() != Some(&app.fixtures.self_user)
+                            })
+                            .cloned();
+                        if let Some(dm) = dm {
+                            let message = Message {
+                                ts: Ts::from("9999999999.000100"),
+                                channel: Some(dm.id.clone()),
+                                user: dm.user.clone(),
+                                text: "This is a demo direct message.".to_owned(),
+                                ..Default::default()
+                            };
+                            app.message_posted(&dm.id, &message, window, cx);
+                        }
+                    }
                     _ => {
                         app.user_menu_open = true;
                         cx.notify();
@@ -5588,6 +6062,27 @@ fn chrome_icon(id: &'static str, icon: IconName, color: Hsla, hover_bg: Hsla) ->
         .child(Icon::new(icon).text_color(color).size(px(16.)))
 }
 
+/// Whether `text` (Slack's mrkdwn) is for `me`: it mentions them (`<@U…>`), broadcasts
+/// (`@here`, `@channel`, `@everyone`), or holds one of the comma-separated notification
+/// `keywords` (case-insensitive).
+fn mentions_me(text: &str, me: &UserId, keywords: &str) -> bool {
+    let mention = format!("<@{me}");
+    let tagged = text
+        .match_indices(&mention)
+        .any(|(at, _)| matches!(text[at + mention.len()..].chars().next(), Some('>' | '|')));
+    if tagged
+        || ["<!here", "<!channel", "<!everyone"]
+            .iter()
+            .any(|b| text.contains(b))
+    {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    (keywords.split(',').map(str::trim))
+        .filter(|keyword| !keyword.is_empty())
+        .any(|keyword| lower.contains(&keyword.to_lowercase()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5676,5 +6171,16 @@ mod tests {
             ["U0TWO", "U0ONE", "U0THREE"],
             "newest author first, then member top-up"
         );
+    }
+
+    #[test]
+    fn notifications_follow_mentions_broadcasts_and_keywords() {
+        let me = UserId::from("U1");
+        assert!(mentions_me("hi <@U1>", &me, ""));
+        assert!(mentions_me("hi <@U1|jakob>", &me, ""));
+        assert!(!mentions_me("hi <@U12>", &me, ""));
+        assert!(mentions_me("<!here> deploying", &me, ""));
+        assert!(mentions_me("The Checkout is down", &me, "deploy, checkout"));
+        assert!(!mentions_me("nothing here", &me, "deploy, , checkout"));
     }
 }

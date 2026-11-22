@@ -13,7 +13,7 @@ use gpui_kit::gpui::{Context, Entity, EntityInputHandler as _, Window};
 use super::Composer;
 use super::menu::Menu;
 use super::tokens::{self, Palette};
-use crate::editor::narrowed;
+use crate::editor::{Atom, narrowed};
 
 impl Composer {
     /// The textarea edited its text: mirror the edit into the editor, then show whatever the
@@ -35,9 +35,11 @@ impl Composer {
             return;
         }
         let selection = self.input.read(cx).selected_range();
+        let mut closed_colon = false;
         let diverged = match event.edits() {
             [(edit, _)] if lines_up(text, edit, after.len()) => {
                 let typed = after.slice(edit.start_byte..edit.new_end_byte).to_string();
+                closed_colon = typed == ":";
                 self.editor
                     .user_edit(edit.start_byte..edit.old_end_byte, &typed, selection)
             }
@@ -45,13 +47,42 @@ impl Composer {
             // document: follow by difference.
             _ => self.editor.user_edit(0..len, &after.to_string(), selection),
         };
+        if !self.editor.doc().text().is_empty() {
+            self.note_typing(cx);
+        }
+        let converted = closed_colon && self.convert_typed_emoji();
         let tokens = self.input.read(cx).tokens().len();
-        if diverged || tokens != self.editor.doc().atoms().len() {
+        if diverged || converted || tokens != self.editor.doc().atoms().len() {
             self.push(window, cx);
         } else {
             self.restyle(cx);
         }
         self.changed(cx);
+    }
+
+    /// Slack turns a typed `:shortcode:` into its emoji as the closing colon is typed (a
+    /// glyph, or the workspace's image), as a pick from the emoji menu would. Returns
+    /// whether it did.
+    fn convert_typed_emoji(&mut self) -> bool {
+        let caret = self.editor.selection().end;
+        let before = &self.editor.doc().text()[..caret];
+        let Some(open) = before[..before.len().saturating_sub(1)].rfind(':') else {
+            return false;
+        };
+        let Some((len, shortcode)) = crate::emoji::parse_shortcode(&before[open..]) else {
+            return false;
+        };
+        let shown = match crate::emoji::EmojiArt::of(&shortcode, &self.fixtures) {
+            crate::emoji::EmojiArt::Glyph(glyph) => glyph,
+            crate::emoji::EmojiArt::Image(_) => format!(":{shortcode}:"),
+            crate::emoji::EmojiArt::Text(_) => return false,
+        };
+        if open + len != caret {
+            return false;
+        }
+        self.editor
+            .place_atom(open..caret, Atom::Emoji(shortcode.into()), &shown);
+        true
     }
 
     /// The textarea repainted; when only the caret or selection moved, follow it.

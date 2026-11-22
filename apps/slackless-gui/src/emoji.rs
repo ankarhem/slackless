@@ -35,6 +35,7 @@ use gpui_kit::gpui::{
 
 use crate::blockkit::{Json, serde_json};
 use crate::fixtures::Fixtures;
+use gpui_kit::gpui::ImageSource;
 
 /// One catalog emoji: Slack shortcode, default glyph, and whether it takes a skin tone.
 pub struct Emoji {
@@ -531,18 +532,45 @@ fn unicode_emoji(name: &str) -> Option<&'static emojis::Emoji> {
 
 /// One emoji at `size`: the unicode glyph, the workspace custom image, or a literal `:name:`.
 pub(crate) fn emoji_element(shortcode: &str, fixtures: &Fixtures, size: Pixels) -> AnyElement {
-    if let Some(glyph) = display_glyph(shortcode) {
-        return div().text_size(size).child(glyph).into_any_element();
+    EmojiArt::of(shortcode, fixtures).element(size)
+}
+
+/// What a shortcode draws as, resolved once so it can be drawn later without the fixtures
+/// (a tooltip builder): a glyph, a workspace emoji image, or its `:shortcode:` text.
+#[derive(Clone)]
+pub(crate) enum EmojiArt {
+    Glyph(String),
+    Image(ImageSource),
+    Text(String),
+}
+
+impl EmojiArt {
+    pub(crate) fn of(shortcode: &str, fixtures: &Fixtures) -> Self {
+        if let Some(glyph) = display_glyph(shortcode) {
+            Self::Glyph(glyph)
+        } else if let Some(image) = fixtures.custom_emoji(base_name(shortcode)) {
+            Self::Image(image.source())
+        } else {
+            Self::Text(format!(":{shortcode}:"))
+        }
     }
-    if let Some(image) = fixtures.custom_emoji(base_name(shortcode)) {
-        // A Picture: animated custom emoji play, as in Slack.
-        return div()
-            .flex_none()
-            .size(size)
-            .child(crate::media::Picture::new(image.source()).radius(px(2.)))
-            .into_any_element();
+
+    /// The emoji at `size`: a glyph's font size, an image's side.
+    pub(crate) fn element(&self, size: Pixels) -> AnyElement {
+        match self {
+            Self::Glyph(glyph) => div()
+                .text_size(size)
+                .child(glyph.clone())
+                .into_any_element(),
+            // A Picture: animated custom emoji play, as in Slack.
+            Self::Image(source) => div()
+                .flex_none()
+                .size(size)
+                .child(crate::media::Picture::new(source.clone()).radius(px(2.)))
+                .into_any_element(),
+            Self::Text(text) => div().child(text.clone()).into_any_element(),
+        }
     }
-    div().child(format!(":{shortcode}:")).into_any_element()
 }
 
 /// A `:shortcode:` (optionally followed by `:skin-tone-N:`) at the start of `rest`: its byte

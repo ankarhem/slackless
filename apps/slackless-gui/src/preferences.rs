@@ -136,6 +136,17 @@ pub const NOTIFY_LEVELS: [&str; 3] = [
     "Nothing",
 ];
 const SOUNDS: [&str; 6] = ["Knock Brush", "Ding", "Plink", "Hummus", "Boing", "None"];
+/// Where [`SOUNDS`] play from, in the same order: Slack's own notification sounds on its CDN
+/// (its web client's `knock_brush`, `b2`, `confirm_delivery`, `hummus` and `animal_stick`
+/// files), fetched the first time one plays; "None" plays nothing.
+pub const SOUND_FILES: [Option<&str>; 6] = [
+    Some("https://a.slack-edge.com/bv1-13/knock_brush-ac2b6e8.mp3"),
+    Some("https://a.slack-edge.com/bv1-13/b2-5fd58e3.mp3"),
+    Some("https://a.slack-edge.com/bv1-13/confirm_delivery-7da5529.mp3"),
+    Some("https://a.slack-edge.com/bv1-13/hummus-2e2613c.mp3"),
+    Some("https://a.slack-edge.com/bv1-13/animal_stick-caaec1f.mp3"),
+    None,
+];
 pub const SCHEDULE_DAYS: [&str; 3] = ["Every day", "Weekdays", "Custom"];
 pub const HOURS: [&str; 24] = [
     "12:00 AM", "1:00 AM", "2:00 AM", "3:00 AM", "4:00 AM", "5:00 AM", "6:00 AM", "7:00 AM",
@@ -254,6 +265,31 @@ pub struct Settings {
     pub hardware_acceleration: bool,
     pub debug_logging: bool,
     pub open_links: usize,
+}
+
+impl Settings {
+    /// Whether the notification schedule lets notifications through now (always without
+    /// one): inside its hours, on its days ("Custom" days count as every day here).
+    pub fn notifications_allowed_now(&self) -> bool {
+        if !self.schedule_enabled {
+            return true;
+        }
+        let utc = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
+        let local = utc + crate::messages::local_offset_now();
+        let hour = (local.rem_euclid(86_400) / 3_600) as usize;
+        // 1970-01-01 was a Thursday; 0 is Sunday.
+        let weekday = (local.div_euclid(86_400) + 4).rem_euclid(7);
+        let on_day = self.schedule_days != 1 || (1..=5).contains(&weekday);
+        let (start, end) = (self.schedule_start, self.schedule_end);
+        let in_hours = if start <= end {
+            (start..end).contains(&hour)
+        } else {
+            hour >= start || hour < end
+        };
+        on_day && in_hours
+    }
 }
 
 impl Default for Settings {
@@ -384,6 +420,15 @@ impl Preferences {
         self.section = section;
         self.open_select = None;
         cx.notify();
+    }
+
+    /// Show zoom level `level` (Cmd+= / Cmd+- / Cmd+0, or the remembered one) and apply it.
+    pub fn set_zoom(&mut self, level: usize, cx: &mut Context<Self>) {
+        if self.settings.zoom != level {
+            self.settings.zoom = level;
+            cx.emit(PreferencesEvent::Changed);
+            cx.notify();
+        }
     }
 
     /// Start on the remembered Color Mode and Font and the color theme Slack stores for the

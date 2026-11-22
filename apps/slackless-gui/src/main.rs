@@ -11,7 +11,9 @@
 //! `=status` / `=switcher` / `=menu` start on Preferences, a profile, the status picker, the
 //! Cmd+K switcher or the user menu (for screenshots); `=later` / `=pins` / `=activity` on
 //! Later, the pins panel or the Activity feed, `=details` the Slack Connect channel with its
-//! details dialog, and `=notify` posts a test notification.
+//! details dialog, `=notify` posts a test notification, `=typing` shows two people typing in
+//! the open conversation and `=message` delivers a demo direct message (notification and
+//! sound).
 
 mod actions;
 mod activity;
@@ -62,12 +64,15 @@ mod threads;
 mod threads_cards;
 mod threads_view;
 mod thumbnail;
+mod zoom;
 
 use std::sync::Arc;
 
 use gpui_kit::assets::AllAssets;
 use gpui_kit::component::TitleBar;
-use gpui_kit::gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
+use gpui_kit::gpui::{
+    Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+};
 use gpui_kit::open_window;
 use slackless_core::platform::{self, IconSetter as _};
 
@@ -79,9 +84,11 @@ fn main() {
         std::process::exit(sign_in::run_helper());
     }
     let session = sign_in::session();
-    let app = gpui_kit::application().with_assets(AllAssets);
+    let zoom = zoom::Zoom::default();
+    let app = Application::with_platform(zoom.platform()).with_assets(AllAssets);
 
     app.run(move |cx| {
+        cx.set_global(zoom);
         // The Dock icon: an unbundled run has no bundle to take one from.
         platform::current().set_icon(include_bytes!("../icon.png"));
         gpui_kit::init(cx);
@@ -97,6 +104,10 @@ fn main() {
         // first frame.
         if let Some(font) = bridge.font() {
             theme::set_font(font, cx);
+        }
+        // The remembered zoom, before the first frame lays out.
+        if let Some(level) = bridge.zoom() {
+            zoom::set_level(level, cx);
         }
         if let Some(mode) = bridge.color_mode() {
             let palette = fixtures.palette.unwrap_or(theme::Palette::Default);

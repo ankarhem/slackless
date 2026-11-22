@@ -57,6 +57,14 @@ pub fn enable_downloads(fetcher: Fetcher, cx: &mut App) {
     cx.set_global(Downloader(fetcher));
 }
 
+/// Fetch `url` through the core's client (live mode; `None` with nothing to fetch with).
+pub fn fetch(
+    url: String,
+    cx: &App,
+) -> Option<impl Future<Output = Result<Vec<u8>, String>> + Send + 'static + use<>> {
+    Some(cx.try_global::<Downloader>()?.0.get(url))
+}
+
 /// Download `url` into ~/Downloads as `name` (`name (1).png` when that is taken), then say
 /// where it went. Fixture mode has nothing to fetch with and says so.
 pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {

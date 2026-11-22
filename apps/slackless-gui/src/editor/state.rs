@@ -174,13 +174,22 @@ impl Editor {
     /// Replace `range` with `atom`, shown as `text`, and leave the caret after a space
     /// following it, as Slack does after a mention.
     pub fn insert_atom(&mut self, range: Range<usize>, atom: Atom, text: &str) {
-        self.history.checkpoint(&self.now);
-        self.place(range.clone(), atom, text);
+        self.place_atom(range.clone(), atom, text);
         let mut caret = range.start + text.len();
         if !self.now.doc.text()[caret..].starts_with(' ') {
             self.replace(caret..caret, " ", &PLAIN);
         }
         caret += 1;
+        self.now.selection = caret..caret;
+    }
+
+    /// Replace `range` with `atom`, shown as `text`, with the caret right after it; its own
+    /// undo step, so undoing leaves the typed characters (a typed `:shortcode:` that became
+    /// its emoji).
+    pub fn place_atom(&mut self, range: Range<usize>, atom: Atom, text: &str) {
+        self.history.checkpoint(&self.now);
+        self.place(range.clone(), atom, text);
+        let caret = range.start + text.len();
         self.now.selection = caret..caret;
         self.pending = None;
     }

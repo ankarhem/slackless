@@ -92,7 +92,12 @@ impl Doc {
                         text: Some(run.to_owned()),
                         style: text_style(attrs.style),
                     }),
-                    None => text(run, text_style(attrs.style)),
+                    None => {
+                        for element in linkified(run, text_style(attrs.style)) {
+                            push(&mut elements, element);
+                        }
+                        continue;
+                    }
                 },
                 Piece::Atom { atom, style, .. } => {
                     let style = text_style(style);
@@ -118,6 +123,60 @@ impl Doc {
         }
         elements
     }
+}
+
+/// `run` with its bare URLs as link elements, as Slack's composer sends a typed or pasted
+/// URL: `http://`, `https://` or `www.` at a word's start, up to whitespace, less trailing
+/// punctuation (a closing parenthesis only when unmatched in the URL).
+fn linkified(run: &str, style: Option<TextStyle>) -> Vec<RichTextElement> {
+    let mut elements = Vec::new();
+    let mut rest = run;
+    while let Some(start) = url_start(rest) {
+        let mut end = rest[start..]
+            .find(char::is_whitespace)
+            .map_or(rest.len(), |len| start + len);
+        while let Some(last) = rest[start..end].chars().last() {
+            let url = &rest[start..end];
+            let unmatched = last == ')' && url.matches('(').count() < url.matches(')').count();
+            if !(".,;:!?'\"".contains(last) || unmatched) {
+                break;
+            }
+            end -= last.len_utf8();
+        }
+        let url = &rest[start..end];
+        if url.len() <= "https://".len() {
+            push(&mut elements, text(&rest[..end], style));
+            rest = &rest[end..];
+            continue;
+        }
+        push(&mut elements, text(&rest[..start], style));
+        elements.push(RichTextElement::Link(LinkElement {
+            url: if url.starts_with("www.") {
+                format!("http://{url}")
+            } else {
+                url.to_owned()
+            },
+            text: None,
+            style,
+        }));
+        rest = &rest[end..];
+    }
+    push(&mut elements, text(rest, style));
+    elements
+}
+
+/// Where the first URL starts in `text`: `http://`, `https://` or `www.` beginning a word.
+fn url_start(text: &str) -> Option<usize> {
+    ["https://", "http://", "www."]
+        .into_iter()
+        .flat_map(|prefix| text.match_indices(prefix).map(|(at, _)| at))
+        .filter(|&at| {
+            text[..at]
+                .chars()
+                .last()
+                .is_none_or(|c| c.is_whitespace() || "(<[".contains(c))
+        })
+        .min()
 }
 
 fn list_style(kind: LineKind) -> ListStyle {

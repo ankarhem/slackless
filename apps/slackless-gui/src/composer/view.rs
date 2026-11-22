@@ -6,8 +6,9 @@ use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::{ActiveTheme as _, Icon, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Context, Div, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    SharedString, Stateful, Styled as _, Window, div, px, relative, rems,
+    App, Context, Div, Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Stateful, Styled as _, StyledText,
+    Window, div, px, relative, rems,
 };
 
 use super::tokens::{self, Palette};
@@ -151,7 +152,6 @@ impl Render for Composer {
             .relative()
             .w_full()
             .px_4()
-            .pb_3()
             .capture_action(cx.listener(Self::on_enter))
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))
@@ -190,5 +190,36 @@ impl Render for Composer {
                     .children(also_send)
                     .child(actions),
             )
+            .child(self.notification_bar(cx))
+    }
+}
+
+impl Composer {
+    /// Slack's notification bar under the box (`.p-notification_bar`): a 24px strip that
+    /// says who is typing, in 0.7em muted text with the names in bold.
+    fn notification_bar(&self, cx: &App) -> Div {
+        let bar = h_flex()
+            .h(px(24.))
+            .pl(px(12.))
+            .pr(px(8.))
+            .items_center()
+            .overflow_hidden();
+        let Some(typing) = &self.typing else {
+            return bar;
+        };
+        let (text, names) = typing.line();
+        let bold = HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        };
+        bar.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(10.5))
+                .line_height(px(16.))
+                .text_color(cx.theme().muted_foreground)
+                .child(StyledText::new(text).with_highlights(names.into_iter().map(|r| (r, bold)))),
+        )
     }
 }

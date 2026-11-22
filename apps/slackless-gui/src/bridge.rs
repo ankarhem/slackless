@@ -72,6 +72,9 @@ const RECENT_PLACES: &str = "recent_places";
 /// The store's local-state key for the Font chosen in Preferences (its family name).
 const FONT: &str = "font";
 
+/// The store's local-state key for the zoom chosen in Preferences (its level).
+const ZOOM: &str = "zoom";
+
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
 struct EventHub;
@@ -405,6 +408,19 @@ impl CoreBridge {
     /// the UI thread. `None` offline.
     pub fn remember_font(&self, font: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
         self.write_local(FONT, theme::FONT_FAMILIES[font].to_owned(), "font")
+    }
+
+    /// The zoom chosen in Preferences, a level of [`crate::zoom::FACTORS`]; `None` offline or
+    /// before one is chosen (100% applies).
+    pub fn zoom(&self) -> Option<usize> {
+        let level: usize = self.local(ZOOM)?.parse().ok()?;
+        (level < crate::zoom::FACTORS.len()).then_some(level)
+    }
+
+    /// Live mode: a write remembering zoom level `level`, to run off the UI thread. `None`
+    /// offline.
+    pub fn remember_zoom(&self, level: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(ZOOM, level.to_string(), "zoom")
     }
 
     /// This workspace's stored local-state `key`; `None` offline or when unset.

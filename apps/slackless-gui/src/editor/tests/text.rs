@@ -23,6 +23,29 @@ fn literal_text_is_escaped_in_mrkdwn_and_untouched_in_rich_text() {
 }
 
 #[test]
+fn bare_urls_post_as_link_elements() {
+    let editor = typed("see https://x.dev/a(b), or www.y.dev. done");
+    let link = |url: &str| {
+        RichTextElement::Link(LinkElement {
+            url: url.to_owned(),
+            text: None,
+            style: None,
+        })
+    };
+
+    assert_eq!(
+        editor.doc().to_rich_text().elements,
+        [section(vec![
+            plain("see "),
+            link("https://x.dev/a(b)"),
+            plain(", or "),
+            link("http://www.y.dev"),
+            plain(". done"),
+        ])]
+    );
+}
+
+#[test]
 fn rich_text_carries_formats_links_references_and_blocks() {
     let source = "*b* _i_ ~s~ `c` <https://x.dev|site> <@U1> <#C1> <!here> :smile:\n\
                   second\n\

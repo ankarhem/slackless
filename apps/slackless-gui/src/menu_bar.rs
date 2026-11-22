@@ -17,10 +17,10 @@ use slackless_core::platform::{self, AboutPanel as _, FullScreenItem as _};
 use slackless_core::types::ChannelId;
 
 use crate::app::{
-    FocusSearch, NavigateBack, NavigateForward, NewMessage, NextWorkspace, OpenActivity,
-    OpenChannelBrowser, OpenDms, OpenDownloads, OpenDrafts, OpenFiles, OpenLater, OpenOwnProfile,
-    OpenPeople, OpenPreferences, OpenRecent, OpenThreads, PreviousWorkspace, QuickSwitch,
-    ShowShortcuts, SignOut, SwitchWorkspace,
+    ActualSize, FocusSearch, NavigateBack, NavigateForward, NewMessage, NextWorkspace,
+    OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads, OpenDrafts, OpenFiles, OpenLater,
+    OpenOwnProfile, OpenPeople, OpenPreferences, OpenRecent, OpenThreads, PreviousWorkspace,
+    QuickSwitch, SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace, ZoomIn, ZoomOut,
 };
 
 actions!(
@@ -131,8 +131,16 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
             MenuItem::separator(),
             MenuItem::action("Search", FocusSearch),
+            MenuItem::separator(),
+            MenuItem::action("Find\u{2026}", SearchConversation),
         ]),
-        Menu::new("View").items([MenuItem::action("Toggle Full Screen", ToggleFullScreen)]),
+        Menu::new("View").items([
+            MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+            MenuItem::separator(),
+            MenuItem::action("Actual Size", ActualSize),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+        ]),
         Menu::new("Go").items([
             MenuItem::action("Switch to Channel", QuickSwitch),
             MenuItem::separator(),

@@ -667,6 +667,12 @@ impl MessageList {
     }
 
     /// Slack's Up arrow in an empty composer: edit the signed-in user's newest message here.
+    /// The open conversation's newest message (Esc marks the conversation read up to it).
+    pub fn newest_ts(&self) -> Option<Ts> {
+        let messages = self.messages.get(&self.channel)?;
+        messages.last().map(|message| message.ts.clone())
+    }
+
     pub fn edit_last_own(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = self.fixtures.self_user.clone();
         let newest = self

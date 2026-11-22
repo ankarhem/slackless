@@ -23,8 +23,10 @@ mod tokens;
 mod toolbar;
 mod view;
 
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEditsEvent, InputState, TextareaState};
 use gpui_kit::gpui::{
@@ -52,6 +54,49 @@ pub enum ComposerEvent {
     Schedule { text: String, when: SendLater },
     /// Up was pressed in an empty draft: edit the user's last message here.
     EditLast,
+    /// The user typed into the draft: tell the conversation they are typing (emitted at most
+    /// every [`TYPING_EVERY`]).
+    Typing,
+}
+
+/// How often Slack re-announces that the user is still typing; receivers drop the indicator
+/// 5 s after the last announcement.
+const TYPING_EVERY: Duration = Duration::from_secs(3);
+
+/// Who Slack's notification bar under the box says is typing.
+#[derive(Clone, PartialEq)]
+pub enum TypingNames {
+    One(SharedString),
+    Two(SharedString, SharedString),
+    Several,
+}
+
+impl TypingNames {
+    /// The line for `names`, earliest typist first; `None` with nobody typing.
+    pub fn of(names: &[SharedString]) -> Option<Self> {
+        match names {
+            [] => None,
+            [one] => Some(Self::One(one.clone())),
+            [one, other] => Some(Self::Two(one.clone(), other.clone())),
+            _ => Some(Self::Several),
+        }
+    }
+
+    /// Slack's wording (`TypingNames`), with the byte ranges of the names it sets in bold.
+    fn line(&self) -> (String, Vec<Range<usize>>) {
+        match self {
+            Self::One(name) => {
+                let bold = std::iter::once(0..name.len()).collect();
+                (format!("{name} is typing"), bold)
+            }
+            Self::Two(name, other) => {
+                let at = name.len() + " and ".len();
+                let text = format!("{name} and {other} are typing");
+                (text, vec![0..name.len(), at..at + other.len()])
+            }
+            Self::Several => ("Several people are typing".to_owned(), Vec::new()),
+        }
+    }
 }
 
 /// Where the thread composer's "Also send" checkbox posts the reply as well.
@@ -111,6 +156,10 @@ pub struct Composer {
     scheduling: bool,
     /// The thread composer's "Also send" checkbox: its target and whether it is ticked.
     also_send: Option<(AlsoSendTarget, bool)>,
+    /// Who the notification bar says is typing.
+    typing: Option<TypingNames>,
+    /// When [`ComposerEvent::Typing`] last went out.
+    typing_sent: Option<Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -172,9 +221,32 @@ impl Composer {
                 enter_sends: true,
                 scheduling: true,
                 also_send: None,
+                typing: None,
+                typing_sent: None,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Show who is typing in the notification bar under the box; `None` clears it.
+    pub fn set_typing(&mut self, typing: Option<TypingNames>, cx: &mut Context<Self>) {
+        if self.typing != typing {
+            self.typing = typing;
+            cx.notify();
+        }
+    }
+
+    /// The user typed: emit [`ComposerEvent::Typing`], at most every [`TYPING_EVERY`].
+    fn note_typing(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if self
+            .typing_sent
+            .is_some_and(|sent| now - sent < TYPING_EVERY)
+        {
+            return;
+        }
+        self.typing_sent = Some(now);
+        cx.emit(ComposerEvent::Typing);
     }
 
     /// Prompt with `placeholder` while empty ("Message #general"); applied on the next frame.
