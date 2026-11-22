@@ -744,23 +744,32 @@ pub fn saved_banner(cx: &App) -> Div {
 }
 
 /// Slack's "Only visible to you" marker above an ephemeral message, with an optional
-/// "Dismiss" link that removes it from the transcript.
+/// "Dismiss" link that removes it from the transcript (`F-COLLAB-683`).
 pub fn ephemeral_banner(key: &str, handler: Option<&ActionHandler>, cx: &App) -> Div {
     let theme = cx.theme();
-    let (muted, link) = (theme.muted_foreground, theme.link);
+    let (muted, link, tint) = (
+        theme.muted_foreground,
+        theme.link,
+        theme.secondary.opacity(0.55),
+    );
     h_flex()
         .items_center()
-        .gap_2()
-        .pb_0p5()
+        .gap_1p5()
+        .mb_1()
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .bg(tint)
         .text_xs()
         .text_color(muted)
         .child(Icon::new(IconName::Eye).text_color(muted).size(px(12.)))
         .child("Only visible to you")
         .when_some(handler.cloned(), |row, handler| {
-            row.child(
+            row.child("·").child(
                 div()
                     .id(SharedString::from(format!("{key}-dismiss-eph")))
                     .cursor_pointer()
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(link)
                     .hover(|el| el.underline())
                     .child("Dismiss")

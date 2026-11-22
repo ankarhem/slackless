@@ -1,8 +1,9 @@
-//! Popped-out secondary GPUI windows for a single conversation or thread (`F-CORE-010`,
-//! `F-CORE-026`, `F-CORE-109`): lightweight native window hosting a live message transcript
-//! and composer (or thread replies + reply composer) backed by the workspace's SQLite store
-//! and sending commands through the main window's live [`CoreBridge`].
+//! Popped-out secondary GPUI windows for a conversation, thread, Activity feed, or Saved/Later
+//! (`F-CORE-010`, `F-CORE-026`, `F-CORE-109`, `F-SHELL-149`): lightweight native window that
+//! observes the main window's live entities for real-time updates and jumps back to the main
+//! window when an Activity or Saved item is clicked.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,35 +14,55 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::{
     App, AppContext as _, Bounds, Context, Entity, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, div, point, px, size,
+    StatefulInteractiveElement as _, Styled as _, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowOptions, div, point, px, size,
 };
 use gpui_kit::open_window;
 use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
 use slackless_core::{Command, SharedStore};
 
+use crate::activity::ActivityFeed;
 use crate::composer::{Composer, ComposerEvent};
 use crate::fixtures::Fixtures;
-use crate::later::LaterItem;
-use crate::messages::{LinkHandler, LinkTarget, message_row_linked};
+use crate::later::{LaterItem, LaterView};
+use crate::messages::{LinkHandler, LinkTarget, MessageList, message_row_linked};
 
 /// Summary row for a popped-out Activity window (`F-SHELL-149`).
 #[derive(Clone)]
 pub struct PopoutActivityRow {
+    pub channel: ChannelId,
+    pub thread_ts: Option<Ts>,
     pub title: String,
     pub body: String,
     pub context: String,
     pub unread: bool,
 }
 
+/// Callback invoked when clicking a row in a popped-out Activity or Saved window:
+/// activates the main window and navigates to `(channel, ts, is_thread)`.
+pub type JumpHandler = Rc<dyn Fn(ChannelId, Option<Ts>, bool, &mut App)>;
+
 /// What this popped-out native window displays.
 #[derive(Clone)]
 pub enum PopoutKind {
-    Conversation(ChannelId),
-    Thread { channel: ChannelId, thread_ts: Ts },
-    Activity(Vec<PopoutActivityRow>),
-    Later(Vec<LaterItem>),
+    Conversation {
+        channel: ChannelId,
+        source: WeakEntity<MessageList>,
+    },
+    Thread {
+        channel: ChannelId,
+        thread_ts: Ts,
+        source: WeakEntity<MessageList>,
+    },
+    Activity {
+        source: WeakEntity<ActivityFeed>,
+        on_jump: JumpHandler,
+    },
+    Later {
+        source: WeakEntity<LaterView>,
+        on_jump: JumpHandler,
+    },
 }
 
 /// Callback that forwards commands (`SendMessage`, etc.) to the workspace's live `CoreBridge`.
@@ -81,6 +102,8 @@ pub struct PopoutWindow {
     team: Option<TeamId>,
     send: CommandForward,
     messages: Vec<Message>,
+    activity_rows: Vec<PopoutActivityRow>,
+    later_items: Vec<LaterItem>,
     composer: Entity<Composer>,
     scroll: ScrollHandle,
     _subscriptions: Vec<gpui_kit::gpui::Subscription>,
@@ -99,17 +122,17 @@ impl PopoutWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let placeholder = match &kind {
-            PopoutKind::Conversation(_) => format!("Message {title}"),
+            PopoutKind::Conversation { .. } => format!("Message {title}"),
             PopoutKind::Thread { .. } => "Reply in thread…".to_owned(),
-            PopoutKind::Activity(_) | PopoutKind::Later(_) => String::new(),
+            PopoutKind::Activity { .. } | PopoutKind::Later { .. } => String::new(),
         };
         let has_composer = matches!(
             &kind,
-            PopoutKind::Conversation(_) | PopoutKind::Thread { .. }
+            PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
         );
         let composer = Composer::new(placeholder.into(), fixtures.clone(), window, cx);
         let initial = load_messages(&kind, &fixtures, store.as_ref(), team.as_ref());
-        let sub = cx.subscribe_in(
+        let mut subscriptions = vec![cx.subscribe_in(
             &composer,
             window,
             |this: &mut Self, _, event: &ComposerEvent, _, cx| {
@@ -117,8 +140,38 @@ impl PopoutWindow {
                     this.send_content(content.clone(), cx);
                 }
             },
-        );
-        // Periodically refresh from the shared SQLite store so live messages appear in the popout.
+        )];
+        let mut activity_rows = Vec::new();
+        let mut later_items = Vec::new();
+        match &kind {
+            PopoutKind::Conversation { source, .. } | PopoutKind::Thread { source, .. } => {
+                if let Some(list) = source.upgrade() {
+                    subscriptions.push(cx.observe(&list, |this, _, cx| {
+                        this.reload_from_store(cx);
+                    }));
+                }
+            }
+            PopoutKind::Activity { source, .. } => {
+                if let Some(feed) = source.upgrade() {
+                    activity_rows = feed.read(cx).snapshot_for_popout();
+                    subscriptions.push(cx.observe(&feed, |this, feed, cx| {
+                        this.activity_rows = feed.read(cx).snapshot_for_popout();
+                        cx.notify();
+                    }));
+                }
+            }
+            PopoutKind::Later { source, .. } => {
+                if let Some(later) = source.upgrade() {
+                    later_items = later.read(cx).items_for_popout();
+                    subscriptions.push(cx.observe(&later, |this, later, cx| {
+                        this.later_items = later.read(cx).items_for_popout();
+                        cx.notify();
+                    }));
+                }
+            }
+        }
+        // Fallback periodic refresh from the shared SQLite store for conversations that are not
+        // currently selected in the main window's `MessageList`.
         if store.is_some() && has_composer {
             cx.spawn(async move |this, cx| {
                 loop {
@@ -147,13 +200,32 @@ impl PopoutWindow {
             team,
             send,
             messages: initial,
+            activity_rows,
+            later_items,
             composer,
             scroll,
-            _subscriptions: vec![sub],
+            _subscriptions: subscriptions,
         }
     }
 
     fn reload_from_store(&mut self, cx: &mut Context<Self>) {
+        match &self.kind {
+            PopoutKind::Activity { source, .. } => {
+                if let Some(feed) = source.upgrade() {
+                    self.activity_rows = feed.read(cx).snapshot_for_popout();
+                    cx.notify();
+                }
+                return;
+            }
+            PopoutKind::Later { source, .. } => {
+                if let Some(later) = source.upgrade() {
+                    self.later_items = later.read(cx).items_for_popout();
+                    cx.notify();
+                }
+                return;
+            }
+            PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {}
+        }
         let fresh = load_messages(
             &self.kind,
             &self.fixtures,
@@ -171,9 +243,11 @@ impl PopoutWindow {
 
     fn send_content(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         let (channel, thread_ts) = match &self.kind {
-            PopoutKind::Conversation(ch) => (ch.clone(), None),
-            PopoutKind::Thread { channel, thread_ts } => (channel.clone(), Some(thread_ts.clone())),
-            PopoutKind::Activity(_) | PopoutKind::Later(_) => return,
+            PopoutKind::Conversation { channel, .. } => (channel.clone(), None),
+            PopoutKind::Thread {
+                channel, thread_ts, ..
+            } => (channel.clone(), Some(thread_ts.clone())),
+            PopoutKind::Activity { .. } | PopoutKind::Later { .. } => return,
         };
         let mut local =
             self.fixtures
@@ -198,17 +272,19 @@ fn load_messages(
     store: Option<&SharedStore>,
     team: Option<&TeamId>,
 ) -> Vec<Message> {
-    if matches!(kind, PopoutKind::Activity(_) | PopoutKind::Later(_)) {
+    if matches!(kind, PopoutKind::Activity { .. } | PopoutKind::Later { .. }) {
         return Vec::new();
     }
     if let (Some(store), Some(team)) = (store, team) {
         if let Ok(guard) = store.lock() {
             let rows = match kind {
-                PopoutKind::Conversation(ch) => guard.channel_history(team, ch, None, 200),
-                PopoutKind::Thread { channel, thread_ts } => {
-                    guard.thread_replies(team, channel, thread_ts)
+                PopoutKind::Conversation { channel, .. } => {
+                    guard.channel_history(team, channel, None, 200)
                 }
-                PopoutKind::Activity(_) | PopoutKind::Later(_) => Ok(Vec::new()),
+                PopoutKind::Thread {
+                    channel, thread_ts, ..
+                } => guard.thread_replies(team, channel, thread_ts),
+                PopoutKind::Activity { .. } | PopoutKind::Later { .. } => Ok(Vec::new()),
             };
             if let Ok(rows) = rows {
                 return rows
@@ -220,13 +296,17 @@ fn load_messages(
         }
     }
     match kind {
-        PopoutKind::Conversation(ch) => fixtures.messages.get(ch).cloned().unwrap_or_default(),
-        PopoutKind::Thread { channel, thread_ts } => fixtures
+        PopoutKind::Conversation { channel, .. } => {
+            fixtures.messages.get(channel).cloned().unwrap_or_default()
+        }
+        PopoutKind::Thread {
+            channel, thread_ts, ..
+        } => fixtures
             .threads
             .get(&(channel.clone(), thread_ts.clone()))
             .cloned()
             .unwrap_or_default(),
-        PopoutKind::Activity(_) | PopoutKind::Later(_) => Vec::new(),
+        PopoutKind::Activity { .. } | PopoutKind::Later { .. } => Vec::new(),
     }
 }
 
@@ -240,20 +320,20 @@ impl Render for PopoutWindow {
             theme.foreground,
             theme.accent,
         );
-        let links: LinkHandler = std::rc::Rc::new(|target, _, cx| {
+        let links: LinkHandler = Rc::new(|target, _, cx| {
             if let LinkTarget::Url(url) = target {
                 cx.open_url(url.as_ref());
             }
         });
         let kind_label = match &self.kind {
-            PopoutKind::Conversation(_) => "Conversation",
+            PopoutKind::Conversation { .. } => "Conversation",
             PopoutKind::Thread { .. } => "Thread",
-            PopoutKind::Activity(_) => "Activity",
-            PopoutKind::Later(_) => "Later",
+            PopoutKind::Activity { .. } => "Activity · Live",
+            PopoutKind::Later { .. } => "Later · Live",
         };
         let has_composer = matches!(
             &self.kind,
-            PopoutKind::Conversation(_) | PopoutKind::Thread { .. }
+            PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
         );
         let header = h_flex()
             .flex_none()
@@ -285,7 +365,7 @@ impl Render for PopoutWindow {
                     .on_click(cx.listener(|this, _, _, cx| this.reload_from_store(cx))),
             );
         let body = match &self.kind {
-            PopoutKind::Conversation(_) | PopoutKind::Thread { .. } => {
+            PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {
                 let rows: Vec<_> = self
                     .messages
                     .iter()
@@ -304,64 +384,114 @@ impl Render for PopoutWindow {
                     .track_scroll(&self.scroll)
                     .children(rows)
             }
-            PopoutKind::Activity(items) => v_flex()
-                .id("popout-activity")
-                .flex_1()
-                .min_h_0()
-                .px_4()
-                .py_3()
-                .gap_2()
-                .overflow_y_scroll()
-                .children(items.iter().map(|item| {
-                    v_flex()
-                        .gap_1()
-                        .p_3()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(if item.unread { accent.opacity(0.2) } else { bg })
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(item.title.clone()),
-                        )
-                        .child(div().text_sm().child(item.body.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(item.context.clone()),
-                        )
-                })),
-            PopoutKind::Later(items) => v_flex()
-                .id("popout-later")
-                .flex_1()
-                .min_h_0()
-                .px_4()
-                .py_3()
-                .gap_2()
-                .overflow_y_scroll()
-                .children(items.iter().map(|item| {
-                    v_flex()
-                        .gap_1()
-                        .p_3()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .child(
-                            h_flex()
-                                .justify_between()
+            PopoutKind::Activity { on_jump, .. } => {
+                let on_jump = on_jump.clone();
+                let mut list = v_flex()
+                    .id("popout-activity")
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .overflow_y_scroll();
+                if self.activity_rows.is_empty() {
+                    list = list.child(
+                        div()
+                            .py_6()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("No activity items."),
+                    );
+                } else {
+                    list =
+                        list.children(self.activity_rows.iter().enumerate().map(|(ix, item)| {
+                            let jump = on_jump.clone();
+                            let channel = item.channel.clone();
+                            let thread_ts = item.thread_ts.clone();
+                            let is_thread = thread_ts.is_some();
+                            v_flex()
+                                .id(SharedString::from(format!("popout-act-{ix}")))
+                                .gap_1()
+                                .p_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .bg(if item.unread { accent.opacity(0.2) } else { bg })
+                                .cursor_pointer()
+                                .hover(|el| el.bg(accent.opacity(0.28)))
+                                .on_click(move |_, _, cx| {
+                                    jump(channel.clone(), thread_ts.clone(), is_thread, cx);
+                                })
                                 .child(
                                     div()
                                         .text_sm()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child(item.author.clone()),
+                                        .child(item.title.clone()),
                                 )
-                                .child(div().text_xs().text_color(muted).child(item.label.clone())),
-                        )
-                        .child(div().text_sm().child(item.text.clone()))
-                })),
+                                .child(div().text_sm().child(item.body.clone()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(item.context.clone()),
+                                )
+                        }));
+                }
+                list
+            }
+            PopoutKind::Later { on_jump, .. } => {
+                let on_jump = on_jump.clone();
+                let mut list = v_flex()
+                    .id("popout-later")
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .overflow_y_scroll();
+                if self.later_items.is_empty() {
+                    list = list.child(
+                        div()
+                            .py_6()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("No saved items."),
+                    );
+                } else {
+                    list = list.children(self.later_items.iter().enumerate().map(|(ix, item)| {
+                        let jump = on_jump.clone();
+                        let channel = item.channel.clone();
+                        let ts = item.ts.clone();
+                        v_flex()
+                            .id(SharedString::from(format!("popout-later-{ix}")))
+                            .gap_1()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .cursor_pointer()
+                            .hover(|el| el.bg(accent.opacity(0.22)))
+                            .on_click(move |_, _, cx| {
+                                jump(channel.clone(), Some(ts.clone()), false, cx);
+                            })
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(item.author.clone()),
+                                    )
+                                    .child(
+                                        div().text_xs().text_color(muted).child(item.label.clone()),
+                                    ),
+                            )
+                            .child(div().text_sm().child(item.text.clone()))
+                    }));
+                }
+                list
+            }
         };
 
         let mut root = v_flex()

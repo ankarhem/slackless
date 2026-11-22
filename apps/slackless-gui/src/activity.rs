@@ -204,6 +204,8 @@ impl ActivityFeed {
                     .map(|c| self.fixtures.conversation_label(c))
                     .unwrap_or_else(|| item.channel.to_string());
                 crate::popout::PopoutActivityRow {
+                    channel: item.channel.clone(),
+                    thread_ts: item.thread_ts.clone(),
                     title,
                     body,
                     context: format!("{place} · {}", list_stamp(&item.ts)),

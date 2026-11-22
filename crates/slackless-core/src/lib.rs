@@ -592,6 +592,8 @@ pub enum Event {
         key: String,
         options: Vec<(String, String)>,
     },
+    /// Number of outgoing commands buffered while offline, waiting to flush on reconnect.
+    OfflineQueueChanged(usize),
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

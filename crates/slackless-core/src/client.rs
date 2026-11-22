@@ -1,6 +1,6 @@
 //! The runtime thread, the command loop and the front-end handle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -268,6 +268,10 @@ pub(crate) struct Core<B: Backend> {
     self_user_id: Arc<Mutex<Option<UserId>>>,
     /// Cloud-synced draft ids per channel (`drafts.list` / `drafts.create` / `drafts.update` / `drafts.delete`).
     cloud_draft_ids: Arc<Mutex<HashMap<ChannelId, String>>>,
+    /// Whether the RTM websocket is currently disconnected or reconnecting.
+    is_offline: bool,
+    /// Outgoing mutations buffered while `is_offline`, flushed FIFO on reconnect.
+    offline_queue: VecDeque<Command>,
 }
 
 impl<B: Backend> Core<B> {
@@ -302,6 +306,8 @@ impl<B: Backend> Core<B> {
             bots: HashMap::new(),
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
+            is_offline: false,
+            offline_queue: VecDeque::new(),
         }
     }
 
@@ -586,6 +592,20 @@ impl<B: Backend> Core<B> {
     }
 
     pub fn handle(&mut self, command: Command) {
+        if self.is_offline
+            && matches!(
+                command,
+                Command::SendMessage { .. }
+                    | Command::AddReaction { .. }
+                    | Command::RemoveReaction { .. }
+                    | Command::MarkRead { .. }
+            )
+        {
+            self.offline_queue.push_back(command);
+            self.events
+                .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
+            return;
+        }
         let backend = self.backend.clone();
         let store = Arc::clone(&self.store);
         let ws = self.workspace.clone();
@@ -1459,8 +1479,22 @@ impl<B: Backend> Core<B> {
         match event {
             RtmEvent::State(state) => {
                 // Subscriptions last one websocket session: (re)subscribe on every `hello`.
-                if matches!(state, ConnectionState::Connected { .. }) {
-                    self.subscribe_dm_presence();
+                match &state {
+                    ConnectionState::Connected { .. } => {
+                        self.is_offline = false;
+                        self.subscribe_dm_presence();
+                        if !self.offline_queue.is_empty() {
+                            let queued: Vec<Command> = self.offline_queue.drain(..).collect();
+                            self.events.emit(Event::OfflineQueueChanged(0));
+                            for cmd in queued {
+                                self.handle(cmd);
+                            }
+                        }
+                    }
+                    ConnectionState::Reconnecting { .. } | ConnectionState::Disconnected { .. } => {
+                        self.is_offline = true;
+                    }
+                    ConnectionState::Connecting => {}
                 }
                 self.events.emit(Event::Connection(state));
             }
@@ -2180,6 +2214,10 @@ pub(crate) mod tests {
         recent_calls: Vec<(ChannelId, u32)>,
         /// `conversations.mark` asks, in order.
         mark_calls: Vec<(ChannelId, Ts)>,
+        /// `chat.postMessage` asks, in order.
+        posted_messages: Vec<(ChannelId, String)>,
+        /// `reactions.add` asks, in order.
+        reaction_adds: Vec<(ChannelId, Ts, String)>,
         /// `client.dms` answer.
         dms: Vec<Conversation>,
         /// How often `client.dms` was asked.
@@ -2811,6 +2849,11 @@ pub(crate) mod tests {
             _thread_ts: Option<Ts>,
             _broadcast: bool,
         ) -> api::Result<PostedMessage> {
+            self.state
+                .lock()
+                .unwrap()
+                .posted_messages
+                .push((channel.clone(), content.text.clone()));
             let ts = Ts::from("100.0");
             let message = Message {
                 ts: ts.clone(),
@@ -2840,7 +2883,12 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn add_reaction(&self, _: ChannelId, _: Ts, _: String) -> api::Result<()> {
+        async fn add_reaction(&self, ch: ChannelId, ts: Ts, name: String) -> api::Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .reaction_adds
+                .push((ch, ts, name));
             Ok(())
         }
 
@@ -5113,5 +5161,81 @@ pub(crate) mod tests {
             .channel_history(&TeamId::from("T1"), &c1(), None, 100)
             .unwrap();
         assert_eq!(stored.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn offline_queue_buffers_and_flushes_on_reconnect() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        // Drop offline via RTM reconnecting state.
+        let reconnecting = ConnectionState::Reconnecting {
+            attempt: 1,
+            delay: Duration::from_secs(2),
+            reason: "network down".into(),
+        };
+        core.on_rtm(RtmEvent::State(reconnecting.clone())).await;
+        assert_eq!(next(&mut rx).await, Event::Connection(reconnecting));
+
+        // Queue a message, reaction, and read-mark while offline.
+        core.handle(Command::SendMessage {
+            channel: c1(),
+            content: MessageContent::plain("first offline"),
+            thread_ts: None,
+            broadcast: false,
+        });
+        assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+
+        core.handle(Command::AddReaction {
+            channel: c1(),
+            ts: Ts::from("100.0"),
+            name: "thumbsup".into(),
+        });
+        assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
+
+        core.handle(Command::MarkRead {
+            channel: c1(),
+            ts: Ts::from("100.0"),
+        });
+        assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(3));
+
+        // Nothing should have hit the backend yet.
+        {
+            let state = fake.state.lock().unwrap();
+            assert!(state.posted_messages.is_empty());
+            assert!(state.reaction_adds.is_empty());
+            assert!(state.mark_calls.is_empty());
+        }
+
+        // Reconnect: queue drains in FIFO order and notifies 0 queued.
+        let connected = ConnectionState::Connected {
+            fast_reconnect: false,
+        };
+        core.on_rtm(RtmEvent::State(connected.clone())).await;
+        assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
+        assert_eq!(next(&mut rx).await, Event::Connection(connected));
+        // Wait for the spawned SendMessage (`StoreChanged`) and MarkRead (`AuthExpired` in FakeBackend).
+        let mut saw_store_changed = false;
+        for _ in 0..2 {
+            if next(&mut rx).await == (Event::StoreChanged { channel: c1() }) {
+                saw_store_changed = true;
+            }
+        }
+        assert!(saw_store_changed);
+        // Yield briefly so the reaction task finishes too.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let state = fake.state.lock().unwrap();
+        assert_eq!(
+            state.posted_messages,
+            vec![(c1(), "first offline".to_owned())]
+        );
+        assert_eq!(
+            state.reaction_adds,
+            vec![(c1(), Ts::from("100.0"), "thumbsup".to_owned())]
+        );
+        assert_eq!(state.mark_calls, vec![(c1(), Ts::from("100.0"))]);
     }
 }

@@ -472,6 +472,7 @@ struct Parked {
     visits: HashMap<ChannelId, u32>,
     active_huddles: HashMap<ChannelId, Vec<UserId>>,
     connection: Option<slackless_core::rtm::ConnectionState>,
+    offline_queued: usize,
     member_counts: HashMap<ChannelId, u32>,
     app_counts: HashMap<ChannelId, u32>,
     history_complete: HashSet<ChannelId>,
@@ -675,6 +676,8 @@ pub struct App {
     peer_dnd_paused: HashMap<UserId, bool>,
     /// Live mode: latest RTM websocket connection state (drives the offline/reconnecting banner).
     connection: Option<slackless_core::rtm::ConnectionState>,
+    /// Live mode: outgoing mutations buffered while offline, waiting to flush on reconnect.
+    offline_queued: usize,
     /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.
     usergroups: Vec<Usergroup>,
     /// Live mode: workspace slash commands from `client.appCommands`, injected into snapshots.
@@ -1313,7 +1316,7 @@ impl App {
                     &later,
                     window,
                     |this: &mut App, _, event: &LaterEvent, window, cx| match event {
-                        LaterEvent::PopOut => this.pop_out_later(cx),
+                        LaterEvent::PopOut => this.pop_out_later(window, cx),
                         LaterEvent::Close => {
                             this.later_open = false;
                             cx.notify();
@@ -1468,9 +1471,10 @@ impl App {
                         UnreadsEvent::MarkAllRead => this.request_mark_all_read(window, cx),
                     },
                 ),
-                cx.subscribe(
+                cx.subscribe_in(
                     &activity,
-                    |this: &mut App, _, event: &ActivityEvent, cx| match event {
+                    window,
+                    |this: &mut App, _, event: &ActivityEvent, window, cx| match event {
                         ActivityEvent::Open { channel, thread_ts } => {
                             this.select(channel.clone(), cx);
                             if let Some(thread_ts) = thread_ts {
@@ -1484,7 +1488,7 @@ impl App {
                             });
                         }
                         ActivityEvent::Retry => this.fetch_activity(cx),
-                        ActivityEvent::PopOut => this.pop_out_activity(cx),
+                        ActivityEvent::PopOut => this.pop_out_activity(window, cx),
                     },
                 ),
                 cx.observe(&activity, |this: &mut App, _, cx| {
@@ -1743,6 +1747,7 @@ impl App {
                 presence: fixtures::PresenceMap::default(),
                 peer_dnd_paused: HashMap::new(),
                 connection: None,
+                offline_queued: 0,
                 usergroups: Vec::new(),
                 app_commands: Vec::new(),
                 visits: HashMap::new(),
@@ -2885,11 +2890,41 @@ impl App {
         cx.notify();
     }
 
+    /// Callback for popped-out Activity / Saved windows: brings the main window to the front
+    /// and navigates to the clicked conversation, message, or thread.
+    fn popout_jump_handler(
+        &self,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> crate::popout::JumpHandler {
+        let app = cx.weak_entity();
+        let main_win = window.window_handle();
+        Rc::new(move |channel, ts, is_thread, cx| {
+            cx.activate(true);
+            let _ = main_win.update(cx, |_, window, cx| {
+                window.activate_window();
+                let _ = app.update(cx, |app, cx| {
+                    app.select(channel.clone(), cx);
+                    if let Some(ts) = ts.clone() {
+                        if is_thread {
+                            app.open_thread(channel.clone(), ts, cx);
+                        } else {
+                            app.messages.update(cx, |list, cx| list.reveal(&ts, cx));
+                        }
+                    }
+                });
+            });
+        })
+    }
+
     /// Pop out `channel` into a separate native GPUI window (`F-CORE-010`, `F-CORE-026`).
     fn pop_out_conversation(&self, channel: ChannelId, cx: &mut Context<Self>) {
         let title = self.label(&channel);
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Conversation(channel),
+            crate::popout::PopoutKind::Conversation {
+                channel,
+                source: self.messages.downgrade(),
+            },
             title,
             self.fixtures.clone(),
             self.bridge.store().cloned(),
@@ -2903,7 +2938,11 @@ impl App {
     fn pop_out_thread(&self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
         let title = format!("Thread in {}", self.label(&channel));
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Thread { channel, thread_ts },
+            crate::popout::PopoutKind::Thread {
+                channel,
+                thread_ts,
+                source: self.messages.downgrade(),
+            },
             title,
             self.fixtures.clone(),
             self.bridge.store().cloned(),
@@ -2913,11 +2952,14 @@ impl App {
         );
     }
 
-    /// Pop out the Activity feed into a separate native GPUI window (`F-SHELL-149`).
-    fn pop_out_activity(&self, cx: &mut Context<Self>) {
-        let rows = self.activity.read(cx).snapshot_for_popout();
+    /// Pop out the live Activity feed into a separate native GPUI window (`F-SHELL-149`).
+    fn pop_out_activity(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_jump = self.popout_jump_handler(window, cx);
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Activity(rows),
+            crate::popout::PopoutKind::Activity {
+                source: self.activity.downgrade(),
+                on_jump,
+            },
             "Activity".to_owned(),
             self.fixtures.clone(),
             None,
@@ -2927,11 +2969,14 @@ impl App {
         );
     }
 
-    /// Pop out Saved / Later items into a separate native GPUI window (`F-SHELL-149`).
-    fn pop_out_later(&self, cx: &mut Context<Self>) {
-        let items = self.later.read(cx).items_for_popout();
+    /// Pop out the live Saved / Later view into a separate native GPUI window (`F-SHELL-149`).
+    fn pop_out_later(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_jump = self.popout_jump_handler(window, cx);
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Later(items),
+            crate::popout::PopoutKind::Later {
+                source: self.later.downgrade(),
+                on_jump,
+            },
             "Saved".to_owned(),
             self.fixtures.clone(),
             None,
@@ -5338,6 +5383,11 @@ impl App {
                     parked.connection = Some(state.clone());
                 }
             }
+            Event::OfflineQueueChanged(count) => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked.offline_queued = *count;
+                }
+            }
             Event::Presence { users, presence } => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     parked
@@ -5604,6 +5654,10 @@ impl App {
             }
             Event::Connection(state) => {
                 self.connection = Some(state.clone());
+                cx.notify();
+            }
+            Event::OfflineQueueChanged(count) => {
+                self.offline_queued = *count;
                 cx.notify();
             }
             Event::SelfDndUpdated(status) => {
@@ -6574,6 +6628,7 @@ impl App {
                     visits: HashMap::new(),
                     active_huddles: HashMap::new(),
                     connection: None,
+                    offline_queued: 0,
                     member_counts: HashMap::new(),
                     app_counts: HashMap::new(),
                     history_complete: HashSet::new(),
@@ -6594,6 +6649,7 @@ impl App {
             visits: mem::replace(&mut self.visits, incoming.visits),
             active_huddles: mem::replace(&mut self.active_huddles, incoming.active_huddles),
             connection: mem::replace(&mut self.connection, incoming.connection),
+            offline_queued: mem::replace(&mut self.offline_queued, incoming.offline_queued),
             member_counts: mem::replace(&mut self.member_counts, incoming.member_counts),
             app_counts: mem::replace(&mut self.app_counts, incoming.app_counts),
             history_complete: mem::replace(&mut self.history_complete, incoming.history_complete),
@@ -7631,8 +7687,9 @@ impl Render for App {
             match &self.tab {
                 // The Pins tab keeps the transcript under it; its panel is the right column.
                 ConversationTab::Messages | ConversationTab::Pins => {
-                    let column =
-                        column.child(div().flex_1().min_h_0().child(self.messages.clone()));
+                    let column = column
+                        .children(self.app_dm_banner(conversation.as_ref(), cx))
+                        .child(div().flex_1().min_h_0().child(self.messages.clone()));
                     // In a public channel the user is not in, Slack's Join card takes the
                     // composer's place.
                     match conversation.as_ref().filter(|c| joinable(c)) {
@@ -8471,21 +8528,38 @@ impl App {
     }
 
     /// Offline / reconnecting notice at the top of the conversation column while Slack's RTM
-    /// socket is dropped (`F-SHELL-169`). Hidden once connected or in fixture mode.
+    /// socket is dropped (`F-SHELL-169`). Also displays the number of queued outgoing mutations
+    /// that will automatically flush on reconnect. Hidden once connected and drained.
     fn connection_banner(&self, cx: &Context<Self>) -> Option<Div> {
         use slackless_core::rtm::ConnectionState;
-        let text = match self.connection.as_ref()? {
-            ConnectionState::Connected { .. } | ConnectionState::Connecting => return None,
-            ConnectionState::Reconnecting { attempt, delay, .. } => {
+        let queued = self.offline_queued;
+        let queue_suffix = if queued == 1 {
+            " (1 queued change will send when reconnected)".to_owned()
+        } else if queued > 1 {
+            format!(" ({queued} queued changes will send when reconnected)")
+        } else {
+            String::new()
+        };
+        let text = match self.connection.as_ref() {
+            Some(ConnectionState::Reconnecting { attempt, delay, .. }) => {
                 let secs = delay.as_secs();
                 if secs > 0 {
-                    format!("Offline — reconnecting to Slack in {secs}s (attempt {attempt})…")
+                    format!(
+                        "Offline — reconnecting to Slack in {secs}s (attempt {attempt})…{queue_suffix}"
+                    )
                 } else {
-                    format!("Offline — reconnecting to Slack (attempt {attempt})…")
+                    format!("Offline — reconnecting to Slack (attempt {attempt})…{queue_suffix}")
                 }
             }
-            ConnectionState::Disconnected { reason } => {
-                format!("Disconnected from Slack ({reason})")
+            Some(ConnectionState::Disconnected { reason }) => {
+                format!("Disconnected from Slack ({reason}){queue_suffix}")
+            }
+            Some(ConnectionState::Connected { .. } | ConnectionState::Connecting) | None => {
+                if queued == 0 {
+                    return None;
+                }
+                let word = if queued == 1 { "change" } else { "changes" };
+                format!("Reconnected — sending {queued} queued {word}…")
             }
         };
         let theme = cx.theme();
@@ -8506,6 +8580,110 @@ impl App {
                         .text_color(theme.warning),
                 )
                 .child(div().text_xs().text_color(theme.foreground).child(text)),
+        )
+    }
+
+    /// App DM info & quick-action strip rendered above the transcript when the active
+    /// conversation is a direct message with an app / bot user (`F-COLLAB-482`).
+    fn app_dm_banner(
+        &self,
+        conversation: Option<&Conversation>,
+        cx: &Context<Self>,
+    ) -> Option<Div> {
+        let peer_id = conversation
+            .filter(|c| c.kind() == ConversationKind::Im)
+            .and_then(|c| c.user.as_ref())?;
+        let user = self.fixtures.user(peer_id)?;
+        if !user.is_bot {
+            return None;
+        }
+        let name = self.fixtures.name_of(user).to_owned();
+        let desc = user
+            .profile
+            .title
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let peer_for_profile = peer_id.clone();
+        let peer_for_copy = peer_id.as_str().to_owned();
+        let theme = cx.theme();
+        let (border, muted, fg, badge_bg) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.secondary,
+        );
+        Some(
+            h_flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .px_4()
+                .py_1p5()
+                .bg(badge_bg.opacity(0.45))
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::Bot).size(px(14.)).text_color(muted))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .px_1()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .bg(badge_bg)
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(muted)
+                                .child("APP"),
+                        )
+                        .children(desc.map(|title| {
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(title)
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Button::new("app-dm-copy-id")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .label("Copy ID")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        peer_for_copy.clone(),
+                                    ));
+                                    notify("App ID copied", peer_for_copy.clone(), window, cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("app-dm-about")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .label("About app")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_profile(peer_for_profile.clone(), cx);
+                                })),
+                        ),
+                ),
         )
     }
 
