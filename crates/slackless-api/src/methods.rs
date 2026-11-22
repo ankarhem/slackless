@@ -2784,6 +2784,21 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `saved.add`: save a file for Later (`item_type=file`, `F-CORE-157`).
+    pub async fn saved_add_file(&self, file_id: &str, date_due: Option<u64>) -> Result<()> {
+        let mut params = vec![
+            ("item_type", "file".to_owned()),
+            ("item_id", file_id.to_owned()),
+            ("_x_reason", "saved-api/addSavedFile".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(due) = date_due {
+            params.push(("date_due", due.to_string()));
+        }
+        self.call::<Empty>(method::SAVED_ADD, params).await?;
+        Ok(())
+    }
+
     /// `saved.update`: transition a saved item's state (`mark`) and/or update or clear (`Some(None)`)
     /// its reminder due time (`date_due`).
     pub async fn saved_update(

@@ -57,6 +57,12 @@ enum Commands {
         /// Maximum number of results.
         #[arg(long, value_name = "N", default_value_t = SEARCH_LIMIT)]
         limit: usize,
+        /// Optional export format (`md` or `json`) for search results.
+        #[arg(long, value_enum)]
+        format: Option<ExportFormat>,
+        /// Write search results to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     /// Print recent messages from a conversation (channel id, #name or @handle).
     Read {
@@ -88,6 +94,17 @@ enum Commands {
     Dms,
     /// Show local SQLite archive statistics (offline).
     Stats,
+    /// Checkpoint WAL, compact unused pages (VACUUM), and optimize FTS5 indexes (offline).
+    Vacuum,
+    /// List archived thread roots with replies from the local archive (offline).
+    Threads {
+        /// Optional channel id, #name, or @handle to scope thread listing.
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+        /// Maximum number of threads (newest first).
+        #[arg(long, value_name = "N", default_value_t = 30)]
+        limit: usize,
+    },
     /// Export a conversation's locally archived messages to JSON or Markdown (offline).
     Export {
         /// Channel id, #name, or @handle.
@@ -157,7 +174,19 @@ async fn dispatch(
 ) -> Result<ExitCode> {
     let flag = flag.as_deref();
     match cli.command {
-        Commands::Search { query, limit } => cmd_search(ctx, workspace.as_ref(), &query, limit),
+        Commands::Search {
+            query,
+            limit,
+            format,
+            out,
+        } => cmd_search(
+            ctx,
+            workspace.as_ref(),
+            &query,
+            limit,
+            format,
+            out.as_deref(),
+        ),
         Commands::Read { channel, limit } => cmd_read(ctx, workspace.as_ref(), &channel, limit),
         Commands::Send { channel, text } => run_send(ctx, flag, &channel, text).await,
         Commands::Reply {
@@ -169,6 +198,10 @@ async fn dispatch(
         Commands::Channels => cmd_channels(ctx, workspace.as_ref()),
         Commands::Dms => cmd_dms(ctx, workspace.as_ref()),
         Commands::Stats => cmd_stats(ctx, workspace.as_ref()),
+        Commands::Vacuum => cmd_vacuum(ctx, workspace.as_ref()),
+        Commands::Threads { channel, limit } => {
+            cmd_threads(ctx, workspace.as_ref(), channel.as_deref(), limit)
+        }
         Commands::Export {
             channel,
             format,
@@ -195,6 +228,8 @@ fn cmd_search(
     workspace: Option<&TeamId>,
     query: &str,
     limit: usize,
+    format: Option<ExportFormat>,
+    out: Option<&std::path::Path>,
 ) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
         return Ok(empty_local(
@@ -218,6 +253,44 @@ fn cmd_search(
         .iter()
         .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
         .collect();
+    if format.is_some() || out.is_some() {
+        let effective = if ctx.json {
+            ExportFormat::Json
+        } else {
+            format.unwrap_or(ExportFormat::Md)
+        };
+        let rendered = match effective {
+            ExportFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+                "query": query,
+                "count": rows.len(),
+                "messages": rows,
+            }))?,
+            ExportFormat::Md => format_markdown_export(&format!("Search: {query}"), &rows),
+        };
+        if let Some(path) = out {
+            std::fs::write(path, &rendered)
+                .with_context(|| format!("writing search results to {}", path.display()))?;
+            if ctx.json {
+                output::emit_json(&serde_json::json!({
+                    "ok": true,
+                    "path": path.display().to_string(),
+                    "count": rows.len(),
+                }));
+            } else {
+                eprintln!(
+                    "Exported {} search matches to {}",
+                    rows.len(),
+                    path.display()
+                );
+            }
+        } else {
+            print!("{rendered}");
+            if !rendered.ends_with('\n') {
+                println!();
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut human = String::new();
     for row in &rows {
         let label = names.get(row.channel.as_str()).map(String::as_str);
@@ -382,6 +455,103 @@ fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
         stats.offline_queued,
     );
     output::emit(ctx.json, &json, &human);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_vacuum(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"ok": false, "reason": "no_workspace"}),
+            "compacting archive",
+        ));
+    };
+    let Some(store) = open_archive_store(workspace) else {
+        archive_hint(workspace);
+        return Ok(ExitCode::SUCCESS);
+    };
+    let before = store.stats(workspace).map(|s| s.db_bytes()).unwrap_or(0);
+    store
+        .vacuum()
+        .with_context(|| format!("compacting local archive for {workspace}"))?;
+    let after = store.stats(workspace).map(|s| s.db_bytes()).unwrap_or(0);
+    let reclaimed = before.saturating_sub(after);
+    let json = serde_json::json!({
+        "ok": true,
+        "workspace": workspace.as_str(),
+        "before_bytes": before,
+        "after_bytes": after,
+        "reclaimed_bytes": reclaimed,
+    });
+    let human = format!(
+        "Compacted {workspace}: {:.1} MiB -> {:.1} MiB (reclaimed {:.1} MiB)\n",
+        before as f64 / (1024.0 * 1024.0),
+        after as f64 / (1024.0 * 1024.0),
+        reclaimed as f64 / (1024.0 * 1024.0),
+    );
+    output::emit(ctx.json, &json, &human);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_threads(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    channel_arg: Option<&str>,
+    limit: usize,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"count": 0, "threads": []}),
+            "listing threads",
+        ));
+    };
+    let archive = Archive::open(workspace);
+    if archive.is_none() {
+        archive_hint(workspace);
+    }
+    let resolved_ch = channel_arg.map(|arg| {
+        archive
+            .as_ref()
+            .and_then(|a| a.resolve_channel(workspace, arg))
+            .map_or_else(|| raw_channel_id(arg), |row| row.id)
+    });
+    let messages = match open_archive_store(workspace) {
+        Some(store) => store
+            .recent_threads(workspace, resolved_ch.as_ref(), limit)
+            .with_context(|| format!("listing archived threads for {workspace}"))?,
+        None => Vec::new(),
+    };
+    let names = archive
+        .as_ref()
+        .map_or_else(Default::default, |a| a.channel_names(workspace));
+    let rows: Vec<MessageRow> = messages
+        .iter()
+        .map(|m| MessageRow::from_stored(m, archive.as_ref(), workspace))
+        .collect();
+    let mut human = String::new();
+    for row in &rows {
+        let label = names
+            .get(row.channel.as_str())
+            .map(String::as_str)
+            .unwrap_or(&row.channel);
+        let replies = row.reply_count.unwrap_or(0);
+        let author = row
+            .user_name
+            .as_deref()
+            .or(row.user.as_deref())
+            .unwrap_or("unknown");
+        let snippet: String = row.text.chars().take(80).collect();
+        human.push_str(&format!(
+            "{label}\t{}\t{replies} replies\t{author}: {snippet}\n",
+            row.ts
+        ));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({"count": rows.len(), "threads": rows}),
+        &human,
+    );
     Ok(ExitCode::SUCCESS)
 }
 

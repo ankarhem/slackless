@@ -56,17 +56,26 @@ enum Load {
     Failed(String),
 }
 
-/// The page's tabs; each filters the loaded page client-side.
+/// The page's tabs; each filters the loaded page client-side (`F-SHELL-046`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Filter {
     All,
     Dms,
     Mentions,
     Threads,
+    Reactions,
+    Apps,
 }
 
 impl Filter {
-    const ALL: [Filter; 4] = [Filter::All, Filter::Dms, Filter::Mentions, Filter::Threads];
+    const ALL: [Filter; 6] = [
+        Filter::All,
+        Filter::Dms,
+        Filter::Mentions,
+        Filter::Threads,
+        Filter::Reactions,
+        Filter::Apps,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -74,11 +83,12 @@ impl Filter {
             Filter::Dms => "DMs",
             Filter::Mentions => "Mentions",
             Filter::Threads => "Threads",
+            Filter::Reactions => "Reactions",
+            Filter::Apps => "Apps",
         }
     }
 
-    /// Whether a row of `kind` shows under this tab (reactions and channel activity only
-    /// under All, like Slack's inbox).
+    /// Whether a row of `kind` shows under this tab.
     fn admits(self, kind: ActivityKind) -> bool {
         matches!(
             (self, kind),
@@ -86,6 +96,8 @@ impl Filter {
                 | (Filter::Dms, ActivityKind::Dm | ActivityKind::App)
                 | (Filter::Mentions, ActivityKind::Mention)
                 | (Filter::Threads, ActivityKind::Thread)
+                | (Filter::Reactions, ActivityKind::Reaction)
+                | (Filter::Apps, ActivityKind::App)
         )
     }
 }

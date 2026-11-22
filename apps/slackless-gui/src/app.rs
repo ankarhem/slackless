@@ -547,6 +547,8 @@ pub struct App {
     active_huddles: HashMap<ChannelId, Vec<UserId>>,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
+    /// Standalone native Preferences OS window handle (`F-CORE-011`) so Cmd+, focuses it if open.
+    prefs_window: Option<gpui::AnyWindowHandle>,
     /// The theme last installed (mode, color theme, darker sidebars, window gradient, focus
     /// mode's grayscale), so unrelated preference edits do not repaint the theme.
     applied_theme: (SlackTheme, Palette, bool, bool, bool),
@@ -1503,11 +1505,20 @@ impl App {
                         .update(cx, |sidebar, cx| sidebar.set_activity_unread(unread, cx));
                     cx.notify();
                 }),
-                cx.subscribe(
+                cx.subscribe_in(
                     &files_page,
-                    |this: &mut App, _, event: &FilesPageEvent, _| {
-                        let FilesPageEvent::Load(filter) = event;
-                        this.bridge.send(Command::LoadFiles(filter.clone()));
+                    window,
+                    |this: &mut App, _, event: &FilesPageEvent, window, cx| match event {
+                        FilesPageEvent::Load(filter) => {
+                            this.bridge.send(Command::LoadFiles(filter.clone()));
+                        }
+                        FilesPageEvent::SaveFile { file_id, name } => {
+                            this.bridge.send(Command::SaveFile {
+                                file_id: file_id.clone(),
+                                date_due: None,
+                            });
+                            notify("Saved for later", name.clone(), window, cx);
+                        }
                     },
                 ),
                 cx.subscribe_in(
@@ -1702,6 +1713,7 @@ impl App {
                 huddle_open: false,
                 active_huddles: HashMap::new(),
                 preferences,
+                prefs_window: None,
                 applied_theme,
                 pane_focus: 2,
                 color_mode,
@@ -4027,11 +4039,12 @@ impl App {
         cx.quit();
     }
 
-    /// The Preferences window in a gpui-kit dialog, optionally at `section`.
+    /// Open Preferences in its own standalone native OS window (`F-CORE-011`), focusing the
+    /// existing window if already open.
     fn open_preferences(
         &mut self,
         section: Option<Section>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.refresh_storage_stats(cx);
@@ -4039,13 +4052,19 @@ impl App {
             self.preferences
                 .update(cx, |prefs, cx| prefs.show(section, cx));
         }
-        let preferences = self.preferences.clone();
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("Preferences")
-                .w(px(920.))
-                .child(preferences.clone())
-        });
+        if let Some(handle) = self.prefs_window {
+            if handle
+                .update(cx, |_, win, _| {
+                    win.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            self.prefs_window = None;
+        }
+        self.prefs_window =
+            crate::preferences::open_preferences_window(self.preferences.clone(), cx);
     }
 
     fn open_status_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5120,6 +5139,139 @@ impl App {
         notify("Media cache pruned", msg, window, cx);
     }
 
+    /// Export the active conversation's locally archived messages as Markdown or pretty JSON
+    /// using a native save dialog.
+    fn export_conversation_transcript(
+        &self,
+        markdown: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let channel = self.channel.clone();
+        let label = self.label(&channel);
+        let safe_name: String = label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let safe_name = safe_name.trim_matches('-');
+        let stem = if safe_name.is_empty() {
+            channel.as_str()
+        } else {
+            safe_name
+        };
+        let ext = if markdown { "md" } else { "json" };
+        let suggested = format!("{stem}-transcript.{ext}");
+        let start_dir = {
+            let custom = self.preferences.read(cx).settings().download_dir.clone();
+            if !custom.is_empty() {
+                std::path::PathBuf::from(custom)
+            } else {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+                    .unwrap_or_else(std::env::temp_dir)
+            }
+        };
+        let fixtures = self.fixtures.clone();
+        let store = self.bridge.store().cloned();
+        let team = self.bridge.team_id().cloned();
+        let rx = cx.prompt_for_new_path(&start_dir, Some(&suggested));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let messages: Vec<slackless_core::types::Message> =
+                        if let (Some(store), Some(team)) = (store, team) {
+                            store
+                                .lock()
+                                .ok()
+                                .and_then(|s| s.channel_history(&team, &channel, None, 10_000).ok())
+                                .map(|rows| rows.into_iter().map(|r| r.message).collect())
+                                .unwrap_or_default()
+                        } else {
+                            fixtures.messages.get(&channel).cloned().unwrap_or_default()
+                        };
+                    let count = messages.len();
+                    let body = if markdown {
+                        let mut md = format!("# {label}\n\n");
+                        for msg in &messages {
+                            let author = msg
+                                .user
+                                .as_ref()
+                                .map(|u| fixtures.user_name(u).to_owned())
+                                .or_else(|| msg.bot_profile.as_ref().map(|b| b.name.clone()))
+                                .unwrap_or_else(|| "unknown".to_owned());
+                            md.push_str(&format!("**{author}** (`{}`)\n\n", msg.ts));
+                            let text = fixtures.plain_text(msg);
+                            if !text.is_empty() {
+                                md.push_str(&text);
+                                md.push_str("\n\n");
+                            }
+                            if !msg.files.is_empty() {
+                                let names: Vec<&str> = msg
+                                    .files
+                                    .iter()
+                                    .filter_map(|f| f.name.as_deref().or(f.title.as_deref()))
+                                    .collect();
+                                if !names.is_empty() {
+                                    md.push_str(&format!("_Files:_ {}\n\n", names.join(", ")));
+                                }
+                            }
+                            md.push_str("---\n\n");
+                        }
+                        md
+                    } else {
+                        let rows: Vec<_> = messages
+                            .iter()
+                            .map(|msg| {
+                                let author = msg
+                                    .user
+                                    .as_ref()
+                                    .map(|u| fixtures.user_name(u).to_owned())
+                                    .or_else(|| msg.bot_profile.as_ref().map(|b| b.name.clone()));
+                                crate::blockkit::serde_json::json!({
+                                    "ts": msg.ts.as_str(),
+                                    "user": msg.user.as_ref().map(|u| u.as_str()),
+                                    "author": author,
+                                    "text": fixtures.plain_text(msg),
+                                    "thread_ts": msg.thread_ts.as_ref().map(|t| t.as_str()),
+                                })
+                            })
+                            .collect();
+                        crate::blockkit::serde_json::to_string_pretty(
+                            &crate::blockkit::serde_json::json!({
+                                "channel": channel.as_str(),
+                                "label": label,
+                                "count": count,
+                                "messages": rows,
+                            }),
+                        )
+                        .unwrap_or_default()
+                    };
+                    std::fs::write(&path, body).map(|()| (count, path))
+                })
+                .await;
+            let _ = cx.update(|window, cx| match result {
+                Ok((count, path)) => notify(
+                    "Transcript exported",
+                    format!("Saved {count} messages to {}", path.display()),
+                    window,
+                    cx,
+                ),
+                Err(err) => notify("Export failed", err.to_string(), window, cx),
+            });
+        })
+        .detach();
+    }
+
     /// Search messages for `query`, showing results in place of the message column. The
     /// pill's Enter and the dropdown's rows both land here; the dropdown's filter chips
     /// (and only its non-empty query) narrow the run and join its history.
@@ -5376,6 +5528,30 @@ impl App {
                                 cx.write_to_clipboard(ClipboardItem::new_string(name.clone()))
                             }),
                     );
+                }
+                if channel.is_some() {
+                    let this_md = this.clone();
+                    let this_json = this.clone();
+                    menu = menu
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Export transcript (Markdown…)")
+                                .icon(IconName::Download)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_md.update(cx, |app, cx| {
+                                        app.export_conversation_transcript(true, window, cx)
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("Export transcript (JSON…)")
+                                .icon(IconName::FileCode)
+                                .on_click(move |_, window, cx| {
+                                    let _ = this_json.update(cx, |app, cx| {
+                                        app.export_conversation_transcript(false, window, cx)
+                                    });
+                                }),
+                        );
                 }
                 if let (Some(_), Some(channel)) = (&channel_name, channel.clone()) {
                     let this = this.clone();

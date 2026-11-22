@@ -326,6 +326,11 @@ pub enum Command {
         ts: Ts,
         date_due: Option<u64>,
     },
+    /// Save a file for Later (`saved.add` with `item_type=file`, `F-CORE-157`).
+    SaveFile {
+        file_id: String,
+        date_due: Option<u64>,
+    },
     /// Update a Later item's state (`mark`) and/or reminder due time (`date_due`, `Some(None)` clears).
     UpdateSavedItem {
         channel: ChannelId,

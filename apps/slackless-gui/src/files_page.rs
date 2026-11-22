@@ -190,6 +190,8 @@ enum Load {
 pub enum FilesPageEvent {
     /// Fetch a page's rows (`files.list`); the answer lands through [`FilesPage::land`].
     Load(FilesFilter),
+    /// Save a file for Later (`saved.add` with `item_type=file`, `F-CORE-157`).
+    SaveFile { file_id: String, name: String },
 }
 
 /// Client-side sort order over the loaded files page (`F-CORE-133`).
@@ -547,13 +549,20 @@ impl Render for FilesPage {
                 }
             }
         } else {
+            let this = cx.weak_entity();
             v_flex()
                 .rounded_lg()
                 .border_1()
                 .border_color(border)
                 .overflow_hidden()
                 .children(self.shown.iter().enumerate().map(|(position, &index)| {
-                    file_row(&rows.files[index], &rows.meta[index], position > 0, cx)
+                    file_row(
+                        &rows.files[index],
+                        &rows.meta[index],
+                        position > 0,
+                        this.clone(),
+                        cx,
+                    )
                 }))
                 .into_any_element()
         };
@@ -605,10 +614,33 @@ fn state_block(title: Option<&'static str>, line: &'static str, fg: Hsla, dim: H
 }
 
 /// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens the file's
-/// permalink in the browser (a file without one is a plain row).
-fn file_row(file: &File, meta: &SharedString, divided: bool, cx: &App) -> Stateful<Div> {
+/// permalink in the browser (a file without one is a plain row) and offers "Save for later"
+/// (`F-CORE-157`).
+fn file_row(
+    file: &File,
+    meta: &SharedString,
+    divided: bool,
+    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    cx: &App,
+) -> Stateful<Div> {
     let theme = cx.theme();
     let (icon, tile) = file_icon(file, cx);
+    let file_id = file.id.to_string();
+    let file_title = display_name(file).to_owned();
+    let save_btn = Button::new(SharedString::from(format!("files-save-{file_id}")))
+        .ghost()
+        .with_size(Size::XSmall)
+        .icon(IconName::Bookmark)
+        .tooltip("Save file for later")
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let _ = page.update(cx, |_, cx| {
+                cx.emit(FilesPageEvent::SaveFile {
+                    file_id: file_id.clone(),
+                    name: file_title.clone(),
+                });
+            });
+        });
     let row = h_flex()
         .id(SharedString::from(format!("files-row-{}", file.id)))
         .items_center()
@@ -648,7 +680,8 @@ fn file_row(file: &File, meta: &SharedString, divided: bool, cx: &App) -> Statef
                         .text_color(theme.muted_foreground)
                         .child(meta.clone()),
                 ),
-        );
+        )
+        .child(save_btn);
     let link = file
         .permalink
         .clone()

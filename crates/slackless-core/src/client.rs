@@ -1622,6 +1622,18 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SaveFile { file_id, date_due } => {
+                self.spawn("saved.add(file)", async move {
+                    match backend.save_file(file_id, date_due).await {
+                        Ok(()) => {}
+                        Err(ApiError::Slack(ref error))
+                            if error == "already_saved" || error == "already_exists" => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                    let loaded = load_saved_items(&backend, &events).await;
+                    answer_load(&events, loaded, Event::SavedLoaded)
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -3686,6 +3698,10 @@ pub(crate) mod tests {
             _tab_id: String,
             _after: Option<String>,
         ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn save_file(&self, _file_id: String, _date_due: Option<u64>) -> api::Result<()> {
             Ok(())
         }
     }

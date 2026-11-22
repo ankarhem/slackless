@@ -485,6 +485,12 @@ pub trait Backend: Clone + Send + Sync + 'static {
         tab_id: String,
         after: Option<String>,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Save a file for Later (`saved.add` with `item_type=file`, `F-CORE-157`).
+    fn save_file(
+        &self,
+        file_id: String,
+        date_due: Option<u64>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -1075,5 +1081,9 @@ impl Backend for SlackApi {
     ) -> api::Result<()> {
         self.conversations_move_tab(&channel, &tab_id, after.as_deref())
             .await
+    }
+
+    async fn save_file(&self, file_id: String, date_due: Option<u64>) -> api::Result<()> {
+        self.saved_add_file(&file_id, date_due).await
     }
 }

@@ -1047,6 +1047,41 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Archived thread roots (`reply_count > 0`, undeleted), newest first, optionally scoped
+    /// to a single `channel`.
+    pub fn recent_threads(
+        &self,
+        workspace: &TeamId,
+        channel: Option<&ChannelId>,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        match channel {
+            Some(ch) => {
+                let mut stmt = self.conn.prepare_cached(
+                    "SELECT channel_id, json, deleted FROM message_current
+                     WHERE workspace_id = ?1 AND channel_id = ?2 AND deleted = 0
+                       AND COALESCE(reply_count, 0) > 0
+                     ORDER BY ts_key DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(
+                    params![workspace.as_str(), ch.as_str(), limit as i64],
+                    raw_row,
+                )?;
+                collect(rows)
+            }
+            None => {
+                let mut stmt = self.conn.prepare_cached(
+                    "SELECT channel_id, json, deleted FROM message_current
+                     WHERE workspace_id = ?1 AND deleted = 0
+                       AND COALESCE(reply_count, 0) > 0
+                     ORDER BY ts_key DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![workspace.as_str(), limit as i64], raw_row)?;
+                collect(rows)
+            }
+        }
+    }
 }
 
 /// Appends ` AND (clause(v1) OR clause(v2) ...)`; `?1` in `clause` is the value placeholder.
@@ -2085,6 +2120,21 @@ mod tests {
         );
         store.clear_offline(&ws()).unwrap();
         assert!(store.list_offline(&ws()).unwrap().is_empty());
+
+        let mut thread_root = msg("1700000002.000100", "U1", "thread starter");
+        thread_root.reply_count = Some(3);
+        store
+            .upsert_message(&ws(), &general(), &thread_root)
+            .unwrap();
+        let threads = store.recent_threads(&ws(), None, 10).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].message.text, "thread starter");
+        assert!(
+            store
+                .recent_threads(&ws(), Some(&ChannelId::from("C9")), 10)
+                .unwrap()
+                .is_empty()
+        );
 
         store.vacuum().unwrap();
     }

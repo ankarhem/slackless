@@ -1858,7 +1858,8 @@ impl Render for Preferences {
         let nav = self.nav(cx);
         let title = self.section.label();
         h_flex()
-            .h(px(560.))
+            .h_full()
+            .min_h(px(560.))
             .w_full()
             .items_start()
             .child(nav)
@@ -1881,4 +1882,62 @@ impl Render for Preferences {
                     .child(body),
             )
     }
+}
+
+/// Standalone native OS window wrapper hosting [`Preferences`] (`F-CORE-011`) so theme,
+/// font, and layout changes can be previewed side-by-side with the main workspace window.
+struct PreferencesWindow {
+    preferences: Entity<Preferences>,
+}
+
+impl Render for PreferencesWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        v_flex()
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(38.))
+                    .pl(px(76.))
+                    .pr_4()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Preferences"),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().child(self.preferences.clone()))
+    }
+}
+
+/// Open Preferences in a standalone native GPUI window (`920 x 640`, `F-CORE-011`).
+pub fn open_preferences_window(
+    preferences: Entity<Preferences>,
+    cx: &mut gpui_kit::gpui::App,
+) -> Option<gpui_kit::gpui::AnyWindowHandle> {
+    use gpui_kit::component::TitleBar;
+    use gpui_kit::gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, size};
+    let bounds = Bounds::centered(None, size(px(920.), px(640.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(SharedString::from("Preferences")),
+            traffic_light_position: Some(point(px(8.), px(12.))),
+            ..TitleBar::title_bar_options()
+        }),
+        ..TitleBar::window_options()
+    };
+    gpui_kit::open_window(options, cx, move |window, cx| {
+        window.set_window_title("Preferences — slackless");
+        cx.new(|_| PreferencesWindow { preferences })
+    })
+    .ok()
+    .map(|(handle, _)| handle)
 }
