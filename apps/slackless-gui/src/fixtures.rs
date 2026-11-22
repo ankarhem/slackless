@@ -119,6 +119,8 @@ pub struct Fixtures {
     pub users: Vec<User>,
     /// Active `@handle` user groups (`usergroups.list`).
     pub usergroups: Vec<Usergroup>,
+    /// Workspace slash commands from `client.appCommands` (merged into `/` autocomplete).
+    pub app_commands: Vec<slackless_core::api::AppCommand>,
     pub channels: Vec<Conversation>,
     /// IMs and MPIMs.
     pub dms: Vec<Conversation>,
@@ -1094,6 +1096,7 @@ pub fn load() -> Fixtures {
         self_user: "U0ME".into(),
         users,
         usergroups,
+        app_commands: Vec::new(),
         channels,
         dms,
         messages,
@@ -1271,6 +1274,7 @@ pub fn live(
         self_user: session.user_id.clone(),
         users,
         usergroups: Vec::new(),
+        app_commands: Vec::new(),
         channels,
         dms,
         messages: HashMap::new(),

@@ -311,6 +311,42 @@ pub trait Backend: Clone + Send + Sync + 'static {
         query: String,
         limit: u32,
     ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send;
+    /// Saved-for-Later items (`saved.list`) under `filter` (`"saved"`, `"completed"`, `"archived"`).
+    fn saved_list(
+        &self,
+        filter: &'static str,
+    ) -> impl Future<Output = api::Result<Vec<api::SavedItem>>> + Send;
+    /// Save a message for Later (`saved.add`), optionally with a reminder (`date_due`).
+    fn saved_add(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        date_due: Option<u64>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Update a saved item's state (`mark`) and/or reminder (`date_due`).
+    fn saved_update(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        mark: Option<api::SavedMark>,
+        date_due: Option<Option<u64>>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Remove a message from Later (`saved.delete`).
+    fn saved_delete(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Clear all completed Later items (`saved.clearCompleted`).
+    fn saved_clear_completed(&self) -> impl Future<Output = api::Result<()>> + Send;
+    /// Workspace slash command catalog (`client.appCommands`).
+    fn app_commands(&self) -> impl Future<Output = api::Result<Vec<api::AppCommand>>> + Send;
+    /// Fast remote typeahead (`edgeapi` `users/search` + `channels/search`) for Cmd+K.
+    fn edge_search(
+        &self,
+        team_id: TeamId,
+        query: String,
+    ) -> impl Future<Output = api::Result<api::EdgeSearchResults>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -692,5 +728,55 @@ impl Backend for SlackApi {
 
     async fn gif_search(&self, query: String, limit: u32) -> api::Result<Vec<api::GifItem>> {
         SlackApi::gif_search(self, &query, limit).await
+    }
+
+    async fn saved_list(&self, filter: &'static str) -> api::Result<Vec<api::SavedItem>> {
+        SlackApi::saved_list(self, filter, 50).await
+    }
+
+    async fn saved_add(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        date_due: Option<u64>,
+    ) -> api::Result<()> {
+        SlackApi::saved_add(self, &channel, &ts, date_due).await
+    }
+
+    async fn saved_update(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        mark: Option<api::SavedMark>,
+        date_due: Option<Option<u64>>,
+    ) -> api::Result<()> {
+        SlackApi::saved_update(self, &channel, &ts, mark, date_due).await
+    }
+
+    async fn saved_delete(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
+        SlackApi::saved_delete(self, &channel, &ts).await
+    }
+
+    async fn saved_clear_completed(&self) -> api::Result<()> {
+        SlackApi::saved_clear_completed(self).await
+    }
+
+    async fn app_commands(&self) -> api::Result<Vec<api::AppCommand>> {
+        SlackApi::client_app_commands(self).await
+    }
+
+    async fn edge_search(
+        &self,
+        team_id: TeamId,
+        query: String,
+    ) -> api::Result<api::EdgeSearchResults> {
+        let (users, channels) = tokio::join!(
+            SlackApi::edge_users_search(self, &team_id, &query, 15),
+            SlackApi::edge_channels_search(self, &team_id, &query, 15),
+        );
+        Ok(api::EdgeSearchResults {
+            users: users.unwrap_or_default(),
+            channels: channels.unwrap_or_default(),
+        })
     }
 }

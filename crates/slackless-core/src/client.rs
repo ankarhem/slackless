@@ -463,12 +463,28 @@ impl<B: Backend> Core<B> {
                 self.events.emit(Event::Usergroups(active));
             }
         }
+        if let Ok(commands) = self.backend.app_commands().await {
+            if !commands.is_empty() {
+                self.events.emit(Event::AppCommands(commands));
+            }
+        }
         self.events.emit(Event::SidebarChanged);
         self.fetch_dm_previews();
         // The Activity badges need the feed's unread state; last, so the boot's own events
         // keep their order. The boot fetch skips the `messages.list` hydration (the view
         // asks for it with bodies when it opens).
         self.fetch_activity(false);
+        self.fetch_saved();
+    }
+
+    /// Later / Saved items (`saved.list` across active, completed, and archived tabs), hydrated
+    /// through `messages.list` so the Saved view and message markers stay synced across devices.
+    fn fetch_saved(&self) {
+        let (backend, events) = (self.backend.clone(), self.events.clone());
+        self.spawn("saved.list", async move {
+            let loaded = load_saved_items(&backend, &events).await;
+            answer_load(&events, loaded, Event::SavedLoaded)
+        });
     }
 
     /// The Activity feed (`activity.feed`): announces [`Event::ActivityView`] when it lands,
@@ -1027,6 +1043,73 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::LoadSaved => self.fetch_saved(),
+            Command::SaveItem {
+                channel,
+                ts,
+                date_due,
+            } => {
+                self.spawn("saved.add", async move {
+                    match backend
+                        .saved_add(channel.clone(), ts.clone(), date_due)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(ApiError::Slack(ref error))
+                            if error == "already_saved" || error == "already_exists" =>
+                        {
+                            if let Some(due) = date_due {
+                                backend
+                                    .saved_update(channel, ts, None, Some(Some(due)))
+                                    .await?;
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                    let loaded = load_saved_items(&backend, &events).await;
+                    answer_load(&events, loaded, Event::SavedLoaded)
+                });
+            }
+            Command::UpdateSavedItem {
+                channel,
+                ts,
+                mark,
+                date_due,
+            } => {
+                self.spawn("saved.update", async move {
+                    backend.saved_update(channel, ts, mark, date_due).await?;
+                    let loaded = load_saved_items(&backend, &events).await;
+                    answer_load(&events, loaded, Event::SavedLoaded)
+                });
+            }
+            Command::DeleteSavedItem { channel, ts } => {
+                self.spawn("saved.delete", async move {
+                    backend.saved_delete(channel, ts).await?;
+                    let loaded = load_saved_items(&backend, &events).await;
+                    answer_load(&events, loaded, Event::SavedLoaded)
+                });
+            }
+            Command::ClearCompletedSaved => {
+                self.spawn("saved.clearCompleted", async move {
+                    backend.saved_clear_completed().await?;
+                    let loaded = load_saved_items(&backend, &events).await;
+                    answer_load(&events, loaded, Event::SavedLoaded)
+                });
+            }
+            Command::QuickSwitchSearch { query } => {
+                self.spawn("edgeapi.search", async move {
+                    let trimmed = query.trim().to_owned();
+                    if trimmed.is_empty() {
+                        return Ok(());
+                    }
+                    let results = backend.edge_search(ws, trimmed).await?;
+                    events.emit(Event::QuickSwitchResults {
+                        query,
+                        results: Box::new(results),
+                    });
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -1055,6 +1138,26 @@ impl<B: Backend> Core<B> {
                 self.events.emit(Event::Connection(state));
             }
             RtmEvent::Event(mut event) => {
+                if let SlackEvent::Unknown { r#type, .. } = &event {
+                    if matches!(
+                        r#type.as_str(),
+                        "saved_added"
+                            | "saved_updated"
+                            | "saved_deleted"
+                            | "saved_clear"
+                            | "saved_due"
+                    ) {
+                        self.fetch_saved();
+                    } else if r#type == "commands_changed" {
+                        let (backend, events) = (self.backend.clone(), self.events.clone());
+                        self.spawn("client.appCommands", async move {
+                            if let Ok(commands) = backend.app_commands().await {
+                                events.emit(Event::AppCommands(commands));
+                            }
+                            Ok(())
+                        });
+                    }
+                }
                 if let Some(channel) = refresh_target(&event) {
                     self.refresh_conversation(channel);
                 }
@@ -1415,6 +1518,55 @@ async fn hydrate_activity<B: Backend>(
         }
         Err(e) => events.report("messages.list", e.into()),
     }
+}
+
+/// Fetch saved items across Slack's Later tabs (`saved`, `completed`, `archived`), deduplicate
+/// by `(channel, ts)`, and hydrate their message bodies through `messages.list`.
+async fn load_saved_items<B: Backend>(
+    backend: &B,
+    events: &Emitter,
+) -> Result<Vec<crate::api::SavedItem>, ApiError> {
+    let mut items = backend.saved_list("saved").await?;
+    for filter in ["completed", "archived"] {
+        if let Ok(extra) = backend.saved_list(filter).await {
+            for item in extra {
+                if !items
+                    .iter()
+                    .any(|existing| existing.channel == item.channel && existing.ts == item.ts)
+                {
+                    items.push(item);
+                }
+            }
+        }
+    }
+    let mut by_channel: Vec<(ChannelId, Vec<Ts>)> = Vec::new();
+    for item in &items {
+        if item.message.is_none() {
+            match by_channel
+                .iter_mut()
+                .find(|(channel, _)| *channel == item.channel)
+            {
+                Some((_, stamps)) => stamps.push(item.ts.clone()),
+                None => by_channel.push((item.channel.clone(), vec![item.ts.clone()])),
+            }
+        }
+    }
+    if !by_channel.is_empty() {
+        match backend.messages_list(by_channel).await {
+            Ok(bodies) => {
+                for item in &mut items {
+                    if item.message.is_none() {
+                        item.message = bodies
+                            .get(&item.channel)
+                            .and_then(|messages| messages.iter().find(|m| m.ts == item.ts))
+                            .cloned();
+                    }
+                }
+            }
+            Err(e) => events.report("messages.list", e.into()),
+        }
+    }
+    Ok(items)
 }
 
 /// Answers a lazy tab load with its data, or with the error text the tab shows instead of
@@ -2584,6 +2736,49 @@ pub(crate) mod tests {
         async fn gif_search(&self, _query: String, _limit: u32) -> api::Result<Vec<api::GifItem>> {
             Ok(Vec::new())
         }
+
+        async fn saved_list(&self, _filter: &'static str) -> api::Result<Vec<api::SavedItem>> {
+            Ok(Vec::new())
+        }
+
+        async fn saved_add(
+            &self,
+            _channel: ChannelId,
+            _ts: Ts,
+            _date_due: Option<u64>,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn saved_update(
+            &self,
+            _channel: ChannelId,
+            _ts: Ts,
+            _mark: Option<api::SavedMark>,
+            _date_due: Option<Option<u64>>,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn saved_delete(&self, _channel: ChannelId, _ts: Ts) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn saved_clear_completed(&self) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn app_commands(&self) -> api::Result<Vec<api::AppCommand>> {
+            Ok(Vec::new())
+        }
+
+        async fn edge_search(
+            &self,
+            _team_id: TeamId,
+            _query: String,
+        ) -> api::Result<api::EdgeSearchResults> {
+            Ok(api::EdgeSearchResults::default())
+        }
     }
 
     pub(crate) fn fake_core_parts() -> (SharedStore, Emitter, UnboundedReceiver<Event>) {
@@ -3411,7 +3606,9 @@ pub(crate) mod tests {
                 | Event::UsersChanged(_)
                 | Event::Counts(_)
                 | Event::SidebarChanged
-                | Event::ActivityView { .. } => {}
+                | Event::ActivityView { .. }
+                | Event::SavedLoaded(_)
+                | Event::AppCommands(_) => {}
                 other => panic!("unexpected hydrate event: {other:?}"),
             }
         }
@@ -3514,7 +3711,9 @@ pub(crate) mod tests {
                 | Event::UsersChanged(_)
                 | Event::Counts(_)
                 | Event::SidebarChanged
-                | Event::ActivityView { .. } => {}
+                | Event::ActivityView { .. }
+                | Event::SavedLoaded(_)
+                | Event::AppCommands(_) => {}
                 other => panic!("unexpected hydrate event: {other:?}"),
             }
         }
@@ -3607,7 +3806,11 @@ pub(crate) mod tests {
                 match next(rx).await {
                     Event::SidebarChanged => break conversations,
                     Event::Conversations(ids) => conversations.extend(ids),
-                    Event::UsersChanged(_) | Event::Counts(_) | Event::ActivityView { .. } => {}
+                    Event::UsersChanged(_)
+                    | Event::Counts(_)
+                    | Event::ActivityView { .. }
+                    | Event::SavedLoaded(_)
+                    | Event::AppCommands(_) => {}
                     other => panic!("unexpected hydrate event: {other:?}"),
                 }
             }

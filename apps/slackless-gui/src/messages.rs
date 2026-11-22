@@ -1001,6 +1001,13 @@ impl MessageList {
         self.refresh(cx);
     }
 
+    pub fn replace_saved(&mut self, saved: HashSet<Ts>, cx: &mut Context<Self>) {
+        self.data.update(cx, |data, _| {
+            data.saved = saved;
+        });
+        self.refresh(cx);
+    }
+
     /// Tint the root of the thread open beside the list (`None`: no thread is open).
     pub fn set_open_thread(&mut self, root: Option<Ts>, cx: &mut Context<Self>) {
         if self.data.read(cx).open_thread != root {

@@ -294,6 +294,10 @@ impl CoreBridge {
         self.store.as_ref()
     }
 
+    pub fn team_id(&self) -> Option<&slackless_core::types::TeamId> {
+        self.session.as_ref().map(|s| &s.team_id)
+    }
+
     /// The conversation last open in this workspace, restored at launch like Slack. `None`
     /// offline or before the first one.
     pub fn last_conversation(&self) -> Option<ChannelId> {

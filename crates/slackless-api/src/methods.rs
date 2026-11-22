@@ -2392,6 +2392,358 @@ impl SlackApi {
             .await?;
         Ok(parse_gif_list(resp.data))
     }
+
+    /// `saved.list`: items saved for Later under `filter` (`"saved"`, `"completed"`, `"archived"`).
+    pub async fn saved_list(&self, filter: &str, limit: u32) -> Result<Vec<SavedItem>> {
+        let resp: ApiResponse<SavedListWire> = self
+            .call(
+                method::SAVED_LIST,
+                vec![
+                    ("filter", filter.to_owned()),
+                    ("limit", limit.to_string()),
+                    ("include_tombstones", "true".to_owned()),
+                    ("_x_reason", "saved-api/savedList".to_owned()),
+                    ("_x_mode", MODE_ONLINE.to_owned()),
+                ],
+            )
+            .await?;
+        Ok(parse_saved_list(resp.data, filter))
+    }
+
+    /// `saved.add`: save a message for Later, optionally with a reminder due time (unix seconds).
+    pub async fn saved_add(
+        &self,
+        channel: &ChannelId,
+        ts: &Ts,
+        date_due: Option<u64>,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("item_type", "message".to_owned()),
+            ("item_id", channel.to_string()),
+            ("ts", ts.to_string()),
+            ("_x_reason", "saved-api/addSavedMessage".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(due) = date_due {
+            params.push(("date_due", due.to_string()));
+        }
+        self.call::<Empty>(method::SAVED_ADD, params).await?;
+        Ok(())
+    }
+
+    /// `saved.update`: transition a saved item's state (`mark`) and/or update or clear (`Some(None)`)
+    /// its reminder due time (`date_due`).
+    pub async fn saved_update(
+        &self,
+        channel: &ChannelId,
+        ts: &Ts,
+        mark: Option<SavedMark>,
+        date_due: Option<Option<u64>>,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("item_type", "message".to_owned()),
+            ("item_id", channel.to_string()),
+            ("ts", ts.to_string()),
+            ("_x_reason", "saved-api/updateSavedMessage".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(mark) = mark {
+            params.push(("mark", mark.as_str().to_owned()));
+        }
+        if let Some(due) = date_due {
+            params.push(("date_due", due.unwrap_or(0).to_string()));
+        }
+        self.call::<Empty>(method::SAVED_UPDATE, params).await?;
+        Ok(())
+    }
+
+    /// `saved.delete`: remove a message from Later.
+    pub async fn saved_delete(&self, channel: &ChannelId, ts: &Ts) -> Result<()> {
+        let params = vec![
+            ("item_type", "message".to_owned()),
+            ("item_id", channel.to_string()),
+            ("ts", ts.to_string()),
+            ("_x_reason", "saved-api/deleteSavedMessage".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::SAVED_DELETE, params).await?;
+        Ok(())
+    }
+
+    /// `saved.clearCompleted`: clear all completed Later items.
+    pub async fn saved_clear_completed(&self) -> Result<()> {
+        let params = vec![
+            ("_x_reason", "manually_marked_all_completed".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::SAVED_CLEAR_COMPLETED, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `client.appCommands`: workspace slash command catalog (`core`, `app`, `service`).
+    pub async fn client_app_commands(&self) -> Result<Vec<AppCommand>> {
+        let params = vec![
+            ("_x_reason", "dispatch-client-extras".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let resp: ApiResponse<AppCommandsWire> =
+            self.call(method::CLIENT_APP_COMMANDS, params).await?;
+        Ok(parse_app_commands(resp.data))
+    }
+
+    /// Edge API `users/search`: fast typeahead lookup across workspace & org people for Cmd+K.
+    pub async fn edge_users_search(
+        &self,
+        team_id: &TeamId,
+        query: &str,
+        count: u32,
+    ) -> Result<Vec<User>> {
+        let payload = serde_json::json!({
+            "query": query,
+            "count": count,
+            "fuzz": 1,
+            "include_profile_only_users": true,
+            "enable_workspace_ranking": true,
+            "search_email": true,
+            "filter": "NOT deactivated",
+            "default_workspace": team_id.as_str(),
+        });
+        let resp: ApiResponse<EdgeUsersWire> = self
+            .call_edge_json(team_id.as_str(), "users/search", payload)
+            .await?;
+        Ok(resp.data.results)
+    }
+
+    /// Edge API `channels/search`: fast typeahead lookup across joined and unjoined channels for Cmd+K.
+    pub async fn edge_channels_search(
+        &self,
+        team_id: &TeamId,
+        query: &str,
+        count: u32,
+    ) -> Result<Vec<Conversation>> {
+        let payload = serde_json::json!({
+            "query": query,
+            "count": count,
+            "fuzz": 1,
+            "filter": "xws",
+            "include_record_channels": false,
+            "check_membership": true,
+            "default_workspace": team_id.as_str(),
+        });
+        let resp: ApiResponse<EdgeChannelsWire> = self
+            .call_edge_json(team_id.as_str(), "channels/search", payload)
+            .await?;
+        let members: std::collections::HashSet<&ChannelId> =
+            resp.data.member_channels.iter().collect();
+        let mut results = resp.data.results;
+        for ch in &mut results {
+            if members.contains(&ch.id) {
+                ch.is_member = true;
+            }
+        }
+        Ok(results)
+    }
+}
+
+/// One workspace slash command returned by `client.appCommands` (`core`, `app`, or `service`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppCommand {
+    /// Name without leading `/`, lowercased (e.g. `"jira"`, `"linear"`, `"giphy"`).
+    pub name: String,
+    /// Argument hint (e.g. `"[issue key]"`).
+    pub usage: String,
+    /// Description shown below the command in `/` autocomplete.
+    pub description: String,
+    /// Owning app or service name (e.g. `"Jira Cloud"`, `"Giphy"`).
+    pub app_name: Option<String>,
+    /// Owning app id (`A...`) for app-provided commands.
+    pub app_id: Option<String>,
+}
+
+/// Combined remote results for the Cmd+K quick switcher (`edgeapi` `users/search` + `channels/search`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EdgeSearchResults {
+    pub users: Vec<User>,
+    pub channels: Vec<Conversation>,
+}
+
+#[derive(Deserialize)]
+struct WireAppCommand {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    usage: String,
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    app_name: Option<String>,
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    alias_of: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct AppCommandsWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    commands: Vec<WireAppCommand>,
+}
+
+fn parse_app_commands(wire: AppCommandsWire) -> Vec<AppCommand> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for cmd in wire.commands {
+        let name = cmd.name.trim().trim_start_matches('/').to_lowercase();
+        if name.is_empty() || !seen.insert(name.clone()) {
+            continue;
+        }
+        let app_name = cmd
+            .app_name
+            .filter(|s| !s.is_empty())
+            .or_else(|| cmd.service_name.filter(|s| !s.is_empty()));
+        let description = if !cmd.desc.trim().is_empty() {
+            cmd.desc.trim().to_owned()
+        } else if let Some(alias) = cmd.alias_of.filter(|s| !s.is_empty()) {
+            format!("Alias for {alias}")
+        } else {
+            String::new()
+        };
+        out.push(AppCommand {
+            name,
+            usage: cmd.usage.trim().to_owned(),
+            description,
+            app_name,
+            app_id: cmd.app.filter(|s| !s.is_empty()),
+        });
+    }
+    out
+}
+
+#[derive(Deserialize, Default)]
+struct EdgeUsersWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    results: Vec<User>,
+}
+
+#[derive(Deserialize, Default)]
+struct EdgeChannelsWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    results: Vec<Conversation>,
+    #[serde(default, deserialize_with = "or_default")]
+    member_channels: Vec<ChannelId>,
+}
+
+/// Which tab of Slack's Later / Saved view an item belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedItemState {
+    InProgress,
+    Archived,
+    Completed,
+}
+
+/// State transition sent to `saved.update`'s `mark` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedMark {
+    Completed,
+    Uncompleted,
+    Archived,
+    Unarchived,
+}
+
+impl SavedMark {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SavedMark::Completed => "completed",
+            SavedMark::Uncompleted => "uncompleted",
+            SavedMark::Archived => "archived",
+            SavedMark::Unarchived => "unarchived",
+        }
+    }
+}
+
+/// One saved message returned by `saved.list` (and hydrated via `messages.list`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedItem {
+    /// Channel ID (`item_id` on the wire).
+    pub channel: ChannelId,
+    /// Message timestamp (`ts`).
+    pub ts: Ts,
+    pub state: SavedItemState,
+    /// Reminder due time in unix seconds (`None` when unset / `0`).
+    pub date_due: Option<u64>,
+    /// Creation timestamp in unix seconds.
+    pub date_created: Option<u64>,
+    /// Message body once hydrated via `messages.list`.
+    pub message: Option<Message>,
+}
+
+#[derive(Deserialize)]
+struct WireSavedItem {
+    #[serde(default)]
+    item_id: String,
+    #[serde(default)]
+    item_type: String,
+    #[serde(default)]
+    ts: String,
+    #[serde(default)]
+    date_created: u64,
+    #[serde(default)]
+    date_due: u64,
+    #[serde(default)]
+    date_completed: u64,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    is_archived: bool,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    todo_state: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SavedListWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    saved_items: Vec<WireSavedItem>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    items: Vec<WireSavedItem>,
+}
+
+fn parse_saved_list(wire: SavedListWire, filter: &str) -> Vec<SavedItem> {
+    let raw = if !wire.saved_items.is_empty() {
+        wire.saved_items
+    } else {
+        wire.items
+    };
+    raw.into_iter()
+        .filter(|item| {
+            (item.item_type.is_empty() || item.item_type == "message")
+                && !item.item_id.is_empty()
+                && !item.ts.is_empty()
+        })
+        .map(|item| {
+            let state = if item.is_archived || item.state == "archived" || filter == "archived" {
+                SavedItemState::Archived
+            } else if item.date_completed > 0
+                || item.todo_state == "completed"
+                || item.state == "completed"
+                || filter == "completed"
+            {
+                SavedItemState::Completed
+            } else {
+                SavedItemState::InProgress
+            };
+            SavedItem {
+                channel: ChannelId::from(item.item_id.as_str()),
+                ts: Ts::new(item.ts),
+                state,
+                date_due: (item.date_due > 0).then_some(item.date_due),
+                date_created: (item.date_created > 0).then_some(item.date_created),
+                message: None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2809,5 +3161,87 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn parses_saved_list_wire_payload() {
+        let wire: SavedListWire = serde_json::from_value(serde_json::json!({
+            "saved_items": [
+                {
+                    "item_id": "C01",
+                    "item_type": "message",
+                    "ts": "1700000001.000100",
+                    "date_created": 1700000010,
+                    "date_due": 1700003600,
+                    "date_completed": 0,
+                    "is_archived": false,
+                    "todo_state": "to_do"
+                },
+                {
+                    "item_id": "C02",
+                    "item_type": "message",
+                    "ts": "1700000002.000200",
+                    "date_completed": 1700001000,
+                    "is_archived": false,
+                    "todo_state": "completed"
+                },
+                {
+                    "item_id": "C03",
+                    "item_type": "message",
+                    "ts": "1700000003.000300",
+                    "is_archived": true
+                },
+                {
+                    "item_id": "F04",
+                    "item_type": "file",
+                    "ts": ""
+                }
+            ]
+        }))
+        .unwrap();
+        let parsed = parse_saved_list(wire, "saved");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].channel.as_str(), "C01");
+        assert_eq!(parsed[0].state, SavedItemState::InProgress);
+        assert_eq!(parsed[0].date_due, Some(1700003600));
+        assert_eq!(parsed[1].state, SavedItemState::Completed);
+        assert_eq!(parsed[1].date_due, None);
+        assert_eq!(parsed[2].state, SavedItemState::Archived);
+    }
+
+    #[test]
+    fn parses_client_app_commands_wire_payload() {
+        let wire: AppCommandsWire = serde_json::from_value(serde_json::json!({
+            "commands": [
+                {
+                    "name": "/linear",
+                    "type": "app",
+                    "app": "AEMQ3Q4F4",
+                    "app_name": "Linear",
+                    "desc": "Create new issue on Linear",
+                    "usage": "issue title (optional) "
+                },
+                {
+                    "name": "/giphy",
+                    "type": "service",
+                    "service_name": "Giphy",
+                    "desc": "Post a random gif to channel",
+                    "usage": "[text]"
+                },
+                {
+                    "name": "/dm",
+                    "alias_of": "/msg",
+                    "type": "core"
+                }
+            ]
+        }))
+        .unwrap();
+        let parsed = parse_app_commands(wire);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "linear");
+        assert_eq!(parsed[0].app_name.as_deref(), Some("Linear"));
+        assert_eq!(parsed[0].usage, "issue title (optional)");
+        assert_eq!(parsed[1].app_name.as_deref(), Some("Giphy"));
+        assert_eq!(parsed[2].description, "Alias for /msg");
     }
 }

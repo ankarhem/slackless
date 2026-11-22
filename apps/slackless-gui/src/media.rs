@@ -4,11 +4,13 @@
 //! so the app keeps a single HTTP stack. Images that may animate (GIFs, animated custom emoji)
 //! render as a [`Picture`].
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::{Child, Command as ProcessCommand};
 use std::time::{Duration, Instant};
 
 use gpui_kit::gpui::http_client::http::HeaderValue;
@@ -65,8 +67,74 @@ pub fn fetch(
     Some(cx.try_global::<Downloader>()?.0.get(url))
 }
 
-/// Download `url` into ~/Downloads as `name` (`name (1).png` when that is taken), then say
-/// where it went. Fixture mode has nothing to fetch with and says so.
+/// Status of one file download initiated in this session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadStatus {
+    InProgress,
+    Completed(PathBuf),
+    Failed(String),
+}
+
+/// One entry in the in-app Downloads list (`Cmd+Shift+J`).
+#[derive(Clone, Debug)]
+pub struct DownloadRecord {
+    pub id: usize,
+    pub name: String,
+    pub url: String,
+    pub bytes: Option<usize>,
+    pub status: DownloadStatus,
+}
+
+#[derive(Default)]
+struct DownloadRegistry {
+    next_id: usize,
+    items: Vec<DownloadRecord>,
+}
+
+impl Global for DownloadRegistry {}
+
+/// All downloads recorded in this session, newest first.
+pub fn downloads(cx: &App) -> Vec<DownloadRecord> {
+    cx.try_global::<DownloadRegistry>()
+        .map(|reg| reg.items.iter().rev().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Remove completed and failed entries from the in-app Downloads list.
+pub fn clear_finished_downloads(cx: &mut App) {
+    let reg = cx.default_global::<DownloadRegistry>();
+    reg.items
+        .retain(|item| matches!(item.status, DownloadStatus::InProgress));
+}
+
+/// Reveal `path` in Finder (macOS) or its parent folder.
+pub fn reveal_in_finder(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ProcessCommand::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(parent) = path.parent() {
+            let _ = ProcessCommand::new("xdg-open").arg(parent).spawn();
+        }
+    }
+}
+
+/// Open `path` with the OS default application.
+pub fn open_local_file(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = ProcessCommand::new("open").arg(path).spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ProcessCommand::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// Download `url` into ~/Downloads as `name` (`name (1).png` when that is taken), track it in
+/// the in-app Downloads list, and notify when it finishes.
 pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
     let Some(fetcher) = cx.try_global::<Downloader>().map(|d| d.0.clone()) else {
         crate::actions::notify(
@@ -77,24 +145,354 @@ pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
         );
         return;
     };
+    let id = {
+        let reg = cx.default_global::<DownloadRegistry>();
+        reg.next_id += 1;
+        let id = reg.next_id;
+        reg.items.push(DownloadRecord {
+            id,
+            name: name.clone(),
+            url: url.clone(),
+            bytes: None,
+            status: DownloadStatus::InProgress,
+        });
+        id
+    };
+    window.refresh();
     let bytes = fetcher.get(url);
     window
         .spawn(cx, async move |cx| {
             let saved = match bytes.await {
                 Ok(bytes) => {
+                    let len = bytes.len();
                     cx.background_executor()
-                        .spawn(async move { save_download(&name, &bytes) })
+                        .spawn(async move { save_download(&name, &bytes).map(|p| (p, len)) })
                         .await
                 }
                 Err(e) => Err(e),
             };
-            cx.update(|window, cx| match saved {
-                Ok(path) => {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let message = format!("{name} is in your Downloads folder.");
-                    crate::actions::notify("Downloaded", message, window, cx);
+            cx.update(|window, cx| {
+                let reg = cx.default_global::<DownloadRegistry>();
+                match saved {
+                    Ok((path, len)) => {
+                        if let Some(item) = reg.items.iter_mut().find(|i| i.id == id) {
+                            item.bytes = Some(len);
+                            item.status = DownloadStatus::Completed(path.clone());
+                        }
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let message = format!("{name} is in your Downloads folder.");
+                        crate::actions::notify("Downloaded", message, window, cx);
+                    }
+                    Err(e) => {
+                        if let Some(item) = reg.items.iter_mut().find(|i| i.id == id) {
+                            item.status = DownloadStatus::Failed(e.clone());
+                        }
+                        crate::actions::notify("Download failed", e, window, cx);
+                    }
                 }
-                Err(e) => crate::actions::notify("Download failed", e, window, cx),
+                window.refresh();
+            })
+            .ok();
+        })
+        .detach();
+}
+
+/// Snapshot of an audio file's inline playback state.
+#[derive(Clone, Debug)]
+pub struct AudioSnapshot {
+    pub loading: bool,
+    pub playing: bool,
+    pub elapsed_ms: u64,
+    pub duration_ms: Option<u64>,
+}
+
+struct ActiveAudio {
+    file_id: String,
+    child: Option<Child>,
+    started: Option<Instant>,
+    duration_ms: Option<u64>,
+    loading: bool,
+}
+
+#[derive(Default)]
+struct MediaPlayer {
+    audio: Option<ActiveAudio>,
+    loading_videos: HashSet<String>,
+}
+
+impl Drop for MediaPlayer {
+    fn drop(&mut self) {
+        if let Some(active) = self.audio.as_mut() {
+            if let Some(child) = active.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Global for MediaPlayer {}
+
+/// Current inline playback state for `file_id`, if it is loading or playing.
+pub fn audio_state(file_id: &str, cx: &App) -> Option<AudioSnapshot> {
+    let active = cx.try_global::<MediaPlayer>()?.audio.as_ref()?;
+    if active.file_id != file_id {
+        return None;
+    }
+    let elapsed_ms = active
+        .started
+        .map(|s| s.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    Some(AudioSnapshot {
+        loading: active.loading,
+        playing: active.child.is_some(),
+        elapsed_ms,
+        duration_ms: active.duration_ms,
+    })
+}
+
+/// Whether `file_id` is currently buffering for video playback.
+pub fn video_loading(file_id: &str, cx: &App) -> bool {
+    cx.try_global::<MediaPlayer>()
+        .is_some_and(|p| p.loading_videos.contains(file_id))
+}
+
+fn stop_active_audio(player: &mut MediaPlayer) {
+    if let Some(mut active) = player.audio.take() {
+        if let Some(mut child) = active.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn media_cache_path(file_id: &str, ext: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("slackless-media");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let safe_id: String = file_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let safe_ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let filename = if safe_ext.is_empty() {
+        safe_id
+    } else {
+        format!("{safe_id}.{safe_ext}")
+    };
+    Ok(dir.join(filename))
+}
+
+/// Toggle inline playback of a Slack-hosted audio clip or file. Downloads authenticated bytes
+/// into `$TMPDIR/slackless-media/` once and plays via macOS `afplay` with live progress ticks.
+pub fn toggle_audio(
+    file_id: String,
+    url: String,
+    ext: String,
+    duration_ms: Option<u64>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let already_playing = cx
+        .try_global::<MediaPlayer>()
+        .and_then(|p| p.audio.as_ref())
+        .is_some_and(|active| active.file_id == file_id);
+    if already_playing {
+        stop_active_audio(cx.default_global::<MediaPlayer>());
+        window.refresh();
+        return;
+    }
+    stop_active_audio(cx.default_global::<MediaPlayer>());
+    let Some(fetcher) = cx.try_global::<Downloader>().map(|d| d.0.clone()) else {
+        crate::actions::notify(
+            "Audio playback",
+            "Playback needs a signed-in workspace.",
+            window,
+            cx,
+        );
+        return;
+    };
+    cx.default_global::<MediaPlayer>().audio = Some(ActiveAudio {
+        file_id: file_id.clone(),
+        child: None,
+        started: None,
+        duration_ms,
+        loading: true,
+    });
+    window.refresh();
+    let cache_id = file_id.clone();
+    window
+        .spawn(cx, async move |cx| {
+            let cached = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = media_cache_path(&cache_id, &ext)?;
+                    Ok::<(PathBuf, bool), String>((path.clone(), path.is_file()))
+                })
+                .await;
+            let path = match cached {
+                Ok((path, true)) => Ok(path),
+                Ok((path, false)) => match fetcher.get(url).await {
+                    Ok(bytes) => {
+                        let write_path = path.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                std::fs::write(&write_path, &bytes).map_err(|e| e.to_string())?;
+                                Ok::<PathBuf, String>(write_path)
+                            })
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            let launched = cx
+                .update(|window, cx| {
+                    let player = cx.default_global::<MediaPlayer>();
+                    if player
+                        .audio
+                        .as_ref()
+                        .is_none_or(|active| active.file_id != file_id)
+                    {
+                        return false;
+                    }
+                    match path {
+                        Ok(path) => {
+                            let spawn_res = {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    ProcessCommand::new("/usr/bin/afplay").arg(&path).spawn()
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    ProcessCommand::new("ffplay")
+                                        .args(["-nodisp", "-autoexit"])
+                                        .arg(&path)
+                                        .spawn()
+                                }
+                            };
+                            match spawn_res {
+                                Ok(child) => {
+                                    if let Some(active) = player.audio.as_mut() {
+                                        active.loading = false;
+                                        active.child = Some(child);
+                                        active.started = Some(Instant::now());
+                                    }
+                                    window.refresh();
+                                    true
+                                }
+                                Err(e) => {
+                                    player.audio = None;
+                                    crate::actions::notify(
+                                        "Audio playback failed",
+                                        e.to_string(),
+                                        window,
+                                        cx,
+                                    );
+                                    window.refresh();
+                                    false
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            player.audio = None;
+                            crate::actions::notify("Audio playback failed", e, window, cx);
+                            window.refresh();
+                            false
+                        }
+                    }
+                })
+                .unwrap_or(false);
+            if !launched {
+                return;
+            }
+            // Poll playback progress at 4 Hz while audio plays and clean up once finished.
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let keep_going = cx
+                    .update(|window, cx| {
+                        let player = cx.default_global::<MediaPlayer>();
+                        let Some(active) = player.audio.as_mut() else {
+                            return false;
+                        };
+                        if active.file_id != file_id {
+                            return false;
+                        }
+                        let done = active
+                            .child
+                            .as_mut()
+                            .is_none_or(|c| matches!(c.try_wait(), Ok(Some(_)) | Err(_)));
+                        if done {
+                            player.audio = None;
+                            window.refresh();
+                            false
+                        } else {
+                            window.refresh();
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+}
+
+/// Fetch a Slack-hosted video clip (authenticated, cached in `$TMPDIR/slackless-media/`) and
+/// play it with native hardware-accelerated QuickLook / QuickTime playback.
+pub fn play_video(file_id: String, url: String, ext: String, window: &mut Window, cx: &mut App) {
+    let Some(fetcher) = cx.try_global::<Downloader>().map(|d| d.0.clone()) else {
+        crate::actions::notify(
+            "Video playback",
+            "Playback needs a signed-in workspace.",
+            window,
+            cx,
+        );
+        return;
+    };
+    let player = cx.default_global::<MediaPlayer>();
+    if !player.loading_videos.insert(file_id.clone()) {
+        return;
+    }
+    window.refresh();
+    let cache_id = file_id.clone();
+    window
+        .spawn(cx, async move |cx| {
+            let cached = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = media_cache_path(&cache_id, &ext)?;
+                    Ok::<(PathBuf, bool), String>((path.clone(), path.is_file()))
+                })
+                .await;
+            let path = match cached {
+                Ok((path, true)) => Ok(path),
+                Ok((path, false)) => match fetcher.get(url).await {
+                    Ok(bytes) => {
+                        let write_path = path.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                std::fs::write(&write_path, &bytes).map_err(|e| e.to_string())?;
+                                Ok::<PathBuf, String>(write_path)
+                            })
+                            .await
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            cx.update(|window, cx| {
+                cx.default_global::<MediaPlayer>()
+                    .loading_videos
+                    .remove(&file_id);
+                match path {
+                    Ok(path) => open_local_file(&path),
+                    Err(e) => crate::actions::notify("Video playback failed", e, window, cx),
+                }
+                window.refresh();
             })
             .ok();
         })

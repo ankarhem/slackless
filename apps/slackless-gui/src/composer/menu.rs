@@ -12,10 +12,18 @@ use slackless_core::types::{ChannelId, UserId, UsergroupId};
 use super::Composer;
 use crate::editor::{Atom, Directory as _, Editor, Lookup, rank, trigger};
 use crate::fixtures::Fixtures;
-use crate::slash::{self, SlashCommand};
+use crate::slash;
 
 /// Entries shown at most, as in Slack's menus.
 const LIMIT: usize = 8;
+
+/// One slash command shown in the `/` completion menu (built-in or workspace app command).
+pub(super) struct SlashEntry {
+    pub name: String,
+    pub usage: String,
+    pub description: String,
+    pub app_name: Option<String>,
+}
 
 pub(super) enum Entry {
     User(UserId),
@@ -24,7 +32,7 @@ pub(super) enum Entry {
     Channel(ChannelId),
     /// A shortcode without colons.
     Emoji(String),
-    Slash(&'static SlashCommand),
+    Slash(SlashEntry),
 }
 
 pub(super) struct Menu {
@@ -43,10 +51,7 @@ impl Menu {
         }
         let doc = editor.doc();
         let (range, entries) = match slash::typing(doc.text()) {
-            Some(name) => {
-                let commands = slash::matches(name).into_iter().map(Entry::Slash);
-                (0..doc.text().len(), commands.collect())
-            }
+            Some(name) => (0..doc.text().len(), slash_commands(fixtures, name)),
             None => {
                 let found = trigger(doc, selection.start)?;
                 let query = found.query.to_lowercase();
@@ -77,9 +82,61 @@ impl Menu {
     pub fn is_typed_command(&self, typed: &str) -> bool {
         matches!(
             self.entries.get(self.selected),
-            Some(Entry::Slash(command)) if slash::typing(typed) == Some(command.name)
+            Some(Entry::Slash(command)) if slash::typing(typed).is_some_and(|t| t.eq_ignore_ascii_case(&command.name))
         )
     }
+}
+
+/// Built-in commands merged with the workspace's `client.appCommands`, prefix matches ahead of
+/// substring matches and deduplicated by name.
+fn slash_commands(fixtures: &Fixtures, query: &str) -> Vec<Entry> {
+    let query = query.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut found: Vec<(u8, String, SlashEntry)> = Vec::new();
+    for cmd in &slash::BUILTINS {
+        if let Some(score) = rank(cmd.name, &query) {
+            seen.insert(cmd.name.to_owned());
+            found.push((
+                score,
+                cmd.name.to_owned(),
+                SlashEntry {
+                    name: cmd.name.to_owned(),
+                    usage: cmd.usage.to_owned(),
+                    description: cmd.description.to_owned(),
+                    app_name: None,
+                },
+            ));
+        }
+    }
+    for cmd in &fixtures.app_commands {
+        if seen.contains(&cmd.name) {
+            continue;
+        }
+        let score = [Some(cmd.name.as_str()), cmd.app_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|field| rank(field, &query))
+            .min();
+        if let Some(score) = score {
+            seen.insert(cmd.name.clone());
+            found.push((
+                score,
+                cmd.name.clone(),
+                SlashEntry {
+                    name: cmd.name.clone(),
+                    usage: cmd.usage.clone(),
+                    description: cmd.description.clone(),
+                    app_name: cmd.app_name.clone(),
+                },
+            ));
+        }
+    }
+    found.sort_unstable_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    found.truncate(LIMIT);
+    found
+        .into_iter()
+        .map(|(_, _, entry)| Entry::Slash(entry))
+        .collect()
 }
 
 /// The best of `found`: each candidate is its [`rank`], the name ties are ordered by, and

@@ -125,15 +125,6 @@ pub fn typing(draft: &str) -> Option<&str> {
     (!name.contains(char::is_whitespace)).then_some(name)
 }
 
-/// Built-ins whose name starts with `query` (case-insensitive), in menu order.
-pub fn matches(query: &str) -> Vec<&'static SlashCommand> {
-    let query = query.to_lowercase();
-    BUILTINS
-        .iter()
-        .filter(|c| c.name.starts_with(&query))
-        .collect()
-}
-
 /// Parse a sent draft. `None` when it is not a command (no leading `/`, or `/` followed by
 /// something that is not a command name, like a path).
 pub fn parse(text: &str) -> Option<Invocation> {

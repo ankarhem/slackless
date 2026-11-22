@@ -25,6 +25,7 @@ use gpui_kit::gpui::{
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Window, div, px,
 };
+use slackless_core::api::SavedMark;
 use slackless_core::types::{ChannelId, Ts};
 
 use crate::drafts::{now_secs, when_label};
@@ -124,10 +125,24 @@ pub enum LaterEvent {
         channel: ChannelId,
         ts: Ts,
     },
-    /// An item was removed from Later; message views drop their saved marker.
+    /// An item was removed from Later; message views drop their saved marker and live mode
+    /// calls `saved.delete`.
     Unsaved {
         workspace: usize,
+        channel: ChannelId,
         ts: Ts,
+    },
+    /// State or reminder changed on a Later item; live mode calls `saved.update`.
+    Update {
+        workspace: usize,
+        channel: ChannelId,
+        ts: Ts,
+        mark: Option<SavedMark>,
+        date_due: Option<Option<u64>>,
+    },
+    /// Clear all completed items; live mode calls `saved.clearCompleted`.
+    ClearCompleted {
+        workspace: usize,
     },
     /// Counts changed (the sidebar's Later row).
     Changed,
@@ -135,6 +150,7 @@ pub enum LaterEvent {
 }
 
 pub struct LaterView {
+    workspace: usize,
     tab: LaterState,
     items: Vec<LaterItem>,
     /// Workspaces already seeded from fixtures.
@@ -146,10 +162,48 @@ impl EventEmitter<LaterEvent> for LaterView {}
 impl LaterView {
     pub fn new(cx: &mut App) -> Entity<LaterView> {
         cx.new(|_| LaterView {
+            workspace: 0,
             tab: LaterState::InProgress,
             items: Vec::new(),
             seeded: HashSet::new(),
         })
+    }
+
+    pub fn set_workspace(&mut self, workspace: usize, cx: &mut Context<Self>) {
+        if self.workspace != workspace {
+            self.workspace = workspace;
+            cx.emit(LaterEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    /// Replace `workspace`'s saved list with live items fetched from Slack (`saved.list`),
+    /// keeping `fired` flags for reminders that already triggered in this session.
+    pub fn replace_live(
+        &mut self,
+        workspace: usize,
+        mut incoming: Vec<LaterItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let now = now_secs();
+        let already_fired: HashSet<(ChannelId, Ts)> = self
+            .items
+            .iter()
+            .filter(|item| item.workspace == workspace && item.fired)
+            .map(|item| (item.channel.clone(), item.ts.clone()))
+            .collect();
+        for item in &mut incoming {
+            item.workspace = workspace;
+            if already_fired.contains(&(item.channel.clone(), item.ts.clone()))
+                || item.due.is_some_and(|due| due <= now)
+            {
+                item.fired = true;
+            }
+        }
+        self.items.retain(|item| item.workspace != workspace);
+        self.items.extend(incoming);
+        cx.emit(LaterEvent::Changed);
+        cx.notify();
     }
 
     /// Seed workspace `workspace` with saved fixture messages (once per workspace): the
@@ -252,11 +306,11 @@ impl LaterView {
             .collect()
     }
 
-    /// Items still in progress (the sidebar's Later count).
+    /// Items still in progress in the active workspace (the sidebar's Later count).
     pub fn in_progress_count(&self) -> usize {
         self.items
             .iter()
-            .filter(|item| item.state == LaterState::InProgress)
+            .filter(|item| item.workspace == self.workspace && item.state == LaterState::InProgress)
             .count()
     }
 
@@ -288,7 +342,22 @@ impl LaterView {
     }
 
     fn set_state(&mut self, ix: usize, state: LaterState, cx: &mut Context<Self>) {
+        let prev = self.items[ix].state;
         self.items[ix].state = state;
+        let mark = match (prev, state) {
+            (_, LaterState::Completed) => SavedMark::Completed,
+            (_, LaterState::Archived) => SavedMark::Archived,
+            (LaterState::Archived, LaterState::InProgress) => SavedMark::Unarchived,
+            _ => SavedMark::Uncompleted,
+        };
+        let item = &self.items[ix];
+        cx.emit(LaterEvent::Update {
+            workspace: item.workspace,
+            channel: item.channel.clone(),
+            ts: item.ts.clone(),
+            mark: Some(mark),
+            date_due: None,
+        });
         cx.emit(LaterEvent::Changed);
         cx.notify();
     }
@@ -297,6 +366,13 @@ impl LaterView {
         let item = &mut self.items[ix];
         item.due = due;
         item.fired = false;
+        cx.emit(LaterEvent::Update {
+            workspace: item.workspace,
+            channel: item.channel.clone(),
+            ts: item.ts.clone(),
+            mark: None,
+            date_due: Some(due),
+        });
         cx.notify();
     }
 
@@ -304,14 +380,36 @@ impl LaterView {
         let item = self.items.remove(ix);
         cx.emit(LaterEvent::Unsaved {
             workspace: item.workspace,
+            channel: item.channel,
             ts: item.ts,
         });
         cx.emit(LaterEvent::Changed);
         cx.notify();
     }
 
+    fn clear_completed(&mut self, cx: &mut Context<Self>) {
+        let ws = self.workspace;
+        let removed: Vec<(ChannelId, Ts)> = self
+            .items
+            .iter()
+            .filter(|item| item.workspace == ws && item.state == LaterState::Completed)
+            .map(|item| (item.channel.clone(), item.ts.clone()))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        self.items
+            .retain(|item| !(item.workspace == ws && item.state == LaterState::Completed));
+        cx.emit(LaterEvent::ClearCompleted { workspace: ws });
+        cx.emit(LaterEvent::Changed);
+        cx.notify();
+    }
+
     fn count(&self, state: LaterState) -> usize {
-        self.items.iter().filter(|item| item.state == state).count()
+        self.items
+            .iter()
+            .filter(|item| item.workspace == self.workspace && item.state == state)
+            .count()
     }
 
     /// The reminder dropdown of item `ix`: the presets plus "Remove reminder" when one is set.
@@ -406,11 +504,12 @@ impl Render for LaterView {
             }));
 
         let tab = self.tab;
+        let ws = self.workspace;
         let shown: Vec<(usize, LaterItem)> = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.state == tab)
+            .filter(|(_, item)| item.workspace == ws && item.state == tab)
             .map(|(ix, item)| (ix, item.clone()))
             .collect();
         let rows: Vec<_> = shown
@@ -497,58 +596,68 @@ impl Render for LaterView {
                     .py_2()
                     .border_b_1()
                     .border_color(border)
-                    .cursor_pointer()
                     .hover(|el| el.bg(hover))
                     .child(
-                        Icon::new(if completed {
-                            IconName::BookmarkCheck
-                        } else {
-                            IconName::Bookmark
-                        })
-                        .text_color(if completed { muted } else { link })
-                        .size(px(16.)),
-                    )
-                    .child(
-                        v_flex()
+                        h_flex()
+                            .id(("later-row-open", ix))
                             .flex_1()
                             .min_w_0()
-                            .gap_0p5()
+                            .items_start()
+                            .gap_3()
+                            .cursor_pointer()
                             .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(item.author.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child(format!("in {}", item.label)),
-                                    )
-                                    .children(due_chip),
+                                Icon::new(if completed {
+                                    IconName::BookmarkCheck
+                                } else {
+                                    IconName::Bookmark
+                                })
+                                .text_color(if completed { muted } else { link })
+                                .size(px(16.)),
                             )
                             .child(
-                                div()
-                                    .text_sm()
-                                    .truncate()
-                                    .when(completed, |text| text.text_color(muted).line_through())
-                                    .child(item.text.replace('\n', " ")),
-                            ),
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(item.author.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(format!("in {}", item.label)),
+                                            )
+                                            .children(due_chip),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .truncate()
+                                            .when(completed, |text| {
+                                                text.text_color(muted).line_through()
+                                            })
+                                            .child(item.text.replace('\n', " ")),
+                                    ),
+                            )
+                            .on_click(cx.listener({
+                                let open_ts = item.ts.clone();
+                                move |_, _, _, cx| {
+                                    cx.emit(LaterEvent::Open {
+                                        workspace,
+                                        channel: channel.clone(),
+                                        ts: open_ts.clone(),
+                                    });
+                                }
+                            })),
                     )
                     .child(actions)
-                    .on_click(cx.listener({
-                        let open_ts = item.ts.clone();
-                        move |_, _, _, cx| {
-                            cx.emit(LaterEvent::Open {
-                                workspace,
-                                channel: channel.clone(),
-                                ts: open_ts.clone(),
-                            });
-                        }
-                    }))
             })
             .collect();
 
@@ -596,12 +705,34 @@ impl Render for LaterView {
                             .child("Saved"),
                     )
                     .child(
-                        Button::new("later-close")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::X)
-                            .tooltip("Close")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(LaterEvent::Close))),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(
+                                tab == LaterState::Completed
+                                    && self.count(LaterState::Completed) > 0,
+                                |row| {
+                                    row.child(
+                                        Button::new("later-clear-completed")
+                                            .ghost()
+                                            .with_size(Size::Small)
+                                            .label("Clear completed")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.clear_completed(cx);
+                                            })),
+                                    )
+                                },
+                            )
+                            .child(
+                                Button::new("later-close")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::X)
+                                    .tooltip("Close")
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| cx.emit(LaterEvent::Close)),
+                                    ),
+                            ),
                     ),
             )
             .child(tab_row)

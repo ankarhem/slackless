@@ -129,6 +129,47 @@ impl SlackApi {
         }
     }
 
+    /// Posts JSON to Slack's Edge cache API (`https://edgeapi.slack.com/cache/<team>/<path>`),
+    /// attaching `token` in the JSON body and the `d` session cookie (docs/research/api-search.md).
+    pub(crate) async fn call_edge_json<T: DeserializeOwned>(
+        &self,
+        team_id: &str,
+        path: &str,
+        mut payload: serde_json::Value,
+    ) -> Result<ApiResponse<T>> {
+        let url = Url::parse(&format!(
+            "{}{}/{}?_x_app_name=client",
+            endpoints::EDGE_API_BASE,
+            team_id,
+            path
+        ))?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "token".to_owned(),
+                serde_json::Value::String(self.token.clone()),
+            );
+        }
+        let body_bytes = serde_json::to_vec(&payload)?;
+        let resp = self
+            .send_with_retry(|| {
+                Ok(self
+                    .http
+                    .post(url.clone())
+                    .header(COOKIE, self.cookie.clone())
+                    .header(CONTENT_TYPE, "text/plain;charset=UTF-8")
+                    .body(body_bytes.clone())
+                    .build()?)
+            })
+            .await?;
+        let status = resp.status();
+        let body = resp.bytes().await?;
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => Ok(ApiResponse::<T>::from_value(value)?),
+            Err(_) if !status.is_success() => Err(status_error(status, &body)),
+            Err(e) => Err(ApiError::Decode(e)),
+        }
+    }
+
     /// Downloads a Slack-hosted file (`url_private`, `url_private_download`, thumbnails).
     ///
     /// File hosts authenticate the browser way, with the `d` cookie only. The cookie is sent only

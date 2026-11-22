@@ -291,6 +291,33 @@ pub enum Command {
     SearchGifs {
         query: String,
     },
+    /// Fetch all Later / Saved items (`saved.list` across in-progress, completed, archived)
+    /// and hydrate their message bodies via `messages.list`.
+    LoadSaved,
+    /// Save a message for Later (`saved.add`), optionally with a reminder due time (`date_due`).
+    SaveItem {
+        channel: ChannelId,
+        ts: Ts,
+        date_due: Option<u64>,
+    },
+    /// Update a Later item's state (`mark`) and/or reminder due time (`date_due`, `Some(None)` clears).
+    UpdateSavedItem {
+        channel: ChannelId,
+        ts: Ts,
+        mark: Option<api::SavedMark>,
+        date_due: Option<Option<u64>>,
+    },
+    /// Remove a message from Later (`saved.delete`).
+    DeleteSavedItem {
+        channel: ChannelId,
+        ts: Ts,
+    },
+    /// Clear all completed Later items (`saved.clearCompleted`).
+    ClearCompletedSaved,
+    /// Fast remote typeahead for Cmd+K Quick Switcher (`edgeapi` `users/search` + `channels/search`).
+    QuickSwitchSearch {
+        query: String,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -424,6 +451,15 @@ pub enum Event {
     GifResults {
         query: String,
         gifs: Vec<api::GifItem>,
+    },
+    /// Hydrated Later / Saved items from `saved.list` + `messages.list`.
+    SavedLoaded(Result<Vec<api::SavedItem>, String>),
+    /// Workspace slash commands from `client.appCommands` (merged with built-ins in `/` menu).
+    AppCommands(Vec<api::AppCommand>),
+    /// Remote people and channels matching a Cmd+K Quick Switcher query (`edgeapi`).
+    QuickSwitchResults {
+        query: String,
+        results: Box<api::EdgeSearchResults>,
     },
     /// A non-fatal failure worth surfacing.
     Error(String),

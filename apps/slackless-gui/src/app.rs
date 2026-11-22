@@ -443,6 +443,8 @@ struct Parked {
     presence: fixtures::PresenceMap,
     peer_dnd_paused: HashMap<UserId, bool>,
     usergroups: Vec<Usergroup>,
+    app_commands: Vec<slackless_core::api::AppCommand>,
+    visits: HashMap<ChannelId, u32>,
     connection: Option<slackless_core::rtm::ConnectionState>,
     member_counts: HashMap<ChannelId, u32>,
     app_counts: HashMap<ChannelId, u32>,
@@ -628,6 +630,10 @@ pub struct App {
     connection: Option<slackless_core::rtm::ConnectionState>,
     /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.
     usergroups: Vec<Usergroup>,
+    /// Live mode: workspace slash commands from `client.appCommands`, injected into snapshots.
+    app_commands: Vec<slackless_core::api::AppCommand>,
+    /// Per-conversation visit counts for Cmd+K Quick Switcher frecency ranking.
+    visits: HashMap<ChannelId, u32>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
     member_counts: HashMap<ChannelId, u32>,
     /// Apps among a channel's members, counted apart from people as Slack's header does.
@@ -815,7 +821,9 @@ impl App {
             let directory = DirectoryView::new(fixtures.clone(), window, cx);
             let compose = NewMessageView::new(fixtures.clone(), window, cx);
             let details = ChannelDetails::new(fixtures.clone(), window, cx);
-            later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
+            if fixtures.sample {
+                later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
+            }
             crate::actions::bind_menu_keys(cx);
             cx.bind_keys([
                 KeyBinding::new("cmd-k", QuickSwitch, None),
@@ -1205,12 +1213,57 @@ impl App {
                             this.select(channel.clone(), cx);
                             this.messages.update(cx, |list, cx| list.reveal(ts, cx));
                         }
-                        LaterEvent::Unsaved { workspace, ts } => {
+                        LaterEvent::Unsaved {
+                            workspace,
+                            channel,
+                            ts,
+                        } => {
                             if *workspace == this.workspace {
                                 this.messages
                                     .update(cx, |list, cx| list.set_saved(ts, false, cx));
                                 this.thread
                                     .update(cx, |thread, cx| thread.set_saved(ts, false, cx));
+                                this.bridge.send(Command::DeleteSavedItem {
+                                    channel: channel.clone(),
+                                    ts: ts.clone(),
+                                });
+                            } else if let Some(bridge) =
+                                this.parked_bridges.get(*workspace).and_then(Option::as_ref)
+                            {
+                                bridge.send(Command::DeleteSavedItem {
+                                    channel: channel.clone(),
+                                    ts: ts.clone(),
+                                });
+                            }
+                        }
+                        LaterEvent::Update {
+                            workspace,
+                            channel,
+                            ts,
+                            mark,
+                            date_due,
+                        } => {
+                            let cmd = Command::UpdateSavedItem {
+                                channel: channel.clone(),
+                                ts: ts.clone(),
+                                mark: *mark,
+                                date_due: *date_due,
+                            };
+                            if *workspace == this.workspace {
+                                this.bridge.send(cmd);
+                            } else if let Some(bridge) =
+                                this.parked_bridges.get(*workspace).and_then(Option::as_ref)
+                            {
+                                bridge.send(cmd);
+                            }
+                        }
+                        LaterEvent::ClearCompleted { workspace } => {
+                            if *workspace == this.workspace {
+                                this.bridge.send(Command::ClearCompletedSaved);
+                            } else if let Some(bridge) =
+                                this.parked_bridges.get(*workspace).and_then(Option::as_ref)
+                            {
+                                bridge.send(Command::ClearCompletedSaved);
                             }
                         }
                         LaterEvent::Changed => this.sync_later_count(cx),
@@ -1560,6 +1613,8 @@ impl App {
                 peer_dnd_paused: HashMap::new(),
                 connection: None,
                 usergroups: Vec::new(),
+                app_commands: Vec::new(),
+                visits: HashMap::new(),
                 member_counts: HashMap::new(),
                 app_counts: HashMap::new(),
                 open_members: None,
@@ -1641,13 +1696,17 @@ impl App {
 
     /// Put the shown workspace's Later items on its message views' saved markers.
     fn sync_saved(&mut self, cx: &mut Context<Self>) {
-        let saved = self.later.read(cx).saved_in(self.workspace);
-        for (_, ts) in saved {
-            self.messages
-                .update(cx, |list, cx| list.set_saved(&ts, true, cx));
-            self.thread
-                .update(cx, |thread, cx| thread.set_saved(&ts, true, cx));
-        }
+        let saved: HashSet<Ts> = self
+            .later
+            .read(cx)
+            .saved_in(self.workspace)
+            .into_iter()
+            .map(|(_, ts)| ts)
+            .collect();
+        self.messages
+            .update(cx, |list, cx| list.replace_saved(saved.clone(), cx));
+        self.thread
+            .update(cx, |thread, cx| thread.replace_saved(saved, cx));
     }
 
     fn sync_later_count(&mut self, cx: &mut Context<Self>) {
@@ -1663,6 +1722,18 @@ impl App {
         self.later.update(cx, |later, cx| {
             later.save(request.clone(), workspace, label, cx)
         });
+        if request.saved {
+            self.bridge.send(Command::SaveItem {
+                channel: request.channel.clone(),
+                ts: request.ts.clone(),
+                date_due: request.due,
+            });
+        } else {
+            self.bridge.send(Command::DeleteSavedItem {
+                channel: request.channel.clone(),
+                ts: request.ts.clone(),
+            });
+        }
     }
 
     fn open_later(&mut self, cx: &mut Context<Self>) {
@@ -1670,7 +1741,74 @@ impl App {
         self.later_open = true;
         self.drafts_open = false;
         self.searching = false;
+        self.bridge.send(Command::LoadSaved);
         cx.notify();
+    }
+
+    /// Map live `saved.list` rows into [`LaterItem`]s using `fixtures` (falling back to the
+    /// workspace's channel/user names when a message body was not returned by `messages.list`).
+    fn apply_saved_loaded(
+        &mut self,
+        workspace: usize,
+        items: &[slackless_core::api::SavedItem],
+        cx: &mut Context<Self>,
+    ) {
+        let fixtures = if workspace == self.workspace {
+            self.fixtures.clone()
+        } else if let Some(parked) = self.parked.get(workspace).and_then(Option::as_ref) {
+            parked.fixtures.clone()
+        } else {
+            return;
+        };
+        let mapped: Vec<crate::later::LaterItem> = items
+            .iter()
+            .map(|item| {
+                let label = fixtures
+                    .conversation(&item.channel)
+                    .map(|c| fixtures.conversation_label(c))
+                    .unwrap_or_else(|| item.channel.to_string());
+                let (author, text) = match &item.message {
+                    Some(msg) => {
+                        let author = msg
+                            .user
+                            .as_ref()
+                            .map(|u| fixtures.user_name(u).to_owned())
+                            .or_else(|| msg.username.clone())
+                            .or_else(|| msg.bot_profile.as_ref().map(|b| b.name.clone()))
+                            .unwrap_or_else(|| "Message".to_owned());
+                        (author, fixtures.preview(msg))
+                    }
+                    None => ("Saved message".to_owned(), String::new()),
+                };
+                let state = match item.state {
+                    slackless_core::api::SavedItemState::InProgress => {
+                        crate::later::LaterState::InProgress
+                    }
+                    slackless_core::api::SavedItemState::Archived => {
+                        crate::later::LaterState::Archived
+                    }
+                    slackless_core::api::SavedItemState::Completed => {
+                        crate::later::LaterState::Completed
+                    }
+                };
+                crate::later::LaterItem {
+                    workspace,
+                    channel: item.channel.clone(),
+                    ts: item.ts.clone(),
+                    label,
+                    author,
+                    text,
+                    state,
+                    due: item.date_due,
+                    fired: false,
+                }
+            })
+            .collect();
+        self.later
+            .update(cx, |later, cx| later.replace_live(workspace, mapped, cx));
+        if workspace == self.workspace {
+            self.sync_saved(cx);
+        }
     }
 
     /// Post every Later reminder that came due: system notification plus in-app toast.
@@ -2191,14 +2329,185 @@ impl App {
         url
     }
 
-    /// slackless has no download manager, so like the browser this reveals the user's
-    /// Downloads folder.
-    fn open_downloads(&mut self, cx: &mut Context<Self>) {
-        if let Some(home) = std::env::var_os("HOME") {
-            let mut downloads = std::path::PathBuf::from(home);
-            downloads.push("Downloads");
-            cx.open_url(&Self::file_url(&downloads));
-        }
+    /// Open Slack's in-app Downloads list (`Cmd+Shift+J`): shows every file downloaded in this
+    /// session with Open / Show in Finder / Retry controls plus a shortcut to `~/Downloads`.
+    fn open_downloads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let downloads_dir = std::env::var_os("HOME").map(|home| {
+            let mut p = std::path::PathBuf::from(home);
+            p.push("Downloads");
+            p
+        });
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, foreground, danger) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.foreground,
+                theme.danger,
+            );
+            let items = crate::media::downloads(cx);
+            let has_finished = items
+                .iter()
+                .any(|d| !matches!(d.status, crate::media::DownloadStatus::InProgress));
+            let folder = downloads_dir.clone();
+            let header_actions = h_flex()
+                .items_center()
+                .gap_2()
+                .when_some(folder, |row, path| {
+                    row.child(
+                        Button::new("downloads-open-folder")
+                            .outline()
+                            .with_size(Size::Small)
+                            .icon(IconName::Folder)
+                            .label("Open folder")
+                            .on_click(move |_, _, cx| {
+                                cx.open_url(&Self::file_url(&path));
+                            }),
+                    )
+                })
+                .when(has_finished, |row| {
+                    row.child(
+                        Button::new("downloads-clear")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .label("Clear list")
+                            .on_click(|_, window, cx| {
+                                crate::media::clear_finished_downloads(cx);
+                                window.refresh();
+                            }),
+                    )
+                });
+            let rows: Vec<_> = items
+                .into_iter()
+                .map(|item| {
+                    let (status_line, is_err) = match &item.status {
+                        crate::media::DownloadStatus::InProgress => {
+                            ("Downloading\u{2026}".to_owned(), false)
+                        }
+                        crate::media::DownloadStatus::Completed(_) => {
+                            let size = item
+                                .bytes
+                                .map(|b| crate::files::human_size(b as i64))
+                                .unwrap_or_default();
+                            if size.is_empty() {
+                                ("Completed".to_owned(), false)
+                            } else {
+                                (format!("{size} \u{b7} Completed"), false)
+                            }
+                        }
+                        crate::media::DownloadStatus::Failed(err) => {
+                            (format!("Failed: {err}"), true)
+                        }
+                    };
+                    let actions = match &item.status {
+                        crate::media::DownloadStatus::InProgress => h_flex().into_any_element(),
+                        crate::media::DownloadStatus::Completed(path) => {
+                            let open_path = path.clone();
+                            let reveal_path = path.clone();
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .child(
+                                    Button::new(("dl-open", item.id))
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .label("Open")
+                                        .on_click(move |_, _, _| {
+                                            crate::media::open_local_file(&open_path);
+                                        }),
+                                )
+                                .child(
+                                    Button::new(("dl-reveal", item.id))
+                                        .ghost()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Folder)
+                                        .tooltip("Show in Finder")
+                                        .on_click(move |_, _, _| {
+                                            crate::media::reveal_in_finder(&reveal_path);
+                                        }),
+                                )
+                                .into_any_element()
+                        }
+                        crate::media::DownloadStatus::Failed(_) => {
+                            let url = item.url.clone();
+                            let name = item.name.clone();
+                            Button::new(("dl-retry", item.id))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::RotateCcw)
+                                .label("Retry")
+                                .on_click(move |_, window, cx| {
+                                    crate::media::download(url.clone(), name.clone(), window, cx);
+                                })
+                                .into_any_element()
+                        }
+                    };
+                    h_flex()
+                        .id(("dl-row", item.id))
+                        .items_center()
+                        .gap_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            Icon::new(IconName::Download)
+                                .size(px(16.))
+                                .text_color(if is_err { danger } else { muted }),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(foreground)
+                                        .child(item.name),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(if is_err { danger } else { muted })
+                                        .child(status_line),
+                                ),
+                        )
+                        .child(actions)
+                })
+                .collect();
+            let empty = rows.is_empty().then(|| {
+                v_flex()
+                    .items_center()
+                    .gap_2()
+                    .py_8()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(
+                        Icon::new(IconName::Download)
+                            .size(px(28.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(foreground)
+                            .child("No downloads yet"),
+                    )
+                    .child("Files you download from messages appear here.")
+            });
+            dialog.title("Downloads").w(px(560.)).child(
+                v_flex().gap_3().child(header_actions).child(
+                    v_flex()
+                        .id("downloads-list")
+                        .max_h(px(380.))
+                        .overflow_y_scroll()
+                        .children(rows)
+                        .children(empty),
+                ),
+            )
+        });
     }
 
     fn user_menu_event(
@@ -2263,7 +2572,7 @@ impl App {
             }
             UserMenuEvent::OpenDownloads => {
                 self.user_menu_open = false;
-                self.open_downloads(cx);
+                self.open_downloads(window, cx);
             }
             UserMenuEvent::SignOut => {
                 self.user_menu_open = false;
@@ -2341,6 +2650,14 @@ impl App {
 
     /// The Cmd+K switcher in a dialog; the filter is focused once the dialog is up.
     fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut recent = Vec::with_capacity(self.recent.len() + 1);
+        if !self.channel.as_str().is_empty() {
+            recent.push(self.channel.clone());
+        }
+        recent.extend(self.recent.iter().cloned());
+        let visits = self.visits.clone();
+        self.switcher
+            .update(cx, |switcher, cx| switcher.set_frecency(recent, visits, cx));
         let switcher = self.switcher.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.w(px(560.)).child(switcher.clone())
@@ -3363,6 +3680,7 @@ impl App {
         self.recent.retain(|c| *c != left && *c != channel);
         self.recent.insert(0, left);
         self.recent.truncate(RECENT_MAX);
+        *self.visits.entry(channel.clone()).or_default() += 1;
         if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
             cx.background_executor().spawn(write).detach();
         }
@@ -3433,6 +3751,9 @@ impl App {
                     cx.notify();
                 }
             }
+            Event::SavedLoaded(Ok(items)) => {
+                self.apply_saved_loaded(ws_index, items, cx);
+            }
             Event::Conversations(_) | Event::SidebarChanged => {
                 // Refresh this background workspace's team name/icon in `live_teams` if hydrate
                 // just stored a richer `team.info` record.
@@ -3452,6 +3773,11 @@ impl App {
             Event::Usergroups(groups) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     parked.usergroups = groups.clone();
+                }
+            }
+            Event::AppCommands(commands) => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked.app_commands = commands.clone();
                 }
             }
             Event::Connection(state) => {
@@ -3672,10 +3998,23 @@ impl App {
                 self.usergroups = groups.clone();
                 self.reload_live(window, cx);
             }
+            Event::AppCommands(commands) => {
+                self.app_commands = commands.clone();
+                self.reload_live(window, cx);
+            }
+            Event::QuickSwitchResults { query, results } => {
+                self.switcher.update(cx, |switcher, cx| {
+                    switcher.set_remote_results(query, (**results).clone(), cx);
+                });
+            }
             Event::GifResults { query, gifs } => {
                 self.emoji_picker.update(cx, |picker, cx| {
                     picker.set_gif_results(query, gifs.clone(), cx);
                 });
+            }
+            Event::SavedLoaded(Ok(items)) => {
+                let ws = self.workspace;
+                self.apply_saved_loaded(ws, items, cx);
             }
             _ => {}
         }
@@ -3696,9 +4035,10 @@ impl App {
         if !self.live_teams.is_empty() {
             snapshot.workspaces = self.live_teams.clone();
         }
-        // Presence and usergroups are transient (never stored), so they ride along every snapshot.
+        // Presence, usergroups, and app_commands are transient (never stored), so they ride along.
         snapshot.presence = self.presence.clone();
         snapshot.usergroups = self.usergroups.clone();
+        snapshot.app_commands = self.app_commands.clone();
         let fixtures = Arc::new(snapshot);
         // Refresh the views in place, as Slack does: a status change or a new channel keeps
         // every scroll position, collapsed section and open panel.
@@ -4366,6 +4706,8 @@ impl App {
                     presence: fixtures::PresenceMap::default(),
                     peer_dnd_paused: HashMap::new(),
                     usergroups: Vec::new(),
+                    app_commands: Vec::new(),
+                    visits: HashMap::new(),
                     connection: None,
                     member_counts: HashMap::new(),
                     app_counts: HashMap::new(),
@@ -4383,6 +4725,8 @@ impl App {
             presence: mem::replace(&mut self.presence, incoming.presence),
             peer_dnd_paused: mem::replace(&mut self.peer_dnd_paused, incoming.peer_dnd_paused),
             usergroups: mem::replace(&mut self.usergroups, incoming.usergroups),
+            app_commands: mem::replace(&mut self.app_commands, incoming.app_commands),
+            visits: mem::replace(&mut self.visits, incoming.visits),
             connection: mem::replace(&mut self.connection, incoming.connection),
             member_counts: mem::replace(&mut self.member_counts, incoming.member_counts),
             app_counts: mem::replace(&mut self.app_counts, incoming.app_counts),
@@ -4410,8 +4754,12 @@ impl App {
         self.profile_open = false;
         self.pins_open = false;
         let fixtures = self.fixtures.clone();
-        self.later
-            .update(cx, |later, cx| later.seed(index, &fixtures, cx));
+        self.later.update(cx, |later, cx| {
+            later.set_workspace(index, cx);
+            if fixtures.sample {
+                later.seed(index, &fixtures, cx);
+            }
+        });
         self.fold_search_menu(window, cx);
         self.search_menu
             .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
@@ -5380,7 +5728,9 @@ impl Render for App {
                     this.open_browser(window, cx)
                 }),
             )
-            .on_action(cx.listener(|this, _: &OpenDownloads, _, cx| this.open_downloads(cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenDownloads, window, cx| this.open_downloads(window, cx)),
+            )
             .on_action(
                 cx.listener(|this, _: &SetStatus, window, cx| this.open_status_picker(window, cx)),
             )
@@ -7171,10 +7521,28 @@ fn subscribe_workspace(
                     this.select(channel.clone(), cx);
                     this.focus.focus(window, cx);
                 }
+                SwitcherEvent::OpenRemoteChannel(conv) => {
+                    window.close_dialog(cx);
+                    if this.fixtures.conversation(&conv.id).is_none() {
+                        if let Some((store, ws)) = this.bridge.store().zip(this.bridge.team_id()) {
+                            if let Ok(mut guard) = store.lock() {
+                                let _ = guard.upsert_conversation(ws, conv);
+                            }
+                            this.reload_live(window, cx);
+                        }
+                    }
+                    this.select(conv.id.clone(), cx);
+                    this.focus.focus(window, cx);
+                }
                 SwitcherEvent::OpenUser(user) => {
                     window.close_dialog(cx);
                     this.message_user(user, window, cx);
                     this.focus.focus(window, cx);
+                }
+                SwitcherEvent::SearchRemote(query) => {
+                    this.bridge.send(Command::QuickSwitchSearch {
+                        query: query.clone(),
+                    });
                 }
             },
         ),

@@ -1204,17 +1204,67 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
             })
             .child(name)
     });
+    let is_video_unfurl = attachment.extra.contains_key("video_html")
+        || attachment.extra.contains_key("video_html_width");
+    let open_url = attachment
+        .title_link
+        .clone()
+        .or_else(|| attachment.from_url.clone());
     let thumb = attachment
         .image_url
         .as_deref()
         .or(attachment.thumb_url.as_deref())
         .map(|url| {
+            let mut inner = div()
+                .relative()
+                .child(picture(Some(url), "", 88., 88., kcx, cx));
+            if is_video_unfurl {
+                let target = open_url.clone();
+                let links = kcx.links.clone();
+                inner = inner.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "bk-{}-att-{n}-play",
+                            kcx.ts.as_str()
+                        )))
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .size(px(32.))
+                                .rounded_full()
+                                .bg(gpui_kit::gpui::hsla(0., 0., 0., 0.62))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::Play)
+                                        .size(px(14.))
+                                        .text_color(gpui_kit::gpui::hsla(0., 0., 1., 0.95)),
+                                ),
+                        )
+                        .when_some(target, |el, url| {
+                            el.on_click(move |_, window, cx| {
+                                messages::route_link(
+                                    links.as_ref(),
+                                    LinkTarget::Url(url.clone().into()),
+                                    window,
+                                    cx,
+                                );
+                            })
+                        }),
+                );
+            }
             div()
                 .flex_none()
                 .p_2()
                 .border_l_1()
                 .border_color(border)
-                .child(picture(Some(url), "", 88., 88., kcx, cx))
+                .child(inner)
         });
     h_flex()
         .max_w(px(640.))
@@ -1257,11 +1307,36 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
     let fixtures = kcx.fixtures;
     let mut body = v_flex().flex_1().min_w_0().gap_1();
     if let Some(author) = &attachment.author_name {
-        body = body.child(
-            div()
+        let label = match &attachment.author_link {
+            Some(url) => routed_link(
+                format!("bk-{}-att-{n}-author", kcx.ts.as_str()),
+                author.clone(),
+                url.clone(),
+                kcx,
+                FontWeight::SEMIBOLD,
+                cx,
+            )
+            .text_xs()
+            .into_any_element(),
+            None => div()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(author.clone()),
+                .child(author.clone())
+                .into_any_element(),
+        };
+        body = body.child(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .when_some(attachment.author_icon.clone(), |row, icon| {
+                    row.child(
+                        img(SharedString::from(icon))
+                            .flex_none()
+                            .size(px(16.))
+                            .rounded_sm(),
+                    )
+                })
+                .child(label),
         );
     }
     if let Some(title) = &attachment.title {

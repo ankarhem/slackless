@@ -33,7 +33,7 @@ impl Composer {
             Some(Entry::User(_) | Entry::Usergroup(_) | Entry::Broadcast(_)) => "People",
             Some(Entry::Channel(_)) => "Channels",
             Some(Entry::Emoji(_)) => "Emoji",
-            Some(Entry::Slash(_)) | None => "Built-in commands",
+            Some(Entry::Slash(_)) | None => "Commands",
         };
         let rows: Vec<_> = menu
             .entries
@@ -180,16 +180,24 @@ impl Composer {
             Entry::Slash(command) => v_flex()
                 .child(
                     h_flex()
+                        .items_center()
                         .gap_2()
                         .child(title(format!("/{}", command.name).into()))
-                        .child(note(command.usage.into())),
+                        .when(!command.usage.is_empty(), |row| {
+                            row.child(note(command.usage.clone().into()))
+                        })
+                        .when_some(command.app_name.clone(), |row, app| {
+                            row.child(div().ml_auto().text_xs().text_color(secondary).child(app))
+                        }),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(secondary)
-                        .child(command.description),
-                ),
+                .when(!command.description.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(secondary)
+                            .child(command.description.clone()),
+                    )
+                }),
         }
     }
 }

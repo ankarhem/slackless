@@ -347,6 +347,11 @@ impl ThreadPanel {
         cx.notify();
     }
 
+    pub fn replace_saved(&mut self, saved: HashSet<Ts>, cx: &mut Context<Self>) {
+        self.saved = saved;
+        cx.notify();
+    }
+
     /// Save (or unsave) `ts` of the open thread, optionally with a reminder, and hand the
     /// request to the root's Later list.
     fn save_for_later(
