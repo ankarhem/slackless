@@ -2679,12 +2679,17 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let unchanged = self.profile_hover.trigger.as_ref() == Some(&trigger);
+        let same_open_card = self
+            .profile_hover
+            .card
+            .as_ref()
+            .is_some_and(|card| card.key == trigger.key && card.user == trigger.user);
         self.profile_hover.grace = None;
         self.profile_hover.trigger = Some(trigger.clone());
         if self.fixtures.user(&trigger.user).is_none() {
             self.resolve_users(std::iter::once(trigger.user.clone()));
         }
-        if unchanged {
+        if unchanged || same_open_card {
             return;
         }
         let (key, user) = (trigger.key.clone(), trigger.user.clone());
@@ -2758,10 +2763,11 @@ impl App {
         }
     }
 
-    /// Start the card's close grace, unless the pointer is inside the card or a grace is
-    /// already running.
+    /// Start the card's close grace, unless the pointer is still on its trigger or inside the
+    /// card, or a grace is already running.
     fn hover_card_maybe_close(&mut self, cx: &mut Context<Self>) {
         if self.profile_hover.card.is_none()
+            || self.profile_hover.trigger.is_some()
             || self.profile_hover.inside
             || self.profile_hover.grace.is_some()
         {
@@ -2780,6 +2786,7 @@ impl App {
     /// pointer re-enters it.
     fn close_hover_card(&mut self, cx: &mut Context<Self>) {
         let closed = self.profile_hover.card.take().is_some();
+        self.profile_hover.inside = false;
         self.profile_hover.grace = None;
         self.profile_hover.dwell = None;
         if closed {

@@ -29,9 +29,10 @@ use crate::status::SelfState;
 /// How long the pointer must rest on a trigger before the card shows, so sweeping the mouse
 /// across a transcript never flashes popovers.
 pub(crate) const DWELL_MS: u64 = 300;
-/// How long the card lingers after the pointer leaves its trigger, so the pointer can cross
-/// the gap into the card to click "Message" or "View full profile".
-pub(crate) const GRACE_MS: u64 = 150;
+/// How long the card lingers after the pointer leaves its trigger or the card itself, so the
+/// pointer can cross the gap into the card to click "Message" or "View full profile" and the
+/// card promptly disappears once neither is hovered.
+pub(crate) const GRACE_MS: u64 = 250;
 
 // ---------------------------------------------------------------------------
 // Triggers and routing

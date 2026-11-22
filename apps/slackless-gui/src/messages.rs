@@ -1723,9 +1723,6 @@ fn profile_link(
     };
     let (user, handler) = (user.clone(), handler.clone());
     let (hover_user, hover_key) = (user.clone(), SharedString::from(format!("name-{id}")));
-    // The anchor the enter reported, so the matching leave reports the same identity.
-    let anchor = Rc::new(Cell::new(None));
-    let hover_anchor = anchor.clone();
     div()
         .id(SharedString::from(id))
         .cursor_pointer()
@@ -1737,7 +1734,6 @@ fn profile_link(
         .on_hover(move |inside: &bool, window, cx| {
             if *inside {
                 let at = window.mouse_position();
-                hover_anchor.set(Some(at));
                 hover_card::entered(
                     Trigger {
                         key: hover_key.clone(),
@@ -1746,7 +1742,7 @@ fn profile_link(
                     },
                     cx,
                 );
-            } else if hover_anchor.take().is_some() {
+            } else {
                 hover_card::left(&hover_key, cx);
             }
         })
