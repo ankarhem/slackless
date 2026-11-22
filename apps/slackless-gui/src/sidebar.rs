@@ -205,6 +205,13 @@ impl NavItem {
     ];
 }
 
+/// Unread/mention badge summary for one tile in the workspace switcher rail (`F-CORE-006`).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct WorkspaceBadge {
+    pub mentions: u32,
+    pub has_unreads: bool,
+}
+
 /// Unread state of one conversation row, derived from the fixture history: messages the
 /// signed-in user did not author that are newer than the newest message in the open
 /// conversation (the fixture-mode "read" watermark). `mentions` is the subset of `count`
@@ -294,6 +301,8 @@ pub struct Sidebar {
     /// Unread Activity rows (the root pushes the live feed's count; fixture mode derives
     /// it), for the rail tile and the dock badge.
     activity_unread: u32,
+    /// Per-workspace unread / mention badges shown on the workspace switcher rail tiles.
+    workspace_badges: Vec<WorkspaceBadge>,
     /// The signed-in user's status and presence, for the rail avatar.
     self_state: SelfState,
     /// The pointer is over the focus button / the focus card.
@@ -410,6 +419,7 @@ impl Sidebar {
                 org_tip: None,
                 org_tip_delay: None,
                 activity_unread: 0,
+                workspace_badges: Vec::new(),
                 self_state: SelfState::default(),
                 focus_hover: (false, false),
                 _subscriptions: subscriptions,
@@ -534,6 +544,29 @@ impl Sidebar {
             + self
                 .total_unread(&self.fixtures.dms, watermark.as_ref())
                 .count
+    }
+
+    /// Whether any channel or DM in this workspace currently has unread messages.
+    pub fn has_any_unreads(&self) -> bool {
+        let watermark = self.read_watermark();
+        self.activity_unread > 0
+            || self
+                .total_unread(&self.fixtures.channels, watermark.as_ref())
+                .count
+                > 0
+            || self
+                .total_unread(&self.fixtures.dms, watermark.as_ref())
+                .count
+                > 0
+            || self.total_unread(&self.joined, watermark.as_ref()).count > 0
+    }
+
+    /// Update per-workspace unread/mention badges on the workspace switcher rail.
+    pub fn set_workspace_badges(&mut self, badges: Vec<WorkspaceBadge>, cx: &mut Context<Self>) {
+        if self.workspace_badges != badges {
+            self.workspace_badges = badges;
+            cx.notify();
+        }
     }
 
     /// Mark `channel` as having a live huddle (`None`: no huddle anywhere).
@@ -1475,9 +1508,53 @@ impl Sidebar {
         };
         let ring = theme.sidebar_foreground.opacity(0.7);
         let hover_ring = theme.sidebar_foreground.opacity(0.3);
+        let badge = self
+            .workspace_badges
+            .get(index)
+            .copied()
+            .unwrap_or_default();
+        let (danger, danger_fg, badge_ring) =
+            (theme.danger, theme.danger_foreground, theme.title_bar);
+        let pill = (!active && badge.mentions > 0).then(|| {
+            let label = if badge.mentions > 99 {
+                "99+".to_owned()
+            } else {
+                badge.mentions.to_string()
+            };
+            div()
+                .absolute()
+                .top(px(-2.))
+                .right(px(-2.))
+                .min_w(px(16.))
+                .h(px(16.))
+                .px_1()
+                .rounded_full()
+                .border_2()
+                .border_color(badge_ring)
+                .bg(danger)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(danger_fg)
+                .child(label)
+        });
+        let dot = (!active && badge.mentions == 0 && badge.has_unreads).then(|| {
+            div()
+                .absolute()
+                .top(px(2.))
+                .right(px(2.))
+                .size(px(8.))
+                .rounded_full()
+                .border_1()
+                .border_color(badge_ring)
+                .bg(theme.sidebar_foreground)
+        });
         // Slack rings the active workspace's icon; the others take a faint ring on hover.
         div()
             .id(SharedString::from(format!("workspace-{index}")))
+            .relative()
             .size(px(44.))
             .flex_none()
             .flex()
@@ -1504,6 +1581,8 @@ impl Sidebar {
                     .text_color(tile_fg)
                     .child(face),
             )
+            .children(pill)
+            .children(dot)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if index != this.active_workspace {
                     cx.emit(SidebarEvent::SwitchWorkspace(index));

@@ -112,6 +112,8 @@ pub struct CoreBridge {
     store: Option<SharedStore>,
     /// Live mode: the signed-in session the core runs with.
     session: Option<Session>,
+    /// Live mode: authenticated HTTP fetcher for remote images and file downloads.
+    fetcher: Option<slackless_core::Fetcher>,
     /// Created by [`CoreBridge::start`], or lazily by [`CoreBridge::subscribe`] in fixture
     /// mode (where nothing will ever emit on it).
     hub: Option<Entity<EventHub>>,
@@ -124,6 +126,7 @@ impl CoreBridge {
             command_sink: None,
             store: None,
             session: None,
+            fetcher: None,
             hub: None,
         }
     }
@@ -144,16 +147,15 @@ impl CoreBridge {
             }
         };
         let hub = cx.new(|_| EventHub);
+        let fetcher = handle.fetcher();
         let mut bridge = Self {
             command_sink: None,
             store: None,
             session: Some(session),
+            fetcher: Some(fetcher),
             hub: Some(hub.clone()),
         };
 
-        // Remote images (`img(url)`: photos, emoji, the workspace icon) fetch through the core.
-        cx.set_http_client(Arc::new(CoreHttp(handle.fetcher())));
-        crate::media::enable_downloads(handle.fetcher(), cx);
         let (commands, mut events, store) = handle.into_parts();
         bridge.store = Some(store);
         let sender = commands.clone();
@@ -182,6 +184,16 @@ impl CoreBridge {
         .detach();
 
         Some(bridge)
+    }
+
+    /// Route GPUI remote image fetches (`img(url)`) and file downloads through this
+    /// workspace's authenticated HTTP fetcher. Call at launch for workspace 0 and whenever
+    /// switching active live workspaces.
+    pub fn activate_media(&self, cx: &mut gpui::App) {
+        if let Some(fetcher) = &self.fetcher {
+            cx.set_http_client(Arc::new(CoreHttp(fetcher.clone())));
+            crate::media::enable_downloads(fetcher.clone(), cx);
+        }
     }
 
     /// Live mode: the signed-in workspace as the store has it now, with Slack's latest read

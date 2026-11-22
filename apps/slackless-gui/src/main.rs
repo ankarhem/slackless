@@ -85,7 +85,7 @@ fn main() {
     if std::env::args().any(|arg| arg == sign_in::FLAG) {
         std::process::exit(sign_in::run_helper());
     }
-    let session = sign_in::session();
+    let sessions = sign_in::sessions();
     let zoom = zoom::Zoom::default();
     let app = Application::with_platform(zoom.platform()).with_assets(AllAssets);
 
@@ -97,10 +97,33 @@ fn main() {
         theme::init(cx);
         menu_bar::init(cx);
 
-        let live = session
-            .and_then(|session| CoreBridge::start(session, cx))
-            .and_then(|bridge| Some((bridge.snapshot(&Default::default())?, bridge)));
-        let (fixtures, bridge) = live.unwrap_or_else(|| (fixtures::load(), CoreBridge::offline()));
+        let live_pairs: Vec<(fixtures::Fixtures, CoreBridge)> = sessions
+            .into_iter()
+            .filter_map(|session| {
+                let bridge = CoreBridge::start(session, cx)?;
+                let snapshot = bridge.snapshot(&Default::default())?;
+                Some((snapshot, bridge))
+            })
+            .collect();
+        let (fixtures, bridges) = if !live_pairs.is_empty() {
+            let teams: Vec<_> = live_pairs
+                .iter()
+                .filter_map(|(snap, _)| snap.workspaces.first().cloned())
+                .collect();
+            let mut snapshots = Vec::with_capacity(live_pairs.len());
+            let mut bridges = Vec::with_capacity(live_pairs.len());
+            for (snap, bridge) in live_pairs {
+                snapshots.push(snap);
+                bridges.push(bridge);
+            }
+            bridges[0].activate_media(cx);
+            let mut first = snapshots.remove(0);
+            first.workspaces = teams;
+            (first, bridges)
+        } else {
+            (fixtures::load(), vec![CoreBridge::offline()])
+        };
+        let bridge = &bridges[0];
         // Live: the Font and Slack's Color Mode (both remembered locally; Lato and `System`
         // until chosen) over the color theme it stores for the workspace, installed before the
         // first frame.
@@ -152,7 +175,7 @@ fn main() {
                     window.activate_window();
                 });
             }
-            App::new(fixtures.clone(), bridge, window, cx)
+            App::new_multi(fixtures.clone(), bridges, window, cx)
         })
         .expect("Failed to open window");
     });

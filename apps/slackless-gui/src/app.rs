@@ -280,7 +280,7 @@ use crate::profile::{ProfileEvent, ProfilePanel};
 use crate::search::{SearchEvent, SearchView, fixture_archive};
 use crate::search_menu::{SEARCH_PLACEHOLDER, SearchMenu, SearchMenuEvent, Snapshot};
 use crate::shortcuts::shortcuts_view;
-use crate::sidebar::{NavItem, Sidebar, SidebarEvent};
+use crate::sidebar::{NavItem, Sidebar, SidebarEvent, WorkspaceBadge};
 use crate::slash::{Invocation, SHRUG, SlashKind};
 use crate::status::{
     FOCUS_UNTIL_OFF, SelfState, StatusEvent, StatusPicker, UserMenu, UserMenuEvent,
@@ -432,13 +432,22 @@ struct WorkspaceViews {
     switcher: Entity<QuickSwitcher>,
 }
 
-/// A workspace that is not shown: its fixtures, open conversation, views and their
-/// subscriptions.
+/// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,
+/// and per-workspace live state (counts, presence, usergroups, connection).
 struct Parked {
     fixtures: Arc<Fixtures>,
     channel: ChannelId,
     views: WorkspaceViews,
     subscriptions: Vec<Subscription>,
+    counts: HashMap<ChannelId, ConversationCounts>,
+    presence: fixtures::PresenceMap,
+    peer_dnd_paused: HashMap<UserId, bool>,
+    usergroups: Vec<Usergroup>,
+    connection: Option<slackless_core::rtm::ConnectionState>,
+    member_counts: HashMap<ChannelId, u32>,
+    app_counts: HashMap<ChannelId, u32>,
+    history_complete: HashSet<ChannelId>,
+    chosen: bool,
 }
 
 /// Where an emoji pick goes.
@@ -458,6 +467,18 @@ pub struct App {
     /// The shown workspace's fixtures.
     fixtures: Arc<Fixtures>,
     bridge: CoreBridge,
+    /// Per workspace index: the live bridge for every other signed-in workspace (`None` for the
+    /// shown workspace or fixture workspaces).
+    parked_bridges: Vec<Option<CoreBridge>>,
+    /// Every signed-in workspace's Team record (name, domain, icon) kept in sync across live
+    /// refreshes so the workspace rail stays complete when `reload_live` rebuilds a single
+    /// workspace's snapshot.
+    live_teams: Vec<Team>,
+    /// Per workspace index: latest `client.counts` for background workspaces so their rail
+    /// tiles show live unread/mention badges even before they are visited.
+    bg_counts: Vec<HashMap<ChannelId, ConversationCounts>>,
+    /// Per workspace index: latest Activity feed unread count for background workspaces.
+    bg_activity_unread: Vec<u32>,
     /// Index of the shown workspace in `fixtures.workspaces`.
     workspace: usize,
     /// Per workspace index: the parked state of a workspace visited before (`None` for the
@@ -639,13 +660,39 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(
         fixtures: Arc<Fixtures>,
-        mut bridge: CoreBridge,
+        bridge: CoreBridge,
         window: &mut Window,
         cx: &mut gpui::App,
     ) -> Entity<App> {
+        Self::new_multi(fixtures, vec![bridge], window, cx)
+    }
+
+    pub fn new_multi(
+        fixtures: Arc<Fixtures>,
+        mut bridges: Vec<CoreBridge>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Entity<App> {
+        if bridges.is_empty() {
+            bridges.push(CoreBridge::offline());
+        }
         let app = cx.new(|cx| {
+            let mut bridge = bridges.remove(0);
+            let live_teams = fixtures.workspaces.clone();
+            let ws_count = live_teams.len().max(1);
+            let mut parked_bridges: Vec<Option<CoreBridge>> = Vec::with_capacity(ws_count);
+            parked_bridges.push(None);
+            for extra in bridges {
+                parked_bridges.push(Some(extra));
+            }
+            while parked_bridges.len() < ws_count {
+                parked_bridges.push(None);
+            }
+            let bg_counts = vec![HashMap::new(); ws_count];
+            let bg_activity_unread = vec![0; ws_count];
             // Like Slack, reopen the conversation that was open last; a fresh store falls back
             // to the sidebar's first conversation until the user picks one.
             let restored = bridge
@@ -845,7 +892,7 @@ impl App {
             let card_keys = cx.weak_entity();
             // A fifth: the All Unreads view's arrow-key intercept.
             let unreads_keys = cx.weak_entity();
-            let subscriptions = vec![
+            let mut subscriptions = vec![
                 cx.observe_window_bounds(window, |this, window, cx| {
                     this.save_window_state(window, cx);
                 }),
@@ -960,7 +1007,7 @@ impl App {
                     });
                 }),
                 bridge.subscribe_in(window, cx, |this: &mut App, event, window, cx| {
-                    this.on_core_event(event, window, cx);
+                    this.on_workspace_event(0, event, window, cx);
                 }),
                 cx.subscribe_in(
                     &search,
@@ -1361,6 +1408,19 @@ impl App {
                     },
                 ),
             ];
+            // Subscribe to every background workspace's EventHub so their unread/mention
+            // badges and team metadata stay current while parked.
+            for (ws_ix, slot) in parked_bridges.iter_mut().enumerate().skip(1) {
+                if let Some(bg_bridge) = slot.as_mut() {
+                    subscriptions.push(bg_bridge.subscribe_in(
+                        window,
+                        cx,
+                        move |this: &mut App, event, window, cx| {
+                            this.on_workspace_event(ws_ix, event, window, cx);
+                        },
+                    ));
+                }
+            }
             cx.spawn_in(window, async move |this, cx| {
                 loop {
                     cx.background_executor().timer(REMINDER_POLL).await;
@@ -1390,6 +1450,10 @@ impl App {
             App {
                 fixtures,
                 bridge,
+                parked_bridges,
+                live_teams,
+                bg_counts,
+                bg_activity_unread,
                 workspace: 0,
                 parked,
                 channel,
@@ -1662,12 +1726,50 @@ impl App {
         }
     }
 
-    /// Hand the unread count to the dock badge when it changed (empty badge at zero).
+    /// Hand the total unread count (across every workspace) to the dock badge, and push
+    /// per-workspace badges to the workspace switcher rail (`F-CORE-006`).
     fn sync_badge(&mut self, cx: &mut Context<Self>) {
-        let count = self.sidebar.read(cx).badge_count();
-        if self.badge != Some(count) {
-            self.badge = Some(count);
-            let label = (count > 0).then(|| count.to_string());
+        let ws_count = self
+            .live_teams
+            .len()
+            .max(self.fixtures.workspaces.len())
+            .max(1);
+        let mut badges = Vec::with_capacity(ws_count);
+        let mut total_dock: u32 = 0;
+        for ix in 0..ws_count {
+            let badge = if ix == self.workspace {
+                let sidebar = self.sidebar.read(cx);
+                let mentions = sidebar.badge_count();
+                let has_unreads = sidebar.has_any_unreads();
+                WorkspaceBadge {
+                    mentions,
+                    has_unreads,
+                }
+            } else if let Some(parked) = self.parked.get(ix).and_then(Option::as_ref) {
+                if !parked.counts.is_empty() {
+                    let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
+                    workspace_badge_from_counts(&parked.counts, activity)
+                } else {
+                    let sidebar = parked.views.sidebar.read(cx);
+                    WorkspaceBadge {
+                        mentions: sidebar.badge_count(),
+                        has_unreads: sidebar.has_any_unreads(),
+                    }
+                }
+            } else if let Some(counts) = self.bg_counts.get(ix).filter(|c| !c.is_empty()) {
+                let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
+                workspace_badge_from_counts(counts, activity)
+            } else {
+                WorkspaceBadge::default()
+            };
+            total_dock = total_dock.saturating_add(badge.mentions);
+            badges.push(badge);
+        }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_workspace_badges(badges, cx));
+        if self.badge != Some(total_dock) {
+            self.badge = Some(total_dock);
+            let label = (total_dock > 0).then(|| total_dock.to_string());
             self.os.set_badge(label.as_deref());
         }
     }
@@ -3171,6 +3273,84 @@ impl App {
         self.show_typing(cx);
     }
 
+    /// Route an event from workspace `ws_index`: active workspace events update the live UI,
+    /// while background workspace events keep their counts, activity badges, and team icons
+    /// fresh on the workspace switcher rail.
+    fn on_workspace_event(
+        &mut self,
+        ws_index: usize,
+        event: &Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ws_index == self.workspace {
+            self.on_core_event(event, window, cx);
+            return;
+        }
+        match event {
+            Event::Counts(counts) => {
+                let map: HashMap<ChannelId, ConversationCounts> =
+                    [&counts.channels, &counts.ims, &counts.mpims]
+                        .into_iter()
+                        .flatten()
+                        .map(|entry| (entry.id.clone(), entry.clone()))
+                        .collect();
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked.counts = map.clone();
+                }
+                if let Some(slot) = self.bg_counts.get_mut(ws_index) {
+                    *slot = map;
+                }
+                cx.notify();
+            }
+            Event::ActivityView { feed } => {
+                if let Ok(feed) = feed.as_deref() {
+                    let unread = feed.items.iter().filter(|item| item.unread).count() as u32;
+                    if let Some(slot) = self.bg_activity_unread.get_mut(ws_index) {
+                        *slot = unread;
+                    }
+                    cx.notify();
+                }
+            }
+            Event::Conversations(_) | Event::SidebarChanged => {
+                // Refresh this background workspace's team name/icon in `live_teams` if hydrate
+                // just stored a richer `team.info` record.
+                let fresh_team = self
+                    .parked_bridges
+                    .get(ws_index)
+                    .and_then(Option::as_ref)
+                    .and_then(|b| b.snapshot(&HashMap::new()))
+                    .and_then(|snap| snap.workspaces.into_iter().next());
+                if let (Some(team), Some(slot)) = (fresh_team, self.live_teams.get_mut(ws_index)) {
+                    if *slot != team {
+                        *slot = team;
+                        self.reload_live(window, cx);
+                    }
+                }
+            }
+            Event::Usergroups(groups) => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked.usergroups = groups.clone();
+                }
+            }
+            Event::Connection(state) => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked.connection = Some(state.clone());
+                }
+            }
+            Event::Presence { users, presence } => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked
+                        .presence
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend(users.iter().map(|u| (u.clone(), presence.clone())));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Live mode: fold a core event into the views.
     fn on_core_event(&mut self, event: &Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
@@ -3381,6 +3561,15 @@ impl App {
         let Some(mut snapshot) = self.bridge.snapshot(&self.counts) else {
             return;
         };
+        // Keep the full multi-workspace rail intact while updating this workspace's team info.
+        if let Some(own) = snapshot.workspaces.first().cloned() {
+            if let Some(slot) = self.live_teams.get_mut(self.workspace) {
+                *slot = own;
+            }
+        }
+        if !self.live_teams.is_empty() {
+            snapshot.workspaces = self.live_teams.clone();
+        }
         // Presence and usergroups are transient (never stored), so they ride along every snapshot.
         snapshot.presence = self.presence.clone();
         snapshot.usergroups = self.usergroups.clone();
@@ -3982,8 +4171,9 @@ impl App {
         }
     }
 
-    /// Show workspace `index`: park the current workspace's views and bring back the target's
-    /// (built from its fixtures on the first visit). Drafts carry over through the store.
+    /// Show workspace `index`: park the current workspace's views (and live bridge/state) and
+    /// bring back the target's (built from its live bridge or sample fixtures on the first
+    /// visit). Drafts carry over through the store.
     fn switch_workspace(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index == self.workspace || index >= self.parked.len() {
             return;
@@ -3991,12 +4181,54 @@ impl App {
         self.save_draft(cx);
         self.bridge
             .send(Command::CloseConversation(self.channel.clone()));
+        // Swap live bridges when target workspace has its own `CoreBridge`.
+        let swapped_bridge = self.parked_bridges.get_mut(index).and_then(Option::take);
+        if let Some(incoming_bridge) = swapped_bridge {
+            let outgoing_bridge = mem::replace(&mut self.bridge, incoming_bridge);
+            if let Some(slot) = self.parked_bridges.get_mut(self.workspace) {
+                *slot = Some(outgoing_bridge);
+            }
+            self.bridge.activate_media(cx);
+        }
         let incoming = match self.parked[index].take() {
             Some(parked) => parked,
             None => {
-                let fixtures = Arc::new(fixtures::workspace(index));
-                let channel = first_conversation(&fixtures);
-                let archive = fixture_archive(&fixtures);
+                let bg_counts = self.bg_counts.get(index).cloned().unwrap_or_default();
+                let (fixtures, channel, archive, chosen) =
+                    if let Some(mut snap) = self.bridge.snapshot(&bg_counts) {
+                        if !self.live_teams.is_empty() {
+                            snap.workspaces = self.live_teams.clone();
+                        }
+                        let restored = self
+                            .bridge
+                            .last_conversation()
+                            .filter(|c| snap.conversation(c).is_some());
+                        let chosen = restored.is_some();
+                        let channel = restored.unwrap_or_else(|| first_conversation(&snap));
+                        let archive = self.bridge.store().cloned();
+                        // Restore persisted drafts for this workspace on first visit.
+                        if let Some(saved_drafts) = self.bridge.drafts() {
+                            let entries: Vec<Entry> = saved_drafts
+                                .into_iter()
+                                .map(|d| Entry {
+                                    id: None,
+                                    workspace: index,
+                                    channel: d.channel,
+                                    label: d.label,
+                                    text: d.text,
+                                    at: d.at,
+                                })
+                                .collect();
+                            self.drafts
+                                .update(cx, |view, cx| view.load_drafts(entries, cx));
+                        }
+                        (Arc::new(snap), channel, archive, chosen)
+                    } else {
+                        let fixtures = Arc::new(fixtures::workspace(index));
+                        let channel = first_conversation(&fixtures);
+                        let archive = fixture_archive(&fixtures);
+                        (fixtures, channel, archive, false)
+                    };
                 let views = build_workspace(&fixtures, index, archive, &channel, window, cx);
                 let subscriptions = subscribe_workspace(&views, window, cx);
                 Parked {
@@ -4004,6 +4236,15 @@ impl App {
                     channel,
                     views,
                     subscriptions,
+                    counts: bg_counts,
+                    presence: fixtures::PresenceMap::default(),
+                    peer_dnd_paused: HashMap::new(),
+                    usergroups: Vec::new(),
+                    connection: None,
+                    member_counts: HashMap::new(),
+                    app_counts: HashMap::new(),
+                    history_complete: HashSet::new(),
+                    chosen,
                 }
             }
         };
@@ -4012,6 +4253,15 @@ impl App {
             channel: mem::replace(&mut self.channel, incoming.channel),
             views: self.swap_views(incoming.views),
             subscriptions: mem::replace(&mut self.workspace_subscriptions, incoming.subscriptions),
+            counts: mem::replace(&mut self.counts, incoming.counts),
+            presence: mem::replace(&mut self.presence, incoming.presence),
+            peer_dnd_paused: mem::replace(&mut self.peer_dnd_paused, incoming.peer_dnd_paused),
+            usergroups: mem::replace(&mut self.usergroups, incoming.usergroups),
+            connection: mem::replace(&mut self.connection, incoming.connection),
+            member_counts: mem::replace(&mut self.member_counts, incoming.member_counts),
+            app_counts: mem::replace(&mut self.app_counts, incoming.app_counts),
+            history_complete: mem::replace(&mut self.history_complete, incoming.history_complete),
+            chosen: mem::replace(&mut self.chosen, incoming.chosen),
         };
         self.parked[self.workspace] = Some(outgoing);
         self.workspace = index;
@@ -4049,13 +4299,17 @@ impl App {
         self.sync_later_count(cx);
         self.huddle_open = false;
         self.tab = ConversationTab::Messages;
-        self.bridge
-            .send(Command::OpenConversation(self.channel.clone()));
+        let channel = self.channel.clone();
+        if !channel.as_str().is_empty() {
+            self.bridge.send(Command::OpenConversation(channel.clone()));
+            self.load_history(&channel, cx);
+        }
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
         // New thread panels / profile panes pick up Enter-to-send and the self state.
         self.apply_preferences(window, cx);
         self.update_menus(cx);
+        cx.notify();
     }
 
     /// Header label of a conversation in the shown workspace.
@@ -6422,6 +6676,26 @@ fn build_workspace(
     }
 }
 
+/// Derive a workspace switcher tile's badge from a background workspace's `client.counts`
+/// and Activity unread count (`F-CORE-006`).
+fn workspace_badge_from_counts(
+    counts: &HashMap<ChannelId, ConversationCounts>,
+    activity_unread: u32,
+) -> WorkspaceBadge {
+    let mut mentions = activity_unread;
+    let mut has_unreads = activity_unread > 0;
+    for entry in counts.values() {
+        mentions = mentions.saturating_add(entry.mention_count);
+        if entry.has_unreads || entry.mention_count > 0 {
+            has_unreads = true;
+        }
+    }
+    WorkspaceBadge {
+        mentions,
+        has_unreads,
+    }
+}
+
 /// Decode a system notification tag (`msg:<channel>:<ts>` or `later:<channel>:<ts>`).
 fn parse_notification_tag(tag: &str) -> Option<(ChannelId, Ts)> {
     let rest = tag
@@ -7471,5 +7745,43 @@ mod tests {
         let rt = doc.to_rich_text();
         let round = crate::editor::from_rich_text(&[rt.into()], &fixtures).unwrap();
         assert_eq!(round.to_draft(), doc.to_draft());
+    }
+
+    #[test]
+    fn workspace_badge_aggregates_mentions_activity_and_unreads() {
+        let mut counts = HashMap::new();
+        counts.insert(
+            ChannelId::from("C1"),
+            ConversationCounts {
+                id: ChannelId::from("C1"),
+                has_unreads: true,
+                mention_count: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            workspace_badge_from_counts(&counts, 0),
+            WorkspaceBadge {
+                mentions: 0,
+                has_unreads: true,
+            }
+        );
+
+        counts.insert(
+            ChannelId::from("D1"),
+            ConversationCounts {
+                id: ChannelId::from("D1"),
+                has_unreads: true,
+                mention_count: 3,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            workspace_badge_from_counts(&counts, 2),
+            WorkspaceBadge {
+                mentions: 5,
+                has_unreads: true,
+            }
+        );
     }
 }

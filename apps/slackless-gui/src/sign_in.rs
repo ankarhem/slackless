@@ -28,36 +28,37 @@ pub fn run_helper() -> i32 {
     }
 }
 
-/// The session to run live with: the first stored one, signing in through the helper first
-/// when none is stored. `None` (sign-in cancelled or failed, or `SLACKLESS_FIXTURES` /
-/// `SLACKLESS_GUI_DEMO` set) runs the bundled sample workspace instead.
-pub fn session() -> Option<Session> {
+/// Every signed-in session to run live with: all stored sessions that have secrets, signing in
+/// through the helper first when none are stored. An empty list (sign-in cancelled or failed, or
+/// `SLACKLESS_FIXTURES` / `SLACKLESS_GUI_DEMO` set) runs the bundled sample workspace instead.
+pub fn sessions() -> Vec<Session> {
     if std::env::var_os("SLACKLESS_FIXTURES").is_some()
         || std::env::var_os("SLACKLESS_GUI_DEMO").is_some()
     {
-        return None;
+        return Vec::new();
     }
-    if let Some(session) = stored() {
-        return Some(session);
+    let existing = stored_all();
+    if !existing.is_empty() {
+        return existing;
     }
     let helper = std::env::current_exe().and_then(|exe| Command::new(exe).arg(FLAG).status());
     match helper {
-        Ok(status) if status.success() => stored(),
+        Ok(status) if status.success() => stored_all(),
         // Cancelled, or failed and the helper said why.
-        Ok(_) => None,
+        Ok(_) => Vec::new(),
         Err(e) => {
             eprintln!("slackless: could not open the sign-in window ({e})");
-            None
+            Vec::new()
         }
     }
 }
 
-fn stored() -> Option<Session> {
+fn stored_all() -> Vec<Session> {
     match SessionStore::new().and_then(|store| store.load()) {
-        Ok(sessions) => sessions.into_iter().find(Session::has_secrets),
+        Ok(sessions) => sessions.into_iter().filter(Session::has_secrets).collect(),
         Err(e) => {
             eprintln!("slackless: could not read saved sessions ({e})");
-            None
+            Vec::new()
         }
     }
 }
