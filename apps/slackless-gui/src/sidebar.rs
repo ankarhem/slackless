@@ -254,8 +254,8 @@ pub struct Sidebar {
     dm_unreads_only: bool,
     /// Channels joined from the channel browser this session, listed after the fixtures'.
     joined: Vec<Conversation>,
-    /// The conversation with a live huddle; its row carries the headphones indicator.
-    huddle: Option<ChannelId>,
+    /// Conversations with a live huddle; their rows carry the headphones indicator.
+    huddles: HashSet<ChannelId>,
     /// Saved drafts, shown on the "Drafts & sent" row.
     draft_count: usize,
     /// In-progress Later items, shown on the "Later" row.
@@ -399,7 +399,7 @@ impl Sidebar {
                 threads_unread: (false, 0),
                 dm_unreads_only: false,
                 joined: Vec::new(),
-                huddle: None,
+                huddles: HashSet::new(),
                 draft_count: 0,
                 later_count: 0,
                 settings_menu_open: false,
@@ -571,8 +571,19 @@ impl Sidebar {
 
     /// Mark `channel` as having a live huddle (`None`: no huddle anywhere).
     pub fn set_huddle(&mut self, channel: Option<ChannelId>, cx: &mut Context<Self>) {
-        self.huddle = channel;
+        self.huddles.clear();
+        if let Some(channel) = channel {
+            self.huddles.insert(channel);
+        }
         cx.notify();
+    }
+
+    /// Replace the set of conversations currently running a live huddle.
+    pub fn set_huddles(&mut self, huddles: HashSet<ChannelId>, cx: &mut Context<Self>) {
+        if self.huddles != huddles {
+            self.huddles = huddles;
+            cx.notify();
+        }
     }
 
     /// List a channel joined from the browser under Channels.
@@ -2705,7 +2716,7 @@ impl Sidebar {
         } else {
             row.child(name.flex_1())
         };
-        if self.huddle.as_ref() == Some(&conversation.id) {
+        if self.huddles.contains(&conversation.id) {
             let live = if selected { color } else { theme.success };
             row = row.child(
                 Icon::new(IconName::Headphones)

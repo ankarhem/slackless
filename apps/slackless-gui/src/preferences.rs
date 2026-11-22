@@ -266,6 +266,10 @@ pub struct Settings {
     pub hardware_acceleration: bool,
     pub debug_logging: bool,
     pub open_links: usize,
+    /// Opt-in: automatically query Slack's remote search alongside instant local FTS5.
+    pub remote_search_auto: bool,
+    /// Whether the leftmost workspace switcher rail is shown (`Cmd+Shift+S`).
+    pub show_workspace_rail: bool,
 }
 
 impl Settings {
@@ -348,6 +352,8 @@ impl Default for Settings {
             hardware_acceleration: true,
             debug_logging: false,
             open_links: 0,
+            remote_search_auto: false,
+            show_workspace_rail: true,
         }
     }
 }
@@ -1239,7 +1245,19 @@ impl Preferences {
             cx,
         );
         let links = self.select("adv-links", &OPEN_LINKS, |s| &mut s.open_links, cx);
+        let remote_search = self.checkbox(
+            "adv-remote-search",
+            "Also search Slack remotely by default (slower; local FTS5 stays instant otherwise)",
+            |s| &mut s.remote_search_auto,
+            cx,
+        );
         v_flex()
+            .child(self.group(
+                "Search",
+                Some("Local search is instant and works offline. Enable remote search when you want older history, unjoined channels, and server-indexed files automatically."),
+                remote_search,
+                cx,
+            ))
             .child(self.group(
                 "Other options",
                 None,

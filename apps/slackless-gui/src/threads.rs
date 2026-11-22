@@ -109,6 +109,19 @@ pub enum ThreadPanelEvent {
     /// A slash command other than /shrug (which replies in the thread) was sent from the
     /// reply composer; the root dispatches it.
     SlashCommand(Invocation),
+    /// The reply composer scheduled a thread reply for later.
+    Schedule {
+        channel: ChannelId,
+        thread_ts: Ts,
+        text: String,
+        when: crate::drafts::SendLater,
+    },
+    /// The reply composer asked for the Custom Schedule Send dialog.
+    ScheduleCustom {
+        channel: ChannelId,
+        thread_ts: Ts,
+        text: String,
+    },
     /// Save for later / Remind me / unsave; the root keeps the Later list.
     Later(SaveRequest),
 }
@@ -152,7 +165,7 @@ impl ThreadPanel {
     ) -> Entity<ThreadPanel> {
         cx.new(|cx| {
             let composer = Composer::new("Reply...".into(), fixtures.clone(), window, cx);
-            composer.update(cx, |composer, cx| composer.set_scheduling(false, cx));
+            composer.update(cx, |composer, cx| composer.set_scheduling(true, cx));
             let edit_composer = Composer::new_edit(fixtures.clone(), window, cx);
             let subscriptions = vec![
                 cx.subscribe_in(
@@ -188,8 +201,26 @@ impl ThreadPanel {
                                 _ => cx.emit(ThreadPanelEvent::SlashCommand(invocation.clone())),
                             }
                         }
-                        // Scheduling is turned off in the reply composer.
-                        ComposerEvent::Schedule { .. } | ComposerEvent::Cancel => {}
+                        ComposerEvent::Schedule { text, when } => {
+                            if let Some((channel, thread_ts)) = this.thread.clone() {
+                                cx.emit(ThreadPanelEvent::Schedule {
+                                    channel,
+                                    thread_ts,
+                                    text: text.clone(),
+                                    when: *when,
+                                });
+                            }
+                        }
+                        ComposerEvent::ScheduleCustom(text) => {
+                            if let Some((channel, thread_ts)) = this.thread.clone() {
+                                cx.emit(ThreadPanelEvent::ScheduleCustom {
+                                    channel,
+                                    thread_ts,
+                                    text: text.clone(),
+                                });
+                            }
+                        }
+                        ComposerEvent::Cancel => {}
                         ComposerEvent::EditLast => this.edit_last_reply(window, cx),
                         ComposerEvent::Typing => cx.emit(ThreadPanelEvent::Typing),
                     },
@@ -206,6 +237,7 @@ impl ThreadPanel {
                         | ComposerEvent::SlashCommand(_)
                         | ComposerEvent::SubmitWithFiles { .. }
                         | ComposerEvent::Schedule { .. }
+                        | ComposerEvent::ScheduleCustom(_)
                         | ComposerEvent::EditLast
                         | ComposerEvent::Typing => {}
                     },
@@ -253,6 +285,12 @@ impl ThreadPanel {
             .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
         self.edit_composer
             .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+    }
+
+    /// Clear the reply composer's draft (e.g. after confirming a Custom Schedule Send).
+    pub fn clear_composer(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.load_draft("", cx));
     }
 
     /// Insert a picked emoji into the inline edit composer.

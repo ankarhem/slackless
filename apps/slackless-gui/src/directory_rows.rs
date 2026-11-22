@@ -11,7 +11,7 @@ use gpui_kit::gpui::{
     AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use slackless_core::types::{ChannelId, Conversation, ConversationKind, UserId};
+use slackless_core::types::{ChannelId, Conversation, ConversationKind, UserId, Usergroup};
 
 use crate::avatars::user_chip;
 use crate::directory::{DirectoryEvent, DirectoryView};
@@ -61,6 +61,28 @@ pub(super) fn channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversation> {
         .collect();
     channels.sort_by(|a, b| a.name.cmp(&b.name));
     channels
+}
+
+/// Active user groups matching `needle` (handle, name, or description), by handle.
+pub(super) fn usergroups(fixtures: &Fixtures, needle: &str) -> Vec<Usergroup> {
+    let mut groups: Vec<Usergroup> = fixtures
+        .usergroups
+        .iter()
+        .filter(|g| g.date_delete == 0)
+        .filter(|g| {
+            needle.is_empty()
+                || g.handle.to_lowercase().contains(needle)
+                || g.name.to_lowercase().contains(needle)
+                || g.description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(needle)
+        })
+        .cloned()
+        .collect();
+    groups.sort_by_key(|a| a.handle.to_lowercase());
+    groups
 }
 
 /// One person row: avatar, name and title; a click opens the profile panel.
@@ -198,5 +220,102 @@ pub(super) fn channel_row(
         )
         .child(action)
         .on_click(cx.listener(move |_, _, _, cx| cx.emit(DirectoryEvent::Open(id.clone()))))
+        .into_any_element()
+}
+
+/// One user group row: `@handle`, name, member count, description, and member names preview.
+pub(super) fn usergroup_row(
+    view: &DirectoryView,
+    ix: usize,
+    group: &Usergroup,
+    cx: &mut Context<DirectoryView>,
+) -> AnyElement {
+    let fixtures = view.fixtures();
+    let theme = cx.theme();
+    let (border, muted, foreground, link, hover) = (
+        theme.border,
+        theme.muted_foreground,
+        theme.foreground,
+        theme.link,
+        theme.accent,
+    );
+    let user_ids: Vec<UserId> = group
+        .extra
+        .get("users")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(UserId::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let count = group.user_count.unwrap_or(0).max(user_ids.len() as u32);
+    let members_preview = if user_ids.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<&str> = user_ids
+            .iter()
+            .take(5)
+            .map(|id| fixtures.user_name(id))
+            .collect();
+        let extra = user_ids.len().saturating_sub(names.len());
+        if extra > 0 {
+            format!(" · {}, +{extra} more", names.join(", "))
+        } else {
+            format!(" · {}", names.join(", "))
+        }
+    };
+    let desc = group.description.as_deref().unwrap_or_default().trim();
+    let subtitle = if desc.is_empty() {
+        format!("{count} members{members_preview}")
+    } else {
+        format!("{desc} · {count} members{members_preview}")
+    };
+    h_flex()
+        .id(("directory-usergroup", ix))
+        .items_center()
+        .gap_3()
+        .px_4()
+        .py_2()
+        .border_b_1()
+        .border_color(border)
+        .hover(|row| row.bg(hover))
+        .child(
+            div()
+                .size(px(32.))
+                .flex_none()
+                .rounded_md()
+                .bg(link.opacity(0.14))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(IconName::Users).text_color(link).size(px(16.))),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_baseline()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(foreground)
+                                .child(group.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(link)
+                                .child(format!("@{}", group.handle)),
+                        ),
+                )
+                .child(div().truncate().text_xs().text_color(muted).child(subtitle)),
+        )
         .into_any_element()
 }

@@ -264,6 +264,8 @@ pub(crate) struct Core<B: Backend> {
     teams_asked: Arc<Mutex<HashSet<TeamId>>>,
     /// Bot profiles read through `bots.info` this session (see `attach_bot_profile`).
     bots: HashMap<BotId, BotProfile>,
+    /// Signed-in user id learned from `client.userBoot` (used to mirror self profile/presence).
+    self_user_id: Arc<Mutex<Option<UserId>>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -296,6 +298,7 @@ impl<B: Backend> Core<B> {
             users_asked: HashSet::new(),
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
             bots: HashMap::new(),
+            self_user_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -340,6 +343,9 @@ impl<B: Backend> Core<B> {
                     Ok((ids, me)) => {
                         self.events.emit(Event::Conversations(ids));
                         if let Some(me) = me {
+                            if let Ok(mut guard) = self.self_user_id.lock() {
+                                *guard = Some(me.clone());
+                            }
                             self.events.emit(Event::UsersChanged(vec![me]));
                         }
                     }
@@ -977,10 +983,11 @@ impl<B: Backend> Core<B> {
                 channel,
                 post_at,
                 content,
+                thread_ts,
             } => {
                 self.spawn("chat.scheduleMessage", async move {
                     let created = backend
-                        .schedule_message(channel.clone(), post_at, content)
+                        .schedule_message(channel.clone(), post_at, content, thread_ts)
                         .await?;
                     events.emit(Event::MessageScheduled {
                         channel: created.channel,
@@ -1110,6 +1117,80 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SearchRemoteMessages { query, sort, page } => {
+                self.spawn("search.modules.messages", async move {
+                    let res = backend
+                        .search_remote_messages(query.clone(), sort, page)
+                        .await;
+                    let emit = match res {
+                        Ok(data) => Ok(Box::new(data)),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    events.emit(Event::RemoteMessagesPage {
+                        query,
+                        sort,
+                        page,
+                        result: emit,
+                    });
+                    Ok(())
+                });
+            }
+            Command::SearchRemoteFiles { query, sort, page } => {
+                self.spawn("search.modules.files", async move {
+                    let res = backend.search_remote_files(query.clone(), sort, page).await;
+                    let emit = match res {
+                        Ok(data) => Ok(Box::new(data)),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    events.emit(Event::RemoteFilesPage {
+                        query,
+                        sort,
+                        page,
+                        result: emit,
+                    });
+                    Ok(())
+                });
+            }
+            Command::UpdateProfile { update } => {
+                let self_user_id = Arc::clone(&self.self_user_id);
+                self.spawn("users.profile.set", async move {
+                    let profile = backend.update_profile(update).await?;
+                    let me = self_user_id.lock().ok().and_then(|g| g.clone());
+                    if let Some(me) = me {
+                        let me_for_store = me.clone();
+                        let _ = with_store(&store, move |s| {
+                            if let Some(mut user) =
+                                s.users(&ws)?.into_iter().find(|u| u.id == me_for_store)
+                            {
+                                user.profile = profile;
+                                s.upsert_user(&ws, &user)?;
+                            }
+                            Ok::<_, StoreError>(())
+                        })
+                        .await;
+                        events.emit(Event::UsersChanged(vec![me]));
+                    }
+                    Ok(())
+                });
+            }
+            Command::SetPresence { away } => {
+                let self_user_id = Arc::clone(&self.self_user_id);
+                self.spawn("presence.set", async move {
+                    backend.set_presence(away).await?;
+                    let me = self_user_id.lock().ok().and_then(|g| g.clone());
+                    if let Some(me) = me {
+                        events.emit(Event::Presence {
+                            users: vec![me],
+                            presence: if away {
+                                crate::Presence::Away
+                            } else {
+                                crate::Presence::Active
+                            },
+                        });
+                    }
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -1138,7 +1219,25 @@ impl<B: Backend> Core<B> {
                 self.events.emit(Event::Connection(state));
             }
             RtmEvent::Event(mut event) => {
-                if let SlackEvent::Unknown { r#type, .. } = &event {
+                if matches!(&event, SlackEvent::EmojiChanged(_)) {
+                    let (backend, store, ws, events) = (
+                        self.backend.clone(),
+                        Arc::clone(&self.store),
+                        self.workspace.clone(),
+                        self.events.clone(),
+                    );
+                    self.spawn("emoji.list", async move {
+                        if let Ok(emoji) = backend.custom_emoji().await {
+                            let pairs: Vec<(String, String)> = emoji.into_iter().collect();
+                            let _ =
+                                with_store(&store, move |s| s.replace_custom_emoji(&ws, &pairs))
+                                    .await;
+                            events.emit(Event::SidebarChanged);
+                        }
+                        Ok(())
+                    });
+                }
+                if let SlackEvent::Unknown { r#type, raw } = &event {
                     if matches!(
                         r#type.as_str(),
                         "saved_added"
@@ -1156,6 +1255,67 @@ impl<B: Backend> Core<B> {
                             }
                             Ok(())
                         });
+                    } else if r#type == "user_status_changed" {
+                        if let Some(user_val) = raw.get("user") {
+                            if let Ok(user) =
+                                serde_json::from_value::<crate::types::User>(user_val.clone())
+                            {
+                                let id = user.id.clone();
+                                let ws = self.workspace.clone();
+                                let _ = with_store(&self.store, move |s| s.upsert_user(&ws, &user))
+                                    .await;
+                                self.events.emit(Event::UsersChanged(vec![id]));
+                            }
+                        }
+                    } else if matches!(
+                        r#type.as_str(),
+                        "sh_room_join" | "sh_room_update" | "sh_room_leave"
+                    ) {
+                        if let Some(room) = raw.get("room") {
+                            let ended = room
+                                .get("has_ended")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            let participants: Vec<UserId> = room
+                                .get("participants")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(UserId::from)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let mut channels: Vec<ChannelId> = room
+                                .get("channels")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(ChannelId::from)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if channels.is_empty() {
+                                if let Some(cid) = raw
+                                    .get("huddle")
+                                    .and_then(|h| h.get("channel_id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .or_else(|| {
+                                        raw.get("channel_id").and_then(serde_json::Value::as_str)
+                                    })
+                                {
+                                    channels.push(ChannelId::from(cid));
+                                }
+                            }
+                            for channel in channels {
+                                self.events.emit(Event::HuddleUpdated {
+                                    channel,
+                                    participants: participants.clone(),
+                                    ended: ended || participants.is_empty(),
+                                });
+                            }
+                        }
                     }
                 }
                 if let Some(channel) = refresh_target(&event) {
@@ -2672,6 +2832,7 @@ pub(crate) mod tests {
             channel: ChannelId,
             post_at: u64,
             content: MessageContent,
+            _thread_ts: Option<Ts>,
         ) -> api::Result<api::ScheduledMessageCreated> {
             let mut state = self.state.lock().unwrap();
             let id = format!("Q{}", state.scheduled.len() + 1);
@@ -2778,6 +2939,41 @@ pub(crate) mod tests {
             _query: String,
         ) -> api::Result<api::EdgeSearchResults> {
             Ok(api::EdgeSearchResults::default())
+        }
+
+        async fn search_remote_messages(
+            &self,
+            _query: String,
+            _sort: api::SearchSort,
+            page: usize,
+        ) -> api::Result<api::RemoteMessagePage> {
+            Ok(api::RemoteMessagePage {
+                page,
+                ..Default::default()
+            })
+        }
+
+        async fn search_remote_files(
+            &self,
+            _query: String,
+            _sort: api::SearchSort,
+            page: usize,
+        ) -> api::Result<api::RemoteFilePage> {
+            Ok(api::RemoteFilePage {
+                page,
+                ..Default::default()
+            })
+        }
+
+        async fn update_profile(
+            &self,
+            _update: api::ProfileUpdate,
+        ) -> api::Result<crate::types::Profile> {
+            Ok(crate::types::Profile::default())
+        }
+
+        async fn set_presence(&self, _away: bool) -> api::Result<()> {
+            Ok(())
         }
     }
 
@@ -2963,6 +3159,7 @@ pub(crate) mod tests {
             channel: c1(),
             post_at: 1_760_010_000,
             content: MessageContent::plain("later"),
+            thread_ts: None,
         });
         let Event::MessageScheduled {
             channel,

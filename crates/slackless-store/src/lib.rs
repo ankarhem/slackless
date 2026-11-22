@@ -21,7 +21,7 @@ pub mod query;
 mod schema;
 mod store;
 
-pub use query::{Date, Has, SearchFilters, SearchQuery};
+pub use query::{Date, Has, SearchFilters, SearchQuery, SearchSort};
 pub use schema::SCHEMA_VERSION;
 pub use store::{MemberCounts, Revision, Store, StoredMessage};
 

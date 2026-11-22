@@ -24,10 +24,11 @@ pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
     AppCommand, AuthTest, BookmarksList, CanvasCreated, ChannelBookmark, ClientCounts,
     ConversationCounts, ConversationView, EdgeSearchResults, FilesFilter, GifItem, HistoryOpts,
-    ListOpts, MessageContent, PinnedItem, PinsList, PostedMessage, SavedItem, SavedItemState,
-    SavedMark, ScheduledMessage, ScheduledMessageCreated, SearchChannel, SearchMatch,
-    SearchMessages, SearchOpts, SearchPagination, SearchSort, SectionCreated, ThreadCounts,
-    ThreadSubscription, ThreadsView, UploadFile, UploadSlot, UserBoot,
+    ListOpts, MessageContent, PinnedItem, PinsList, PostedMessage, ProfileUpdate, RemoteFilePage,
+    RemoteMessageHit, RemoteMessagePage, SavedItem, SavedItemState, SavedMark, ScheduledMessage,
+    ScheduledMessageCreated, SearchChannel, SearchMatch, SearchMessages, SearchOpts,
+    SearchPagination, SearchSort, SectionCreated, ThreadCounts, ThreadSubscription, ThreadsView,
+    UploadFile, UploadSlot, UserBoot,
 };
 pub use pagination::{Page, paginate};
 

@@ -2544,6 +2544,254 @@ impl SlackApi {
         }
         Ok(results)
     }
+
+    /// `search.modules.messages`: private web-client message search (`docs/research/api-search.md`).
+    pub async fn search_modules_messages(
+        &self,
+        query: &str,
+        sort: SearchSort,
+        page: usize,
+    ) -> Result<RemoteMessagePage> {
+        let sort_key = match sort {
+            SearchSort::Score => "score",
+            SearchSort::Timestamp => "timestamp",
+        };
+        let params = vec![
+            ("module", "messages".to_owned()),
+            ("query", query.to_owned()),
+            ("page", page.max(1).to_string()),
+            ("count", "20".to_owned()),
+            ("extracts", "1".to_owned()),
+            ("highlight", "0".to_owned()),
+            ("max_extract_len", "200".to_owned()),
+            ("extra_message_data", "1".to_owned()),
+            ("no_user_profile", "1".to_owned()),
+            ("file_title_only", "false".to_owned()),
+            ("query_rewrite_disabled", "false".to_owned()),
+            ("include_files_shares", "1".to_owned()),
+            ("search_context", "desktop_messages_tab".to_owned()),
+            ("sort", sort_key.to_owned()),
+            ("sort_dir", "desc".to_owned()),
+            ("search_tab_filter", "messages".to_owned()),
+            ("search_tab_sort", sort_key.to_owned()),
+            ("_x_reason", "search-modules-messages".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+            ("_x_app_name", "client".to_owned()),
+        ];
+        let wire: SearchModulesMessagesWire =
+            self.call("search.modules.messages", params).await?.data;
+        Ok(parse_search_modules_messages(wire))
+    }
+
+    /// `search.modules.files`: private web-client file search (`docs/research/api-search.md`).
+    pub async fn search_modules_files(
+        &self,
+        query: &str,
+        sort: SearchSort,
+        page: usize,
+    ) -> Result<RemoteFilePage> {
+        let sort_key = match sort {
+            SearchSort::Score => "score",
+            SearchSort::Timestamp => "timestamp",
+        };
+        let params = vec![
+            ("module", "files".to_owned()),
+            ("query", query.to_owned()),
+            ("page", page.max(1).to_string()),
+            ("count", "20".to_owned()),
+            ("extracts", "1".to_owned()),
+            ("highlight", "0".to_owned()),
+            ("extra_message_data", "1".to_owned()),
+            ("file_title_only", "false".to_owned()),
+            ("query_rewrite_disabled", "false".to_owned()),
+            ("include_files_shares", "1".to_owned()),
+            ("search_context", "desktop_files_tab".to_owned()),
+            ("sort", sort_key.to_owned()),
+            ("sort_dir", "desc".to_owned()),
+            ("search_tab_filter", "messages".to_owned()),
+            ("search_tab_sort", sort_key.to_owned()),
+            ("_x_reason", "search-modules-files".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+            ("_x_app_name", "client".to_owned()),
+        ];
+        let wire: SearchModulesFilesWire = self.call("search.modules.files", params).await?.data;
+        Ok(parse_search_modules_files(wire))
+    }
+
+    /// `users.profile.set`: sparse update to the caller's profile or custom status.
+    pub async fn users_profile_set(
+        &self,
+        update: &ProfileUpdate,
+    ) -> Result<slackless_types::Profile> {
+        let profile_json = serde_json::to_string(update)
+            .map_err(|e| crate::ApiError::Slack(format!("invalid profile update payload: {e}")))?;
+        let params = vec![
+            ("profile", profile_json),
+            ("_x_reason", "profile-edit".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let resp: ProfileSetWire = self.call("users.profile.set", params).await?.data;
+        Ok(resp.profile)
+    }
+
+    /// `presence.set`: private web-client manual presence toggle (`"active"` or `"away"`).
+    pub async fn presence_set(&self, away: bool) -> Result<()> {
+        let presence = if away { "away" } else { "active" };
+        let params = vec![
+            ("presence", presence.to_owned()),
+            ("_x_reason", "manual-presence".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>("presence.set", params).await?;
+        Ok(())
+    }
+
+    /// `users.prefs.set`: write a single user preference key/value pair back to Slack.
+    pub async fn users_prefs_set(&self, name: &str, value: &str) -> Result<()> {
+        let params = vec![
+            ("name", name.to_owned()),
+            ("value", value.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>("users.prefs.set", params).await?;
+        Ok(())
+    }
+}
+
+/// One message hit returned by `search.modules.messages`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteMessageHit {
+    pub channel: ChannelId,
+    pub channel_name: Option<String>,
+    pub message: Message,
+}
+
+/// One page of remote message search hits.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RemoteMessagePage {
+    pub hits: Vec<RemoteMessageHit>,
+    pub total: usize,
+    pub page: usize,
+    pub page_count: usize,
+}
+
+/// One page of remote file search hits.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RemoteFilePage {
+    pub files: Vec<File>,
+    pub total: usize,
+    pub page: usize,
+    pub page_count: usize,
+}
+
+/// Sparse payload for `users.profile.set`: only `Some` fields are serialized.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ProfileUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_expiration: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pronouns: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ProfileSetWire {
+    #[serde(default)]
+    profile: slackless_types::Profile,
+}
+
+#[derive(Deserialize, Default)]
+struct ModulePaginationWire {
+    #[serde(default)]
+    total_count: usize,
+    #[serde(default)]
+    page: usize,
+    #[serde(default)]
+    page_count: usize,
+}
+
+#[derive(Deserialize, Default)]
+struct SearchModuleChannelWire {
+    #[serde(default)]
+    id: ChannelId,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct SearchModuleMessageGroupWire {
+    #[serde(default)]
+    channel: SearchModuleChannelWire,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    messages: Vec<Message>,
+}
+
+#[derive(Deserialize, Default)]
+struct SearchModulesMessagesWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    items: Vec<SearchModuleMessageGroupWire>,
+    #[serde(default)]
+    pagination: ModulePaginationWire,
+}
+
+#[derive(Deserialize, Default)]
+struct SearchModulesFilesWire {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    items: Vec<File>,
+    #[serde(default)]
+    pagination: ModulePaginationWire,
+}
+
+fn strip_highlight_markers(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\u{e000}' && c != '\u{e001}')
+        .collect()
+}
+
+fn parse_search_modules_messages(wire: SearchModulesMessagesWire) -> RemoteMessagePage {
+    let mut hits = Vec::new();
+    for group in wire.items {
+        if group.channel.id.as_str().is_empty() {
+            continue;
+        }
+        let channel_name = group.channel.name.filter(|s| !s.is_empty());
+        for mut message in group.messages {
+            if message.text.contains('\u{e000}') || message.text.contains('\u{e001}') {
+                message.text = strip_highlight_markers(&message.text);
+            }
+            hits.push(RemoteMessageHit {
+                channel: group.channel.id.clone(),
+                channel_name: channel_name.clone(),
+                message,
+            });
+        }
+    }
+    RemoteMessagePage {
+        hits,
+        total: wire.pagination.total_count,
+        page: wire.pagination.page.max(1),
+        page_count: wire.pagination.page_count,
+    }
+}
+
+fn parse_search_modules_files(wire: SearchModulesFilesWire) -> RemoteFilePage {
+    RemoteFilePage {
+        files: wire.items,
+        total: wire.pagination.total_count,
+        page: wire.pagination.page.max(1),
+        page_count: wire.pagination.page_count,
+    }
 }
 
 /// One workspace slash command returned by `client.appCommands` (`core`, `app`, or `service`).
@@ -3243,5 +3491,56 @@ mod tests {
         assert_eq!(parsed[0].usage, "issue title (optional)");
         assert_eq!(parsed[1].app_name.as_deref(), Some("Giphy"));
         assert_eq!(parsed[2].description, "Alias for /msg");
+    }
+
+    #[test]
+    fn parses_search_modules_messages_and_files_and_sparse_profile_update() {
+        let msg_wire: SearchModulesMessagesWire = serde_json::from_value(serde_json::json!({
+            "pagination": { "total_count": 42, "page": 1, "page_count": 3 },
+            "items": [
+                {
+                    "channel": { "id": "C01", "name": "general" },
+                    "messages": [
+                        { "ts": "1700000001.000100", "user": "U01", "text": "hello \u{e000}deploy\u{e001} ok" }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let page = parse_search_modules_messages(msg_wire);
+        assert_eq!(page.total, 42);
+        assert_eq!(page.page_count, 3);
+        assert_eq!(page.hits.len(), 1);
+        assert_eq!(page.hits[0].channel.as_str(), "C01");
+        assert_eq!(page.hits[0].channel_name.as_deref(), Some("general"));
+        assert_eq!(page.hits[0].message.text, "hello deploy ok");
+
+        let file_wire: SearchModulesFilesWire = serde_json::from_value(serde_json::json!({
+            "pagination": { "total_count": 1, "page": 1, "page_count": 1 },
+            "items": [
+                { "id": "F01", "name": "plan.pdf", "title": "Q4 Plan", "mimetype": "application/pdf", "size": 1024 }
+            ]
+        }))
+        .unwrap();
+        let files = parse_search_modules_files(file_wire);
+        assert_eq!(files.total, 1);
+        assert_eq!(files.files.len(), 1);
+        assert_eq!(files.files[0].id.as_str(), "F01");
+
+        let update = ProfileUpdate {
+            status_text: Some("In a meeting".into()),
+            status_emoji: Some(":calendar:".into()),
+            status_expiration: Some(1_700_003_600),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "status_text": "In a meeting",
+                "status_emoji": ":calendar:",
+                "status_expiration": 1_700_003_600
+            })
+        );
     }
 }

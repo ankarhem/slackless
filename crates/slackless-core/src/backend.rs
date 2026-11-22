@@ -279,6 +279,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
         channel: ChannelId,
         post_at: u64,
         content: MessageContent,
+        thread_ts: Option<Ts>,
     ) -> impl Future<Output = api::Result<ScheduledMessageCreated>> + Send;
     /// List pending scheduled messages (`chat.scheduledMessages.list`).
     fn scheduled_messages(&self)
@@ -347,6 +348,27 @@ pub trait Backend: Clone + Send + Sync + 'static {
         team_id: TeamId,
         query: String,
     ) -> impl Future<Output = api::Result<api::EdgeSearchResults>> + Send;
+    /// Opt-in remote Slack message search (`search.modules.messages`).
+    fn search_remote_messages(
+        &self,
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    ) -> impl Future<Output = api::Result<api::RemoteMessagePage>> + Send;
+    /// Opt-in remote Slack file search (`search.modules.files`).
+    fn search_remote_files(
+        &self,
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    ) -> impl Future<Output = api::Result<api::RemoteFilePage>> + Send;
+    /// Update the signed-in user's profile or custom status (`users.profile.set`).
+    fn update_profile(
+        &self,
+        update: api::ProfileUpdate,
+    ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send;
+    /// Manually set presence active or away (`presence.set`).
+    fn set_presence(&self, away: bool) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -690,8 +712,9 @@ impl Backend for SlackApi {
         channel: ChannelId,
         post_at: u64,
         content: MessageContent,
+        thread_ts: Option<Ts>,
     ) -> api::Result<ScheduledMessageCreated> {
-        self.chat_schedule_message(&channel, post_at, &content, None)
+        self.chat_schedule_message(&channel, post_at, &content, thread_ts.as_ref())
             .await
     }
 
@@ -778,5 +801,34 @@ impl Backend for SlackApi {
             users: users.unwrap_or_default(),
             channels: channels.unwrap_or_default(),
         })
+    }
+
+    async fn search_remote_messages(
+        &self,
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    ) -> api::Result<api::RemoteMessagePage> {
+        SlackApi::search_modules_messages(self, &query, sort, page).await
+    }
+
+    async fn search_remote_files(
+        &self,
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    ) -> api::Result<api::RemoteFilePage> {
+        SlackApi::search_modules_files(self, &query, sort, page).await
+    }
+
+    async fn update_profile(
+        &self,
+        update: api::ProfileUpdate,
+    ) -> api::Result<slackless_types::Profile> {
+        SlackApi::users_profile_set(self, &update).await
+    }
+
+    async fn set_presence(&self, away: bool) -> api::Result<()> {
+        SlackApi::presence_set(self, away).await
     }
 }

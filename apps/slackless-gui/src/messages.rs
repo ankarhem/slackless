@@ -321,6 +321,7 @@ impl MessageList {
                         | ComposerEvent::SlashCommand(_)
                         | ComposerEvent::SubmitWithFiles { .. }
                         | ComposerEvent::Schedule { .. }
+                        | ComposerEvent::ScheduleCustom(_)
                         | ComposerEvent::EditLast
                         | ComposerEvent::Typing => {}
                     },

@@ -261,7 +261,7 @@ use crate::canvas::canvas_view;
 use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
 use crate::composer::{self, Composer, ComposerEvent, ContextBar, Placeholder, TypingNames};
 use crate::directory::{DirectoryEvent, DirectoryView};
-use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
+use crate::drafts::{DraftsEvent, DraftsView, Entry, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent, PickerTab};
 use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
@@ -325,6 +325,7 @@ actions!(
         MarkConversationRead,
         MarkAllRead,
         SearchConversation,
+        ToggleWorkspaceRail,
         ZoomIn,
         ZoomOut,
         ActualSize,
@@ -445,6 +446,7 @@ struct Parked {
     usergroups: Vec<Usergroup>,
     app_commands: Vec<slackless_core::api::AppCommand>,
     visits: HashMap<ChannelId, u32>,
+    active_huddles: HashMap<ChannelId, Vec<UserId>>,
     connection: Option<slackless_core::rtm::ConnectionState>,
     member_counts: HashMap<ChannelId, u32>,
     app_counts: HashMap<ChannelId, u32>,
@@ -506,6 +508,8 @@ pub struct App {
     /// The fixture huddle's bar and the channel it runs in; `None` without a huddle.
     huddle: Option<(ChannelId, Entity<HuddleBar>)>,
     huddle_open: bool,
+    /// Live huddles currently running in this workspace (`sh_room_*` socket updates): channel -> participant user ids.
+    active_huddles: HashMap<ChannelId, Vec<UserId>>,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
     /// The theme last installed (mode, color theme, focus mode's grayscale), so unrelated
@@ -845,6 +849,7 @@ impl App {
                 KeyBinding::new("cmd-shift-y", SetStatus, None),
                 KeyBinding::new("cmd-g", FocusSearch, None),
                 KeyBinding::new("cmd-f", SearchConversation, None),
+                KeyBinding::new("cmd-shift-s", ToggleWorkspaceRail, None),
                 // Slack's View menu shows Cmd++; Cmd+= (no Shift) zooms in too.
                 KeyBinding::new("cmd-+", ZoomIn, None),
                 KeyBinding::new("cmd-=", ZoomIn, None),
@@ -1109,7 +1114,20 @@ impl App {
                             this.run_slash(invocation, None, window, cx);
                         }
                         ComposerEvent::Schedule { text, when } => {
-                            this.schedule(text.clone(), *when, window, cx);
+                            let channel = this.channel.clone();
+                            this.schedule_at(
+                                channel,
+                                None,
+                                text.clone(),
+                                when.at(now_secs()),
+                                when.label().to_lowercase(),
+                                window,
+                                cx,
+                            );
+                        }
+                        ComposerEvent::ScheduleCustom(text) => {
+                            let channel = this.channel.clone();
+                            this.open_custom_schedule(channel, None, text.clone(), window, cx);
                         }
                         ComposerEvent::Typing => this.bridge.send(Command::Typing {
                             channel: this.channel.clone(),
@@ -1155,6 +1173,7 @@ impl App {
                     |this: &mut App, _, event: &StatusEvent, window, cx| {
                         if let StatusEvent::Save(status) = event {
                             this.self_state.set_status(status.clone());
+                            this.send_status_to_slack(this.self_state.status.as_ref());
                             this.push_self_state(cx);
                         }
                         window.close_dialog(cx);
@@ -1560,6 +1579,7 @@ impl App {
                 tab: ConversationTab::Messages,
                 huddle,
                 huddle_open: false,
+                active_huddles: HashMap::new(),
                 preferences,
                 applied_theme,
                 color_mode,
@@ -2245,6 +2265,9 @@ impl App {
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
         self.compose
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
+        let remote_auto = settings.remote_search_auto;
+        self.results
+            .update(cx, |view, _| view.set_remote_auto(remote_auto));
         if self
             .saved_settings
             .as_ref()
@@ -2268,12 +2291,189 @@ impl App {
         self.apply_preferences(window, cx);
     }
 
-    /// End a timed focus mode once its Duration ran out (checked on the reminder poll).
+    /// End a timed focus mode or expired custom status once its Duration ran out (checked on
+    /// the reminder poll).
     fn expire_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.self_state.focus_until.is_some() && !self.self_state.focused() {
             self.self_state.end_focus();
             self.apply_preferences(window, cx);
         }
+        if self.self_state.expire_status() {
+            self.push_self_state(cx);
+        }
+    }
+
+    /// Toggle the leftmost workspace switcher rail (`Cmd+Shift+S` / View menu) and persist.
+    fn toggle_workspace_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preferences.update(cx, |prefs, cx| {
+            let mut next = prefs.settings().clone();
+            next.show_workspace_rail = !next.show_workspace_rail;
+            prefs.load_settings(next, window, cx);
+        });
+        self.apply_preferences(window, cx);
+        cx.notify();
+    }
+
+    /// Sync the signed-in user's custom status (or clear it with `None`) to Slack via
+    /// `users.profile.set`.
+    fn send_status_to_slack(&self, status: Option<&crate::status::UserStatus>) {
+        if self.fixtures.sample {
+            return;
+        }
+        let update = match status {
+            Some(s) => slackless_core::api::ProfileUpdate {
+                status_text: Some(s.text.clone()),
+                status_emoji: Some(format!(":{}:", s.emoji.trim_matches(':'))),
+                status_expiration: Some(s.clears_at().unwrap_or(0)),
+                ..Default::default()
+            },
+            None => slackless_core::api::ProfileUpdate {
+                status_text: Some(String::new()),
+                status_emoji: Some(String::new()),
+                status_expiration: Some(0),
+                ..Default::default()
+            },
+        };
+        self.bridge.send(Command::UpdateProfile { update });
+    }
+
+    /// Open Slack's "Edit your profile" dialog for the signed-in user (display name, title,
+    /// phone, pronouns), persisting via `users.profile.set`.
+    fn open_profile_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let me = self.fixtures.user(&self.fixtures.self_user).cloned();
+        let initial_display = me
+            .as_ref()
+            .and_then(|u| u.profile.display_name.clone())
+            .unwrap_or_default();
+        let initial_title = me
+            .as_ref()
+            .and_then(|u| u.profile.title.clone())
+            .unwrap_or_default();
+        let initial_phone = me
+            .as_ref()
+            .and_then(|u| u.profile.phone.clone())
+            .unwrap_or_default();
+        let initial_pronouns = self
+            .fixtures
+            .profile_extras
+            .get(&self.fixtures.self_user)
+            .and_then(|e| e.pronouns.clone())
+            .unwrap_or_default();
+
+        let display_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("Display name")
+                .auto_grow(1, 1);
+            s.set_value(initial_display, window, cx);
+            s
+        });
+        let title_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("What I do (e.g. Developer)")
+                .auto_grow(1, 1);
+            s.set_value(initial_title, window, cx);
+            s
+        });
+        let phone_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("Phone number")
+                .auto_grow(1, 1);
+            s.set_value(initial_phone, window, cx);
+            s
+        });
+        let pronouns_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("Pronouns (optional)")
+                .auto_grow(1, 1);
+            s.set_value(initial_pronouns, window, cx);
+            s
+        });
+
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (muted, border) = (theme.muted_foreground, theme.border);
+            let field = |label: &'static str, state: &Entity<TextareaState>| {
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(Textarea::new(state).appearance(false).bordered(false)),
+                    )
+            };
+            let this_save = this.clone();
+            let (d_save, t_save, p_save, pr_save) = (
+                display_in.clone(),
+                title_in.clone(),
+                phone_in.clone(),
+                pronouns_in.clone(),
+            );
+            dialog.title("Edit your profile").w(px(460.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(field("Display name", &display_in))
+                    .child(field("Title", &title_in))
+                    .child(field("Phone", &phone_in))
+                    .child(field("Pronouns", &pronouns_in))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("profile-edit-cancel")
+                                    .outline()
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("profile-edit-save")
+                                    .primary()
+                                    .label("Save Changes")
+                                    .on_click(move |_, window, cx| {
+                                        let update = slackless_core::api::ProfileUpdate {
+                                            display_name: Some(
+                                                d_save.read(cx).value().trim().to_owned(),
+                                            ),
+                                            title: Some(t_save.read(cx).value().trim().to_owned()),
+                                            phone: Some(p_save.read(cx).value().trim().to_owned()),
+                                            pronouns: Some(
+                                                pr_save.read(cx).value().trim().to_owned(),
+                                            ),
+                                            ..Default::default()
+                                        };
+                                        if let Some(app) = this_save.upgrade() {
+                                            app.update(cx, |app, cx| {
+                                                if !app.fixtures.sample {
+                                                    app.bridge
+                                                        .send(Command::UpdateProfile { update });
+                                                }
+                                                notify(
+                                                    "Profile updated",
+                                                    "Your profile changes were saved.",
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                        window.close_dialog(cx);
+                                    }),
+                            ),
+                    ),
+            )
+        });
     }
 
     /// The composer prompts with the open conversation's name, as Slack does.
@@ -2521,8 +2721,16 @@ impl App {
                 self.user_menu_open = false;
                 self.open_status_picker(window, cx);
             }
-            UserMenuEvent::ClearStatus => self.self_state.set_status(None),
-            UserMenuEvent::SetAway(away) => self.self_state.away = *away,
+            UserMenuEvent::ClearStatus => {
+                self.self_state.set_status(None);
+                self.send_status_to_slack(None);
+            }
+            UserMenuEvent::SetAway(away) => {
+                self.self_state.away = *away;
+                if !self.fixtures.sample {
+                    self.bridge.send(Command::SetPresence { away: *away });
+                }
+            }
             UserMenuEvent::Pause(until) => {
                 self.self_state.paused_until = *until;
                 self.user_menu_open = false;
@@ -3364,7 +3572,11 @@ impl App {
     /// The header's huddle button: the sample workspace toggles its huddle bar; a live
     /// conversation starts or joins its huddle in Slack's web client (no media stack here).
     fn start_huddle(&mut self, cx: &mut Context<Self>) {
-        if self.huddle_here() {
+        let has_fixture_bar = self
+            .huddle
+            .as_ref()
+            .is_some_and(|(channel, _)| *channel == self.channel);
+        if has_fixture_bar {
             self.huddle_open = !self.huddle_open;
             cx.notify();
         } else {
@@ -3794,6 +4006,26 @@ impl App {
                         .extend(users.iter().map(|u| (u.clone(), presence.clone())));
                 }
             }
+            Event::HuddleUpdated {
+                channel,
+                participants,
+                ended,
+            } => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    if *ended {
+                        parked.active_huddles.remove(channel);
+                    } else {
+                        parked
+                            .active_huddles
+                            .insert(channel.clone(), participants.clone());
+                    }
+                    let keys: HashSet<ChannelId> = parked.active_huddles.keys().cloned().collect();
+                    parked
+                        .views
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
+                }
+            }
             _ => {}
         }
     }
@@ -4016,6 +4248,44 @@ impl App {
                 let ws = self.workspace;
                 self.apply_saved_loaded(ws, items, cx);
             }
+            Event::RemoteMessagesPage {
+                query,
+                sort,
+                page,
+                result,
+            } => {
+                let mapped = result.as_ref().map(|p| (**p).clone()).map_err(Clone::clone);
+                self.results.update(cx, |view, cx| {
+                    view.set_remote_messages(query, *sort, *page, mapped, cx);
+                });
+            }
+            Event::RemoteFilesPage {
+                query,
+                sort,
+                page,
+                result,
+            } => {
+                let mapped = result.as_ref().map(|p| (**p).clone()).map_err(Clone::clone);
+                self.results.update(cx, |view, cx| {
+                    view.set_remote_files(query, *sort, *page, mapped, cx);
+                });
+            }
+            Event::HuddleUpdated {
+                channel,
+                participants,
+                ended,
+            } => {
+                if *ended {
+                    self.active_huddles.remove(channel);
+                } else {
+                    self.active_huddles
+                        .insert(channel.clone(), participants.clone());
+                }
+                let keys: HashSet<ChannelId> = self.active_huddles.keys().cloned().collect();
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -4076,6 +4346,15 @@ impl App {
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
+        // Hydrate custom status from Slack's live self profile (preserving active focus mode).
+        if !self.self_state.focused() {
+            if let Some(me) = self.fixtures.user(&self.fixtures.self_user) {
+                let remote = crate::status::UserStatus::from_profile(&me.profile);
+                if self.self_state.status != remote {
+                    self.self_state.set_status(remote);
+                }
+            }
+        }
         self.sync_connect_orgs(cx);
         self.resolve_users(self.fixtures.dms.iter().filter_map(|dm| dm.user.clone()));
         if !keep {
@@ -4708,6 +4987,7 @@ impl App {
                     usergroups: Vec::new(),
                     app_commands: Vec::new(),
                     visits: HashMap::new(),
+                    active_huddles: HashMap::new(),
                     connection: None,
                     member_counts: HashMap::new(),
                     app_counts: HashMap::new(),
@@ -4727,6 +5007,7 @@ impl App {
             usergroups: mem::replace(&mut self.usergroups, incoming.usergroups),
             app_commands: mem::replace(&mut self.app_commands, incoming.app_commands),
             visits: mem::replace(&mut self.visits, incoming.visits),
+            active_huddles: mem::replace(&mut self.active_huddles, incoming.active_huddles),
             connection: mem::replace(&mut self.connection, incoming.connection),
             member_counts: mem::replace(&mut self.member_counts, incoming.member_counts),
             app_counts: mem::replace(&mut self.app_counts, incoming.app_counts),
@@ -5099,28 +5380,33 @@ impl App {
         cx.notify();
     }
 
-    /// Queue the composer's draft for later delivery in the open conversation.
-    fn schedule(
+    /// Queue a message (in a channel or inside `thread_ts`) for delivery at unix timestamp
+    /// `post_at`, recording it in Drafts & sent and posting `chat.scheduleMessage` live.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_at(
         &mut self,
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
         text: String,
-        when: SendLater,
+        post_at: u64,
+        when_label: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let post_at = when.at(now_secs());
         if !self.fixtures.sample {
             let content = composer::content_of(&text, &self.fixtures);
             self.bridge.send(Command::ScheduleMessage {
-                channel: self.channel.clone(),
+                channel: channel.clone(),
                 post_at,
                 content,
+                thread_ts,
             });
         }
         let entry = Entry {
             id: None,
             workspace: self.workspace,
-            channel: self.channel.clone(),
-            label: self.label(&self.channel),
+            channel: channel.clone(),
+            label: self.label(&channel),
             text,
             at: post_at,
         };
@@ -5129,10 +5415,135 @@ impl App {
         self.save_draft(cx);
         notify(
             "Message scheduled",
-            format!("Sends {}. See Drafts & sent.", when.label().to_lowercase()),
+            format!("Sends {when_label}. See Drafts & sent."),
             window,
             cx,
         );
+    }
+
+    /// Open a native dialog for picking a custom local date (`YYYY-MM-DD`) and time (`HH:MM`)
+    /// to schedule `text` in `channel` (optionally in `thread_ts`).
+    fn open_custom_schedule(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = now_secs() as i64;
+        let offset = crate::messages::local_offset_now();
+        let tomorrow_day = (now + offset).div_euclid(86_400) + 1;
+        let (y, m, d) = civil_from_days(tomorrow_day);
+        let default_date = format!("{y:04}-{m:02}-{d:02}");
+
+        let date_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("YYYY-MM-DD")
+                .auto_grow(1, 1);
+            s.set_value(default_date, window, cx);
+            s
+        });
+        let time_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("HH:MM (24-hour)")
+                .auto_grow(1, 1);
+            s.set_value("09:00", window, cx);
+            s
+        });
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (muted, border) = (theme.muted_foreground, theme.border);
+            let field = |label: &'static str, state: &Entity<TextareaState>| {
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(Textarea::new(state).appearance(false).bordered(false)),
+                    )
+            };
+            let this_save = this.clone();
+            let (d_in, t_in) = (date_in.clone(), time_in.clone());
+            let (ch, th, body) = (channel.clone(), thread_ts.clone(), text.clone());
+            dialog.title("Schedule message").w(px(400.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Choose a local date and 24-hour time to send your message."),
+                    )
+                    .child(field("Date (YYYY-MM-DD)", &date_in))
+                    .child(field("Time (HH:MM)", &time_in))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("sched-custom-cancel")
+                                    .outline()
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("sched-custom-ok")
+                                    .primary()
+                                    .label("Schedule message")
+                                    .on_click(move |_, window, cx| {
+                                        let ds = d_in.read(cx).value().trim().to_owned();
+                                        let ts = t_in.read(cx).value().trim().to_owned();
+                                        let Some(post_at) = parse_local_schedule(&ds, &ts) else {
+                                            notify(
+                                                "Invalid date or time",
+                                                "Use YYYY-MM-DD and HH:MM in the future.",
+                                                window,
+                                                cx,
+                                            );
+                                            return;
+                                        };
+                                        if let Some(app) = this_save.upgrade() {
+                                            app.update(cx, |app, cx| {
+                                                if th.is_some() {
+                                                    app.thread.update(cx, |panel, cx| {
+                                                        panel.clear_composer(window, cx);
+                                                    });
+                                                } else {
+                                                    app.composer.update(cx, |c, cx| {
+                                                        c.load_draft("", cx);
+                                                    });
+                                                }
+                                                app.schedule_at(
+                                                    ch.clone(),
+                                                    th.clone(),
+                                                    body.clone(),
+                                                    post_at,
+                                                    format!("on {ds} at {ts}"),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                        window.close_dialog(cx);
+                                    }),
+                            ),
+                    ),
+            )
+        });
     }
 
     /// Deliver a scheduled message now; it shows in the transcript when its workspace is the
@@ -5219,6 +5630,11 @@ impl App {
             }
             SlashKind::Away => {
                 self.self_state.away = !self.self_state.away;
+                if !self.fixtures.sample {
+                    self.bridge.send(Command::SetPresence {
+                        away: self.self_state.away,
+                    });
+                }
                 self.push_self_state(cx);
                 let state = if self.self_state.away {
                     "away"
@@ -5228,7 +5644,8 @@ impl App {
                 notify("/away", format!("You are now {state}."), window, cx);
             }
             SlashKind::Status if invocation.args.eq_ignore_ascii_case("clear") => {
-                self.self_state.status = None;
+                self.self_state.set_status(None);
+                self.send_status_to_slack(None);
                 self.push_self_state(cx);
                 notify("/status", "Your status was cleared.", window, cx);
             }
@@ -5252,6 +5669,7 @@ impl App {
         self.huddle
             .as_ref()
             .is_some_and(|(channel, _)| *channel == self.channel)
+            || self.active_huddles.contains_key(&self.channel)
     }
 
     /// The channel browser in a gpui-kit dialog (gpui-kit-guide section 7).
@@ -5837,6 +6255,9 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &SearchConversation, window, cx| {
                 this.search_in_conversation(window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleWorkspaceRail, window, cx| {
+                this.toggle_workspace_rail(window, cx)
+            }))
             .relative()
             .size_full()
             .bg(chrome)
@@ -5848,7 +6269,10 @@ impl Render for App {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(switcher)
+                    .when(
+                        self.preferences.read(cx).settings().show_workspace_rail,
+                        |row| row.child(switcher),
+                    )
                     // Slack's workspace panel: the tab rail and the tab panel (sidebar,
                     // conversation, side panel) in one rounded card inset from the window's
                     // right and bottom edges, lifted by a shadow in light mode and outlined in
@@ -6943,8 +7367,38 @@ impl App {
                     .items_center()
                     .gap_1()
                     .when(can_huddle, |actions| {
+                        let live_count = self
+                            .active_huddles
+                            .get(&self.channel)
+                            .map(Vec::len)
+                            .unwrap_or(0);
                         actions
-                            .child(
+                            .child(if live_count > 0 {
+                                h_flex()
+                                    .id("hdr-huddle")
+                                    .h(px(28.))
+                                    .px_2()
+                                    .gap_1()
+                                    .rounded_sm()
+                                    .items_center()
+                                    .bg(success.opacity(0.16))
+                                    .cursor_pointer()
+                                    .hover(|el| el.bg(success.opacity(0.24)))
+                                    .child(
+                                        Icon::new(IconName::Headphones)
+                                            .text_color(success)
+                                            .size(px(14.)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(success)
+                                            .child(live_count.to_string()),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx)))
+                                    .into_any_element()
+                            } else {
                                 chrome_icon(
                                     "hdr-huddle",
                                     IconName::Headphones,
@@ -6955,8 +7409,9 @@ impl App {
                                     },
                                     accent,
                                 )
-                                .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx))),
-                            )
+                                .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx)))
+                                .into_any_element()
+                            })
                             .child(self.huddle_menu(cx))
                     })
                     .child(self.notify_menu(conversation, cx))
@@ -7332,6 +7787,20 @@ fn subscribe_workspace(
                     this.select(channel.clone(), cx);
                     this.messages.update(cx, |list, cx| list.reveal(ts, cx));
                 }
+                SearchEvent::RemoteMessages { query, sort, page } => {
+                    this.bridge.send(Command::SearchRemoteMessages {
+                        query: query.clone(),
+                        sort: *sort,
+                        page: *page,
+                    });
+                }
+                SearchEvent::RemoteFiles { query, sort, page } => {
+                    this.bridge.send(Command::SearchRemoteFiles {
+                        query: query.clone(),
+                        sort: *sort,
+                        page: *page,
+                    });
+                }
             },
         ),
         cx.subscribe_in(
@@ -7466,6 +7935,35 @@ fn subscribe_workspace(
                     let thread = this.thread.read(cx).open_thread();
                     this.run_slash(invocation, thread, window, cx)
                 }
+                ThreadPanelEvent::Schedule {
+                    channel,
+                    thread_ts,
+                    text,
+                    when,
+                } => {
+                    this.schedule_at(
+                        channel.clone(),
+                        Some(thread_ts.clone()),
+                        text.clone(),
+                        when.at(now_secs()),
+                        when.label().to_lowercase(),
+                        window,
+                        cx,
+                    );
+                }
+                ThreadPanelEvent::ScheduleCustom {
+                    channel,
+                    thread_ts,
+                    text,
+                } => {
+                    this.open_custom_schedule(
+                        channel.clone(),
+                        Some(thread_ts.clone()),
+                        text.clone(),
+                        window,
+                        cx,
+                    );
+                }
                 ThreadPanelEvent::Later(request) => this.save_for_later(request, cx),
                 ThreadPanelEvent::Changed { channel, change } => this.post_change(channel, change),
                 ThreadPanelEvent::SetSubscribed {
@@ -7510,6 +8008,7 @@ fn subscribe_workspace(
                     }
                 }
                 ProfileEvent::EditStatus => this.open_status_picker(window, cx),
+                ProfileEvent::EditProfile => this.open_profile_editor(window, cx),
             },
         ),
         cx.subscribe_in(
@@ -7775,6 +8274,36 @@ fn forget_failure<T>(loaded: &mut HashMap<ChannelId, Loaded<T>>, channel: &Chann
     if loaded.get(channel).is_some_and(Result::is_err) {
         loaded.remove(channel);
     }
+}
+
+/// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 into `(year, month, day)`.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    (year as i32, m as u32, d as u32)
+}
+
+/// Parse a local `YYYY-MM-DD` date and `HH:MM` (24-hour) time into a future unix timestamp.
+fn parse_local_schedule(date_str: &str, time_str: &str) -> Option<u64> {
+    let date = slackless_core::store::Date::parse(date_str)?;
+    let (h_str, m_str) = time_str.split_once(':')?;
+    let hour: i64 = h_str.trim().parse().ok()?;
+    let min: i64 = m_str.trim().parse().ok()?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&min) {
+        return None;
+    }
+    let offset = crate::messages::local_offset_now();
+    let utc = date.unix_start() + hour * 3_600 + min * 60 - offset;
+    let now = now_secs() as i64;
+    (utc > now + 30).then_some(utc as u64)
 }
 
 /// A 28px square chrome icon button.

@@ -264,11 +264,12 @@ pub enum Command {
     /// Resume the signed-in user's notifications immediately (`dnd.endSnooze`).
     EndDndSnooze,
     /// Queue a message for delivery at unix timestamp `post_at` (`chat.scheduleMessage`),
-    /// then reload the workspace's scheduled messages.
+    /// optionally inside a thread (`thread_ts`), then reload scheduled messages.
     ScheduleMessage {
         channel: ChannelId,
         post_at: u64,
         content: MessageContent,
+        thread_ts: Option<Ts>,
     },
     /// Fetch pending scheduled messages (`chat.scheduledMessages.list`).
     LoadScheduledMessages,
@@ -317,6 +318,26 @@ pub enum Command {
     /// Fast remote typeahead for Cmd+K Quick Switcher (`edgeapi` `users/search` + `channels/search`).
     QuickSwitchSearch {
         query: String,
+    },
+    /// Opt-in remote Slack message search (`search.modules.messages`).
+    SearchRemoteMessages {
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    },
+    /// Opt-in remote Slack file search (`search.modules.files`).
+    SearchRemoteFiles {
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+    },
+    /// Update the signed-in user's profile or custom status (`users.profile.set`).
+    UpdateProfile {
+        update: api::ProfileUpdate,
+    },
+    /// Manually set presence active or away (`presence.set`).
+    SetPresence {
+        away: bool,
     },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
@@ -460,6 +481,26 @@ pub enum Event {
     QuickSwitchResults {
         query: String,
         results: Box<api::EdgeSearchResults>,
+    },
+    /// Opt-in remote message search page (`search.modules.messages`).
+    RemoteMessagesPage {
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+        result: Result<Box<api::RemoteMessagePage>, String>,
+    },
+    /// Opt-in remote file search page (`search.modules.files`).
+    RemoteFilesPage {
+        query: String,
+        sort: api::SearchSort,
+        page: usize,
+        result: Result<Box<api::RemoteFilePage>, String>,
+    },
+    /// Live huddle state update for a conversation (`sh_room_join` / `sh_room_update` / `sh_room_leave`).
+    HuddleUpdated {
+        channel: ChannelId,
+        participants: Vec<UserId>,
+        ended: bool,
     },
     /// A non-fatal failure worth surfacing.
     Error(String),

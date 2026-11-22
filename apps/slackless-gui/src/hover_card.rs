@@ -433,10 +433,11 @@ mod tests {
         let mut fixtures = crate::fixtures::load();
         let self_state = SelfState {
             status: Some(UserStatus {
-                emoji: "coffee",
+                emoji: "coffee".to_owned(),
                 text: "Brewing".to_owned(),
                 clear_after: 0,
                 pause: false,
+                expiration: None,
             }),
             ..SelfState::default()
         };

@@ -130,6 +130,7 @@ impl NewMessageView {
                         }
                         // Scheduling is turned off here, and a new message has nothing to edit.
                         ComposerEvent::Schedule { .. }
+                        | ComposerEvent::ScheduleCustom(_)
                         | ComposerEvent::EditLast
                         | ComposerEvent::Typing
                         | ComposerEvent::Cancel => {}

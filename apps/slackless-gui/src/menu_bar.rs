@@ -21,7 +21,7 @@ use crate::app::{
     OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads, OpenDrafts, OpenFiles, OpenLater,
     OpenOwnProfile, OpenPeople, OpenPreferences, OpenRecent, OpenThreads, OpenUnreads,
     PreviousWorkspace, QuickSwitch, SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace,
-    ZoomIn, ZoomOut,
+    ToggleWorkspaceRail, ZoomIn, ZoomOut,
 };
 
 actions!(
@@ -136,6 +136,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
             MenuItem::action("Find\u{2026}", SearchConversation),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Toggle Workspace Switcher", ToggleWorkspaceRail),
             MenuItem::action("Toggle Full Screen", ToggleFullScreen),
             MenuItem::separator(),
             MenuItem::action("Actual Size", ActualSize),

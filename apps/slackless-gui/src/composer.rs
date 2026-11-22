@@ -73,6 +73,8 @@ pub enum ComposerEvent {
     SlashCommand(Invocation),
     /// The draft, as mrkdwn, was scheduled for later (composer already cleared).
     Schedule { text: String, when: SendLater },
+    /// The user chose "Custom time..." in the Schedule Send menu (draft kept until confirmed).
+    ScheduleCustom(String),
     /// Up was pressed in an empty draft: edit the user's last message here.
     EditLast,
     /// The user typed into the draft: tell the conversation they are typing (emitted at most
@@ -767,6 +769,15 @@ impl Composer {
         if let Some(doc) = self.take(window, cx) {
             let text = doc.to_mrkdwn();
             cx.emit(ComposerEvent::Schedule { text, when });
+        }
+    }
+
+    /// Ask the root to open the Custom Schedule Send dialog for the current draft (does not
+    /// clear the draft yet — root clears it once confirmed).
+    fn schedule_custom(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.doc().to_mrkdwn();
+        if !text.trim().is_empty() {
+            cx.emit(ComposerEvent::ScheduleCustom(text));
         }
     }
 }

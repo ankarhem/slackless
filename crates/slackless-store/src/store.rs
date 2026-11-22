@@ -803,15 +803,48 @@ impl Store {
         query: &SearchQuery,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
+        self.search_sorted(workspace, query, crate::query::SearchSort::Recent, limit)
+    }
+
+    /// Local search with explicit sort order (`Recent` = newest first; `Relevant` = FTS5 BM25
+    /// relevance when free text is present, breaking ties by newest first).
+    pub fn search_sorted(
+        &self,
+        workspace: &TeamId,
+        query: &SearchQuery,
+        sort: crate::query::SearchSort,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
         let f = &query.filters;
-        let mut sql = String::from(
-            "SELECT m.channel_id, m.json, m.deleted FROM message_current m
-             WHERE m.workspace_id = ? AND m.deleted = 0",
-        );
+        let fts = query.fts_match();
+        let rank_relevant = sort == crate::query::SearchSort::Relevant && fts.is_some();
+        let mut sql = if rank_relevant {
+            String::from(
+                "SELECT m.channel_id, m.json, m.deleted FROM message_current m
+                 JOIN message_fts ON message_fts.rowid = m.id
+                 WHERE m.workspace_id = ? AND m.deleted = 0 AND message_fts MATCH ?",
+            )
+        } else {
+            String::from(
+                "SELECT m.channel_id, m.json, m.deleted FROM message_current m
+                 WHERE m.workspace_id = ? AND m.deleted = 0",
+            )
+        };
         let mut args = vec![SqlValue::Text(workspace.as_str().to_owned())];
-        if let Some(fts) = query.fts_match() {
-            sql.push_str(" AND m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)");
-            args.push(SqlValue::Text(fts));
+        if let Some(fts) = fts {
+            if rank_relevant {
+                args.push(SqlValue::Text(fts));
+            } else {
+                sql.push_str(
+                    " AND m.id IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)",
+                );
+                args.push(SqlValue::Text(fts));
+            }
+        } else if let Some(excluded_fts) = query.fts_excluded_match() {
+            sql.push_str(
+                " AND m.id NOT IN (SELECT rowid FROM message_fts WHERE message_fts MATCH ?)",
+            );
+            args.push(SqlValue::Text(excluded_fts));
         }
         any_of(
             &mut sql,
@@ -820,10 +853,25 @@ impl Store {
             "m.channel_id = ?1 OR m.channel_id IN (SELECT id FROM conversation
                  WHERE workspace_id = m.workspace_id AND name = ?1 COLLATE NOCASE)",
         );
+        none_of(
+            &mut sql,
+            &mut args,
+            &f.exclude_channels,
+            "m.channel_id = ?1 OR m.channel_id IN (SELECT id FROM conversation
+                 WHERE workspace_id = m.workspace_id AND name = ?1 COLLATE NOCASE)",
+        );
         any_of(
             &mut sql,
             &mut args,
             &f.from_users,
+            r#"m.user_id = ?1 OR m.user_id IN (SELECT id FROM "user"
+                 WHERE workspace_id = m.workspace_id AND (name = ?1 COLLATE NOCASE
+                   OR display_name = ?1 COLLATE NOCASE OR real_name = ?1 COLLATE NOCASE))"#,
+        );
+        none_of(
+            &mut sql,
+            &mut args,
+            &f.exclude_users,
             r#"m.user_id = ?1 OR m.user_id IN (SELECT id FROM "user"
                  WHERE workspace_id = m.workspace_id AND (name = ?1 COLLATE NOCASE
                    OR display_name = ?1 COLLATE NOCASE OR real_name = ?1 COLLATE NOCASE))"#,
@@ -854,7 +902,11 @@ impl Store {
         if f.threads_only {
             sql.push_str(" AND m.thread_ts IS NOT NULL");
         }
-        sql.push_str(" ORDER BY m.ts_key DESC LIMIT ?");
+        if rank_relevant {
+            sql.push_str(" ORDER BY bm25(message_fts), m.ts_key DESC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY m.ts_key DESC LIMIT ?");
+        }
         args.push(SqlValue::Integer(limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -877,6 +929,22 @@ fn any_of(sql: &mut String, args: &mut Vec<SqlValue>, values: &[String], clause:
         })
         .collect();
     sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
+}
+
+/// Appends ` AND NOT (clause(v1) OR clause(v2) ...)`; `?1` in `clause` is the value placeholder.
+fn none_of(sql: &mut String, args: &mut Vec<SqlValue>, values: &[String], clause: &str) {
+    if values.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = values
+        .iter()
+        .map(|v| {
+            let occurrences = clause.matches("?1").count();
+            args.extend((0..occurrences).map(|_| SqlValue::Text(v.clone())));
+            format!("({})", clause.replace("?1", "?"))
+        })
+        .collect();
+    sql.push_str(&format!(" AND NOT ({})", parts.join(" OR ")));
 }
 
 /// Orders sections for display: the `next_id` chain starting at the section no other section

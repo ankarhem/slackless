@@ -34,6 +34,8 @@ pub enum ProfileEvent {
     Message(UserId),
     /// The signed-in user's "Set a status".
     EditStatus,
+    /// The signed-in user's "Edit profile".
+    EditProfile,
 }
 
 pub struct ProfilePanel {
@@ -287,12 +289,22 @@ impl Render for ProfilePanel {
                 row.child(
                     action(
                         "profile-status",
-                        IconName::Pencil,
+                        IconName::CircleDot,
                         "Set a status",
                         border,
                         hover,
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(ProfileEvent::EditStatus))),
+                )
+                .child(
+                    action(
+                        "profile-edit",
+                        IconName::Pencil,
+                        "Edit profile",
+                        border,
+                        hover,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ProfileEvent::EditProfile))),
                 )
             })
             // A deactivated person cannot be messaged.

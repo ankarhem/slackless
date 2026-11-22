@@ -106,22 +106,56 @@ impl PauseLength {
 /// A custom status: emoji shortcode (no colons), text, and when it clears.
 #[derive(Clone, PartialEq)]
 pub struct UserStatus {
-    pub emoji: &'static str,
+    pub emoji: String,
     pub text: String,
     /// Index into [`CLEAR_AFTER`].
     pub clear_after: usize,
     /// Slack's "Pause notifications until status is cleared".
     pub pause: bool,
+    /// Concrete unix expiration timestamp (seconds), when set or synced from Slack.
+    pub expiration: Option<i64>,
 }
 
 impl UserStatus {
     pub fn glyph(&self) -> &'static str {
-        emoji_glyph(self.emoji).unwrap_or("\u{1F4AC}")
+        emoji_glyph(self.emoji.as_str()).unwrap_or("\u{1F4AC}")
+    }
+
+    /// Hydrate a [`UserStatus`] from a Slack [`Profile`], dropping expired or empty ones.
+    pub fn from_profile(profile: &slackless_core::types::Profile) -> Option<Self> {
+        let text = profile.status_text.as_deref().unwrap_or_default().trim();
+        let emoji = profile
+            .status_emoji
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches(':');
+        if text.is_empty() && emoji.is_empty() {
+            return None;
+        }
+        let expiration = profile.status_expiration.filter(|&ts| ts > 0);
+        if expiration.is_some_and(|ts| ts <= now_secs()) {
+            return None;
+        }
+        Some(Self {
+            emoji: if emoji.is_empty() {
+                EMOJI_CHOICES[0].to_owned()
+            } else {
+                emoji.to_owned()
+            },
+            text: text.to_owned(),
+            clear_after: 0,
+            pause: false,
+            expiration,
+        })
     }
 
     /// When a status set now clears (Unix seconds); `None` for "Don't clear". "Today" ends
     /// at local midnight, "This week" at the local midnight starting next Monday.
     pub fn clears_at(&self) -> Option<i64> {
+        if let Some(exp) = self.expiration {
+            return Some(exp);
+        }
         let now = now_secs();
         let offset = local_offset_now();
         let day = (now + offset).div_euclid(86_400);
@@ -167,10 +201,11 @@ pub const FOCUS_UNTIL_OFF: usize = 3;
 /// with the telescope.
 fn focus_status() -> UserStatus {
     UserStatus {
-        emoji: "telescope",
+        emoji: "telescope".to_owned(),
         text: "In focus mode".to_owned(),
         clear_after: 0,
         pause: false,
+        expiration: None,
     }
 }
 
@@ -213,13 +248,33 @@ impl SelfState {
     /// Set (or with `None` clear) the custom status. A status saved with "Pause notifications
     /// until status is cleared" pauses until it clears (indefinitely for "Don't clear"), and
     /// replacing or clearing such a status resumes notifications.
-    pub fn set_status(&mut self, status: Option<UserStatus>) {
+    pub fn set_status(&mut self, mut status: Option<UserStatus>) {
+        if let Some(new) = status.as_mut() {
+            if new.expiration.is_none() {
+                new.expiration = new.clears_at();
+            }
+        }
         if let Some(new) = status.as_ref().filter(|status| status.pause) {
             self.paused_until = Some(new.clears_at().unwrap_or(i64::MAX));
         } else if self.status.as_ref().is_some_and(|old| old.pause) {
             self.paused_until = None;
         }
         self.status = status;
+    }
+
+    /// Clear the custom status if its expiration timestamp has passed. Returns `true` if cleared.
+    pub fn expire_status(&mut self) -> bool {
+        let expired = self
+            .status
+            .as_ref()
+            .and_then(|s| s.expiration)
+            .is_some_and(|exp| exp <= now_secs());
+        if expired {
+            self.set_status(None);
+            true
+        } else {
+            false
+        }
     }
 
     /// `Notifications paused until 4:30 PM`, or just `Notifications paused` while paused
@@ -292,7 +347,7 @@ pub enum StatusEvent {
 /// workspace's suggestions, then (once a suggestion is picked or text typed) the status with
 /// its Duration select and the pause checkbox.
 pub struct StatusPicker {
-    emoji: &'static str,
+    emoji: String,
     /// An emoji was chosen (or loaded): until then the field shows Slack's smiley outline.
     emoji_set: bool,
     text: Entity<TextareaState>,
@@ -329,7 +384,7 @@ impl StatusPicker {
                 },
             )];
             StatusPicker {
-                emoji: EMOJI_CHOICES[0],
+                emoji: EMOJI_CHOICES[0].to_owned(),
                 emoji_set: false,
                 text,
                 has_text: false,
@@ -363,12 +418,12 @@ impl StatusPicker {
     fn load(&mut self, status: Option<&UserStatus>, window: &mut Window, cx: &mut Context<Self>) {
         let (emoji, text, clear_after, pause) = match status {
             Some(status) => (
-                status.emoji,
+                status.emoji.clone(),
                 status.text.clone(),
                 status.clear_after,
                 status.pause,
             ),
-            None => (EMOJI_CHOICES[0], String::new(), 0, false),
+            None => (EMOJI_CHOICES[0].to_owned(), String::new(), 0, false),
         };
         self.emoji = emoji;
         self.emoji_set = status.is_some();
@@ -384,11 +439,16 @@ impl StatusPicker {
 
     fn save(&mut self, cx: &mut Context<Self>) {
         let text = self.text.read(cx).value().trim().to_owned();
-        let status = (!text.is_empty()).then_some(UserStatus {
-            emoji: self.emoji,
-            text,
-            clear_after: self.clear_after,
-            pause: self.pause,
+        let status = (!text.is_empty()).then(|| {
+            let mut s = UserStatus {
+                emoji: self.emoji.clone(),
+                text,
+                clear_after: self.clear_after,
+                pause: self.pause,
+                expiration: None,
+            };
+            s.expiration = s.clears_at();
+            s
         });
         cx.emit(StatusEvent::Save(status));
     }
@@ -397,10 +457,11 @@ impl StatusPicker {
         let (emoji, text, clear_after) = SUGGESTED[ix];
         self.load(
             Some(&UserStatus {
-                emoji,
+                emoji: emoji.to_owned(),
                 text: text.to_owned(),
                 clear_after,
                 pause: false,
+                expiration: None,
             }),
             window,
             cx,
@@ -422,7 +483,7 @@ impl Render for StatusPicker {
             theme.sidebar_accent,
         );
         let foreground = theme.foreground;
-        let glyph = emoji_glyph(self.emoji).unwrap_or("\u{1F4AC}");
+        let glyph = emoji_glyph(self.emoji.as_str()).unwrap_or("\u{1F4AC}");
         let show_glyph = self.emoji_set || self.has_text;
 
         let field = h_flex()
@@ -507,7 +568,7 @@ impl Render for StatusPicker {
                         .hover(|el| el.bg(hover))
                         .child(emoji_glyph(code).unwrap_or("?"))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.emoji = code;
+                            this.emoji = code.to_owned();
                             this.emoji_set = true;
                             this.emoji_open = false;
                             cx.notify();

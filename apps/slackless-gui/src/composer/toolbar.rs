@@ -390,7 +390,18 @@ impl Composer {
                             }),
                     );
                 }
-                menu
+                let custom_this = this.clone();
+                menu.separator().item(
+                    PopupMenuItem::new("Custom time\u{2026}")
+                        .icon(IconName::Calendar)
+                        .on_click(move |_, _, cx| {
+                            if let Some(this) = custom_this.upgrade() {
+                                this.update(cx, |composer, cx| {
+                                    composer.schedule_custom(cx);
+                                });
+                            }
+                        }),
+                )
             });
         div()
             .id("schedule-tip")

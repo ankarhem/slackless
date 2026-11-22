@@ -3,11 +3,23 @@
 //! Recognized modifiers become [`SearchFilters`] (SQL WHERE clauses); everything else, including
 //! a modifier whose value does not parse, is free text for the FTS5 MATCH.
 
+/// Sort order for local and remote search results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchSort {
+    /// Newest messages first (`ts_key DESC` locally, `timestamp/desc` remotely).
+    #[default]
+    Recent,
+    /// Best match first (`bm25` locally when free text is present, `score/desc` remotely).
+    Relevant,
+}
+
 /// A parsed search query.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchQuery {
     /// Free-text terms; a quoted phrase is one term.
     pub terms: Vec<String>,
+    /// Excluded free-text terms (`-word`, `-"exact phrase"`).
+    pub excluded_terms: Vec<String>,
     pub filters: SearchFilters,
 }
 
@@ -17,8 +29,12 @@ pub struct SearchQuery {
 pub struct SearchFilters {
     /// Channel ids or names (`#` and `<#C…|name>` wrappers stripped).
     pub in_channels: Vec<String>,
+    /// Excluded channel ids or names (`-in:#channel`).
+    pub exclude_channels: Vec<String>,
     /// User ids or names (`@` and `<@U…>` wrappers stripped).
     pub from_users: Vec<String>,
+    /// Excluded user ids or names (`-from:@user`).
+    pub exclude_users: Vec<String>,
     /// Messages strictly before this day (UTC).
     pub before: Option<Date>,
     /// Messages strictly after this day (UTC).
@@ -96,17 +112,26 @@ impl SearchQuery {
     /// Parses a Slack-style query string. Never fails.
     pub fn parse(input: &str) -> Self {
         let mut query = Self::default();
-        for (token, quoted) in tokenize(input) {
+        for (token, quoted, negated_quote) in tokenize(input) {
             if token.is_empty() {
                 continue;
             }
-            let is_modifier = !quoted
-                && token
-                    .split_once(':')
-                    .is_some_and(|(key, value)| query.filters.apply(key, value));
-            if !is_modifier {
-                query.terms.push(token);
+            if negated_quote {
+                query.excluded_terms.push(token);
+                continue;
             }
+            if !quoted {
+                if let Some((key, value)) = token.split_once(':') {
+                    if query.filters.apply(key, value) {
+                        continue;
+                    }
+                }
+                if let Some(excluded) = token.strip_prefix('-').filter(|t| !t.is_empty()) {
+                    query.excluded_terms.push(excluded.to_owned());
+                    continue;
+                }
+            }
+            query.terms.push(token);
         }
         query
     }
@@ -117,15 +142,37 @@ impl SearchQuery {
     }
 
     /// The FTS5 MATCH expression: every term quoted (so FTS5 syntax in user input is literal),
-    /// implicitly ANDed. `None` when there is no free text.
+    /// implicitly ANDed, with any `-excluded` terms appended via `NOT`. `None` when there are
+    /// no positive free-text terms (use [`Self::fts_excluded_match`] for negative-only queries).
     pub fn fts_match(&self) -> Option<String> {
-        (!self.terms.is_empty()).then(|| {
-            self.terms
+        if self.terms.is_empty() {
+            return None;
+        }
+        let mut expr = self
+            .terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for excluded in &self.excluded_terms {
+            expr.push_str(&format!(" NOT \"{}\"", excluded.replace('"', "\"\"")));
+        }
+        Some(expr)
+    }
+
+    /// FTS5 MATCH expression for excluded terms when a query has `-term` exclusions without
+    /// positive free-text terms (`OR`-joined so matching rows can be filtered with `NOT IN`).
+    pub fn fts_excluded_match(&self) -> Option<String> {
+        if !self.terms.is_empty() || self.excluded_terms.is_empty() {
+            return None;
+        }
+        Some(
+            self.excluded_terms
                 .iter()
                 .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
                 .collect::<Vec<_>>()
-                .join(" ")
-        })
+                .join(" OR "),
+        )
     }
 }
 
@@ -137,7 +184,9 @@ impl SearchFilters {
         }
         match key.to_ascii_lowercase().as_str() {
             "in" => self.in_channels.push(unwrap_ref(value, "<#", '#')),
+            "-in" => self.exclude_channels.push(unwrap_ref(value, "<#", '#')),
             "from" => self.from_users.push(unwrap_ref(value, "<@", '@')),
+            "-from" => self.exclude_users.push(unwrap_ref(value, "<@", '@')),
             "before" => match Date::parse(value) {
                 Some(d) => self.before = Some(d),
                 None => return false,
@@ -164,27 +213,34 @@ fn unwrap_ref(value: &str, open: &str, sigil: char) -> String {
     value.strip_prefix(sigil).unwrap_or(value).to_owned()
 }
 
-/// Splits on whitespace outside double quotes; quotes are removed. The flag is true when the
-/// token began with a quote (a quoted `"in:x"` is free text, not a modifier).
-fn tokenize(input: &str) -> Vec<(String, bool)> {
+/// Splits on whitespace outside double quotes; quotes are removed.
+/// Returns `(token, started_quoted, negated_quote)`:
+/// - `started_quoted`: `"in:x"` or `"-word"` stays positive literal free text
+/// - `negated_quote`: `-"exact phrase"` becomes an excluded free-text phrase
+fn tokenize(input: &str) -> Vec<(String, bool, bool)> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let (mut in_quotes, mut started_quoted, mut has_token) = (false, false, false);
+    let (mut in_quotes, mut started_quoted, mut negated_quote, mut has_token) =
+        (false, false, false, false);
     for c in input.chars() {
         match c {
             '"' => {
                 if !has_token {
                     started_quoted = true;
+                } else if !in_quotes && current == "-" {
+                    current.clear();
+                    negated_quote = true;
                 }
                 in_quotes = !in_quotes;
                 has_token = true;
             }
             c if c.is_whitespace() && !in_quotes => {
                 if has_token {
-                    tokens.push((std::mem::take(&mut current), started_quoted));
+                    tokens.push((std::mem::take(&mut current), started_quoted, negated_quote));
                 }
                 has_token = false;
                 started_quoted = false;
+                negated_quote = false;
             }
             c => {
                 current.push(c);
@@ -193,7 +249,7 @@ fn tokenize(input: &str) -> Vec<(String, bool)> {
         }
     }
     if has_token {
-        tokens.push((current, started_quoted));
+        tokens.push((current, started_quoted, negated_quote));
     }
     tokens
 }
@@ -264,5 +320,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(q.fts_match().as_deref(), Some(r#""a""b""#));
+    }
+
+    #[test]
+    fn parses_exclusions_for_terms_phrases_channels_and_users() {
+        let q =
+            SearchQuery::parse(r#"deploy -staging -"dry run" -in:#alerts -from:@bot "-literal""#);
+        assert_eq!(q.terms, vec!["deploy", "-literal"]);
+        assert_eq!(q.excluded_terms, vec!["staging", "dry run"]);
+        assert_eq!(q.filters.exclude_channels, vec!["alerts"]);
+        assert_eq!(q.filters.exclude_users, vec!["bot"]);
+        assert_eq!(
+            q.fts_match().as_deref(),
+            Some(r#""deploy" "-literal" NOT "staging" NOT "dry run""#)
+        );
+        assert_eq!(q.fts_excluded_match(), None);
+
+        let neg_only = SearchQuery::parse("-noise -spam");
+        assert_eq!(neg_only.fts_match(), None);
+        assert_eq!(
+            neg_only.fts_excluded_match().as_deref(),
+            Some(r#""noise" OR "spam""#)
+        );
     }
 }

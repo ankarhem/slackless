@@ -23,7 +23,7 @@ use gpui_kit::gpui::{
 };
 use slackless_core::types::{ChannelId, UserId};
 
-use crate::directory_rows::{channel_row, channels, people, person_row};
+use crate::directory_rows::{channel_row, channels, people, person_row, usergroup_row, usergroups};
 use crate::fixtures::Fixtures;
 
 /// Rows listed per tab at once.
@@ -33,6 +33,7 @@ const MAX_ROWS: usize = 30;
 enum DirectoryTab {
     People,
     Channels,
+    UserGroups,
 }
 
 pub enum DirectoryEvent {
@@ -118,11 +119,15 @@ impl Render for DirectoryView {
         let needle = self.needle(cx);
         let fixtures = self.fixtures.clone();
         let (tab, joined) = (self.tab, &self.joined);
-        let (matching_people, matching_channels) =
-            (people(&fixtures, &needle), channels(&fixtures, &needle));
+        let (matching_people, matching_channels, matching_groups) = (
+            people(&fixtures, &needle),
+            channels(&fixtures, &needle),
+            usergroups(&fixtures, &needle),
+        );
         let count = match tab {
             DirectoryTab::People => matching_people.len(),
             DirectoryTab::Channels => matching_channels.len(),
+            DirectoryTab::UserGroups => matching_groups.len(),
         };
         let rows: Vec<_> = match tab {
             DirectoryTab::People => matching_people
@@ -137,10 +142,21 @@ impl Render for DirectoryView {
                 .enumerate()
                 .map(|(ix, channel)| channel_row(ix, channel, joined, cx))
                 .collect(),
+            DirectoryTab::UserGroups => matching_groups
+                .iter()
+                .take(MAX_ROWS)
+                .enumerate()
+                .map(|(ix, group)| usergroup_row(self, ix, group, cx))
+                .collect(),
         };
         let tab_row = [
             (DirectoryTab::People, "People", "directory-tab-People"),
             (DirectoryTab::Channels, "Channels", "directory-tab-Channels"),
+            (
+                DirectoryTab::UserGroups,
+                "User groups",
+                "directory-tab-UserGroups",
+            ),
         ]
         .map(|(tab, label, id)| {
             let active = tab == self.tab;
