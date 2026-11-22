@@ -1058,6 +1058,61 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `conversations.addTab`: add a tab (`files`, `bookmarks`, `folder`, `canvas`, etc.) to `channel` (`F-CORE-061`).
+    pub async fn conversations_add_tab(
+        &self,
+        channel: &ChannelId,
+        tab_type: &str,
+        label: Option<&str>,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("channel_id", channel.as_str().to_owned()),
+            ("type", tab_type.to_owned()),
+            ("reason", "add-channel-tab".to_owned()),
+        ];
+        if let Some(label) = label.filter(|s| !s.is_empty()) {
+            params.push(("label", label.to_owned()));
+        }
+        let _: serde_json::Value = self.call(method::CONVERSATIONS_ADD_TAB, params).await?.data;
+        Ok(())
+    }
+
+    /// `conversations.removeTab`: remove a tab from `channel` while keeping shared files (`F-CORE-061`).
+    pub async fn conversations_remove_tab(&self, channel: &ChannelId, tab_id: &str) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel.as_str().to_owned()),
+            ("id", tab_id.to_owned()),
+            ("keep_file_share", "true".to_owned()),
+            ("reason", "remove-channel-tab".to_owned()),
+        ];
+        let _: serde_json::Value = self
+            .call(method::CONVERSATIONS_REMOVE_TAB, params)
+            .await?
+            .data;
+        Ok(())
+    }
+
+    /// `conversations.moveTab`: reorder a tab inside `channel` (`F-CORE-061`).
+    pub async fn conversations_move_tab(
+        &self,
+        channel: &ChannelId,
+        tab_id: &str,
+        after: Option<&str>,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("channel_id", channel.as_str().to_owned()),
+            ("id", tab_id.to_owned()),
+        ];
+        if let Some(after) = after.filter(|s| !s.is_empty()) {
+            params.push(("after", after.to_owned()));
+        }
+        let _: serde_json::Value = self
+            .call(method::CONVERSATIONS_MOVE_TAB, params)
+            .await?
+            .data;
+        Ok(())
+    }
+
     /// `client.userBoot` (cold boot): self, team, channels, IMs, priorities, prefs.
     pub async fn client_user_boot(&self) -> Result<UserBoot> {
         let params = vec![

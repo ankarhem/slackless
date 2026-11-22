@@ -21,6 +21,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -191,10 +192,33 @@ pub enum FilesPageEvent {
     Load(FilesFilter),
 }
 
+/// Client-side sort order over the loaded files page (`F-CORE-133`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilesSort {
+    Newest,
+    Oldest,
+    Name,
+    Largest,
+}
+
+impl FilesSort {
+    const ALL: [FilesSort; 4] = [Self::Newest, Self::Oldest, Self::Name, Self::Largest];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "Newest first",
+            Self::Oldest => "Oldest first",
+            Self::Name => "Name A\u{2013}Z",
+            Self::Largest => "Largest first",
+        }
+    }
+}
+
 pub struct FilesPage {
     fixtures: Arc<Fixtures>,
     section: FilesSection,
     chip: FilesChip,
+    sort: FilesSort,
     search: Entity<TextareaState>,
     /// The search, trimmed and lowercased; empty lists every row.
     query: String,
@@ -230,6 +254,7 @@ impl FilesPage {
                 fixtures,
                 section: FilesSection::All,
                 chip: FilesChip::All,
+                sort: FilesSort::Newest,
                 search,
                 query: String::new(),
                 rows: Default::default(),
@@ -357,13 +382,15 @@ impl FilesPage {
 
     fn refilter(&mut self) {
         let rows = &self.rows[self.section.source().index()];
-        self.shown = visible_files(
+        let mut shown = visible_files(
             &rows.files,
             self.section,
             self.chip,
             &self.fixtures.self_user,
             &self.query,
         );
+        sort_visible_files(&rows.files, &mut shown, self.sort);
+        self.shown = shown;
     }
 
     /// Slack's search box: a full-width field led by the magnifier.
@@ -470,6 +497,36 @@ impl Render for FilesPage {
             )
             .child(self.search_field(cx));
         let chips = self.chips(cx);
+        let current_sort = self.sort;
+        let this = cx.weak_entity();
+        let sort_menu = Button::new("files-sort-menu")
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::ArrowUpDown)
+            .label(current_sort.label())
+            .dropdown_menu(move |mut menu, _, _| {
+                for choice in FilesSort::ALL {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == current_sort)
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |page, cx| {
+                                    page.sort = choice;
+                                    page.refilter();
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
+        let toolbar = h_flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(chips)
+            .child(sort_menu);
         let rows = &self.rows[section.source().index()];
         let error = match &rows.load {
             Load::Failed(error) => Some(Self::error_row(error, cx)),
@@ -516,7 +573,7 @@ impl Render for FilesPage {
                         v_flex()
                             .gap_3()
                             .pb_6()
-                            .child(chips)
+                            .child(toolbar)
                             .children(error)
                             .child(body),
                     )),
@@ -651,6 +708,40 @@ fn visible_files(
         .collect()
 }
 
+/// Sort filtered file indices by `sort` (newest, oldest, name A-Z, or largest first).
+fn sort_visible_files(files: &[File], indices: &mut [usize], sort: FilesSort) {
+    match sort {
+        FilesSort::Newest => indices.sort_by(|&a, &b| {
+            let ta = files[a].created.or(files[a].timestamp).unwrap_or(0);
+            let tb = files[b].created.or(files[b].timestamp).unwrap_or(0);
+            tb.cmp(&ta)
+        }),
+        FilesSort::Oldest => indices.sort_by(|&a, &b| {
+            let ta = files[a].created.or(files[a].timestamp).unwrap_or(0);
+            let tb = files[b].created.or(files[b].timestamp).unwrap_or(0);
+            ta.cmp(&tb)
+        }),
+        FilesSort::Name => indices.sort_by(|&a, &b| {
+            let na = files[a]
+                .title
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(files[a].name.as_deref())
+                .unwrap_or(files[a].id.as_str());
+            let nb = files[b]
+                .title
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(files[b].name.as_deref())
+                .unwrap_or(files[b].id.as_str());
+            na.to_lowercase().cmp(&nb.to_lowercase())
+        }),
+        FilesSort::Largest => {
+            indices.sort_by(|&a, &b| files[b].size.unwrap_or(0).cmp(&files[a].size.unwrap_or(0)))
+        }
+    }
+}
+
 /// Each row's muted line: "<owner> · Created <when>", the owner marked "(you)" for the
 /// signed-in user; either half is left out when unknown.
 fn metas(fixtures: &Fixtures, files: &[File]) -> Vec<SharedString> {
@@ -773,5 +864,31 @@ mod tests {
             ["F2", "F4"]
         );
         assert!(shown(FilesSection::All, FilesChip::All, "budget").is_empty());
+    }
+
+    #[test]
+    fn sorts_visible_files_by_date_name_and_size() {
+        let mut a = file("F1", "zebra.txt", "text", ME);
+        a.created = Some(100);
+        a.size = Some(500);
+        let mut b = file("F2", "alpha.pdf", "pdf", ME);
+        b.created = Some(300);
+        b.size = Some(100);
+        let mut c = file("F3", "middle.png", "png", ME);
+        c.created = Some(200);
+        c.size = Some(900);
+        let files = vec![a, b, c];
+
+        let run = |sort| {
+            let mut ix = vec![0, 1, 2];
+            sort_visible_files(&files, &mut ix, sort);
+            ix.into_iter()
+                .map(|i| files[i].id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(FilesSort::Newest), ["F2", "F3", "F1"]);
+        assert_eq!(run(FilesSort::Oldest), ["F1", "F3", "F2"]);
+        assert_eq!(run(FilesSort::Name), ["F2", "F3", "F1"]);
+        assert_eq!(run(FilesSort::Largest), ["F3", "F1", "F2"]);
     }
 }

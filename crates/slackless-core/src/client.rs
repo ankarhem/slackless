@@ -1578,6 +1578,50 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::AddConversationTab {
+                channel,
+                tab_type,
+                label,
+            } => {
+                self.spawn("conversations.addTab", async move {
+                    backend
+                        .add_conversation_tab(channel.clone(), tab_type, label)
+                        .await?;
+                    if let Ok(fresh) = backend.conversation_info(channel.clone()).await {
+                        with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+                    }
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
+            Command::RemoveConversationTab { channel, tab_id } => {
+                self.spawn("conversations.removeTab", async move {
+                    backend
+                        .remove_conversation_tab(channel.clone(), tab_id)
+                        .await?;
+                    if let Ok(fresh) = backend.conversation_info(channel.clone()).await {
+                        with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+                    }
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
+            Command::MoveConversationTab {
+                channel,
+                tab_id,
+                after,
+            } => {
+                self.spawn("conversations.moveTab", async move {
+                    backend
+                        .move_conversation_tab(channel.clone(), tab_id, after)
+                        .await?;
+                    if let Ok(fresh) = backend.conversation_info(channel.clone()).await {
+                        with_store(&store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+                    }
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -3616,6 +3660,32 @@ pub(crate) mod tests {
         }
 
         async fn auth_revoke(&self) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn add_conversation_tab(
+            &self,
+            _channel: ChannelId,
+            _tab_type: String,
+            _label: Option<String>,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_conversation_tab(
+            &self,
+            _channel: ChannelId,
+            _tab_id: String,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn move_conversation_tab(
+            &self,
+            _channel: ChannelId,
+            _tab_id: String,
+            _after: Option<String>,
+        ) -> api::Result<()> {
             Ok(())
         }
     }

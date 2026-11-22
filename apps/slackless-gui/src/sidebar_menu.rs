@@ -232,7 +232,7 @@ impl Render for SectionNameForm {
 
 /// Slack's per-section "Filter" choice. Slack's default ("Active only") hides the
 /// conversations the server marks dormant; the rest widen or narrow the section's rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SectionFilter {
     ActiveOnly,
     Unreads,

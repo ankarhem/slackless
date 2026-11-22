@@ -224,7 +224,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Escape as InputEscape, InputEvent, Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, TitleBar, WindowExt as _, h_flex,
     h_resizable, resizable_panel, v_flex,
@@ -1668,7 +1668,13 @@ impl App {
             let parked = fixtures.workspaces.iter().map(|_| None).collect();
             // The fixture-derived feed lights the rail tile before any live fetch lands.
             let unread = activity.read(cx).unread_count();
-            sidebar.update(cx, |sidebar, cx| sidebar.set_activity_unread(unread, cx));
+            let saved_section_prefs = bridge.section_prefs();
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_activity_unread(unread, cx);
+                if let Some(prefs) = saved_section_prefs {
+                    sidebar.restore_section_prefs(prefs, cx);
+                }
+            });
 
             App {
                 fixtures,
@@ -6751,6 +6757,11 @@ impl App {
                         (fixtures, channel, archive, false)
                     };
                 let views = build_workspace(&fixtures, index, archive, &channel, window, cx);
+                if let Some(prefs) = self.bridge.section_prefs() {
+                    views
+                        .sidebar
+                        .update(cx, |sidebar, cx| sidebar.restore_section_prefs(prefs, cx));
+                }
                 let subscriptions = subscribe_workspace(&views, window, cx);
                 Parked {
                     fixtures,
@@ -9644,6 +9655,7 @@ impl App {
         );
         let this = cx.entity().downgrade();
         let sample = self.fixtures.sample;
+        let ch_for_add = self.channel.clone();
         let add_menu = Button::new("tab-add")
             .ghost()
             .with_size(Size::XSmall)
@@ -9651,12 +9663,43 @@ impl App {
             .tooltip("New tab")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                 if !sample {
-                    let this = this.clone();
+                    let this_canvas = this.clone();
                     menu = menu.item(
                         PopupMenuItem::new("Canvas")
                             .icon(IconName::LayoutTemplate)
                             .on_click(move |_, _, cx| {
-                                let _ = this.update(cx, |app, cx| app.open_or_add_canvas(cx));
+                                let _ =
+                                    this_canvas.update(cx, |app, cx| app.open_or_add_canvas(cx));
+                            }),
+                    );
+                    let this_files = this.clone();
+                    let ch_files = ch_for_add.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("Files & links")
+                            .icon(IconName::Files)
+                            .on_click(move |_, _, cx| {
+                                let _ = this_files.update(cx, |app, _| {
+                                    app.bridge.send(Command::AddConversationTab {
+                                        channel: ch_files.clone(),
+                                        tab_type: "files".to_owned(),
+                                        label: None,
+                                    });
+                                });
+                            }),
+                    );
+                    let this_pins = this.clone();
+                    let ch_pins = ch_for_add.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("Pins & bookmarks")
+                            .icon(IconName::Pin)
+                            .on_click(move |_, _, cx| {
+                                let _ = this_pins.update(cx, |app, _| {
+                                    app.bridge.send(Command::AddConversationTab {
+                                        channel: ch_pins.clone(),
+                                        tab_type: "bookmarks".to_owned(),
+                                        label: None,
+                                    });
+                                });
                             }),
                     );
                 }
@@ -9667,6 +9710,9 @@ impl App {
                     },
                 ))
             });
+        let tab_ids: Vec<Option<String>> = specs.iter().map(|s| s.tab_id.clone()).collect();
+        let ch_for_tabs = self.channel.clone();
+        let this_for_tabs = cx.entity().downgrade();
         h_flex()
             .items_stretch()
             .flex_none()
@@ -9675,7 +9721,7 @@ impl App {
             .h(px(40.))
             .border_b_1()
             .border_color(border)
-            .children(specs.into_iter().map(|spec| {
+            .children(specs.into_iter().enumerate().map(|(ix, spec)| {
                 let active = match &spec.action {
                     TabAction::Switch(target) => {
                         *target == self.tab
@@ -9683,6 +9729,7 @@ impl App {
                     }
                     _ => false,
                 };
+                let tab_id = spec.tab_id;
                 let entry = tab_views::tab(
                     spec.id,
                     spec.label,
@@ -9692,7 +9739,7 @@ impl App {
                     muted_foreground,
                     foreground,
                 );
-                match spec.action {
+                let clickable = match spec.action {
                     TabAction::Switch(target) => {
                         entry.on_click(cx.listener(move |this, _, _, cx| {
                             this.select_tab(target.clone(), cx);
@@ -9701,7 +9748,77 @@ impl App {
                     action => entry.on_click(cx.listener(move |this, _, _, cx| {
                         this.activate_tab(action.clone(), cx);
                     })),
+                };
+                if !sample {
+                    if let Some(tid) = tab_id {
+                        let prev_after = if ix >= 2 {
+                            tab_ids.get(ix - 2).cloned().flatten()
+                        } else {
+                            None
+                        };
+                        let can_left = ix > 1 && tab_ids.get(ix - 1).is_some_and(Option::is_some);
+                        let next_after = tab_ids.get(ix + 1).cloned().flatten();
+                        let ch_menu = ch_for_tabs.clone();
+                        let app_menu = this_for_tabs.clone();
+                        return clickable
+                            .context_menu(move |mut menu, _, _| {
+                                if can_left {
+                                    let ch = ch_menu.clone();
+                                    let tid = tid.clone();
+                                    let after = prev_after.clone();
+                                    let app = app_menu.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new("Move left")
+                                            .icon(IconName::ArrowLeft)
+                                            .on_click(move |_, _, cx| {
+                                                let _ = app.update(cx, |app, _| {
+                                                    app.bridge.send(Command::MoveConversationTab {
+                                                        channel: ch.clone(),
+                                                        tab_id: tid.clone(),
+                                                        after: after.clone(),
+                                                    });
+                                                });
+                                            }),
+                                    );
+                                }
+                                if let Some(after) = next_after.clone() {
+                                    let ch = ch_menu.clone();
+                                    let tid = tid.clone();
+                                    let app = app_menu.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new("Move right")
+                                            .icon(IconName::ArrowRight)
+                                            .on_click(move |_, _, cx| {
+                                                let _ = app.update(cx, |app, _| {
+                                                    app.bridge.send(Command::MoveConversationTab {
+                                                        channel: ch.clone(),
+                                                        tab_id: tid.clone(),
+                                                        after: Some(after.clone()),
+                                                    });
+                                                });
+                                            }),
+                                    );
+                                }
+                                let ch = ch_menu.clone();
+                                let tid = tid.clone();
+                                let app = app_menu.clone();
+                                menu.item(
+                                    PopupMenuItem::new("Remove tab")
+                                        .icon(IconName::Trash)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = app.update(cx, |app, _| {
+                                                app.bridge.send(Command::RemoveConversationTab {
+                                                    channel: ch.clone(),
+                                                    tab_id: tid.clone(),
+                                                });
+                                            });
+                                        }),
+                                )
+                            })
+                            .into_any_element();
+                    }
                 }
+                clickable.into_any_element()
             }))
             // The stretched row would top-align the small button: center it, as the tab
             // labels are.
@@ -9894,6 +10011,12 @@ fn subscribe_workspace(
                 }
                 SidebarEvent::OpenInNewWindow(channel) => {
                     this.pop_out_conversation(channel.clone(), cx)
+                }
+                SidebarEvent::SectionPrefsChanged => {
+                    let prefs = this.sidebar.read(cx).export_section_prefs();
+                    if let Some(write) = this.bridge.remember_section_prefs(&prefs) {
+                        cx.background_executor().spawn(write).detach();
+                    }
                 }
                 SidebarEvent::OpenDrafts => this.open_drafts(cx),
                 SidebarEvent::OpenLater => this.open_later(cx),

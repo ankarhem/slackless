@@ -465,6 +465,26 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<Vec<(String, String)>>> + Send;
     /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
     fn auth_revoke(&self) -> impl Future<Output = api::Result<()>> + Send;
+    /// Add a conversation tab (`conversations.addTab`, `F-CORE-061`).
+    fn add_conversation_tab(
+        &self,
+        channel: ChannelId,
+        tab_type: String,
+        label: Option<String>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Remove a conversation tab (`conversations.removeTab`, `F-CORE-061`).
+    fn remove_conversation_tab(
+        &self,
+        channel: ChannelId,
+        tab_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Move a conversation tab (`conversations.moveTab`, `F-CORE-061`).
+    fn move_conversation_tab(
+        &self,
+        channel: ChannelId,
+        tab_id: String,
+        after: Option<String>,
+    ) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -1031,5 +1051,29 @@ impl Backend for SlackApi {
 
     async fn auth_revoke(&self) -> api::Result<()> {
         SlackApi::auth_revoke(self).await
+    }
+
+    async fn add_conversation_tab(
+        &self,
+        channel: ChannelId,
+        tab_type: String,
+        label: Option<String>,
+    ) -> api::Result<()> {
+        self.conversations_add_tab(&channel, &tab_type, label.as_deref())
+            .await
+    }
+
+    async fn remove_conversation_tab(&self, channel: ChannelId, tab_id: String) -> api::Result<()> {
+        self.conversations_remove_tab(&channel, &tab_id).await
+    }
+
+    async fn move_conversation_tab(
+        &self,
+        channel: ChannelId,
+        tab_id: String,
+        after: Option<String>,
+    ) -> api::Result<()> {
+        self.conversations_move_tab(&channel, &tab_id, after.as_deref())
+            .await
     }
 }

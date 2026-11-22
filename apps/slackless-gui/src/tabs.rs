@@ -56,6 +56,9 @@ pub enum TabAction {
 /// One entry of the rendered tab row.
 pub struct TabSpec {
     pub id: SharedString,
+    /// Slack's `properties.tabs[].id` when derived from conversation properties (used by
+    /// `conversations.removeTab` / `conversations.moveTab`, `F-CORE-061`).
+    pub tab_id: Option<String>,
     pub label: SharedString,
     pub icon: IconName,
     pub action: TabAction,
@@ -86,6 +89,23 @@ const SAMPLE_TABS: [(&str, &str, IconName, ConversationTab); 3] = [
 fn spec(id: &str, label: &str, icon: IconName, action: TabAction) -> TabSpec {
     TabSpec {
         id: SharedString::from(id.to_owned()),
+        tab_id: None,
+        label: SharedString::from(label.to_owned()),
+        icon,
+        action,
+    }
+}
+
+fn spec_with_id(
+    id: &str,
+    tab_id: Option<String>,
+    label: &str,
+    icon: IconName,
+    action: TabAction,
+) -> TabSpec {
+    TabSpec {
+        id: SharedString::from(id.to_owned()),
+        tab_id,
         label: SharedString::from(label.to_owned()),
         icon,
         action,
@@ -140,19 +160,28 @@ pub fn derive(conversation: &Conversation, sample: bool) -> Vec<TabSpec> {
         (Some(_), _) => None,
     };
     if let Some((label, action)) = canvas {
-        row.push(spec("tab-canvas", label, IconName::LayoutTemplate, action));
+        let cid = canvas_tab.and_then(|t| t.id.clone());
+        row.push(spec_with_id(
+            "tab-canvas",
+            cid,
+            label,
+            IconName::LayoutTemplate,
+            action,
+        ));
     }
 
     for tab in tabs {
         match tab.kind.as_ref() {
-            Some(ConversationTabKind::Files) => row.push(spec(
+            Some(ConversationTabKind::Files) => row.push(spec_with_id(
                 "tab-files",
+                tab.id.clone(),
                 "Files & links",
                 IconName::Files,
                 TabAction::Switch(ConversationTab::Files),
             )),
-            Some(ConversationTabKind::Bookmarks) => row.push(spec(
+            Some(ConversationTabKind::Bookmarks) => row.push(spec_with_id(
                 "tab-pins",
+                tab.id.clone(),
                 "Pins",
                 IconName::Pin,
                 TabAction::Switch(ConversationTab::Pins),
@@ -171,8 +200,9 @@ pub fn derive(conversation: &Conversation, sample: bool) -> Vec<TabSpec> {
                     .as_deref()
                     .filter(|label| !label.is_empty())
                     .unwrap_or("Bookmarks");
-                row.push(spec(
+                row.push(spec_with_id(
                     "tab-folder",
+                    tab.id.clone(),
                     label,
                     IconName::Folder,
                     TabAction::Switch(ConversationTab::Folder {

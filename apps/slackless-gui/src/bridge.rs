@@ -48,6 +48,15 @@ pub struct SavedDraft {
     pub at: u64,
 }
 
+/// Persisted per-section sidebar filter and sort preferences for one workspace.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SectionPrefs {
+    #[serde(default)]
+    pub filters: HashMap<String, crate::sidebar_menu::SectionFilter>,
+    #[serde(default)]
+    pub sorts: HashMap<String, crate::sidebar_menu::SectionSort>,
+}
+
 /// Idle wait between event polls while the core is running. The guide's pattern would await
 /// the stream directly; without a `futures` dependency a short bounded poll keeps events at
 /// sub-frame latency without spinning the executor.
@@ -58,6 +67,9 @@ const HISTORY_LIMIT: usize = 500;
 
 /// The store's local-state key for the last open conversation.
 const LAST_CONVERSATION: &str = "last_conversation";
+
+/// The store's local-state key for per-section sidebar filter and sort choices.
+const SECTION_PREFS: &str = "section_prefs";
 
 /// The store's local-state key for the window's frame (AppKit restorable state, hex-encoded).
 const WINDOW_STATE: &str = "window_state";
@@ -570,6 +582,24 @@ impl CoreBridge {
             WORKSPACE_ORDER,
             serde_json::to_string(team_ids).ok()?,
             "workspace order",
+        )
+    }
+
+    /// Saved per-section sidebar filter and sort choices; `None` offline or unset.
+    pub fn section_prefs(&self) -> Option<SectionPrefs> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(SECTION_PREFS)?).ok()
+    }
+
+    /// Live mode: persist per-section sidebar filter & sort choices off the UI thread.
+    pub fn remember_section_prefs(
+        &self,
+        prefs: &SectionPrefs,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(
+            SECTION_PREFS,
+            serde_json::to_string(prefs).ok()?,
+            "sidebar section preferences",
         )
     }
 

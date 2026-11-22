@@ -12,10 +12,11 @@ mod output;
 mod session;
 mod write;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use slackless_core::auth::SessionStore;
 use slackless_core::store::{SearchQuery, Store};
 use slackless_core::types::{ChannelId, TeamId};
@@ -85,11 +86,33 @@ enum Commands {
     Channels,
     /// List direct messages and group DMs known to the local archive.
     Dms,
+    /// Show local SQLite archive statistics (offline).
+    Stats,
+    /// Export a conversation's locally archived messages to JSON or Markdown (offline).
+    Export {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Output format (`md` or `json`).
+        #[arg(long, value_enum, default_value_t = ExportFormat::Md)]
+        format: ExportFormat,
+        /// Maximum number of messages to export (newest window, ordered oldest first).
+        #[arg(long, value_name = "N", default_value_t = 10_000)]
+        limit: usize,
+        /// Write export to a file instead of stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
     /// Account and session management.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ExportFormat {
+    Md,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -145,6 +168,20 @@ async fn dispatch(
         Commands::React { channel, ts, emoji } => run_react(ctx, flag, &channel, &ts, &emoji).await,
         Commands::Channels => cmd_channels(ctx, workspace.as_ref()),
         Commands::Dms => cmd_dms(ctx, workspace.as_ref()),
+        Commands::Stats => cmd_stats(ctx, workspace.as_ref()),
+        Commands::Export {
+            channel,
+            format,
+            limit,
+            out,
+        } => cmd_export(
+            ctx,
+            workspace.as_ref(),
+            &channel,
+            format,
+            limit,
+            out.as_deref(),
+        ),
         Commands::Auth { command } => match command {
             AuthCommand::Status => cmd_auth_status(ctx),
             AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),
@@ -308,6 +345,176 @@ fn cmd_dms(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"workspace": null, "messages": 0}),
+            "reading archive stats",
+        ));
+    };
+    let db_path = archive::store_path(workspace);
+    let Some(store) = open_archive_store(workspace) else {
+        archive_hint(workspace);
+        return Ok(ExitCode::SUCCESS);
+    };
+    let stats = store
+        .stats(workspace)
+        .with_context(|| format!("reading local archive stats for {workspace}"))?;
+    let json = serde_json::json!({
+        "workspace": workspace.as_str(),
+        "db_path": db_path.as_ref().map(|p| p.display().to_string()),
+        "db_bytes": stats.db_bytes(),
+        "messages": stats.messages,
+        "revisions": stats.revisions,
+        "conversations": stats.conversations,
+        "users": stats.users,
+        "offline_queued": stats.offline_queued,
+    });
+    let human = format_stats_human(
+        workspace.as_str(),
+        db_path.as_deref(),
+        stats.db_bytes(),
+        stats.messages,
+        stats.revisions,
+        stats.conversations,
+        stats.users,
+        stats.offline_queued,
+    );
+    output::emit(ctx.json, &json, &human);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_export(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    channel_arg: &str,
+    format: ExportFormat,
+    limit: usize,
+    out: Option<&std::path::Path>,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"channel": channel_arg, "count": 0, "messages": []}),
+            "exporting",
+        ));
+    };
+    let archive = Archive::open(workspace);
+    if archive.is_none() {
+        archive_hint(workspace);
+    }
+    let resolved = archive
+        .as_ref()
+        .and_then(|a| a.resolve_channel(workspace, channel_arg));
+    let channel_id = resolved
+        .as_ref()
+        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+    let label = resolved
+        .as_ref()
+        .map(|row| row.label())
+        .unwrap_or_else(|| channel_id.as_str().to_owned());
+    let messages = match open_archive_store(workspace) {
+        Some(store) => store
+            .channel_history(workspace, &channel_id, None, limit)
+            .with_context(|| format!("exporting the history of {channel_id}"))?,
+        None => Vec::new(),
+    };
+    let rows: Vec<MessageRow> = messages
+        .iter()
+        .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
+        .collect();
+    let effective = if ctx.json { ExportFormat::Json } else { format };
+    let rendered = match effective {
+        ExportFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+            "workspace": workspace.as_str(),
+            "channel": {
+                "id": channel_id.as_str(),
+                "label": label,
+            },
+            "count": rows.len(),
+            "messages": rows,
+        }))?,
+        ExportFormat::Md => format_markdown_export(&label, &rows),
+    };
+    if let Some(path) = out {
+        std::fs::write(path, &rendered)
+            .with_context(|| format!("writing export to {}", path.display()))?;
+        if ctx.json {
+            output::emit_json(&serde_json::json!({
+                "ok": true,
+                "path": path.display().to_string(),
+                "count": rows.len(),
+            }));
+        } else {
+            eprintln!("Exported {} messages to {}", rows.len(), path.display());
+        }
+    } else {
+        print!("{rendered}");
+        if !rendered.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_stats_human(
+    workspace: &str,
+    db_path: Option<&std::path::Path>,
+    db_bytes: u64,
+    messages: u64,
+    revisions: u64,
+    conversations: u64,
+    users: u64,
+    offline_queued: u64,
+) -> String {
+    let path = db_path
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(unknown)".to_owned());
+    let size = if db_bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", db_bytes as f64 / (1024.0 * 1024.0))
+    } else if db_bytes >= 1024 {
+        format!("{:.1} KiB", db_bytes as f64 / 1024.0)
+    } else {
+        format!("{db_bytes} B")
+    };
+    format!(
+        "Workspace:\t{workspace}\nDatabase:\t{path} ({size})\nMessages:\t{messages} ({revisions} revisions)\nConversations:\t{conversations}\nUsers:\t\t{users}\nOffline queue:\t{offline_queued}\n"
+    )
+}
+
+fn format_markdown_export(label: &str, rows: &[MessageRow]) -> String {
+    let mut out = format!("# {label}\n\n");
+    for row in rows {
+        let author = row
+            .user_name
+            .as_deref()
+            .or(row.user.as_deref())
+            .or(row.bot_id.as_deref())
+            .unwrap_or("unknown");
+        let deleted = if row.deleted { " _(deleted)_" } else { "" };
+        out.push_str(&format!("**{author}** (`{}`){deleted}\n\n", row.ts));
+        if !row.text.is_empty() {
+            out.push_str(&row.text);
+            out.push_str("\n\n");
+        }
+        if !row.files.is_empty() {
+            out.push_str(&format!("_Files:_ {}\n\n", row.files.join(", ")));
+        }
+        if !row.reactions.is_empty() {
+            let rx: Vec<String> = row
+                .reactions
+                .iter()
+                .map(|r| format!(":{}: {}", r.name, r.count))
+                .collect();
+            out.push_str(&format!("_Reactions:_ {}\n\n", rx.join(" · ")));
+        }
+        out.push_str("---\n\n");
+    }
+    out
+}
+
 fn cmd_auth_status(ctx: &Ctx) -> Result<ExitCode> {
     let entries = session::status_entries();
     let view = output::AuthStatusView {
@@ -385,4 +592,53 @@ fn fail(ctx: &Ctx, code: &str, message: &str) -> ExitCode {
         eprintln!("slackless: {message}");
     }
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::ReactionRow;
+
+    #[test]
+    fn formats_markdown_export_and_stats_human() {
+        let rows = vec![MessageRow {
+            channel: "C1".into(),
+            ts: "1700000001.000100".into(),
+            user: Some("U1".into()),
+            user_name: Some("Ana".into()),
+            bot_id: None,
+            text: "Shipped release".into(),
+            thread_ts: None,
+            subtype: None,
+            deleted: false,
+            edited: false,
+            reply_count: None,
+            reactions: vec![ReactionRow {
+                name: "tada".into(),
+                count: 2,
+            }],
+            files: vec!["notes.md".into()],
+            permalink: None,
+        }];
+        let md = format_markdown_export("#eng", &rows);
+        assert!(md.contains("# #eng"));
+        assert!(md.contains("**Ana** (`1700000001.000100`)"));
+        assert!(md.contains("Shipped release"));
+        assert!(md.contains("_Files:_ notes.md"));
+        assert!(md.contains(":tada: 2"));
+
+        let stats = format_stats_human(
+            "T1",
+            Some(std::path::Path::new("/tmp/T1.sqlite")),
+            2 * 1024 * 1024,
+            42,
+            50,
+            7,
+            12,
+            1,
+        );
+        assert!(stats.contains("2.0 MiB"));
+        assert!(stats.contains("42 (50 revisions)"));
+        assert!(stats.contains("Offline queue:\t1"));
+    }
 }

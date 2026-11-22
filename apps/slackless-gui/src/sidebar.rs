@@ -90,6 +90,8 @@ pub enum SidebarEvent {
     },
     /// Open `channel` in a separate native GPUI window (`F-CORE-026`).
     OpenInNewWindow(ChannelId),
+    /// Per-section sort or filter changed; persist to SQLite `local_state`.
+    SectionPrefsChanged,
     /// The "Drafts & sent" row.
     OpenDrafts,
     /// The "Saved" row.
@@ -922,6 +924,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.section_filters.insert(key, filter);
+        cx.emit(SidebarEvent::SectionPrefsChanged);
         cx.notify();
     }
 
@@ -942,6 +945,42 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.section_sorts.insert(key, sort);
+        cx.emit(SidebarEvent::SectionPrefsChanged);
+        cx.notify();
+    }
+
+    /// Snapshot per-section filter & sort choices for SQLite `local_state` persistence.
+    pub(crate) fn export_section_prefs(&self) -> crate::bridge::SectionPrefs {
+        crate::bridge::SectionPrefs {
+            filters: self
+                .section_filters
+                .iter()
+                .map(|(k, &v)| (k.to_string(), v))
+                .collect(),
+            sorts: self
+                .section_sorts
+                .iter()
+                .map(|(k, &v)| (k.to_string(), v))
+                .collect(),
+        }
+    }
+
+    /// Restore per-section filter & sort choices loaded from SQLite `local_state`.
+    pub(crate) fn restore_section_prefs(
+        &mut self,
+        prefs: crate::bridge::SectionPrefs,
+        cx: &mut Context<Self>,
+    ) {
+        self.section_filters = prefs
+            .filters
+            .into_iter()
+            .map(|(k, v)| (SharedString::from(k), v))
+            .collect();
+        self.section_sorts = prefs
+            .sorts
+            .into_iter()
+            .map(|(k, v)| (SharedString::from(k), v))
+            .collect();
         cx.notify();
     }
 

@@ -418,6 +418,23 @@ pub enum Command {
     DiscardOfflineMutation(i64),
     /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
     SignOut,
+    /// Add a conversation tab (`conversations.addTab`, `F-CORE-061`) and refresh channel info.
+    AddConversationTab {
+        channel: ChannelId,
+        tab_type: String,
+        label: Option<String>,
+    },
+    /// Remove a conversation tab (`conversations.removeTab`, `F-CORE-061`) and refresh channel info.
+    RemoveConversationTab {
+        channel: ChannelId,
+        tab_id: String,
+    },
+    /// Reorder a conversation tab (`conversations.moveTab`, `F-CORE-061`) and refresh channel info.
+    MoveConversationTab {
+        channel: ChannelId,
+        tab_id: String,
+        after: Option<String>,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
