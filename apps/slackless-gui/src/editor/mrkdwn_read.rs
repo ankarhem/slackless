@@ -1,4 +1,7 @@
-//! Reading a draft back from the mrkdwn `Doc::to_mrkdwn` writes.
+//! Reading Slack mrkdwn (saved drafts, fallback message text) into an Obsidian Live Preview
+//! markdown [`Doc`]: Slack-specific wire syntax (`<@U1>`, `<#C1|name>`, `<!here>`,
+//! `<url|label>`, `&gt; `, `• `, `:emoji:`, inline ```` ```code``` ````) becomes clean
+//! editable markdown plus semantic atoms.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -7,11 +10,11 @@ use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{ChannelId, UserId};
 
 use super::doc::Doc;
-use super::marks::{Atom, Attrs, LineKind, PLAIN, Style};
+use super::marks::{Atom, LineKind, Style};
 use super::mrkdwn::{Directory, FENCE, SOFT_INDENT, WRAPPERS, unescape};
 
-/// Read a document back from the mrkdwn [`Doc::to_mrkdwn`] writes. Anything that is not
-/// valid markup stays literal text.
+/// Read a document back from Slack mrkdwn into clean editable Markdown + atoms. Anything
+/// that is not valid markup stays literal text.
 pub fn from_mrkdwn(text: &str, names: &dyn Directory) -> Doc {
     let mut reader = Reader {
         doc: Doc::default(),
@@ -22,7 +25,15 @@ pub fn from_mrkdwn(text: &str, names: &dyn Directory) -> Doc {
     let mut list = List::default();
     for raw in text.split('\n') {
         if in_code {
-            in_code = reader.code_line(raw);
+            let (continues, tail) = reader.code_line(raw);
+            in_code = continues;
+            if !in_code {
+                reader.begin_line("```");
+                if let Some(tail) = tail.filter(|t| !t.is_empty()) {
+                    reader.begin_line("");
+                    reader.inline(tail, 0..tail.len(), Style::NONE);
+                }
+            }
             continue;
         }
         let kind = line_kind(raw, &list);
@@ -36,66 +47,82 @@ pub fn from_mrkdwn(text: &str, names: &dyn Directory) -> Doc {
                 is_open: true,
                 number: 0,
             },
-            Some((LineKind::Quote | LineKind::Code | LineKind::Heading(_), _)) | None => {
-                List::default()
-            }
+            _ => List::default(),
         };
         match kind {
-            Some((LineKind::Code, prefix)) => in_code = reader.code_line(&raw[prefix..]),
+            Some((LineKind::Code, prefix)) => {
+                reader.begin_line("```");
+                let (continues, tail) = reader.code_line(&raw[prefix..]);
+                in_code = continues;
+                if !in_code {
+                    reader.begin_line("```");
+                    if let Some(tail) = tail.filter(|t| !t.is_empty()) {
+                        reader.begin_line("");
+                        reader.inline(tail, 0..tail.len(), Style::NONE);
+                    }
+                }
+            }
+            Some((LineKind::Divider, _)) => reader.begin_line("---"),
             Some((LineKind::Quote, prefix)) => {
-                reader.begin_line(Some(LineKind::Quote), LineKind::Quote.marker_text());
-                reader.inline(raw, prefix..raw.len(), &PLAIN);
+                reader.begin_line("> ");
+                reader.inline(raw, prefix..raw.len(), Style::NONE);
             }
             Some((LineKind::Heading(level), prefix)) => {
-                reader.begin_line(
-                    Some(LineKind::Heading(level)),
-                    LineKind::Heading(level).marker_text(),
-                );
-                reader.inline(raw, prefix..raw.len(), &PLAIN);
+                reader.begin_line(LineKind::Heading(level).markdown_prefix());
+                reader.inline(raw, prefix..raw.len(), Style::NONE);
             }
             Some((LineKind::Soft, prefix)) => {
-                reader.begin_line(Some(LineKind::Soft), LineKind::Soft.marker_text());
-                reader.inline(raw, prefix..raw.len(), &PLAIN);
+                reader.begin_line(SOFT_INDENT);
+                reader.inline(raw, prefix..raw.len(), Style::NONE);
             }
-            Some((kind @ (LineKind::Bullet | LineKind::Ordered), prefix)) => {
-                reader.begin_line(Some(kind), &raw[..prefix]);
-                reader.inline(raw, prefix..raw.len(), &PLAIN);
+            Some((LineKind::Bullet, prefix)) => {
+                reader.begin_line("- ");
+                reader.inline(raw, prefix..raw.len(), Style::NONE);
             }
-            None => {
-                reader.begin_line(None, "");
-                reader.inline(raw, 0..raw.len(), &PLAIN);
+            Some((LineKind::Ordered, prefix)) => {
+                reader.begin_line(&raw[..prefix]);
+                reader.inline(raw, prefix..raw.len(), Style::NONE);
+            }
+            Some((LineKind::Fence, _)) | None => {
+                reader.begin_line("");
+                reader.inline(raw, 0..raw.len(), Style::NONE);
             }
         }
+    }
+    if in_code {
+        reader.begin_line("```");
     }
     reader.doc
 }
 
-/// The list the lines read so far have left open.
 #[derive(Default)]
 struct List {
     is_open: bool,
-    /// The number of the last ordered item; zero outside an ordered list.
     number: u32,
 }
 
-/// The block a mrkdwn line opens with and the length of its prefix. A numbered line is an
-/// ordered item only when its number continues `list`, so a paragraph that happens to start
-/// with `3. ` stays a paragraph.
 fn line_kind(raw: &str, list: &List) -> Option<(LineKind, usize)> {
+    if raw == "---" {
+        return Some((LineKind::Divider, 3));
+    }
     if raw.starts_with(FENCE) {
         return Some((LineKind::Code, FENCE.len()));
     }
     if raw.starts_with("&gt; ") {
         return Some((LineKind::Quote, "&gt; ".len()));
     }
-    for level in 1..=3 {
-        let marker = "#".repeat(level as usize) + " ";
-        if raw.starts_with(&marker) {
+    if raw.starts_with("> ") {
+        return Some((LineKind::Quote, 2));
+    }
+    for (level, marker) in [(3u8, "### "), (2, "## "), (1, "# ")] {
+        if raw.starts_with(marker) {
             return Some((LineKind::Heading(level), marker.len()));
         }
     }
-    if raw.starts_with(LineKind::Bullet.marker_text()) {
-        return Some((LineKind::Bullet, LineKind::Bullet.marker_text().len()));
+    for bullet in ["\u{2022} ", "- "] {
+        if raw.starts_with(bullet) {
+            return Some((LineKind::Bullet, bullet.len()));
+        }
     }
     if list.is_open && raw.starts_with(SOFT_INDENT) {
         return Some((LineKind::Soft, SOFT_INDENT.len()));
@@ -112,29 +139,27 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    fn begin_line(&mut self, kind: Option<LineKind>, marker: &str) {
+    fn begin_line(&mut self, prefix: &str) {
         if self.lines > 0 {
-            self.doc.append("\n", &PLAIN);
+            self.doc.append("\n");
         }
         self.lines += 1;
-        if let Some(kind) = kind {
-            self.doc.append_atom(Atom::Marker(kind), marker);
-        }
+        self.doc.append(prefix);
     }
 
-    /// A code-block line, up to the closing fence when it has one. Returns whether the block
-    /// continues on the next line.
-    fn code_line(&mut self, raw: &str) -> bool {
-        let (code, continues) = raw
+    /// A code-block line, up to the closing fence when it has one. Returns `(continues, tail)`
+    /// where `tail` is any text following a closing fence on the same line.
+    fn code_line<'a>(&mut self, raw: &'a str) -> (bool, Option<&'a str>) {
+        let (code, continues, tail) = raw
             .split_once(FENCE)
-            .map_or((raw, true), |(code, _)| (code, false));
-        self.begin_line(Some(LineKind::Code), LineKind::Code.marker_text());
-        self.doc.append(&unescape(code), &PLAIN);
-        continues
+            .map_or((raw, true, None), |(code, rest)| (code, false, Some(rest)));
+        self.begin_line("");
+        self.doc.append(&unescape(code));
+        (continues, tail)
     }
 
-    /// Read `line[range]` as inline markup carrying `attrs`.
-    fn inline(&mut self, line: &str, range: Range<usize>, attrs: &Attrs) {
+    /// Read `line[range]` as Slack mrkdwn inline markup and emit clean Markdown + atoms.
+    fn inline(&mut self, line: &str, range: Range<usize>, active: Style) {
         let mut literal = range.start;
         let mut at = range.start;
         while at < range.end {
@@ -143,23 +168,22 @@ impl Reader<'_> {
                 at += 1;
                 continue;
             }
-            self.doc.append(&line[literal..at], attrs);
+            self.doc.append(&line[literal..at]);
             let here = at..range.end;
             let consumed = match byte {
-                b'<' => self.reference(line, here, attrs),
-                b'&' => self.entity(&line[here], attrs),
+                b'<' => self.reference(line, here, active),
+                b'&' => self.entity(&line[here]),
                 b':' => self.emoji(&line[here]),
-                b'`' => self.code(&line[here], attrs),
-                _ => self.wrapped(line, here, attrs),
+                b'`' => self.code(&line[here]),
+                _ => self.wrapped(line, here, active),
             };
             literal = at + consumed.unwrap_or(0);
             at = literal.max(at + 1);
         }
-        self.doc.append(&line[literal..range.end], attrs);
+        self.doc.append(&line[literal..range.end]);
     }
 
-    /// `<@U1>`, `<#C1|name>`, `<!here>` or `<url|label>` at the start of `line[range]`.
-    fn reference(&mut self, line: &str, range: Range<usize>, attrs: &Attrs) -> Option<usize> {
+    fn reference(&mut self, line: &str, range: Range<usize>, active: Style) -> Option<usize> {
         let close = line[range.clone()].find('>')?;
         let inner = range.start + 1..range.start + close;
         let body = &line[inner.clone()];
@@ -184,13 +208,21 @@ impl Reader<'_> {
                 .append_atom(Atom::Broadcast(range), &format!("@{name}"));
         } else if target.contains("://") || target.starts_with("mailto:") {
             let url = unescape(target);
-            let linked = Attrs {
-                style: attrs.style,
-                link: Some(Arc::from(url.as_ref())),
-            };
             match label {
-                Some(label) => self.inline(line, label, &linked),
-                None => self.doc.append(&url, &linked),
+                Some(label_range) => {
+                    self.doc.append("[");
+                    self.inline(line, label_range, active);
+                    self.doc.append("](");
+                    self.doc.append(&url);
+                    self.doc.append(")");
+                }
+                None => {
+                    self.doc.append("[");
+                    self.doc.append(&url);
+                    self.doc.append("](");
+                    self.doc.append(&url);
+                    self.doc.append(")");
+                }
             }
         } else {
             return None;
@@ -198,11 +230,11 @@ impl Reader<'_> {
         Some(close + 1)
     }
 
-    fn entity(&mut self, rest: &str, attrs: &Attrs) -> Option<usize> {
+    fn entity(&mut self, rest: &str) -> Option<usize> {
         let (entity, ch) = [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">")]
             .into_iter()
             .find(|(entity, _)| rest.starts_with(entity))?;
-        self.doc.append(ch, attrs);
+        self.doc.append(ch);
         Some(entity.len())
     }
 
@@ -214,24 +246,20 @@ impl Reader<'_> {
         Some(len)
     }
 
-    fn code(&mut self, rest: &str, attrs: &Attrs) -> Option<usize> {
+    fn code(&mut self, rest: &str) -> Option<usize> {
         let close = rest[1..].find('`').filter(|len| *len > 0)? + 1;
-        let code = Attrs {
-            style: attrs.style.with(Style::CODE),
-            link: attrs.link.clone(),
-        };
-        self.doc.append(&unescape(&rest[1..close]), &code);
+        self.doc.append("`");
+        self.doc.append(&unescape(&rest[1..close]));
+        self.doc.append("`");
         Some(close + 1)
     }
 
-    /// A `*bold*`, `_italic_` or `~strike~` pair opening at the start of `line[range]`. The
-    /// opening marker must start a word and the closing one end it, as Slack reads mrkdwn.
-    fn wrapped(&mut self, line: &str, range: Range<usize>, attrs: &Attrs) -> Option<usize> {
+    fn wrapped(&mut self, line: &str, range: Range<usize>, active: Style) -> Option<usize> {
         let marker = line[range.clone()].chars().next()?;
         let (style, _) = WRAPPERS.into_iter().find(|(_, m)| *m == marker)?;
         let is_word = |ch: Option<char>| ch.is_some_and(char::is_alphanumeric);
         let inner_start = range.start + 1;
-        let opens = !attrs.style.contains(style)
+        let opens = !active.contains(style)
             && !is_word(line[..range.start].chars().next_back())
             && line[inner_start..range.end]
                 .chars()
@@ -243,15 +271,18 @@ impl Reader<'_> {
         let close = line[inner_start..range.end]
             .match_indices(marker)
             .map(|(ix, _)| inner_start + ix)
-            .find(|close| {
-                !line[..*close].ends_with(char::is_whitespace)
-                    && !is_word(line[close + 1..].chars().next())
+            .find(|&at| {
+                line[inner_start..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|before| !before.is_whitespace())
+                    && !is_word(line[at + 1..range.end].chars().next())
             })?;
-        let inner = Attrs {
-            style: attrs.style.with(style),
-            link: attrs.link.clone(),
-        };
-        self.inline(line, inner_start..close, &inner);
+        let mut buf = [0u8; 4];
+        let m = marker.encode_utf8(&mut buf);
+        self.doc.append(m);
+        self.inline(line, inner_start..close, active.with(style));
+        self.doc.append(m);
         Some(close + 1 - range.start)
     }
 }

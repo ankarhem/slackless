@@ -399,6 +399,16 @@ pub fn thread_root(cx: &App) -> Hsla {
     }
 }
 
+/// Slack's tint on a message row being edited in place: warm olive in dark (`#433F2A`,
+/// measured on Slack 4.53), warm yellow wash in light.
+pub fn editing_row(cx: &App) -> Hsla {
+    if cx.theme().mode.is_dark() {
+        color(0x43_3F_2A)
+    } else {
+        cx.theme().background.blend(color(0xFF_DE_30).opacity(0.15))
+    }
+}
+
 /// Slack's reaction pill that includes you (`.c-reaction--reacted`) as (background, count
 /// color, ring): filled blue under light text on dark themes; a blue wash with blue text and a
 /// blue ring on light ones.

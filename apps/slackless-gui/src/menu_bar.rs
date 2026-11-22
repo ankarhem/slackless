@@ -19,8 +19,9 @@ use slackless_core::types::ChannelId;
 use crate::app::{
     ActualSize, FocusSearch, NavigateBack, NavigateForward, NewMessage, NextWorkspace,
     OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads, OpenDrafts, OpenFiles, OpenLater,
-    OpenOwnProfile, OpenPeople, OpenPreferences, OpenRecent, OpenThreads, PreviousWorkspace,
-    QuickSwitch, SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace, ZoomIn, ZoomOut,
+    OpenOwnProfile, OpenPeople, OpenPreferences, OpenRecent, OpenThreads, OpenUnreads,
+    PreviousWorkspace, QuickSwitch, SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace,
+    ZoomIn, ZoomOut,
 };
 
 actions!(
@@ -147,6 +148,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
             MenuItem::submenu(Menu::new("History").items(back_forward())),
             MenuItem::separator(),
             MenuItem::action("Threads", OpenThreads),
+            MenuItem::action("All Unreads", OpenUnreads),
             MenuItem::action("All DMs", OpenDms),
             MenuItem::action("Drafts & sent", OpenDrafts),
             MenuItem::action("Activity", OpenActivity),

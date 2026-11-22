@@ -1,37 +1,38 @@
-//! Inline formatting, as-you-type conversion and undo.
+//! Inline markdown formatting, toggling, clearing, links, and undo.
 
-use super::{span, type_text, typed};
-use crate::editor::marks::{Attrs, Span, Style};
-use crate::editor::state::Editor;
 use slackless_core::types::{RichTextContainer, RichTextElement, TextStyle};
 
+use super::{type_text, typed};
+use crate::editor::marks::Style;
+use crate::editor::state::Editor;
+
 #[test]
-fn toggling_a_format_on_a_selection_formats_exactly_that_range_and_back() {
+fn toggling_a_format_on_a_selection_wraps_and_unwraps_markdown_delimiters() {
     let mut editor = typed("hello world");
     editor.select(0..5);
 
     editor.toggle_style(Style::BOLD);
-    assert_eq!(editor.doc().spans(), [span(0..5, Style::BOLD)]);
+    assert_eq!(editor.doc().text(), "*hello* world");
+    assert_eq!(editor.selection(), 1..6);
     assert_eq!(editor.active_style(), Style::BOLD);
 
     editor.toggle_style(Style::BOLD);
-    assert!(editor.doc().spans().is_empty());
+    assert_eq!(editor.doc().text(), "hello world");
+    assert_eq!(editor.selection(), 0..5);
+    assert_eq!(editor.active_style(), Style::NONE);
 }
 
 #[test]
-fn clearing_formats_strips_every_inline_format_and_serializes_underline() {
+fn clearing_formats_strips_inline_markers_and_serializes_underline() {
     let mut editor = typed("hello world");
     editor.select(0..5);
 
     editor.toggle_style(Style::BOLD);
     editor.toggle_style(Style::UNDERLINE);
-    assert_eq!(
-        editor.doc().spans(),
-        [span(0..5, Style::BOLD.with(Style::UNDERLINE))]
-    );
+    assert_eq!(editor.doc().text(), "*<u>hello</u>* world");
+    assert_eq!(editor.active_style(), Style::BOLD.with(Style::UNDERLINE));
 
-    // An underlined run serializes its style; a cleared one does not.
-    let wire = |editor: &Editor| match &editor.doc().to_rich_text().elements.first() {
+    let wire = |editor: &Editor| match editor.doc().to_rich_text().elements.first() {
         Some(RichTextContainer::Section(section)) => match section.elements.first() {
             Some(RichTextElement::Text(text)) => text.style,
             _ => None,
@@ -40,7 +41,7 @@ fn clearing_formats_strips_every_inline_format_and_serializes_underline() {
     };
     let underlined = wire(&editor);
     editor.clear_styles();
-    assert!(editor.doc().spans().is_empty());
+    assert_eq!(editor.doc().text(), "hello world");
     assert_eq!(
         underlined,
         Some(TextStyle {
@@ -53,91 +54,75 @@ fn clearing_formats_strips_every_inline_format_and_serializes_underline() {
 }
 
 #[test]
-fn a_format_armed_with_nothing_selected_applies_to_what_is_typed_next() {
+fn toggling_with_collapsed_caret_inserts_pair_and_toggling_again_steps_out() {
     let mut editor = typed("a ");
 
     editor.toggle_style(Style::BOLD);
+    assert_eq!(editor.doc().text(), "a **");
+    assert_eq!(editor.active_style(), Style::BOLD);
     type_text(&mut editor, "bc");
+    assert_eq!(editor.doc().text(), "a *bc*");
     editor.toggle_style(Style::BOLD);
     type_text(&mut editor, "d");
 
-    assert_eq!(editor.doc().text(), "a bcd");
-    assert_eq!(editor.doc().spans(), [span(2..4, Style::BOLD)]);
+    assert_eq!(editor.doc().text(), "a *bc*d");
+    // Toggling off an empty armed pair deletes both markers.
+    let mut empty = typed("ab");
+    empty.toggle_style(Style::ITALIC);
+    assert_eq!(empty.doc().text(), "ab__");
+    empty.toggle_style(Style::ITALIC);
+    assert_eq!(empty.doc().text(), "ab");
 }
 
 #[test]
-fn moving_the_caret_disarms_a_pending_format() {
-    let mut editor = typed("ab");
-    editor.toggle_style(Style::ITALIC);
-
-    editor.select(1..1);
-    type_text(&mut editor, "x");
-
-    assert!(editor.doc().spans().is_empty());
-}
-
-#[test]
-fn text_typed_inside_a_format_keeps_it_but_a_link_is_not_extended_from_its_edge() {
+fn links_wrap_and_unwrap_as_markdown_and_support_inline_styles() {
     let mut editor = typed("see docs");
     editor.select(4..8);
-    editor.toggle_style(Style::BOLD);
     editor.set_link("https://example.com");
+    assert_eq!(editor.doc().text(), "see [docs](https://example.com)");
+    assert!(editor.active_link().is_some());
 
-    editor.select(6..6);
-    type_text(&mut editor, "X");
-    editor.select(9..9);
-    type_text(&mut editor, "!");
+    editor.select(5..9);
+    editor.toggle_style(Style::BOLD);
+    assert_eq!(editor.doc().text(), "see [*docs*](https://example.com)");
 
-    let link = Some("https://example.com".into());
-    assert_eq!(
-        editor.doc().spans(),
-        [
-            Span {
-                range: 4..9,
-                attrs: Attrs {
-                    style: Style::BOLD,
-                    link,
-                },
-            },
-            span(9..10, Style::BOLD),
-        ]
-    );
+    editor.unlink();
+    assert_eq!(editor.doc().text(), "see *docs*");
+    assert!(editor.active_link().is_none());
 }
 
 #[test]
-fn a_closing_marker_turns_the_pair_into_formatting_and_typing_continues_plain() {
+fn markdown_inline_syntax_parses_live_for_single_and_double_delimiters() {
     for (source, style) in [
-        ("say *hi*", Style::BOLD),
-        ("say _hi_", Style::ITALIC),
-        ("say ~hi~", Style::STRIKE),
-        ("say `hi`", Style::CODE),
+        ("say *hi*!", Style::BOLD),
+        ("say **hi**!", Style::BOLD),
+        ("say _hi_!", Style::ITALIC),
+        ("say ~hi~!", Style::STRIKE),
+        ("say ~~hi~~!", Style::STRIKE),
+        ("say `hi`!", Style::CODE),
+        ("say <u>hi</u>!", Style::UNDERLINE),
     ] {
-        let mut editor = typed(source);
-        type_text(&mut editor, "!");
-
-        assert_eq!(editor.doc().text(), "say hi!", "{source}");
-        assert_eq!(editor.doc().spans(), [span(4..6, style)], "{source}");
+        let editor = typed(source);
+        assert_eq!(editor.doc().text(), source, "buffer keeps raw markdown");
+        let parsed = editor.doc().parse();
+        assert_eq!(parsed.lines[0].inlines.len(), 1, "{source}");
+        let inner_pos = parsed.lines[0].inlines[0].inner.start;
+        assert_eq!(
+            parsed.attrs_at(editor.doc(), inner_pos).style,
+            style,
+            "{source}"
+        );
     }
 }
 
 #[test]
-fn markers_that_do_not_wrap_a_word_stay_as_typed() {
+fn markers_that_do_not_wrap_a_word_stay_literal() {
     for source in ["2*3*4", "snake_case_name", "a * b*", "x ~ y ~", "``"] {
         let editor = typed(source);
 
         assert_eq!(editor.doc().text(), source);
-        assert!(editor.doc().spans().is_empty(), "{source}");
+        assert!(editor.doc().parse().lines[0].inlines.is_empty(), "{source}");
     }
-}
-
-#[test]
-fn undo_after_a_conversion_brings_back_the_typed_markers() {
-    let mut editor = typed("*hi*");
-
-    assert!(editor.undo());
-
-    assert_eq!(editor.doc().text(), "*hi*");
-    assert!(editor.doc().spans().is_empty());
 }
 
 #[test]
@@ -155,25 +140,72 @@ fn undo_steps_back_a_word_at_a_time_and_redo_returns() {
 }
 
 #[test]
-fn undo_reverts_a_format_toggle_without_touching_the_text() {
+fn undo_reverts_a_format_toggle_cleanly() {
     let mut editor = typed("hello");
     editor.select(0..5);
     editor.toggle_style(Style::STRIKE);
+    assert_eq!(editor.doc().text(), "~hello~");
 
     assert!(editor.undo());
-
     assert_eq!(editor.doc().text(), "hello");
-    assert!(editor.doc().spans().is_empty());
 }
 
 #[test]
-fn an_ime_commit_reported_as_a_whole_replacement_keeps_the_formatting() {
+fn an_ime_commit_reported_as_a_whole_replacement_keeps_markdown() {
     let mut editor = typed("ab cd");
     editor.select(0..2);
     editor.toggle_style(Style::BOLD);
+    assert_eq!(editor.doc().text(), "*ab* cd");
 
-    editor.user_edit(0..5, "ab cd\u{3042}", 8..8);
+    editor.user_edit(0..7, "*ab* cd\u{3042}", 10..10);
 
-    assert_eq!(editor.doc().text(), "ab cd\u{3042}");
-    assert_eq!(editor.doc().spans(), [span(0..2, Style::BOLD)]);
+    assert_eq!(editor.doc().text(), "*ab* cd\u{3042}");
+    let parsed = editor.doc().parse();
+    assert_eq!(parsed.attrs_at(editor.doc(), 1).style, Style::BOLD);
+}
+
+#[test]
+fn toggle_style_handles_multiline_whitespace_double_pairs_and_atoms() {
+    // Whitespace-padded selection keeps trailing space outside `*`.
+    let mut editor = typed("hello world");
+    editor.select(0..6);
+    editor.toggle_style(Style::BOLD);
+    assert_eq!(editor.doc().text(), "*hello* world");
+
+    // Multi-line selection wraps per line instead of creating unparseable cross-line `*`.
+    let mut multi = typed("one\ntwo");
+    multi.select(0..7);
+    multi.toggle_style(Style::BOLD);
+    assert_eq!(multi.doc().text(), "*one*\n*two*");
+
+    // Double pair `**|**` deletes cleanly on toggle, while `*a*|*b*` does not corrupt.
+    let mut dbl = typed("****");
+    dbl.select(2..2);
+    dbl.toggle_style(Style::BOLD);
+    assert_eq!(dbl.doc().text(), "");
+
+    let mut adj = typed("*a**b*");
+    adj.select(3..3);
+    assert_eq!(adj.active_style(), Style::NONE);
+
+    // Inline code and links inside outer emphasis don't close the outer marker early.
+    let nested_url = typed("_[docs](https://example.com/a_)_");
+    let parsed = nested_url.doc().parse();
+    assert_eq!(parsed.lines[0].inlines.len(), 2);
+    let nested_code = typed("*check `x*` now*");
+    let parsed_code = nested_code.doc().parse();
+    assert_eq!(parsed_code.lines[0].inlines.len(), 2);
+
+    // `set_link` preserves atoms inside selection and updates existing links without nesting.
+    use crate::editor::marks::Atom;
+    use slackless_core::types::UserId;
+    let mut linked = typed("hi ");
+    linked.insert_atom(3..3, Atom::User(UserId::from("U1")), "@Alice");
+    linked.select(3..9);
+    linked.set_link("https://one.dev");
+    assert_eq!(linked.doc().text(), "hi [@Alice](https://one.dev) ");
+    assert_eq!(linked.doc().atoms().len(), 1);
+    linked.select(4..10);
+    linked.set_link("https://two.dev");
+    assert_eq!(linked.doc().text(), "hi [@Alice](https://two.dev) ");
 }

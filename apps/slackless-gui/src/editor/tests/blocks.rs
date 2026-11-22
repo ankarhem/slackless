@@ -1,36 +1,46 @@
-//! Lists, quotes and code blocks: opening, continuing, leaving and merging them.
+//! Markdown blocks in Obsidian Live Preview: headings, lists, quotes, code fences, dividers.
 
 use slackless_core::types::RichTextContainer;
-use slackless_core::types::rich_text::{ListStyle, RichTextList};
+use slackless_core::types::rich_text::{ListStyle, RichTextHeader, RichTextList};
 
 use super::{Names, kinds, plain, section, type_text, typed};
 use crate::editor::from_mrkdwn;
 use crate::editor::marks::LineKind;
 
 #[test]
-fn a_line_prefix_opens_its_block_and_the_prefix_disappears() {
+fn markdown_line_prefixes_parse_directly_as_blocks() {
     for (prefix, kind) in [
+        ("# ", LineKind::Heading(1)),
+        ("## ", LineKind::Heading(2)),
+        ("### ", LineKind::Heading(3)),
         ("- ", LineKind::Bullet),
         ("* ", LineKind::Bullet),
         ("1. ", LineKind::Ordered),
         ("> ", LineKind::Quote),
-        ("```", LineKind::Code),
     ] {
         let mut editor = typed(prefix);
         type_text(&mut editor, "x");
 
-        let line = editor.doc().line(0);
+        let parsed = editor.doc().parse();
+        let line = &parsed.lines[0];
         assert_eq!(line.kind, Some(kind), "{prefix}");
-        assert_eq!(&editor.doc().text()[line.content], "x", "{prefix}");
+        assert_eq!(&editor.doc().text()[line.content.clone()], "x", "{prefix}");
     }
 }
 
 #[test]
-fn three_backticks_after_text_start_a_code_block_on_the_next_line() {
-    let editor = typed("run ```ls");
+fn fenced_code_block_parses_fence_and_code_lines() {
+    let editor = typed("```\nlet x = 1;\n```");
 
-    assert_eq!(kinds(&editor), [None, Some(LineKind::Code)]);
-    assert_eq!(editor.doc().to_mrkdwn(), "run \n```ls```");
+    assert_eq!(
+        kinds(&editor),
+        [
+            Some(LineKind::Fence),
+            Some(LineKind::Code),
+            Some(LineKind::Fence)
+        ]
+    );
+    assert_eq!(editor.doc().to_mrkdwn(), "```let x = 1;```");
 }
 
 #[test]
@@ -46,13 +56,16 @@ fn enter_starts_the_next_list_item_and_numbers_it() {
 
 #[test]
 fn enter_on_an_empty_item_leaves_the_block() {
-    for prefix in ["- ", "1. ", "> ", "```"] {
+    for prefix in ["- ", "1. ", "> ", "# "] {
         let mut editor = typed(prefix);
         type_text(&mut editor, "x");
         editor.enter();
-
+        if prefix == "# " {
+            // Heading Enter breaks directly to a plain paragraph.
+            assert_eq!(kinds(&editor)[1], None, "{prefix}");
+            continue;
+        }
         assert!(editor.enter(), "{prefix}");
-
         assert_eq!(kinds(&editor)[1], None, "{prefix}");
         let caret = editor.doc().text().len();
         assert_eq!(editor.selection(), caret..caret, "{prefix}");
@@ -93,62 +106,6 @@ fn shift_enter_in_a_list_item_adds_a_line_to_the_same_item() {
 }
 
 #[test]
-fn joining_an_item_onto_the_line_above_drops_its_marker() {
-    let mut editor = typed("x");
-    type_text(&mut editor, "\n- y");
-    assert_eq!(editor.doc().text(), "x\n\u{2022} y");
-
-    // The engine erased the line break before the bullet.
-    let diverged = editor.user_edit(1..2, "", 1..1);
-
-    assert!(diverged);
-    assert_eq!(editor.doc().text(), "xy");
-    assert!(editor.doc().atoms().is_empty());
-}
-
-#[test]
-fn text_typed_in_front_of_a_marker_lands_after_it() {
-    let mut editor = typed("- b");
-
-    // The caret sat before the bullet when the engine inserted "a" at offset 0.
-    let diverged = editor.user_edit(0..0, "a", 1..1);
-
-    assert!(diverged);
-    assert_eq!(editor.doc().text(), "\u{2022} ab");
-    assert_eq!(kinds(&editor), [Some(LineKind::Bullet)]);
-    let caret = "\u{2022} a".len();
-    assert_eq!(editor.selection(), caret..caret);
-}
-
-#[test]
-fn the_caret_never_rests_in_front_of_a_marker() {
-    let mut editor = typed("x");
-    type_text(&mut editor, "\n- y");
-    let bullet = "x\n".len();
-    let text_start = "x\n\u{2022} ".len();
-
-    // Home on the item's line asks for the offset in front of its bullet.
-    editor.select(bullet..bullet);
-    assert_eq!(editor.selection(), text_start..text_start);
-
-    // Left from there goes to the end of the line above, and nowhere on the first line.
-    assert!(editor.left_over_marker());
-    assert_eq!(editor.selection(), 1..1);
-    assert!(!editor.left_over_marker());
-}
-
-#[test]
-fn lines_pasted_into_a_quote_are_all_quoted() {
-    let mut editor = typed("> a");
-    let caret = editor.selection().start;
-
-    editor.user_edit(caret..caret, "b\nc\nd", caret + 5..caret + 5);
-
-    assert_eq!(kinds(&editor), [Some(LineKind::Quote); 3]);
-    assert_eq!(editor.doc().to_mrkdwn(), "&gt; ab\n&gt; c\n&gt; d");
-}
-
-#[test]
 fn a_block_button_toggles_every_selected_line() {
     let mut editor = typed("a\nb\nc");
     editor.select(0..3);
@@ -162,14 +119,25 @@ fn a_block_button_toggles_every_selected_line() {
 }
 
 #[test]
+fn code_block_button_wraps_and_unwraps_fences() {
+    let mut editor = typed("let x = 1;");
+    editor.toggle_block(LineKind::Code);
+    assert_eq!(editor.doc().text(), "```\nlet x = 1;\n```");
+    assert_eq!(editor.active_block(), Some(LineKind::Code));
+
+    editor.toggle_block(LineKind::Code);
+    assert_eq!(editor.doc().text(), "let x = 1;");
+    assert_eq!(editor.active_block(), None);
+}
+
+#[test]
 fn a_heading_line_serializes_as_a_header_container_and_round_trips() {
     let mut editor = typed("title\nbody");
     editor.select(0..5);
     editor.toggle_block(LineKind::Heading(1));
+    assert_eq!(editor.doc().text(), "# title\nbody");
     assert_eq!(editor.active_block(), Some(LineKind::Heading(1)));
 
-    // The wire: a rich_text_header of level 1, then the plain paragraph.
-    use slackless_core::types::rich_text::RichTextHeader;
     assert_eq!(
         editor.doc().to_rich_text().elements,
         vec![
@@ -181,13 +149,43 @@ fn a_heading_line_serializes_as_a_header_container_and_round_trips() {
         ]
     );
 
-    // A draft round-trips through mrkdwn's "#" form.
     let draft = editor.doc().to_mrkdwn();
     assert_eq!(draft, "# title\nbody");
     assert_eq!(from_mrkdwn(&draft, &Names).to_mrkdwn(), draft);
 
     // The dropdown's Paragraph clears the heading; lists and quotes stay.
-    editor.select(0..5);
+    editor.select(0..7);
     editor.paragraph();
+    assert_eq!(editor.doc().text(), "title\nbody");
     assert_eq!(editor.active_block(), None);
+}
+
+#[test]
+fn insert_divider_places_rule_and_moves_caret_below() {
+    let mut editor = typed("above");
+    editor.insert_divider();
+    type_text(&mut editor, "below");
+
+    assert_eq!(editor.doc().text(), "above\n---\nbelow");
+    assert_eq!(kinds(&editor), [None, Some(LineKind::Divider), None]);
+}
+
+#[test]
+fn toggle_code_block_on_closing_fence_and_enter_inside_prefix_stay_well_formed() {
+    // Toggling code block on the closing fence unwraps ONLY that block, not a second one below.
+    let mut editor = typed("```\none\n```\nmid\n```\ntwo\n```");
+    let close_pos = "```\none\n".len();
+    editor.select(close_pos..close_pos);
+    editor.toggle_block(LineKind::Code);
+    assert_eq!(editor.doc().text(), "one\nmid\n```\ntwo\n```");
+
+    // Enter at offset 0 of `- foo` pushes the item down instead of emitting `- - foo`.
+    let mut list = typed("- foo");
+    list.select(0..0);
+    assert!(list.enter());
+    assert_eq!(list.doc().text(), "\n- foo");
+
+    // Deleting item 2 from an ordered list keeps item 3 recognized as ordered.
+    let gap = typed("1. a\n3. c");
+    assert_eq!(kinds(&gap), [Some(LineKind::Ordered); 2]);
 }

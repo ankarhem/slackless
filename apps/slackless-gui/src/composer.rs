@@ -34,9 +34,10 @@ use gpui_kit::gpui::{
     SharedString, Subscription, Window,
 };
 use slackless_core::api::MessageContent;
+use slackless_core::types::Message;
 
 use crate::drafts::SendLater;
-use crate::editor::{Atom, Doc, Editor, from_mrkdwn};
+use crate::editor::{Atom, Doc, Editor, from_mrkdwn, from_rich_text};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::slash::{self, Invocation};
@@ -57,6 +58,8 @@ pub enum ComposerEvent {
     /// The user typed into the draft: tell the conversation they are typing (emitted at most
     /// every [`TYPING_EVERY`]).
     Typing,
+    /// Edit mode was cancelled (Cancel button or Esc).
+    Cancel,
 }
 
 /// How often Slack re-announces that the user is still typing; receivers drop the indicator
@@ -139,6 +142,9 @@ pub struct Composer {
     link_open: bool,
     /// The theme colors the draft's formatting was last drawn with.
     palette: Option<Palette>,
+    /// Whether the draft textarea was focused on the last frame (Live Preview reveals active
+    /// markdown syntax only while focused).
+    was_focused: bool,
     /// The textarea must be refilled from the editor on the next frame (that needs the
     /// window): a draft was loaded.
     is_stale: bool,
@@ -156,6 +162,12 @@ pub struct Composer {
     scheduling: bool,
     /// The thread composer's "Also send" checkbox: its target and whether it is ticked.
     also_send: Option<(AlsoSendTarget, bool)>,
+    /// Whether the top formatting toolbar is visible (toggled by the `Aa` button).
+    show_toolbar: bool,
+    /// Inline edit mode for an existing message: omits outer padding and notification bar,
+    /// shows `+`, `Aa`, `☺` on the left and `Cancel` / `Save` on the right, and emits
+    /// [`ComposerEvent::Cancel`] on Esc.
+    edit_mode: bool,
     /// Who the notification bar says is typing.
     typing: Option<TypingNames>,
     /// When [`ComposerEvent::Typing`] last went out.
@@ -182,6 +194,25 @@ impl Composer {
     pub fn new(
         placeholder: SharedString,
         fixtures: Arc<Fixtures>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Composer> {
+        Self::build(placeholder, fixtures, false, window, cx)
+    }
+
+    /// A WYSIWYG composer configured for editing a sent message in place.
+    pub fn new_edit(
+        fixtures: Arc<Fixtures>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Composer> {
+        Self::build("Edit message".into(), fixtures, true, window, cx)
+    }
+
+    fn build(
+        placeholder: SharedString,
+        fixtures: Arc<Fixtures>,
+        edit_mode: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Composer> {
@@ -214,13 +245,16 @@ impl Composer {
                 link_input,
                 link_open: false,
                 palette: None,
+                was_focused: false,
                 is_stale: false,
                 pending_placeholder: None,
                 private_placeholder: None,
                 context_bar: None,
                 enter_sends: true,
-                scheduling: true,
+                scheduling: !edit_mode,
                 also_send: None,
+                show_toolbar: true,
+                edit_mode,
                 typing: None,
                 typing_sent: None,
                 _subscriptions: subscriptions,
@@ -308,6 +342,20 @@ impl Composer {
         self.changed(cx);
     }
 
+    /// Load a sent message for editing: reads its `rich_text` blocks losslessly (falling back
+    /// to mrkdwn), refills the textarea, and focuses at the end.
+    pub fn load_message(&mut self, message: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        let doc = from_rich_text(&message.blocks, &*self.fixtures)
+            .unwrap_or_else(|| from_mrkdwn(&message.text, &*self.fixtures));
+        self.editor.load(doc);
+        self.link_open = false;
+        self.dismissed = None;
+        self.was_focused = true;
+        self.reset(window, cx);
+        self.focus_input(window, cx);
+        self.changed(cx);
+    }
+
     /// Insert a picked emoji at the caret and give the draft focus back.
     pub fn insert_emoji(
         &mut self,
@@ -322,13 +370,29 @@ impl Composer {
         let atom = Atom::Emoji(choice.name.as_str().into());
         self.editor
             .insert_atom(self.editor.selection(), atom, &shown);
-        self.push(window, cx);
+        self.was_focused = true;
         self.focus_input(window, cx);
+        self.push(window, cx);
         self.changed(cx);
     }
 
-    fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.input.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_ids_for_test(&self, cx: &App) -> Vec<(String, String)> {
+        self.input
+            .read(cx)
+            .tokens()
+            .iter()
+            .map(|span| {
+                (
+                    span.token().id().to_string(),
+                    span.token().text().to_string(),
+                )
+            })
+            .collect()
     }
 
     /// Take the draft for sending: trimmed, and cleared from the composer. `None` when there
@@ -348,6 +412,10 @@ impl Composer {
         let Some(doc) = self.take(window, cx) else {
             return;
         };
+        if self.edit_mode {
+            cx.emit(ComposerEvent::Submit(content(&doc)));
+            return;
+        }
         match slash::parse(doc.text()) {
             Some(invocation) => cx.emit(ComposerEvent::SlashCommand(invocation)),
             None => cx.emit(ComposerEvent::Submit(content(&doc))),

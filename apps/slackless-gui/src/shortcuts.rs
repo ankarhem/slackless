@@ -14,13 +14,14 @@ use gpui_kit::gpui::{
 /// `(keys, what it does, handled by this app)`.
 type Shortcut = (&'static [&'static str], &'static str, bool);
 
-const GROUPS: [(&str, &[Shortcut]); 4] = [
+const GROUPS: [(&str, &[Shortcut]); 5] = [
     (
         "Navigation",
         &[
             (&["\u{2318}", "K"], "Jump to a conversation", true),
             (&["\u{2318}", "\u{21e7}", "K"], "Open direct messages", true),
             (&["\u{2318}", "\u{21e7}", "M"], "Open activity", true),
+            (&["\u{2318}", "\u{21e7}", "A"], "Open All unreads", true),
             (&["\u{2318}", "\u{21e7}", "T"], "Open threads", true),
             (&["\u{2318}", "\u{21e7}", "D"], "Open drafts & sent", true),
             (&["\u{2318}", "\u{21e7}", "L"], "Browse channels", true),
@@ -63,6 +64,22 @@ const GROUPS: [(&str, &[Shortcut]); 4] = [
             ),
             (&["Esc"], "Mark conversation as read", true),
             (&["\u{21e7}", "Esc"], "Mark all messages as read", true),
+        ],
+    ),
+    (
+        "Take actions on messages",
+        // Slack's message focus: the last message the mouse hovered, acted on only while
+        // no field holds the focus (messages.rs focus_action).
+        &[
+            (&["E"], "Edit message", true),
+            (&["\u{232b}"], "Delete message", true),
+            (&["T", "\u{2192}"], "Open or reply in thread", true),
+            (&["F"], "Forward message", true),
+            (&["P"], "Pin or unpin a message", true),
+            (&["A"], "Save or unsave a message", true),
+            (&["U"], "Mark all messages above as unread", true),
+            (&["M"], "Set a reminder", true),
+            (&["R"], "Add a reaction", true),
         ],
     ),
     (
@@ -155,7 +172,7 @@ pub fn shortcuts_view(cx: &App) -> Stateful<Div> {
                     )
             }))
     });
-    let [navigation, messages, formatting, general] = groups;
+    let [navigation, messages, take_actions, formatting, general] = groups;
     div()
         .id("shortcuts")
         .max_h(px(560.))
@@ -165,6 +182,13 @@ pub fn shortcuts_view(cx: &App) -> Stateful<Div> {
                 .items_start()
                 .gap_6()
                 .child(v_flex().flex_1().gap_5().child(navigation).child(general))
-                .child(v_flex().flex_1().gap_5().child(messages).child(formatting)),
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .gap_5()
+                        .child(messages)
+                        .child(take_actions)
+                        .child(formatting),
+                ),
         )
 }

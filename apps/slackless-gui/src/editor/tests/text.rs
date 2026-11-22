@@ -4,12 +4,14 @@ use slackless_core::types::rich_text::{
     BroadcastElement, BroadcastRange, ChannelElement, EmojiElement, LinkElement, ListStyle,
     RichTextList, RichTextPreformatted, RichTextQuote, TextElement, UserElement,
 };
-use slackless_core::types::{ChannelId, RichTextContainer, RichTextElement, TextStyle, UserId};
+use slackless_core::types::{
+    Block, ChannelId, RichTextContainer, RichTextElement, TextStyle, UserId,
+};
 
 use super::{Names, kinds, plain, section, type_text, typed};
 use crate::editor::doc::Doc;
-use crate::editor::from_mrkdwn;
 use crate::editor::marks::{Atom, LineKind};
+use crate::editor::{from_mrkdwn, from_rich_text};
 
 #[test]
 fn literal_text_is_escaped_in_mrkdwn_and_untouched_in_rich_text() {
@@ -160,7 +162,11 @@ fn an_edited_draft_survives_the_mrkdwn_round_trip_exactly() {
     let mut editor = typed("- *first* item");
     editor.enter();
     type_text(&mut editor, "see ");
+    let start = editor.selection().start;
+    type_text(&mut editor, "site");
+    editor.select(start..editor.selection().end);
     editor.set_link("https://x.dev");
+    type_text(&mut editor, " ");
     editor.insert_atom(editor.selection(), Atom::Emoji("smile".into()), "\u{1F604}");
 
     let read = from_mrkdwn(&editor.doc().to_mrkdwn(), &Names);
@@ -195,4 +201,102 @@ fn what_is_sent_has_no_surrounding_blank_space_or_trailing_empty_item() {
     assert!(!sent.is_blank());
     assert!(typed("- ").doc().is_blank());
     assert!(typed(" \n ").doc().is_blank());
+}
+
+#[test]
+fn rich_text_round_trips_all_inline_styles_and_blocks() {
+    let mut editor = typed("# Title\n## Sub\n### Small\n");
+    type_text(
+        &mut editor,
+        "*bold* <u>under</u> _italic_ ~strike~ `code` [docs](https://example.com) ",
+    );
+    editor.insert_atom(editor.selection(), Atom::User(UserId::from("U1")), "@Alice");
+    editor.insert_atom(
+        editor.selection(),
+        Atom::Channel(ChannelId::from("C1")),
+        "#general",
+    );
+    editor.insert_atom(
+        editor.selection(),
+        Atom::Broadcast(BroadcastRange::Here),
+        "@here",
+    );
+    editor.insert_atom(editor.selection(), Atom::Emoji("smile".into()), "\u{1F604}");
+
+    type_text(&mut editor, "\n1. first");
+    editor.soft_break();
+    type_text(&mut editor, "cont");
+    editor.enter();
+    type_text(&mut editor, "second");
+    editor.enter();
+    editor.enter();
+    type_text(&mut editor, "- bullet");
+    editor.enter();
+    editor.enter();
+    type_text(&mut editor, "> quoted");
+    editor.enter();
+    editor.enter();
+    type_text(&mut editor, "```\nlet x = 1;\nx\n```\n---\ntail");
+
+    let original = editor.doc().trimmed();
+    let rich = original.to_rich_text();
+    let blocks: Vec<Block> = vec![rich.clone().into()];
+    let restored = from_rich_text(&blocks, &Names).expect("restores rich_text doc");
+
+    assert_eq!(restored, original);
+    assert_eq!(restored.to_rich_text(), rich);
+}
+
+#[test]
+fn from_rich_text_returns_none_without_rich_text_blocks() {
+    assert!(from_rich_text(&[], &Names).is_none());
+}
+
+#[test]
+fn code_styled_links_adjacent_runs_inline_code_urls_and_consecutive_fences_round_trip() {
+    use slackless_core::types::RichTextBlock;
+
+    let bold = TextStyle {
+        bold: true,
+        ..Default::default()
+    };
+    let bold_italic = TextStyle {
+        bold: true,
+        italic: true,
+        ..Default::default()
+    };
+    let code = TextStyle {
+        code: true,
+        ..Default::default()
+    };
+    let rich = RichTextBlock {
+        block_id: None,
+        elements: vec![section(vec![
+            RichTextElement::Link(LinkElement {
+                url: "https://x.dev".into(),
+                text: Some("api".into()),
+                style: Some(code),
+            }),
+            plain(" "),
+            RichTextElement::Text(TextElement {
+                text: "foo".into(),
+                style: Some(bold),
+            }),
+            RichTextElement::Text(TextElement {
+                text: "bar".into(),
+                style: Some(bold_italic),
+            }),
+            plain(" "),
+            RichTextElement::Text(TextElement {
+                text: "https://literal.dev".into(),
+                style: Some(code),
+            }),
+        ])],
+    };
+    let restored = from_rich_text(&[rich.clone().into()], &Names).unwrap();
+    assert_eq!(restored.to_rich_text(), rich);
+
+    // Consecutive fenced code blocks stay distinct in `to_mrkdwn`.
+    let two_blocks = typed("```\na\n```\n```\nb\n```");
+    assert_eq!(two_blocks.doc().to_mrkdwn(), "```a```\n```b```");
 }

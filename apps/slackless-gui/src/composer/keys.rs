@@ -5,9 +5,7 @@
 //! binding's action before any key-down listener, so those are intercepted as actions in the
 //! capture phase. The formatting shortcuts have no binding and arrive as plain key-downs.
 
-use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, MoveDown, MoveLeft, MoveUp, Redo, Undo,
-};
+use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Redo, Undo};
 use gpui_kit::gpui::{ClipboardItem, Context, KeyDownEvent, Window};
 
 use super::{Composer, ComposerEvent};
@@ -29,6 +27,8 @@ pub(super) enum Tool {
     Heading(u8),
     /// Back to plain paragraphs (clears headings).
     Paragraph,
+    /// Insert a horizontal divider line.
+    Divider,
 }
 
 impl Composer {
@@ -38,7 +38,7 @@ impl Composer {
             Tool::Style(style) => self.editor.active_style().contains(style),
             Tool::Block(kind) => self.editor.active_block() == Some(kind),
             Tool::Link => self.editor.active_link().is_some(),
-            Tool::Mention | Tool::Slash | Tool::Clear | Tool::Paragraph => false,
+            Tool::Mention | Tool::Slash | Tool::Clear | Tool::Paragraph | Tool::Divider => false,
             Tool::Heading(level) => self.editor.active_block() == Some(LineKind::Heading(level)),
         }
     }
@@ -62,9 +62,11 @@ impl Composer {
             Tool::Clear => self.editor.clear_styles(),
             Tool::Heading(level) => self.editor.toggle_block(LineKind::Heading(level)),
             Tool::Paragraph => self.editor.paragraph(),
+            Tool::Divider => self.editor.insert_divider(),
         }
-        self.push(window, cx);
+        self.was_focused = true;
         self.focus_input(window, cx);
+        self.push(window, cx);
         self.changed(cx);
     }
 
@@ -96,6 +98,7 @@ impl Composer {
         } else {
             format!("https://{typed}")
         };
+        self.was_focused = true;
         self.editor.set_link(&url);
         self.push(window, cx);
         self.changed(cx);
@@ -160,23 +163,11 @@ impl Composer {
         if let Some(menu) = &mut self.menu {
             menu.step(false);
             cx.notify();
-        } else if self.editor.doc().text().is_empty() && !self.link_open {
+        } else if !self.edit_mode && self.editor.doc().text().is_empty() && !self.link_open {
             cx.emit(ComposerEvent::EditLast);
         } else {
             return;
         }
-        cx.stop_propagation();
-    }
-
-    /// Left at the start of a list item's text goes to the line above, past the marker.
-    pub(super) fn on_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        if self.link_open || !self.editor.left_over_marker() {
-            return;
-        }
-        let selection = self.editor.selection();
-        self.input
-            .update(cx, |state, cx| state.set_selected_range(selection, cx));
-        self.changed(cx);
         cx.stop_propagation();
     }
 
@@ -201,6 +192,8 @@ impl Composer {
         } else if let Some(menu) = self.menu.take() {
             self.dismissed = Some(menu.range.start);
             cx.notify();
+        } else if self.edit_mode {
+            cx.emit(ComposerEvent::Cancel);
         } else {
             return;
         }

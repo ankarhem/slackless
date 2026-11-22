@@ -26,10 +26,17 @@ pub struct Trigger<'a> {
 const EMOJI_QUERY_MIN: usize = 2;
 
 /// The lookup the caret is at the end of, if any. The trigger character must start a word,
-/// so `12:30` and `user@example.com` open nothing; code never completes.
+/// so `12:30` and `user@example.com` open nothing; code never completes. A `#` at the very
+/// start of a line (markdown heading syntax `# ` / `## ` / `### `) does not open channel
+/// completion until a word character follows `#`, and `##` never opens channel completion.
 pub fn trigger(doc: &Doc, caret: usize) -> Option<Trigger<'_>> {
-    let line = doc.line(caret);
-    if line.kind == Some(LineKind::Code) || caret < line.content.start {
+    let parsed = doc.parse();
+    let line = parsed.line_at(caret);
+    if matches!(
+        line.kind,
+        Some(LineKind::Code | LineKind::Fence | LineKind::Divider)
+    ) || caret < line.content.start
+    {
         return None;
     }
     // A query never reaches back over a mention or an emoji.
@@ -49,6 +56,13 @@ pub fn trigger(doc: &Doc, caret: usize) -> Option<Trigger<'_>> {
         "#" => Lookup::Channels,
         _ => Lookup::Emoji,
     };
+    // Don't pop up the #channel menu when typing `##` / `###` markdown headings at line start.
+    if lookup == Lookup::Channels
+        && start > line.start
+        && text[line.start..start].bytes().all(|b| b == b'#')
+    {
+        return None;
+    }
     let starts_word = text[floor..start]
         .chars()
         .next_back()
@@ -57,7 +71,7 @@ pub fn trigger(doc: &Doc, caret: usize) -> Option<Trigger<'_>> {
         .chars()
         .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '+'));
     let is_long_enough = lookup != Lookup::Emoji || query.len() >= EMOJI_QUERY_MIN;
-    let in_code = doc.attrs_at(start).style.contains(Style::CODE);
+    let in_code = parsed.attrs_at(doc, start).style.contains(Style::CODE);
     (starts_word && is_name && is_long_enough && !in_code).then_some(Trigger {
         lookup,
         range: start..caret,

@@ -56,12 +56,24 @@ fn a_lookup_opens_only_where_its_trigger_starts_a_word() {
 #[test]
 fn no_lookup_opens_inside_code() {
     let mut inline = typed("`a b`");
-    inline.select(2..2);
+    inline.select(3..3);
     type_text(&mut inline, "@c");
-    let block = typed("```@al");
+    let block = typed("```\n@al");
 
-    assert_eq!(trigger(inline.doc(), 4), None);
+    assert_eq!(trigger(inline.doc(), 5), None);
     assert_eq!(trigger(block.doc(), block.selection().start), None);
+}
+
+#[test]
+fn hash_heading_prefixes_do_not_trigger_channel_completion() {
+    for source in ["##", "###", "# "] {
+        let editor = typed(source);
+        assert_eq!(
+            trigger(editor.doc(), editor.selection().start),
+            None,
+            "{source}"
+        );
+    }
 }
 
 #[test]

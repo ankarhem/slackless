@@ -1,5 +1,6 @@
-//! What is laid over a document's text: inline formats and links on runs of it, and the
-//! atomic units (mentions, emoji, block markers) that occupy stretches of it.
+//! What is laid over a document's markdown text: inline character styles and the semantic
+//! atomic units (mentions, channels, broadcasts, emoji) that stay opaque chips while block
+//! and inline formatting live as real editable markdown.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -19,20 +20,12 @@ impl Style {
     pub const CODE: Style = Style(1 << 3);
     pub const UNDERLINE: Style = Style(1 << 4);
 
-    /// Every inline format at once (clear formatting).
-    pub const INLINE: Style =
-        Style(Self::BOLD.0 | Self::ITALIC.0 | Self::STRIKE.0 | Self::CODE.0 | Self::UNDERLINE.0);
-
     pub const fn contains(self, other: Style) -> bool {
         self.0 & other.0 == other.0
     }
 
     pub const fn with(self, other: Style) -> Style {
         Style(self.0 | other.0)
-    }
-
-    pub const fn without(self, other: Style) -> Style {
-        Style(self.0 & !other.0)
     }
 
     /// The formats both sets carry.
@@ -64,41 +57,44 @@ pub static PLAIN: Attrs = Attrs {
     link: None,
 };
 
-/// A run of formatted text. Plain text has no span.
-#[derive(Clone, PartialEq, Debug)]
-pub struct Span {
-    pub range: Range<usize>,
-    pub attrs: Attrs,
-}
-
 /// How a line is laid out as a block; a plain paragraph line has none.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineKind {
     Bullet,
     Ordered,
     Quote,
+    /// A line inside a fenced code block.
     Code,
+    /// An opening or closing ```` ``` ```` code fence line.
+    Fence,
     /// A further line of the list item above it (Shift+Enter inside an item).
     Soft,
     /// A Big / Medium / Small heading line, `level` 1 to 3.
     Heading(u8),
+    /// A horizontal rule (`---`); the line has no text of its own.
+    Divider,
 }
 
 impl LineKind {
-    /// The text a marker of this kind occupies at the start of its line. An ordered marker
-    /// is renumbered in place, so its text varies.
-    pub(super) const fn marker_text(self) -> &'static str {
+    /// The canonical markdown prefix inserted when a toolbar button or shortcut applies
+    /// this block kind to a line.
+    pub(super) const fn markdown_prefix(self) -> &'static str {
         match self {
-            LineKind::Bullet => "\u{2022} ",
+            LineKind::Bullet => "- ",
             LineKind::Ordered => "1. ",
             LineKind::Quote => "> ",
-            LineKind::Code | LineKind::Soft | LineKind::Heading(_) => "  ",
+            LineKind::Soft => "    ",
+            LineKind::Heading(1) => "# ",
+            LineKind::Heading(2) => "## ",
+            LineKind::Heading(_) => "### ",
+            LineKind::Divider => "---",
+            LineKind::Code | LineKind::Fence => "",
         }
     }
 }
 
-/// A unit the caret cannot enter and that is deleted whole: a mention, an emoji, or the
-/// marker that opens a list, quote or code line.
+/// A semantic inline unit the caret cannot enter and that is deleted whole: a user mention,
+/// a channel reference, a broadcast (`@here`/`@channel`/`@everyone`), or an emoji.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Atom {
     User(UserId),
@@ -106,10 +102,9 @@ pub enum Atom {
     Broadcast(BroadcastRange),
     /// Shortcode without colons, in Slack's `name::skin-tone-N` form when toned.
     Emoji(Arc<str>),
-    Marker(LineKind),
 }
 
-/// An atom and the text range it occupies.
+/// An atom and the UTF-8 byte range it occupies in [`super::Doc::text`].
 #[derive(Clone, PartialEq, Debug)]
 pub struct Placed {
     pub range: Range<usize>,

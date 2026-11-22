@@ -3,16 +3,16 @@
 //! Lucide set.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, AnyView, App, ClickEvent, Context, Div, InteractiveElement as _,
-    IntoElement, Keystroke, MouseButton, ParentElement as _, Stateful,
+    Anchor, AnyElement, AnyView, App, ClickEvent, Context, Div, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Stateful,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
@@ -29,8 +29,8 @@ pub(super) enum Slot {
     Styles,
 }
 
-/// Slack's grouping: text style | link | lists | quote and code | clear.
-pub(super) const TOOLBAR: [Slot; 16] = [
+/// Slack's grouping: text style + headings | link & lists | quote, code & divider.
+pub(super) const TOOLBAR: [Slot; 14] = [
     Slot::Tool("fmt-bold", IconName::Bold, Tool::Style(Style::BOLD)),
     Slot::Tool("fmt-italic", IconName::Italic, Tool::Style(Style::ITALIC)),
     Slot::Tool(
@@ -46,7 +46,6 @@ pub(super) const TOOLBAR: [Slot; 16] = [
     Slot::Styles,
     Slot::Divider,
     Slot::Tool("fmt-link", IconName::Link, Tool::Link),
-    Slot::Divider,
     Slot::Tool(
         "fmt-ol",
         IconName::ListOrdered,
@@ -65,39 +64,86 @@ pub(super) const TOOLBAR: [Slot; 16] = [
         IconName::SquareCode,
         Tool::Block(LineKind::Code),
     ),
-    Slot::Divider,
-    Slot::Tool("fmt-clear", IconName::RemoveFormatting, Tool::Clear),
+    Slot::Tool("fmt-divider", IconName::SeparatorHorizontal, Tool::Divider),
 ];
 
-/// The popover over a toolbar button: Slack's label and its shortcut, when the tool has one.
-fn slot_tip(tool: Tool) -> Option<(&'static str, &'static str)> {
+/// The popover over a toolbar button: Slack's title and its individual keycap chips for the
+/// 9 shortcut buttons (none on `¶▾`, Code block, or Divider).
+fn slot_tip(tool: Tool) -> Option<(&'static str, &'static [&'static str])> {
     Some(match tool {
-        Tool::Style(style) if style == Style::BOLD => ("Bold", "cmd-b"),
-        Tool::Style(style) if style == Style::ITALIC => ("Italic", "cmd-i"),
-        Tool::Style(style) if style == Style::UNDERLINE => ("Underline", "cmd-u"),
-        Tool::Style(style) if style == Style::STRIKE => ("Strikethrough", "cmd-shift-x"),
-        Tool::Style(style) if style == Style::CODE => ("Code", "cmd-shift-c"),
-        Tool::Link => ("Link", "cmd-shift-u"),
-        Tool::Block(LineKind::Ordered) => ("Ordered list", "cmd-shift-7"),
-        Tool::Block(LineKind::Bullet) => ("Bulleted list", "cmd-shift-8"),
-        Tool::Block(LineKind::Quote) => ("Blockquote", "cmd-shift-9"),
-        Tool::Block(LineKind::Code) => ("Code block", "cmd-alt-shift-c"),
-        Tool::Clear => ("Clear formatting", "cmd-\\"),
+        Tool::Style(style) if style == Style::BOLD => ("Bold", &["⌘", "B"]),
+        Tool::Style(style) if style == Style::ITALIC => ("Italic", &["⌘", "I"]),
+        Tool::Style(style) if style == Style::UNDERLINE => ("Underline", &["⌘", "U"]),
+        Tool::Style(style) if style == Style::STRIKE => ("Strikethrough", &["⌘", "Shift", "X"]),
+        Tool::Link => ("Link", &["⌘", "Shift", "U"]),
+        Tool::Block(LineKind::Ordered) => ("Ordered list", &["⌘", "Shift", "7"]),
+        Tool::Block(LineKind::Bullet) => ("Bulleted list", &["⌘", "Shift", "8"]),
+        Tool::Block(LineKind::Quote) => ("Blockquote", &["⌘", "Shift", "9"]),
+        Tool::Style(style) if style == Style::CODE => ("Code", &["⌘", "Shift", "C"]),
         Tool::Style(_)
-        | Tool::Block(LineKind::Soft | LineKind::Heading(_))
+        | Tool::Block(
+            LineKind::Code
+            | LineKind::Fence
+            | LineKind::Soft
+            | LineKind::Heading(_)
+            | LineKind::Divider,
+        )
         | Tool::Mention
         | Tool::Slash
+        | Tool::Clear
         | Tool::Heading(_)
-        | Tool::Paragraph => return None,
+        | Tool::Paragraph
+        | Tool::Divider => return None,
     })
 }
 
-/// The popover itself: the label, with the shortcut as a key chip beside it.
-fn tip_view(label: &'static str, key: &'static str, window: &mut Window, cx: &mut App) -> AnyView {
-    let kbd = Keystroke::parse_with_os(key, cx.platform_info().os)
-        .ok()
-        .map(Kbd::new);
-    Tooltip::new(label).key_binding(kbd).build(window, cx)
+/// Slack's centered 2-row hover popover: bold title on row 1, individual bordered keycap
+/// chips on row 2.
+fn tip_view(
+    label: &'static str,
+    keys: &'static [&'static str],
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyView {
+    Tooltip::element(move |_, cx| {
+        let theme = cx.theme();
+        let chip_bg = if theme.mode.is_dark() {
+            theme.background
+        } else {
+            theme.secondary
+        };
+        let (chip_border, chip_fg) = (theme.foreground.opacity(0.25), theme.popover_foreground);
+        v_flex()
+            .items_center()
+            .gap_1p5()
+            .px_1()
+            .py_0p5()
+            .child(div().text_xs().font_weight(FontWeight::BOLD).child(label))
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_1p5()
+                    .children(keys.iter().map(|key| {
+                        div()
+                            .min_w(px(20.))
+                            .h(px(20.))
+                            .px_1p5()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(chip_border)
+                            .bg(chip_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(chip_fg)
+                            .child(*key)
+                    })),
+            )
+    })
+    .build(window, cx)
 }
 
 /// The square a toolbar or action-row control sits in.
@@ -164,50 +210,82 @@ impl Composer {
             .into_any_element()
     }
 
-    /// The paragraph-style dropdown beside the inline styles: Slack's Paragraph / Big / Medium
-    /// / Small heading picker.
-    fn styles_button(&self, _focused: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// The paragraph-style dropdown beside the inline styles: compact `¶`/`H1`/`H2`/`H3`
+    /// icon + chevron opening Slack's Paragraph / Big / Medium / Small heading menu upward.
+    fn styles_button(&self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         let active = match self.editor.active_block() {
             Some(LineKind::Heading(level)) => level,
             _ => 0,
         };
-        let label = match active {
-            1 => "Big heading",
-            2 => "Medium heading",
-            3 => "Small heading",
-            _ => "Paragraph",
+        let active_icon = match active {
+            1 => IconName::Heading1,
+            2 => IconName::Heading2,
+            3 => IconName::Heading3,
+            _ => IconName::Pilcrow,
         };
+        let idle = cx.theme().foreground.opacity(0.9);
+        let color = if focused { idle } else { idle.opacity(0.3) };
         let this = cx.entity().downgrade();
         Button::new("fmt-styles")
             .ghost()
             .with_size(Size::XSmall)
-            .label(label)
-            .icon(IconName::ChevronDown)
-            .tooltip("Text style")
+            .h(px(26.))
+            .px_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(Icon::new(active_icon).text_color(color).size(px(15.)))
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .text_color(color)
+                            .size(px(11.)),
+                    ),
+            )
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
-                for (choice, tool) in [
-                    ("Paragraph", Tool::Paragraph),
-                    ("Big heading", Tool::Heading(1)),
-                    ("Medium heading", Tool::Heading(2)),
-                    ("Small heading", Tool::Heading(3)),
+                for (level, icon, choice, tool) in [
+                    (0u8, IconName::Pilcrow, "Paragraph", Tool::Paragraph),
+                    (1, IconName::Heading1, "Big heading", Tool::Heading(1)),
+                    (2, IconName::Heading2, "Medium heading", Tool::Heading(2)),
+                    (3, IconName::Heading3, "Small heading", Tool::Heading(3)),
                 ] {
                     let this = this.clone();
-                    let checked = matches!(
-                        (choice, active),
-                        ("Paragraph", 0)
-                            | ("Big heading", 1)
-                            | ("Medium heading", 2)
-                            | ("Small heading", 3)
-                    );
-                    menu = menu.item(PopupMenuItem::new(choice).checked(checked).on_click(
-                        move |_, window, cx| {
+                    let checked = active == level;
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let theme = cx.theme();
+                            let color = if checked {
+                                theme.link
+                            } else {
+                                theme.popover_foreground
+                            };
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .children(checked.then(|| {
+                                            Icon::new(IconName::Check)
+                                                .size(px(14.))
+                                                .text_color(color)
+                                        })),
+                                )
+                                .child(Icon::new(icon).size(px(15.)).text_color(color))
+                                .child(div().text_color(color).child(choice))
+                        })
+                        .on_click(move |_, window, cx| {
                             if let Some(this) = this.upgrade() {
                                 this.update(cx, |composer, cx| {
                                     composer.run(tool, window, cx);
                                 });
                             }
-                        },
-                    ));
+                        }),
+                    );
                 }
                 menu
             })
@@ -304,7 +382,11 @@ impl Composer {
                 .child(label)
                 .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         };
-        let aa = div().text_sm().underline().child("Aa").into_any_element();
+        let aa = div()
+            .text_sm()
+            .when(self.show_toolbar, |el| el.underline())
+            .child("Aa")
+            .into_any_element();
         let smiley = icon(IconName::FaceSlightlySmiling).into_any_element();
         let tools = h_flex()
             .items_center()
@@ -314,51 +396,85 @@ impl Composer {
                     .rounded_full()
                     .bg(secondary),
             )
-            .child(chrome("act-format", aa))
+            .child(
+                button("act-format", aa).on_click(cx.listener(|this, _, _, cx| {
+                    this.show_toolbar = !this.show_toolbar;
+                    cx.notify();
+                })),
+            )
             .child(button("act-emoji", smiley).on_click(cx.listener(
                 |_, event: &ClickEvent, _, cx| {
                     cx.emit(ComposerEvent::OpenEmojiPicker(event.position()));
                 },
             )))
-            .child(
-                button("act-mention", icon(IconName::AtSign).into_any_element()).on_click(
-                    cx.listener(|this, _, window, cx| this.run(Tool::Mention, window, cx)),
-                ),
-            )
-            .child(separator())
-            .child(chrome(
-                "act-video",
-                icon(IconName::Video).into_any_element(),
-            ))
-            .child(chrome("act-mic", icon(IconName::Mic).into_any_element()))
-            .child(separator())
-            .child(
-                button("act-slash", icon(IconName::SquareSlash).into_any_element())
-                    .on_click(cx.listener(|this, _, window, cx| this.run(Tool::Slash, window, cx))),
-            );
-        let send = div()
-            .id("send")
-            .flex_none()
-            .size(px(28.))
-            .rounded_sm()
-            .flex()
-            .items_center()
-            .justify_center()
-            .map(|send| {
-                if can_send {
-                    send.cursor_pointer()
-                        .bg(primary)
-                        .hover(|el| el.opacity(0.9))
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
-                } else {
-                    send.opacity(0.5)
-                }
-            })
-            .child(
-                Icon::new(IconName::Send)
-                    .text_color(if can_send { primary_foreground } else { muted })
-                    .size(px(16.)),
-            );
+            .when(!self.edit_mode, |row| {
+                row.child(
+                    button("act-mention", icon(IconName::AtSign).into_any_element()).on_click(
+                        cx.listener(|this, _, window, cx| this.run(Tool::Mention, window, cx)),
+                    ),
+                )
+                .child(separator())
+                .child(chrome(
+                    "act-video",
+                    icon(IconName::Video).into_any_element(),
+                ))
+                .child(chrome("act-mic", icon(IconName::Mic).into_any_element()))
+                .child(separator())
+                .child(
+                    button("act-slash", icon(IconName::SquareSlash).into_any_element()).on_click(
+                        cx.listener(|this, _, window, cx| this.run(Tool::Slash, window, cx)),
+                    ),
+                )
+            });
+        let right = if self.edit_mode {
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("edit-cancel")
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Cancel")
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Cancel))),
+                )
+                .child(
+                    Button::new("edit-save")
+                        .primary()
+                        .with_size(Size::Small)
+                        .label("Save")
+                        .disabled(!can_send)
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                )
+        } else {
+            let send = div()
+                .id("send")
+                .flex_none()
+                .size(px(28.))
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .map(|send| {
+                    if can_send {
+                        send.cursor_pointer()
+                            .bg(primary)
+                            .hover(|el| el.opacity(0.9))
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
+                    } else {
+                        send.opacity(0.5)
+                    }
+                })
+                .child(
+                    Icon::new(IconName::Send)
+                        .text_color(if can_send { primary_foreground } else { muted })
+                        .size(px(16.)),
+                );
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .child(send)
+                .when(self.scheduling, |row| row.child(self.schedule_button(cx)))
+        };
         h_flex()
             .items_center()
             .justify_between()
@@ -366,12 +482,58 @@ impl Composer {
             .pb_1p5()
             .pt_1()
             .child(tools)
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_0p5()
-                    .child(send)
-                    .when(self.scheduling, |row| row.child(self.schedule_button(cx))),
-            )
+            .child(right)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_matches_slack_twelve_controls_and_two_dividers() {
+        let dividers = TOOLBAR
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Divider))
+            .count();
+        let controls = TOOLBAR.len() - dividers;
+        assert_eq!(controls, 12);
+        assert_eq!(dividers, 2);
+        // Dividers sit after Styles (index 5) and after Bulleted list (index 9).
+        assert!(matches!(TOOLBAR[4], Slot::Styles));
+        assert!(matches!(TOOLBAR[5], Slot::Divider));
+        assert!(matches!(TOOLBAR[9], Slot::Divider));
+        // Trailing tool is Divider (SeparatorHorizontal), not Clear formatting.
+        assert!(matches!(
+            TOOLBAR[13],
+            Slot::Tool("fmt-divider", IconName::SeparatorHorizontal, Tool::Divider)
+        ));
+    }
+
+    #[test]
+    fn hover_popovers_cover_exactly_the_nine_shortcut_buttons() {
+        let tipped: Vec<&'static str> = TOOLBAR
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Tool(_, _, tool) => slot_tip(*tool).map(|(label, _)| label),
+                Slot::Divider | Slot::Styles => None,
+            })
+            .collect();
+        assert_eq!(
+            tipped,
+            [
+                "Bold",
+                "Italic",
+                "Underline",
+                "Strikethrough",
+                "Link",
+                "Ordered list",
+                "Bulleted list",
+                "Blockquote",
+                "Code",
+            ]
+        );
+        assert!(slot_tip(Tool::Block(LineKind::Code)).is_none());
+        assert!(slot_tip(Tool::Divider).is_none());
     }
 }

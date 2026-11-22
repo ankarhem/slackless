@@ -187,6 +187,14 @@
 //!   Sidebar::badge_count() -> u32 drives the dock badge (slackless_core::platform); the
 //!   sidebar's activity part is pushed from the feed's unread rows
 //!
+//! unreads.rs (the All Unreads view, Slack's `p-unreads_view`; replaces the message column
+//! while `unreads_open`)
+//!   UnreadsView::new(Arc<Fixtures>, &mut App) -> Entity<UnreadsView>
+//!   local_groups / store_groups / store_targets drive it (pure, unit-tested there)
+//!   emits UnreadsEvent::OpenConversation(ChannelId) / OpenLink(LinkTarget)
+//!   / MarkRead { channel, ts } (the root's mark path) / MarkAllRead (the root's confirm
+//!   dialog); SidebarEvent::OpenUnreads opens it
+//!
 //! files_page.rs (the Files view: the main-area page of the rail's Files destination, beside
 //! the sidebar's Files list column)
 //!   FilesPage::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<FilesPage>
@@ -197,7 +205,8 @@
 //! app.rs
 //!   App::new(Arc<Fixtures>, CoreBridge, &mut Window, &mut gpui::App) -> Entity<App>
 //!   actions: QuickSwitch (cmd-k), OpenPreferences (cmd-,), ShowShortcuts (cmd-/),
-//!   OpenDms (cmd-shift-k), OpenActivity (cmd-shift-m, cmd-shift-a), OpenDrafts (cmd-shift-d),
+//!   OpenDms (cmd-shift-k), OpenActivity (cmd-shift-m), OpenUnreads (cmd-shift-a),
+//!   OpenDrafts (cmd-shift-d),
 //!   OpenChannelBrowser (cmd-shift-l), OpenDownloads (cmd-shift-j), SetStatus (cmd-shift-y),
 //!   FocusSearch (cmd-g), NavigateBack / NavigateForward (cmd-[ / cmd-]), NewMessage (cmd-n),
 //!   OpenThreads (cmd-shift-t), OpenPeople (cmd-shift-e), OpenLater, OpenFiles,
@@ -215,15 +224,15 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Escape as InputEscape, InputEvent, Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, TitleBar, WindowExt as _, h_flex,
     h_resizable, resizable_panel, v_flex,
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    self, Anchor, AnyElement, AppContext as _, BoxShadow, ClipboardItem, Context, Div, Edges,
-    Entity, FocusHandle, Focusable as _, FontWeight, Hsla, InputPreference,
+    self, Anchor, AnyElement, AppContext as _, BoxShadow, ClipboardItem, Context, DismissEvent,
+    Div, Edges, Entity, FocusHandle, Focusable as _, FontWeight, Hsla, InputPreference,
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
     ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
@@ -236,7 +245,11 @@ use slackless_core::types::{
 };
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
-use crate::actions::{MessageChange, notify};
+use crate::actions::{
+    FocusDeleteMessage, FocusEditMessage, FocusForwardMessage, FocusMarkMessageUnread, FocusReact,
+    FocusRemindMe, FocusReplyInThread, FocusSaveMessage, FocusTogglePin, MessageAction,
+    MessageChange, notify,
+};
 use crate::activity::{ActivityEvent, ActivityFeed};
 use crate::avatars::conversation_avatar;
 use crate::bookmarks;
@@ -250,10 +263,11 @@ use crate::drafts::{DraftsEvent, DraftsView, Entry, SendLater, now_secs};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent};
 use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
+use crate::hover_card;
 use crate::huddle::{self, HuddleBar, HuddleEvent};
 use crate::huddles::{self, HuddlesEvent, HuddlesView};
 use crate::image_viewer::{ImageViewer, ViewerEvent, ViewerImage};
-use crate::later::{LaterEvent, LaterView, SaveRequest};
+use crate::later::{LaterEvent, LaterView, Remind, SaveRequest};
 use crate::lists::list_view;
 use crate::menu_bar::{self, MenuBar};
 use crate::messages::{LinkTarget, MessageList, MessageListEvent};
@@ -276,6 +290,7 @@ use crate::theme::{self, Palette, SlackTheme};
 use crate::threads::{ThreadPanel, ThreadPanelEvent};
 use crate::threads_cards::{local_cards, store_cards};
 use crate::threads_view::{ThreadsEvent, ThreadsView};
+use crate::unreads::{UnreadsEvent, UnreadsView, local_groups, store_groups, store_targets};
 
 actions!(
     slackless,
@@ -294,6 +309,7 @@ actions!(
         FocusSearch,
         NewMessage,
         OpenThreads,
+        OpenUnreads,
         OpenLater,
         OpenFiles,
         OpenPeople,
@@ -430,6 +446,8 @@ enum PickerTarget {
     ThreadComposer,
     ThreadsComposer,
     ComposeView,
+    MessageEdit,
+    ThreadEdit,
     Message { channel: ChannelId, ts: Ts },
     ThreadMessage(Ts),
 }
@@ -483,6 +501,13 @@ pub struct App {
     /// The emoji picker overlay and, while it is open, its target and anchor point.
     emoji_picker: Entity<EmojiPicker>,
     picker: Option<(PickerTarget, Point<Pixels>)>,
+    /// Slack's member profile hover card (hover on an @mention pill or an author name): the
+    /// trigger under the pointer, the open card and the pending dwell / grace timers
+    /// (trigger reports arrive through `hover_card`'s router; a dropped timer cancels).
+    profile_hover: hover_card::Lifecycle,
+    /// The focused message's reminder menu (Slack's M key): the open menu, its anchor
+    /// point and its dismiss subscription; `None` keeps it closed.
+    remind_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     /// The image viewer overlay (a message image was clicked); `None` keeps it closed.
     image_viewer: Option<Entity<ImageViewer>>,
     /// Drafts, scheduled and sent messages; shown in place of the message column while
@@ -495,6 +520,13 @@ pub struct App {
     /// The Threads view; replaces the message column while `threads_open`.
     threads: Entity<ThreadsView>,
     threads_open: bool,
+    /// The All Unreads view (Slack's `p-unreads_view`); replaces the message column while
+    /// `unreads_open`.
+    unreads: Entity<UnreadsView>,
+    unreads_open: bool,
+    /// Channels already asked for a single-page history fetch from `refresh_unreads`, so an
+    /// empty unread channel is fetched at most once per session.
+    unreads_fetched: HashSet<ChannelId>,
     /// The Activity page (the rail's Activity destination): a full-width page right of the
     /// rail - the sidebar's list column hides while the destination is active.
     activity: Entity<ActivityFeed>,
@@ -680,6 +712,7 @@ impl App {
             let drafts = DraftsView::new(cx);
             let later = LaterView::new(cx);
             let threads = ThreadsView::new(fixtures.clone(), window, cx);
+            let unreads = UnreadsView::new(fixtures.clone(), cx);
             let activity = ActivityFeed::new(fixtures.clone(), cx);
             let files_page = FilesPage::new(fixtures.clone(), window, cx);
             let huddles = HuddlesView::new(fixtures.clone(), cx);
@@ -696,11 +729,10 @@ impl App {
                 KeyBinding::new("cmd-/", ShowShortcuts, None),
                 KeyBinding::new("cmd-n", NewMessage, None),
                 KeyBinding::new("cmd-shift-k", OpenDms, None),
-                // Slack's Activity shortcut first: the menu bar shows the earliest binding.
-                // Cmd+Shift+A (Slack's All Unreads) opens Activity too, where slackless's
-                // Unreads row leads.
+                // Slack's Activity shortcut: Cmd+Shift+A is Slack's All Unreads, which
+                // its own menu labels "All Unreads"; Activity keeps Cmd+Shift+M.
                 KeyBinding::new("cmd-shift-m", OpenActivity, None),
-                KeyBinding::new("cmd-shift-a", OpenActivity, None),
+                KeyBinding::new("cmd-shift-a", OpenUnreads, None),
                 KeyBinding::new("cmd-shift-t", OpenThreads, None),
                 KeyBinding::new("cmd-shift-d", OpenDrafts, None),
                 KeyBinding::new("cmd-shift-e", OpenPeople, None),
@@ -720,8 +752,30 @@ impl App {
                 KeyBinding::new("alt-down", NextConversation, None),
                 KeyBinding::new("alt-shift-up", PreviousUnread, None),
                 KeyBinding::new("alt-shift-down", NextUnread, None),
-                KeyBinding::new("escape", MarkConversationRead, None),
+                // Only fire while focus is on the app shell itself, never inside an input,
+                // popup menu, dialog or popover: GPUI resolves keybindings before text
+                // insertion, so an unscoped single-key binding would swallow those letters
+                // (and Backspace / Right / Escape) in the composer and every text field.
                 KeyBinding::new("shift-escape", MarkAllRead, None),
+            ]);
+            const OUTSIDE_INPUT: Option<&str> =
+                Some("App && !Input && !PopupMenu && !Dialog && !Popover && !Select");
+            cx.bind_keys([
+                KeyBinding::new("escape", MarkConversationRead, OUTSIDE_INPUT),
+                // Slack's one-key actions on the focused message (the transcript's last
+                // hovered row). Scoped to `OUTSIDE_INPUT` so focused fields still receive
+                // their own letters, arrows, backspace and escape; [`App::focus_message`]
+                // re-checks the rest (which message, whose message, no overlay open).
+                KeyBinding::new("e", FocusEditMessage, OUTSIDE_INPUT),
+                KeyBinding::new("backspace", FocusDeleteMessage, OUTSIDE_INPUT),
+                KeyBinding::new("t", FocusReplyInThread, OUTSIDE_INPUT),
+                KeyBinding::new("right", FocusReplyInThread, OUTSIDE_INPUT),
+                KeyBinding::new("f", FocusForwardMessage, OUTSIDE_INPUT),
+                KeyBinding::new("p", FocusTogglePin, OUTSIDE_INPUT),
+                KeyBinding::new("a", FocusSaveMessage, OUTSIDE_INPUT),
+                KeyBinding::new("u", FocusMarkMessageUnread, OUTSIDE_INPUT),
+                KeyBinding::new("m", FocusRemindMe, OUTSIDE_INPUT),
+                KeyBinding::new("r", FocusReact, OUTSIDE_INPUT),
             ]);
             let workspace_keys = [
                 "cmd-1", "cmd-2", "cmd-3", "cmd-4", "cmd-5", "cmd-6", "cmd-7", "cmd-8", "cmd-9",
@@ -738,6 +792,10 @@ impl App {
             let viewer_keys = cx.weak_entity();
             // A third: the profile menu's Escape intercept moves `this` into its closure.
             let menu_keys = cx.weak_entity();
+            // A fourth: the member hover card's Escape intercept.
+            let card_keys = cx.weak_entity();
+            // A fifth: the All Unreads view's arrow-key intercept.
+            let unreads_keys = cx.weak_entity();
             let subscriptions = vec![
                 cx.observe_window_bounds(window, |this, window, cx| {
                     this.save_window_state(window, cx);
@@ -812,6 +870,45 @@ impl App {
                             cx.stop_propagation();
                         });
                     }
+                }),
+                // While the member hover card is open, Escape closes it, like Slack's
+                // hovercard.
+                cx.intercept_keystrokes(move |event, _, cx| {
+                    if event.input_preference == InputPreference::CharacterInput
+                        || event.keystroke.key.as_str() != "escape"
+                    {
+                        return;
+                    }
+                    let _ = card_keys.update(cx, |app, cx| {
+                        if app.profile_hover.card.is_some() {
+                            app.close_hover_card(cx);
+                            cx.stop_propagation();
+                        }
+                    });
+                }),
+                // While the All Unreads view is open and no field, dialog or menu holds the
+                // focus, its keys steer the cards (Slack's "Navigate unread messages"):
+                // Up/Down walk, Left/Right fold, Esc marks the focused group read - ahead of
+                // the transcript's own arrow and Esc actions.
+                cx.intercept_keystrokes(move |event, window, cx| {
+                    if event.input_preference == InputPreference::CharacterInput {
+                        return;
+                    }
+                    let _ = unreads_keys.update(cx, |app, cx| {
+                        if !app.unreads_open
+                            || !window
+                                .focused(cx)
+                                .is_none_or(|focused| focused == app.focus)
+                        {
+                            return;
+                        }
+                        let handled = app
+                            .unreads
+                            .update(cx, |view, cx| view.handle_key(&event.keystroke.key, cx));
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    });
                 }),
                 bridge.subscribe_in(window, cx, |this: &mut App, event, window, cx| {
                     this.on_core_event(event, window, cx);
@@ -894,6 +991,7 @@ impl App {
                             channel: this.channel.clone(),
                             thread_ts: None,
                         }),
+                        ComposerEvent::Cancel => {}
                     },
                 ),
                 cx.subscribe_in(
@@ -1002,6 +1100,23 @@ impl App {
                             this.threads_open = false;
                             cx.notify();
                         }
+                    },
+                ),
+                cx.subscribe_in(
+                    &unreads,
+                    window,
+                    |this: &mut App, _, event: &UnreadsEvent, window, cx| match event {
+                        UnreadsEvent::OpenConversation(channel) => {
+                            this.unreads_open = false;
+                            this.select(channel.clone(), cx);
+                        }
+                        UnreadsEvent::OpenLink(target) => {
+                            this.open_link(target.clone(), window, cx);
+                        }
+                        UnreadsEvent::MarkRead { channel, ts } => {
+                            this.mark_read(channel, ts.clone(), cx);
+                        }
+                        UnreadsEvent::MarkAllRead => this.request_mark_all_read(window, cx),
                     },
                 ),
                 cx.subscribe(
@@ -1170,6 +1285,8 @@ impl App {
                 switcher,
                 emoji_picker,
                 picker: None,
+                profile_hover: hover_card::Lifecycle::default(),
+                remind_menu: None,
                 image_viewer: None,
                 drafts,
                 drafts_open: false,
@@ -1177,6 +1294,9 @@ impl App {
                 later_open: false,
                 threads,
                 threads_open: false,
+                unreads,
+                unreads_open: false,
+                unreads_fetched: HashSet::new(),
                 activity,
                 activity_open: false,
                 files_page,
@@ -1224,6 +1344,8 @@ impl App {
                 _subscriptions: subscriptions,
             }
         });
+        // Route member-hover-card trigger reports (mention pills, author names) to this root.
+        hover_card::init(&app, cx);
         app.update(cx, |app, cx| {
             app.push_self_state(cx);
             app.sync_saved(cx);
@@ -1684,6 +1806,8 @@ impl App {
         let enter_sends = settings.enter_sends;
         self.composer
             .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+        self.messages
+            .update(cx, |list, cx| list.set_enter_sends(enter_sends, cx));
         self.thread
             .update(cx, |thread, cx| thread.set_enter_sends(enter_sends, cx));
         self.threads
@@ -1875,6 +1999,7 @@ impl App {
     }
 
     fn open_status_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_hover_card(cx);
         let status = self.self_state.status.clone();
         let workspace = SharedString::from(self.fixtures.workspaces[self.workspace].name.clone());
         self.status_picker.update(cx, |picker, cx| {
@@ -1965,6 +2090,77 @@ impl App {
         cx.notify();
     }
 
+    /// A one-key shortcut on the focused message, routed through the transcript's shared
+    /// [`MessageAction`] handler. Inert while an overlay owns the screen (a picker, the
+    /// reminder menu) or while the focus has left the root (a field, a dialog, an open
+    /// menu) — on top of GPUI already withholding character keys from focused fields.
+    fn focus_message(
+        &mut self,
+        action: MessageAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.picker.is_some()
+            || self.remind_menu.is_some()
+            || !window
+                .focused(cx)
+                .is_none_or(|focused| focused == self.focus)
+        {
+            return;
+        }
+        self.messages
+            .update(cx, |list, cx| list.focus_action(action, window, cx));
+    }
+
+    /// Slack's M key: the reminder presets for the focused message, dropped at the mouse
+    /// like the row's context menu. A pick routes through the transcript's handler and the
+    /// menu dismisses itself (its [`DismissEvent`] closes the overlay).
+    fn open_remind_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remind_menu.is_some()
+            || self.picker.is_some()
+            || !window
+                .focused(cx)
+                .is_none_or(|focused| focused == self.focus)
+            || self.messages.read(cx).focused(cx).is_none()
+        {
+            return;
+        }
+        let position = window.mouse_position();
+        let menu = PopupMenu::build(window, cx, |menu, _, _| {
+            let mut menu = menu;
+            for preset in Remind::ALL {
+                let messages = self.messages.downgrade();
+                menu = menu.item(
+                    PopupMenuItem::new(preset.label().to_owned())
+                        .icon(IconName::Clock)
+                        .on_click(move |_, window, cx| {
+                            let _ = messages.update(cx, |list, cx| {
+                                list.focus_action(MessageAction::RemindMe(preset), window, cx)
+                            });
+                        }),
+                );
+            }
+            menu
+        });
+        menu.focus_handle(cx).focus(window, cx);
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            |this: &mut Self, _, _: &DismissEvent, window, cx| {
+                this.close_remind_menu(window, cx);
+            },
+        );
+        self.remind_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    fn close_remind_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remind_menu.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         self.focus.focus(window, cx);
@@ -1983,14 +2179,19 @@ impl App {
                     Command::RemoveReaction { channel, ts, name }
                 }
             }
-            MessageChange::Edit { ts, text } => Command::EditMessage {
+            MessageChange::Edit { ts, content } => Command::EditMessage {
                 channel,
                 ts: ts.clone(),
-                text: text.clone(),
+                content: content.clone(),
             },
             MessageChange::Delete { ts } => Command::DeleteMessage {
                 channel,
                 ts: ts.clone(),
+            },
+            MessageChange::Pin { ts, pinned } => Command::SetPinned {
+                channel,
+                ts: ts.clone(),
+                pinned: *pinned,
             },
             MessageChange::BlockAction(dispatch) => Command::BlockAction {
                 bot: dispatch.bot.clone(),
@@ -2024,6 +2225,15 @@ impl App {
                 self.compose
                     .update(cx, |view, cx| view.insert_emoji(choice, window, cx));
             }
+            PickerTarget::MessageEdit => {
+                self.messages
+                    .update(cx, |list, cx| list.insert_edit_emoji(choice, window, cx));
+            }
+            PickerTarget::ThreadEdit => {
+                self.thread.update(cx, |thread, cx| {
+                    thread.insert_edit_emoji(choice, window, cx)
+                });
+            }
             PickerTarget::Message { channel, ts } => {
                 self.messages.update(cx, |list, cx| {
                     list.add_reaction(&channel, &ts, &choice.name, cx)
@@ -2043,6 +2253,7 @@ impl App {
     /// stays loaded under it: the transcript drops the thread's tint while the profile
     /// shows, and the profile's back chevron returns to the thread.
     fn open_profile(&mut self, user: UserId, cx: &mut Context<Self>) {
+        self.close_hover_card(cx);
         let over_thread = self.thread_open;
         self.profile
             .update(cx, |profile, cx| profile.open(user, over_thread, cx));
@@ -2053,6 +2264,152 @@ impl App {
         }
         self.pins_open = false;
         cx.notify();
+    }
+
+    // ---------------------------------------------------------------------------
+    // Slack's member profile hover card (`hover_card.rs`): dwell open, grace close.
+    // ---------------------------------------------------------------------------
+
+    /// The pointer entered a profile hover trigger (an @mention pill or an author name):
+    /// dwell before showing, so a sweeping pointer never flashes the card. A user the
+    /// snapshot lacks (an external member) is resolved right away, so the card has a name
+    /// by the time the dwell ends.
+    pub(crate) fn profile_hover_entered(
+        &mut self,
+        trigger: hover_card::Trigger,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = self.profile_hover.trigger.as_ref() == Some(&trigger);
+        self.profile_hover.grace = None;
+        self.profile_hover.trigger = Some(trigger.clone());
+        if self.fixtures.user(&trigger.user).is_none() {
+            self.resolve_users(std::iter::once(trigger.user.clone()));
+        }
+        if unchanged {
+            return;
+        }
+        let (key, user) = (trigger.key.clone(), trigger.user.clone());
+        self.profile_hover.dwell = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(hover_card::DWELL_MS))
+                .await;
+            let _ = this.update(cx, |app, cx| app.hover_dwell_elapsed(&key, &user, cx));
+        }));
+    }
+
+    /// The pointer left the trigger registered under `key`. A leave from any other element
+    /// (the pointer crossed straight onto a newer trigger before this frame's hover diff)
+    /// is stale and drops.
+    pub(crate) fn profile_hover_left(&mut self, key: &SharedString, cx: &mut Context<Self>) {
+        if !self
+            .profile_hover
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.key == *key)
+        {
+            return;
+        }
+        self.profile_hover.trigger = None;
+        self.profile_hover.dwell = None; // left before the dwell: no card
+        self.hover_card_maybe_close(cx);
+    }
+
+    /// The dwell elapsed with the pointer still on `key`'s trigger: show the card.
+    fn hover_dwell_elapsed(&mut self, key: &SharedString, user: &UserId, cx: &mut Context<Self>) {
+        if !self
+            .profile_hover
+            .trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.key == *key && trigger.user == *user)
+        {
+            return; // the pointer moved on (or left) before the dwell ended
+        }
+        let trigger = self
+            .profile_hover
+            .trigger
+            .clone()
+            .expect("the guard above matched the trigger");
+        self.profile_hover.card = Some(trigger);
+        self.profile_hover.grace = None;
+        cx.notify();
+    }
+
+    /// The grace elapsed without the pointer returning to the trigger or into the card.
+    fn hover_grace_elapsed(&mut self, cx: &mut Context<Self>) {
+        if self.profile_hover.trigger.is_some() || self.profile_hover.inside {
+            return; // the pointer came back before the grace closed the card
+        }
+        self.profile_hover.grace = None;
+        if self.profile_hover.card.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The pointer entered / left the open card: entering cancels a pending close (the
+    /// pointer crossed the gap from its trigger); leaving starts the grace.
+    fn hover_card_hovered(&mut self, inside: bool, cx: &mut Context<Self>) {
+        if self.profile_hover.inside == inside {
+            return;
+        }
+        self.profile_hover.inside = inside;
+        if inside {
+            self.profile_hover.grace = None;
+        } else {
+            self.hover_card_maybe_close(cx);
+        }
+    }
+
+    /// Start the card's close grace, unless the pointer is inside the card or a grace is
+    /// already running.
+    fn hover_card_maybe_close(&mut self, cx: &mut Context<Self>) {
+        if self.profile_hover.card.is_none()
+            || self.profile_hover.inside
+            || self.profile_hover.grace.is_some()
+        {
+            return;
+        }
+        self.profile_hover.grace = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(hover_card::GRACE_MS))
+                .await;
+            let _ = this.update(cx, |app, cx| app.hover_grace_elapsed(cx));
+        }));
+    }
+
+    /// Close the card outright: a click outside, Escape, a conversation switch, or an
+    /// action opened from it. The trigger stays, so the card does not come back until the
+    /// pointer re-enters it.
+    fn close_hover_card(&mut self, cx: &mut Context<Self>) {
+        let closed = self.profile_hover.card.take().is_some();
+        self.profile_hover.grace = None;
+        self.profile_hover.dwell = None;
+        if closed {
+            cx.notify();
+        }
+    }
+
+    /// The hover card's "Message": open the DM with `user` — the existing IM, else (live)
+    /// have Slack open (or create) it, like the New message view's people picks.
+    fn message_user(&mut self, user: &UserId, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_hover_card(cx);
+        if let Some(dm) = self
+            .fixtures
+            .dms
+            .iter()
+            .find(|dm| dm.user.as_ref() == Some(user))
+            .map(|dm| dm.id.clone())
+        {
+            self.select(dm, cx);
+        } else if self.bridge.store().is_some() {
+            self.bridge.send(Command::OpenDm { user: user.clone() });
+        } else {
+            notify(
+                "Needs a live workspace",
+                "Sign in to start a new DM with this person.",
+                window,
+                cx,
+            );
+        }
     }
 
     /// Slack's channel details dialog, opened by clicking the channel name in the header or
@@ -2203,6 +2560,7 @@ impl App {
     fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.chosen = true;
         self.close_full_column_views(cx);
+        self.close_hover_card(cx);
         cx.notify();
         self.show_conversation(channel, cx);
     }
@@ -2587,6 +2945,7 @@ impl App {
         if channel == self.channel {
             return;
         }
+        self.close_hover_card(cx);
         if let Some(write) = self.bridge.remember_conversation(channel.clone()) {
             cx.background_executor().spawn(write).detach();
         }
@@ -2654,6 +3013,10 @@ impl App {
                     self.load_join_people(cx);
                 }
                 self.refresh_dm_latest(channel, cx);
+                // The open Unreads view follows a message landing in any channel.
+                if self.unreads_open {
+                    self.refresh_unreads(cx);
+                }
                 // The open thread: a fetched replies page landed, or a live reply arrived.
                 if self.thread_open {
                     let open = self.thread.read(cx).open_thread();
@@ -2826,6 +3189,8 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.threads
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.unreads
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.huddles
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.directory
@@ -2845,6 +3210,9 @@ impl App {
         }
         self.sync_composer_placeholder(cx);
         self.apply_preferences(window, cx);
+        if self.unreads_open {
+            self.refresh_unreads(cx);
+        }
         // Conversation names may have arrived: the History menu shows them.
         self.update_menus(cx);
         cx.notify();
@@ -3042,17 +3410,17 @@ impl App {
     }
 
     /// Like Slack, viewing a conversation with unreads marks it read up to its newest message:
-    /// Slack is told (`conversations.mark`) and the sidebar un-bolds it at once.
+    /// Slack is told (`conversations.mark`) and the sidebar un-bolds it at once. Without a
+    /// counts entry (the bundled sample workspace) the sidebar's own read state moves.
     fn mark_read(&mut self, channel: &ChannelId, newest: Ts, cx: &mut Context<Self>) {
-        let Some(counts) = self.counts.get_mut(channel) else {
-            return;
-        };
-        if !counts.has_unreads && counts.mention_count == 0 {
-            return;
+        if let Some(counts) = self.counts.get_mut(channel) {
+            if !counts.has_unreads && counts.mention_count == 0 {
+                return;
+            }
+            counts.has_unreads = false;
+            counts.mention_count = 0;
+            counts.last_read = Some(newest.clone());
         }
-        counts.has_unreads = false;
-        counts.mention_count = 0;
-        counts.last_read = Some(newest.clone());
         self.bridge.send(Command::MarkRead {
             channel: channel.clone(),
             ts: newest,
@@ -3073,8 +3441,15 @@ impl App {
         }
     }
 
-    /// Esc: mark the open conversation read up to its newest message.
+    /// Esc: mark the open conversation read up to its newest message - or, while the All
+    /// Unreads view is open, the group the keyboard focused.
     fn mark_open_read(&mut self, cx: &mut Context<Self>) {
+        if self.unreads_open {
+            self.unreads.update(cx, |view, cx| {
+                view.handle_key("escape", cx);
+            });
+            return;
+        }
         let channel = self.channel.clone();
         if let Some(newest) = self.messages.read(cx).newest_ts() {
             self.mark_read(&channel, newest, cx);
@@ -3152,6 +3527,9 @@ impl App {
                 sidebar.mark_read(channel, cx);
             }
         });
+        if self.unreads_open {
+            self.refresh_unreads(cx);
+        }
     }
 
     /// Someone started or kept typing: show them until [`TYPING_TTL`] after their last
@@ -3428,6 +3806,8 @@ impl App {
         self.drafts_open = false;
         self.later_open = false;
         self.threads_open = false;
+        self.unreads_open = false;
+        self.unreads_fetched.clear();
         self.huddles_open = false;
         self.directory_open = false;
         self.compose_open = false;
@@ -3520,6 +3900,7 @@ impl App {
         self.drafts_open = false;
         self.later_open = false;
         self.threads_open = false;
+        self.unreads_open = false;
         self.huddles_open = false;
         self.directory_open = false;
         self.compose_open = false;
@@ -3563,6 +3944,60 @@ impl App {
         self.close_full_column_views(cx);
         self.threads_open = true;
         cx.notify();
+    }
+
+    /// The All Unreads view (Slack's `p-unreads_view`, Cmd+Shift+A): the sidebar's unread
+    /// order as one card per conversation - its rows from the bundled workspace at once
+    /// and, in live mode, from the local store off the UI thread.
+    fn open_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.close_full_column_views(cx);
+        self.unreads_open = true;
+        self.focus.focus(window, cx);
+        self.refresh_unreads(cx);
+        cx.notify();
+    }
+
+    /// Re-derive the open Unreads view's cards: the view opened, the workspace reloaded, a
+    /// message landed, or everything was marked read.
+    fn refresh_unreads(&mut self, cx: &mut Context<Self>) {
+        let order = self.sidebar.read(cx).unread_ids();
+        let groups = local_groups(&self.fixtures, &order);
+        let fixtures = self.fixtures.clone();
+        self.unreads
+            .update(cx, |view, cx| view.show_local(fixtures, groups.clone(), cx));
+        if let Some(store) = self.bridge.store().cloned() {
+            let team = self.fixtures.workspaces[self.workspace].id.clone();
+            let targets = store_targets(&self.fixtures, &groups);
+            cx.spawn(async move |this, cx| {
+                let groups = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let Ok(store) = store.lock() else {
+                            return Vec::new();
+                        };
+                        store_groups(&store, &team, &targets)
+                    })
+                    .await;
+                this.update(cx, |app, cx| {
+                    // Only conversations Slack still counts unread take part: a mark may
+                    // have raced the store read.
+                    let keep = app.sidebar.read(cx).unread_ids();
+                    for group in &groups {
+                        if group.messages.is_empty()
+                            && keep.contains(&group.channel)
+                            && app.unreads_fetched.insert(group.channel.clone())
+                        {
+                            app.bridge
+                                .send(Command::FetchLatestHistory(group.channel.clone()));
+                        }
+                    }
+                    app.unreads
+                        .update(cx, |view, cx| view.show_store(groups, &keep, cx));
+                })
+            })
+            .detach();
+        }
     }
 
     /// The Huddles page: the bundled sample huddle, or the stored `huddle_thread` trails live.
@@ -3906,6 +4341,8 @@ impl Render for App {
             v_flex().size_full().child(self.later.clone())
         } else if self.threads_open {
             v_flex().size_full().child(self.threads.clone())
+        } else if self.unreads_open {
+            v_flex().size_full().child(self.unreads.clone())
         } else if self.huddles_open {
             v_flex().size_full().child(self.huddles.clone())
         } else if self.directory_open {
@@ -4131,6 +4568,7 @@ impl Render for App {
 
         v_flex()
             .id("root")
+            .key_context("App")
             .track_focus(&self.focus)
             .on_action(
                 cx.listener(|this, _: &QuickSwitch, window, cx| this.open_switcher(window, cx)),
@@ -4181,6 +4619,9 @@ impl Render for App {
                 cx.listener(|this, _: &NewMessage, window, cx| this.open_compose("", window, cx)),
             )
             .on_action(cx.listener(|this, _: &OpenThreads, _, cx| this.open_threads(cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenUnreads, window, cx| this.open_unreads(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &OpenLater, _, cx| this.open_later(cx)))
             .on_action(cx.listener(|this, _: &OpenFiles, _, cx| this.open_files(cx)))
             .on_action(cx.listener(|this, _: &OpenPeople, _, cx| this.open_directory(cx)))
@@ -4210,6 +4651,41 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &InputEscape, _, cx| {
                 this.mark_open_read(cx);
                 cx.propagate();
+            }))
+            // Slack's one-key message shortcuts (E, Delete, T/Right, F, P, A, U, M, R), all
+            // through the transcript's shared [`MessageAction`] handlers.
+            .on_action(cx.listener(|this, _: &FocusEditMessage, window, cx| {
+                this.focus_message(MessageAction::Edit, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusDeleteMessage, window, cx| {
+                this.focus_message(MessageAction::Delete, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusReplyInThread, window, cx| {
+                this.focus_message(MessageAction::ReplyInThread, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusForwardMessage, window, cx| {
+                this.focus_message(MessageAction::Forward, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusTogglePin, window, cx| {
+                this.focus_message(MessageAction::TogglePin, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusSaveMessage, window, cx| {
+                this.focus_message(MessageAction::SaveForLater, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusMarkMessageUnread, window, cx| {
+                this.focus_message(MessageAction::MarkUnread, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &FocusRemindMe, window, cx| {
+                    this.open_remind_menu(window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &FocusReact, window, cx| {
+                this.focus_message(
+                    MessageAction::PickReaction(window.mouse_position()),
+                    window,
+                    cx,
+                )
             }))
             .on_action(cx.listener(|this, _: &MarkAllRead, window, cx| {
                 this.request_mark_all_read(window, cx)
@@ -4331,6 +4807,81 @@ impl Render for App {
                     ))
                 },
             )
+            .when_some(
+                self.remind_menu
+                    .as_ref()
+                    .map(|(menu, position, _)| (menu.clone(), *position)),
+                |root, (menu, position)| {
+                    // Slack drops the reminder menu beside the message; the mouse is the
+                    // nearest fixed point the focused message has.
+                    root.child(deferred(
+                        anchored()
+                            .position(position)
+                            .anchor(Anchor::TopLeft)
+                            .snap_to_window_with_margin(Edges::all(px(8.)))
+                            .child(div().id("remind-menu-overlay").occlude().child(menu)),
+                    ))
+                },
+            )
+            .when_some(self.profile_hover.card.clone(), |root, trigger| {
+                // Slack's member hover card, anchored at its trigger: above one in the
+                // lower half of the viewport, below one in the upper half.
+                let this = cx.weak_entity();
+                let user = trigger.user.clone();
+                let actions = hover_card::CardActions {
+                    open_profile: {
+                        let this = this.clone();
+                        Rc::new(move |_window, cx| {
+                            let _ = this.update(cx, |app, cx| {
+                                app.close_hover_card(cx);
+                                app.open_profile(user.clone(), cx);
+                            });
+                        })
+                    },
+                    message: {
+                        let (this, user) = (this.clone(), trigger.user.clone());
+                        Rc::new(move |window, cx| {
+                            let _ = this.update(cx, |app, cx| app.message_user(&user, window, cx));
+                        })
+                    },
+                    set_status: {
+                        let this = this.clone();
+                        Rc::new(move |window, cx| {
+                            let _ = this.update(cx, |app, cx| {
+                                app.close_hover_card(cx);
+                                app.open_status_picker(window, cx);
+                            });
+                        })
+                    },
+                    hovered: {
+                        let this = this.clone();
+                        Rc::new(move |inside, _window, cx| {
+                            let _ = this.update(cx, |app, cx| app.hover_card_hovered(inside, cx));
+                        })
+                    },
+                    dismiss: {
+                        let this = this.clone();
+                        Rc::new(move |_window, cx| {
+                            let _ = this.update(cx, |app, cx| app.close_hover_card(cx));
+                        })
+                    },
+                };
+                let (anchor, position) =
+                    hover_card::anchor_for(&trigger.anchor, window.viewport_size());
+                root.child(deferred(
+                    anchored()
+                        .position(position)
+                        .anchor(anchor)
+                        .snap_to_window_with_margin(Edges::all(px(8.)))
+                        .child(hover_card::card(
+                            &self.fixtures,
+                            &self.self_state,
+                            &trigger.user,
+                            &actions,
+                            cx,
+                        )),
+                ))
+            })
             .when(self.search_menu_open, |root| {
                 let bounds = self.search_menu.read(cx).pill_bounds();
                 root.when_some(
@@ -5450,6 +6001,7 @@ fn subscribe_workspace(
                 SidebarEvent::OpenDrafts => this.open_drafts(cx),
                 SidebarEvent::OpenLater => this.open_later(cx),
                 SidebarEvent::OpenThreads => this.open_threads(cx),
+                SidebarEvent::OpenUnreads => this.open_unreads(window, cx),
                 SidebarEvent::OpenActivity => this.open_activity(cx),
                 SidebarEvent::LeftActivity => {
                     this.activity_open = false;
@@ -5597,6 +6149,9 @@ fn subscribe_workspace(
                     };
                     this.open_picker(target, *position, window, cx);
                 }
+                MessageListEvent::PickEditEmoji(position) => {
+                    this.open_picker(PickerTarget::MessageEdit, *position, window, cx);
+                }
             },
         ),
         cx.subscribe_in(
@@ -5609,6 +6164,9 @@ fn subscribe_workspace(
                 }
                 ThreadPanelEvent::PickEmoji(position) => {
                     this.open_picker(PickerTarget::ThreadComposer, *position, window, cx);
+                }
+                ThreadPanelEvent::PickEditEmoji(position) => {
+                    this.open_picker(PickerTarget::ThreadEdit, *position, window, cx);
                 }
                 ThreadPanelEvent::Close => {
                     this.close_thread(cx);
@@ -5725,9 +6283,10 @@ fn subscribe_workspace(
 /// Block Kit message; `=emoji` additionally opens the composer's emoji picker. `=shortcuts`
 /// opens the shortcuts sheet, `=drafts` Drafts & sent, `=side` the second workspace and
 /// `=slash` the composer's slash menu. `=later` opens Later, `=pins` the pins panel,
-/// `=activity` the Activity page, `=files` the Files view (`=files:canvases` / `=files:lists`
-/// on that page), `=notify` posts a test system notification, `=typing` shows two people typing
-/// in the open conversation and `=message` delivers a demo direct message.
+/// `=activity` the Activity page, `=unreads` the All Unreads view, `=files` the Files view
+/// (`=files:canvases` / `=files:lists` on that page), `=notify` posts a test system
+/// notification, `=typing` shows two people typing in the open conversation and `=message`
+/// delivers a demo direct message.
 fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>) {
     let Ok(demo) = std::env::var("SLACKLESS_GUI_DEMO") else {
         return;
@@ -5762,6 +6321,7 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
             | "later"
             | "pins"
             | "activity"
+            | "unreads"
             | "files"
             | "files:canvases"
             | "files:lists"
@@ -5796,6 +6356,7 @@ fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut Context<App>
                     "later" => app.open_later(cx),
                     "pins" => app.toggle_pins(cx),
                     "activity" => app.show_nav(NavItem::Activity, cx),
+                    "unreads" => app.open_unreads(window, cx),
                     "files" => app.show_nav(NavItem::Files, cx),
                     "files:canvases" | "files:lists" => {
                         app.show_nav(NavItem::Files, cx);
@@ -6086,6 +6647,7 @@ fn mentions_me(text: &str, me: &UserId, keywords: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::gpui;
     use slackless_core::types::User;
 
     #[test]
@@ -6182,5 +6744,196 @@ mod tests {
         assert!(mentions_me("<!here> deploying", &me, ""));
         assert!(mentions_me("The Checkout is down", &me, "deploy, checkout"));
         assert!(!mentions_me("nothing here", &me, "deploy, , checkout"));
+    }
+
+    #[gpui::test]
+    fn composer_typing_and_editing_are_not_swallowed_by_app_message_shortcuts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui_kit::base::Root;
+        use std::cell::RefCell;
+
+        cx.update(|cx| {
+            cx.set_global(crate::zoom::Zoom::default());
+            gpui_kit::init(cx);
+            theme::init(cx);
+        });
+        let mounted = Rc::new(RefCell::new(None));
+        let slot = mounted.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(
+                Arc::new(fixtures::load()),
+                CoreBridge::offline(),
+                window,
+                cx,
+            );
+            *slot.borrow_mut() = Some(app.clone());
+            Root::new(app, window, cx)
+        });
+        let app = mounted.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+
+        // Focus the main composer and type every single-key shortcut letter (e, t, f, p, a, u, m, r)
+        // plus Backspace and Right arrow through the full GPUI key dispatch tree.
+        cx.update(|window, cx| {
+            let composer = app.read(cx).composer.clone();
+            composer.update(cx, |composer, cx| composer.focus_input(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("e t f p a u m r");
+        cx.run_until_parked();
+        let typed = app.read_with(cx, |app, cx| app.composer.read(cx).text());
+        assert_eq!(
+            typed, "etfpaumr",
+            "one-key message shortcuts must not swallow letters typed into the composer"
+        );
+
+        // Left, Backspace, Right, and typing at the end all reach the composer's textarea.
+        cx.simulate_keystrokes("left backspace right !");
+        cx.run_until_parked();
+        let edited = app.read_with(cx, |app, cx| app.composer.read(cx).text());
+        assert_eq!(
+            edited, "etfpaur!",
+            "backspace and right arrow must reach the focused composer"
+        );
+
+        // Select all + Cmd+B bolds the draft in place.
+        cx.simulate_keystrokes("cmd-a cmd-b");
+        cx.run_until_parked();
+        let bolded = app.read_with(cx, |app, cx| app.composer.read(cx).text());
+        assert_eq!(bolded, "*etfpaur!*");
+
+        // Blurring back to the App root restores one-key message shortcuts (`e` opens WYSIWYG edit).
+        let own_ts = app.read_with(cx, |app, cx| {
+            app.messages
+                .read(cx)
+                .own_message_ts_for_test()
+                .expect("fixture channel has an own message")
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.messages
+                    .update(cx, |list, cx| list.set_focused_for_test(&own_ts, cx));
+                app.focus.focus(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("e");
+        cx.run_until_parked();
+        let editing = app.read_with(cx, |app, cx| app.messages.read(cx).is_editing_for_test(cx));
+        assert!(
+            editing,
+            "pressing `e` outside an input opens inline WYSIWYG edit"
+        );
+
+        // Inside inline edit mode, typing `e, t, f, p, a, u, m, r` + backspace works and Esc cancels.
+        cx.simulate_keystrokes("space e t f p a u m r backspace");
+        cx.run_until_parked();
+        let edit_text = app.read_with(cx, |app, cx| app.messages.read(cx).edit_text_for_test(cx));
+        assert!(
+            edit_text.ends_with(" etfpaum"),
+            "typing in inline edit composer should work, got: {edit_text:?}"
+        );
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let still_editing =
+            app.read_with(cx, |app, cx| app.messages.read(cx).is_editing_for_test(cx));
+        assert!(!still_editing, "Esc cancels inline WYSIWYG edit mode");
+        drop(root);
+    }
+
+    #[gpui::test]
+    fn composer_live_preview_collapses_and_reveals_markdown_on_cursor_movement(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui_kit::base::Root;
+        use std::cell::RefCell;
+
+        cx.update(|cx| {
+            cx.set_global(crate::zoom::Zoom::default());
+            gpui_kit::init(cx);
+            theme::init(cx);
+        });
+        let mounted = Rc::new(RefCell::new(None));
+        let slot = mounted.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(
+                Arc::new(fixtures::load()),
+                CoreBridge::offline(),
+                window,
+                cx,
+            );
+            *slot.borrow_mut() = Some(app.clone());
+            Root::new(app, window, cx)
+        });
+        let app = mounted.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+
+        // Focus composer and type 3 headings + a paragraph with *bold* + trailing space.
+        cx.update(|window, cx| {
+            let composer = app.read(cx).composer.clone();
+            composer.update(cx, |composer, cx| composer.focus_input(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes(
+            "# space H 1 enter # # space H 2 enter # # # space H 3 enter * b o l d * space",
+        );
+        cx.run_until_parked();
+
+        let tokens = app.read_with(cx, |app, cx| app.composer.read(cx).token_ids_for_test(cx));
+        assert_eq!(
+            tokens,
+            vec![
+                ("h1".into(), "# ".into()),
+                ("h2".into(), "## ".into()),
+                ("h3".into(), "### ".into()),
+                ("hide".into(), "*".into()),
+                ("hide".into(), "*".into()),
+            ],
+            "inactive headings show H1/H2/H3 badges and inactive *bold* hides its `*` markers"
+        );
+
+        // Moving Left onto `*bold*` reveals its `*` delimiters while headings stay badges.
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+        let tokens = app.read_with(cx, |app, cx| app.composer.read(cx).token_ids_for_test(cx));
+        assert_eq!(
+            tokens,
+            vec![
+                ("h1".into(), "# ".into()),
+                ("h2".into(), "## ".into()),
+                ("h3".into(), "### ".into()),
+            ],
+            "caret touching `*bold*` reveals its `*` syntax"
+        );
+
+        // Moving Up onto `### H3` reveals `### ` while `*bold*` collapses again and H1/H2 stay badges.
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        let tokens = app.read_with(cx, |app, cx| app.composer.read(cx).token_ids_for_test(cx));
+        assert_eq!(
+            tokens,
+            vec![
+                ("h1".into(), "# ".into()),
+                ("h2".into(), "## ".into()),
+                ("hide".into(), "*".into()),
+                ("hide".into(), "*".into()),
+            ],
+            "caret on H3 reveals `### ` while H1/H2 stay badges and `*bold*` re-collapses"
+        );
+
+        drop(root);
     }
 }

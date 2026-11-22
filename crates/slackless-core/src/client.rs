@@ -552,6 +552,26 @@ impl<B: Backend> Core<B> {
                 self.fetch_peer_dnd(channel.clone());
                 self.watch_peer_presence(channel);
             }
+            Command::FetchLatestHistory(channel) => {
+                let unfurls = self.unfurls.clone();
+                self.spawn("conversations.history", async move {
+                    let items = wait_out_rate_limits(|| {
+                        backend
+                            .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
+                    })
+                    .await?;
+                    unfurls.resolve(items.iter());
+                    let target = channel.clone();
+                    with_store(&store, move |s| {
+                        items
+                            .iter()
+                            .try_for_each(|message| s.upsert_message(&ws, &target, message))
+                    })
+                    .await?;
+                    events.emit(Event::StoreChanged { channel });
+                    Ok(())
+                });
+            }
             Command::CloseConversation(channel) => {
                 if let Some(task) = self.backfills.remove(&channel) {
                     task.abort();
@@ -646,8 +666,12 @@ impl<B: Backend> Core<B> {
             }
             // Edits, deletions and reactions reach the store through their websocket echo
             // (`message_changed`, `message_deleted`, `reaction_*`), which carries the edit ts.
-            Command::EditMessage { channel, ts, text } => self.spawn("chat.update", async move {
-                backend.update_message(channel, ts, text).await?;
+            Command::EditMessage {
+                channel,
+                ts,
+                content,
+            } => self.spawn("chat.update", async move {
+                backend.update_message(channel, ts, content).await?;
                 Ok(())
             }),
             Command::DeleteMessage { channel, ts } => self.spawn("chat.delete", async move {
@@ -882,6 +906,20 @@ impl<B: Backend> Core<B> {
                         channel,
                         bookmarks,
                     })
+                });
+            }
+            Command::SetPinned {
+                channel,
+                ts,
+                pinned,
+            } => {
+                let method = if pinned { "pins.add" } else { "pins.remove" };
+                self.spawn(method, async move {
+                    backend
+                        .set_pinned(channel.clone(), ts.clone(), pinned)
+                        .await?;
+                    let pins = backend.pins(channel.clone()).await;
+                    answer_load(&events, pins, |pins| Event::PinsLoaded { channel, pins })
                 });
             }
             Command::CreateChannelCanvas(channel) => {
@@ -1457,6 +1495,10 @@ pub(crate) mod tests {
         member_calls: Vec<ChannelId>,
         /// `conversations.history` limit-1 asks (DM previews), in order.
         latest_calls: Vec<ChannelId>,
+        /// Single-page `conversations.history` asks (`FetchLatestHistory`): (channel, limit).
+        recent_calls: Vec<(ChannelId, u32)>,
+        /// `conversations.mark` asks, in order.
+        mark_calls: Vec<(ChannelId, Ts)>,
         /// `client.dms` answer.
         dms: Vec<Conversation>,
         /// How often `client.dms` was asked.
@@ -1490,6 +1532,8 @@ pub(crate) mod tests {
         /// `files.list` answer.
         files: Vec<File>,
         bookmark_adds: Vec<(ChannelId, String, String)>,
+        /// `pins.add` / `pins.remove` asks: (channel, ts, pinned?).
+        pin_calls: Vec<(ChannelId, Ts, bool)>,
         canvas_creations: Vec<ChannelId>,
         /// Every tab load (`pins.list`, `bookmarks.list`, `files.list`) fails.
         fail_tab_loads: bool,
@@ -1703,6 +1747,11 @@ pub(crate) mod tests {
         /// The recorded `bookmarks.add` calls.
         pub fn bookmark_adds(&self) -> Vec<(ChannelId, String, String)> {
             self.state.lock().unwrap().bookmark_adds.clone()
+        }
+
+        /// The recorded `pins.add` / `pins.remove` calls.
+        pub fn pin_calls(&self) -> Vec<(ChannelId, Ts, bool)> {
+            self.state.lock().unwrap().pin_calls.clone()
         }
 
         /// The recorded `conversations.canvases.create` calls.
@@ -1959,6 +2008,19 @@ pub(crate) mod tests {
             Ok(state.history.iter().max_by(|a, b| a.ts.cmp(&b.ts)).cloned())
         }
 
+        async fn recent_history(
+            &self,
+            channel: ChannelId,
+            limit: u32,
+        ) -> api::Result<Vec<Message>> {
+            let mut state = self.state.lock().unwrap();
+            state.recent_calls.push((channel, limit));
+            let mut items = state.history.clone();
+            items.sort_by(|a, b| b.ts.cmp(&a.ts));
+            items.truncate(limit as usize);
+            Ok(items)
+        }
+
         async fn leave_conversation(&self, channel: ChannelId) -> api::Result<()> {
             self.state.lock().unwrap().leave_calls.push(channel);
             Ok(())
@@ -2084,7 +2146,7 @@ pub(crate) mod tests {
             &self,
             _: ChannelId,
             _: Ts,
-            _: String,
+            _: MessageContent,
         ) -> api::Result<PostedMessage> {
             Ok(PostedMessage::default())
         }
@@ -2257,7 +2319,8 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn mark_read(&self, _: ChannelId, _: Ts) -> api::Result<()> {
+        async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
+            self.state.lock().unwrap().mark_calls.push((channel, ts));
             Err(ApiError::AuthExpired("invalid_auth".into()))
         }
 
@@ -2312,6 +2375,15 @@ pub(crate) mod tests {
                 kind: Some("link".to_owned()),
                 ..Default::default()
             });
+            Ok(())
+        }
+
+        async fn set_pinned(&self, channel: ChannelId, ts: Ts, pinned: bool) -> api::Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .pin_calls
+                .push((channel, ts, pinned));
             Ok(())
         }
 
@@ -2458,6 +2530,27 @@ pub(crate) mod tests {
                 "https://acme.test/roadmap".to_owned()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn set_pinned_calls_the_pin_method_then_refetches_the_list() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+        let ts = Ts::from("1508197641.000151");
+
+        core.handle(Command::SetPinned {
+            channel: c1(),
+            ts: ts.clone(),
+            pinned: true,
+        });
+
+        let Event::PinsLoaded { channel, pins } = next(&mut rx).await else {
+            panic!("expected the refreshed list");
+        };
+        assert_eq!(channel, c1());
+        assert!(pins.is_ok(), "the refreshed list lands");
+        assert_eq!(fake.pin_calls(), vec![(c1(), ts, true)]);
     }
 
     #[tokio::test]
@@ -3885,5 +3978,28 @@ pub(crate) mod tests {
             .find(|section| section.id == "LNEW")
             .unwrap();
         assert_eq!(fresh.channel_ids, vec![c1()]);
+    }
+
+    #[tokio::test]
+    async fn fetch_latest_history_stores_one_page_without_marking_read() {
+        let fake = FakeBackend::with_history(1..=60);
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+        core.handle(Command::FetchLatestHistory(c1()));
+
+        assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.recent_calls, vec![(c1(), 50)]);
+        assert!(state.mark_calls.is_empty());
+        assert!(state.calls.is_empty(), "no multi-page backfill walk");
+        drop(state);
+
+        let stored = store
+            .lock()
+            .unwrap()
+            .channel_history(&TeamId::from("T1"), &c1(), None, 100)
+            .unwrap();
+        assert_eq!(stored.len(), 50);
     }
 }

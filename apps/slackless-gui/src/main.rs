@@ -10,10 +10,10 @@
 //! channel with the huddle bar open on its Canvas or List tab; `=prefs` / `=profile` /
 //! `=status` / `=switcher` / `=menu` start on Preferences, a profile, the status picker, the
 //! Cmd+K switcher or the user menu (for screenshots); `=later` / `=pins` / `=activity` on
-//! Later, the pins panel or the Activity feed, `=details` the Slack Connect channel with its
-//! details dialog, `=notify` posts a test notification, `=typing` shows two people typing in
-//! the open conversation and `=message` delivers a demo direct message (notification and
-//! sound).
+//! Later, the pins panel or the Activity feed, `=unreads` the All Unreads view, `=details`
+//! the Slack Connect channel with its details dialog, `=notify` posts a test notification,
+//! `=typing` shows two people typing in the open conversation and `=message` delivers a demo
+//! direct message (notification and sound).
 
 mod actions;
 mod activity;
@@ -36,6 +36,7 @@ mod emoji;
 mod files;
 mod files_page;
 mod fixtures;
+mod hover_card;
 mod huddle;
 mod huddles;
 mod image_viewer;
@@ -64,6 +65,7 @@ mod threads;
 mod threads_cards;
 mod threads_view;
 mod thumbnail;
+mod unreads;
 mod zoom;
 
 use std::sync::Arc;

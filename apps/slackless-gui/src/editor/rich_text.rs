@@ -1,39 +1,442 @@
-//! The document as the `rich_text` block Slack's own client posts: paragraphs become
-//! sections, list items a list, quote lines a quote, code lines one preformatted block.
-//! Formatting is carried by element styles, so no character has to be escaped.
+//! Converting between an Obsidian Live Preview markdown [`Doc`] and Slack's `rich_text`
+//! Block Kit wire format.
+//!
+//! - [`from_rich_text`] loads a sent message's `rich_text` blocks into clean editable
+//!   Markdown (`#`/`##`/`###` headings, `- ` / `1. ` lists, `> ` quotes, ```` ``` ```` code
+//!   fences, `---` dividers, `*bold*`, `_italic_`, `~strike~`, `` `code` ``,
+//!   `<u>underline</u>`, `[label](url)`) plus semantic atoms (`@mentions`, `#channels`,
+//!   `@here`, `:emoji:`).
+//! - [`Doc::to_rich_text`] parses the markdown buffer and emits Slack's exact `rich_text`
+//!   containers and styled inline elements.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use slackless_core::types::rich_text::{
-    BroadcastElement, ChannelElement, EmojiElement, LinkElement, ListStyle, RichTextHeader,
-    RichTextList, RichTextPreformatted, RichTextQuote, RichTextSection, TextElement, UserElement,
+    BroadcastElement, ChannelElement, EmojiElement, LinkElement, ListStyle, RichTextDivider,
+    RichTextHeader, RichTextList, RichTextPreformatted, RichTextQuote, RichTextSection,
+    TextElement, UserElement,
 };
-use slackless_core::types::{RichTextBlock, RichTextContainer, RichTextElement, TextStyle};
+use slackless_core::types::{Block, RichTextBlock, RichTextContainer, RichTextElement, TextStyle};
 
 use super::doc::Doc;
 use super::marks::{Atom, LineKind, Style};
-use super::read::Piece;
+use super::mrkdwn::{Directory, SOFT_INDENT};
+use super::parse::{ParsedDoc, Piece};
+
+/// Read a document back from a message's `rich_text` Block Kit blocks into clean editable
+/// Markdown + atoms so every inline style, link, mention, emoji, heading, list, quote, code
+/// block, and divider round-trips losslessly when editing a sent message.
+pub fn from_rich_text(blocks: &[Block], names: &dyn Directory) -> Option<Doc> {
+    let mut reader = RichTextReader {
+        doc: Doc::default(),
+        names,
+        lines: 0,
+    };
+    let mut saw_container = false;
+    for block in blocks {
+        let Block::RichText(rich_text) = block else {
+            continue;
+        };
+        for container in &rich_text.elements {
+            if reader.container(container) {
+                saw_container = true;
+            }
+        }
+    }
+    saw_container.then_some(reader.doc)
+}
+
+struct RichTextReader<'a> {
+    doc: Doc,
+    names: &'a dyn Directory,
+    lines: usize,
+}
+
+impl RichTextReader<'_> {
+    fn begin_line(&mut self, prefix: &str) {
+        if self.lines > 0 {
+            self.doc.append("\n");
+        }
+        self.lines += 1;
+        self.doc.append(prefix);
+    }
+
+    fn container(&mut self, container: &RichTextContainer) -> bool {
+        match container {
+            RichTextContainer::Section(section) => {
+                self.begin_line("");
+                self.elements(&section.elements, "");
+                true
+            }
+            RichTextContainer::Header(header) => {
+                let level = header.level.unwrap_or(2).clamp(1, 3);
+                let prefix = LineKind::Heading(level).markdown_prefix();
+                self.begin_line(prefix);
+                self.elements(&header.elements, prefix);
+                true
+            }
+            RichTextContainer::Quote(quote) => {
+                self.begin_line("> ");
+                self.elements(&quote.elements, "> ");
+                true
+            }
+            RichTextContainer::Preformatted(code) => {
+                self.begin_line("```");
+                self.begin_line("");
+                self.code_elements(&code.elements);
+                self.begin_line("```");
+                true
+            }
+            RichTextContainer::Divider(_) => {
+                self.begin_line("---");
+                true
+            }
+            RichTextContainer::List(list) => {
+                let mut number = list.offset.unwrap_or(0);
+                let mut any = false;
+                for item in &list.elements {
+                    let elements = match item {
+                        RichTextContainer::Section(sec) => &sec.elements,
+                        RichTextContainer::Quote(q) => &q.elements,
+                        RichTextContainer::Header(h) => &h.elements,
+                        RichTextContainer::Preformatted(p) => &p.elements,
+                        RichTextContainer::List(_)
+                        | RichTextContainer::Divider(_)
+                        | RichTextContainer::Unknown { .. } => continue,
+                    };
+                    match list.style {
+                        ListStyle::Ordered => {
+                            number += 1;
+                            self.begin_line(&format!("{number}. "));
+                        }
+                        ListStyle::Bullet | ListStyle::Other(_) => {
+                            self.begin_line("- ");
+                        }
+                    }
+                    self.elements(elements, SOFT_INDENT);
+                    any = true;
+                }
+                any
+            }
+            RichTextContainer::Unknown { .. } => false,
+        }
+    }
+
+    fn code_elements(&mut self, elements: &[RichTextElement]) {
+        for element in elements {
+            let text = match element {
+                RichTextElement::Text(t) => t.text.as_str(),
+                RichTextElement::Link(l) => l.text.as_deref().unwrap_or(l.url.as_str()),
+                _ => continue,
+            };
+            let mut chunks = text.split('\n');
+            if let Some(first) = chunks.next() {
+                self.doc.append(first);
+            }
+            for rest in chunks {
+                self.begin_line("");
+                self.doc.append(rest);
+            }
+        }
+    }
+
+    fn elements(&mut self, elements: &[RichTextElement], continuation: &str) {
+        for element in elements {
+            match element {
+                RichTextElement::Text(t) => {
+                    let style = from_text_style(t.style);
+                    self.append_styled_multiline(&t.text, style, None, continuation);
+                }
+                RichTextElement::Link(link) => {
+                    let style = from_text_style(link.style);
+                    let label = link.text.as_deref().filter(|s| !s.is_empty());
+                    match label {
+                        Some(label) => {
+                            self.append_styled_multiline(
+                                label,
+                                style,
+                                Some(link.url.as_str()),
+                                continuation,
+                            );
+                        }
+                        None => {
+                            self.append_styled_multiline(&link.url, style, None, continuation);
+                        }
+                    }
+                }
+                RichTextElement::User(user) => {
+                    let name = self.names.mention(&user.user_id);
+                    let style = from_text_style(user.style);
+                    self.append_styled_atom(
+                        Atom::User(user.user_id.clone()),
+                        &format!("@{name}"),
+                        style,
+                    );
+                }
+                RichTextElement::Channel(channel) => {
+                    let name = self.names.channel_name(&channel.channel_id);
+                    let style = from_text_style(channel.style);
+                    self.append_styled_atom(
+                        Atom::Channel(channel.channel_id.clone()),
+                        &format!("#{name}"),
+                        style,
+                    );
+                }
+                RichTextElement::Broadcast(broadcast) => {
+                    let style = from_text_style(broadcast.style);
+                    self.append_styled_atom(
+                        Atom::Broadcast(broadcast.range.clone()),
+                        &format!("@{}", broadcast.range.as_str()),
+                        style,
+                    );
+                }
+                RichTextElement::Emoji(emoji) => {
+                    let shortcode = match emoji.skin_tone {
+                        Some(tone) => format!("{}::skin-tone-{tone}", emoji.name),
+                        None => emoji.name.clone(),
+                    };
+                    let shown = self
+                        .names
+                        .emoji_text(&shortcode)
+                        .unwrap_or_else(|| format!(":{shortcode}:"));
+                    let style = from_text_style(emoji.style);
+                    self.append_styled_atom(Atom::Emoji(Arc::from(shortcode)), &shown, style);
+                }
+                RichTextElement::Date(date) => {
+                    let text = date.fallback.as_deref().unwrap_or(date.format.as_str());
+                    self.append_styled_multiline(text, Style::NONE, None, continuation);
+                }
+                RichTextElement::Color(color) => {
+                    self.doc.append(&color.value);
+                }
+                RichTextElement::AttachmentMention(mention) => {
+                    let style = from_text_style(mention.style);
+                    let label = mention
+                        .text
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(mention.url.as_str());
+                    let url = (!mention.url.is_empty()).then_some(mention.url.as_str());
+                    self.append_styled_multiline(label, style, url, continuation);
+                }
+                RichTextElement::MessageMention(mention) => {
+                    let label = mention
+                        .url
+                        .as_deref()
+                        .or(mention.text.as_deref())
+                        .unwrap_or_default();
+                    let url = mention.url.as_deref().filter(|u| *u != label);
+                    self.append_styled_multiline(label, Style::NONE, url, continuation);
+                }
+                RichTextElement::Usergroup(group) => {
+                    let style = from_text_style(group.style);
+                    self.append_styled_multiline(
+                        &format!("<!subteam^{}>", group.usergroup_id),
+                        style,
+                        None,
+                        continuation,
+                    );
+                }
+                RichTextElement::Team(team) => {
+                    let style = from_text_style(team.style);
+                    self.append_styled_multiline(team.team_id.as_str(), style, None, continuation);
+                }
+                RichTextElement::Canvas(_) | RichTextElement::Unknown { .. } => {}
+            }
+        }
+    }
+
+    fn append_styled_atom(&mut self, atom: Atom, shown: &str, style: Style) {
+        let (open, close) = style_wrappers(style);
+        self.doc.append(&open);
+        self.doc.append_atom(atom, shown);
+        self.doc.append(&close);
+    }
+
+    fn append_styled_multiline(
+        &mut self,
+        text: &str,
+        style: Style,
+        link: Option<&str>,
+        continuation: &str,
+    ) {
+        let mut chunks = text.split('\n');
+        if let Some(first) = chunks.next() {
+            self.append_styled_chunk(first, style, link);
+        }
+        for rest in chunks {
+            self.begin_line(continuation);
+            self.append_styled_chunk(rest, style, link);
+        }
+    }
+
+    fn append_styled_chunk(&mut self, chunk: &str, style: Style, link: Option<&str>) {
+        if chunk.is_empty() {
+            return;
+        }
+        if style.is_plain() && link.is_none() {
+            self.doc.append(chunk);
+            return;
+        }
+        // Keep leading/trailing spaces outside `*`/`_`/`~` so word-boundary parsing matches.
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() {
+            self.doc.append(chunk);
+            return;
+        }
+        let lead_len = chunk.len() - chunk.trim_start().len();
+        let trail_start = lead_len + trimmed.len();
+        let (lead, body, trail) = (
+            &chunk[..lead_len],
+            &chunk[lead_len..trail_start],
+            &chunk[trail_start..],
+        );
+        self.doc.append(lead);
+        // If `body` directly abuts a word char or matching delimiter (e.g. adjacent styled
+        // runs `*foo*` + `*_bar_*` or `foo` + `*bar*`), use double delimiters (`**` / `~~`)
+        // so single-delimiter word-boundary rules never break parsing.
+        let prev_char = self.doc.text().chars().next_back();
+        let abuts_word = prev_char.is_some_and(char::is_alphanumeric);
+        let has_code = style.contains(Style::CODE);
+        let outer_style = if link.is_some() && has_code {
+            // Put inline code backticks INSIDE `[label](url)` so the link parses cleanly.
+            Style::NONE
+                .with(if style.contains(Style::BOLD) {
+                    Style::BOLD
+                } else {
+                    Style::NONE
+                })
+                .with(if style.contains(Style::ITALIC) {
+                    Style::ITALIC
+                } else {
+                    Style::NONE
+                })
+                .with(if style.contains(Style::STRIKE) {
+                    Style::STRIKE
+                } else {
+                    Style::NONE
+                })
+                .with(if style.contains(Style::UNDERLINE) {
+                    Style::UNDERLINE
+                } else {
+                    Style::NONE
+                })
+        } else {
+            style
+        };
+        let (open, close) = style_wrappers_for(outer_style, abuts_word, prev_char);
+        self.doc.append(&open);
+        match link {
+            Some(url) => {
+                self.doc.append("[");
+                if has_code {
+                    self.doc.append("`");
+                }
+                self.doc.append(body);
+                if has_code {
+                    self.doc.append("`");
+                }
+                self.doc.append("](");
+                self.doc.append(url);
+                self.doc.append(")");
+            }
+            None => self.doc.append(body),
+        }
+        self.doc.append(&close);
+        self.doc.append(trail);
+    }
+}
+
+/// Opening and closing markdown delimiters for `style`, outermost first (`code` innermost
+/// since inline code does not nest further formatting).
+fn style_wrappers(style: Style) -> (String, String) {
+    style_wrappers_for(style, false, None)
+}
+
+fn style_wrappers_for(style: Style, abuts_word: bool, prev: Option<char>) -> (String, String) {
+    let mut open = String::new();
+    let mut close = String::new();
+    let bold_delim = if abuts_word || prev == Some('*') {
+        "**"
+    } else {
+        "*"
+    };
+    let strike_delim = if abuts_word || prev == Some('~') {
+        "~~"
+    } else {
+        "~"
+    };
+    for (flag, o, c) in [
+        (Style::BOLD, bold_delim, bold_delim),
+        (Style::ITALIC, "_", "_"),
+        (Style::STRIKE, strike_delim, strike_delim),
+        (Style::UNDERLINE, "<u>", "</u>"),
+        (Style::CODE, "`", "`"),
+    ] {
+        if style.contains(flag) {
+            open.push_str(o);
+            close.insert_str(0, c);
+        }
+    }
+    (open, close)
+}
+
+fn from_text_style(style: Option<TextStyle>) -> Style {
+    let Some(style) = style else {
+        return Style::NONE;
+    };
+    let mut out = Style::NONE;
+    if style.bold {
+        out = out.with(Style::BOLD);
+    }
+    if style.italic {
+        out = out.with(Style::ITALIC);
+    }
+    if style.strike {
+        out = out.with(Style::STRIKE);
+    }
+    if style.underline {
+        out = out.with(Style::UNDERLINE);
+    }
+    if style.code {
+        out = out.with(Style::CODE);
+    }
+    out
+}
 
 impl Doc {
     pub fn to_rich_text(&self) -> RichTextBlock {
+        let parsed = self.parse();
         let mut containers: Vec<RichTextContainer> = Vec::new();
-        // The previous line's kind; the outer `None` is "no line yet".
+        // The previous non-fence line's kind; outer `None` is "no line yet".
         let mut above: Option<Option<LineKind>> = None;
-        for line in self.lines() {
-            let elements = self.elements(line.kind, line.content.clone());
+        for line in &parsed.lines {
+            if line.kind == Some(LineKind::Fence) {
+                // A fence starts/ends a preformatted block; break adjacency with any
+                // preceding section or code block.
+                above = Some(Some(LineKind::Fence));
+                continue;
+            }
+            let elements = line_elements(self, &parsed, line.kind, line.content.clone());
             let last = containers.last_mut();
             match (line.kind, last) {
                 (None, Some(RichTextContainer::Section(section))) if above == Some(None) => {
                     extend_line(&mut section.elements, elements);
                 }
-                (Some(LineKind::Quote), Some(RichTextContainer::Quote(quote))) => {
+                (Some(LineKind::Quote), Some(RichTextContainer::Quote(quote)))
+                    if above == Some(Some(LineKind::Quote)) =>
+                {
                     extend_line(&mut quote.elements, elements);
                 }
-                (Some(LineKind::Code), Some(RichTextContainer::Preformatted(code))) => {
+                (Some(LineKind::Code), Some(RichTextContainer::Preformatted(code)))
+                    if above == Some(Some(LineKind::Code)) =>
+                {
                     extend_line(&mut code.elements, elements);
                 }
                 (Some(LineKind::Heading(level)), Some(RichTextContainer::Header(header)))
-                    if header.level == Some(level) =>
+                    if above == Some(Some(LineKind::Heading(level)))
+                        && header.level == Some(level) =>
                 {
                     extend_line(&mut header.elements, elements);
                 }
@@ -45,7 +448,12 @@ impl Doc {
                 (
                     Some(kind @ (LineKind::Bullet | LineKind::Ordered)),
                     Some(RichTextContainer::List(list)),
-                ) if list.style == list_style(kind) => {
+                ) if list.style == list_style(kind)
+                    && matches!(
+                        above,
+                        Some(Some(LineKind::Bullet | LineKind::Ordered | LineKind::Soft))
+                    ) =>
+                {
                     list.elements.push(section(elements));
                 }
                 (Some(kind @ (LineKind::Bullet | LineKind::Ordered)), _) => {
@@ -76,8 +484,13 @@ impl Doc {
                         elements,
                     }));
                 }
+                (Some(LineKind::Divider), _) => {
+                    containers.push(RichTextContainer::Divider(RichTextDivider::default()));
+                }
                 // A soft line with no item above it reads as a paragraph.
-                (None | Some(LineKind::Soft), _) => containers.push(section(elements)),
+                (None | Some(LineKind::Soft) | Some(LineKind::Fence), _) => {
+                    containers.push(section(elements));
+                }
             }
             above = Some(line.kind);
         }
@@ -87,58 +500,59 @@ impl Doc {
             elements: containers,
         }
     }
-
-    /// The inline elements of `range`, the content of a line of `kind`. Code is literal text.
-    fn elements(&self, kind: Option<LineKind>, range: Range<usize>) -> Vec<RichTextElement> {
-        let mut elements = Vec::new();
-        if kind == Some(LineKind::Code) {
-            push(&mut elements, text(&self.text()[range], None));
-            return elements;
-        }
-        for piece in self.pieces(range) {
-            let element = match piece {
-                Piece::Text { text: run, attrs } => match &attrs.link {
-                    Some(url) => RichTextElement::Link(LinkElement {
-                        url: url.to_string(),
-                        text: Some(run.to_owned()),
-                        style: text_style(attrs.style),
-                    }),
-                    None => {
-                        for element in linkified(run, text_style(attrs.style)) {
-                            push(&mut elements, element);
-                        }
-                        continue;
-                    }
-                },
-                Piece::Atom { atom, style, .. } => {
-                    let style = text_style(style);
-                    match atom {
-                        Atom::User(id) => RichTextElement::User(UserElement {
-                            user_id: id.clone(),
-                            style,
-                        }),
-                        Atom::Channel(id) => RichTextElement::Channel(ChannelElement {
-                            channel_id: id.clone(),
-                            style,
-                        }),
-                        Atom::Broadcast(range) => RichTextElement::Broadcast(BroadcastElement {
-                            range: range.clone(),
-                            style,
-                        }),
-                        Atom::Emoji(shortcode) => emoji(shortcode, style),
-                        Atom::Marker(_) => continue,
-                    }
-                }
-            };
-            push(&mut elements, element);
-        }
-        elements
-    }
 }
 
-/// `run` with its bare URLs as link elements, as Slack's composer sends a typed or pasted
-/// URL: `http://`, `https://` or `www.` at a word's start, up to whitespace, less trailing
-/// punctuation (a closing parenthesis only when unmatched in the URL).
+fn line_elements(
+    doc: &Doc,
+    parsed: &ParsedDoc,
+    kind: Option<LineKind>,
+    range: Range<usize>,
+) -> Vec<RichTextElement> {
+    let mut elements = Vec::new();
+    if kind == Some(LineKind::Code) {
+        push(&mut elements, text(&doc.text()[range], None));
+        return elements;
+    }
+    for piece in parsed.pieces(doc, range) {
+        let element = match piece {
+            Piece::Text { text: run, attrs } => match &attrs.link {
+                Some(url) => RichTextElement::Link(LinkElement {
+                    url: url.to_string(),
+                    text: (url.as_ref() != run).then(|| run.to_owned()),
+                    style: text_style(attrs.style),
+                }),
+                None if attrs.style.contains(Style::CODE) => text(run, text_style(attrs.style)),
+                None => {
+                    for element in linkified(run, text_style(attrs.style)) {
+                        push(&mut elements, element);
+                    }
+                    continue;
+                }
+            },
+            Piece::Atom { atom, style, .. } => {
+                let style = text_style(style);
+                match atom {
+                    Atom::User(id) => RichTextElement::User(UserElement {
+                        user_id: id.clone(),
+                        style,
+                    }),
+                    Atom::Channel(id) => RichTextElement::Channel(ChannelElement {
+                        channel_id: id.clone(),
+                        style,
+                    }),
+                    Atom::Broadcast(range) => RichTextElement::Broadcast(BroadcastElement {
+                        range: range.clone(),
+                        style,
+                    }),
+                    Atom::Emoji(shortcode) => emoji(shortcode, style),
+                }
+            }
+        };
+        push(&mut elements, element);
+    }
+    elements
+}
+
 fn linkified(run: &str, style: Option<TextStyle>) -> Vec<RichTextElement> {
     let mut elements = Vec::new();
     let mut rest = run;
@@ -176,7 +590,6 @@ fn linkified(run: &str, style: Option<TextStyle>) -> Vec<RichTextElement> {
     elements
 }
 
-/// Where the first URL starts in `text`: `http://`, `https://` or `www.` beginning a word.
 fn url_start(text: &str) -> Option<usize> {
     ["https://", "http://", "www."]
         .into_iter()
@@ -196,8 +609,10 @@ fn list_style(kind: LineKind) -> ListStyle {
         LineKind::Bullet
         | LineKind::Quote
         | LineKind::Code
+        | LineKind::Fence
         | LineKind::Soft
-        | LineKind::Heading(_) => ListStyle::Bullet,
+        | LineKind::Heading(_)
+        | LineKind::Divider => ListStyle::Bullet,
     }
 }
 
@@ -223,7 +638,6 @@ fn text_style(style: Style) -> Option<TextStyle> {
     })
 }
 
-/// `wave::skin-tone-3` as Slack's emoji element: the base name and the tone beside it.
 fn emoji(shortcode: &str, style: Option<TextStyle>) -> RichTextElement {
     let (name, tone) = match shortcode.split_once("::skin-tone-") {
         Some((name, tone)) => (name, tone.parse().ok()),
@@ -237,14 +651,13 @@ fn emoji(shortcode: &str, style: Option<TextStyle>) -> RichTextElement {
     })
 }
 
-/// Drop what Slack rejects as an empty block: containers and list items without elements.
-/// (A blank line inside a paragraph, quote or code block is a newline in its text.)
 fn prune(containers: &mut Vec<RichTextContainer>) {
     containers.retain_mut(|container| match container {
         RichTextContainer::Section(section) => !section.elements.is_empty(),
         RichTextContainer::Header(header) => !header.elements.is_empty(),
         RichTextContainer::Quote(quote) => !quote.elements.is_empty(),
         RichTextContainer::Preformatted(code) => !code.elements.is_empty(),
+        RichTextContainer::Divider(_) => true,
         RichTextContainer::List(list) => {
             prune(&mut list.elements);
             !list.elements.is_empty()
@@ -253,8 +666,6 @@ fn prune(containers: &mut Vec<RichTextContainer>) {
     });
 }
 
-/// Add `element`, joining it onto the previous text run when both carry the same style. An
-/// empty text run is not an element.
 fn push(elements: &mut Vec<RichTextElement>, element: RichTextElement) {
     match (elements.last_mut(), &element) {
         (_, RichTextElement::Text(next)) if next.text.is_empty() => {}
@@ -267,7 +678,6 @@ fn push(elements: &mut Vec<RichTextElement>, element: RichTextElement) {
     }
 }
 
-/// Continue a container with a further line.
 fn extend_line(elements: &mut Vec<RichTextElement>, line: Vec<RichTextElement>) {
     push(elements, text("\n", None));
     for element in line {

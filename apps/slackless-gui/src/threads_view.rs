@@ -92,7 +92,8 @@ impl ThreadsView {
                     // "last message" for Up to edit.
                     ComposerEvent::Schedule { .. }
                     | ComposerEvent::EditLast
-                    | ComposerEvent::Typing => {}
+                    | ComposerEvent::Typing
+                    | ComposerEvent::Cancel => {}
                 },
             )];
             ThreadsView {

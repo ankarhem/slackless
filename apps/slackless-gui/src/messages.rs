@@ -33,22 +33,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
 use gpui_kit::component::button::{Button, ButtonRounded};
-use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     Anchor, AnyElement, App, AppContext as _, BorderStyle, Bounds, Context, Corners, CursorStyle,
-    DispatchPhase, Div, Edges, Element, ElementId, Entity, EventEmitter, Focusable as _, Font,
-    FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, ImageSource,
-    InspectorElementId, InteractiveElement as _, InteractiveText, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels, Point,
-    Render, RenderOnce, SharedString, Stateful, StatefulInteractiveElement as _,
-    StrikethroughStyle, StyleRefinement, Styled as _, StyledText, Subscription, TextLayout,
-    TextRun, TransformationMatrix, UnderlineStyle, WeakEntity, Window, deferred, div, px, relative,
-    rgb, transparent_black,
+    DispatchPhase, Div, Edges, Element, ElementId, Entity, EventEmitter, Font, FontStyle,
+    FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, ImageSource, InspectorElementId,
+    InteractiveElement as _, InteractiveText, IntoElement, LayoutId, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels, Point, Render, RenderOnce,
+    ScrollEvent, SharedString, Stateful, StatefulInteractiveElement as _, StrikethroughStyle,
+    StyleRefinement, Styled as _, StyledText, Subscription, TextLayout, TextRun,
+    TransformationMatrix, UnderlineStyle, WeakEntity, Window, deferred, div, px, relative, rgb,
+    size, transparent_black,
 };
+use slackless_core::api::MessageContent;
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList, RichTextPreformatted,
 };
@@ -56,8 +56,10 @@ use slackless_core::types::{Block, ChannelId, Message, MessageSubtype, TextStyle
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
 use crate::blockkit::{self, BlockDispatch, BlockKitState, KitCx};
-use crate::emoji;
+use crate::composer::{Composer, ComposerEvent};
+use crate::emoji::{self, EmojiChoice};
 use crate::fixtures::Fixtures;
+use crate::hover_card::{self, Trigger};
 use crate::image_viewer::{self, ImageClick, ImageOrigin};
 use crate::later::{Remind, SaveRequest};
 
@@ -181,6 +183,9 @@ pub enum MessageListEvent {
         ts: Ts,
         position: Point<Pixels>,
     },
+    /// The inline edit composer's emoji button asked for the picker; picks come back through
+    /// [`MessageList::insert_edit_emoji`].
+    PickEditEmoji(Point<Pixels>),
     /// Save for later / Remind me / unsave; the root keeps the Later list.
     Later(SaveRequest),
     /// The user reacted to, edited or deleted a message in `channel` (already shown here);
@@ -232,11 +237,13 @@ struct MessageData {
     kit: Entity<BlockKitState>,
     /// Messages saved for later (fixture mode: in memory).
     saved: HashSet<Ts>,
+    /// The hovered message (Slack's one-key target while no field holds focus).
+    active: Option<Ts>,
     /// Root of the thread open beside the list, tinted while it shows.
     open_thread: Option<Ts>,
-    /// The message being edited in place; its draft is `edit_draft`.
+    /// The message being edited in place; its WYSIWYG draft is `edit_composer`.
     editing: Option<Ts>,
-    edit_draft: Entity<TextareaState>,
+    edit_composer: Entity<Composer>,
 }
 
 pub struct MessageList {
@@ -269,20 +276,29 @@ impl MessageList {
             let history = history_of(&messages, &channel);
             let count = history.len();
             let kit = cx.new(|_| BlockKitState::default());
-            let edit_draft = cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Edit message")
-                    .auto_grow(1, 8)
-            });
+            let edit_composer = Composer::new_edit(fixtures.clone(), window, cx);
             // Constructor enables FollowMode::Tail: the transcript starts at the bottom and
             // follows new content.
             let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
-            // Control state and the edit draft live in their own entities: repaint the rows
+            // Control state and the edit composer live in their own entities: repaint the rows
             // that show them when either changes; the scroller is watched to page older
             // history in when the reader reaches the top.
             let subscriptions = vec![
                 cx.observe(&kit, |_, _, cx| cx.notify()),
-                cx.subscribe(&edit_draft, |_, _, _: &InputEvent, cx| cx.notify()),
+                cx.subscribe(
+                    &edit_composer,
+                    |list: &mut MessageList, _, event: &ComposerEvent, cx| match event {
+                        ComposerEvent::Submit(content) => list.save_edit(content.clone(), cx),
+                        ComposerEvent::Cancel => list.cancel_edit(cx),
+                        ComposerEvent::OpenEmojiPicker(position) => {
+                            cx.emit(MessageListEvent::PickEditEmoji(*position));
+                        }
+                        ComposerEvent::SlashCommand(_)
+                        | ComposerEvent::Schedule { .. }
+                        | ComposerEvent::EditLast
+                        | ComposerEvent::Typing => {}
+                    },
+                ),
                 cx.observe(&scroller, |list: &mut MessageList, scroller, cx| {
                     list.request_older_near_top(&scroller, cx)
                 }),
@@ -296,9 +312,10 @@ impl MessageList {
                     .and_then(|conversation| conversation.last_read.clone()),
                 kit,
                 saved: HashSet::new(),
+                active: None,
                 open_thread: None,
                 editing: None,
-                edit_draft,
+                edit_composer,
             });
             MessageList {
                 fixtures,
@@ -316,12 +333,33 @@ impl MessageList {
     /// Live refresh: draw names, emoji and conversations from `fixtures`; the loaded history,
     /// scroll position and new-messages divider stay.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        let edit_composer = self.data.read(cx).edit_composer.clone();
+        edit_composer.update(cx, |composer, cx| {
+            composer.set_fixtures(fixtures.clone(), cx)
+        });
         self.data.update(cx, |data, cx| {
             data.fixtures = fixtures.clone();
             cx.notify();
         });
         self.fixtures = fixtures;
         cx.notify();
+    }
+
+    /// Forward the Enter-to-send preference to the inline edit composer.
+    pub fn set_enter_sends(&mut self, enter_sends: bool, cx: &mut Context<Self>) {
+        let edit_composer = self.data.read(cx).edit_composer.clone();
+        edit_composer.update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+    }
+
+    /// Insert a picked emoji into the inline edit composer.
+    pub fn insert_edit_emoji(
+        &mut self,
+        choice: &EmojiChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let edit_composer = self.data.read(cx).edit_composer.clone();
+        edit_composer.update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
 
     pub fn set_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
@@ -485,6 +523,7 @@ impl MessageList {
             data.messages = history;
             data.last_read = last_read;
             data.editing = None;
+            data.active = None;
         });
         self.scroller
             .update(cx, |scroller, cx| scroller.reset(count, cx));
@@ -615,6 +654,35 @@ impl MessageList {
                     let _ = this.update(cx, |list, cx| list.delete(&ts, cx));
                 });
             }
+            MessageAction::TogglePin => {
+                let pinned = self
+                    .current_mut(ts)
+                    .map(|message| actions::toggle_pin(message, &channel));
+                let Some(pinned) = pinned else {
+                    return;
+                };
+                let preview = {
+                    let data = self.data.read(cx);
+                    data.messages
+                        .iter()
+                        .find(|m| &m.ts == ts)
+                        .map(|m| self.fixtures.preview(m))
+                        .unwrap_or_default()
+                };
+                actions::notify(
+                    if pinned { "Pinned" } else { "Unpinned" },
+                    preview,
+                    window,
+                    cx,
+                );
+                cx.emit(MessageListEvent::Changed {
+                    channel,
+                    change: MessageChange::Pin {
+                        ts: ts.clone(),
+                        pinned,
+                    },
+                });
+            }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
             MessageAction::OpenImage(origin) => self.open_image(ts, &origin, cx),
             MessageAction::BlockAction { action, attachment } => {
@@ -686,6 +754,83 @@ impl MessageList {
         if let Some(ts) = newest {
             self.begin_edit(&ts, window, cx);
         }
+    }
+
+    /// Track the message currently under the pointer for Slack's one-key shortcuts, without
+    /// re-rendering the transcript (row hover styling is handled natively in paint).
+    fn set_focused(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        if self.data.read(cx).active.as_ref() != Some(ts) {
+            self.data
+                .update(cx, |data, _| data.active = Some(ts.clone()));
+        }
+    }
+
+    fn clear_focused(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        if self.data.read(cx).active.as_ref() == Some(ts) {
+            self.data.update(cx, |data, _| data.active = None);
+        }
+    }
+
+    /// The focused message, if the mouse has hovered the transcript.
+    pub fn focused(&self, cx: &App) -> Option<Ts> {
+        self.data.read(cx).active.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_focused_for_test(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        self.set_focused(ts, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_editing_for_test(&self, cx: &App) -> bool {
+        self.data.read(cx).editing.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edit_text_for_test(&self, cx: &App) -> String {
+        self.data.read(cx).edit_composer.read(cx).text()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn own_message_ts_for_test(&self) -> Option<Ts> {
+        let self_user = &self.fixtures.self_user;
+        self.messages
+            .get(&self.channel)?
+            .iter()
+            .find(|m| m.user.as_ref() == Some(self_user))
+            .map(|m| m.ts.clone())
+    }
+
+    /// A one-key shortcut on the focused message, routed through the row's own
+    /// [`MessageAction`] handler — the same one the hover bar and menu run. No-op while no
+    /// message is focused (the mouse has not hovered the transcript yet) or the action does
+    /// not apply: Edit and Delete are the signed-in user's only.
+    pub fn focus_action(
+        &mut self,
+        action: MessageAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (ts, set) = {
+            let data = self.data.read(cx);
+            let Some(ts) = data.active.clone() else {
+                return;
+            };
+            let set = match data.messages.iter().find(|message| message.ts == ts) {
+                Some(message) => ActionSet {
+                    own: message.user.as_ref() == Some(&self.fixtures.self_user),
+                    reply: true,
+                    saved: data.saved.contains(&message.ts),
+                    pinned: message.pinned_to.contains(&self.channel),
+                },
+                None => return,
+            };
+            (ts, set)
+        };
+        if !actions::eligible(set, &action) {
+            return;
+        }
+        self.run_action(&ts, action, window, cx);
     }
 
     /// The date divider's "Jump to…": scroll to the newest message, or to the first message
@@ -848,43 +993,38 @@ impl MessageList {
         self.refresh(cx);
     }
 
-    /// Edit `ts` in place: the row body becomes the shared edit draft, focused at the end.
+    /// Edit `ts` in place: the row body becomes the shared WYSIWYG edit composer, focused at
+    /// the end and scrolled into view.
     fn begin_edit(&mut self, ts: &Ts, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.current_mut(ts).map(|message| message.text.clone()) else {
+        let Some(message) = self.current_mut(ts).cloned() else {
             return;
         };
-        let caret = text.len();
-        let draft = self.data.read(cx).edit_draft.clone();
-        draft.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
-            state.set_selected_range(caret..caret, cx);
+        let composer = self.data.read(cx).edit_composer.clone();
+        composer.update(cx, |composer, cx| {
+            composer.load_message(&message, window, cx);
         });
-        draft.read(cx).focus_handle(cx).focus(window, cx);
+        let row = self.data.read(cx).messages.iter().position(|m| &m.ts == ts);
         self.data
             .update(cx, |data, _| data.editing = Some(ts.clone()));
         self.refresh(cx);
+        if let Some(ix) = row {
+            self.scroller
+                .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+        }
     }
 
-    fn save_edit(&mut self, cx: &mut Context<Self>) {
-        let (editing, draft) = {
-            let data = self.data.read(cx);
-            (data.editing.clone(), data.edit_draft.clone())
-        };
-        let Some(ts) = editing else {
+    fn save_edit(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+        let Some(ts) = self.data.read(cx).editing.clone() else {
             return;
         };
-        let text = draft.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
         let me = self.fixtures.self_user.clone();
         if let Some(message) = self.current_mut(&ts) {
-            actions::apply_edit(message, &me, text.clone());
+            actions::apply_edit(message, &me, content.clone());
             cx.emit(MessageListEvent::Changed {
                 channel: self.channel.clone(),
                 change: MessageChange::Edit {
                     ts: ts.clone(),
-                    text,
+                    content,
                 },
             });
         }
@@ -1071,7 +1211,7 @@ fn transcript_row(
     };
 
     let mut body = v_flex().flex_1().min_w_0().gap_0p5().text_sm();
-    if !grouped || editing {
+    if !grouped && !editing {
         body = body.child(message_header(
             message,
             &author,
@@ -1082,14 +1222,7 @@ fn transcript_row(
         ));
     }
     if editing {
-        let (cancel, save) = (this.clone(), this.clone());
-        body = body.child(actions::edit_box(
-            &key,
-            &store.edit_draft,
-            move |_, cx| cancel.update(cx, |list, cx| list.cancel_edit(cx)),
-            move |_, cx| save.update(cx, |list, cx| list.save_edit(cx)),
-            cx,
-        ));
+        body = body.child(store.edit_composer.clone());
     } else {
         let kcx = KitCx::new(fixtures, Some(&store.kit), &message.ts)
             .with_links(links.clone())
@@ -1287,12 +1420,14 @@ fn transcript_row(
         own: message.user.as_ref() == Some(&fixtures.self_user),
         reply: true,
         saved,
+        pinned: message.pinned_to.contains(&store.channel),
     };
     let theme = cx.theme();
     let hover_bg = theme.secondary.opacity(0.5);
     let saved_bg = theme.warning.opacity(0.08);
     let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
     let thread_bg = crate::theme::thread_root(cx);
+    let editing_bg = crate::theme::editing_row(cx);
     let menu_handler = handler.clone();
     let card = div()
         .id(SharedString::from(key.clone()))
@@ -1302,16 +1437,19 @@ fn transcript_row(
         .ml(px(-GUTTER))
         .mr(px(-GUTTER))
         .px(px(GUTTER))
-        .py_0p5()
-        .when(saved, |card| {
-            card.bg(saved_bg).child(actions::saved_banner(cx))
-        })
-        .when(message.is_ephemeral, |card| {
-            card.child(actions::ephemeral_banner(cx))
-        })
-        .when(thread_open, |card| card.bg(thread_bg))
-        .when(!saved && !thread_open, |card| {
-            card.hover(|card| card.bg(hover_bg))
+        .when(editing, |card| card.py_2().bg(editing_bg))
+        .when(!editing, |card| {
+            card.py_0p5()
+                .when(saved, |card| {
+                    card.bg(saved_bg).child(actions::saved_banner(cx))
+                })
+                .when(message.is_ephemeral, |card| {
+                    card.child(actions::ephemeral_banner(cx))
+                })
+                .when(thread_open, |card| card.bg(thread_bg))
+                .when(!saved && !thread_open, |card| {
+                    card.hover(|card| card.bg(hover_bg))
+                })
         })
         .child(
             h_flex()
@@ -1331,8 +1469,27 @@ fn transcript_row(
                 cx,
             ))
         })
+        .on_hover({
+            let (this, ts) = (this.clone(), message.ts.clone());
+            move |hovered: &bool, _, cx| {
+                this.update(cx, |list, cx| {
+                    if *hovered {
+                        list.set_focused(&ts, cx);
+                    } else {
+                        list.clear_focused(&ts, cx);
+                    }
+                });
+            }
+        })
         .context_menu(move |menu, window, cx| {
-            actions::actions_menu(menu, set, &menu_handler, window, cx)
+            actions::actions_menu(
+                menu,
+                set,
+                &menu_handler,
+                actions::MenuOrigin::Context,
+                window,
+                cx,
+            )
         });
     row.child(card)
 }
@@ -1478,7 +1635,9 @@ pub fn message_row_linked(
 }
 
 /// `element` as a link to `user`'s profile, like Slack's message avatars and names; plain
-/// when there is no user or no action handler (search and pinned cards).
+/// when there is no user or no action handler (search and pinned cards). The link also
+/// drives the member hover card: hover reports carry its key, so the pointer crossing
+/// straight onto another trigger keeps the newer one.
 fn profile_link(
     element: impl IntoElement,
     id: String,
@@ -1489,6 +1648,10 @@ fn profile_link(
         return element.into_any_element();
     };
     let (user, handler) = (user.clone(), handler.clone());
+    let (hover_user, hover_key) = (user.clone(), SharedString::from(format!("name-{id}")));
+    // The anchor the enter reported, so the matching leave reports the same identity.
+    let anchor = Rc::new(Cell::new(None));
+    let hover_anchor = anchor.clone();
     div()
         .id(SharedString::from(id))
         .cursor_pointer()
@@ -1497,11 +1660,39 @@ fn profile_link(
         .on_click(move |_, window, cx| {
             handler(MessageAction::OpenProfile(user.clone()), window, cx)
         })
+        .on_hover(move |inside: &bool, window, cx| {
+            if *inside {
+                let at = window.mouse_position();
+                hover_anchor.set(Some(at));
+                hover_card::entered(
+                    Trigger {
+                        key: hover_key.clone(),
+                        user: hover_user.clone(),
+                        anchor: Bounds::new(at, size(px(40.), px(20.))),
+                    },
+                    cx,
+                );
+            } else if hover_anchor.take().is_some() {
+                hover_card::left(&hover_key, cx);
+            }
+        })
         .into_any_element()
 }
 
 /// A message's avatar gutter: the author's avatar (badged when they are from another
 /// organization) as a link to their profile, [`AVATAR_TOP`] down like Slack's.
+/// The 36px left-gutter author avatar shared by transcript and thread editing rows.
+pub(crate) fn editing_avatar(
+    fixtures: &Fixtures,
+    message: &Message,
+    key: &str,
+    cx: &App,
+) -> AnyElement {
+    let key_id = author_key(message);
+    let author = author_name(message, fixtures);
+    avatar_gutter(fixtures, message, &key_id, &author, key, None, cx)
+}
+
 fn avatar_gutter(
     fixtures: &Fixtures,
     message: &Message,
@@ -2409,12 +2600,14 @@ struct SelectableParagraph {
 }
 
 /// What one paragraph keeps between frames: its selection handle (and the subscription
-/// that redraws the window when a drag moves its selection), the link it hovers and the
-/// link a press started in.
+/// that redraws the window when a drag moves its selection), the link it hovers, the link a
+/// press started in, and its key for member-hover-card reports.
 struct ParagraphState {
     handle: TextSelectionHandle,
     hovered_link: Rc<Cell<Option<usize>>>,
     mouse_down: Rc<Cell<Option<usize>>>,
+    /// This paragraph's key in hover-card trigger reports (stable across frames).
+    hover_key: SharedString,
     _refresh: Subscription,
 }
 
@@ -2671,11 +2864,15 @@ impl SelectableParagraph {
                 self.paint_hover_underline(layout, range.clone(), window);
             }
         }
-        let (mouse_down, hovered_link) = window.with_element_state::<ParagraphState, _>(
+        let (mouse_down, hovered_link, hover_key) = window.with_element_state::<ParagraphState, _>(
             global_id.expect("SelectableParagraph must have a stable element id"),
             |state, _| {
                 let state = state.expect("request_layout retained the paragraph state");
-                let cells = (state.mouse_down.clone(), state.hovered_link.clone());
+                let cells = (
+                    state.mouse_down.clone(),
+                    state.hovered_link.clone(),
+                    state.hover_key.clone(),
+                );
                 (cells, state)
             },
         );
@@ -2715,24 +2912,70 @@ impl SelectableParagraph {
             }
         };
         window.on_mouse_event(up);
+        // The wheel handler below takes its own copies: `r#move` moves the cells in.
+        let wheel_hover = (hover_key.clone(), hovered_link.clone());
         let r#move = {
             let (layout, links) = (layout.clone(), self.links.clone());
-            let hitbox = hitbox.clone();
-            move |event: &MouseMoveEvent, phase, window: &mut Window, _: &mut App| {
-                if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+            let (hitbox, hover_key) = (hitbox.clone(), hover_key.clone());
+            move |event: &MouseMoveEvent, phase, window: &mut Window, cx: &mut App| {
+                if phase != DispatchPhase::Bubble {
                     return;
                 }
-                let now = layout
-                    .index_for_position(event.position)
-                    .ok()
-                    .and_then(|ix| links.iter().position(|(range, _)| range.contains(&ix)));
-                if hovered_link.get() != now {
-                    hovered_link.set(now);
-                    window.refresh();
+                // Off the paragraph counts as no link, so the cell (and a profile-link hover
+                // card trigger) clears when the pointer leaves the hitbox too.
+                let now = if hitbox.is_hovered(window) {
+                    layout
+                        .index_for_position(event.position)
+                        .ok()
+                        .and_then(|ix| links.iter().position(|(range, _)| range.contains(&ix)))
+                } else {
+                    None
+                };
+                let was = hovered_link.replace(now);
+                if was == now {
+                    return;
                 }
+                // Profile links (@mention pills) drive the member hover card: the anchor is
+                // the pill's first glyph in window coordinates, pill-wide and one line tall.
+                let trigger = |ix: usize| {
+                    links.get(ix).and_then(|(range, target)| {
+                        let LinkTarget::Profile(user) = target else {
+                            return None;
+                        };
+                        let origin = layout.position_for_index(range.start)?;
+                        Some((
+                            user.clone(),
+                            Bounds::new(origin, size(px(40.), layout.line_height())),
+                        ))
+                    })
+                };
+                if let Some((user, anchor)) = now.and_then(trigger) {
+                    hover_card::entered(
+                        Trigger {
+                            key: hover_key.clone(),
+                            user,
+                            anchor,
+                        },
+                        cx,
+                    );
+                } else if was.and_then(trigger).is_some() {
+                    hover_card::left(&hover_key, cx);
+                }
+                window.refresh();
             }
         };
         window.on_mouse_event(r#move);
+        // A scroll can move a trigger out from under a still pointer: the card closes, as
+        // Slack's does. Only the paragraph owning the trigger reports (its cell is set).
+        let wheel = {
+            let (hover_key, hovered_link) = wheel_hover;
+            move |_: &ScrollEvent, phase, _window: &mut Window, cx: &mut App| {
+                if phase == DispatchPhase::Bubble && hovered_link.replace(None).is_some() {
+                    hover_card::left(&hover_key, cx);
+                }
+            }
+        };
+        window.on_mouse_event(wheel);
     }
 }
 
@@ -2773,6 +3016,7 @@ impl Element for SelectableParagraph {
                         handle,
                         hovered_link: Rc::new(Cell::new(None)),
                         mouse_down: Rc::new(Cell::new(None)),
+                        hover_key: format!("{:?}", self.id).into(),
                         _refresh: refresh,
                     }
                 });
@@ -3069,19 +3313,35 @@ fn render_containers(
                 }
                 RichTextContainer::Header(header) => {
                     paragraph(&header.elements, fixtures, theme, false).map(|paragraph| {
-                        // Slack's heading scale over the 15px body (level 2 when unset).
-                        let (size, line) = match header.level.unwrap_or(2).clamp(1, 3) {
-                            1 => (30., 38.),
-                            2 => (22., 30.),
-                            _ => (18., 26.),
+                        // Slack's `.p-rich_text_header`: 18px Black for Big, 15px Black for
+                        // Medium and 15px Bold for Small, each on a 22.5px line, with 1em
+                        // above (none as the first container) and 4px below.
+                        let (size, weight) = match header.level.unwrap_or(2).clamp(1, 3) {
+                            1 => (18., FontWeight::BLACK),
+                            2 => (15., FontWeight::BLACK),
+                            _ => (15., FontWeight::BOLD),
                         };
                         div()
+                            .when(n > 0, |d| d.mt(px(15.)))
+                            .mb(px(4.))
                             .text_size(px(size))
-                            .line_height(px(line))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .line_height(px(22.5))
+                            .font_weight(weight)
                             .child(paragraph)
                             .into_any_element()
                     })
+                }
+                RichTextContainer::Divider(_) => {
+                    // Slack's `.p-rich_text_divider`: a full-width rule, 8px clear above and
+                    // below.
+                    Some(
+                        div()
+                            .w_full()
+                            .my_2()
+                            .h(px(1.))
+                            .bg(theme.border)
+                            .into_any_element(),
+                    )
                 }
                 _ => None,
             }
@@ -4180,6 +4440,7 @@ mod tests {
     /// selection layer; the harness stands in for it), recording routed links.
     struct TranscriptHarness {
         links: Rc<RefCell<Vec<LinkTarget>>>,
+        events: Rc<RefCell<Vec<&'static str>>>,
         list: Entity<MessageList>,
         _subscription: Subscription,
     }
@@ -4189,16 +4450,29 @@ mod tests {
             let fixtures = Arc::new(crate::fixtures::load());
             let list = MessageList::new(fixtures, ChannelId::from(channel), window, cx);
             let links = Rc::new(RefCell::new(Vec::new()));
+            let events = Rc::new(RefCell::new(Vec::new()));
             let subscription = {
                 let links = links.clone();
+                let events = events.clone();
                 cx.subscribe(&list, move |_, _, event: &MessageListEvent, _| {
                     if let MessageListEvent::OpenLink(target) = event {
                         links.borrow_mut().push(target.clone());
                     }
+                    events.borrow_mut().push(match event {
+                        MessageListEvent::OpenThread { .. } => "open-thread",
+                        MessageListEvent::Changed { change, .. } => match change {
+                            MessageChange::Pin { .. } => "pin-changed",
+                            _ => "changed",
+                        },
+                        MessageListEvent::Later(_) => "later",
+                        MessageListEvent::PickReaction { .. } => "pick-reaction",
+                        _ => "event",
+                    });
                 })
             };
             Self {
                 links,
+                events,
                 list,
                 _subscription: subscription,
             }
@@ -4215,7 +4489,9 @@ mod tests {
     }
 
     /// The channel's transcript window, drawn once, then `run` with its harness and test
-    /// context (`add_window_view` lends the context only for the borrow).
+    /// context (`add_window_view` lends the context only for the borrow). The window's
+    /// root is the kit's base [`gpui_kit::base::Root`], exactly as `open_window` mounts it,
+    /// so the toast layer behind [`crate::actions::notify`] exists.
     fn with_transcript<R>(
         channel: &str,
         cx: &mut TestAppContext,
@@ -4225,14 +4501,21 @@ mod tests {
             gpui_kit::init(cx);
             crate::theme::init(cx);
         });
-        let (harness, cx) =
-            cx.add_window_view(|window, cx| TranscriptHarness::open(channel, window, cx));
+        let harness = Rc::new(RefCell::new(None));
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| TranscriptHarness::open(channel, window, cx));
+            *harness.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let harness = harness.borrow_mut().take().unwrap();
         cx.run_until_parked();
         cx.update(|window, cx| {
             let _ = window.draw(cx);
             let _ = window.draw(cx);
         });
-        run(harness, cx)
+        let result = run(harness, cx);
+        drop(root);
+        result
     }
 
     #[test]
@@ -4407,6 +4690,148 @@ mod tests {
                 harness.update(cx, |harness, _| harness.links.borrow().clone()),
                 Vec::<LinkTarget>::new(),
                 "a drag that selects text does not open the link it crossed"
+            );
+        });
+    }
+
+    /// The ts of the first C0ENG message whose text contains `needle`.
+    fn message_ts(
+        harness: &Entity<TranscriptHarness>,
+        cx: &mut VisualTestContext,
+        needle: &str,
+    ) -> Ts {
+        harness.update(cx, |harness, cx| {
+            harness
+                .list
+                .read(cx)
+                .data
+                .read(cx)
+                .messages
+                .iter()
+                .find(|message| message.text.contains(needle))
+                .map(|message| message.ts.clone())
+                .unwrap_or_else(|| panic!("no fixture message contains {needle:?}"))
+        })
+    }
+
+    #[gpui::test]
+    fn one_key_actions_reach_the_shared_handler_and_respect_the_ownership_rule(
+        cx: &mut TestAppContext,
+    ) {
+        with_transcript("C0ENG", cx, |harness, cx| {
+            let (own, other) = harness.update(cx, |harness, cx| {
+                let list = harness.list.read(cx);
+                let own = list
+                    .data
+                    .read(cx)
+                    .messages
+                    .iter()
+                    .find(|message| message.text.contains("Merged the reconnect"))
+                    .map(|message| message.ts.clone())
+                    .unwrap();
+                let other = list
+                    .data
+                    .read(cx)
+                    .messages
+                    .iter()
+                    .find(|message| message.text.starts_with("Deploy of"))
+                    .map(|message| message.ts.clone())
+                    .unwrap();
+                (own, other)
+            });
+
+            cx.update(|window, cx| {
+                let list = harness.read(cx).list.clone();
+                list.update(cx, |list, cx| {
+                    // Without a focused message (the draw may have left the synthetic
+                    // pointer on some row) the shortcuts are inert.
+                    list.data.update(cx, |data, _| data.active = None);
+                    list.focus_action(MessageAction::Edit, window, cx);
+                    assert!(list.data.read(cx).editing.is_none());
+
+                    // Someone else's message: Edit is not offered, so E does nothing.
+                    list.set_focused(&other, cx);
+                    assert_eq!(list.focused(cx).as_ref(), Some(&other));
+                    list.focus_action(MessageAction::Edit, window, cx);
+                    assert!(list.data.read(cx).editing.is_none());
+
+                    // Your own message: E edits it in place, loading its rich_text into the
+                    // WYSIWYG edit composer, and Esc cancels.
+                    list.set_focused(&own, cx);
+                    list.focus_action(MessageAction::Edit, window, cx);
+                    assert_eq!(list.data.read(cx).editing.as_ref(), Some(&own));
+                    let loaded = list.data.read(cx).edit_composer.read(cx).text();
+                    assert!(
+                        loaded.contains("Merged the reconnect"),
+                        "edit composer loaded the message text: {loaded:?}"
+                    );
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let _ = window.draw(cx);
+            });
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                let list = harness.read(cx).list.read(cx);
+                assert!(
+                    list.data.read(cx).editing.is_none(),
+                    "Esc cancels inline WYSIWYG editing"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn one_key_reply_and_pin_emit_the_transcript_events(cx: &mut TestAppContext) {
+        with_transcript("C0ENG", cx, |harness, cx| {
+            let own = message_ts(&harness, cx, "Merged the reconnect");
+
+            cx.update(|window, cx| {
+                let list = harness.read(cx).list.clone();
+                list.update(cx, |list, cx| {
+                    list.set_focused(&own, cx);
+                    list.focus_action(MessageAction::ReplyInThread, window, cx);
+                    list.focus_action(MessageAction::TogglePin, window, cx);
+
+                    // The pin landed on the message's `pinned_to`.
+                    let channel = list.channel.clone();
+                    let pinned = list
+                        .messages
+                        .get(&channel)
+                        .unwrap()
+                        .iter()
+                        .find(|message| message.ts == own)
+                        .map(|message| message.pinned_to.contains(&channel));
+                    assert_eq!(pinned, Some(true));
+                });
+            });
+            assert_eq!(
+                harness.update(cx, |harness, _| harness.events.borrow().clone()),
+                ["open-thread", "pin-changed"],
+            );
+
+            // P again unpins, and the change is reported the same way.
+            cx.update(|window, cx| {
+                let list = harness.read(cx).list.clone();
+                list.update(cx, |list, cx| {
+                    list.focus_action(MessageAction::TogglePin, window, cx);
+                    let channel = list.channel.clone();
+                    let pinned = list
+                        .messages
+                        .get(&channel)
+                        .unwrap()
+                        .iter()
+                        .find(|message| message.ts == own)
+                        .map(|message| message.pinned_to.contains(&channel));
+                    assert_eq!(pinned, Some(false));
+                });
+            });
+            assert_eq!(
+                harness.update(cx, |harness, _| harness.events.borrow().clone()),
+                ["open-thread", "pin-changed", "pin-changed"],
             );
         });
     }

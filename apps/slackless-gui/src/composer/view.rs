@@ -66,40 +66,43 @@ impl Render for Composer {
             });
         }
         // Both need the window or an update of the textarea, which a render cannot make.
+        let editor_focused = self.input.focus_handle(cx).is_focused(window);
+        let focused = editor_focused && window.is_window_active();
         let this = cx.entity();
         if self.is_stale {
+            self.was_focused = editor_focused;
             window.defer(cx, move |window, cx| {
                 this.update(cx, |composer, cx| composer.reset(window, cx));
             });
-        } else if self.palette.is_some_and(|drawn| drawn != Palette::of(cx)) {
+        } else if editor_focused != self.was_focused
+            || self.palette.is_some_and(|drawn| drawn != Palette::of(cx))
+        {
             window.defer(cx, move |_, cx| {
-                this.update(cx, |composer, cx| composer.restyle(cx));
+                this.update(cx, |composer, cx| composer.sync_focus(editor_focused, cx));
             });
         }
 
         // Slack's formatting bar across the top of the box: a shaded band on light themes, the
         // box's own raised surface on dark ones.
-        // Slack styles the composer by `:focus-within`, which the browser drops when the window
-        // loses focus; GPUI keeps the focused element, so the window's activation counts too
-        // (GPUI repaints the window when it changes).
-        let focused = self.input.focus_handle(cx).is_focused(window) && window.is_window_active();
         let (surface, band) = crate::theme::composer_surfaces(cx);
         // A context bar takes the frame's top edge, and the formatting bar squares off under it.
         let context_bar = self.context_bar.clone().map(|bar| bar(window, cx));
         let has_bar = context_bar.is_some();
-        let toolbar = h_flex()
-            .items_center()
-            .gap_0p5()
-            .px_1p5()
-            // Slack's band: 4px around 28px buttons.
-            .py(px(5.))
-            .rounded_t_lg()
-            .bg(band)
-            .children(
-                TOOLBAR
-                    .iter()
-                    .map(|slot| self.tool_button(slot, focused, cx)),
-            );
+        let toolbar = self.show_toolbar.then(|| {
+            h_flex()
+                .items_center()
+                .gap_0p5()
+                .px_1p5()
+                // Slack's band: 4px around 28px buttons.
+                .py(px(5.))
+                .rounded_t_lg()
+                .bg(band)
+                .children(
+                    TOOLBAR
+                        .iter()
+                        .map(|slot| self.tool_button(slot, focused, cx)),
+                )
+        });
         let also_send = self.also_send_row(cx);
         let actions = self.action_row(cx);
         let overlay = if self.link_open {
@@ -151,11 +154,10 @@ impl Render for Composer {
             .key_context("Composer")
             .relative()
             .w_full()
-            .px_4()
+            .when(!self.edit_mode, |el| el.px_4())
             .capture_action(cx.listener(Self::on_enter))
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))
-            .capture_action(cx.listener(Self::on_left))
             .capture_action(cx.listener(Self::on_tab))
             .capture_action(cx.listener(Self::on_escape))
             .capture_action(cx.listener(Self::on_undo))
@@ -176,7 +178,7 @@ impl Render for Composer {
                     // while the box has focus (#afafb0).
                     .border_color(theme.foreground.opacity(if focused { 0.35 } else { 0.1 }))
                     .bg(surface)
-                    .child(toolbar)
+                    .children(toolbar)
                     .child(
                         div()
                             .relative()
@@ -190,7 +192,7 @@ impl Render for Composer {
                     .children(also_send)
                     .child(actions),
             )
-            .child(self.notification_bar(cx))
+            .when(!self.edit_mode, |el| el.child(self.notification_bar(cx)))
     }
 }
 

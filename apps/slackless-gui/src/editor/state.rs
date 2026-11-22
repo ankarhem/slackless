@@ -1,20 +1,17 @@
-//! The composer's editing state: the document and selection, the formats armed for the next
-//! typed character, and undo. The input engine owns typing; [`Editor::user_edit`] mirrors
-//! each of its edits here, and every other method is a change this model makes that the
-//! composer then pushes back to the engine.
+//! The composer's editing state: the markdown [`Doc`], the current selection, and undo.
+//! The input engine owns typing; [`Editor::user_edit`] mirrors each of its edits here
+//! without mutating what the user typed, while toolbar buttons and shortcuts edit the
+//! markdown buffer and push the change back to the engine.
 
 use std::ops::Range;
 
 use super::doc::Doc;
 use super::history::{Change, History, Snapshot};
-use super::marks::{Atom, Attrs, LineKind, PLAIN, Style};
+use super::marks::Atom;
 
 #[derive(Default)]
 pub struct Editor {
     pub(super) now: Snapshot,
-    /// Formats the next typed character takes instead of its neighbor's: a format toggled
-    /// with nothing selected. Dropped when the caret moves.
-    pub(super) pending: Option<Style>,
     pub(super) history: History,
 }
 
@@ -27,7 +24,7 @@ impl Editor {
         self.now.selection.clone()
     }
 
-    /// Start over from `doc` (a loaded draft, or nothing after sending), caret at the end.
+    /// Start over from `doc` (a loaded draft, sent message, or empty), caret at the end.
     pub fn load(&mut self, doc: Doc) {
         let end = doc.text().len();
         *self = Editor {
@@ -39,64 +36,32 @@ impl Editor {
         };
     }
 
-    /// The caret or selection moved without an edit. A caret never rests in front of a
-    /// line's marker: it lands after it, so the result can differ from `selection`. Returns
-    /// whether the selection changed.
+    /// The caret or selection moved without an edit. Returns whether the selection changed.
     pub fn select(&mut self, selection: Range<usize>) -> bool {
-        let selection = match self.now.doc.marker(selection.start) {
-            Some((_, marker)) if selection.is_empty() => marker.end..marker.end,
-            _ => selection,
-        };
+        let len = self.now.doc.text().len();
+        let selection = selection.start.min(len)..selection.end.min(len);
         if selection == self.now.selection {
             return false;
         }
         self.now.selection = selection;
-        self.pending = None;
         self.history.break_run();
         true
     }
 
     /// Mirror an edit the input engine made: `range` of the old text became `text`, and the
     /// engine's selection is now `selection`. Returns whether the document ended up different
-    /// from the engine's text (a marker was carried to a pasted line, typed markup turned
-    /// into formatting, ...), in which case the caller pushes the document back.
+    /// from the engine's text (so the caller should push it back).
     pub fn user_edit(&mut self, range: Range<usize>, text: &str, selection: Range<usize>) -> bool {
         let (range, text) = narrowed(self.now.doc.text(), range, text);
         if range.is_empty() && text.is_empty() {
             self.now.selection = selection;
             return false;
         }
-        let typed = sole_char(text).filter(|_| range.is_empty());
         self.history.record(&self.now, self.change(&range, text));
-
-        // Text typed in front of a line's marker lands after it.
-        let (at, selection, mut diverged) = match self.now.doc.marker(range.start) {
-            Some((_, marker)) if range.is_empty() => {
-                let shift = marker.len();
-                let moved = selection.start + shift..selection.end + shift;
-                (marker.end..marker.end, moved, true)
-            }
-            _ => (range, selection, false),
-        };
-        let attrs = self.typing_attrs(&at);
-        let kind = self.now.doc.line(at.start).kind;
-        self.now.doc.replace(at.clone(), text, &attrs);
-        self.now.selection = selection;
-        self.pending = None;
-
-        // Lines broken off inside a list, quote or code block stay in it.
-        if let Some(kind) = kind {
-            for (ix, _) in text.rmatch_indices('\n') {
-                self.set_kind(at.start + ix + 1, Some(kind));
-                diverged = true;
-            }
-        }
-        diverged |= self.fix_markers();
-        let caret = self.now.selection.clone();
-        if let Some(typed) = typed.filter(|_| caret.is_empty()) {
-            diverged |= self.autoformat(typed);
-        }
-        diverged
+        self.now.doc.replace(range, text);
+        let len = self.now.doc.text().len();
+        self.now.selection = selection.start.min(len)..selection.end.min(len);
+        false
     }
 
     fn change(&self, range: &Range<usize>, text: &str) -> Change {
@@ -120,55 +85,11 @@ impl Editor {
         }
     }
 
-    /// What text replacing `range` carries: the armed formats, else those of the text it
-    /// continues. A link is continued only from inside it, never from its edge.
-    pub(super) fn typing_attrs(&self, range: &Range<usize>) -> Attrs {
-        let doc = &self.now.doc;
-        let line = doc.line(range.start);
-        if line.kind == Some(LineKind::Code) {
-            return Attrs::default();
-        }
-        // The character the new text continues: the first one replaced, else the one before.
-        let lead = if range.is_empty() {
-            doc.text()[line.content.start.min(range.start)..range.start]
-                .char_indices()
-                .next_back()
-                .map(|(ix, _)| line.content.start + ix)
-        } else {
-            Some(range.start)
-        };
-        let next = (range.end < doc.line_end(range.end) && doc.atom_at(range.end).is_none())
-            .then(|| doc.attrs_at(range.end));
-        let mut attrs = match lead {
-            Some(lead) if doc.atom_at(lead).is_none() => {
-                let lead = doc.attrs_at(lead);
-                let continues = |link: &std::sync::Arc<str>| {
-                    next.is_some_and(|next| next.link.as_ref() == Some(link))
-                };
-                Attrs {
-                    style: lead.style,
-                    link: lead.link.clone().filter(continues),
-                }
-            }
-            Some(_) => Attrs::default(),
-            None => Attrs {
-                style: next.map_or(Style::NONE, |next| next.style),
-                link: None,
-            },
-        };
-        if let Some(style) = self.pending {
-            attrs.style = style;
-        }
-        attrs
-    }
-
-    /// Replace the selection with `text` (an emoji pick, a pasted link).
+    /// Replace the selection with plain `text`.
     pub fn insert_text(&mut self, text: &str) {
         self.history.checkpoint(&self.now);
         let range = self.now.selection.clone();
-        let attrs = self.typing_attrs(&range);
-        self.replace(range, text, &attrs);
-        self.pending = None;
+        self.replace(range, text);
     }
 
     /// Replace `range` with `atom`, shown as `text`, and leave the caret after a space
@@ -177,7 +98,7 @@ impl Editor {
         self.place_atom(range.clone(), atom, text);
         let mut caret = range.start + text.len();
         if !self.now.doc.text()[caret..].starts_with(' ') {
-            self.replace(caret..caret, " ", &PLAIN);
+            self.replace(caret..caret, " ");
         }
         caret += 1;
         self.now.selection = caret..caret;
@@ -191,7 +112,6 @@ impl Editor {
         self.place(range.clone(), atom, text);
         let caret = range.start + text.len();
         self.now.selection = caret..caret;
-        self.pending = None;
     }
 
     /// Replace the whole draft with unformatted `text`, caret at the end.
@@ -201,25 +121,22 @@ impl Editor {
             doc: Doc::from(text),
             selection: text.len()..text.len(),
         };
-        self.pending = None;
     }
 
     /// Step back; false when there is nothing to undo.
     pub fn undo(&mut self) -> bool {
-        self.pending = None;
         self.history.undo(&mut self.now)
     }
 
     /// Step forward again; false when nothing was undone.
     pub fn redo(&mut self) -> bool {
-        self.pending = None;
         self.history.redo(&mut self.now)
     }
 
     /// [`Doc::replace`], with the selection following the edit.
-    pub(super) fn replace(&mut self, range: Range<usize>, text: &str, attrs: &Attrs) {
+    pub(super) fn replace(&mut self, range: Range<usize>, text: &str) {
         self.follow(&range, text.len());
-        self.now.doc.replace(range, text, attrs);
+        self.now.doc.replace(range, text);
     }
 
     /// [`Doc::place`], with the selection following the edit.
@@ -252,24 +169,26 @@ pub fn narrowed<'a>(doc: &str, range: Range<usize>, text: &'a str) -> (Range<usi
     let prefix = old
         .char_indices()
         .zip(text.chars())
-        .find(|((_, a), b)| a != b)
-        .map_or(old.len().min(text.len()), |((ix, _), _)| ix);
-    let suffix: usize = old[prefix..]
+        .take_while(|((_, a), b)| a == b)
+        .last()
+        .map_or(0, |((ix, ch), _)| ix + ch.len_utf8());
+    let old_tail = &old[prefix..];
+    let text_tail = &text[prefix..];
+    let suffix = old_tail
         .chars()
         .rev()
-        .zip(text[prefix..].chars().rev())
+        .zip(text_tail.chars().rev())
         .take_while(|(a, b)| a == b)
         .map(|(a, _)| a.len_utf8())
-        .sum();
+        .sum::<usize>();
     (
         range.start + prefix..range.end - suffix,
         &text[prefix..text.len() - suffix],
     )
 }
 
-/// The character `text` consists of, when it is exactly one.
 fn sole_char(text: &str) -> Option<char> {
     let mut chars = text.chars();
-    let first = chars.next()?;
-    chars.next().is_none().then_some(first)
+    let ch = chars.next()?;
+    chars.next().is_none().then_some(ch)
 }

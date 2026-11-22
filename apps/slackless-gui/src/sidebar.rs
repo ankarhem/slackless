@@ -87,6 +87,8 @@ pub enum SidebarEvent {
     OpenLater,
     /// The "Threads" row: open the Threads view.
     OpenThreads,
+    /// The Home list's "Unreads" row: open the All Unreads view (Slack's `p-unreads_view`).
+    OpenUnreads,
     /// The "Huddles" row: open the Huddles page.
     OpenHuddles,
     /// The "Directories" row: open the directory.
@@ -141,8 +143,8 @@ pub enum SidebarEvent {
     FocusDuration(usize),
     /// The rail's own avatar: open the user menu.
     OpenUserMenu,
-    /// The rail's Activity tile (or the Home list's Unreads row): open the Activity page,
-    /// which the root renders beside the rail instead of this sidebar's list column.
+    /// The rail's Activity tile: open the Activity page, which the root renders beside the
+    /// rail instead of this sidebar's list column.
     OpenActivity,
     /// A rail destination other than Activity was shown while the Activity page was open;
     /// the root stops rendering the page.
@@ -3226,6 +3228,7 @@ fn container_mentions_user(container: &RichTextContainer, user: &UserId) -> bool
             .elements
             .iter()
             .any(|element| element_mentions_user(element, user)),
+        RichTextContainer::Divider(_) => false,
         RichTextContainer::Unknown { .. } => false,
     }
 }
@@ -3296,7 +3299,7 @@ impl Render for Sidebar {
                         None,
                         cx,
                     )
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenActivity))),
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUnreads))),
                     // Slack bolds Threads while followed threads have unread replies and
                     // counts the ones mentioning you in a red pill.
                     self.nav_row(

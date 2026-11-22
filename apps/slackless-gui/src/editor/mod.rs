@@ -1,39 +1,24 @@
-//! The composer's rich-text editing model: a WYSIWYG document (formatted runs, mention and
-//! emoji atoms, list / quote / code lines), the edits Slack's composer makes to one, undo,
-//! and its two serializations (mrkdwn text and the `rich_text` block). Nothing here touches
-//! GPUI, so all of it is unit-tested.
+//! The composer's Obsidian-style Live Preview Markdown editing model.
 //!
-//! # Architecture decision
+//! # Architecture
 //!
-//! The composer keeps gpui-kit's `TextareaState` as its editing engine and drives it from
-//! this model, instead of replacing it with a custom GPUI text element.
+//! The composer keeps gpui-kit's `TextareaState` as its editing engine (preserving native
+//! IME, caret movement, selection, soft wrapping, auto-grow, clipboard, and accessibility)
+//! and stores **real editable Markdown** in [`Doc`] plus atomic semantic references
+//! (`@mentions`, `#channels`, `@here/@channel`, `:emoji:`).
 //!
-//! The engine already does the parts of text editing that are hard to get right and
-//! impossible to unit-test: IME composition, caret movement and selection by keyboard,
-//! mouse and touch, soft wrapping, auto-grow and scrolling, clipboard, accessibility. It
-//! also has exactly the three hooks true WYSIWYG needs. `set_decorations` draws bold,
-//! italic, strikethrough, code and link styling over plain text, so no marker character is
-//! ever visible. Inline tokens are atomic units the caret cannot enter, which is what a
-//! mention chip is, and what a list bullet or quote bar is. `InputEditsEvent` reports each
-//! edit as an exact byte range, so this model follows typing in O(edit) with no diffing.
-//!
-//! The division of work: the engine owns typing; [`Editor::user_edit`] mirrors each edit
-//! into the [`Doc`]. Everything Slack-specific is decided here (formats armed for the next
-//! character, markup that converts as you type, lists that continue on Enter, undo) and the
-//! composer pushes the resulting document back to the engine as one text replacement plus
-//! its tokens and decorations.
-//!
-//! The rejected alternative, a custom element over its own layout, would render block
-//! chrome more faithfully (see the limits below) but would mean re-implementing and
-//! hand-verifying all of the above, with every caret and IME bug landing in the one control
-//! the user types into all day.
-//!
-//! Limits that follow from the engine: decorations cannot change the font, so code is shown
-//! by color and background rather than monospace, and a wrapped list item continues under
-//! its bullet instead of hanging. Undo is this model's (the engine's own history does not
-//! know about formatting), so the composer routes Undo and Redo here.
+//! [`Doc::parse`] derives all block structure (`#`/`##`/`###` headings, `- ` bullets,
+//! `1. ` ordered lists, `> ` quotes, ```` ``` ```` code fences, `---` dividers) and inline
+//! formatting (`*bold*`, `**bold**`, `_italic_`, `~strike~`, `~~strike~~`, `` `code` ``,
+//! `<u>underline</u>`, `[label](url)`) purely from the markdown text. The composer then
+//! projects Live Preview onto the textarea:
+//! - Lines and inline spans touched by the caret reveal their raw markdown syntax in muted
+//!   color while keeping live styling applied.
+//! - Inactive inline delimiters collapse to 0px tokens so formatted text renders cleanly
+//!   without raw markers.
+//! - Inactive block prefixes render clean WYSIWYG indicators (subtle `H1`/`H2`/`H3` badges
+//!   on headings, bullet discs, numbered markers, quote bars, horizontal rules).
 
-mod autoformat;
 mod blocks;
 mod complete;
 mod doc;
@@ -42,7 +27,7 @@ mod history;
 mod marks;
 mod mrkdwn;
 mod mrkdwn_read;
-mod read;
+mod parse;
 mod rich_text;
 mod state;
 #[cfg(test)]
@@ -53,4 +38,7 @@ pub use doc::Doc;
 pub use marks::{Atom, Attrs, LineKind, Style};
 pub use mrkdwn::Directory;
 pub use mrkdwn_read::from_mrkdwn;
+pub(crate) use parse::delimiter_ranges;
+pub use parse::empty_pair_at;
+pub use rich_text::from_rich_text;
 pub use state::{Editor, narrowed};

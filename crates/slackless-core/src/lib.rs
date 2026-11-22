@@ -46,6 +46,10 @@ pub enum Command {
     /// The user opened a conversation: load its newest history into the store and keep
     /// backfilling older pages in the background until the beginning is reached.
     OpenConversation(ChannelId),
+    /// Fetch a single page of recent history (`conversations.history`, limit 50) into the
+    /// store and announce [`Event::StoreChanged`], without moving the read cursor or walking
+    /// older pages. Used by the All Unreads view for unread channels with no stored rows yet.
+    FetchLatestHistory(ChannelId),
     /// Stop backfilling a conversation (it stays in the store).
     CloseConversation(ChannelId),
     /// Look up people the workspace directory (`users.list`) leaves out, such as members of
@@ -101,11 +105,11 @@ pub enum Command {
         thread_ts: Option<Ts>,
         broadcast: bool,
     },
-    /// Replace a message's text.
+    /// Replace a message's content (its blocks, with mrkdwn text as fallback).
     EditMessage {
         channel: ChannelId,
         ts: Ts,
-        text: String,
+        content: MessageContent,
     },
     DeleteMessage {
         channel: ChannelId,
@@ -121,6 +125,13 @@ pub enum Command {
         channel: ChannelId,
         ts: Ts,
         name: String,
+    },
+    /// Pin or unpin a message in its conversation (`pins.add` / `pins.remove`), then
+    /// re-read the pins so an open Pins tab shows the change.
+    SetPinned {
+        channel: ChannelId,
+        ts: Ts,
+        pinned: bool,
     },
     /// Run a slash command Slack handles (`chat.command`, e.g. `/giphy`) in `channel`, or in
     /// the thread at `thread_ts`. Its result arrives on the websocket; a refusal (a command

@@ -15,6 +15,8 @@ use crate::types::{
 
 /// `conversations.history` page size the core requests (Slack max 999).
 pub(crate) const HISTORY_PAGE_LIMIT: u32 = 200;
+/// Single-page `conversations.history` size for [`crate::Command::FetchLatestHistory`].
+pub(crate) const UNREADS_HISTORY_LIMIT: u32 = 50;
 
 /// `subscriptions.thread.getView` page size the core requests.
 pub(crate) const THREADS_PAGE_LIMIT: u32 = 50;
@@ -72,6 +74,13 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
     ) -> impl Future<Output = api::Result<Option<Message>>> + Send;
+    /// One page of recent history (`conversations.history`, up to `limit` messages, newest
+    /// first). Read-only; never moves the read cursor.
+    fn recent_history(
+        &self,
+        channel: ChannelId,
+        limit: u32,
+    ) -> impl Future<Output = api::Result<Vec<Message>>> + Send;
     /// A user's do-not-disturb state (`dnd.info`). Read-only.
     fn dnd_info(&self, user: UserId) -> impl Future<Output = api::Result<DndStatus>> + Send;
     /// One user's profile (`users.info`), reaching people `users.list` omits. Read-only.
@@ -126,7 +135,7 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
         ts: Ts,
-        text: String,
+        content: MessageContent,
     ) -> impl Future<Output = api::Result<PostedMessage>> + Send;
     fn delete_message(
         &self,
@@ -247,6 +256,13 @@ pub trait Backend: Clone + Send + Sync + 'static {
         title: String,
         url: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Pin (`pins.add`) or unpin (`pins.remove`) the message `ts` in `channel`.
+    fn set_pinned(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        pinned: bool,
+    ) -> impl Future<Output = api::Result<()>> + Send;
     /// Create a conversation's empty channel canvas (`conversations.canvases.create`),
     /// returning the canvas file id.
     fn create_canvas(&self, channel: ChannelId)
@@ -339,6 +355,17 @@ impl Backend for SlackApi {
             .next())
     }
 
+    async fn recent_history(&self, channel: ChannelId, limit: u32) -> api::Result<Vec<Message>> {
+        let opts = HistoryOpts {
+            limit: Some(limit),
+            ..Default::default()
+        };
+        Ok(self
+            .conversations_history(&channel, &opts, None)
+            .await?
+            .items)
+    }
+
     async fn dnd_info(&self, user: UserId) -> api::Result<DndStatus> {
         SlackApi::dnd_info(self, &user).await
     }
@@ -396,10 +423,9 @@ impl Backend for SlackApi {
         &self,
         channel: ChannelId,
         ts: Ts,
-        text: String,
+        content: MessageContent,
     ) -> api::Result<PostedMessage> {
-        self.chat_update(&channel, &ts, &MessageContent::plain(text))
-            .await
+        self.chat_update(&channel, &ts, &content).await
     }
 
     async fn delete_message(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
@@ -553,6 +579,14 @@ impl Backend for SlackApi {
         url: String,
     ) -> api::Result<()> {
         self.bookmarks_add_link(&channel, &title, &url).await
+    }
+
+    async fn set_pinned(&self, channel: ChannelId, ts: Ts, pinned: bool) -> api::Result<()> {
+        if pinned {
+            self.pins_add(&channel, &ts).await
+        } else {
+            self.pins_remove(&channel, &ts).await
+        }
     }
 
     async fn create_canvas(&self, channel: ChannelId) -> api::Result<String> {

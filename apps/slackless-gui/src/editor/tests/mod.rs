@@ -1,17 +1,16 @@
-//! Behavior of the editing model, driven the way the composer drives it: typing arrives as
-//! the input engine's edits ([`type_text`]), everything else through [`Editor`]'s methods.
+//! Behavior of the Obsidian Live Preview markdown editing model, driven the way the composer
+//! drives it: typing arrives as the input engine's edits ([`type_text`]), everything else
+//! through [`Editor`]'s methods.
 
 mod blocks;
 mod editing;
 mod lookup;
 mod text;
 
-use std::ops::Range;
-
 use slackless_core::types::rich_text::{RichTextSection, TextElement};
 use slackless_core::types::{ChannelId, RichTextContainer, RichTextElement, UserId};
 
-use super::marks::{Attrs, LineKind, Span, Style};
+use super::marks::LineKind;
 use super::{Directory, Editor};
 
 /// Type `text` as the input engine reports it: one edit per character at the selection.
@@ -30,14 +29,13 @@ fn typed(text: &str) -> Editor {
 }
 
 fn kinds(editor: &Editor) -> Vec<Option<LineKind>> {
-    editor.doc().lines().map(|line| line.kind).collect()
-}
-
-fn span(range: Range<usize>, style: Style) -> Span {
-    Span {
-        range,
-        attrs: Attrs { style, link: None },
-    }
+    editor
+        .doc()
+        .parse()
+        .lines
+        .into_iter()
+        .map(|line| line.kind)
+        .collect()
 }
 
 /// The directory the drafts in these tests are named from.

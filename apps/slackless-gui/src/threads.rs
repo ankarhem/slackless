@@ -23,15 +23,13 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, Focusable as _,
-    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div, px,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Point, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
@@ -42,7 +40,7 @@ use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, ContextBar, Typin
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
-use crate::messages::{LinkHandler, LinkTarget, message_row_linked, same_group};
+use crate::messages::{LinkHandler, LinkTarget, editing_avatar, message_row_linked, same_group};
 use crate::slash::{Invocation, SHRUG, SlashKind};
 
 pub enum ThreadPanelEvent {
@@ -94,6 +92,9 @@ pub enum ThreadPanelEvent {
     /// The reply composer's emoji button asked for the picker; picks come back through
     /// [`ThreadPanel::insert_emoji`].
     PickEmoji(Point<Pixels>),
+    /// The inline edit composer's emoji button asked for the picker; picks come back through
+    /// [`ThreadPanel::insert_edit_emoji`].
+    PickEditEmoji(Point<Pixels>),
     /// A slash command other than /shrug (which replies in the thread) was sent from the
     /// reply composer; the root dispatches it.
     SlashCommand(Invocation),
@@ -115,9 +116,9 @@ pub struct ThreadPanel {
     replies: Vec<Message>,
     /// Whether the "Replying in thread" hint above the composer shows (Reply in thread action).
     reply_hint: bool,
-    /// Message currently edited in place; its draft lives in `edit_draft`.
+    /// Message currently edited in place; its WYSIWYG draft lives in `edit_composer`.
     editing: Option<Ts>,
-    edit_draft: Entity<TextareaState>,
+    edit_composer: Entity<Composer>,
     /// Fixture-mode unread marker: the New divider renders above this message.
     unread_after: Option<Ts>,
     /// Messages saved for later (fixture mode: in memory).
@@ -141,11 +142,7 @@ impl ThreadPanel {
         cx.new(|cx| {
             let composer = Composer::new("Reply...".into(), fixtures.clone(), window, cx);
             composer.update(cx, |composer, cx| composer.set_scheduling(false, cx));
-            let edit_draft = cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .placeholder("Edit message")
-                    .auto_grow(1, 8)
-            });
+            let edit_composer = Composer::new_edit(fixtures.clone(), window, cx);
             let subscriptions = vec![
                 cx.subscribe_in(
                     &composer,
@@ -168,15 +165,25 @@ impl ThreadPanel {
                             }
                         }
                         // Scheduling is turned off in the reply composer.
-                        ComposerEvent::Schedule { .. } => {}
+                        ComposerEvent::Schedule { .. } | ComposerEvent::Cancel => {}
                         ComposerEvent::EditLast => this.edit_last_reply(window, cx),
                         ComposerEvent::Typing => cx.emit(ThreadPanelEvent::Typing),
                     },
                 ),
-                // The edit box's Save button tracks whether the draft is empty.
-                cx.subscribe(&edit_draft, |_: &mut ThreadPanel, _, _: &InputEvent, cx| {
-                    cx.notify()
-                }),
+                cx.subscribe(
+                    &edit_composer,
+                    |this: &mut ThreadPanel, _, event: &ComposerEvent, cx| match event {
+                        ComposerEvent::Submit(content) => this.save_edit(content.clone(), cx),
+                        ComposerEvent::Cancel => this.cancel_edit(cx),
+                        ComposerEvent::OpenEmojiPicker(position) => {
+                            cx.emit(ThreadPanelEvent::PickEditEmoji(*position));
+                        }
+                        ComposerEvent::SlashCommand(_)
+                        | ComposerEvent::Schedule { .. }
+                        | ComposerEvent::EditLast
+                        | ComposerEvent::Typing => {}
+                    },
+                ),
             ];
             ThreadPanel {
                 fixtures,
@@ -185,7 +192,7 @@ impl ThreadPanel {
                 replies: Vec::new(),
                 reply_hint: false,
                 editing: None,
-                edit_draft,
+                edit_composer,
                 unread_after: None,
                 saved: HashSet::new(),
                 composer,
@@ -201,6 +208,9 @@ impl ThreadPanel {
         self.composer.update(cx, |composer, cx| {
             composer.set_fixtures(fixtures.clone(), cx)
         });
+        self.edit_composer.update(cx, |composer, cx| {
+            composer.set_fixtures(fixtures.clone(), cx)
+        });
         self.fixtures = fixtures;
         cx.notify();
     }
@@ -211,10 +221,23 @@ impl ThreadPanel {
             .update(cx, |composer, cx| composer.set_context_bar(bar, cx));
     }
 
-    /// Forward the Enter-to-send preference to the reply composer.
+    /// Forward the Enter-to-send preference to the reply and edit composers.
     pub fn set_enter_sends(&mut self, enter_sends: bool, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+        self.edit_composer
+            .update(cx, |composer, cx| composer.set_enter_sends(enter_sends, cx));
+    }
+
+    /// Insert a picked emoji into the inline edit composer.
+    pub fn insert_edit_emoji(
+        &mut self,
+        choice: &EmojiChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_composer
+            .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
 
     pub fn open(&mut self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
@@ -478,6 +501,38 @@ impl ThreadPanel {
             }
             MessageAction::MarkUnread => self.mark_unread(ts.clone(), cx),
             MessageAction::Edit => self.begin_edit(ts.clone(), window, cx),
+            MessageAction::TogglePin => {
+                let Some((channel, _)) = &self.thread else {
+                    return;
+                };
+                let channel = channel.clone();
+                let pinned = self
+                    .message_at_mut(ts)
+                    .map(|message| actions::toggle_pin(message, &channel));
+                let Some(pinned) = pinned else {
+                    return;
+                };
+                let preview = self
+                    .root
+                    .iter()
+                    .chain(&self.replies)
+                    .find(|message| &message.ts == ts)
+                    .map(|message| self.fixtures.preview(message))
+                    .unwrap_or_default();
+                actions::notify(
+                    if pinned { "Pinned" } else { "Unpinned" },
+                    preview,
+                    window,
+                    cx,
+                );
+                self.post(
+                    MessageChange::Pin {
+                        ts: ts.clone(),
+                        pinned,
+                    },
+                    cx,
+                );
+            }
             MessageAction::Delete => {
                 let Some(message) = self.message_at_mut(ts).map(|message| message.clone()) else {
                     return;
@@ -532,36 +587,28 @@ impl ThreadPanel {
         }
     }
 
-    /// Edit `ts` in place: swap the row body for the shared edit draft, focused with the caret
-    /// at the end.
+    /// Edit `ts` in place: swap the row body for the shared WYSIWYG edit composer, focused
+    /// with the caret at the end.
     fn begin_edit(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(message) = self.message_at_mut(&ts) else {
+        let Some(message) = self.message_at_mut(&ts).cloned() else {
             return;
         };
-        let text = message.text.clone();
         self.reply_hint = false;
         self.editing = Some(ts);
-        let caret = text.len();
-        self.edit_draft.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
-            state.set_selected_range(caret..caret, cx);
+        self.edit_composer.update(cx, |composer, cx| {
+            composer.load_message(&message, window, cx);
         });
-        self.edit_draft.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    fn save_edit(&mut self, cx: &mut Context<Self>) {
+    fn save_edit(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         let Some(ts) = self.editing.clone() else {
             return;
         };
-        let text = self.edit_draft.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
-        }
         let me = self.fixtures.self_user.clone();
         if let Some(message) = self.message_at_mut(&ts) {
-            actions::apply_edit(message, &me, text.clone());
-            self.post(MessageChange::Edit { ts, text }, cx);
+            actions::apply_edit(message, &me, content.clone());
+            self.post(MessageChange::Edit { ts, content }, cx);
         }
         self.editing = None;
         cx.notify();
@@ -686,16 +733,20 @@ impl ThreadPanel {
         let key = format!("thread-row-{}", ts.as_str());
         let this = cx.entity();
         if self.editing.as_ref() == Some(&ts) {
-            let (cancel, save) = (this.clone(), this);
             return div()
+                .w_full()
+                .min_w_0()
                 .px_2()
-                .child(actions::edit_box(
-                    &key,
-                    &self.edit_draft,
-                    move |_, cx| cancel.update(cx, ThreadPanel::cancel_edit),
-                    move |_, cx| save.update(cx, ThreadPanel::save_edit),
-                    cx,
-                ))
+                .py_2()
+                .bg(crate::theme::editing_row(cx))
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_3()
+                        .min_w_0()
+                        .child(editing_avatar(&self.fixtures, message, &key, cx))
+                        .child(div().flex_1().min_w_0().child(self.edit_composer.clone())),
+                )
                 .into_any_element();
         }
 
@@ -719,6 +770,10 @@ impl ThreadPanel {
             own: message.user.as_ref() == Some(&self.fixtures.self_user),
             reply: !is_root,
             saved,
+            pinned: self
+                .thread
+                .as_ref()
+                .is_some_and(|(channel, _)| message.pinned_to.contains(channel)),
         };
         let row_group = SharedString::from(format!("thread-row-group-{}", ts.as_str()));
         let hover_bg = cx.theme().secondary.opacity(0.5);
@@ -766,7 +821,14 @@ impl ThreadPanel {
             .child(v_flex().min_w_0().child(card).children(chips))
             .child(toolbar)
             .context_menu(move |menu, window, cx| {
-                actions::actions_menu(menu, set, &menu_handler, window, cx)
+                actions::actions_menu(
+                    menu,
+                    set,
+                    &menu_handler,
+                    actions::MenuOrigin::Context,
+                    window,
+                    cx,
+                )
             })
             .into_any_element()
     }

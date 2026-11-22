@@ -4,9 +4,14 @@
 //!
 //! - [`hover_toolbar`]: Slack's floating bar revealed on row hover (quick reactions, add
 //!   reaction, reply in thread, forward, save for later, and a "more" dropdown);
-//! - [`actions_menu`]: the full menu behind "more" and the row's right-click `ContextMenu`,
-//!   in Slack's order (edit; mark unread, save, reminder submenu; copy link, copy message;
-//!   delete), each with Slack's keyboard shortcut while the menu is open ([`bind_menu_keys`]);
+//! - [`actions_menu`]: the full menu behind "more" and the row's right-click `ContextMenu`
+//!   ([`MenuOrigin`] reorders Edit and Delete to the top, as Slack's right-click does), in
+//!   Slack's order (edit; mark unread, save, reminder submenu; copy link, copy message; pin,
+//!   forward, reply in thread; delete), each with Slack's keyboard shortcut while the menu
+//!   is open ([`bind_menu_keys`]);
+//! - the `message_focus` actions: Slack's one-key shortcuts for the focused message (the
+//!   transcript's last hovered one), which the root binds and routes through the same
+//!   [`ActionHandler`];
 //! - [`reaction_chips`]: reaction aggregates, interactive (toggle + add) when a handler is
 //!   given, static otherwise;
 //! - [`edit_box`]: the inline edit draft that replaces a row while it is edited;
@@ -19,9 +24,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
@@ -30,12 +33,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyWindowHandle, App, ClipboardItem, Context, DismissEvent, Div, Entity,
+    Action, Anchor, AnyWindowHandle, App, ClipboardItem, Context, DismissEvent, Div,
     Focusable as _, FontWeight, Global, InteractiveElement as _, KeyBinding, ParentElement as _,
     Pixels, Point, SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window,
     actions, div, px,
 };
-use slackless_core::types::{ChannelId, Edited, Message, Reaction, RichTextBlock, Ts, UserId};
+use slackless_core::api::MessageContent;
+use slackless_core::types::{ChannelId, Edited, Message, Reaction, Ts, UserId};
 
 use crate::emoji;
 use crate::fixtures::Fixtures;
@@ -60,6 +64,8 @@ pub enum MessageAction {
     MarkUnread,
     Edit,
     Delete,
+    /// Pin or unpin the message in its conversation ("Pin to conversation").
+    TogglePin,
     /// Copy the message's text ("Copy message").
     CopyText,
     /// The author's avatar or name was clicked: show their profile.
@@ -83,6 +89,9 @@ pub struct ActionSet {
     pub reply: bool,
     /// Currently saved for later: the save action reads "Remove from saved".
     pub saved: bool,
+    /// Currently pinned to the conversation: the pin action reads "Unpin from
+    /// conversation".
+    pub pinned: bool,
 }
 
 pub type ActionHandler = Rc<dyn Fn(MessageAction, &mut Window, &mut App)>;
@@ -101,6 +110,30 @@ actions!(
         DeleteMessage
     ]
 );
+
+// Slack's one-key shortcuts for the focused message: the message last hovered while no
+// field holds the focus (the root binds and routes them through the transcript's
+// [`ActionHandler`]). E and Delete act on the signed-in user's messages only.
+actions!(
+    message_focus,
+    [
+        FocusEditMessage,
+        FocusDeleteMessage,
+        FocusReplyInThread,
+        FocusForwardMessage,
+        FocusTogglePin,
+        FocusSaveMessage,
+        FocusMarkMessageUnread,
+        FocusRemindMe,
+        FocusReact,
+    ]
+);
+
+/// Whether `action` applies to a message with this action set: Edit and Delete apply to
+/// the signed-in user's messages only, as their menu items do.
+pub fn eligible(set: ActionSet, action: &MessageAction) -> bool {
+    !matches!(action, MessageAction::Edit | MessageAction::Delete) || set.own
+}
 
 /// Slack's shortcuts for the open message menu, shown beside its items. The kit draws menus
 /// in the root's popover layer, outside any message row, so the actions are handled app-wide
@@ -149,8 +182,7 @@ fn shortcut(action: MessageAction, cx: &mut App) {
             let Some(menu) = target.menu.upgrade() else {
                 return;
             };
-            let own_only = matches!(action, MessageAction::Edit | MessageAction::Delete);
-            if (own_only && !target.set.own) || !menu.focus_handle(cx).contains_focused(window, cx)
+            if !eligible(target.set, &action) || !menu.focus_handle(cx).contains_focused(window, cx)
             {
                 return;
             }
@@ -255,7 +287,7 @@ pub fn hover_toolbar(
             .icon(IconName::EllipsisVertical)
             .tooltip("More actions")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
-                actions_menu(menu, set, &menu_handler, window, cx)
+                actions_menu(menu, set, &menu_handler, MenuOrigin::More, window, cx)
             }),
     )
 }
@@ -272,14 +304,144 @@ fn menu_item(
         .on_click(move |_, window, cx| handler(action.clone(), window, cx))
 }
 
-/// The full action menu: the hover bar's "more" dropdown and the row's right-click menu, in
-/// Slack's order with Slack's shortcut beside each item ([`bind_menu_keys`]). Reacting,
-/// replying and forwarding live on the hover bar only, as in Slack. `menu` is the fresh popup
-/// the framework hands to the builder closure.
+/// Where the message actions menu opens from: the row's right-click menu carries Forward
+/// and Reply in thread too (no hover bar is up beside it), whereas the hover bar's "More
+/// actions" dropdown omits what sits right beside it on the bar.
+#[derive(Clone, Copy, PartialEq)]
+pub enum MenuOrigin {
+    /// The hover bar's "More actions" dropdown.
+    More,
+    /// The row's right-click menu.
+    Context,
+}
+
+/// One row of the message actions menu, in Slack's order. [`menu_rows`] computes the pure
+/// shape; [`actions_menu`] renders it.
+enum MenuRow {
+    Item {
+        label: &'static str,
+        icon: IconName,
+        action: MessageAction,
+        /// Slack's keyboard shortcut shown beside the item while the menu is open, whose
+        /// binding dispatches it (see [`bind_menu_keys`]).
+        hint: Option<Box<dyn Action>>,
+    },
+    /// "Add a reminder" with its presets.
+    Reminders,
+    /// Slack's destructive "Delete message..." item: no icon, in the danger color.
+    Delete,
+    Separator,
+}
+
+impl MenuRow {
+    /// The row's menu label; separators have none.
+    #[cfg(test)]
+    fn label(&self) -> &'static str {
+        match self {
+            MenuRow::Item { label, .. } => label,
+            MenuRow::Reminders => "Add a reminder",
+            MenuRow::Delete => "Delete message...",
+            MenuRow::Separator => "",
+        }
+    }
+}
+
+/// The message actions menu's rows in Slack's order for one message and origin: Edit and
+/// Delete only on the signed-in user's messages, Reply in thread only where replies are
+/// offered.
+fn menu_rows(set: ActionSet, origin: MenuOrigin) -> Vec<MenuRow> {
+    let edit = MenuRow::Item {
+        label: "Edit message",
+        icon: IconName::Pencil,
+        action: MessageAction::Edit,
+        hint: Some(Box::new(EditMessage)),
+    };
+    let mark_unread = MenuRow::Item {
+        label: "Mark unread",
+        icon: IconName::SquareDot,
+        action: MessageAction::MarkUnread,
+        hint: Some(Box::new(MarkMessageUnread)),
+    };
+    let save = MenuRow::Item {
+        label: if set.saved {
+            "Remove from saved"
+        } else {
+            "Add to saved"
+        },
+        icon: IconName::Bookmark,
+        action: MessageAction::SaveForLater,
+        hint: Some(Box::new(SaveMessage)),
+    };
+    let copy_link = MenuRow::Item {
+        label: "Copy link",
+        icon: IconName::Link2,
+        action: MessageAction::CopyLink,
+        hint: Some(Box::new(CopyMessageLink)),
+    };
+    let copy_text = MenuRow::Item {
+        label: "Copy message",
+        icon: IconName::Type,
+        action: MessageAction::CopyText,
+        hint: Some(Box::new(CopyMessageText)),
+    };
+    let pin = MenuRow::Item {
+        label: if set.pinned {
+            "Unpin from conversation"
+        } else {
+            "Pin to conversation"
+        },
+        icon: IconName::Pin,
+        action: MessageAction::TogglePin,
+        hint: None,
+    };
+    let forward = MenuRow::Item {
+        label: "Forward message",
+        icon: IconName::Forward,
+        action: MessageAction::Forward,
+        hint: None,
+    };
+    let mut rows = Vec::new();
+    if set.own {
+        rows.push(edit);
+        rows.push(MenuRow::Separator);
+    }
+    rows.extend([
+        mark_unread,
+        save,
+        MenuRow::Reminders,
+        MenuRow::Separator,
+        copy_link,
+        copy_text,
+        MenuRow::Separator,
+        pin,
+    ]);
+    if origin == MenuOrigin::Context {
+        rows.push(forward);
+        if set.reply {
+            rows.push(MenuRow::Item {
+                label: "Reply in thread",
+                icon: IconName::MessageSquareReply,
+                action: MessageAction::ReplyInThread,
+                hint: None,
+            });
+        }
+    }
+    if set.own {
+        rows.push(MenuRow::Separator);
+        rows.push(MenuRow::Delete);
+    }
+    rows
+}
+
+/// The full action menu: the hover bar's "more" dropdown and the row's right-click menu
+/// ([`MenuOrigin`]), in Slack's order with Slack's shortcut beside each item
+/// ([`bind_menu_keys`]). Reacting lives on the hover bar only, as in Slack. `menu` is the
+/// fresh popup the framework hands to the builder closure.
 pub fn actions_menu(
     menu: PopupMenu,
     set: ActionSet,
     handler: &ActionHandler,
+    origin: MenuOrigin,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
@@ -305,87 +467,55 @@ pub fn actions_menu(
         menu
     });
 
+    let mut reminders =
+        Some(PopupMenuItem::submenu("Add a reminder", remind).icon(IconName::AlarmClock));
     let mut menu = menu;
-    if set.own {
-        menu = menu
-            .item(
-                menu_item(
-                    "Edit message",
-                    IconName::Pencil,
-                    handler,
-                    MessageAction::Edit,
+    for row in menu_rows(set, origin) {
+        menu = match row {
+            MenuRow::Item {
+                label,
+                icon,
+                action,
+                hint,
+            } => {
+                let item = menu_item(label, icon, handler, action);
+                menu.item(match hint {
+                    Some(hint) => item.action(hint),
+                    None => item,
+                })
+            }
+            MenuRow::Reminders => menu.item(
+                reminders
+                    .take()
+                    .expect("menu_rows carries one reminder submenu"),
+            ),
+            MenuRow::Delete => {
+                // Slack's destructive item: no icon, in the danger color.
+                let delete = handler.clone();
+                menu.item(
+                    PopupMenuItem::element(|_, cx| {
+                        h_flex()
+                            .w_full()
+                            .gap_3()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_color(crate::theme::danger_text(cx))
+                                    .child("Delete message..."),
+                            )
+                            // The menu's hint for the backspace binding, as Slack labels that key.
+                            .child(
+                                div()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("delete"),
+                            )
+                    })
+                    .action(Box::new(DeleteMessage))
+                    .on_click(move |_, window, cx| delete(MessageAction::Delete, window, cx)),
                 )
-                .action(Box::new(EditMessage)),
-            )
-            .separator();
-    }
-    menu = menu
-        .item(
-            menu_item(
-                "Mark unread",
-                IconName::SquareDot,
-                handler,
-                MessageAction::MarkUnread,
-            )
-            .action(Box::new(MarkMessageUnread)),
-        )
-        .item(
-            menu_item(
-                if set.saved {
-                    "Remove from saved"
-                } else {
-                    "Add to saved"
-                },
-                IconName::Bookmark,
-                handler,
-                MessageAction::SaveForLater,
-            )
-            .action(Box::new(SaveMessage)),
-        )
-        .item(PopupMenuItem::submenu("Add a reminder", remind).icon(IconName::AlarmClock))
-        .separator()
-        .item(
-            menu_item(
-                "Copy link",
-                IconName::Link2,
-                handler,
-                MessageAction::CopyLink,
-            )
-            .action(Box::new(CopyMessageLink)),
-        )
-        .item(
-            menu_item(
-                "Copy message",
-                IconName::Type,
-                handler,
-                MessageAction::CopyText,
-            )
-            .action(Box::new(CopyMessageText)),
-        );
-    if set.own {
-        // Slack's destructive item: no icon, in the danger color.
-        let delete = handler.clone();
-        menu = menu.separator().item(
-            PopupMenuItem::element(|_, cx| {
-                h_flex()
-                    .w_full()
-                    .gap_3()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_color(crate::theme::danger_text(cx))
-                            .child("Delete message..."),
-                    )
-                    // The menu's hint for the backspace binding, as Slack labels that key.
-                    .child(
-                        div()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("delete"),
-                    )
-            })
-            .action(Box::new(DeleteMessage))
-            .on_click(move |_, window, cx| delete(MessageAction::Delete, window, cx)),
-        );
+            }
+            MenuRow::Separator => menu.separator(),
+        };
     }
     menu
 }
@@ -617,63 +747,6 @@ pub fn ephemeral_banner(cx: &App) -> Div {
         .child("Only visible to you")
 }
 
-/// The inline edit draft replacing an edited row: a label, the framed textarea and
-/// Cancel/Save buttons (Save disabled while the draft is empty).
-pub fn edit_box(
-    key: &str,
-    draft: &Entity<TextareaState>,
-    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
-    on_save: impl Fn(&mut Window, &mut App) + 'static,
-    cx: &App,
-) -> Div {
-    let theme = cx.theme();
-    let has_text = !draft.read(cx).value().trim().is_empty();
-    v_flex()
-        .w_full()
-        .min_w_0()
-        .py_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Editing message"),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .mt_1()
-                .px_2()
-                .py_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.input)
-                .bg(theme.background)
-                .child(Textarea::new(draft).appearance(false).bordered(false)),
-        )
-        .child(
-            h_flex()
-                .justify_end()
-                .gap_1()
-                .mt_1()
-                .child(
-                    Button::new(SharedString::from(format!("{key}-cancel-edit")))
-                        .ghost()
-                        .with_size(Size::Small)
-                        .label("Cancel")
-                        .on_click(move |_, window, cx| on_cancel(window, cx)),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("{key}-save-edit")))
-                        .primary()
-                        .with_size(Size::Small)
-                        .label("Save")
-                        .disabled(!has_text)
-                        .on_click(move |_, window, cx| on_save(window, cx)),
-                ),
-        )
-}
-
 /// A toast for feedback on fixture-mode actions.
 pub fn notify(title: &str, message: impl Into<SharedString>, window: &mut Window, cx: &mut App) {
     window.push_notification(
@@ -799,7 +872,8 @@ pub fn confirm_delete(
 }
 
 /// A change the user made to a message, already shown by the view that made it, which the
-/// root must post to Slack (reactions, edits and deletions are not local-only in live mode).
+/// root must post to Slack (reactions, edits, pins and deletions are not local-only in
+/// live mode).
 pub enum MessageChange {
     /// `add`: the user's `name` reaction was added (else removed).
     React {
@@ -809,22 +883,36 @@ pub enum MessageChange {
     },
     Edit {
         ts: Ts,
-        text: String,
+        content: MessageContent,
     },
     Delete {
         ts: Ts,
+    },
+    /// `pinned`: the message is now pinned to its conversation (else unpinned).
+    Pin {
+        ts: Ts,
+        pinned: bool,
     },
     /// A Block Kit button press for the app that posted the message (`blocks.actions`).
     BlockAction(crate::blockkit::BlockDispatch),
 }
 
-/// Apply a local edit: new text (re-rendered as one plain rich-text block, as the web client
-/// sends it) and the `edited` marker.
-pub fn apply_edit(message: &mut Message, me: &UserId, text: String) {
-    if !message.blocks.is_empty() {
-        message.blocks = vec![RichTextBlock::plain_text(text.clone()).into()];
+/// Pin or unpin `message` in `channel` (its `pinned_to` list); returns whether it is
+/// pinned afterwards.
+pub fn toggle_pin(message: &mut Message, channel: &ChannelId) -> bool {
+    let pinned = !message.pinned_to.contains(channel);
+    if pinned {
+        message.pinned_to.push(channel.clone());
+    } else {
+        message.pinned_to.retain(|kept| kept != channel);
     }
-    message.text = text;
+    pinned
+}
+
+/// Apply a local edit: new rich-text blocks, mrkdwn fallback text, and the `edited` marker.
+pub fn apply_edit(message: &mut Message, me: &UserId, content: MessageContent) {
+    message.blocks = content.blocks;
+    message.text = content.text;
     message.edited = Some(Edited {
         user: Some(me.clone()),
         ts: now_ts(),
@@ -837,4 +925,111 @@ pub fn now_ts() -> Ts {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     Ts::new(format!("{}.{:06}", now.as_secs(), now.subsec_micros()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(own: bool) -> ActionSet {
+        ActionSet {
+            own,
+            reply: true,
+            saved: false,
+            pinned: false,
+        }
+    }
+
+    fn labels(set: ActionSet, origin: MenuOrigin) -> Vec<&'static str> {
+        menu_rows(set, origin).iter().map(MenuRow::label).collect()
+    }
+
+    #[test]
+    fn edit_and_delete_apply_to_own_messages_only() {
+        let mine = set(true);
+        let theirs = set(false);
+        for action in [MessageAction::Edit, MessageAction::Delete] {
+            assert!(eligible(mine, &action));
+            assert!(!eligible(theirs, &action));
+        }
+        for action in [
+            MessageAction::MarkUnread,
+            MessageAction::SaveForLater,
+            MessageAction::TogglePin,
+            MessageAction::Forward,
+            MessageAction::ReplyInThread,
+            MessageAction::CopyLink,
+        ] {
+            assert!(eligible(mine, &action));
+            assert!(eligible(theirs, &action));
+        }
+    }
+
+    #[test]
+    fn own_menus_lead_with_edit_and_end_with_delete() {
+        for origin in [MenuOrigin::Context, MenuOrigin::More] {
+            let rows = labels(set(true), origin);
+            assert_eq!(&rows[..2], &["Edit message", ""]);
+            assert_eq!(&rows[rows.len() - 2..], &["", "Delete message..."]);
+            assert_eq!(rows.iter().filter(|l| **l == "Copy link").count(), 1);
+        }
+    }
+
+    #[test]
+    fn other_menus_omit_edit_and_delete() {
+        for origin in [MenuOrigin::Context, MenuOrigin::More] {
+            let rows = labels(set(false), origin);
+            assert_eq!(rows.first(), Some(&"Mark unread"));
+            assert!(!rows.contains(&"Edit message"));
+            assert!(!rows.contains(&"Delete message..."));
+        }
+    }
+
+    #[test]
+    fn context_menu_includes_bar_actions_that_more_dropdown_omits() {
+        let context = labels(set(false), MenuOrigin::Context);
+        assert!(context.contains(&"Forward message"));
+        assert!(context.contains(&"Reply in thread"));
+
+        let more = labels(set(false), MenuOrigin::More);
+        assert!(!more.contains(&"Forward message"));
+        assert!(!more.contains(&"Reply in thread"));
+    }
+
+    #[test]
+    fn save_and_pin_labels_flip_with_state() {
+        let mut saved = set(false);
+        saved.saved = true;
+        assert!(labels(saved, MenuOrigin::Context).contains(&"Remove from saved"));
+        assert!(labels(set(false), MenuOrigin::Context).contains(&"Add to saved"));
+
+        let mut pinned = set(false);
+        pinned.pinned = true;
+        assert!(labels(pinned, MenuOrigin::Context).contains(&"Unpin from conversation"));
+        assert!(labels(set(false), MenuOrigin::Context).contains(&"Pin to conversation"));
+    }
+
+    #[test]
+    fn reply_row_follows_the_action_set() {
+        let mut no_replies = set(false);
+        no_replies.reply = false;
+        assert!(labels(set(false), MenuOrigin::Context).contains(&"Reply in thread"));
+        assert!(!labels(no_replies, MenuOrigin::Context).contains(&"Reply in thread"));
+    }
+
+    #[test]
+    fn toggle_pin_flips_pinned_to() {
+        let channel = ChannelId::from("C1");
+        let other = ChannelId::from("C2");
+        let mut message = Message {
+            pinned_to: vec![other.clone()],
+            ..Default::default()
+        };
+
+        assert!(toggle_pin(&mut message, &channel));
+        assert_eq!(message.pinned_to, vec![other.clone(), channel.clone()]);
+
+        assert!(!toggle_pin(&mut message, &channel));
+        assert_eq!(message.pinned_to, vec![other.clone()]);
+    }
 }
