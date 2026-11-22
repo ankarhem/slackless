@@ -36,7 +36,9 @@ use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
 use crate::blockkit::BlockDispatch;
-use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, ContextBar, TypingNames};
+use crate::composer::{
+    AlsoSendTarget, Composer, ComposerEvent, ContextBar, PendingAttachment, TypingNames,
+};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::{Remind, SaveRequest};
@@ -82,6 +84,13 @@ pub enum ThreadPanelEvent {
         thread_ts: Ts,
         content: MessageContent,
         broadcast: bool,
+    },
+    /// The user replied with attached files (and optional message text).
+    ReplyWithFiles {
+        channel: ChannelId,
+        thread_ts: Ts,
+        content: Option<MessageContent>,
+        files: Vec<PendingAttachment>,
     },
     /// An add-reaction control asked for the emoji picker at `position`; the root routes the
     /// pick back through [`ThreadPanel::add_reaction`].
@@ -149,6 +158,16 @@ impl ThreadPanel {
                     window,
                     |this: &mut ThreadPanel, _, event: &ComposerEvent, window, cx| match event {
                         ComposerEvent::Submit(content) => this.reply(content.clone(), cx),
+                        ComposerEvent::SubmitWithFiles { content, files } => {
+                            if let Some((channel, thread_ts)) = this.thread.clone() {
+                                cx.emit(ThreadPanelEvent::ReplyWithFiles {
+                                    channel,
+                                    thread_ts,
+                                    content: content.clone(),
+                                    files: files.clone(),
+                                });
+                            }
+                        }
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(ThreadPanelEvent::PickEmoji(*position));
                         }
@@ -179,6 +198,7 @@ impl ThreadPanel {
                             cx.emit(ThreadPanelEvent::PickEditEmoji(*position));
                         }
                         ComposerEvent::SlashCommand(_)
+                        | ComposerEvent::SubmitWithFiles { .. }
                         | ComposerEvent::Schedule { .. }
                         | ComposerEvent::EditLast
                         | ComposerEvent::Typing => {}

@@ -993,6 +993,23 @@ impl<B: Backend> Core<B> {
                     answer_load(&events, list, Event::ScheduledMessagesLoaded)
                 });
             }
+            Command::UploadFiles {
+                channel,
+                thread_ts,
+                content,
+                files,
+            } => {
+                self.spawn("files.upload", async move {
+                    let uploaded = backend
+                        .upload_files(channel.clone(), thread_ts, content, files)
+                        .await?;
+                    events.emit(Event::FilesUploaded {
+                        channel,
+                        count: uploaded.len(),
+                    });
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -2521,6 +2538,25 @@ pub(crate) mod tests {
         async fn usergroups(&self) -> api::Result<Vec<crate::types::Usergroup>> {
             Ok(Vec::new())
         }
+
+        async fn upload_files(
+            &self,
+            _channel: ChannelId,
+            _thread_ts: Option<Ts>,
+            _content: Option<MessageContent>,
+            files: Vec<api::UploadFile>,
+        ) -> api::Result<Vec<File>> {
+            Ok(files
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| File {
+                    id: crate::types::FileId::from(format!("FUP{i}")),
+                    name: Some(f.filename),
+                    size: Some(f.bytes.len() as i64),
+                    ..Default::default()
+                })
+                .collect())
+        }
     }
 
     pub(crate) fn fake_core_parts() -> (SharedStore, Emitter, UnboundedReceiver<Event>) {
@@ -4036,6 +4072,41 @@ pub(crate) mod tests {
             .expect("the group DM lands in the store");
         assert!(stored.is_mpim);
         assert_eq!(stored.members, vec![UserId::from("U2"), UserId::from("U3")]);
+    }
+
+    #[tokio::test]
+    async fn upload_files_calls_backend_and_emits_uploaded_count() {
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(
+            FakeBackend::default(),
+            Arc::clone(&store),
+            TeamId::from("T1"),
+            events,
+        );
+
+        core.handle(Command::UploadFiles {
+            channel: ChannelId::from("C1"),
+            thread_ts: None,
+            content: Some(MessageContent::plain("attached")),
+            files: vec![
+                api::UploadFile {
+                    filename: "a.png".into(),
+                    bytes: vec![1, 2, 3],
+                },
+                api::UploadFile {
+                    filename: "b.txt".into(),
+                    bytes: vec![4, 5],
+                },
+            ],
+        });
+
+        assert_eq!(
+            next(&mut rx).await,
+            Event::FilesUploaded {
+                channel: ChannelId::from("C1"),
+                count: 2,
+            }
+        );
     }
 
     #[tokio::test]

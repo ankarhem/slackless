@@ -24,14 +24,15 @@ mod toolbar;
 mod view;
 
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEditsEvent, InputState, TextareaState};
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Pixels, Point,
-    SharedString, Subscription, Window,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Image,
+    ImageFormat, PathPromptOptions, Pixels, Point, SharedString, Subscription, Window,
 };
 use slackless_core::api::MessageContent;
 use slackless_core::types::Message;
@@ -44,9 +45,23 @@ use crate::slash::{self, Invocation};
 use menu::Menu;
 use tokens::Palette;
 
+/// A file or clipboard image staged in the composer, waiting to upload on send.
+#[derive(Clone)]
+pub struct PendingAttachment {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+    /// Thumbnail preview for pasted screenshots and attached image files.
+    pub preview: Option<Arc<Image>>,
+}
+
 pub enum ComposerEvent {
     /// The message the user sent, never blank. The composer has already cleared itself.
     Submit(MessageContent),
+    /// One or more attached files sent, with optional message text. The composer has cleared.
+    SubmitWithFiles {
+        content: Option<MessageContent>,
+        files: Vec<PendingAttachment>,
+    },
     /// The emoji button was clicked at this window position.
     OpenEmojiPicker(Point<Pixels>),
     /// A `/command` draft was sent (composer already cleared).
@@ -168,6 +183,10 @@ pub struct Composer {
     /// shows `+`, `Aa`, `☺` on the left and `Cancel` / `Save` on the right, and emits
     /// [`ComposerEvent::Cancel`] on Esc.
     edit_mode: bool,
+    /// Files and pasted images staged for upload on send.
+    attachments: Vec<PendingAttachment>,
+    /// Counter for naming pasted clipboard images (`image-1.png`, `image-2.png`, ...).
+    next_paste_id: usize,
     /// Who the notification bar says is typing.
     typing: Option<TypingNames>,
     /// When [`ComposerEvent::Typing`] last went out.
@@ -255,6 +274,8 @@ impl Composer {
                 also_send: None,
                 show_toolbar: true,
                 edit_mode,
+                attachments: Vec::new(),
+                next_paste_id: 1,
                 typing: None,
                 typing_sent: None,
                 _subscriptions: subscriptions,
@@ -408,7 +429,118 @@ impl Composer {
         Some(doc)
     }
 
+    /// Open the OS file picker and stage every chosen file as a pending attachment.
+    pub(super) fn pick_files(&mut self, cx: &mut Context<Self>) {
+        if self.edit_mode {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach files".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let _ = this.update(cx, |composer, cx| composer.attach_paths(paths, cx));
+        })
+        .detach();
+    }
+
+    /// Read on-disk files off the UI thread and stage them in `self.attachments`.
+    pub(super) fn attach_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.edit_mode || paths.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    for path in paths {
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let Ok(bytes) = std::fs::read(&path) else {
+                            continue;
+                        };
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file")
+                            .to_owned();
+                        let preview = image_format_for_ext(&path)
+                            .map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
+                        out.push(PendingAttachment {
+                            filename,
+                            bytes,
+                            preview,
+                        });
+                    }
+                    out
+                })
+                .await;
+            if loaded.is_empty() {
+                return;
+            }
+            let _ = this.update(cx, |composer, cx| {
+                composer.attachments.extend(loaded);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Stage an image pasted from the clipboard (`Cmd+V`).
+    pub(super) fn attach_clipboard_image(&mut self, image: Image, cx: &mut Context<Self>) {
+        if self.edit_mode || image.bytes.is_empty() {
+            return;
+        }
+        let ext = match image.format {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Svg => "svg",
+            ImageFormat::Bmp => "bmp",
+            ImageFormat::Tiff => "tiff",
+            ImageFormat::Ico => "ico",
+            ImageFormat::Pnm => "pnm",
+        };
+        let n = self.next_paste_id;
+        self.next_paste_id += 1;
+        let bytes = image.bytes.clone();
+        self.attachments.push(PendingAttachment {
+            filename: format!("image-{n}.{ext}"),
+            bytes,
+            preview: Some(Arc::new(image)),
+        });
+        cx.notify();
+    }
+
+    pub(super) fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.attachments.len() {
+            self.attachments.remove(index);
+            cx.notify();
+        }
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.edit_mode && !self.attachments.is_empty() {
+            let files = std::mem::take(&mut self.attachments);
+            let doc = self.take(window, cx);
+            cx.emit(ComposerEvent::SubmitWithFiles {
+                content: doc.as_ref().map(content),
+                files,
+            });
+            cx.notify();
+            return;
+        }
         let Some(doc) = self.take(window, cx) else {
             return;
         };
@@ -428,5 +560,28 @@ impl Composer {
             let text = doc.to_mrkdwn();
             cx.emit(ComposerEvent::Schedule { text, when });
         }
+    }
+}
+
+fn image_format_for_ext(path: &std::path::Path) -> Option<ImageFormat> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "webp" => Some(ImageFormat::Webp),
+        "gif" => Some(ImageFormat::Gif),
+        "bmp" => Some(ImageFormat::Bmp),
+        "tif" | "tiff" => Some(ImageFormat::Tiff),
+        _ => None,
+    }
+}
+
+pub(super) fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }

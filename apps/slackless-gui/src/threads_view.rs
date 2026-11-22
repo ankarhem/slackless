@@ -27,7 +27,7 @@ use gpui_kit::gpui::{
 use slackless_core::api::{MessageContent, ThreadsView as SlackThreads};
 use slackless_core::types::{ChannelId, Ts};
 
-use crate::composer::{Composer, ComposerEvent};
+use crate::composer::{Composer, ComposerEvent, PendingAttachment};
 use crate::fixtures::Fixtures;
 use crate::slash::{Invocation, SHRUG, SlashKind};
 use crate::threads_cards::{ThreadCard, card_view, remote_cards};
@@ -43,6 +43,13 @@ pub enum ThreadsEvent {
         channel: slackless_core::types::ChannelId,
         thread_ts: slackless_core::types::Ts,
         content: MessageContent,
+    },
+    /// The user replied with attached files (and optional message text).
+    ReplyWithFiles {
+        channel: slackless_core::types::ChannelId,
+        thread_ts: slackless_core::types::Ts,
+        content: Option<MessageContent>,
+        files: Vec<PendingAttachment>,
     },
     /// The reply composer's emoji button asked for the picker.
     PickEmoji(Point<Pixels>),
@@ -73,6 +80,16 @@ impl ThreadsView {
                 &composer,
                 |this: &mut ThreadsView, _, event: &ComposerEvent, cx| match event {
                     ComposerEvent::Submit(content) => this.reply(content.clone(), cx),
+                    ComposerEvent::SubmitWithFiles { content, files } => {
+                        if let Some((channel, thread_ts)) = this.active_thread() {
+                            cx.emit(ThreadsEvent::ReplyWithFiles {
+                                channel,
+                                thread_ts,
+                                content: content.clone(),
+                                files: files.clone(),
+                            });
+                        }
+                    }
                     ComposerEvent::OpenEmojiPicker(position) => {
                         cx.emit(ThreadsEvent::PickEmoji(*position));
                     }

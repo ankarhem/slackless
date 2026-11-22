@@ -164,6 +164,28 @@ impl SlackApi {
         Ok(resp.bytes().await?)
     }
 
+    /// Uploads raw bytes to an external upload slot returned by `files.getUploadURLExternal`.
+    /// No Slack session cookie or token is sent; retries on HTTP 429.
+    pub(crate) async fn post_upload_bytes(&self, upload_url: &str, bytes: &[u8]) -> Result<()> {
+        let url = Url::parse(upload_url)?;
+        let resp = self
+            .send_with_retry(|| {
+                Ok(self
+                    .http
+                    .post(url.clone())
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(bytes.to_vec())
+                    .build()?)
+            })
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.bytes().await?;
+            return Err(status_error(status, &body));
+        }
+        Ok(())
+    }
+
     fn is_trusted_file_url(&self, url: &Url) -> bool {
         let same_origin = url.origin() == self.base.origin();
         let slack_host = url.scheme() == "https"

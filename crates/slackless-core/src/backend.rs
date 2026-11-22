@@ -7,7 +7,7 @@ use crate::api::{
     self, ActionContainer, ActivityEntry, ActivityFeed, ChannelBookmark, ClientCounts, FilesFilter,
     HistoryOpts, ListOpts, MessageContent, Page, PinnedItem, PostedMessage, ScheduledMessage,
     ScheduledMessageCreated, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView,
-    UserBoot,
+    UploadFile, UserBoot,
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File,
@@ -291,6 +291,15 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<()>> + Send;
     /// Active `@handle` user groups (`usergroups.list`).
     fn usergroups(&self) -> impl Future<Output = api::Result<Vec<Usergroup>>> + Send;
+    /// Upload files into `channel` via external upload v2 (`files.getUploadURLExternal` +
+    /// raw upload POST + `files.completeUploadExternal`).
+    fn upload_files(
+        &self,
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
+        content: Option<MessageContent>,
+        files: Vec<UploadFile>,
+    ) -> impl Future<Output = api::Result<Vec<File>>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -654,5 +663,15 @@ impl Backend for SlackApi {
 
     async fn usergroups(&self) -> api::Result<Vec<Usergroup>> {
         self.usergroups_list().await
+    }
+
+    async fn upload_files(
+        &self,
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
+        content: Option<MessageContent>,
+        files: Vec<UploadFile>,
+    ) -> api::Result<Vec<File>> {
+        SlackApi::upload_files(self, &channel, thread_ts.as_ref(), content.as_ref(), &files).await
     }
 }

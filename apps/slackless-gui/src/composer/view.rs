@@ -6,9 +6,9 @@ use gpui_kit::component::input::{Input, Textarea};
 use gpui_kit::component::{ActiveTheme as _, Icon, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Context, Div, Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Stateful, Styled as _, StyledText,
-    Window, div, px, relative, rems,
+    App, Context, Div, ExternalPaths, Focusable as _, FontWeight, HighlightStyle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
+    Styled as _, StyledText, Window, div, px, relative, rems,
 };
 
 use super::tokens::{self, Palette};
@@ -103,6 +103,7 @@ impl Render for Composer {
                         .map(|slot| self.tool_button(slot, focused, cx)),
                 )
         });
+        let attachments = self.attachments_strip(cx);
         let also_send = self.also_send_row(cx);
         let actions = self.action_row(cx);
         let overlay = if self.link_open {
@@ -178,6 +179,17 @@ impl Render for Composer {
                     // while the box has focus (#afafb0).
                     .border_color(theme.foreground.opacity(if focused { 0.35 } else { 0.1 }))
                     .bg(surface)
+                    .when(!self.edit_mode, |frame| {
+                        frame
+                            .on_drop::<ExternalPaths>(cx.listener(
+                                |this, paths: &ExternalPaths, _, cx| {
+                                    this.attach_paths(paths.paths().to_vec(), cx);
+                                },
+                            ))
+                            .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                                style.border_color(cx.theme().link)
+                            })
+                    })
                     .children(toolbar)
                     .child(
                         div()
@@ -189,6 +201,7 @@ impl Render for Composer {
                             .child(draft)
                             .children(private_prompt),
                     )
+                    .children(attachments)
                     .children(also_send)
                     .child(actions),
             )

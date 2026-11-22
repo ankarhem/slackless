@@ -110,6 +110,20 @@ pub struct ListOpts {
     pub limit: Option<u32>,
 }
 
+/// One pending file to upload through Slack's external upload v2 flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Answer to `files.getUploadURLExternal`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadSlot {
+    pub file_id: String,
+    pub upload_url: String,
+}
+
 /// Filters for `files.list` (`FilesFilter::channel` / `FilesFilter::workspace` plus the
 /// optional narrowings).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1905,6 +1919,86 @@ impl SlackApi {
         params.push(("page", page_no.to_string()));
         let resp = self.call::<FilesWire>(method::FILES_LIST, params).await?;
         Ok(page(resp, |w| w.files))
+    }
+
+    /// `files.getUploadURLExternal`: reserve an upload slot for `filename` of `length` bytes.
+    pub async fn files_get_upload_url_external(
+        &self,
+        filename: &str,
+        length: usize,
+    ) -> Result<UploadSlot> {
+        let params = vec![
+            ("filename", filename.to_owned()),
+            ("length", length.to_string()),
+        ];
+        Ok(self
+            .call::<UploadSlot>(method::FILES_GET_UPLOAD_U_R_L_EXTERNAL, params)
+            .await?
+            .data)
+    }
+
+    /// `files.completeUploadExternal`: finalize uploaded file IDs and share them to `channel`
+    /// (optionally inside `thread_ts` and accompanied by `content`).
+    pub async fn files_complete_upload_external(
+        &self,
+        files: &[(String, String)],
+        channel: &ChannelId,
+        thread_ts: Option<&Ts>,
+        content: Option<&MessageContent>,
+    ) -> Result<Vec<File>> {
+        let entries: Vec<Value> = files
+            .iter()
+            .map(|(id, title)| serde_json::json!({ "id": id, "title": title }))
+            .collect();
+        let mut params = vec![
+            ("files", serde_json::to_string(&entries)?),
+            ("channel_id", channel.to_string()),
+        ];
+        if let Some(ts) = thread_ts {
+            params.push(("thread_ts", ts.to_string()));
+        }
+        if let Some(content) = content {
+            if !content.blocks.is_empty() {
+                params.push(("blocks", serde_json::to_string(&content.blocks)?));
+            } else if !content.text.trim().is_empty() {
+                params.push(("initial_comment", content.text.clone()));
+            }
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default, deserialize_with = "lenient_vec")]
+            files: Vec<File>,
+        }
+        Ok(self
+            .call::<Wire>(method::FILES_COMPLETE_UPLOAD_EXTERNAL, params)
+            .await?
+            .data
+            .files)
+    }
+
+    /// Full external upload v2 flow: reserve a slot per file, POST its raw bytes, and finalize
+    /// all files in one `files.completeUploadExternal` call into `channel`.
+    pub async fn upload_files(
+        &self,
+        channel: &ChannelId,
+        thread_ts: Option<&Ts>,
+        content: Option<&MessageContent>,
+        files: &[UploadFile],
+    ) -> Result<Vec<File>> {
+        let mut completed = Vec::with_capacity(files.len());
+        for file in files {
+            if file.bytes.is_empty() {
+                return Err(crate::ApiError::Slack("empty_file".to_owned()));
+            }
+            let slot = self
+                .files_get_upload_url_external(&file.filename, file.bytes.len())
+                .await?;
+            self.post_upload_bytes(&slot.upload_url, &file.bytes)
+                .await?;
+            completed.push((slot.file_id, file.filename.clone()));
+        }
+        self.files_complete_upload_external(&completed, channel, thread_ts, content)
+            .await
     }
 
     /// `conversations.canvases.create`: creates the conversation's empty channel canvas and

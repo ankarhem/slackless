@@ -26,7 +26,7 @@ pub use methods::{
     ConversationView, FilesFilter, HistoryOpts, ListOpts, MessageContent, PinnedItem, PinsList,
     PostedMessage, ScheduledMessage, ScheduledMessageCreated, SearchChannel, SearchMatch,
     SearchMessages, SearchOpts, SearchPagination, SearchSort, SectionCreated, ThreadCounts,
-    ThreadSubscription, ThreadsView, UserBoot,
+    ThreadSubscription, ThreadsView, UploadFile, UploadSlot, UserBoot,
 };
 pub use pagination::{Page, paginate};
 

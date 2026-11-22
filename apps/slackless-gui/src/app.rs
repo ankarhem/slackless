@@ -1022,6 +1022,17 @@ impl App {
                     window,
                     |this: &mut App, _, event: &ComposerEvent, window, cx| match event {
                         ComposerEvent::Submit(content) => this.send(content.clone(), window, cx),
+                        ComposerEvent::SubmitWithFiles { content, files } => {
+                            let channel = this.channel.clone();
+                            this.upload_files(
+                                channel,
+                                None,
+                                content.clone(),
+                                files.clone(),
+                                window,
+                                cx,
+                            );
+                        }
                         ComposerEvent::OpenEmojiPicker(position) => {
                             this.open_picker(PickerTarget::Composer, *position, window, cx);
                         }
@@ -1161,6 +1172,21 @@ impl App {
                                 broadcast: false,
                             });
                         }
+                        ThreadsEvent::ReplyWithFiles {
+                            channel,
+                            thread_ts,
+                            content,
+                            files,
+                        } => {
+                            this.upload_files(
+                                channel.clone(),
+                                Some(thread_ts.clone()),
+                                content.clone(),
+                                files.clone(),
+                                window,
+                                cx,
+                            );
+                        }
                         ThreadsEvent::PickEmoji(position) => {
                             this.open_picker(PickerTarget::ThreadsComposer, *position, window, cx);
                         }
@@ -1272,6 +1298,22 @@ impl App {
                             this.compose_open = false;
                             this.select(channel.clone(), cx);
                             this.send(content.clone(), window, cx);
+                        }
+                        NewMessageEvent::SendWithFiles {
+                            channel,
+                            content,
+                            files,
+                        } => {
+                            this.compose_open = false;
+                            this.select(channel.clone(), cx);
+                            this.upload_files(
+                                channel.clone(),
+                                None,
+                                content.clone(),
+                                files.clone(),
+                                window,
+                                cx,
+                            );
                         }
                         NewMessageEvent::OpenDm { users, content } => {
                             // If one person was picked and an IM already exists, deliver directly.
@@ -4602,6 +4644,65 @@ impl App {
         // The composer is empty now: drop any saved draft for this conversation.
         self.save_draft(cx);
     }
+
+    /// Upload staged files (with optional message text) into `channel` (or `thread_ts`).
+    fn upload_files(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
+        content: Option<MessageContent>,
+        files: Vec<composer::PendingAttachment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        if self.bridge.store().is_some() {
+            let count = files.len();
+            let uploads = files
+                .into_iter()
+                .map(|f| slackless_core::api::UploadFile {
+                    filename: f.filename,
+                    bytes: f.bytes,
+                })
+                .collect();
+            self.bridge.send(Command::UploadFiles {
+                channel,
+                thread_ts,
+                content,
+                files: uploads,
+            });
+            let label = if count == 1 { "file" } else { "files" };
+            notify(
+                "Uploading",
+                format!("Uploading {count} {label}\u{2026}"),
+                window,
+                cx,
+            );
+        } else {
+            // Fixture mode: echo the message locally with stub file entries.
+            let text = content.as_ref().map(|c| c.text.clone()).unwrap_or_default();
+            let mut message = self.fixtures.local_message(&channel, text, thread_ts);
+            if let Some(content) = content {
+                message.blocks = content.blocks;
+            }
+            message.files = files
+                .into_iter()
+                .enumerate()
+                .map(|(i, f)| File {
+                    id: slackless_core::types::FileId::from(format!("FLOCAL{i}")),
+                    name: Some(f.filename.clone()),
+                    title: Some(f.filename),
+                    size: Some(f.bytes.len() as i64),
+                    ..Default::default()
+                })
+                .collect();
+            self.messages
+                .update(cx, |list, cx| list.append(channel, message, cx));
+        }
+        self.save_draft(cx);
+    }
 }
 
 impl Render for App {
@@ -6575,6 +6676,21 @@ fn subscribe_workspace(
                         thread_ts: Some(thread_ts.clone()),
                         broadcast: *broadcast,
                     });
+                }
+                ThreadPanelEvent::ReplyWithFiles {
+                    channel,
+                    thread_ts,
+                    content,
+                    files,
+                } => {
+                    this.upload_files(
+                        channel.clone(),
+                        Some(thread_ts.clone()),
+                        content.clone(),
+                        files.clone(),
+                        window,
+                        cx,
+                    );
                 }
                 ThreadPanelEvent::SlashCommand(invocation) => {
                     let thread = this.thread.read(cx).open_thread();

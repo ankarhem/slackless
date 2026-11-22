@@ -11,9 +11,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, AnyView, App, ClickEvent, Context, Div, FontWeight,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Anchor, AnyElement, AnyView, App, ClickEvent, Context, Div, FontWeight, ImageSource,
+    InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement as _, Stateful,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
 };
 
 use super::keys::Tool;
@@ -362,6 +362,84 @@ impl Composer {
             })
     }
 
+    /// Staged attachment chips / image thumbnails rendered inside the composer above the action row.
+    pub(super) fn attachments_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (border, secondary, foreground, muted) = (
+            theme.border,
+            theme.secondary,
+            theme.foreground,
+            theme.muted_foreground,
+        );
+        Some(h_flex().flex_wrap().gap_2().px_3().pb_1p5().children(
+            self.attachments.iter().enumerate().map(|(ix, file)| {
+                let thumb = match &file.preview {
+                    Some(preview) => img(ImageSource::Image(preview.clone()))
+                        .size(px(36.))
+                        .rounded_sm()
+                        .object_fit(ObjectFit::Cover)
+                        .flex_none()
+                        .into_any_element(),
+                    None => div()
+                        .size(px(36.))
+                        .flex_none()
+                        .rounded_sm()
+                        .bg(secondary)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::File).size(px(18.)).text_color(muted))
+                        .into_any_element(),
+                };
+                h_flex()
+                    .id(("attach-chip", ix))
+                    .items_center()
+                    .gap_2()
+                    .pl_1p5()
+                    .pr_1()
+                    .py_1()
+                    .max_w(px(220.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(secondary.opacity(0.6))
+                    .child(thumb)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(foreground)
+                                    .child(file.filename.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(super::format_bytes(file.bytes.len())),
+                            ),
+                    )
+                    .child(
+                        Button::new(("attach-rm", ix))
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::X)
+                            .tooltip("Remove attachment")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_attachment(ix, cx);
+                            })),
+                    )
+            }),
+        ))
+    }
+
     /// Slack's always-visible row under the draft: attach, format, emoji, mention, clips and
     /// slash on the left; send and schedule on the right.
     pub(super) fn action_row(&self, cx: &mut Context<Self>) -> Div {
@@ -369,7 +447,8 @@ impl Composer {
         let (muted, border, hover) = (theme.muted_foreground, theme.border, theme.secondary_hover);
         let secondary = theme.secondary;
         let (primary, primary_foreground) = (theme.primary, theme.primary_foreground);
-        let can_send = !self.editor.doc().is_blank();
+        let can_send =
+            !self.editor.doc().is_blank() || (!self.edit_mode && !self.attachments.is_empty());
         let icon = |name: IconName| Icon::new(name).text_color(muted).size(px(15.));
         let separator = || div().w(px(1.)).h(px(16.)).rounded_full().bg(border);
         // Window chrome: Slack's controls for features slackless does not have yet.
@@ -391,11 +470,17 @@ impl Composer {
         let tools = h_flex()
             .items_center()
             .gap_0p5()
-            .child(
+            .child(if self.edit_mode {
                 chrome("act-plus", icon(IconName::Plus).into_any_element())
                     .rounded_full()
-                    .bg(secondary),
-            )
+                    .bg(secondary)
+            } else {
+                button("act-plus", icon(IconName::Plus).into_any_element())
+                    .rounded_full()
+                    .bg(secondary)
+                    .tooltip(|window, cx| Tooltip::new("Attach files").build(window, cx))
+                    .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)))
+            })
             .child(
                 button("act-format", aa).on_click(cx.listener(|this, _, _, cx| {
                     this.show_toolbar = !this.show_toolbar;

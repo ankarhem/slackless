@@ -318,6 +318,7 @@ impl MessageList {
                             cx.emit(MessageListEvent::PickEditEmoji(*position));
                         }
                         ComposerEvent::SlashCommand(_)
+                        | ComposerEvent::SubmitWithFiles { .. }
                         | ComposerEvent::Schedule { .. }
                         | ComposerEvent::EditLast
                         | ComposerEvent::Typing => {}

@@ -28,7 +28,7 @@ use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, UserId};
 
 use crate::compose_targets::{Picked, suggestion_rows, suggestions};
-use crate::composer::{Composer, ComposerEvent};
+use crate::composer::{Composer, ComposerEvent, PendingAttachment};
 use crate::fixtures::Fixtures;
 use crate::slash::{Invocation, SHRUG, SlashKind};
 
@@ -36,6 +36,12 @@ pub enum NewMessageEvent {
     Send {
         channel: ChannelId,
         content: MessageContent,
+    },
+    /// Send attached files (with optional message text) into an existing conversation.
+    SendWithFiles {
+        channel: ChannelId,
+        content: Option<MessageContent>,
+        files: Vec<PendingAttachment>,
     },
     /// Open (or reuse) a 1:1 DM, self-DM, or group DM with `users` and deliver `content` there.
     OpenDm {
@@ -76,7 +82,8 @@ impl NewMessageView {
             let composer =
                 Composer::new("Start a new message".into(), fixtures.clone(), window, cx);
             composer.update(cx, |composer, cx| composer.set_scheduling(false, cx));
-            let subscriptions = vec![
+            let subscriptions =
+                vec![
                 cx.subscribe_in(
                     &to,
                     window,
@@ -91,6 +98,19 @@ impl NewMessageView {
                     window,
                     |this: &mut NewMessageView, _, event: &ComposerEvent, window, cx| match event {
                         ComposerEvent::Submit(content) => this.send(content.clone(), window, cx),
+                        ComposerEvent::SubmitWithFiles { content, files } => {
+                            if let [Picked {
+                                recipient: crate::compose_targets::Recipient::Conversation(channel),
+                                ..
+                            }] = this.picked.as_slice()
+                            {
+                                cx.emit(NewMessageEvent::SendWithFiles {
+                                    channel: channel.clone(),
+                                    content: content.clone(),
+                                    files: files.clone(),
+                                });
+                            }
+                        }
                         ComposerEvent::OpenEmojiPicker(position) => {
                             cx.emit(NewMessageEvent::PickEmoji(*position));
                         }

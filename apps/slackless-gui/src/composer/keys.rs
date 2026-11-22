@@ -6,7 +6,7 @@
 //! capture phase. The formatting shortcuts have no binding and arrive as plain key-downs.
 
 use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Redo, Undo};
-use gpui_kit::gpui::{ClipboardItem, Context, KeyDownEvent, Window};
+use gpui_kit::gpui::{ClipboardEntry, ClipboardItem, Context, KeyDownEvent, Window};
 
 use super::{Composer, ComposerEvent};
 use crate::editor::{LineKind, Style};
@@ -104,14 +104,30 @@ impl Composer {
         self.changed(cx);
     }
 
-    /// A URL pasted over selected text links that text. Returns whether the paste was taken;
-    /// otherwise the textarea pastes as usual.
+    /// Handles clipboard image/file paste (attaching them to the composer) and URL-over-selection
+    /// paste (linking the selected text). Returns whether the paste was taken; otherwise the
+    /// textarea pastes text as usual.
     pub(super) fn on_paste(
         &mut self,
         item: &ClipboardItem,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.edit_mode {
+            for entry in &item.entries {
+                match entry {
+                    ClipboardEntry::Image(image) => {
+                        self.attach_clipboard_image(image.clone(), cx);
+                        return true;
+                    }
+                    ClipboardEntry::ExternalPaths(paths) => {
+                        self.attach_paths(paths.paths().to_vec(), cx);
+                        return true;
+                    }
+                    ClipboardEntry::String(_) => {}
+                }
+            }
+        }
         let Some(pasted) = item.text() else {
             return false;
         };

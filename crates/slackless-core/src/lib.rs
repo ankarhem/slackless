@@ -277,6 +277,15 @@ pub enum Command {
         channel: ChannelId,
         scheduled_message_id: String,
     },
+    /// Upload one or more files into `channel` (optionally in `thread_ts` with `content`)
+    /// through Slack's external upload v2 flow (`files.getUploadURLExternal` -> raw POST ->
+    /// `files.completeUploadExternal`).
+    UploadFiles {
+        channel: ChannelId,
+        thread_ts: Option<Ts>,
+        content: Option<MessageContent>,
+        files: Vec<api::UploadFile>,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -402,6 +411,8 @@ pub enum Event {
     /// Slack refused a [`Command::RunCommand`]: the command and Slack's error code
     /// (`unknown_command` for one the workspace does not have).
     CommandFailed { command: String, error: String },
+    /// One or more files finished uploading and sharing into `channel`.
+    FilesUploaded { channel: ChannelId, count: usize },
     /// Active `@handle` user groups from `usergroups.list`.
     Usergroups(Vec<types::Usergroup>),
     /// A non-fatal failure worth surfacing.

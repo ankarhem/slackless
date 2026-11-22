@@ -973,3 +973,57 @@ async fn usergroups_list_parses_groups() {
     assert_eq!(groups[0].user_count, Some(12));
     assert!(!groups[0].is_deleted());
 }
+
+#[tokio::test]
+async fn upload_files_runs_get_url_raw_post_and_complete_external() {
+    let (server, api) = setup().await;
+    let upload_url = format!("{}/upload/v1/slot1", server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/api/files.getUploadURLExternal"))
+        .and(body_string_contains("filename=hello.txt"))
+        .and(body_string_contains("length=5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "file_id": "F09UP1",
+            "upload_url": upload_url,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/upload/v1/slot1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("OK - 5"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/files.completeUploadExternal"))
+        .and(body_string_contains("channel_id=C0ENG"))
+        .and(body_string_contains("F09UP1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "files": [{ "id": "F09UP1", "name": "hello.txt", "size": 5 }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let files = vec![slackless_api::UploadFile {
+        filename: "hello.txt".into(),
+        bytes: b"hello".to_vec(),
+    }];
+    let uploaded = api
+        .upload_files(
+            &ChannelId::from("C0ENG"),
+            None,
+            Some(&MessageContent::plain("check this out")),
+            &files,
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0].id.as_str(), "F09UP1");
+}
