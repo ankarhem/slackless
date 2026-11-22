@@ -1557,6 +1557,54 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `blocks.suggestions`: fetch dynamic option suggestions for `external_select` /
+    /// `multi_external_select` elements (`F-COLLAB-786`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn blocks_suggestions(
+        &self,
+        bot: &BotId,
+        app_id: &str,
+        team: &TeamId,
+        action_id: &str,
+        block_id: &str,
+        value: &str,
+        container: &ActionContainer,
+    ) -> Result<Vec<(String, String)>> {
+        let params = vec![
+            ("service_id", bot.to_string()),
+            ("app_id", app_id.to_owned()),
+            ("service_team_id", team.to_string()),
+            ("action_id", action_id.to_owned()),
+            ("block_id", block_id.to_owned()),
+            ("value", value.to_owned()),
+            ("container", container.json().to_string()),
+            ("client_token", client_token()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let raw: Value = self.call(method::BLOCKS_SUGGESTIONS, params).await?.data;
+        let groups = raw["option_groups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| g["options"].as_array())
+            .flatten();
+        let options = raw["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(groups)
+            .filter_map(|opt| {
+                let text = opt["text"]["text"]
+                    .as_str()
+                    .or_else(|| opt["text"].as_str())?
+                    .to_owned();
+                let val = opt["value"].as_str()?.to_owned();
+                Some((text, val))
+            })
+            .collect();
+        Ok(options)
+    }
+
     /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app (`F-COLLAB-725`).
     pub async fn views_submit(
         &self,
@@ -2034,20 +2082,115 @@ impl SlackApi {
         Ok(self.call(method::BOOKMARKS_LIST, params).await?.data)
     }
 
-    /// `bookmarks.add` of a `link` bookmark to the conversation's bar.
+    /// `bookmarks.add` of a `link` bookmark to the conversation's bar (or inside `parent_id`).
     pub async fn bookmarks_add_link(
         &self,
         channel: &ChannelId,
         title: &str,
         link: &str,
     ) -> Result<()> {
-        let params = vec![
+        self.bookmarks_add_link_in_folder(channel, title, link, None)
+            .await
+    }
+
+    /// `bookmarks.add` of a `link` bookmark optionally placed inside a folder (`parent_id`).
+    pub async fn bookmarks_add_link_in_folder(
+        &self,
+        channel: &ChannelId,
+        title: &str,
+        link: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        let mut params = vec![
             ("channel_id", channel.to_string()),
             ("title", title.to_owned()),
             ("type", "link".to_owned()),
             ("link", link.to_owned()),
         ];
+        if let Some(parent) = parent_id.filter(|s| !s.is_empty()) {
+            params.push(("parent_id", parent.to_owned()));
+        }
         self.call::<Empty>(method::BOOKMARKS_ADD, params).await?;
+        Ok(())
+    }
+
+    /// `bookmarks.remove`: delete a bookmark from `channel` (`F-CORE-062`).
+    pub async fn bookmarks_remove(&self, channel: &ChannelId, bookmark_id: &str) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel.to_string()),
+            ("bookmark_id", bookmark_id.to_owned()),
+        ];
+        self.call::<Empty>(method::BOOKMARKS_REMOVE, params).await?;
+        Ok(())
+    }
+
+    /// `drafts.list`: fetch the signed-in user's cloud-synced drafts (`F-CORE-089`).
+    pub async fn drafts_list(&self) -> Result<Vec<CloudDraft>> {
+        let params = vec![
+            ("limit", "100".to_owned()),
+            ("is_active", "true".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let raw: Value = self.call(method::DRAFTS_LIST, params).await?.data;
+        Ok(parse_cloud_drafts(&raw))
+    }
+
+    /// `drafts.create`: create a cloud-synced draft for `channel` and return its draft id.
+    pub async fn drafts_create(&self, channel: &ChannelId, text: &str) -> Result<Option<String>> {
+        let blocks = serde_json::json!([{
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{ "type": "text", "text": text }]
+            }]
+        }]);
+        let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
+        let params = vec![
+            ("blocks", blocks.to_string()),
+            ("destinations", destinations.to_string()),
+            ("client_msg_id", client_token()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let raw: Value = self.call(method::DRAFTS_CREATE, params).await?.data;
+        Ok(raw
+            .get("draft")
+            .and_then(|d| d.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    }
+
+    /// `drafts.update`: update an existing cloud draft's text.
+    pub async fn drafts_update(
+        &self,
+        draft_id: &str,
+        channel: &ChannelId,
+        text: &str,
+    ) -> Result<()> {
+        let blocks = serde_json::json!([{
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_section",
+                "elements": [{ "type": "text", "text": text }]
+            }]
+        }]);
+        let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
+        let params = vec![
+            ("draft_id", draft_id.to_owned()),
+            ("blocks", blocks.to_string()),
+            ("destinations", destinations.to_string()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::DRAFTS_UPDATE, params).await?;
+        Ok(())
+    }
+
+    /// `drafts.delete`: remove a cloud draft once sent or cleared.
+    pub async fn drafts_delete(&self, draft_id: &str) -> Result<()> {
+        let params = vec![
+            ("draft_id", draft_id.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::DRAFTS_DELETE, params).await?;
         Ok(())
     }
 
@@ -2805,6 +2948,61 @@ impl SlackApi {
         self.call::<Empty>("users.prefs.set", params).await?;
         Ok(())
     }
+}
+
+/// One cloud-synced draft returned by `drafts.list` (`F-CORE-089`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudDraft {
+    pub id: String,
+    pub channel: ChannelId,
+    pub text: String,
+    pub updated_secs: Option<u64>,
+}
+
+fn parse_cloud_drafts(raw: &Value) -> Vec<CloudDraft> {
+    fn extract_text(blocks: &Value) -> String {
+        let mut out = String::new();
+        for block in blocks.as_array().into_iter().flatten() {
+            for container in block["elements"].as_array().into_iter().flatten() {
+                for el in container["elements"].as_array().into_iter().flatten() {
+                    if let Some(t) = el["text"].as_str() {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+    raw["drafts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| {
+            if d["is_deleted"].as_bool().unwrap_or(false) || d["is_sent"].as_bool().unwrap_or(false)
+            {
+                return None;
+            }
+            let id = d["id"].as_str()?.to_owned();
+            let channel = d["destinations"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|dest| dest["channel_id"].as_str())
+                .map(ChannelId::from)?;
+            let text = extract_text(&d["blocks"]);
+            if text.trim().is_empty() {
+                return None;
+            }
+            let updated_secs = d["date_last_updated"]
+                .as_u64()
+                .or_else(|| d["date_created"].as_u64());
+            Some(CloudDraft {
+                id,
+                channel,
+                text,
+                updated_secs,
+            })
+        })
+        .collect()
 }
 
 /// One message hit returned by `search.modules.messages`.

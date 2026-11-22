@@ -375,6 +375,21 @@ impl MessageList {
         cx.notify();
     }
 
+    /// Store dynamically fetched `blocks.suggestions` options for an `external_select` control.
+    pub fn set_block_suggestions(
+        &mut self,
+        key: String,
+        options: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let kit = self.data.read(cx).kit.clone();
+        kit.update(cx, |kit, cx| {
+            kit.set_suggestions(key, options);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     /// Forward the Enter-to-send preference to the inline edit composer.
     pub fn set_enter_sends(&mut self, enter_sends: bool, cx: &mut Context<Self>) {
         let edit_composer = self.data.read(cx).edit_composer.clone();

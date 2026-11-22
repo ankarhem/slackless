@@ -5704,6 +5704,40 @@ impl App {
             }
             Event::ModalOpened(view) => self.open_block_modal(view.clone(), window, cx),
             Event::ModalClosed(_) => window.close_dialog(cx),
+            Event::CloudDrafts(cloud_drafts) => {
+                let mut added = false;
+                for draft in cloud_drafts {
+                    let has_local = self
+                        .drafts
+                        .read(cx)
+                        .draft(self.workspace, &draft.channel)
+                        .is_some();
+                    if !has_local {
+                        let entry = Entry {
+                            id: Some(draft.id.clone()),
+                            workspace: self.workspace,
+                            channel: draft.channel.clone(),
+                            label: self.label(&draft.channel),
+                            text: draft.text.clone(),
+                            at: draft.updated_secs.unwrap_or_else(now_secs),
+                        };
+                        self.drafts
+                            .update(cx, |drafts, cx| drafts.set_draft(entry, cx));
+                        added = true;
+                    }
+                }
+                if added {
+                    let count = self.drafts.read(cx).draft_count();
+                    self.sidebar
+                        .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
+                    self.persist_drafts(cx);
+                }
+            }
+            Event::BlockSuggestions { key, options } => {
+                self.messages.update(cx, |list, cx| {
+                    list.set_block_suggestions(key.clone(), options.clone(), cx);
+                });
+            }
             _ => {}
         }
     }
@@ -6652,6 +6686,7 @@ impl App {
         if text == saved {
             return;
         }
+        let text_for_cloud = text.clone();
         let entry = Entry {
             id: None,
             workspace: self.workspace,
@@ -6666,6 +6701,12 @@ impl App {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
         self.persist_drafts(cx);
+        if !self.fixtures.sample {
+            self.bridge.send(Command::SyncDraft {
+                channel: self.channel.clone(),
+                text: text_for_cloud,
+            });
+        }
     }
 
     /// Persist the active workspace's unsent drafts into the local store off the UI thread.
@@ -6707,6 +6748,7 @@ impl App {
         self.searching = false;
         if !self.fixtures.sample {
             self.bridge.send(Command::LoadScheduledMessages);
+            self.bridge.send(Command::FetchCloudDrafts);
             if let Some(read) = self.bridge.recent_sent(self.fixtures.self_user.clone(), 50) {
                 let workspace = self.workspace;
                 let fixtures = self.fixtures.clone();
@@ -7625,7 +7667,46 @@ impl Render for App {
                 }
                 ConversationTab::Folder { bookmark_id, .. } => {
                     let bookmarks = self.bookmarks.get(&self.channel);
-                    let view = tab_views::folder_view(bookmark_id, bookmarks, cx);
+                    let (on_add, on_remove): (
+                        Option<tab_views::BookmarkAddFn>,
+                        Option<tab_views::BookmarkRemoveFn>,
+                    ) = if !self.fixtures.sample {
+                        let this_add = cx.weak_entity();
+                        let folder_for_add = bookmark_id.clone();
+                        let ch_for_add = self.channel.clone();
+                        let add_fn: tab_views::BookmarkAddFn =
+                            std::rc::Rc::new(move |window, cx| {
+                                let this_cb = this_add.clone();
+                                let folder_cb = folder_for_add.clone();
+                                let ch_cb = ch_for_add.clone();
+                                bookmarks::open_add_dialog(window, cx, move |title, url, cx| {
+                                    let _ = this_cb.update(cx, |app, _| {
+                                        app.bridge.send(Command::AddBookmarkInFolder {
+                                            channel: ch_cb.clone(),
+                                            title,
+                                            url,
+                                            parent_id: folder_cb.clone(),
+                                        });
+                                    });
+                                });
+                            });
+                        let this_rm = cx.weak_entity();
+                        let ch_for_rm = self.channel.clone();
+                        let rm_fn: tab_views::BookmarkRemoveFn =
+                            std::rc::Rc::new(move |bm_id, cx| {
+                                let _ = this_rm.update(cx, |app, _| {
+                                    app.bridge.send(Command::RemoveBookmark {
+                                        channel: ch_for_rm.clone(),
+                                        bookmark_id: bm_id,
+                                    });
+                                });
+                            });
+                        (Some(add_fn), Some(rm_fn))
+                    } else {
+                        (None, None)
+                    };
+                    let view =
+                        tab_views::folder_view(bookmark_id, bookmarks, on_add, on_remove, cx);
                     column.child(div().flex_1().min_h_0().child(view))
                 }
             }
@@ -7965,7 +8046,10 @@ impl Render for App {
                     .min_h_0()
                     .w_full()
                     .when(
-                        self.preferences.read(cx).settings().show_workspace_rail,
+                        {
+                            let s = self.preferences.read(cx).settings();
+                            s.show_workspace_rail && !s.simplified_layout
+                        },
                         |row| row.child(switcher),
                     )
                     // Slack's workspace panel: the tab rail and the tab panel (sidebar,

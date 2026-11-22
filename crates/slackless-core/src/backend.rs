@@ -420,6 +420,49 @@ pub trait Backend: Clone + Send + Sync + 'static {
         view_id: String,
         hash: Option<String>,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Add a link bookmark inside a folder (`bookmarks.add` with `parent_id`).
+    fn add_bookmark_in_folder(
+        &self,
+        channel: ChannelId,
+        title: String,
+        url: String,
+        parent_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Remove a bookmark (`bookmarks.remove`).
+    fn remove_bookmark(
+        &self,
+        channel: ChannelId,
+        bookmark_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Fetch cloud-synced drafts (`drafts.list`).
+    fn drafts_list(&self) -> impl Future<Output = api::Result<Vec<api::CloudDraft>>> + Send;
+    /// Create a cloud draft (`drafts.create`).
+    fn drafts_create(
+        &self,
+        channel: ChannelId,
+        text: String,
+    ) -> impl Future<Output = api::Result<Option<String>>> + Send;
+    /// Update an existing cloud draft (`drafts.update`).
+    fn drafts_update(
+        &self,
+        draft_id: String,
+        channel: ChannelId,
+        text: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Delete a cloud draft (`drafts.delete`).
+    fn drafts_delete(&self, draft_id: String) -> impl Future<Output = api::Result<()>> + Send;
+    /// Fetch dynamic `external_select` options (`blocks.suggestions`).
+    #[allow(clippy::too_many_arguments)]
+    fn block_suggestions(
+        &self,
+        bot: BotId,
+        app_id: String,
+        team: TeamId,
+        action_id: String,
+        block_id: String,
+        value: String,
+        container: ActionContainer,
+    ) -> impl Future<Output = api::Result<Vec<(String, String)>>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -930,5 +973,57 @@ impl Backend for SlackApi {
 
     async fn views_close(&self, view_id: String, hash: Option<String>) -> api::Result<()> {
         SlackApi::views_close(self, &view_id, hash.as_deref()).await
+    }
+
+    async fn add_bookmark_in_folder(
+        &self,
+        channel: ChannelId,
+        title: String,
+        url: String,
+        parent_id: String,
+    ) -> api::Result<()> {
+        self.bookmarks_add_link_in_folder(&channel, &title, &url, Some(&parent_id))
+            .await
+    }
+
+    async fn remove_bookmark(&self, channel: ChannelId, bookmark_id: String) -> api::Result<()> {
+        self.bookmarks_remove(&channel, &bookmark_id).await
+    }
+
+    async fn drafts_list(&self) -> api::Result<Vec<api::CloudDraft>> {
+        SlackApi::drafts_list(self).await
+    }
+
+    async fn drafts_create(&self, channel: ChannelId, text: String) -> api::Result<Option<String>> {
+        SlackApi::drafts_create(self, &channel, &text).await
+    }
+
+    async fn drafts_update(
+        &self,
+        draft_id: String,
+        channel: ChannelId,
+        text: String,
+    ) -> api::Result<()> {
+        SlackApi::drafts_update(self, &draft_id, &channel, &text).await
+    }
+
+    async fn drafts_delete(&self, draft_id: String) -> api::Result<()> {
+        SlackApi::drafts_delete(self, &draft_id).await
+    }
+
+    async fn block_suggestions(
+        &self,
+        bot: BotId,
+        app_id: String,
+        team: TeamId,
+        action_id: String,
+        block_id: String,
+        value: String,
+        container: ActionContainer,
+    ) -> api::Result<Vec<(String, String)>> {
+        self.blocks_suggestions(
+            &bot, &app_id, &team, &action_id, &block_id, &value, &container,
+        )
+        .await
     }
 }

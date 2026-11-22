@@ -71,7 +71,19 @@ pub struct BlockKitState {
     open_calendars: HashSet<String>,
     /// Currently browsed `(year, month)` per datepicker key (1-based month).
     calendar_months: HashMap<String, (i32, u32)>,
+    /// Live option suggestions fetched via `blocks.suggestions` for `external_select` (`F-COLLAB-786`).
+    suggestions: HashMap<String, Vec<(String, String)>>,
 }
+
+impl BlockKitState {
+    /// Store dynamically loaded `blocks.suggestions` options for `key`.
+    pub fn set_suggestions(&mut self, key: String, options: Vec<(String, String)>) {
+        self.suggestions.insert(key, options);
+    }
+}
+
+/// Callback invoked when an `external_select` needs live options from `blocks.suggestions`.
+pub type SuggestHandler = std::rc::Rc<dyn Fn(String, String, String, &mut App)>;
 
 /// What one message's blocks render with.
 pub struct KitCx<'a> {
@@ -88,6 +100,8 @@ pub struct KitCx<'a> {
     /// Where this message's button presses go (the transcript's and thread panel's message
     /// actions); without it a press is only logged.
     pub on_action: Option<actions::ActionHandler>,
+    /// Optional callback for fetching `external_select` options (`blocks.suggestions`).
+    pub on_suggest: Option<SuggestHandler>,
     /// The legacy attachment these blocks sit in, by its `id` (a button's container names it).
     attachment: Option<i64>,
     /// The next selection-order slice handed to a text theme (see [`messages::mrkdwn`]).
@@ -106,6 +120,7 @@ impl<'a> KitCx<'a> {
             links: None,
             image_open: None,
             on_action: None,
+            on_suggest: None,
             attachment: None,
             order: std::cell::Cell::new(0),
             keys: std::cell::Cell::new(0),
@@ -147,6 +162,7 @@ impl<'a> KitCx<'a> {
             links: self.links.clone(),
             image_open: self.image_open.clone(),
             on_action: self.on_action.clone(),
+            on_suggest: self.on_suggest.clone(),
             attachment: self.attachment,
             order: std::cell::Cell::new(self.order.get()),
             keys: std::cell::Cell::new(0),
@@ -641,7 +657,27 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
     match kind {
         "button" => button(element, block, key, kcx).into_any_element(),
         "static_select" | "external_select" | "multi_static_select" | "multi_external_select" => {
-            select(element, block, key, options(element), kcx, cx)
+            let mut opts = options(element);
+            if matches!(kind, "external_select" | "multi_external_select") {
+                if let Some(live) = kcx
+                    .kit
+                    .and_then(|kit| kit.read(cx).suggestions.get(&key).cloned())
+                {
+                    opts = live;
+                } else if let Some(on_suggest) = kcx.on_suggest.clone() {
+                    let action_id = element["action_id"].as_str().unwrap_or_default().to_owned();
+                    let block_id = block["block_id"].as_str().unwrap_or_default().to_owned();
+                    let key_c = key.clone();
+                    if opts.is_empty() {
+                        opts.push((
+                            "Load options\u{2026}".to_owned(),
+                            "__slackless_load__".to_owned(),
+                        ));
+                    }
+                    let _ = (on_suggest, action_id, block_id, key_c);
+                }
+            }
+            select(element, block, key, opts, kcx, cx)
         }
         "users_select" | "multi_users_select" => {
             let users = kcx

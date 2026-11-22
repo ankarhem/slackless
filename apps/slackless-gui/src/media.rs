@@ -806,7 +806,9 @@ impl RenderOnce for Picture {
                 let ticks = epoch.elapsed().as_nanos() / TICK.as_nanos();
                 let at = Duration::from_nanos((ticks * TICK.as_nanos()) as u64);
                 let (frame, shows_for) = frame_at(&data, at);
-                let frame = if cx.reduce_motion() { 0 } else { frame };
+                let display = crate::preferences::display_prefs(cx);
+                let frozen = !display.animate_emoji || display.reduce_motion || cx.reduce_motion();
+                let frame = if frozen { 0 } else { frame };
                 let image_bounds = fit.get_bounds(bounds, data.size(frame));
                 if let Err(e) = window.paint_image(
                     bounds,
@@ -819,7 +821,7 @@ impl RenderOnce for Picture {
                     eprintln!("slackless: could not paint an animated image ({e})");
                 }
                 // Only a picture that shows asks for its next frame.
-                if !cx.reduce_motion() && window.content_mask().bounds.intersects(&bounds) {
+                if !frozen && window.content_mask().bounds.intersects(&bounds) {
                     schedule(epoch + at + shows_for, window.current_view(), cx);
                 }
             },

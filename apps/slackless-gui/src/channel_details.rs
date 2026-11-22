@@ -809,6 +809,58 @@ impl ChannelDetails {
             ),
         );
 
+        // Posting & management permissions card (`F-CORE-064`).
+        let manager_names: Vec<String> = self
+            .managers
+            .iter()
+            .filter_map(|id| self.fixtures.user(id))
+            .map(|u| self.fixtures.name_of(u).to_owned())
+            .collect();
+        let posting_restricted = conversation
+            .extra
+            .get("properties")
+            .and_then(|p| p.get("posting_restricted_to"))
+            .is_some_and(|v| !v.is_null());
+        let posting_policy = if conversation.is_archived {
+            "Archived — nobody can post new messages."
+        } else if posting_restricted {
+            "Restricted — only Channel Managers & Admins can post."
+        } else {
+            "Everyone in this channel can post."
+        };
+        let managers_line = if manager_names.is_empty() {
+            "Workspace Admins & Owners".to_owned()
+        } else {
+            manager_names.join(", ")
+        };
+        cards = cards.child(
+            v_flex()
+                .flex_none()
+                .gap_1p5()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Posting & management permissions"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_foreground)
+                        .child(posting_policy),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted_foreground)
+                        .child(format!("Channel managers: {managers_line}")),
+                ),
+        );
+
         // Leave channel, Slack's red row at the end of the cards.
         let channel = self.channel.clone();
         cards = cards.child(

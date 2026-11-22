@@ -223,6 +223,11 @@ pub enum Palette {
         sidebar: usize,
         accent: usize,
     },
+    /// Arbitrary `#RRGGBB` sidebar & accent colors (`F-SHELL-077`).
+    CustomHex {
+        sidebar: u32,
+        accent: u32,
+    },
 }
 
 impl Palette {
@@ -248,7 +253,7 @@ impl Palette {
             Palette::Lagoon => "Lagoon",
             Palette::Barbra => "Barbra",
             Palette::MoodIndigo => "Mood Indigo",
-            Palette::Custom { .. } => "Custom",
+            Palette::Custom { .. } | Palette::CustomHex { .. } => "Custom",
         }
     }
 
@@ -267,6 +272,7 @@ impl Palette {
                 CUSTOM_SIDEBARS[sidebar % CUSTOM_SIDEBARS.len()],
                 CUSTOM_ACCENTS[accent % CUSTOM_ACCENTS.len()],
             )),
+            Palette::CustomHex { sidebar, accent } => Some((sidebar, accent)),
         }
     }
 
@@ -296,8 +302,13 @@ impl Palette {
             Palette::Lagoon => Some("lagoon"),
             Palette::Barbra => Some("barbra"),
             Palette::MoodIndigo => Some("mood_indigo"),
-            Palette::Custom { .. } => None,
+            Palette::Custom { .. } | Palette::CustomHex { .. } => None,
         }
+    }
+
+    /// Return the active `(sidebar, accent)` 24-bit RGB values if tinted.
+    pub fn rgb_pair(self) -> Option<(u32, u32)> {
+        self.colors()
     }
 
     /// The swatch shown for this theme in the picker: its sidebar and accent colors, or
@@ -329,6 +340,20 @@ pub const CUSTOM_SIDEBARS: [u32; 6] = [
 pub const CUSTOM_ACCENTS: [u32; 6] = [
     0x11_64_A3, 0x2B_AC_76, 0xE0_1E_5A, 0xEC_B2_2E, 0x7C_5C_FF, 0xE8_71_2D,
 ];
+
+/// Parse a `#RRGGBB` or `RRGGBB` hex color string into a 24-bit RGB integer (`F-SHELL-077`).
+pub fn parse_hex_rgb(input: &str) -> Option<u32> {
+    let trimmed = input.trim().trim_start_matches('#');
+    if trimmed.len() != 6 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(trimmed, 16).ok()
+}
+
+/// Format a 24-bit RGB integer as `#RRGGBB`.
+pub fn format_hex_rgb(rgb: u32) -> String {
+    format!("#{:06X}", rgb & 0x00FF_FFFF)
+}
 
 /// A custom-builder swatch as a theme color.
 pub fn swatch_color(hex: u32) -> Hsla {
@@ -759,5 +784,18 @@ mod tests {
         let aubergine = json!({ "sidebar_theme": "aubergine_theme" });
         assert_eq!(palette_from_prefs(&aubergine), Some(Palette::Aubergine));
         assert_eq!(palette_from_prefs(&json!({})), None);
+    }
+
+    #[test]
+    fn parses_and_formats_custom_hex_theme_colors() {
+        assert_eq!(parse_hex_rgb("#3F0E40"), Some(0x3F_0E_40));
+        assert_eq!(parse_hex_rgb("1164a3"), Some(0x11_64_A3));
+        assert_eq!(parse_hex_rgb("#GGG"), None);
+        assert_eq!(format_hex_rgb(0x11_64_A3), "#1164A3");
+        let p = Palette::CustomHex {
+            sidebar: 0x11_22_33,
+            accent: 0x44_55_66,
+        };
+        assert_eq!(p.rgb_pair(), Some((0x11_22_33, 0x44_55_66)));
     }
 }

@@ -266,6 +266,8 @@ pub(crate) struct Core<B: Backend> {
     bots: HashMap<BotId, BotProfile>,
     /// Signed-in user id learned from `client.userBoot` (used to mirror self profile/presence).
     self_user_id: Arc<Mutex<Option<UserId>>>,
+    /// Cloud-synced draft ids per channel (`drafts.list` / `drafts.create` / `drafts.update` / `drafts.delete`).
+    cloud_draft_ids: Arc<Mutex<HashMap<ChannelId, String>>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -299,6 +301,7 @@ impl<B: Backend> Core<B> {
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
             bots: HashMap::new(),
             self_user_id: Arc::new(Mutex::new(None)),
+            cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1259,6 +1262,92 @@ impl<B: Backend> Core<B> {
             Command::CloseModal { view_id, hash } => {
                 self.spawn("views.close", async move {
                     backend.views_close(view_id, hash).await?;
+                    Ok(())
+                });
+            }
+            Command::AddBookmarkInFolder {
+                channel,
+                title,
+                url,
+                parent_id,
+            } => {
+                self.spawn("bookmarks.add", async move {
+                    backend
+                        .add_bookmark_in_folder(channel.clone(), title, url, parent_id)
+                        .await?;
+                    let bookmarks = backend.bookmarks(channel.clone()).await;
+                    answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
+                        channel,
+                        bookmarks,
+                    })
+                });
+            }
+            Command::RemoveBookmark {
+                channel,
+                bookmark_id,
+            } => {
+                self.spawn("bookmarks.remove", async move {
+                    backend
+                        .remove_bookmark(channel.clone(), bookmark_id)
+                        .await?;
+                    let bookmarks = backend.bookmarks(channel.clone()).await;
+                    answer_load(&events, bookmarks, |bookmarks| Event::BookmarksLoaded {
+                        channel,
+                        bookmarks,
+                    })
+                });
+            }
+            Command::FetchCloudDrafts => {
+                let draft_ids = Arc::clone(&self.cloud_draft_ids);
+                self.spawn("drafts.list", async move {
+                    let drafts = backend.drafts_list().await?;
+                    if let Ok(mut guard) = draft_ids.lock() {
+                        for d in &drafts {
+                            guard.insert(d.channel.clone(), d.id.clone());
+                        }
+                    }
+                    events.emit(Event::CloudDrafts(drafts));
+                    Ok(())
+                });
+            }
+            Command::SyncDraft { channel, text } => {
+                let draft_ids = Arc::clone(&self.cloud_draft_ids);
+                self.spawn("drafts.sync", async move {
+                    let existing = draft_ids.lock().ok().and_then(|g| g.get(&channel).cloned());
+                    if text.trim().is_empty() {
+                        if let Some(id) = existing {
+                            let _ = backend.drafts_delete(id).await;
+                            if let Ok(mut guard) = draft_ids.lock() {
+                                guard.remove(&channel);
+                            }
+                        }
+                    } else if let Some(id) = existing {
+                        let _ = backend.drafts_update(id, channel, text).await;
+                    } else if let Ok(Some(new_id)) =
+                        backend.drafts_create(channel.clone(), text).await
+                    {
+                        if let Ok(mut guard) = draft_ids.lock() {
+                            guard.insert(channel, new_id);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Command::BlockSuggestions {
+                key,
+                bot,
+                app_id,
+                team,
+                action_id,
+                block_id,
+                value,
+                container,
+            } => {
+                self.spawn("blocks.suggestions", async move {
+                    let options = backend
+                        .block_suggestions(bot, app_id, team, action_id, block_id, value, container)
+                        .await?;
+                    events.emit(Event::BlockSuggestions { key, options });
                     Ok(())
                 });
             }
@@ -3233,6 +3322,62 @@ pub(crate) mod tests {
 
         async fn views_close(&self, _view_id: String, _hash: Option<String>) -> api::Result<()> {
             Ok(())
+        }
+
+        async fn add_bookmark_in_folder(
+            &self,
+            _channel: ChannelId,
+            _title: String,
+            _url: String,
+            _parent_id: String,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_bookmark(
+            &self,
+            _channel: ChannelId,
+            _bookmark_id: String,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn drafts_list(&self) -> api::Result<Vec<api::CloudDraft>> {
+            Ok(Vec::new())
+        }
+
+        async fn drafts_create(
+            &self,
+            _channel: ChannelId,
+            _text: String,
+        ) -> api::Result<Option<String>> {
+            Ok(Some("Dr01".to_owned()))
+        }
+
+        async fn drafts_update(
+            &self,
+            _draft_id: String,
+            _channel: ChannelId,
+            _text: String,
+        ) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn drafts_delete(&self, _draft_id: String) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn block_suggestions(
+            &self,
+            _bot: BotId,
+            _app_id: String,
+            _team: TeamId,
+            _action_id: String,
+            _block_id: String,
+            _value: String,
+            _container: api::ActionContainer,
+        ) -> api::Result<Vec<(String, String)>> {
+            Ok(Vec::new())
         }
     }
 

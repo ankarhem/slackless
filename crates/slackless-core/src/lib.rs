@@ -377,6 +377,36 @@ pub enum Command {
         hash: Option<String>,
         state_values: serde_json::Value,
     },
+    /// Add a link bookmark to a folder inside `channel` (`bookmarks.add` with `parent_id`).
+    AddBookmarkInFolder {
+        channel: ChannelId,
+        title: String,
+        url: String,
+        parent_id: String,
+    },
+    /// Remove a bookmark from `channel` (`bookmarks.remove`, `F-CORE-062`).
+    RemoveBookmark {
+        channel: ChannelId,
+        bookmark_id: String,
+    },
+    /// Sync a conversation draft to Slack (`drafts.create` / `drafts.update` / `drafts.delete`, `F-CORE-089`).
+    SyncDraft {
+        channel: ChannelId,
+        text: String,
+    },
+    /// Fetch the signed-in user's cloud-synced drafts (`drafts.list`).
+    FetchCloudDrafts,
+    /// Fetch dynamic option suggestions for an `external_select` element (`blocks.suggestions`).
+    BlockSuggestions {
+        key: String,
+        bot: BotId,
+        app_id: String,
+        team: TeamId,
+        action_id: String,
+        block_id: String,
+        value: String,
+        container: api::ActionContainer,
+    },
     /// Dismiss an interactive Block Kit modal (`views.close`).
     CloseModal {
         view_id: String,
@@ -555,6 +585,13 @@ pub enum Event {
     ModalOpened(serde_json::Value),
     /// An app closed an interactive Block Kit modal (`view_closed`).
     ModalClosed(String),
+    /// Cloud-synced drafts fetched via `drafts.list` (`F-CORE-089`).
+    CloudDrafts(Vec<api::CloudDraft>),
+    /// Dynamic options returned by `blocks.suggestions` (`F-COLLAB-786`).
+    BlockSuggestions {
+        key: String,
+        options: Vec<(String, String)>,
+    },
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

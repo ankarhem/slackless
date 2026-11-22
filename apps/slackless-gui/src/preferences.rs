@@ -272,6 +272,8 @@ pub struct Settings {
     pub underline_links: bool,
     pub reduce_motion: bool,
     pub announce_incoming: bool,
+    /// Hide extra chrome (workspace rail, decorative gradients) for a clean single-column feel (`F-SHELL-109`).
+    pub simplified_layout: bool,
     // Mark as read
     pub mark_read: usize,
     pub confirm_mark_all: bool,
@@ -315,6 +317,8 @@ pub struct DisplayPrefs {
     pub inline_media: bool,
     pub link_previews: bool,
     pub underline_links: bool,
+    pub animate_emoji: bool,
+    pub reduce_motion: bool,
 }
 
 impl Default for DisplayPrefs {
@@ -329,6 +333,8 @@ impl Default for DisplayPrefs {
             inline_media: true,
             link_previews: true,
             underline_links: false,
+            animate_emoji: true,
+            reduce_motion: false,
         }
     }
 }
@@ -350,6 +356,8 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         inline_media: settings.inline_media,
         link_previews: settings.link_previews,
         underline_links: settings.underline_links,
+        animate_emoji: settings.animate_emoji,
+        reduce_motion: settings.reduce_motion,
     });
 }
 
@@ -435,6 +443,7 @@ impl Default for Settings {
             underline_links: false,
             reduce_motion: false,
             announce_incoming: false,
+            simplified_layout: false,
             mark_read: 0,
             confirm_mark_all: true,
             no_bg_mark_read: true,
@@ -496,6 +505,8 @@ pub struct Preferences {
     open_select: Option<&'static str>,
     keywords: Entity<TextareaState>,
     excluded_channels: Entity<TextareaState>,
+    custom_sidebar_hex: Entity<TextareaState>,
+    custom_accent_hex: Entity<TextareaState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -517,6 +528,20 @@ impl Preferences {
                     .placeholder("e.g. random, alerts, noisy-bot")
                     .auto_grow(1, 2);
                 state.set_value(settings.excluded_channels.clone(), window, cx);
+                state
+            });
+            let custom_sidebar_hex = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("#3F0E40")
+                    .auto_grow(1, 1);
+                state.set_value("#3F0E40".to_owned(), window, cx);
+                state
+            });
+            let custom_accent_hex = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("#1164A3")
+                    .auto_grow(1, 1);
+                state.set_value("#1164A3".to_owned(), window, cx);
                 state
             });
             let subscriptions = vec![
@@ -547,6 +572,8 @@ impl Preferences {
                 open_select: None,
                 keywords,
                 excluded_channels,
+                custom_sidebar_hex,
+                custom_accent_hex,
                 _subscriptions: subscriptions,
             }
         })
@@ -565,11 +592,20 @@ impl Preferences {
     ) {
         let keywords = settings.keywords.clone();
         let excluded = settings.excluded_channels.clone();
+        let rgb_pair = settings.palette.rgb_pair();
         self.settings = settings;
         self.keywords
             .update(cx, |state, cx| state.set_value(keywords, window, cx));
         self.excluded_channels
             .update(cx, |state, cx| state.set_value(excluded, window, cx));
+        if let Some((sb, ac)) = rgb_pair {
+            self.custom_sidebar_hex.update(cx, |state, cx| {
+                state.set_value(theme::format_hex_rgb(sb), window, cx)
+            });
+            self.custom_accent_hex.update(cx, |state, cx| {
+                state.set_value(theme::format_hex_rgb(ac), window, cx)
+            });
+        }
         cx.notify();
     }
 
@@ -1174,6 +1210,68 @@ impl Preferences {
                         }))
                 }))
         };
+        let custom_hex_row = {
+            let input_border = cx.theme().input;
+            let sb_preview = theme::parse_hex_rgb(&self.custom_sidebar_hex.read(cx).value())
+                .map(theme::swatch_color);
+            let ac_preview = theme::parse_hex_rgb(&self.custom_accent_hex.read(cx).value())
+                .map(theme::swatch_color);
+            let hex_box = |state: &Entity<TextareaState>, preview: Option<gpui_kit::gpui::Hsla>| {
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2()
+                    .py_1()
+                    .w(px(120.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(input_border)
+                    .text_xs()
+                    .when_some(preview, |row, col| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .size(px(14.))
+                                .rounded_xs()
+                                .bg(col)
+                                .border_1()
+                                .border_color(border),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Textarea::new(state).appearance(false).bordered(false)),
+                    )
+            };
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(hex_box(&self.custom_sidebar_hex, sb_preview))
+                .child(hex_box(&self.custom_accent_hex, ac_preview))
+                .child(
+                    Button::new("custom-hex-apply")
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Apply hex")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let sb =
+                                theme::parse_hex_rgb(&this.custom_sidebar_hex.read(cx).value());
+                            let ac = theme::parse_hex_rgb(&this.custom_accent_hex.read(cx).value());
+                            if let (Some(sidebar), Some(accent)) = (sb, ac) {
+                                this.settings.palette = Palette::CustomHex { sidebar, accent };
+                                this.changed(cx);
+                            }
+                        })),
+                )
+        };
+        let simplified = self.checkbox(
+            "appearance-simplified",
+            "Simplified layout (hide workspace rail and extra chrome)",
+            |s| &mut s.simplified_layout,
+            cx,
+        );
         let custom = v_flex()
             .gap_3()
             .child(self.labeled(
@@ -1183,7 +1281,9 @@ impl Preferences {
             .child(self.labeled(
                 "Accent",
                 swatch_row("custom-accent", &CUSTOM_ACCENTS, custom_accent, cx),
-            ));
+            ))
+            .child(self.labeled("Custom hex colors (Sidebar / Accent)", custom_hex_row))
+            .child(simplified);
 
         let gradient = self.checkbox(
             "appearance-gradient",

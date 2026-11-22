@@ -167,10 +167,19 @@ pub fn files_view(fixtures: &Fixtures, files: Option<&Loaded<File>>, cx: &App) -
     v_flex().flex_1().min_h_0().bg(theme.background).child(body)
 }
 
-/// One bookmark row of a folder tab; opens `link` in the browser.
-fn bookmark_row(bookmark: &ChannelBookmark, link: &str, cx: &App) -> Stateful<Div> {
+/// Callbacks for mutating bookmarks inside a folder tab (`F-CORE-062`).
+pub type BookmarkAddFn = std::rc::Rc<dyn Fn(&mut gpui_kit::gpui::Window, &mut App)>;
+pub type BookmarkRemoveFn = std::rc::Rc<dyn Fn(String, &mut App)>;
+
+/// One bookmark row of a folder tab; opens `link` in the browser, with a remove action.
+fn bookmark_row(
+    bookmark: &ChannelBookmark,
+    link: &str,
+    on_remove: Option<&BookmarkRemoveFn>,
+    cx: &App,
+) -> Stateful<Div> {
     let theme = cx.theme();
-    let (muted, hover) = (theme.muted_foreground, theme.muted);
+    let (muted, hover, danger) = (theme.muted_foreground, theme.muted, theme.danger);
     let host = link
         .split("://")
         .nth(1)
@@ -178,6 +187,24 @@ fn bookmark_row(bookmark: &ChannelBookmark, link: &str, cx: &App) -> Stateful<Di
         .map(|host| format!(" · {host}"))
         .unwrap_or_default();
     let link = link.to_owned();
+    let bm_id = bookmark.id.clone();
+    let remove_btn = on_remove.cloned().map(|remove| {
+        div()
+            .id(SharedString::from(format!("folder-bookmark-rm-{bm_id}")))
+            .size(px(24.))
+            .flex_none()
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(muted)
+            .hover(move |el| el.text_color(danger))
+            .child(Icon::new(IconName::X).size(px(14.)))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                remove(bm_id.clone(), cx);
+            })
+    });
     h_flex()
         .id(SharedString::from(format!(
             "folder-bookmark-{}",
@@ -211,13 +238,47 @@ fn bookmark_row(bookmark: &ChannelBookmark, link: &str, cx: &App) -> Stateful<Di
                         .child(format!("Link{host}")),
                 ),
         )
+        .children(remove_btn)
         .on_click(move |_, _, cx| cx.open_url(&link))
 }
 
-/// A folder tab's body: the link bookmarks inside the folder, bar order.
-pub fn folder_view(folder_id: &str, bookmarks: Option<&Loaded<ChannelBookmark>>, cx: &App) -> Div {
+/// A folder tab's body: the link bookmarks inside the folder, with add/remove controls (`F-CORE-062`).
+pub fn folder_view(
+    folder_id: &str,
+    bookmarks: Option<&Loaded<ChannelBookmark>>,
+    on_add: Option<BookmarkAddFn>,
+    on_remove: Option<BookmarkRemoveFn>,
+    cx: &App,
+) -> Div {
     let theme = cx.theme();
-    let muted = theme.muted_foreground;
+    let (muted, border, hover) = (theme.muted_foreground, theme.border, theme.accent);
+    let toolbar = on_add.map(|add| {
+        h_flex()
+            .flex_none()
+            .px_4()
+            .py_2()
+            .justify_end()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("folder-add-{folder_id}")))
+                    .items_center()
+                    .gap_1p5()
+                    .px_2p5()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .cursor_pointer()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .hover(move |el| el.bg(hover))
+                    .child(Icon::new(IconName::Plus).size(px(13.)))
+                    .child("Add link to folder")
+                    .on_click(move |_, window, cx| add(window, cx)),
+            )
+    });
     let body = match bookmarks {
         None => state_line("Loading bookmarks…", muted),
         Some(Err(error)) => state_line(&format!("Could not load bookmarks: {error}"), muted),
@@ -239,13 +300,16 @@ pub fn folder_view(folder_id: &str, bookmarks: Option<&Loaded<ChannelBookmark>>,
                     .min_h_0()
                     .overflow_y_scroll()
                     .py_3()
-                    .children(
-                        entries
-                            .into_iter()
-                            .map(|(bookmark, link)| bookmark_row(bookmark, link, cx)),
-                    )
+                    .children(entries.into_iter().map(|(bookmark, link)| {
+                        bookmark_row(bookmark, link, on_remove.as_ref(), cx)
+                    }))
             }
         }
     };
-    v_flex().flex_1().min_h_0().bg(theme.background).child(body)
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .bg(theme.background)
+        .children(toolbar)
+        .child(body)
 }
