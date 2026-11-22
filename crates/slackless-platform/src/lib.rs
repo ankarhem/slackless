@@ -9,12 +9,13 @@
 //! | [`IconSetter`] | app icon | `NSApplication.setApplicationIconImage` via `objc2` |
 //! | [`AboutPanel`] | the app's About window | `NSApplication.orderFrontStandardAboutPanel` |
 //! | [`FullScreenItem`] | the menu bar's full-screen item | `NSFullScreenMenuItemEverywhere` registered off |
+//! | [`SoundPlayer`] | play a sound (notification sounds) | `NSSound` from the sound's bytes |
 //! | [`SecretStore`] | named secrets | Keychain generic passwords via `security-framework` |
 //! | [`DeepLinkHandler`] | `slack://` and `https://app.slack.com/client` links | bundle `Info.plist` scheme check + the pure [`DeepLink`] parser |
 //!
 //! Other platforms get a compiling, non-OS fallback backend so the crate
 //! builds everywhere; its `SecretStore` is in-process memory, its notifier,
-//! badge setter, icon setter, About panel and full-screen item are no-ops.
+//! badge setter, icon setter, About panel, full-screen item and sound player are no-ops.
 //!
 //! A `StatusItem` trait (`NSStatusItem`, guide §14) is planned but not yet
 //! modeled; it will land here alongside [`BadgeSetter`].
@@ -93,6 +94,12 @@ pub trait FullScreenItem {
     fn drop_system_full_screen_item(&self);
 }
 
+/// Play a sound from its encoded bytes (an mp3), replacing one still playing. Call it on
+/// the main thread.
+pub trait SoundPlayer {
+    fn play_sound(&self, data: &[u8]);
+}
+
 /// Store, load, and delete a named secret (macOS: Keychain generic password).
 ///
 /// Secrets are addressed by a `service` (the app/workspace scope) plus a
@@ -151,6 +158,7 @@ pub fn current() -> impl Notifier
 + IconSetter
 + AboutPanel
 + FullScreenItem
++ SoundPlayer
 + SecretStore
 + DeepLinkHandler
 + Send

@@ -14,7 +14,7 @@ percent-encoding = "2.3.2"
 # Dock badge, app icon + bundle Info.plist URL types. GPUI has no dock-tile API
 # (gpui-kit guide §14), so the badge and icon go through objc2.
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSImage"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSImage", "NSSound"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSBundle", "NSData", "NSDictionary", "NSEnumerator", "NSString", "NSUserDefaults", "NSValue"] }
 # Main-queue hop for badge calls made off the main thread.
 dispatch2 = "0.3.1"

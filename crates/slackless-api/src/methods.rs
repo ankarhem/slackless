@@ -1234,6 +1234,13 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `users.markAllRead`: every conversation and thread read (Slack's Shift+Esc).
+    pub async fn users_mark_all_read(&self) -> Result<()> {
+        self.call::<Empty>(method::USERS_MARK_ALL_READ, Vec::new())
+            .await?;
+        Ok(())
+    }
+
     /// `subscriptions.thread.add` / `subscriptions.thread.remove`: follow or unfollow a
     /// thread, so its replies notify you and it lists under Threads. `last_read` is the
     /// thread's read cursor, which Slack's client sends with both.

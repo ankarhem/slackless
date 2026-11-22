@@ -286,6 +286,7 @@ pub mod method {
     pub const USERS_GET_PRESENCE: &str = "users.getPresence";
     pub const USERS_INFO: &str = "users.info";
     pub const USERS_LIST: &str = "users.list";
+    pub const USERS_MARK_ALL_READ: &str = "users.markAllRead";
     pub const USERS_PREFS_GET: &str = "users.prefs.get";
     pub const USERS_PREFS_SET: &str = "users.prefs.set";
     pub const USERS_PREFS_SET_NOTIFICATIONS: &str = "users.prefs.setNotifications";

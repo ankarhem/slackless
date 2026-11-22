@@ -19,7 +19,8 @@ use crate::rtm::{ConnectParams, RtmClient, RtmConfig, RtmEvent};
 use crate::store::{SearchQuery, Store, StoreError};
 use crate::types::event::MessageEvent;
 use crate::types::{
-    BotId, BotProfile, ChannelId, ConversationKind, SlackEvent, TeamId, Ts, UserId,
+    BotId, BotProfile, ChannelId, ConversationKind, Message, MessageSubtype, SlackEvent, TeamId,
+    Ts, UserId,
 };
 use crate::unfurl::{Unfurls, event_messages};
 use crate::{Command, Event, apply_event};
@@ -704,6 +705,11 @@ impl<B: Backend> Core<B> {
             Command::MarkRead { channel, ts } => self.spawn("conversations.mark", async move {
                 Ok(backend.mark_read(channel, ts).await?)
             }),
+            Command::MarkAllRead => self.spawn("users.markAllRead", async move {
+                backend.mark_all_read().await?;
+                events.emit(Event::Counts(Box::new(backend.counts().await?)));
+                Ok(())
+            }),
             Command::SetThreadSubscribed {
                 channel,
                 thread_ts,
@@ -923,10 +929,14 @@ impl<B: Backend> Core<B> {
                 }
                 self.attach_bot_profile(&mut event).await;
                 self.unfurls.resolve(event_messages(&event));
+                let posted = posted_message(&event);
                 let ws = self.workspace.clone();
                 let changed = with_store(&self.store, move |s| apply_event(s, &ws, event)).await;
                 if let Some(changed) = changed {
                     self.events.emit(changed);
+                }
+                if let Some((channel, message)) = posted {
+                    self.events.emit(Event::MessagePosted { channel, message });
                 }
             }
         }
@@ -1293,6 +1303,25 @@ fn answer_load<T>(
             Err(e.into())
         }
     }
+}
+
+/// A message someone just posted, with its channel: plain, bot and `/me` messages, files and
+/// thread broadcasts, not edits, deletions or channel events (joins, topics, ...).
+fn posted_message(event: &SlackEvent) -> Option<(ChannelId, Box<Message>)> {
+    let SlackEvent::Message(MessageEvent::Message(message)) = event else {
+        return None;
+    };
+    let posted = match message.subtype {
+        None => true,
+        Some(ref subtype) => matches!(
+            subtype,
+            MessageSubtype::BotMessage
+                | MessageSubtype::MeMessage
+                | MessageSubtype::FileShare
+                | MessageSubtype::ThreadBroadcast
+        ),
+    };
+    posted.then(|| Some((message.channel.clone()?, message.clone())))?
 }
 
 /// Conversation events without a conversation object; the store needs a fresh copy.
@@ -2232,6 +2261,10 @@ pub(crate) mod tests {
             Err(ApiError::AuthExpired("invalid_auth".into()))
         }
 
+        async fn mark_all_read(&self) -> api::Result<()> {
+            Err(ApiError::AuthExpired("invalid_auth".into()))
+        }
+
         async fn set_thread_subscribed(
             &self,
             _: ChannelId,
@@ -2682,6 +2715,11 @@ pub(crate) mod tests {
             Event::Connection(ConnectionState::Connecting)
         );
         assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+        // The live post also goes out as itself, for notifications.
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::MessagePosted { channel, message } if channel == c1() && message.text == "live"
+        ));
         assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
 
         // The socket stream ended; commands are still served.

@@ -5,14 +5,16 @@
 //! where that center refuses to start, post through Notification Center via
 //! `osascript` (see [`Notifier`]).
 
+use std::cell::RefCell;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use dispatch2::DispatchQueue;
 use objc2::AnyThread as _;
 use objc2::MainThreadMarker;
+use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2_app_kit::{NSAboutPanelOptionApplicationIcon, NSApplication, NSImage};
+use objc2_app_kit::{NSAboutPanelOptionApplicationIcon, NSApplication, NSImage, NSSound};
 use objc2_foundation::{
     NSArray, NSBundle, NSData, NSDictionary, NSNumber, NSString, NSUserDefaults,
 };
@@ -21,7 +23,7 @@ use security_framework::passwords::{self, PasswordOptions};
 use crate::deep_link::{self, DeepLink};
 use crate::{
     AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
-    Result, SecretStore,
+    Result, SecretStore, SoundPlayer,
 };
 
 /// `errSecItemNotFound`, the documented OSStatus for a missing keychain item.
@@ -147,6 +149,22 @@ impl FullScreenItem for MacPlatform {
         let defaults = NSDictionary::from_slices(&[&*key], &[off]);
         // SAFETY: NSString keys to an NSNumber, the dictionary registerDefaults: takes.
         unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
+    }
+}
+
+thread_local! {
+    /// The sound playing now: an NSSound stops when released, so it is kept until the next.
+    static PLAYING: RefCell<Option<Retained<NSSound>>> = const { RefCell::new(None) };
+}
+
+impl SoundPlayer for MacPlatform {
+    fn play_sound(&self, data: &[u8]) {
+        let Some(sound) = NSSound::initWithData(NSSound::alloc(), &NSData::with_bytes(data)) else {
+            eprintln!("slackless-platform: not a playable sound");
+            return;
+        };
+        sound.play();
+        PLAYING.with(|playing| *playing.borrow_mut() = Some(sound));
     }
 }
 

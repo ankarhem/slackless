@@ -213,6 +213,8 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn search(&self, query: String) -> impl Future<Output = api::Result<SearchMessages>> + Send;
     fn mark_read(&self, channel: ChannelId, ts: Ts)
     -> impl Future<Output = api::Result<()>> + Send;
+    /// Mark every conversation and thread read (`users.markAllRead`).
+    fn mark_all_read(&self) -> impl Future<Output = api::Result<()>> + Send;
     /// Follow or unfollow a thread (`subscriptions.thread.add` / `.remove`); `last_read` is
     /// the thread's read cursor.
     fn set_thread_subscribed(
@@ -507,6 +509,10 @@ impl Backend for SlackApi {
 
     async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
         self.conversations_mark(&channel, &ts).await
+    }
+
+    async fn mark_all_read(&self) -> api::Result<()> {
+        self.users_mark_all_read().await
     }
 
     async fn set_thread_subscribed(

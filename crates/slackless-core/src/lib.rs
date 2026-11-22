@@ -38,7 +38,7 @@ pub use reducer::apply_event;
 use api::MessageContent;
 use rtm::ConnectionState;
 use store::StoredMessage;
-use types::{BotId, ChannelId, File, Presence, TeamId, Ts, UserId};
+use types::{BotId, ChannelId, File, Message, Presence, TeamId, Ts, UserId};
 
 /// Commands a front-end sends into the core.
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +151,9 @@ pub enum Command {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Mark every conversation and thread read (`users.markAllRead`, Slack's Shift+Esc),
+    /// then re-read the unread counts.
+    MarkAllRead,
     /// Follow or unfollow a thread (`subscriptions.thread.add` / `.remove`), then read the
     /// thread again so the stored root carries the new state. `last_read` is the thread's
     /// read cursor.
@@ -288,6 +291,12 @@ pub enum Event {
     Counts(Box<api::ClientCounts>),
     /// The read cursor of `channel` moved to `ts` (possibly from another client).
     ReadMarker { channel: ChannelId, ts: Ts },
+    /// A message was just posted (live, over the websocket; not history or edits), after
+    /// [`Event::StoreChanged`] for its channel: what notifications are decided from.
+    MessagePosted {
+        channel: ChannelId,
+        message: Box<Message>,
+    },
     /// Someone is typing (receivers expire it after ~5 s).
     Typing {
         channel: ChannelId,

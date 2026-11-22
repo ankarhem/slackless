@@ -1,7 +1,7 @@
 //! Non-macOS fallback backend: compiles everywhere, touches no OS API.
 //!
-//! `Notifier`, `BadgeSetter`, `IconSetter`, `AboutPanel` and `FullScreenItem` are true
-//! no-ops until their platform ports begin. `SecretStore` keeps secrets in-process only
+//! `Notifier`, `BadgeSetter`, `IconSetter`, `AboutPanel`, `FullScreenItem` and
+//! `SoundPlayer` are true no-ops until their platform ports begin. `SecretStore` keeps secrets in-process only
 //! (a `HashMap` behind a mutex) so the trait contract is exercised without a system keychain;
 //! persistence arrives with each OS backend. `DeepLinkHandler` shares the
 //! pure parser in [`crate::deep_link`]; nothing can be registered with an OS.
@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crate::deep_link::{self, DeepLink};
 use crate::{
     AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
-    Result, SecretStore,
+    Result, SecretStore, SoundPlayer,
 };
 
 /// No-op backend for platforms without a port yet.
@@ -60,6 +60,11 @@ impl AboutPanel for FallbackPlatform {
 impl FullScreenItem for FallbackPlatform {
     /// No-op: no system menu items to hold back on this platform yet.
     fn drop_system_full_screen_item(&self) {}
+}
+
+impl SoundPlayer for FallbackPlatform {
+    /// No-op: no audio output is wired for this platform yet.
+    fn play_sound(&self, _data: &[u8]) {}
 }
 
 impl SecretStore for FallbackPlatform {
