@@ -57,8 +57,13 @@ tagged_enum! {
         "rich_text_quote" => Quote(RichTextQuote),
         "rich_text_preformatted" => Preformatted(RichTextPreformatted),
         "rich_text_header" => Header(RichTextHeader),
+        "rich_text_divider" => Divider(RichTextDivider),
     }
 }
+
+/// A horizontal rule; Slack serializes it as just `{"type": "rich_text_divider"}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RichTextDivider {}
 
 /// A paragraph of inline elements.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

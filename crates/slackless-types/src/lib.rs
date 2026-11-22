@@ -30,6 +30,8 @@ pub use ids::{BotId, ChannelId, FileId, TeamId, Ts, UserId, UsergroupId};
 pub use message::{Attachment, BotProfile, Edited, Message, MessageSubtype};
 pub use reaction::Reaction;
 pub use response::{ApiEnvelope, ApiResponse, Empty, ResponseError, ResponseMetadata};
-pub use rich_text::{Block, RichTextBlock, RichTextContainer, RichTextElement, TextStyle};
+pub use rich_text::{
+    Block, RichTextBlock, RichTextContainer, RichTextDivider, RichTextElement, TextStyle,
+};
 pub use section::{ChannelSection, SectionKind};
 pub use user::{DndStatus, Presence, Profile, Team, User, UserPresence};

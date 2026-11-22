@@ -1728,6 +1728,26 @@ impl SlackApi {
         Ok(self.call(method::PINS_LIST, params).await?.data)
     }
 
+    /// `pins.add`: pin the message `ts` in `channel`.
+    pub async fn pins_add(&self, channel: &ChannelId, ts: &Ts) -> Result<()> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("timestamp", ts.to_string()),
+        ];
+        self.call::<Empty>(method::PINS_ADD, params).await?;
+        Ok(())
+    }
+
+    /// `pins.remove`: unpin the message `ts` in `channel`.
+    pub async fn pins_remove(&self, channel: &ChannelId, ts: &Ts) -> Result<()> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("timestamp", ts.to_string()),
+        ];
+        self.call::<Empty>(method::PINS_REMOVE, params).await?;
+        Ok(())
+    }
+
     /// `bookmarks.list`: the conversation's bookmarks, folders included. Fetched lazily by
     /// the tab row (once per conversation, when a bookmarks surface is opened).
     pub async fn bookmarks_list(&self, channel: &ChannelId) -> Result<BookmarksList> {

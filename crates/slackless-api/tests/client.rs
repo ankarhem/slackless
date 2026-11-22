@@ -648,6 +648,26 @@ async fn pins_list_posts_channel_and_parses_message_and_file_items() {
 }
 
 #[tokio::test]
+async fn pins_add_and_remove_post_channel_and_timestamp() {
+    let (server, api) = setup().await;
+    for endpoint in ["pins.add", "pins.remove"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/api/{endpoint}")))
+            .and(body_string_contains("channel=C1"))
+            .and(body_string_contains("timestamp=1508197641.000151"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let channel = ChannelId::from("C1");
+    let ts = Ts::from("1508197641.000151");
+    api.pins_add(&channel, &ts).await.unwrap();
+    api.pins_remove(&channel, &ts).await.unwrap();
+}
+
+#[tokio::test]
 async fn channel_managers_reads_the_manager_role_on_the_channel() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))
