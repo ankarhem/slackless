@@ -16,13 +16,15 @@
 //! emits `PreferencesEvent::Changed`.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowAppearance, div, px,
+    App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FontWeight, Global,
+    InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    WindowAppearance, div, px,
 };
 
 use crate::theme::{self, CUSTOM_ACCENTS, CUSTOM_SIDEBARS, Palette, SlackTheme};
@@ -241,6 +243,7 @@ pub struct Settings {
     // Messages & media
     pub density: usize,
     pub names: usize,
+    pub clock_24h: bool,
     pub inline_media: bool,
     pub link_previews: bool,
     pub large_files: bool,
@@ -271,6 +274,56 @@ pub struct Settings {
     pub remote_search_auto: bool,
     /// Whether the leftmost workspace switcher rail is shown (`Cmd+Shift+S`).
     pub show_workspace_rail: bool,
+    /// Custom download folder path (empty string uses `~/Downloads`).
+    pub download_dir: String,
+}
+
+/// Active rendering preferences cached as a GPUI global so every message list, thread panel,
+/// search view, and unread card reflects Preferences changes live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayPrefs {
+    pub compact: bool,
+    pub clock_24h: bool,
+    pub display_names_only: bool,
+    pub jumbomoji: bool,
+    pub convert_emoticons: bool,
+    pub inline_media: bool,
+    pub link_previews: bool,
+    pub underline_links: bool,
+}
+
+impl Default for DisplayPrefs {
+    fn default() -> Self {
+        Self {
+            compact: false,
+            clock_24h: false,
+            display_names_only: false,
+            jumbomoji: true,
+            convert_emoticons: true,
+            inline_media: true,
+            link_previews: true,
+            underline_links: false,
+        }
+    }
+}
+
+impl Global for DisplayPrefs {}
+
+pub fn display_prefs(cx: &App) -> DisplayPrefs {
+    cx.try_global::<DisplayPrefs>().copied().unwrap_or_default()
+}
+
+pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
+    cx.set_global(DisplayPrefs {
+        compact: settings.density == 1,
+        clock_24h: settings.clock_24h,
+        display_names_only: settings.names == 1,
+        jumbomoji: settings.jumbomoji,
+        convert_emoticons: settings.convert_emoticons,
+        inline_media: settings.inline_media,
+        link_previews: settings.link_previews,
+        underline_links: settings.underline_links,
+    });
 }
 
 impl Settings {
@@ -332,6 +385,7 @@ impl Default for Settings {
             convert_emoticons: true,
             density: 0,
             names: 0,
+            clock_24h: false,
             inline_media: true,
             link_previews: true,
             large_files: true,
@@ -356,6 +410,7 @@ impl Default for Settings {
             open_links: 0,
             remote_search_auto: false,
             show_workspace_rail: true,
+            download_dir: String::new(),
         }
     }
 }
@@ -1095,6 +1150,12 @@ impl Preferences {
     fn messages(&mut self, cx: &mut Context<Self>) -> Div {
         let density = self.radios("msg-density", &DENSITY, |s| &mut s.density, cx);
         let names = self.radios("msg-names", &NAMES, |s| &mut s.names, cx);
+        let clock24 = self.checkbox(
+            "msg-clock-24h",
+            "Display times with a 24-hour clock",
+            |s| &mut s.clock_24h,
+            cx,
+        );
         let enter = self.radio_rows(
             "msg-enter",
             &ENTER_OPTIONS,
@@ -1128,7 +1189,12 @@ impl Preferences {
         );
         v_flex()
             .child(self.group("Message theme", None, density, cx))
-            .child(self.group("Names", None, names, cx))
+            .child(self.group(
+                "Names & timestamps",
+                None,
+                v_flex().gap_2().child(names).child(clock24),
+                cx,
+            ))
             .child(self.group(
                 "When writing a message, press Enter to\u{2026}",
                 None,
@@ -1264,11 +1330,80 @@ impl Preferences {
             |s| &mut s.remote_search_auto,
             cx,
         );
+        let dl_label = if self.settings.download_dir.is_empty() {
+            "~/Downloads (default)".to_owned()
+        } else {
+            self.settings.download_dir.clone()
+        };
+        let has_custom_dl = !self.settings.download_dir.is_empty();
+        let dl_muted = cx.theme().muted_foreground;
+        let dl_border = cx.theme().input;
+        let download_row = h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(dl_border)
+                    .text_sm()
+                    .text_color(dl_muted)
+                    .child(dl_label),
+            )
+            .child(
+                Button::new("adv-dl-choose")
+                    .outline()
+                    .with_size(Size::Small)
+                    .label("Choose folder\u{2026}")
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        let rx = cx.prompt_for_paths(PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some("Choose download folder".into()),
+                        });
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(Ok(Some(paths))) = rx.await {
+                                if let Some(path) = paths.into_iter().next() {
+                                    let _ = this.update(cx, |prefs, cx| {
+                                        prefs.settings.download_dir =
+                                            path.to_string_lossy().into_owned();
+                                        prefs.changed(cx);
+                                    });
+                                }
+                            }
+                        })
+                        .detach();
+                    })),
+            )
+            .when(has_custom_dl, |row| {
+                row.child(
+                    Button::new("adv-dl-reset")
+                        .ghost()
+                        .with_size(Size::Small)
+                        .label("Reset")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings.download_dir.clear();
+                            this.changed(cx);
+                        })),
+                )
+            });
         v_flex()
             .child(self.group(
                 "Search",
                 Some("Local search is instant and works offline. Enable remote search when you want older history, unjoined channels, and server-indexed files automatically."),
                 remote_search,
+                cx,
+            ))
+            .child(self.group(
+                "Download location",
+                Some("Where files downloaded from Slack are saved."),
+                download_row,
                 cx,
             ))
             .child(self.group(

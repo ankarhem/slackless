@@ -174,15 +174,7 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
 }
 
 fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
-    let host_ok = url
-        .host_str()
-        .is_some_and(|h| h.eq_ignore_ascii_case("app.slack.com"));
-    if !host_ok {
-        return Err(PlatformError::BadLink(format!(
-            "{raw}: https link is not app.slack.com"
-        )));
-    }
-
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
     let path: Vec<String> = url
         .path()
         .split('/')
@@ -190,24 +182,59 @@ fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
         .map(decode_segment)
         .collect();
 
-    if path.first().map(String::as_str) != Some("client") {
-        return Err(PlatformError::BadLink(format!(
-            "{raw}: app.slack.com link outside /client/"
-        )));
+    if host == "app.slack.com" {
+        if path.first().map(String::as_str) != Some("client") {
+            return Err(PlatformError::BadLink(format!(
+                "{raw}: app.slack.com link outside /client/"
+            )));
+        }
+        let thread_ts = path.get(3).cloned().or_else(|| {
+            url.query_pairs()
+                .find(|(k, _)| k == "thread_ts")
+                .map(|(_, v)| v.into_owned())
+        });
+        return Ok(DeepLink::WebClient(WebClientLink {
+            team_id: path.get(1).cloned(),
+            channel_id: path.get(2).cloned(),
+            thread_ts,
+            raw: raw.to_string(),
+        }));
     }
 
-    let thread_ts = path.get(3).cloned().or_else(|| {
-        url.query_pairs()
+    // Workspace permalink: `https://<domain>.slack.com/archives/<C...>[/p<ts_digits>[?thread_ts=...&cid=...]]`
+    if host.ends_with(".slack.com") && path.first().map(String::as_str) == Some("archives") {
+        let cid_query = url
+            .query_pairs()
+            .find(|(k, _)| k == "cid")
+            .map(|(_, v)| v.into_owned());
+        let channel_id = cid_query.or_else(|| path.get(1).cloned());
+        let thread_query = url
+            .query_pairs()
             .find(|(k, _)| k == "thread_ts")
-            .map(|(_, v)| v.into_owned())
-    });
+            .map(|(_, v)| v.into_owned());
+        let p_ts = path.get(2).and_then(|seg| parse_archive_p_ts(seg));
+        return Ok(DeepLink::WebClient(WebClientLink {
+            team_id: None,
+            channel_id,
+            thread_ts: thread_query.or(p_ts),
+            raw: raw.to_string(),
+        }));
+    }
 
-    Ok(DeepLink::WebClient(WebClientLink {
-        team_id: path.get(1).cloned(),
-        channel_id: path.get(2).cloned(),
-        thread_ts,
-        raw: raw.to_string(),
-    }))
+    Err(PlatformError::BadLink(format!(
+        "{raw}: https link is not a Slack client or archive URL"
+    )))
+}
+
+/// Convert a Slack permalink `p1700000000123456` segment into `1700000000.123456`.
+fn parse_archive_p_ts(seg: &str) -> Option<String> {
+    let digits = seg.strip_prefix('p')?;
+    if digits.len() > 6 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        let split = digits.len() - 6;
+        Some(format!("{}.{}", &digits[..split], &digits[split..]))
+    } else {
+        None
+    }
 }
 
 /// Percent-decode one path segment, keeping the raw text if it is not UTF-8.
@@ -355,6 +382,28 @@ mod tests {
         match parse_deep_link(url).unwrap() {
             DeepLink::WebClient(link) => {
                 assert_eq!(link.thread_ts.as_deref(), Some("1699999999.000100"));
+            }
+            other => panic!("expected WebClient link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_archive_permalink_parses_channel_and_ts() {
+        let url = "https://norce.slack.com/archives/C0456DEF/p1700000001234567";
+        assert_eq!(
+            parse_deep_link(url).unwrap(),
+            DeepLink::WebClient(WebClientLink {
+                team_id: None,
+                channel_id: Some("C0456DEF".into()),
+                thread_ts: Some("1700000001.234567".into()),
+                raw: url.into(),
+            })
+        );
+        let thread_url = "https://norce.slack.com/archives/C0456DEF/p1700000001234567?thread_ts=1700000000.000100&cid=C0456DEF";
+        match parse_deep_link(thread_url).unwrap() {
+            DeepLink::WebClient(link) => {
+                assert_eq!(link.channel_id.as_deref(), Some("C0456DEF"));
+                assert_eq!(link.thread_ts.as_deref(), Some("1700000000.000100"));
             }
             other => panic!("expected WebClient link, got {other:?}"),
         }

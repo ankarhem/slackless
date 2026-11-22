@@ -1202,6 +1202,12 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SetUserPref { name, value } => {
+                self.spawn("users.prefs.set", async move {
+                    backend.set_user_pref(name, value).await?;
+                    Ok(())
+                });
+            }
             Command::CreateChannel {
                 name,
                 is_private,
@@ -3133,6 +3139,10 @@ pub(crate) mod tests {
                 id: channel,
                 ..Default::default()
             })
+        }
+
+        async fn set_user_pref(&self, _name: String, _value: String) -> api::Result<()> {
+            Ok(())
         }
     }
 

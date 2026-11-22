@@ -22,6 +22,17 @@ fn main() {
 	<string>Slackless</string>
 	<key>CFBundleShortVersionString</key>
 	<string>{version}</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Slack Deep Link</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>slack</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
 "#

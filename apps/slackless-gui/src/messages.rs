@@ -605,7 +605,7 @@ impl MessageList {
             .find(|message| &message.ts == ts)
     }
 
-    fn run_action(
+    pub fn run_action(
         &mut self,
         ts: &Ts,
         action: MessageAction,
@@ -737,6 +737,17 @@ impl MessageList {
                     },
                 });
             }
+            MessageAction::DismissEphemeral => {
+                let target = ts.clone();
+                if let Some(history) = self.messages.get_mut(&self.channel) {
+                    history.retain(|m| m.ts != target);
+                }
+                self.data.update(cx, |data, cx| {
+                    data.messages.retain(|m| m.ts != target);
+                    cx.notify();
+                });
+                cx.notify();
+            }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
             MessageAction::OpenImage(origin) => self.open_image(ts, &origin, cx),
             MessageAction::BlockAction { action, attachment } => {
@@ -756,6 +767,19 @@ impl MessageList {
                 }
             }
         }
+    }
+
+    /// The newest message authored by the signed-in user in the open conversation (for
+    /// quick unsend, `F-CORE-093`).
+    pub fn latest_own_ts(&self, cx: &App) -> Option<Ts> {
+        let me = &self.fixtures.self_user;
+        self.data
+            .read(cx)
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !m.is_ephemeral && m.user.as_ref() == Some(me))
+            .map(|m| m.ts.clone())
     }
 
     /// A message image was clicked: walk the conversation's messages into the viewer's
@@ -1166,7 +1190,7 @@ impl MessageList {
     }
 
     /// Delete `ts` from the fixture store and drop its row from the virtual list.
-    fn delete(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+    pub fn delete(&mut self, ts: &Ts, cx: &mut Context<Self>) {
         if let Some(history) = self.messages.get_mut(&self.channel) {
             history.retain(|message| &message.ts != ts);
         }
@@ -1338,12 +1362,15 @@ fn transcript_row(
         })
     };
 
+    let prefs = crate::preferences::display_prefs(cx);
+    let author = author_name_with(message, fixtures, prefs.display_names_only);
+    let stamp = format_clock_with(&message.ts, prefs.clock_24h);
     let mut body = v_flex().flex_1().min_w_0().gap_0p5().text_sm();
     if !grouped && !editing {
         body = body.child(message_header(
             message,
             &author,
-            format_clock(&message.ts),
+            stamp.clone(),
             fixtures,
             Some(&handler),
             cx,
@@ -1400,10 +1427,19 @@ fn transcript_row(
             );
         }
         body = body.child(message_body(message, &kcx, cx));
-        if let Some(files) =
-            crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx)
-        {
-            body = body.child(files);
+        if prefs.inline_media {
+            if let Some(files) =
+                crate::files::attachments(fixtures, message, kcx.image_open.as_ref(), cx)
+            {
+                body = body.child(files);
+            }
+        } else if !message.files.is_empty() {
+            let muted = cx.theme().muted_foreground;
+            body = body.child(div().text_xs().text_color(muted).child(format!(
+                "{} file{} hidden (inline media off)",
+                message.files.len(),
+                if message.files.len() == 1 { "" } else { "s" }
+            )));
         }
         body = body.children(actions::reaction_chips(
             &key,
@@ -1514,7 +1550,22 @@ fn transcript_row(
         }
     }
 
-    let gutter = if grouped && !editing {
+    let gutter = if prefs.compact && !editing {
+        div()
+            .w(px(52.))
+            .flex_none()
+            .flex()
+            .items_start()
+            .justify_end()
+            .pt_0p5()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(stamp),
+            )
+            .into_any_element()
+    } else if grouped && !editing {
         // Slack shows a small hover-only timestamp in place of the avatar on grouped rows.
         div()
             .w(px(AVATAR_SIZE))
@@ -1529,7 +1580,7 @@ fn transcript_row(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format_clock(&message.ts)),
+                    .child(stamp),
             )
             .into_any_element()
     } else {
@@ -1573,7 +1624,7 @@ fn transcript_row(
                     card.bg(saved_bg).child(actions::saved_banner(cx))
                 })
                 .when(message.is_ephemeral, |card| {
-                    card.child(actions::ephemeral_banner(cx))
+                    card.child(actions::ephemeral_banner(&key, Some(&handler), cx))
                 })
                 .when(highlighted, |card| card.bg(editing_bg))
                 .when(!highlighted && thread_open, |card| card.bg(thread_bg))
@@ -1650,10 +1701,26 @@ fn author_key(message: &Message) -> String {
 }
 
 fn author_name(message: &Message, fixtures: &Fixtures) -> String {
+    author_name_with(message, fixtures, false)
+}
+
+fn author_name_with(message: &Message, fixtures: &Fixtures, display_only: bool) -> String {
     message
         .user
         .as_ref()
-        .map(|user| fixtures.user_name(user).to_owned())
+        .map(|user| {
+            if display_only {
+                fixtures
+                    .user(user)
+                    .and_then(|u| {
+                        let d = u.profile.display_name.as_deref().unwrap_or("").trim();
+                        (!d.is_empty()).then(|| d.to_owned())
+                    })
+                    .unwrap_or_else(|| fixtures.user_name(user).to_owned())
+            } else {
+                fixtures.user_name(user).to_owned()
+            }
+        })
         .or_else(|| message.username.clone())
         // An app message without a username (Giphy's preview) goes by its bot's name.
         .or_else(|| {
@@ -1688,8 +1755,9 @@ pub fn message_row_linked(
     grouped: Option<SharedString>,
     cx: &App,
 ) -> Div {
+    let prefs = crate::preferences::display_prefs(cx);
     let author_key = author_key(message);
-    let author = author_name(message, fixtures);
+    let author = author_name_with(message, fixtures, prefs.display_names_only);
     let kcx = match links.cloned() {
         Some(links) => KitCx::new(fixtures, None, &message.ts).with_links(links),
         None => KitCx::new(fixtures, None, &message.ts),
@@ -1714,7 +1782,7 @@ pub fn message_row_linked(
             body.child(message_header(
                 message,
                 &author,
-                card_stamp(&message.ts),
+                card_stamp(&message.ts, prefs.clock_24h),
                 fixtures,
                 handler,
                 cx,
@@ -1757,7 +1825,7 @@ pub fn message_row_linked(
     if message.is_ephemeral {
         v_flex()
             .min_w_0()
-            .child(actions::ephemeral_banner(cx))
+            .child(actions::ephemeral_banner(&key, handler, cx))
             .child(row)
     } else {
         row
@@ -2177,6 +2245,8 @@ struct RunTheme {
     order: Option<u64>,
     /// Routing for this text's links; `None` falls back to [`open_link_default`].
     links: Option<LinkHandler>,
+    /// Always underline website links (Preferences > Accessibility > Underline links).
+    underline_links: bool,
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
     /// within its message (GPUI keys interaction and accessibility state by the id path)
     /// and counts its selection document order.
@@ -2217,6 +2287,7 @@ impl RunTheme {
             selection: gpui_kit::base::Theme::global(cx).tokens.colors.selection,
             order,
             links,
+            underline_links: crate::preferences::display_prefs(cx).underline_links,
             base_font,
             paragraphs: Cell::new(0),
             key,
@@ -2372,7 +2443,11 @@ impl ParagraphBuilder {
         }
         let target = LinkTarget::Url(url.into());
         let start = self.text.len();
-        self.push_text(&label, theme, run, Some(theme.link), None);
+        let mut link_run = run;
+        if theme.underline_links {
+            link_run.underline = true;
+        }
+        self.push_text(&label, theme, link_run, Some(theme.link), None);
         self.links.push((start..self.text.len(), target));
     }
 
@@ -3803,6 +3878,21 @@ fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
     let edited = message.edited.is_some();
     let inline_edited = edited && body_ends_in_text(message);
     let attachments = blockkit::attachments(message, kcx, cx);
+    // Jumbomoji: when enabled and the message is 1..=5 emoji only, render them large (32px).
+    if crate::preferences::display_prefs(cx).jumbomoji
+        && !has_kit
+        && message.attachments.is_empty()
+        && message.files.is_empty()
+    {
+        if let Some(jumbos) = jumbomoji_elements(&message.text, kcx.fixtures) {
+            column = column.child(h_flex().items_center().gap_1p5().children(jumbos));
+            if edited {
+                let muted = cx.theme().muted_foreground;
+                column = column.child(div().text_xs().text_color(muted).child("(edited)"));
+            }
+            return column;
+        }
+    }
     let mut rendered = 0;
     let last_block = message.blocks.len().saturating_sub(1);
     for (ix, block) in message.blocks.iter().enumerate() {
@@ -4207,16 +4297,60 @@ fn day_index(ts: &Ts) -> Option<i64> {
         .map(|secs| (secs + local_utc_offset(secs)).div_euclid(86_400))
 }
 
+/// If `text` consists exclusively of 1..=5 Slack `:emoji:` shortcodes (whitespace ignored),
+/// return large 32px jumbomoji elements.
+fn jumbomoji_elements(text: &str, fixtures: &Fixtures) -> Option<Vec<AnyElement>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut rest = trimmed;
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let after_open = rest.strip_prefix(':')?;
+        let close = after_open.find(':')?;
+        let code = &after_open[..close];
+        if code.is_empty()
+            || !code
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
+        {
+            return None;
+        }
+        if crate::emoji::glyph(code).is_none() && !fixtures.custom_emoji.contains_key(code) {
+            return None;
+        }
+        out.push(crate::emoji::emoji_element(code, fixtures, px(32.)).into_any_element());
+        rest = &after_open[close + 1..];
+        if out.len() > 5 {
+            return None;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn format_clock(ts: &Ts) -> String {
+    format_clock_with(ts, false)
+}
+
+fn format_clock_with(ts: &Ts, clock_24h: bool) -> String {
     match ts.secs() {
         Some(secs) => {
             let time = CivilTime::from_unix(secs);
-            let hour12 = match time.hour % 12 {
-                0 => 12,
-                hour => hour,
-            };
-            let meridiem = if time.hour < 12 { "AM" } else { "PM" };
-            format!("{}:{:02} {}", hour12, time.minute, meridiem)
+            if clock_24h {
+                format!("{:02}:{:02}", time.hour, time.minute)
+            } else {
+                let hour12 = match time.hour % 12 {
+                    0 => 12,
+                    hour => hour,
+                };
+                let meridiem = if time.hour < 12 { "AM" } else { "PM" };
+                format!("{}:{:02} {}", hour12, time.minute, meridiem)
+            }
         }
         None => ts.as_str().to_owned(),
     }
@@ -4288,14 +4422,18 @@ pub(crate) fn file_day(secs: i64) -> String {
 /// The stamp on a message card outside the day-divided transcript (threads, search, pins):
 /// like Slack, the time for today's messages, "Yesterday at …", the weekday within the past
 /// week ("Tuesday at 9:01 AM"), the full date before that.
-fn card_stamp(ts: &Ts) -> String {
+fn card_stamp(ts: &Ts, clock_24h: bool) -> String {
     let Some(secs) = ts.secs() else {
         return ts.as_str().to_owned();
     };
     let day = CivilTime::from_unix(secs).day_index;
     match CivilTime::now().day_index - day {
-        0 => format_clock(ts),
-        2..=6 => format!("{} at {}", weekday_name(day), format_clock(ts)),
+        0 => format_clock_with(ts, clock_24h),
+        2..=6 => format!(
+            "{} at {}",
+            weekday_name(day),
+            format_clock_with(ts, clock_24h)
+        ),
         _ => day_and_time(ts),
     }
 }

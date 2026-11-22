@@ -78,6 +78,8 @@ pub enum MessageAction {
         action: crate::blockkit::Json,
         attachment: Option<i64>,
     },
+    /// Dismiss an ephemeral ("Only visible to you") message locally.
+    DismissEphemeral,
     /// One of the message's images was clicked: open the image viewer on it.
     OpenImage(crate::image_viewer::ImageOrigin),
 }
@@ -741,17 +743,32 @@ pub fn saved_banner(cx: &App) -> Div {
         .child("Saved for later")
 }
 
-/// Slack's "Only visible to you" marker above an ephemeral message (Giphy's preview).
-pub fn ephemeral_banner(cx: &App) -> Div {
-    let muted = cx.theme().muted_foreground;
+/// Slack's "Only visible to you" marker above an ephemeral message, with an optional
+/// "Dismiss" link that removes it from the transcript.
+pub fn ephemeral_banner(key: &str, handler: Option<&ActionHandler>, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (muted, link) = (theme.muted_foreground, theme.link);
     h_flex()
         .items_center()
-        .gap_1()
+        .gap_2()
         .pb_0p5()
         .text_xs()
         .text_color(muted)
         .child(Icon::new(IconName::Eye).text_color(muted).size(px(12.)))
         .child("Only visible to you")
+        .when_some(handler.cloned(), |row, handler| {
+            row.child(
+                div()
+                    .id(SharedString::from(format!("{key}-dismiss-eph")))
+                    .cursor_pointer()
+                    .text_color(link)
+                    .hover(|el| el.underline())
+                    .child("Dismiss")
+                    .on_click(move |_, window, cx| {
+                        handler(MessageAction::DismissEphemeral, window, cx)
+                    }),
+            )
+        })
 }
 
 /// A toast for feedback on fixture-mode actions.

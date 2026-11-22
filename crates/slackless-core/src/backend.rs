@@ -392,6 +392,12 @@ pub trait Backend: Clone + Send + Sync + 'static {
         channel: ChannelId,
         users: Vec<UserId>,
     ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Write a single user preference back to Slack (`users.prefs.set`).
+    fn set_user_pref(
+        &self,
+        name: String,
+        value: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -877,5 +883,9 @@ impl Backend for SlackApi {
         users: Vec<UserId>,
     ) -> api::Result<Conversation> {
         SlackApi::conversations_invite(self, &channel, &users).await
+    }
+
+    async fn set_user_pref(&self, name: String, value: String) -> api::Result<()> {
+        SlackApi::users_prefs_set(self, &name, &value).await
     }
 }

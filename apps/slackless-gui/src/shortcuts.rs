@@ -65,6 +65,11 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
             (&["/"], "Slash commands (at the start of a message)", true),
             (&["\u{2191}"], "Edit your last message", true),
             (
+                &["\u{2318}", "\u{21e7}", "\u{232b}"],
+                "Unsend your last message",
+                true,
+            ),
+            (
                 &["\u{2318}", "\u{21e7}", "\\"],
                 "Add a reaction to the last message",
                 false,

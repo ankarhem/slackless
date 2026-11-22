@@ -25,11 +25,12 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
+    Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::NotifyLevel;
@@ -209,6 +210,8 @@ pub enum UnreadsEvent {
     OpenLink(LinkTarget),
     /// The group's "Mark as Read" (or Esc): move the read cursor to `ts`.
     MarkRead { channel: ChannelId, ts: Ts },
+    /// Quick inline reply sent directly from an unread card (`F-CORE-031`).
+    Reply { channel: ChannelId, text: String },
     /// "Mark All Messages Read": the root runs it through the user's confirmation setting.
     MarkAllRead,
 }
@@ -220,6 +223,8 @@ pub struct UnreadsView {
     collapsed: HashSet<ChannelId>,
     /// The keyboard-focused group (Up/Down move it, Left/Right fold it, Esc marks it read).
     focused: Option<usize>,
+    /// Active inline reply composer on one unread card (`F-CORE-031`).
+    replying: Option<(ChannelId, Entity<TextareaState>)>,
 }
 
 impl EventEmitter<UnreadsEvent> for UnreadsView {}
@@ -231,6 +236,7 @@ impl UnreadsView {
             groups: Vec::new(),
             collapsed: HashSet::new(),
             focused: None,
+            replying: None,
         })
     }
 
@@ -353,10 +359,38 @@ impl UnreadsView {
         let (channel, ts) = (group.channel.clone(), group.newest_ts.clone());
         self.groups.remove(ix);
         self.collapsed.remove(&channel);
+        if self.replying.as_ref().is_some_and(|(ch, _)| *ch == channel) {
+            self.replying = None;
+        }
         self.focused = (!self.groups.is_empty() && self.focused.is_some())
             .then(|| ix.min(self.groups.len() - 1));
         cx.emit(UnreadsEvent::MarkRead { channel, ts });
         cx.notify();
+    }
+
+    fn start_reply(&mut self, channel: ChannelId, window: &mut Window, cx: &mut Context<Self>) {
+        self.collapsed.remove(&channel);
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Write a quick reply…")
+                .auto_grow(1, 4)
+        });
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        self.replying = Some((channel, input));
+        cx.notify();
+    }
+
+    fn submit_reply(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some((channel, input)) = self.replying.take() else {
+            return;
+        };
+        let text = input.read(cx).value().trim().to_owned();
+        if text.is_empty() {
+            cx.notify();
+            return;
+        }
+        cx.emit(UnreadsEvent::Reply { channel, text });
+        self.mark_read(ix, cx);
     }
 }
 
@@ -437,6 +471,7 @@ impl Render for UnreadsView {
                 )
                 .into_any_element()
         } else {
+            let replying = self.replying.clone();
             v_flex()
                 .id("unreads-scroll")
                 .flex_1()
@@ -446,12 +481,17 @@ impl Render for UnreadsView {
                 .py_3()
                 .gap_3()
                 .children((0..groups.len()).map(|ix| {
+                    let reply_input = replying
+                        .as_ref()
+                        .filter(|(ch, _)| *ch == groups[ix].channel)
+                        .map(|(_, input)| input.clone());
                     card_view(
                         &fixtures,
                         ix,
                         &groups[ix],
                         collapsed.contains(&groups[ix].channel),
                         focused == Some(ix),
+                        reply_input,
                         background,
                         cx,
                     )
@@ -481,12 +521,14 @@ impl Render for UnreadsView {
 /// One conversation's card: the header (collapse chevron, conversation badge, bold name,
 /// mention pill, unread count, "Mark as Read") over its unread messages, oldest first - or,
 /// while collapsed, nothing, and while its rows lag, the line that loads them.
+#[allow(clippy::too_many_arguments)]
 fn card_view(
     fixtures: &Fixtures,
     ix: usize,
     group: &UnreadGroup,
     collapsed: bool,
     focused: bool,
+    reply_input: Option<Entity<TextareaState>>,
     background: Hsla,
     cx: &mut Context<UnreadsView>,
 ) -> AnyElement {
@@ -609,12 +651,28 @@ fn card_view(
                 ),
         )
         .child(
-            Button::new(("unreads-mark-read", ix))
-                .ghost()
-                .with_size(Size::Small)
-                .icon(IconName::Check)
-                .label("Mark as Read")
-                .on_click(cx.listener(move |this, _, _, cx| this.mark_read(ix, cx))),
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child({
+                    let reply_channel = group.channel.clone();
+                    Button::new(("unreads-reply-btn", ix))
+                        .ghost()
+                        .with_size(Size::Small)
+                        .icon(IconName::Reply)
+                        .label("Reply")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.start_reply(reply_channel.clone(), window, cx);
+                        }))
+                })
+                .child(
+                    Button::new(("unreads-mark-read", ix))
+                        .ghost()
+                        .with_size(Size::Small)
+                        .icon(IconName::Check)
+                        .label("Mark as Read")
+                        .on_click(cx.listener(move |this, _, _, cx| this.mark_read(ix, cx))),
+                ),
         );
 
     let channel = group.channel.clone();
@@ -656,6 +714,46 @@ fn card_view(
         )
     };
 
+    let reply_box = if !collapsed {
+        reply_input.map(|input| {
+            h_flex()
+                .items_end()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .child(Textarea::new(&input).appearance(false).bordered(false)),
+                )
+                .child(
+                    Button::new(("unreads-reply-cancel", ix))
+                        .ghost()
+                        .with_size(Size::Small)
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.replying = None;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new(("unreads-reply-send", ix))
+                        .primary()
+                        .with_size(Size::Small)
+                        .label("Send")
+                        .on_click(cx.listener(move |this, _, _, cx| this.submit_reply(ix, cx))),
+                )
+        })
+    } else {
+        None
+    };
+
     v_flex()
         .id(("unreads-card", ix))
         .flex_none()
@@ -666,6 +764,7 @@ fn card_view(
         .overflow_hidden()
         .child(header)
         .children(body)
+        .children(reply_box)
         .into_any_element()
 }
 

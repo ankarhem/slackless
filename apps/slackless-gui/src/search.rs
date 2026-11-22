@@ -22,7 +22,9 @@ use slackless_core::api::{
     RemoteFilePage, RemoteMessageHit, RemoteMessagePage, SearchSort as ApiSearchSort,
 };
 use slackless_core::store::{SearchFilters, SearchQuery, SearchSort, Store, StoredMessage};
-use slackless_core::types::{ChannelId, File, TeamId, Ts};
+use slackless_core::types::{
+    ChannelId, Conversation, ConversationKind, File, TeamId, Ts, User, UserId,
+};
 
 use crate::fixtures::Fixtures;
 use crate::messages::{list_stamp, message_row};
@@ -34,6 +36,9 @@ const RESULT_LIMIT: usize = 50;
 pub enum SearchTab {
     Messages,
     Files,
+    Channels,
+    People,
+    Dms,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +53,10 @@ pub enum SearchEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Open a channel or DM matched in the Channels / DMs search tabs.
+    OpenChannel(ChannelId),
+    /// Open a person's profile matched in the People search tab.
+    OpenProfile(UserId),
     /// User opted into remote Slack message search (`search.modules.messages`).
     RemoteMessages {
         query: String,
@@ -414,6 +423,82 @@ impl SearchView {
         }
     }
 
+    fn matching_channels(&self) -> Vec<&Conversation> {
+        let needle = self.query.trim().to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        self.fixtures
+            .channels
+            .iter()
+            .chain(&self.fixtures.directory)
+            .filter(|c| {
+                matches!(
+                    c.kind(),
+                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+                )
+            })
+            .filter(|c| seen.insert(c.id.clone()))
+            .filter(|c| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let name = c.name.as_deref().unwrap_or("").to_lowercase();
+                let topic = c
+                    .topic
+                    .as_ref()
+                    .map(|t| t.value.to_lowercase())
+                    .unwrap_or_default();
+                let purpose = c
+                    .purpose
+                    .as_ref()
+                    .map(|p| p.value.to_lowercase())
+                    .unwrap_or_default();
+                name.contains(&needle) || topic.contains(&needle) || purpose.contains(&needle)
+            })
+            .take(50)
+            .collect()
+    }
+
+    fn matching_people(&self) -> Vec<&User> {
+        let needle = self.query.trim().to_lowercase();
+        self.fixtures
+            .users
+            .iter()
+            .filter(|u| !u.deleted && !u.is_bot && u.id.as_str() != "USLACKBOT")
+            .filter(|u| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let name = self.fixtures.name_of(u).to_lowercase();
+                let handle = u.name.to_lowercase();
+                let title = u.profile.title.as_deref().unwrap_or("").to_lowercase();
+                let email = u.profile.email.as_deref().unwrap_or("").to_lowercase();
+                name.contains(&needle)
+                    || handle.contains(&needle)
+                    || title.contains(&needle)
+                    || email.contains(&needle)
+            })
+            .take(50)
+            .collect()
+    }
+
+    fn matching_dms(&self) -> Vec<&Conversation> {
+        let needle = self.query.trim().to_lowercase();
+        self.fixtures
+            .dms
+            .iter()
+            .filter(|c| {
+                if needle.is_empty() {
+                    return true;
+                }
+                self.fixtures
+                    .conversation_label(c)
+                    .to_lowercase()
+                    .contains(&needle)
+            })
+            .take(50)
+            .collect()
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, border, hover, foreground, link, secondary) = (
@@ -448,6 +533,9 @@ impl SearchView {
                     format!("{} files", self.remote_files.len())
                 }
             }
+            (SearchTab::Channels, _) => format!("{} channels", self.matching_channels().len()),
+            (SearchTab::People, _) => format!("{} people", self.matching_people().len()),
+            (SearchTab::Dms, _) => format!("{} DMs", self.matching_dms().len()),
         };
 
         let pill = |id: &'static str, label: &'static str, active: bool| {
@@ -557,7 +645,37 @@ impl SearchView {
                                         },
                                     )),
                                 )
-                            }),
+                            })
+                            .child(
+                                tab_btn(
+                                    "search-tab-channels",
+                                    "Channels",
+                                    self.tab == SearchTab::Channels,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_tab(SearchTab::Channels, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                tab_btn(
+                                    "search-tab-people",
+                                    "People",
+                                    self.tab == SearchTab::People,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.set_tab(SearchTab::People, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                tab_btn("search-tab-dms", "DMs", self.tab == SearchTab::Dms)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_tab(SearchTab::Dms, cx);
+                                    })),
+                            ),
                     )
                     .child(div().flex_1())
                     .when(
@@ -700,6 +818,9 @@ impl SearchView {
                         false,
                     )
                 }
+            }
+            (SearchTab::Channels | SearchTab::People | SearchTab::Dms, _) => {
+                ("No matches".to_owned(), "Try another query.", false)
             }
         };
         let muted = cx.theme().muted_foreground;
@@ -890,8 +1011,16 @@ impl SearchView {
 
 impl Render for SearchView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (muted, border) = (theme.muted_foreground, theme.border);
+        let (muted, border, hover, fg, bg) = {
+            let theme = cx.theme();
+            (
+                theme.muted_foreground,
+                theme.border,
+                theme.accent,
+                theme.foreground,
+                theme.background,
+            )
+        };
         let header = self.header(cx);
         let body = match (self.tab, self.source) {
             (SearchTab::Messages, SearchSource::Local) => {
@@ -1029,6 +1158,196 @@ impl Render for SearchView {
                                 ),
                             )
                         })
+                        .into_any_element()
+                }
+            }
+            (SearchTab::Channels, _) => {
+                let channels: Vec<Conversation> =
+                    self.matching_channels().into_iter().cloned().collect();
+                if channels.is_empty() {
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child("No matching channels"),
+                        )
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .id(SharedString::from("search-channels-list"))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(channels.into_iter().enumerate().map(|(ix, ch)| {
+                            let id = ch.id.clone();
+                            let icon = if ch.is_private {
+                                IconName::Lock
+                            } else {
+                                IconName::Hash
+                            };
+                            let name = ch.name.clone().unwrap_or_else(|| ch.id.to_string());
+                            let desc = ch
+                                .purpose
+                                .as_ref()
+                                .map(|p| p.value.clone())
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| ch.topic.as_ref().map(|t| t.value.clone()))
+                                .unwrap_or_default();
+                            h_flex()
+                                .id(("search-ch", ix))
+                                .items_center()
+                                .gap_3()
+                                .px_4()
+                                .py_2p5()
+                                .border_b_1()
+                                .border_color(border)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(hover))
+                                .child(Icon::new(icon).size(px(16.)).text_color(muted))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(fg)
+                                                .child(name),
+                                        )
+                                        .when(!desc.is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(desc),
+                                            )
+                                        }),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SearchEvent::OpenChannel(id.clone()));
+                                }))
+                        }))
+                        .into_any_element()
+                }
+            }
+            (SearchTab::People, _) => {
+                let people: Vec<User> = self.matching_people().into_iter().cloned().collect();
+                if people.is_empty() {
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child("No matching people"),
+                        )
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .id(SharedString::from("search-people-list"))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(people.into_iter().enumerate().map(|(ix, user)| {
+                            let uid = user.id.clone();
+                            let name = self.fixtures.name_of(&user).to_owned();
+                            let title = user.profile.title.clone().unwrap_or_default();
+                            let avatar = crate::avatars::user_chip(&self.fixtures, &uid, 32.);
+                            h_flex()
+                                .id(("search-person", ix))
+                                .items_center()
+                                .gap_3()
+                                .px_4()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(border)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(hover))
+                                .child(avatar)
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(fg)
+                                                .child(name),
+                                        )
+                                        .when(!title.is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(title),
+                                            )
+                                        }),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SearchEvent::OpenProfile(uid.clone()));
+                                }))
+                        }))
+                        .into_any_element()
+                }
+            }
+            (SearchTab::Dms, _) => {
+                let dms: Vec<Conversation> = self.matching_dms().into_iter().cloned().collect();
+                if dms.is_empty() {
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(div().text_sm().text_color(muted).child("No matching DMs"))
+                        .into_any_element()
+                } else {
+                    v_flex()
+                        .id(SharedString::from("search-dms-list"))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(dms.into_iter().enumerate().map(|(ix, dm)| {
+                            let id = dm.id.clone();
+                            let label = self.fixtures.conversation_label(&dm);
+                            let avatar = crate::avatars::conversation_avatar(
+                                &self.fixtures,
+                                &dm,
+                                28.,
+                                bg,
+                                cx,
+                            );
+                            h_flex()
+                                .id(("search-dm", ix))
+                                .items_center()
+                                .gap_3()
+                                .px_4()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(border)
+                                .cursor_pointer()
+                                .hover(|el| el.bg(hover))
+                                .child(avatar)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(fg)
+                                        .child(label),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(SearchEvent::OpenChannel(id.clone()));
+                                }))
+                        }))
                         .into_any_element()
                 }
             }

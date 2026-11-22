@@ -824,7 +824,19 @@ pub(crate) fn channel_menu(
                 ));
             }
             menu
-        })
+        });
+    let open_win_sidebar = sidebar.clone();
+    let open_win_channel = channel.clone();
+    menu = menu
+        .item(
+            PopupMenuItem::new("Open in new window")
+                .icon(IconName::ExternalLink)
+                .on_click(move |_, _, cx| {
+                    let _ = open_win_sidebar.update(cx, |sidebar, cx| {
+                        sidebar.open_in_new_window(open_win_channel.clone(), cx)
+                    });
+                }),
+        )
         .separator()
         .label("Notify you about…");
     for (choice, text) in [

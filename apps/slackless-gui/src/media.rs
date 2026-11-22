@@ -89,9 +89,27 @@ pub struct DownloadRecord {
 struct DownloadRegistry {
     next_id: usize,
     items: Vec<DownloadRecord>,
+    custom_dir: Option<PathBuf>,
 }
 
 impl Global for DownloadRegistry {}
+
+/// Override the folder used by [`download`] (`None` reverts to `~/Downloads`).
+pub fn set_download_dir(dir: Option<PathBuf>, cx: &mut App) {
+    let reg = cx.default_global::<DownloadRegistry>();
+    reg.custom_dir = dir;
+}
+
+/// Active download directory (custom preference if set, else `~/Downloads`).
+pub fn effective_download_dir(cx: &App) -> Option<PathBuf> {
+    if let Some(dir) = cx
+        .try_global::<DownloadRegistry>()
+        .and_then(|reg| reg.custom_dir.clone())
+    {
+        return Some(dir);
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join("Downloads"))
+}
 
 /// All downloads recorded in this session, newest first.
 pub fn downloads(cx: &App) -> Vec<DownloadRecord> {
@@ -159,6 +177,7 @@ pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
         id
     };
     window.refresh();
+    let dir = effective_download_dir(cx);
     let bytes = fetcher.get(url);
     window
         .spawn(cx, async move |cx| {
@@ -166,7 +185,7 @@ pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
                 Ok(bytes) => {
                     let len = bytes.len();
                     cx.background_executor()
-                        .spawn(async move { save_download(&name, &bytes).map(|p| (p, len)) })
+                        .spawn(async move { save_download(dir, &name, &bytes).map(|p| (p, len)) })
                         .await
                 }
                 Err(e) => Err(e),
@@ -180,7 +199,12 @@ pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
                             item.status = DownloadStatus::Completed(path.clone());
                         }
                         let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        let message = format!("{name} is in your Downloads folder.");
+                        let folder = path
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Downloads".to_owned());
+                        let message = format!("{name} saved to {folder}.");
                         crate::actions::notify("Downloaded", message, window, cx);
                     }
                     Err(e) => {
@@ -188,6 +212,87 @@ pub fn download(url: String, name: String, window: &mut Window, cx: &mut App) {
                             item.status = DownloadStatus::Failed(e.clone());
                         }
                         crate::actions::notify("Download failed", e, window, cx);
+                    }
+                }
+                window.refresh();
+            })
+            .ok();
+        })
+        .detach();
+}
+
+/// Prompt for a destination path ("Save as…"), then download `url` directly to that path.
+pub fn download_as(url: String, name: String, window: &mut Window, cx: &mut App) {
+    let Some(fetcher) = cx.try_global::<Downloader>().map(|d| d.0.clone()) else {
+        crate::actions::notify(
+            "Save as",
+            "Downloads need a signed-in workspace.",
+            window,
+            cx,
+        );
+        return;
+    };
+    let start_dir = effective_download_dir(cx).unwrap_or_else(|| PathBuf::from("."));
+    let rx = cx.prompt_for_new_path(&start_dir, Some(&name));
+    window
+        .spawn(cx, async move |cx| {
+            let Ok(Ok(Some(dest))) = rx.await else {
+                return;
+            };
+            let id = cx
+                .update(|window, cx| {
+                    let reg = cx.default_global::<DownloadRegistry>();
+                    reg.next_id += 1;
+                    let id = reg.next_id;
+                    let disp = dest
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| name.clone());
+                    reg.items.push(DownloadRecord {
+                        id,
+                        name: disp,
+                        url: url.clone(),
+                        bytes: None,
+                        status: DownloadStatus::InProgress,
+                    });
+                    window.refresh();
+                    id
+                })
+                .ok();
+            let saved = match fetcher.get(url).await {
+                Ok(bytes) => {
+                    let len = bytes.len();
+                    let dest_write = dest.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            std::fs::write(&dest_write, &bytes)
+                                .map(|()| (dest_write, len))
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            cx.update(|window, cx| {
+                let reg = cx.default_global::<DownloadRegistry>();
+                match saved {
+                    Ok((path, len)) => {
+                        if let Some(id) = id {
+                            if let Some(item) = reg.items.iter_mut().find(|i| i.id == id) {
+                                item.bytes = Some(len);
+                                item.status = DownloadStatus::Completed(path.clone());
+                            }
+                        }
+                        let file = path.file_name().unwrap_or_default().to_string_lossy();
+                        crate::actions::notify("Saved", file.into_owned(), window, cx);
+                    }
+                    Err(e) => {
+                        if let Some(id) = id {
+                            if let Some(item) = reg.items.iter_mut().find(|i| i.id == id) {
+                                item.status = DownloadStatus::Failed(e.clone());
+                            }
+                        }
+                        crate::actions::notify("Save failed", e, window, cx);
                     }
                 }
                 window.refresh();
@@ -499,10 +604,16 @@ pub fn play_video(file_id: String, url: String, ext: String, window: &mut Window
         .detach();
 }
 
-/// Writes `bytes` to ~/Downloads/`name`, numbering the name like a browser when it is taken.
-fn save_download(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("no home folder")?;
-    let dir = PathBuf::from(home).join("Downloads");
+/// Writes `bytes` to `dir`/`name` (or ~/Downloads/`name`), numbering the name like a browser when it is taken.
+fn save_download(dir: Option<PathBuf>, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = match dir {
+        Some(dir) => dir,
+        None => {
+            let home = std::env::var_os("HOME").ok_or("no home folder")?;
+            PathBuf::from(home).join("Downloads")
+        }
+    };
+    let _ = std::fs::create_dir_all(&dir);
     // A name from Slack never reaches outside the folder.
     let name = Path::new(name)
         .file_name()

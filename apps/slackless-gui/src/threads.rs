@@ -116,6 +116,11 @@ pub enum ThreadPanelEvent {
         text: String,
         when: crate::drafts::SendLater,
     },
+    /// Open the open thread in a separate native GPUI window (`F-CORE-109`).
+    PopOut {
+        channel: ChannelId,
+        thread_ts: Ts,
+    },
     /// The reply composer asked for the Custom Schedule Send dialog.
     ScheduleCustom {
         channel: ChannelId,
@@ -649,6 +654,11 @@ impl ThreadPanel {
                     let _ = this.update(cx, |panel, cx| panel.delete_message(&ts, cx));
                 });
             }
+            MessageAction::DismissEphemeral => {
+                let target = ts.clone();
+                self.replies.retain(|m| m.ts != target);
+                cx.notify();
+            }
             MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
             MessageAction::OpenImage(origin) => {
                 // The viewer pages through the thread's images, root first.
@@ -991,14 +1001,33 @@ impl Render for ThreadPanel {
                     .child("Thread"),
             )
             .child(
-                h_flex().items_center().gap_1().children(more).child(
-                    Button::new("close-thread")
-                        .ghost()
-                        .with_size(Size::Small)
-                        .icon(IconName::X)
-                        .tooltip("Close")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadPanelEvent::Close))),
-                ),
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .when_some(self.thread.clone(), |bar, (ch, ts)| {
+                        bar.child(
+                            Button::new("popout-thread")
+                                .ghost()
+                                .with_size(Size::Small)
+                                .icon(IconName::ExternalLink)
+                                .tooltip("Open thread in new window")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(ThreadPanelEvent::PopOut {
+                                        channel: ch.clone(),
+                                        thread_ts: ts.clone(),
+                                    });
+                                })),
+                        )
+                    })
+                    .children(more)
+                    .child(
+                        Button::new("close-thread")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::X)
+                            .tooltip("Close")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadPanelEvent::Close))),
+                    ),
             );
 
         // The body's rows; `revealed` is the index of the row a permalink asked to show.

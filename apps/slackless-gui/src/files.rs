@@ -792,12 +792,29 @@ fn file_card(file: &File, cx: &App) -> Div {
                         .text_color(theme.muted_foreground)
                         .child(meta),
                 ),
-        )
-        .child(
-            Icon::new(IconName::Download)
-                .text_color(theme.muted_foreground)
-                .size(px(16.)),
         );
+    let save_as = dl_url.clone().map(|url| {
+        let name = name.clone();
+        div()
+            .id(SharedString::from(format!("file-saveas-{}", file.id)))
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .cursor_pointer()
+            .hover(|b| b.bg(theme.secondary_hover).text_color(theme.foreground))
+            .child("Save as\u{2026}")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, window, cx| {
+                crate::media::download_as(url.clone(), name.clone(), window, cx);
+            })
+    });
+    let card = card.children(save_as).child(
+        Icon::new(IconName::Download)
+            .text_color(theme.muted_foreground)
+            .size(px(16.)),
+    );
     let card = match dl_url {
         Some(url) => card
             .cursor_pointer()

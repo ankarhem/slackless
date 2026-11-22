@@ -330,6 +330,8 @@ actions!(
         SearchConversation,
         ToggleWorkspaceRail,
         ToggleRightPane,
+        PopOutConversation,
+        UnsendLastMessage,
         ZoomIn,
         ZoomOut,
         ActualSize,
@@ -868,6 +870,7 @@ impl App {
                 KeyBinding::new("cmd-f", SearchConversation, None),
                 KeyBinding::new("cmd-shift-s", ToggleWorkspaceRail, None),
                 KeyBinding::new("cmd-.", ToggleRightPane, None),
+                KeyBinding::new("cmd-shift-backspace", UnsendLastMessage, None),
                 // Slack's View menu shows Cmd++; Cmd+= (no Shift) zooms in too.
                 KeyBinding::new("cmd-+", ZoomIn, None),
                 KeyBinding::new("cmd-=", ZoomIn, None),
@@ -1377,6 +1380,16 @@ impl App {
                         }
                         UnreadsEvent::MarkRead { channel, ts } => {
                             this.mark_read(channel, ts.clone(), cx);
+                        }
+                        UnreadsEvent::Reply { channel, text } => {
+                            let content = slackless_core::api::MessageContent::plain(text.clone());
+                            this.bridge.send(Command::SendMessage {
+                                channel: channel.clone(),
+                                content,
+                                thread_ts: None,
+                                broadcast: false,
+                            });
+                            actions::notify("Reply sent", this.label(channel), window, cx);
                         }
                         UnreadsEvent::MarkAllRead => this.request_mark_all_read(window, cx),
                     },
@@ -2036,7 +2049,7 @@ impl App {
     /// A link in message text was activated. Slack resolves its own targets in-app:
     /// profiles, channels and threads open their panes, and Slack permalinks open the
     /// conversation (or thread) instead of the browser; everything else is a web URL.
-    fn open_link(&mut self, target: LinkTarget, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_link(&mut self, target: LinkTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             LinkTarget::Profile(user) => self.open_profile(user, cx),
             LinkTarget::Channel(channel) if self.fixtures.conversation(&channel).is_some() => {
@@ -2047,26 +2060,132 @@ impl App {
             {
                 self.open_thread(channel, thread_ts, cx);
             }
-            LinkTarget::Url(url) => match parse_permalink(&url) {
-                Some(permalink) if self.fixtures.conversation(&permalink.channel).is_some() => {
-                    self.select(permalink.channel.clone(), cx);
-                    match permalink.thread_ts {
-                        // A reply's link opens its thread scrolled to the reply, as in Slack.
-                        Some(thread_ts) => {
-                            self.open_thread(permalink.channel.clone(), thread_ts, cx);
-                            self.thread
-                                .update(cx, |panel, cx| panel.reveal(permalink.ts, cx));
-                        }
-                        None => {
-                            self.messages
-                                .update(cx, |list, cx| list.reveal(&permalink.ts, cx));
+            LinkTarget::Url(url) => {
+                if self.handle_deep_link(url.as_ref(), window, cx) {
+                    return;
+                }
+                match parse_permalink(&url) {
+                    Some(permalink) if self.fixtures.conversation(&permalink.channel).is_some() => {
+                        self.select(permalink.channel.clone(), cx);
+                        match permalink.thread_ts {
+                            // A reply's link opens its thread scrolled to the reply, as in Slack.
+                            Some(thread_ts) => {
+                                self.open_thread(permalink.channel.clone(), thread_ts, cx);
+                                self.thread
+                                    .update(cx, |panel, cx| panel.reveal(permalink.ts, cx));
+                            }
+                            None => {
+                                self.messages
+                                    .update(cx, |list, cx| list.reveal(&permalink.ts, cx));
+                            }
                         }
                     }
+                    _ => cx.open_url(url.as_ref()),
                 }
-                _ => cx.open_url(url.as_ref()),
-            },
+            }
             // An in-app target this workspace does not know: nothing to open.
             LinkTarget::Channel(_) | LinkTarget::Thread { .. } => {}
+        }
+    }
+
+    /// Route a `slack://`, `https://app.slack.com/client/...`, or `https://*.slack.com/archives/...`
+    /// deep link into the matching workspace, conversation, thread, or user profile (`F-SHELL-182..187`).
+    /// Returns `true` when the URL was handled in-app.
+    pub fn handle_deep_link(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use slackless_core::platform::{DeepLink, SlackLinkKind, parse_deep_link};
+        let Ok(link) = parse_deep_link(url) else {
+            return false;
+        };
+        let switch_team = |this: &mut Self,
+                           team_id: Option<&str>,
+                           window: &mut Window,
+                           cx: &mut Context<Self>| {
+            let Some(team_id) = team_id else {
+                return;
+            };
+            let idx = this
+                .live_teams
+                .iter()
+                .position(|t| t.id.as_str() == team_id)
+                .or_else(|| {
+                    this.fixtures
+                        .workspaces
+                        .iter()
+                        .position(|t| t.id.as_str() == team_id)
+                });
+            if let Some(ix) = idx {
+                if ix != this.workspace {
+                    this.switch_workspace(ix, window, cx);
+                }
+            }
+        };
+        match link {
+            DeepLink::Slack(slack) => match slack.kind {
+                SlackLinkKind::Team { team_id } => {
+                    switch_team(self, Some(&team_id), window, cx);
+                    true
+                }
+                SlackLinkKind::Channel {
+                    channel_id,
+                    team_id,
+                } => {
+                    switch_team(self, team_id.as_deref(), window, cx);
+                    let ch = ChannelId::from(channel_id.as_str());
+                    if self.fixtures.conversation(&ch).is_some() {
+                        self.select(ch, cx);
+                        return true;
+                    }
+                    false
+                }
+                SlackLinkKind::User { user_id, team_id } => {
+                    switch_team(self, team_id.as_deref(), window, cx);
+                    let uid = UserId::from(user_id.as_str());
+                    self.open_profile(uid, cx);
+                    true
+                }
+                SlackLinkKind::Open { team_id, target_id } => {
+                    switch_team(self, team_id.as_deref(), window, cx);
+                    if let Some(target) = target_id {
+                        if target.starts_with('U') || target.starts_with('W') {
+                            self.open_profile(UserId::from(target.as_str()), cx);
+                            return true;
+                        }
+                        let ch = ChannelId::from(target.as_str());
+                        if self.fixtures.conversation(&ch).is_some() {
+                            self.select(ch, cx);
+                            return true;
+                        }
+                    }
+                    team_id.is_some()
+                }
+            },
+            DeepLink::WebClient(web) => {
+                switch_team(self, web.team_id.as_deref(), window, cx);
+                let Some(channel_id) = web.channel_id else {
+                    return web.team_id.is_some();
+                };
+                let ch = ChannelId::from(channel_id.as_str());
+                if self.fixtures.conversation(&ch).is_none() {
+                    return false;
+                }
+                self.select(ch.clone(), cx);
+                if let Some(ts_str) = web.thread_ts {
+                    let ts = Ts::from(ts_str.as_str());
+                    if url.contains("thread_ts=") {
+                        self.open_thread(ch, ts.clone(), cx);
+                        self.thread.update(cx, |panel, cx| panel.reveal(ts, cx));
+                    } else {
+                        self.messages.update(cx, |list, cx| list.reveal(&ts, cx));
+                    }
+                }
+                true
+            }
+            DeepLink::Other { .. } => false,
         }
     }
 
@@ -2292,6 +2411,12 @@ impl App {
         let remote_auto = settings.remote_search_auto;
         self.results
             .update(cx, |view, _| view.set_remote_auto(remote_auto));
+        crate::preferences::set_display_prefs(&settings, cx);
+        crate::media::set_download_dir(
+            (!settings.download_dir.is_empty())
+                .then(|| std::path::PathBuf::from(&settings.download_dir)),
+            cx,
+        );
         let nav_prefs = crate::sidebar::NavPrefs {
             show_home: settings.show_home,
             show_dms: settings.show_dms,
@@ -2302,16 +2427,53 @@ impl App {
         };
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_nav_prefs(nav_prefs, cx));
-        if self
-            .saved_settings
-            .as_ref()
-            .is_some_and(|saved| *saved != settings)
-        {
-            self.saved_settings = Some(settings.clone());
-            if let Some(write) = self.bridge.remember_settings(&settings) {
-                cx.background_executor().spawn(write).detach();
+        if let Some(prev) = self.saved_settings.as_ref() {
+            if *prev != settings {
+                // Cloud pref write-back (`users.prefs.set`) for display preferences that changed.
+                if !self.fixtures.sample {
+                    let sync_pref = |name: &str, value: String| {
+                        self.bridge.send(Command::SetUserPref {
+                            name: name.to_owned(),
+                            value,
+                        });
+                    };
+                    if prev.clock_24h != settings.clock_24h {
+                        sync_pref("time24", settings.clock_24h.to_string());
+                    }
+                    if prev.names != settings.names {
+                        sync_pref("display_real_names", (settings.names == 0).to_string());
+                    }
+                    if prev.jumbomoji != settings.jumbomoji {
+                        sync_pref("jumbomoji", settings.jumbomoji.to_string());
+                    }
+                    if prev.convert_emoticons != settings.convert_emoticons {
+                        sync_pref("convert_emoticons", settings.convert_emoticons.to_string());
+                    }
+                    if prev.underline_links != settings.underline_links {
+                        sync_pref("underline_links", settings.underline_links.to_string());
+                    }
+                    if prev.density != settings.density {
+                        sync_pref(
+                            "messages_theme",
+                            if settings.density == 1 {
+                                "compact"
+                            } else {
+                                "default"
+                            }
+                            .to_owned(),
+                        );
+                    }
+                    if prev.skin_tone != settings.skin_tone {
+                        sync_pref("emoji_skin_tone", (settings.skin_tone + 1).to_string());
+                    }
+                }
+                self.saved_settings = Some(settings.clone());
+                if let Some(write) = self.bridge.remember_settings(&settings) {
+                    cx.background_executor().spawn(write).detach();
+                }
             }
         }
+        window.refresh();
         self.push_self_state(cx);
         self.sync_badge(cx);
     }
@@ -2398,6 +2560,99 @@ impl App {
         self.close_full_column_views(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.show_home(cx));
         cx.notify();
+    }
+
+    /// Pop out `channel` into a separate native GPUI window (`F-CORE-010`, `F-CORE-026`).
+    fn pop_out_conversation(&self, channel: ChannelId, cx: &mut Context<Self>) {
+        let title = self.label(&channel);
+        crate::popout::open_popout(
+            crate::popout::PopoutKind::Conversation(channel),
+            title,
+            self.fixtures.clone(),
+            self.bridge.store().cloned(),
+            self.bridge.team_id().cloned(),
+            self.bridge.forwarder(),
+            cx,
+        );
+    }
+
+    /// Pop out a thread into a separate native GPUI window (`F-CORE-109`).
+    fn pop_out_thread(&self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
+        let title = format!("Thread in {}", self.label(&channel));
+        crate::popout::open_popout(
+            crate::popout::PopoutKind::Thread { channel, thread_ts },
+            title,
+            self.fixtures.clone(),
+            self.bridge.store().cloned(),
+            self.bridge.team_id().cloned(),
+            self.bridge.forwarder(),
+            cx,
+        );
+    }
+
+    /// Reorder workspace tile `from` to `to` in the switcher rail and persist (`F-CORE-003`).
+    fn reorder_workspace(
+        &mut self,
+        from: usize,
+        to: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.live_teams.len();
+        if from == to || from >= len || to >= len {
+            return;
+        }
+        self.live_teams.swap(from, to);
+        if from < self.parked.len() && to < self.parked.len() {
+            self.parked.swap(from, to);
+        }
+        if from < self.parked_bridges.len() && to < self.parked_bridges.len() {
+            self.parked_bridges.swap(from, to);
+        }
+        if from < self.bg_counts.len() && to < self.bg_counts.len() {
+            self.bg_counts.swap(from, to);
+        }
+        if from < self.bg_activity_unread.len() && to < self.bg_activity_unread.len() {
+            self.bg_activity_unread.swap(from, to);
+        }
+        if self.workspace == from {
+            self.workspace = to;
+        } else if self.workspace == to {
+            self.workspace = from;
+        }
+        self.sidebar
+            .update(cx, |s, cx| s.set_workspace(self.workspace, cx));
+        let order: Vec<String> = self
+            .live_teams
+            .iter()
+            .map(|t| t.id.as_str().to_owned())
+            .collect();
+        if let Some(write) = self.bridge.remember_workspace_order(&order) {
+            cx.background_executor().spawn(write).detach();
+        }
+        self.reload_live(window, cx);
+        self.update_menus(cx);
+    }
+
+    /// Delete the most recent message you sent in the open conversation (`Cmd+Shift+Backspace`,
+    /// `F-CORE-093`), respecting `Settings.confirm_unsend`.
+    fn unsend_last_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ts) = self.messages.read(cx).latest_own_ts(cx) else {
+            return;
+        };
+        let confirm = self.preferences.read(cx).settings().confirm_unsend;
+        if confirm {
+            self.messages.update(cx, |list, cx| {
+                list.run_action(&ts, MessageAction::Delete, window, cx);
+            });
+        } else {
+            let channel = self.channel.clone();
+            self.messages.update(cx, |list, cx| {
+                list.delete(&ts, cx);
+            });
+            self.bridge.send(Command::DeleteMessage { channel, ts });
+            actions::notify("Message unsent", "Deleted your last message.", window, cx);
+        }
     }
 
     /// Open Slack's "Create a channel" dialog (`conversations.create` + optional purpose).
@@ -5054,11 +5309,17 @@ impl App {
                 if app.history_generation == generation && app.channel == channel {
                     app.resolve_named_users(&history);
                     let newest = history.last().map(|message| message.ts.clone());
+                    let mark_read_mode = app.preferences.read(cx).settings().mark_read;
                     app.messages.update(cx, |list, cx| {
-                        list.set_history(channel.clone(), history, cx)
+                        list.set_history(channel.clone(), history, cx);
+                        if mark_read_mode == 0 {
+                            list.jump_to_unread(cx);
+                        }
                     });
-                    if let Some(newest) = newest {
-                        app.mark_read(&channel, newest, cx);
+                    if mark_read_mode != 2 {
+                        if let Some(newest) = newest {
+                            app.mark_read(&channel, newest, cx);
+                        }
                     }
                 }
             })
@@ -6443,7 +6704,13 @@ impl App {
         self.deliver_send(content, cx);
     }
 
-    fn deliver_send(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+    fn deliver_send(&mut self, mut content: MessageContent, cx: &mut Context<Self>) {
+        if self.preferences.read(cx).settings().convert_emoticons && !content.text.is_empty() {
+            let converted = convert_emoticons(&content.text);
+            if converted != content.text {
+                content.text = converted;
+            }
+        }
         let channel = self.channel.clone();
         // The local echo shows the same blocks & attachments the message posts with.
         let mut message = self
@@ -6944,6 +7211,13 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &OpenHome, _, cx| this.open_home(cx)))
             .on_action(cx.listener(|this, _: &CreateChannelAction, window, cx| {
                 this.open_create_channel(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PopOutConversation, _, cx| {
+                let ch = this.channel.clone();
+                this.pop_out_conversation(ch, cx);
+            }))
+            .on_action(cx.listener(|this, _: &UnsendLastMessage, window, cx| {
+                this.unsend_last_message(window, cx);
             }))
             .relative()
             .size_full()
@@ -8375,6 +8649,12 @@ fn subscribe_workspace(
                 SidebarEvent::BrowseChannels => this.open_browser(window, cx),
                 SidebarEvent::CreateChannel => this.open_create_channel(window, cx),
                 SidebarEvent::SwitchWorkspace(index) => this.switch_workspace(*index, window, cx),
+                SidebarEvent::ReorderWorkspace { from, to } => {
+                    this.reorder_workspace(*from, *to, window, cx)
+                }
+                SidebarEvent::OpenInNewWindow(channel) => {
+                    this.pop_out_conversation(channel.clone(), cx)
+                }
                 SidebarEvent::OpenDrafts => this.open_drafts(cx),
                 SidebarEvent::OpenLater => this.open_later(cx),
                 SidebarEvent::OpenThreads => this.open_threads(cx),
@@ -8474,6 +8754,12 @@ fn subscribe_workspace(
                 SearchEvent::Open { channel, ts } => {
                     this.select(channel.clone(), cx);
                     this.messages.update(cx, |list, cx| list.reveal(ts, cx));
+                }
+                SearchEvent::OpenChannel(channel) => {
+                    this.select(channel.clone(), cx);
+                }
+                SearchEvent::OpenProfile(user) => {
+                    this.open_profile(user.clone(), cx);
                 }
                 SearchEvent::RemoteMessages { query, sort, page } => {
                     this.bridge.send(Command::SearchRemoteMessages {
@@ -8651,6 +8937,9 @@ fn subscribe_workspace(
                         window,
                         cx,
                     );
+                }
+                ThreadPanelEvent::PopOut { channel, thread_ts } => {
+                    this.pop_out_thread(channel.clone(), thread_ts.clone(), cx);
                 }
                 ThreadPanelEvent::Later(request) => this.save_for_later(request, cx),
                 ThreadPanelEvent::Changed { channel, change } => this.post_change(channel, change),
@@ -8962,6 +9251,60 @@ fn forget_failure<T>(loaded: &mut HashMap<ChannelId, Loaded<T>>, channel: &Chann
     if loaded.get(channel).is_some_and(Result::is_err) {
         loaded.remove(channel);
     }
+}
+
+/// Convert common typed emoticons outside inline/fenced code spans into Slack `:shortcode:`
+/// emoji when Preferences > Appearance > Convert emoticons is enabled (`F-SHELL-091`).
+fn convert_emoticons(text: &str) -> String {
+    const MAP: [(&str, &str); 12] = [
+        (":-)", ":slightly_smiling_face:"),
+        (":)", ":slightly_smiling_face:"),
+        (":-D", ":smiley:"),
+        (":D", ":smiley:"),
+        (":-(", ":disappointed:"),
+        (":(", ":disappointed:"),
+        (";-)", ":wink:"),
+        (";)", ":wink:"),
+        (":-P", ":stuck_out_tongue:"),
+        (":P", ":stuck_out_tongue:"),
+        ("<3", ":heart:"),
+        (":/", ":confused:"),
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('`') {
+            in_code = !in_code;
+            out.push('`');
+            rest = after;
+            continue;
+        }
+        if !in_code {
+            let at_boundary = out
+                .chars()
+                .last()
+                .is_none_or(|c| c.is_whitespace() || c == '(');
+            if at_boundary {
+                if let Some((pat, rep)) = MAP.iter().find(|(pat, _)| {
+                    rest.strip_prefix(*pat).is_some_and(|after| {
+                        after
+                            .chars()
+                            .next()
+                            .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?'))
+                    })
+                }) {
+                    out.push_str(rep);
+                    rest = &rest[pat.len()..];
+                    continue;
+                }
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
 }
 
 /// Howard Hinnant's `civil_from_days`: convert days since 1970-01-01 into `(year, month, day)`.

@@ -20,8 +20,9 @@ use crate::app::{
     ActualSize, CreateChannelAction, FocusSearch, JumpToUnread, NavigateBack, NavigateForward,
     NewMessage, NextWorkspace, OpenActivity, OpenChannelBrowser, OpenDms, OpenDownloads,
     OpenDrafts, OpenFiles, OpenHome, OpenLater, OpenOwnProfile, OpenPeople, OpenPreferences,
-    OpenRecent, OpenThreads, OpenUnreads, PreviousWorkspace, QuickSwitch, SearchConversation,
-    ShowShortcuts, SignOut, SwitchWorkspace, ToggleRightPane, ToggleWorkspaceRail, ZoomIn, ZoomOut,
+    OpenRecent, OpenThreads, OpenUnreads, PopOutConversation, PreviousWorkspace, QuickSwitch,
+    SearchConversation, ShowShortcuts, SignOut, SwitchWorkspace, ToggleRightPane,
+    ToggleWorkspaceRail, UnsendLastMessage, ZoomIn, ZoomOut,
 };
 
 actions!(
@@ -110,6 +111,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
         Menu::new("File").items([
             MenuItem::action("New Message", NewMessage),
             MenuItem::action("Create a Channel\u{2026}", CreateChannelAction),
+            MenuItem::action("Open Conversation in New Window", PopOutConversation),
             MenuItem::separator(),
             MenuItem::submenu(
                 Menu::new("Workspace").items(
@@ -131,6 +133,8 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
             MenuItem::os_action("Copy", Copy, OsAction::Copy),
             MenuItem::os_action("Paste", Paste, OsAction::Paste),
             MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("Unsend Last Message", UnsendLastMessage),
             MenuItem::separator(),
             MenuItem::action("Search", FocusSearch),
             MenuItem::separator(),

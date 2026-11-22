@@ -96,6 +96,9 @@ const FREQUENT_EMOJI: &str = "frequent_emoji";
 /// The store's local-state key for the chosen emoji skin tone (1..=6).
 const EMOJI_TONE: &str = "emoji_tone";
 
+/// The store's local-state key for the user's preferred workspace rail order (JSON array of TeamId strings).
+const WORKSPACE_ORDER: &str = "workspace_order";
+
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
 struct EventHub;
@@ -106,7 +109,7 @@ pub struct CoreBridge {
     /// Live mode: forwards commands into the core's command loop. Fixture mode: `None`.
     /// The `futures::channel::mpsc::UnboundedSender` it captures is not nameable here, so it
     /// is wrapped in a closure instead of a field.
-    command_sink: Option<Box<dyn Fn(Command) + Send>>,
+    command_sink: Option<Arc<dyn Fn(Command) + Send + Sync>>,
     /// Live mode: the store the core keeps current; views re-read it to render. Fixture
     /// mode: `None`.
     store: Option<SharedStore>,
@@ -159,7 +162,7 @@ impl CoreBridge {
         let (commands, mut events, store) = handle.into_parts();
         bridge.store = Some(store);
         let sender = commands.clone();
-        bridge.command_sink = Some(Box::new(move |command| {
+        bridge.command_sink = Some(Arc::new(move |command| {
             if let Err(e) = commands.unbounded_send(command) {
                 eprintln!("slackless: core has stopped; command dropped ({e})");
             }
@@ -306,6 +309,13 @@ impl CoreBridge {
         if let Some(sink) = &self.command_sink {
             sink(command);
         }
+    }
+
+    /// Clone a lightweight command forwarder for popped-out secondary GPUI windows.
+    pub fn forwarder(&self) -> Arc<dyn Fn(Command) + Send + Sync> {
+        self.command_sink
+            .clone()
+            .unwrap_or_else(|| Arc::new(|_| {}))
     }
 
     /// The store the core keeps current (live mode); views re-read it to render. `None` in
@@ -543,6 +553,24 @@ impl CoreBridge {
         tone: u8,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
         self.write_local(EMOJI_TONE, tone.to_string(), "emoji skin tone")
+    }
+
+    /// Saved workspace switcher order (`TeamId` strings); `None` offline or unset.
+    pub fn workspace_order(&self) -> Option<Vec<String>> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(WORKSPACE_ORDER)?).ok()
+    }
+
+    /// Live mode: persist workspace switcher order off the UI thread. `None` offline.
+    pub fn remember_workspace_order(
+        &self,
+        team_ids: &[String],
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(
+            WORKSPACE_ORDER,
+            serde_json::to_string(team_ids).ok()?,
+            "workspace order",
+        )
     }
 
     /// This workspace's stored local-state `key`; `None` offline or when unset.

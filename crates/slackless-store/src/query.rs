@@ -141,9 +141,10 @@ impl SearchQuery {
         self.terms.join(" ")
     }
 
-    /// The FTS5 MATCH expression: every term quoted (so FTS5 syntax in user input is literal),
-    /// implicitly ANDed, with any `-excluded` terms appended via `NOT`. `None` when there are
-    /// no positive free-text terms (use [`Self::fts_excluded_match`] for negative-only queries).
+    /// The FTS5 MATCH expression: every term quoted (so FTS5 syntax in user input is literal,
+    /// with trailing `*` honored as an FTS5 prefix wildcard), implicitly ANDed, with any
+    /// `-excluded` terms appended via `NOT`. `None` when there are no positive free-text terms
+    /// (use [`Self::fts_excluded_match`] for negative-only queries).
     pub fn fts_match(&self) -> Option<String> {
         if self.terms.is_empty() {
             return None;
@@ -151,11 +152,12 @@ impl SearchQuery {
         let mut expr = self
             .terms
             .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .map(|t| fts_term(t))
             .collect::<Vec<_>>()
             .join(" ");
         for excluded in &self.excluded_terms {
-            expr.push_str(&format!(" NOT \"{}\"", excluded.replace('"', "\"\"")));
+            expr.push_str(" NOT ");
+            expr.push_str(&fts_term(excluded));
         }
         Some(expr)
     }
@@ -169,10 +171,20 @@ impl SearchQuery {
         Some(
             self.excluded_terms
                 .iter()
-                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+                .map(|t| fts_term(t))
                 .collect::<Vec<_>>()
                 .join(" OR "),
         )
+    }
+}
+
+/// Format a single search term for FTS5 `MATCH`, supporting Slack's trailing `*` prefix wildcard
+/// (`deploy*` -> `"deploy"*`) while quoting all other characters literally.
+fn fts_term(term: &str) -> String {
+    if let Some(stem) = term.strip_suffix('*').filter(|s| !s.is_empty()) {
+        format!("\"{}\"*", stem.replace('"', "\"\""))
+    } else {
+        format!("\"{}\"", term.replace('"', "\"\""))
     }
 }
 
@@ -341,6 +353,12 @@ mod tests {
         assert_eq!(
             neg_only.fts_excluded_match().as_deref(),
             Some(r#""noise" OR "spam""#)
+        );
+
+        let prefix = SearchQuery::parse("deploy* -stag*");
+        assert_eq!(
+            prefix.fts_match().as_deref(),
+            Some(r#""deploy"* NOT "stag"*"#)
         );
     }
 }

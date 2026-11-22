@@ -364,6 +364,11 @@ pub enum Command {
     SetPresence {
         away: bool,
     },
+    /// Write a single user preference key/value back to Slack (`users.prefs.set`).
+    SetUserPref {
+        name: String,
+        value: String,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }

@@ -957,16 +957,31 @@ pub fn attachments(message: &Message, kcx: &KitCx, cx: &App) -> Option<Div> {
     if message.attachments.is_empty() {
         return None;
     }
+    let show_previews = crate::preferences::display_prefs(cx).link_previews;
+    let cards: Vec<Div> = message
+        .attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, attachment)| show_previews || !is_page_preview_attachment(attachment))
+        .map(|(n, attachment)| attachment_card(attachment, n, kcx, cx))
+        .collect();
+    if cards.is_empty() {
+        return None;
+    }
     // Slack's cards sit about 6px under the text above them: the body's gap alone.
-    Some(
-        v_flex().gap_2().children(
-            message
-                .attachments
-                .iter()
-                .enumerate()
-                .map(|(n, attachment)| attachment_card(attachment, n, kcx, cx)),
-        ),
-    )
+    Some(v_flex().gap_2().children(cards))
+}
+
+fn is_page_preview_attachment(attachment: &Attachment) -> bool {
+    !attachment.is_msg_unfurl
+        && attachment.from_url.is_some()
+        && attachment.service_name.is_some()
+        && attachment.color.is_none()
+        && attachment
+            .extra
+            .get("is_app_unfurl")
+            .and_then(|value| value.as_bool())
+            != Some(true)
 }
 
 /// The color bar's color: `good` / `warning` / `danger`, a hex value, or the border color.

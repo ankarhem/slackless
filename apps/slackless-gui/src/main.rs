@@ -47,6 +47,7 @@ mod menu_bar;
 mod messages;
 mod new_message;
 mod pins;
+mod popout;
 mod preferences;
 mod profile;
 mod search;
@@ -85,9 +86,32 @@ fn main() {
     if std::env::args().any(|arg| arg == sign_in::FLAG) {
         std::process::exit(sign_in::run_helper());
     }
+    let startup_urls: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| {
+            arg.starts_with("slack://")
+                || arg.starts_with("https://app.slack.com/")
+                || arg.contains(".slack.com/archives/")
+        })
+        .collect();
     let sessions = sign_in::sessions();
     let zoom = zoom::Zoom::default();
     let app = Application::with_platform(zoom.platform()).with_assets(AllAssets);
+    type MainWindowSlot = std::rc::Rc<
+        std::cell::RefCell<
+            Option<(
+                gpui_kit::gpui::WeakEntity<App>,
+                gpui_kit::gpui::AnyWindowHandle,
+            )>,
+        >,
+    >;
+    let main_app: MainWindowSlot = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let pending_urls: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(startup_urls));
+    let pending_for_open = pending_urls.clone();
+    app.on_open_urls(move |urls| {
+        pending_for_open.borrow_mut().extend(urls);
+    });
 
     app.run(move |cx| {
         cx.set_global(zoom);
@@ -97,7 +121,7 @@ fn main() {
         theme::init(cx);
         menu_bar::init(cx);
 
-        let live_pairs: Vec<(fixtures::Fixtures, CoreBridge)> = sessions
+        let mut live_pairs: Vec<(fixtures::Fixtures, CoreBridge)> = sessions
             .into_iter()
             .filter_map(|session| {
                 let bridge = CoreBridge::start(session, cx)?;
@@ -105,6 +129,26 @@ fn main() {
                 Some((snapshot, bridge))
             })
             .collect();
+        // Restore persisted workspace rail order (`F-CORE-003`) if present.
+        if live_pairs.len() > 1 {
+            if let Some(order) = live_pairs
+                .iter()
+                .find_map(|(_, b)| b.workspace_order())
+                .filter(|o| !o.is_empty())
+            {
+                live_pairs.sort_by_key(|(snap, _)| {
+                    let id = snap
+                        .workspaces
+                        .first()
+                        .map(|t| t.id.as_str())
+                        .unwrap_or_default();
+                    order
+                        .iter()
+                        .position(|wanted| wanted == id)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        }
         let (fixtures, bridges) = if !live_pairs.is_empty() {
             let teams: Vec<_> = live_pairs
                 .iter()
@@ -164,7 +208,9 @@ fn main() {
             ..TitleBar::window_options()
         };
 
-        open_window(window_options, cx, move |window, cx| {
+        let main_app_for_win = main_app.clone();
+        let pending_for_poll = pending_urls.clone();
+        let handle = open_window(window_options, cx, move |window, cx| {
             if let Some(state) = saved_frame {
                 // Restore once the window is built, then re-read its size: AppKit's resize
                 // notification can miss GPUI (the viewport would keep the 1200x800 default and
@@ -175,8 +221,41 @@ fn main() {
                     window.activate_window();
                 });
             }
-            App::new_multi(fixtures.clone(), bridges, window, cx)
+            let entity = App::new_multi(fixtures.clone(), bridges, window, cx);
+            *main_app_for_win.borrow_mut() = Some((entity.downgrade(), window.window_handle()));
+            entity
         })
         .expect("Failed to open window");
+        let _ = handle;
+        // Drain OS `on_open_urls` and startup CLI deep links (`slack://`, `app.slack.com/client/...`,
+        // `*.slack.com/archives/...`) into the main App window.
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(120))
+                    .await;
+                let urls: Vec<String> = {
+                    let mut guard = pending_for_poll.borrow_mut();
+                    std::mem::take(&mut *guard)
+                };
+                if urls.is_empty() {
+                    continue;
+                }
+                let target = main_app.borrow().clone();
+                if let Some((weak, win_handle)) = target {
+                    cx.update(|cx| {
+                        let _ = win_handle.update(cx, |_, window, cx| {
+                            window.activate_window();
+                            let _ = weak.update(cx, |app, cx| {
+                                for url in urls {
+                                    app.handle_deep_link(&url, window, cx);
+                                }
+                            });
+                        });
+                    });
+                }
+            }
+        })
+        .detach();
     });
 }

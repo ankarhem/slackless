@@ -83,6 +83,13 @@ pub enum SidebarEvent {
     CreateChannel,
     /// A workspace tile in the rail was clicked (index into `Fixtures::workspaces`).
     SwitchWorkspace(usize),
+    /// Reorder a workspace tile in the rail (`F-CORE-003`).
+    ReorderWorkspace {
+        from: usize,
+        to: usize,
+    },
+    /// Open `channel` in a separate native GPUI window (`F-CORE-026`).
+    OpenInNewWindow(ChannelId),
     /// The "Drafts & sent" row.
     OpenDrafts,
     /// The "Saved" row.
@@ -893,6 +900,10 @@ impl Sidebar {
         cx.emit(SidebarEvent::LeaveChannel(channel));
     }
 
+    pub(crate) fn open_in_new_window(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        cx.emit(SidebarEvent::OpenInNewWindow(channel));
+    }
+
     /// The rows a section's menus and popover list: this menu's labels and glyphs.
     pub(crate) fn menu_rows(&self, ids: &[ChannelId]) -> Vec<MenuRow> {
         let watermark = self.read_watermark();
@@ -1683,6 +1694,8 @@ impl Sidebar {
                 .border_color(badge_ring)
                 .bg(theme.sidebar_foreground)
         });
+        let ws_len = self.fixtures.workspaces.len();
+        let this_ws = cx.entity().downgrade();
         // Slack rings the active workspace's icon; the others take a faint ring on hover.
         div()
             .id(SharedString::from(format!("workspace-{index}")))
@@ -1720,6 +1733,41 @@ impl Sidebar {
                     cx.emit(SidebarEvent::SwitchWorkspace(index));
                 }
             }))
+            .context_menu(move |mut menu, _, _| {
+                if ws_len > 1 {
+                    if index > 0 {
+                        let this = this_ws.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new("Move up")
+                                .icon(IconName::ArrowUp)
+                                .on_click(move |_, _, cx| {
+                                    let _ = this.update(cx, |_, cx| {
+                                        cx.emit(SidebarEvent::ReorderWorkspace {
+                                            from: index,
+                                            to: index - 1,
+                                        });
+                                    });
+                                }),
+                        );
+                    }
+                    if index + 1 < ws_len {
+                        let this = this_ws.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new("Move down")
+                                .icon(IconName::ArrowDown)
+                                .on_click(move |_, _, cx| {
+                                    let _ = this.update(cx, |_, cx| {
+                                        cx.emit(SidebarEvent::ReorderWorkspace {
+                                            from: index,
+                                            to: index + 1,
+                                        });
+                                    });
+                                }),
+                        );
+                    }
+                }
+                menu
+            })
     }
 
     fn workspace_header(&self, cx: &mut Context<Self>) -> Div {
