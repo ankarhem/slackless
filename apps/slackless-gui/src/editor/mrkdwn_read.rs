@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use slackless_core::types::rich_text::BroadcastRange;
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, UserId, UsergroupId};
 
 use super::doc::Doc;
 use super::marks::{Atom, LineKind, Style};
@@ -171,7 +171,9 @@ impl Reader<'_> {
             self.doc.append(&line[literal..at]);
             let here = at..range.end;
             let consumed = match byte {
-                b'<' => self.reference(line, here, active),
+                b'<' => self
+                    .underline(line, here.clone(), active)
+                    .or_else(|| self.reference(line, here, active)),
                 b'&' => self.entity(&line[here]),
                 b':' => self.emoji(&line[here]),
                 b'`' => self.code(&line[here]),
@@ -181,6 +183,22 @@ impl Reader<'_> {
             at = literal.max(at + 1);
         }
         self.doc.append(&line[literal..range.end]);
+    }
+
+    fn underline(&mut self, line: &str, range: Range<usize>, active: Style) -> Option<usize> {
+        if active.contains(Style::UNDERLINE) || !line[range.clone()].starts_with("<u>") {
+            return None;
+        }
+        let inner_start = range.start + 3;
+        let rel_close = line[inner_start..range.end].find("</u>")?;
+        if rel_close == 0 {
+            return None;
+        }
+        let close = inner_start + rel_close;
+        self.doc.append("<u>");
+        self.inline(line, inner_start..close, active.with(Style::UNDERLINE));
+        self.doc.append("</u>");
+        Some(close + 4 - range.start)
     }
 
     fn reference(&mut self, line: &str, range: Range<usize>, active: Style) -> Option<usize> {
@@ -199,6 +217,20 @@ impl Reader<'_> {
             let id = ChannelId::from(id);
             let name = self.names.channel_name(&id);
             self.doc.append_atom(Atom::Channel(id), &format!("#{name}"));
+        } else if let Some(rest) = target.strip_prefix("!subteam^") {
+            let id = UsergroupId::from(rest);
+            let shown = match label {
+                Some(label_range) => {
+                    let text = &line[label_range];
+                    if text.starts_with('@') {
+                        text.to_owned()
+                    } else {
+                        format!("@{text}")
+                    }
+                }
+                None => format!("@{}", self.names.usergroup_handle(&id)),
+            };
+            self.doc.append_atom(Atom::Usergroup(id), &shown);
         } else if let Some(name) = target.strip_prefix('!') {
             let range = match BroadcastRange::from(name) {
                 BroadcastRange::Other(_) => return None,

@@ -18,6 +18,7 @@ emojis = "0.9"
 raw-window-handle = "0.6"
 smallvec = "1"
 futures.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 # Headless window tests: drag selection and link clicks over rendered message text. The

@@ -17,7 +17,7 @@ use gpui_kit::gpui::{
     AnyElement, App, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement as _,
     ParentElement as _, SharedString, StrikethroughStyle, Styled as _, UnderlineStyle, div, px,
 };
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, UserId, UsergroupId};
 
 use crate::editor::{
     Atom, Attrs, Directory, Doc, LineKind, Style, delimiter_ranges, empty_pair_at,
@@ -48,6 +48,12 @@ impl Directory for Fixtures {
             .unwrap_or_else(|| id.to_string())
     }
 
+    fn usergroup_handle(&self, id: &UsergroupId) -> String {
+        self.usergroup_handle(id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| id.to_string())
+    }
+
     fn emoji_text(&self, shortcode: &str) -> Option<String> {
         emoji::display_glyph(shortcode).or_else(|| {
             let name = shortcode.split("::").next()?;
@@ -59,7 +65,9 @@ impl Directory for Fixtures {
 /// The token id for a semantic atom.
 fn atom_token_id(atom: &Atom) -> SharedString {
     match atom {
-        Atom::User(_) | Atom::Channel(_) | Atom::Broadcast(_) => MENTION.into(),
+        Atom::User(_) | Atom::Channel(_) | Atom::Usergroup(_) | Atom::Broadcast(_) => {
+            MENTION.into()
+        }
         Atom::Emoji(shortcode) => format!("{EMOJI}{shortcode}").into(),
     }
 }

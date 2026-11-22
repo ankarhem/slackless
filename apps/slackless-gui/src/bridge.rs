@@ -36,8 +36,17 @@ use crate::media::CoreHttp;
 
 /// `serde_json` through gpui's re-export (see `crate::blockkit`).
 use crate::blockkit::serde_json;
-use crate::preferences::AppearanceMode;
+use crate::preferences::{AppearanceMode, Settings};
 use crate::theme;
+
+/// One persisted composer draft in the workspace's local store.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedDraft {
+    pub channel: ChannelId,
+    pub label: String,
+    pub text: String,
+    pub at: u64,
+}
 
 /// Idle wait between event polls while the core is running. The guide's pattern would await
 /// the stream directly; without a `futures` dependency a short bounded poll keeps events at
@@ -74,6 +83,18 @@ const FONT: &str = "font";
 
 /// The store's local-state key for the zoom chosen in Preferences (its level).
 const ZOOM: &str = "zoom";
+
+/// The store's local-state key for all Preferences settings (JSON).
+const SETTINGS: &str = "preferences_settings";
+
+/// The store's local-state key for per-conversation composer drafts (JSON).
+const DRAFTS: &str = "drafts";
+
+/// The store's local-state key for recently/frequently used emoji shortcodes (JSON).
+const FREQUENT_EMOJI: &str = "frequent_emoji";
+
+/// The store's local-state key for the chosen emoji skin tone (1..=6).
+const EMOJI_TONE: &str = "emoji_tone";
 
 /// Receives core events and re-emits them to subscribed views on the UI thread. The bridge
 /// emits through this entity so subscribers can use gpui's native `subscribe` machinery.
@@ -421,6 +442,71 @@ impl CoreBridge {
     /// offline.
     pub fn remember_zoom(&self, level: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
         self.write_local(ZOOM, level.to_string(), "zoom")
+    }
+
+    /// The Preferences settings saved locally; `None` offline or before the first save.
+    pub fn settings(&self) -> Option<Settings> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(SETTINGS)?).ok()
+    }
+
+    /// Live mode: persist Preferences `settings` locally, off the UI thread. `None` offline.
+    pub fn remember_settings(
+        &self,
+        settings: &Settings,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(
+            SETTINGS,
+            serde_json::to_string(settings).ok()?,
+            "preferences",
+        )
+    }
+
+    /// Saved per-conversation composer drafts for this workspace; `None` offline or unset.
+    pub fn drafts(&self) -> Option<Vec<SavedDraft>> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(DRAFTS)?).ok()
+    }
+
+    /// Live mode: persist per-conversation composer drafts off the UI thread. `None` offline.
+    pub fn remember_drafts(
+        &self,
+        drafts: &[SavedDraft],
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(DRAFTS, serde_json::to_string(drafts).ok()?, "drafts")
+    }
+
+    /// Saved frequently used emoji shortcodes; `None` offline or before the first pick.
+    pub fn frequent_emoji(&self) -> Option<Vec<String>> {
+        self.store.as_ref()?;
+        serde_json::from_str(&self.local(FREQUENT_EMOJI)?).ok()
+    }
+
+    /// Live mode: persist frequently used emoji shortcodes off the UI thread. `None` offline.
+    pub fn remember_frequent_emoji(
+        &self,
+        list: &[String],
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(
+            FREQUENT_EMOJI,
+            serde_json::to_string(list).ok()?,
+            "frequent emoji",
+        )
+    }
+
+    /// Saved emoji skin tone (1..=6); `None` offline or before the user picks one.
+    pub fn emoji_tone(&self) -> Option<u8> {
+        self.store.as_ref()?;
+        let tone: u8 = self.local(EMOJI_TONE)?.parse().ok()?;
+        (1..=6).contains(&tone).then_some(tone)
+    }
+
+    /// Live mode: persist emoji skin tone (1..=6) off the UI thread. `None` offline.
+    pub fn remember_emoji_tone(
+        &self,
+        tone: u8,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        self.write_local(EMOJI_TONE, tone.to_string(), "emoji skin tone")
     }
 
     /// This workspace's stored local-state `key`; `None` offline or when unset.

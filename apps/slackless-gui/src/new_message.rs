@@ -37,9 +37,9 @@ pub enum NewMessageEvent {
         channel: ChannelId,
         content: MessageContent,
     },
-    /// No DM exists with `user`; open one and deliver `content` there.
+    /// Open (or reuse) a 1:1 DM, self-DM, or group DM with `users` and deliver `content` there.
     OpenDm {
-        user: UserId,
+        users: Vec<UserId>,
         content: MessageContent,
     },
     /// The composer's emoji button asked for the picker.
@@ -54,7 +54,7 @@ pub struct NewMessageView {
     pub(super) to: Entity<TextareaState>,
     pub(super) query: String,
     pub(super) selected: usize,
-    pub(super) picked: Option<Picked>,
+    pub(super) picked: Vec<Picked>,
     pub(super) composer: Entity<Composer>,
     _subscriptions: Vec<Subscription>,
 }
@@ -117,7 +117,7 @@ impl NewMessageView {
                 to,
                 query: String::new(),
                 selected: 0,
-                picked: None,
+                picked: Vec::new(),
                 composer,
                 _subscriptions: subscriptions,
             }
@@ -129,7 +129,7 @@ impl NewMessageView {
     pub fn open(&mut self, draft: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.query.clear();
         self.selected = 0;
-        self.picked = None;
+        self.picked.clear();
         self.to.update(cx, |state, cx| {
             state.set_value("", window, cx);
             state.focus_handle(cx).focus(window, cx);
@@ -166,16 +166,51 @@ impl NewMessageView {
 impl Render for NewMessageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, foreground, popover) = (
+        let (border, muted, foreground, popover, secondary) = (
             theme.border,
             theme.muted_foreground,
             theme.foreground,
             theme.popover,
+            theme.secondary,
         );
-        let suggestions = suggestions(&self.fixtures, &self.query);
+        let suggestions = suggestions(&self.fixtures, &self.picked, &self.query);
         let selected = self.selected.min(suggestions.len().saturating_sub(1));
-        let picking = self.picked.is_none();
+        let picking = self.picked.is_empty()
+            || (!self.query.is_empty() && !suggestions.is_empty())
+            || (self
+                .picked
+                .iter()
+                .all(|p| matches!(p.recipient, crate::compose_targets::Recipient::User(_)))
+                && self.to.read(cx).focus_handle(cx).is_focused(_window));
         let rows = suggestion_rows(&self.fixtures, &suggestions, selected, picking, cx);
+        let chips: Vec<_> = self
+            .picked
+            .iter()
+            .enumerate()
+            .map(|(ix, picked)| {
+                h_flex()
+                    .id(("compose-chip", ix))
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(secondary)
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(foreground)
+                    .child(picked.label.clone())
+                    .child(
+                        Button::new(("compose-chip-rm", ix))
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::X)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_picked(ix, cx);
+                            })),
+                    )
+            })
+            .collect();
 
         v_flex()
             .id("new-message")
@@ -217,16 +252,18 @@ impl Render for NewMessageView {
                     .pt_2()
                     .child(
                         h_flex()
+                            .flex_wrap()
                             .items_center()
-                            .gap_2()
+                            .gap_1p5()
                             .px_2()
                             .py_1()
                             .rounded_md()
                             .border_1()
                             .border_color(border)
                             .child(div().flex_none().text_sm().text_color(muted).child("To:"))
+                            .children(chips)
                             .child(
-                                div().flex_1().min_w_0().child(
+                                div().flex_1().min_w(px(140.)).child(
                                     Textarea::new(&self.to).appearance(false).bordered(false),
                                 ),
                             ),

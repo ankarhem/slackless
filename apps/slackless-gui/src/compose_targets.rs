@@ -24,12 +24,15 @@ use crate::new_message::{NewMessageEvent, NewMessageView};
 /// Suggestions listed at once.
 const MAX_ROWS: usize = 8;
 
+/// Slack's group DM limit: up to 8 other people (9 total including yourself).
+pub(crate) const MAX_GROUP_USERS: usize = 8;
+
 /// Where a composed message goes.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Recipient {
     /// An existing conversation, ready to receive the message.
     Conversation(ChannelId),
-    /// A person with no DM yet; the root opens one before delivering.
+    /// A person; one or more people open a DM / group DM (`conversations.open`).
     User(UserId),
 }
 
@@ -40,7 +43,7 @@ pub(crate) struct Suggestion {
     pub recipient: Recipient,
 }
 
-/// The picked recipient and the label shown in the To field.
+/// A picked recipient chip in the To field.
 #[derive(Clone)]
 pub(crate) struct Picked {
     pub recipient: Recipient,
@@ -48,43 +51,111 @@ pub(crate) struct Picked {
 }
 
 /// Every pickable recipient matching `query` (lowercased, trimmed), best first.
-pub(crate) fn suggestions(fixtures: &Fixtures, query: &str) -> Vec<Suggestion> {
-    let mut conversations: Vec<Conversation> = fixtures
-        .channels
+/// When one or more people are already picked, only additional people are offered (up to
+/// [`MAX_GROUP_USERS`]) so the user can compose a group DM.
+pub(crate) fn suggestions(fixtures: &Fixtures, picked: &[Picked], query: &str) -> Vec<Suggestion> {
+    let people_only = !picked.is_empty()
+        && picked
+            .iter()
+            .all(|p| matches!(p.recipient, Recipient::User(_)));
+    if !picked.is_empty() && !people_only {
+        return Vec::new();
+    }
+    if people_only && picked.len() >= MAX_GROUP_USERS {
+        return Vec::new();
+    }
+    let chosen_users: HashSet<&UserId> = picked
         .iter()
-        .chain(&fixtures.dms)
-        .cloned()
-        .collect();
-    conversations
-        .sort_by_key(|conversation| std::cmp::Reverse(latest_activity(fixtures, conversation)));
-    let with_dm: HashSet<UserId> = fixtures
-        .dms
-        .iter()
-        .filter_map(|dm| dm.user.clone())
-        .collect();
-    let all: Vec<Suggestion> = conversations
-        .into_iter()
-        .map(|conversation| Suggestion {
-            recipient: Recipient::Conversation(conversation.id.clone()),
-            label: fixtures.conversation_label(&conversation),
-            kind: match conversation.kind() {
-                ConversationKind::Im => "Direct message",
-                ConversationKind::Mpim => "Group DM",
-                _ => "Channel",
-            },
+        .filter_map(|p| match &p.recipient {
+            Recipient::User(u) => Some(u),
+            Recipient::Conversation(_) => None,
         })
-        .chain(
-            fixtures
-                .users
-                .iter()
-                .filter(|user| user.id != fixtures.self_user && !with_dm.contains(&user.id))
-                .map(|user| Suggestion {
-                    label: fixtures.user_name(&user.id).to_owned(),
-                    kind: "Person",
-                    recipient: Recipient::User(user.id.clone()),
-                }),
-        )
         .collect();
+
+    let all: Vec<Suggestion> = if people_only {
+        fixtures
+            .users
+            .iter()
+            .filter(|u| !u.deleted && !chosen_users.contains(&u.id) && u.id != fixtures.self_user)
+            .map(|user| Suggestion {
+                label: fixtures.user_name(&user.id).to_owned(),
+                kind: "Person",
+                recipient: Recipient::User(user.id.clone()),
+            })
+            .collect()
+    } else {
+        let mut conversations: Vec<Conversation> = fixtures
+            .channels
+            .iter()
+            .chain(&fixtures.dms)
+            .cloned()
+            .collect();
+        conversations
+            .sort_by_key(|conversation| std::cmp::Reverse(latest_activity(fixtures, conversation)));
+        let with_dm: HashSet<UserId> = fixtures
+            .dms
+            .iter()
+            .filter_map(|dm| dm.user.clone())
+            .collect();
+        conversations
+            .into_iter()
+            .map(|conversation| {
+                // Picking a 1:1 IM's peer as `User` lets the user add more people to form a
+                // group DM; if sent alone, the root still routes to the existing IM.
+                let (recipient, label, kind) = match conversation.kind() {
+                    ConversationKind::Im => match conversation.user.clone() {
+                        Some(peer) => {
+                            let is_self = peer == fixtures.self_user;
+                            let name = if is_self {
+                                format!("{} (you)", fixtures.user_name(&peer))
+                            } else {
+                                fixtures.user_name(&peer).to_owned()
+                            };
+                            (Recipient::User(peer), name, "Direct message")
+                        }
+                        None => (
+                            Recipient::Conversation(conversation.id.clone()),
+                            fixtures.conversation_label(&conversation),
+                            "Direct message",
+                        ),
+                    },
+                    ConversationKind::Mpim => (
+                        Recipient::Conversation(conversation.id.clone()),
+                        fixtures.conversation_label(&conversation),
+                        "Group DM",
+                    ),
+                    _ => (
+                        Recipient::Conversation(conversation.id.clone()),
+                        fixtures.conversation_label(&conversation),
+                        "Channel",
+                    ),
+                };
+                Suggestion {
+                    recipient,
+                    label,
+                    kind,
+                }
+            })
+            .chain(
+                fixtures
+                    .users
+                    .iter()
+                    .filter(|user| !user.deleted && !with_dm.contains(&user.id))
+                    .map(|user| {
+                        let is_self = user.id == fixtures.self_user;
+                        Suggestion {
+                            label: if is_self {
+                                format!("{} (you)", fixtures.user_name(&user.id))
+                            } else {
+                                fixtures.user_name(&user.id).to_owned()
+                            },
+                            kind: if is_self { "Direct message" } else { "Person" },
+                            recipient: Recipient::User(user.id.clone()),
+                        }
+                    }),
+            )
+            .collect()
+    };
     let key = |label: &str| label.trim_start_matches("# ").to_lowercase();
     let (mut prefix, mut rest): (Vec<_>, Vec<_>) = all
         .into_iter()
@@ -182,13 +253,6 @@ pub(super) fn suggestion_rows(
 impl NewMessageView {
     pub(super) fn on_query_change(&mut self, to: &Entity<TextareaState>, cx: &mut Context<Self>) {
         let value = to.read(cx).value().to_string();
-        if self
-            .picked
-            .as_ref()
-            .is_some_and(|picked| picked.label != value)
-        {
-            self.picked = None;
-        }
         self.query = value.trim().to_lowercase();
         self.selected = 0;
         cx.notify();
@@ -197,21 +261,47 @@ impl NewMessageView {
     pub(super) fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.query.clone();
         let fixtures = self.fixtures.clone();
-        let Some(suggestion) = suggestions(&fixtures, &query)
+        let Some(suggestion) = suggestions(&fixtures, &self.picked, &query)
             .into_iter()
             .nth(self.selected)
         else {
             return;
         };
         let label = suggestion.label.trim_start_matches("# ").to_owned();
-        self.picked = Some(Picked {
-            recipient: suggestion.recipient,
-            label: label.clone(),
-        });
+        match &suggestion.recipient {
+            Recipient::Conversation(_) => {
+                self.picked = vec![Picked {
+                    recipient: suggestion.recipient,
+                    label,
+                }];
+            }
+            Recipient::User(user) => {
+                if !self
+                    .picked
+                    .iter()
+                    .any(|p| matches!(&p.recipient, Recipient::User(u) if u == user))
+                    && self.picked.len() < MAX_GROUP_USERS
+                {
+                    self.picked.push(Picked {
+                        recipient: suggestion.recipient,
+                        label,
+                    });
+                }
+            }
+        }
+        self.query.clear();
         self.selected = 0;
         self.to
-            .update(cx, |state, cx| state.set_value(label, window, cx));
+            .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
+    }
+
+    pub(super) fn remove_picked(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.picked.len() {
+            self.picked.remove(index);
+            self.selected = 0;
+            cx.notify();
+        }
     }
 
     pub(super) fn send(
@@ -220,27 +310,53 @@ impl NewMessageView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(picked) = self.picked.clone() else {
+        if self.picked.is_empty() {
             // Keep the draft (its mrkdwn reads back with formatting): nothing is picked yet.
             self.composer
                 .update(cx, |composer, cx| composer.load_draft(&content.text, cx));
             self.to.read(cx).focus_handle(cx).focus(window, cx);
             cx.notify();
             return;
-        };
-        match picked.recipient {
-            Recipient::Conversation(channel) => {
-                cx.emit(NewMessageEvent::Send { channel, content });
-            }
-            Recipient::User(user) => {
-                cx.emit(NewMessageEvent::OpenDm { user, content });
-            }
+        }
+        if let [
+            Picked {
+                recipient: Recipient::Conversation(channel),
+                ..
+            },
+        ] = self.picked.as_slice()
+        {
+            cx.emit(NewMessageEvent::Send {
+                channel: channel.clone(),
+                content,
+            });
+            return;
+        }
+        let users: Vec<UserId> = self
+            .picked
+            .iter()
+            .filter_map(|p| match &p.recipient {
+                Recipient::User(u) => Some(u.clone()),
+                Recipient::Conversation(_) => None,
+            })
+            .collect();
+        if !users.is_empty() {
+            cx.emit(NewMessageEvent::OpenDm { users, content });
         }
     }
 
     pub(super) fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key.as_str() == "backspace"
+            && self.query.is_empty()
+            && !self.picked.is_empty()
+        {
+            self.picked.pop();
+            self.selected = 0;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let (fixtures, query) = (self.fixtures.clone(), self.query.clone());
-        let count = suggestions(&fixtures, &query).len();
+        let count = suggestions(&fixtures, &self.picked, &query).len();
         match event.keystroke.key.as_str() {
             "down" if count > 0 => self.selected = (self.selected + 1) % count,
             "up" if count > 0 => self.selected = (self.selected + count - 1) % count,

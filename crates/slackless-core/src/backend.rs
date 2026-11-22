@@ -11,7 +11,7 @@ use crate::api::{
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File,
-    Message, Team, TeamId, Ts, User, UserId, UserPresence,
+    Message, Team, TeamId, Ts, User, UserId, UserPresence, Usergroup,
 };
 
 /// `conversations.history` page size the core requests (Slack max 999).
@@ -196,8 +196,9 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         entries: Vec<ActivityEntry>,
     ) -> impl Future<Output = api::Result<()>> + Send;
-    /// Open (or find) the DM with `user` (`conversations.open`).
-    fn open_dm(&self, user: UserId) -> impl Future<Output = api::Result<Conversation>> + Send;
+    /// Open (or find) the DM or group DM with `users` (`conversations.open`).
+    fn open_dm(&self, users: Vec<UserId>)
+    -> impl Future<Output = api::Result<Conversation>> + Send;
     /// Create a sidebar channel section (`users.channelSections.create`).
     fn create_section(
         &self,
@@ -288,6 +289,8 @@ pub trait Backend: Clone + Send + Sync + 'static {
         channel: ChannelId,
         scheduled_message_id: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Active `@handle` user groups (`usergroups.list`).
+    fn usergroups(&self) -> impl Future<Output = api::Result<Vec<Usergroup>>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -516,8 +519,9 @@ impl Backend for SlackApi {
         SlackApi::activity_mark_unread(self, &entries).await
     }
 
-    async fn open_dm(&self, user: UserId) -> api::Result<Conversation> {
-        self.conversations_open(user.as_str()).await
+    async fn open_dm(&self, users: Vec<UserId>) -> api::Result<Conversation> {
+        let csv: Vec<&str> = users.iter().map(UserId::as_str).collect();
+        self.conversations_open(&csv.join(",")).await
     }
 
     async fn create_section(&self, name: String) -> api::Result<SectionCreated> {
@@ -646,5 +650,9 @@ impl Backend for SlackApi {
     ) -> api::Result<()> {
         self.chat_delete_scheduled_message(&channel, &scheduled_message_id)
             .await
+    }
+
+    async fn usergroups(&self) -> api::Result<Vec<Usergroup>> {
+        self.usergroups_list().await
     }
 }

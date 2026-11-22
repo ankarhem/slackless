@@ -6,6 +6,7 @@
 //! `QuickSwitcher::open(&mut self, &mut Window, &mut Context<Self>)` (reset + focus)
 //! emits `SwitcherEvent::Open(ChannelId)`
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -17,9 +18,9 @@ use gpui_kit::gpui::{
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::types::{ChannelId, ConversationKind};
+use slackless_core::types::{ChannelId, ConversationKind, UserId};
 
-use crate::avatars::conversation_avatar;
+use crate::avatars::{conversation_avatar, user_chip};
 use crate::fixtures::Fixtures;
 
 /// Most rows listed at once.
@@ -27,6 +28,13 @@ const MAX_ROWS: usize = 12;
 
 pub enum SwitcherEvent {
     Open(ChannelId),
+    /// A colleague with no open DM yet; the root opens or creates the DM.
+    OpenUser(UserId),
+}
+
+enum Target {
+    Channel(ChannelId),
+    User(UserId),
 }
 
 pub struct QuickSwitcher {
@@ -91,24 +99,49 @@ impl QuickSwitcher {
         cx.notify();
     }
 
-    /// Conversations matching the filter: name-prefix matches, then substring matches.
-    fn matches(&self) -> Vec<(ChannelId, String)> {
-        // The same prefix-then-substring ranking the search pill's dropdown lists
-        // ([`crate::search_menu::rank_matches`]).
-        crate::search_menu::rank_matches(
-            &self.query,
-            self.fixtures
-                .dms
-                .iter()
-                .chain(&self.fixtures.channels)
-                .map(|c| (c.id.clone(), self.fixtures.conversation_label(c))),
-            MAX_ROWS,
-        )
+    /// Conversations and colleagues matching the filter: prefix matches before substring
+    /// matches, existing conversations ahead of people without an open DM.
+    fn matches(&self) -> Vec<(Target, String)> {
+        let with_dm: HashSet<&UserId> = self
+            .fixtures
+            .dms
+            .iter()
+            .filter_map(|dm| dm.user.as_ref())
+            .collect();
+        let candidates = self
+            .fixtures
+            .dms
+            .iter()
+            .chain(&self.fixtures.channels)
+            .map(|c| {
+                (
+                    Target::Channel(c.id.clone()),
+                    self.fixtures.conversation_label(c),
+                )
+            })
+            .chain(
+                self.fixtures
+                    .users
+                    .iter()
+                    .filter(|u| !u.deleted && !with_dm.contains(&u.id))
+                    .map(|u| {
+                        let name = if u.id == self.fixtures.self_user {
+                            format!("{} (you)", self.fixtures.name_of(u))
+                        } else {
+                            self.fixtures.name_of(u).to_owned()
+                        };
+                        (Target::User(u.id.clone()), name)
+                    }),
+            );
+        crate::search_menu::rank_matches(&self.query, candidates, MAX_ROWS)
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Some((channel, _)) = self.matches().into_iter().nth(self.selected) {
-            cx.emit(SwitcherEvent::Open(channel));
+        if let Some((target, _)) = self.matches().into_iter().nth(self.selected) {
+            match target {
+                Target::Channel(channel) => cx.emit(SwitcherEvent::Open(channel)),
+                Target::User(user) => cx.emit(SwitcherEvent::OpenUser(user)),
+            }
         }
     }
 
@@ -138,81 +171,97 @@ impl Render for QuickSwitcher {
         let matches = self.matches();
         let selected = self.selected.min(matches.len().saturating_sub(1));
 
-        let rows: Vec<_> =
-            matches
-                .iter()
-                .enumerate()
-                .map(|(ix, (channel, label))| {
-                    let on = ix == selected;
-                    let conversation = self.fixtures.conversation(channel);
-                    let leading = match conversation.map(|c| c.kind()) {
-                        Some(ConversationKind::PrivateChannel) => div()
-                            .size(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(IconName::Lock)
-                                    .text_color(if on { active_fg } else { muted })
-                                    .size(px(14.)),
-                            ),
-                        Some(ConversationKind::PublicChannel) => div()
-                            .size(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(IconName::Hash)
-                                    .text_color(if on { active_fg } else { muted })
-                                    .size(px(14.)),
-                            ),
-                        _ => conversation
-                            .map(|c| {
-                                conversation_avatar(
-                                    &self.fixtures,
-                                    c,
-                                    20.,
-                                    if on { active } else { popover },
-                                    cx,
-                                )
-                            })
-                            .unwrap_or_else(div),
-                    };
-                    let kind = match conversation.map(|c| c.kind()) {
-                        Some(ConversationKind::Im) => "Direct message",
-                        Some(ConversationKind::Mpim) => "Group DM",
-                        _ => "Channel",
-                    };
-                    let channel = channel.clone();
-                    h_flex()
-                        .id(("switcher-row", ix))
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_1p5()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .when(on, |row| row.bg(active).text_color(active_fg))
-                        .when(!on, |row| row.hover(|el| el.bg(hover)))
-                        .child(leading)
-                        .child(
-                            div()
-                                .flex_1()
-                                .truncate()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(label.trim_start_matches("# ").to_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if on { active_fg } else { muted })
-                                .child(kind),
-                        )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(SwitcherEvent::Open(channel.clone()))
-                        }))
-                })
-                .collect();
+        let rows: Vec<_> = matches
+            .iter()
+            .enumerate()
+            .map(|(ix, (target, label))| {
+                let on = ix == selected;
+                let (leading, kind) = match target {
+                    Target::Channel(channel) => {
+                        let conversation = self.fixtures.conversation(channel);
+                        let icon = match conversation.map(|c| c.kind()) {
+                            Some(ConversationKind::PrivateChannel) => div()
+                                .size(px(20.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::Lock)
+                                        .text_color(if on { active_fg } else { muted })
+                                        .size(px(14.)),
+                                ),
+                            Some(ConversationKind::PublicChannel) => div()
+                                .size(px(20.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::Hash)
+                                        .text_color(if on { active_fg } else { muted })
+                                        .size(px(14.)),
+                                ),
+                            _ => conversation
+                                .map(|c| {
+                                    conversation_avatar(
+                                        &self.fixtures,
+                                        c,
+                                        20.,
+                                        if on { active } else { popover },
+                                        cx,
+                                    )
+                                })
+                                .unwrap_or_else(div),
+                        };
+                        let kind = match conversation.map(|c| c.kind()) {
+                            Some(ConversationKind::Im) => "Direct message",
+                            Some(ConversationKind::Mpim) => "Group DM",
+                            _ => "Channel",
+                        };
+                        (icon, kind)
+                    }
+                    Target::User(user) => {
+                        let kind = if *user == self.fixtures.self_user {
+                            "Direct message"
+                        } else {
+                            "Person"
+                        };
+                        (user_chip(&self.fixtures, user, 20.), kind)
+                    }
+                };
+                let target_clone = match target {
+                    Target::Channel(c) => Target::Channel(c.clone()),
+                    Target::User(u) => Target::User(u.clone()),
+                };
+                h_flex()
+                    .id(("switcher-row", ix))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(on, |row| row.bg(active).text_color(active_fg))
+                    .when(!on, |row| row.hover(|el| el.bg(hover)))
+                    .child(leading)
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(label.trim_start_matches("# ").to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if on { active_fg } else { muted })
+                            .child(kind),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| match &target_clone {
+                        Target::Channel(channel) => cx.emit(SwitcherEvent::Open(channel.clone())),
+                        Target::User(user) => cx.emit(SwitcherEvent::OpenUser(user.clone())),
+                    }))
+            })
+            .collect();
 
         let empty = rows.is_empty().then(|| {
             div()

@@ -3241,9 +3241,13 @@ fn push_element(
                 None,
             );
         }
-        RichTextElement::Usergroup(_) => {
+        RichTextElement::Usergroup(el) => {
+            let label = fixtures
+                .usergroup_handle(&el.usergroup_id)
+                .map(|handle| format!("@{handle}"))
+                .unwrap_or_else(|| "@group".to_owned());
             builder.push_text(
-                "@group",
+                &label,
                 theme,
                 mention_flags(),
                 Some(theme.link),

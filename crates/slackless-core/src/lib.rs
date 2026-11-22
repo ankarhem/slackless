@@ -179,10 +179,10 @@ pub enum Command {
     FetchChannelManagers {
         channel: ChannelId,
     },
-    /// Open (or find) the DM with `user` (`conversations.open`), store it and announce it
-    /// with [`Event::ConversationOpened`].
+    /// Open (or find) the DM or group DM with `users` (`conversations.open`), store it and
+    /// announce it with [`Event::ConversationOpened`].
     OpenDm {
-        user: UserId,
+        users: Vec<UserId>,
     },
     /// Create a sidebar channel section (`users.channelSections.create`), then re-read the
     /// sections and announce [`Event::SidebarChanged`].
@@ -402,6 +402,8 @@ pub enum Event {
     /// Slack refused a [`Command::RunCommand`]: the command and Slack's error code
     /// (`unknown_command` for one the workspace does not have).
     CommandFailed { command: String, error: String },
+    /// Active `@handle` user groups from `usergroups.list`.
+    Usergroups(Vec<types::Usergroup>),
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

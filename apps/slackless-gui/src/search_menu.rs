@@ -1099,13 +1099,13 @@ fn labeled_conversations(
 
 /// Conversations whose label matches `query` (lowercase): name-prefix matches first, then
 /// substring matches, at most `limit` of them. Shared with the quick switcher's Cmd+K list.
-pub(crate) fn rank_matches(
+pub(crate) fn rank_matches<T>(
     query: &str,
-    conversations: impl Iterator<Item = (ChannelId, String)>,
+    items: impl Iterator<Item = (T, String)>,
     limit: usize,
-) -> Vec<(ChannelId, String)> {
+) -> Vec<(T, String)> {
     let key = |label: &str| label.trim_start_matches("# ").to_lowercase();
-    let (mut prefix, mut rest): (Vec<_>, Vec<_>) = conversations
+    let (mut prefix, mut rest): (Vec<_>, Vec<_>) = items
         .filter(|(_, label)| key(label).contains(query))
         .partition(|(_, label)| key(label).starts_with(query));
     prefix.append(&mut rest);

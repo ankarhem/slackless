@@ -15,7 +15,7 @@ use std::sync::Arc;
 use slackless_core::types::rich_text::{
     BroadcastElement, ChannelElement, EmojiElement, LinkElement, ListStyle, RichTextDivider,
     RichTextHeader, RichTextList, RichTextPreformatted, RichTextQuote, RichTextSection,
-    TextElement, UserElement,
+    TextElement, UserElement, UsergroupElement,
 };
 use slackless_core::types::{Block, RichTextBlock, RichTextContainer, RichTextElement, TextStyle};
 
@@ -230,12 +230,12 @@ impl RichTextReader<'_> {
                     self.append_styled_multiline(label, Style::NONE, url, continuation);
                 }
                 RichTextElement::Usergroup(group) => {
+                    let handle = self.names.usergroup_handle(&group.usergroup_id);
                     let style = from_text_style(group.style);
-                    self.append_styled_multiline(
-                        &format!("<!subteam^{}>", group.usergroup_id),
+                    self.append_styled_atom(
+                        Atom::Usergroup(group.usergroup_id.clone()),
+                        &format!("@{handle}"),
                         style,
-                        None,
-                        continuation,
                     );
                 }
                 RichTextElement::Team(team) => {
@@ -538,6 +538,10 @@ fn line_elements(
                     }),
                     Atom::Channel(id) => RichTextElement::Channel(ChannelElement {
                         channel_id: id.clone(),
+                        style,
+                    }),
+                    Atom::Usergroup(id) => RichTextElement::Usergroup(UsergroupElement {
+                        usergroup_id: id.clone(),
                         style,
                     }),
                     Atom::Broadcast(range) => RichTextElement::Broadcast(BroadcastElement {

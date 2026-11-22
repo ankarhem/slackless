@@ -16,7 +16,7 @@ use slackless_core::types::{
     Attachment, Block, ChannelId, ChannelSection, Conversation, ConversationKind,
     ConversationProperties, Edited, File, FileId, Message, MessageSubtype, Presence, Profile,
     Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TextStyle, TopicPurpose, Ts,
-    User, UserId,
+    User, UserId, Usergroup, UsergroupId,
     message::AttachmentField,
     rich_text::{
         EmojiElement, LinkElement, ListStyle, RichTextList, RichTextPreformatted, RichTextSection,
@@ -117,6 +117,8 @@ pub struct Fixtures {
     /// The signed-in user; author of locally composed messages.
     pub self_user: UserId,
     pub users: Vec<User>,
+    /// Active `@handle` user groups (`usergroups.list`).
+    pub usergroups: Vec<Usergroup>,
     pub channels: Vec<Conversation>,
     /// IMs and MPIMs.
     pub dms: Vec<Conversation>,
@@ -229,6 +231,16 @@ impl Fixtures {
 
     pub fn user(&self, id: &UserId) -> Option<&User> {
         self.users.iter().find(|u| u.id == *id)
+    }
+
+    pub fn usergroup(&self, id: &UsergroupId) -> Option<&Usergroup> {
+        self.usergroups.iter().find(|g| g.id == *id)
+    }
+
+    pub fn usergroup_handle(&self, id: &UsergroupId) -> Option<&str> {
+        self.usergroup(id)
+            .map(|g| g.handle.as_str())
+            .filter(|h| !h.is_empty())
     }
 
     pub fn presence(&self, user: &UserId) -> Option<Presence> {
@@ -1057,11 +1069,31 @@ pub fn load() -> Fixtures {
         },
     ];
 
+    let usergroups = vec![
+        Usergroup {
+            id: UsergroupId::from("S0ENG"),
+            name: "Engineering".into(),
+            handle: "engineering".into(),
+            description: Some("Product and platform engineers".into()),
+            user_count: Some(6),
+            ..Default::default()
+        },
+        Usergroup {
+            id: UsergroupId::from("S0DES"),
+            name: "Design".into(),
+            handle: "design".into(),
+            description: Some("Product designers".into()),
+            user_count: Some(3),
+            ..Default::default()
+        },
+    ];
+
     Fixtures {
         workspaces,
         teams,
         self_user: "U0ME".into(),
         users,
+        usergroups,
         channels,
         dms,
         messages,
@@ -1238,6 +1270,7 @@ pub fn live(
         teams,
         self_user: session.user_id.clone(),
         users,
+        usergroups: Vec::new(),
         channels,
         dms,
         messages: HashMap::new(),

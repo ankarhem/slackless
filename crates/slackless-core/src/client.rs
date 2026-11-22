@@ -454,6 +454,15 @@ impl<B: Backend> Core<B> {
             }
             Err(e) => self.events.report("emoji.list", e.into()),
         }
+        if let Ok(groups) = self.backend.usergroups().await {
+            let active: Vec<_> = groups
+                .into_iter()
+                .filter(|g| !g.is_deleted() && !g.handle.is_empty())
+                .collect();
+            if !active.is_empty() {
+                self.events.emit(Event::Usergroups(active));
+            }
+        }
         self.events.emit(Event::SidebarChanged);
         self.fetch_dm_previews();
         // The Activity badges need the feed's unread state; last, so the boot's own events
@@ -784,8 +793,8 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
-            Command::OpenDm { user } => self.spawn("conversations.open", async move {
-                let dm = backend.open_dm(user).await?;
+            Command::OpenDm { users } => self.spawn("conversations.open", async move {
+                let dm = backend.open_dm(users).await?;
                 let channel = dm.id.clone();
                 with_store(&store, move |s| s.upsert_conversation(&ws, &dm)).await?;
                 events.emit(Event::Conversations(vec![channel.clone()]));
@@ -2298,13 +2307,22 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn open_dm(&self, user: UserId) -> api::Result<Conversation> {
-            Ok(Conversation {
-                id: ChannelId::from("D9"),
-                is_im: true,
-                user: Some(user),
-                ..Default::default()
-            })
+        async fn open_dm(&self, users: Vec<UserId>) -> api::Result<Conversation> {
+            if users.len() > 1 {
+                Ok(Conversation {
+                    id: ChannelId::from("G9"),
+                    is_mpim: true,
+                    members: users,
+                    ..Default::default()
+                })
+            } else {
+                Ok(Conversation {
+                    id: ChannelId::from("D9"),
+                    is_im: true,
+                    user: users.into_iter().next(),
+                    ..Default::default()
+                })
+            }
         }
 
         async fn create_section(&self, name: String) -> api::Result<api::SectionCreated> {
@@ -2498,6 +2516,10 @@ pub(crate) mod tests {
                 .scheduled
                 .retain(|m| m.id != scheduled_message_id);
             Ok(())
+        }
+
+        async fn usergroups(&self) -> api::Result<Vec<crate::types::Usergroup>> {
+            Ok(Vec::new())
         }
     }
 
@@ -3964,7 +3986,7 @@ pub(crate) mod tests {
         );
 
         core.handle(Command::OpenDm {
-            user: UserId::from("U2"),
+            users: vec![UserId::from("U2")],
         });
 
         assert_eq!(
@@ -3982,6 +4004,38 @@ pub(crate) mod tests {
             .unwrap()
             .expect("the DM lands in the store");
         assert_eq!(stored.user, Some(UserId::from("U2")));
+    }
+
+    #[tokio::test]
+    async fn open_group_dm_stores_mpim_conversation() {
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(
+            FakeBackend::default(),
+            Arc::clone(&store),
+            TeamId::from("T1"),
+            events,
+        );
+
+        core.handle(Command::OpenDm {
+            users: vec![UserId::from("U2"), UserId::from("U3")],
+        });
+
+        assert_eq!(
+            next(&mut rx).await,
+            Event::Conversations(vec![ChannelId::from("G9")])
+        );
+        assert_eq!(
+            next(&mut rx).await,
+            Event::ConversationOpened(ChannelId::from("G9"))
+        );
+        let stored = store
+            .lock()
+            .unwrap()
+            .conversation(&TeamId::from("T1"), &ChannelId::from("G9"))
+            .unwrap()
+            .expect("the group DM lands in the store");
+        assert!(stored.is_mpim);
+        assert_eq!(stored.members, vec![UserId::from("U2"), UserId::from("U3")]);
     }
 
     #[tokio::test]

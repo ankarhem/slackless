@@ -240,8 +240,10 @@ use gpui_kit::gpui::{
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{self, BadgeSetter, Notifier, SoundPlayer};
+use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{
-    ChannelId, Conversation, ConversationKind, File, Message, Team, Ts, UserId,
+    Block, ChannelId, Conversation, ConversationKind, File, Message, RichTextContainer,
+    RichTextElement, Team, Ts, UserId, Usergroup,
 };
 use slackless_core::{Command, Event, NotifyLevel, SharedStore};
 
@@ -253,7 +255,7 @@ use crate::actions::{
 use crate::activity::{ActivityEvent, ActivityFeed};
 use crate::avatars::conversation_avatar;
 use crate::bookmarks;
-use crate::bridge::CoreBridge;
+use crate::bridge::{CoreBridge, SavedDraft};
 use crate::browser::{ChannelBrowser, ChannelBrowserEvent};
 use crate::canvas::canvas_view;
 use crate::channel_details::{self, ChannelDetails, ChannelDetailsEvent};
@@ -488,6 +490,8 @@ pub struct App {
     applied_theme: (SlackTheme, Palette, bool),
     /// The Color Mode last stored (`None` offline), so only a changed mode is written.
     color_mode: Option<AppearanceMode>,
+    /// The full Preferences snapshot last persisted (`None` offline), avoiding redundant writes.
+    saved_settings: Option<crate::preferences::Settings>,
     /// The profile pane; shown in the right panel while `profile_open` (exclusive with the
     /// thread panel).
     profile: Entity<ProfilePanel>,
@@ -601,6 +605,8 @@ pub struct App {
     peer_dnd_paused: HashMap<UserId, bool>,
     /// Live mode: latest RTM websocket connection state (drives the offline/reconnecting banner).
     connection: Option<slackless_core::rtm::ConnectionState>,
+    /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.
+    usergroups: Vec<Usergroup>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
     member_counts: HashMap<ChannelId, u32>,
     /// Apps among a channel's members, counted apart from people as Slack's header does.
@@ -688,30 +694,71 @@ impl App {
                 .filter(|channel| fixtures.conversation(channel).is_some())
                 .collect();
             let preferences = Preferences::new(window, cx);
-            // The zoom `main` applied from the remembered level, shown in the select.
+            // Restore persisted Preferences settings first, then overlay the zoom/font/color_mode
+            // values `main` installed before the first frame.
+            let mut restored_settings = bridge.settings();
+            if let Some(settings) = restored_settings.clone() {
+                preferences.update(cx, |prefs, cx| prefs.load_settings(settings, window, cx));
+            }
             let factor = cx.global::<crate::zoom::Zoom>().factor();
             let zoom = (crate::zoom::FACTORS.iter())
                 .position(|level| *level == factor)
                 .unwrap_or(crate::zoom::ACTUAL_SIZE);
             preferences.update(cx, |prefs, cx| prefs.set_zoom(zoom, cx));
-            // Live: the remembered Color Mode over Slack's color theme, as `main` installed it
-            // before the first frame. The sample workspace keeps its dark reference look.
+            // Live: the remembered Color Mode over Slack's color theme (or persisted palette),
+            // as `main` installed it before the first frame.
             let color_mode = bridge.color_mode();
             let applied_theme = match color_mode {
                 Some(mode) => {
-                    let palette = fixtures.palette.unwrap_or(Palette::Default);
+                    let palette = restored_settings
+                        .as_ref()
+                        .map(|s| s.palette)
+                        .or(fixtures.palette)
+                        .unwrap_or(Palette::Default);
                     let font = theme::font(cx);
                     preferences.update(cx, |prefs, cx| {
                         prefs.set_appearance(mode, palette, font, cx)
                     });
+                    if let Some(ref mut s) = restored_settings {
+                        s.mode = mode;
+                        s.palette = palette;
+                        s.font = font;
+                        s.zoom = zoom;
+                    }
                     (mode.resolve(window.appearance()), palette, false)
                 }
                 None => (SlackTheme::Dark, Palette::Default, false),
             };
+            let saved_settings = if bridge.store().is_some() {
+                Some(restored_settings.unwrap_or_else(|| preferences.read(cx).settings().clone()))
+            } else {
+                None
+            };
             let status_picker = StatusPicker::new(window, cx);
             let user_menu = UserMenu::new(fixtures.clone(), cx);
             let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
+            let persisted_freq = bridge.frequent_emoji();
+            let persisted_tone = bridge.emoji_tone();
+            if persisted_freq.is_some() || persisted_tone.is_some() {
+                emoji_picker.update(cx, |picker, cx| {
+                    picker.restore(persisted_freq, persisted_tone, cx);
+                });
+            }
             let drafts = DraftsView::new(cx);
+            if let Some(saved_drafts) = bridge.drafts() {
+                let entries: Vec<Entry> = saved_drafts
+                    .into_iter()
+                    .map(|d| Entry {
+                        id: None,
+                        workspace: 0,
+                        channel: d.channel,
+                        label: d.label,
+                        text: d.text,
+                        at: d.at,
+                    })
+                    .collect();
+                drafts.update(cx, |view, cx| view.load_drafts(entries, cx));
+            }
             let later = LaterView::new(cx);
             let threads = ThreadsView::new(fixtures.clone(), window, cx);
             let unreads = UnreadsView::new(fixtures.clone(), cx);
@@ -974,7 +1021,7 @@ impl App {
                     &composer,
                     window,
                     |this: &mut App, _, event: &ComposerEvent, window, cx| match event {
-                        ComposerEvent::Submit(content) => this.send(content.clone(), cx),
+                        ComposerEvent::Submit(content) => this.send(content.clone(), window, cx),
                         ComposerEvent::OpenEmojiPicker(position) => {
                             this.open_picker(PickerTarget::Composer, *position, window, cx);
                         }
@@ -999,9 +1046,13 @@ impl App {
                 cx.subscribe_in(
                     &emoji_picker,
                     window,
-                    |this: &mut App, _, event: &EmojiPickerEvent, window, cx| {
-                        let EmojiPickerEvent::Pick(choice) = event;
-                        this.pick_emoji(choice, window, cx);
+                    |this: &mut App, _, event: &EmojiPickerEvent, window, cx| match event {
+                        EmojiPickerEvent::Pick(choice) => this.pick_emoji(choice, window, cx),
+                        EmojiPickerEvent::ToneChanged(tone) => {
+                            if let Some(write) = this.bridge.remember_emoji_tone(*tone) {
+                                cx.background_executor().spawn(write).detach();
+                            }
+                        }
                     },
                 ),
                 cx.subscribe_in(
@@ -1052,6 +1103,12 @@ impl App {
                                     scheduled_message_id: id,
                                 });
                             }
+                        }
+                        DraftsEvent::Deleted => {
+                            let count = this.drafts.read(cx).draft_count();
+                            this.sidebar
+                                .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
+                            this.persist_drafts(cx);
                         }
                     },
                 ),
@@ -1214,16 +1271,36 @@ impl App {
                         NewMessageEvent::Send { channel, content } => {
                             this.compose_open = false;
                             this.select(channel.clone(), cx);
-                            this.send(content.clone(), cx);
+                            this.send(content.clone(), window, cx);
                         }
-                        NewMessageEvent::OpenDm { user, content } => {
+                        NewMessageEvent::OpenDm { users, content } => {
+                            // If one person was picked and an IM already exists, deliver directly.
+                            if let [user] = users.as_slice() {
+                                if let Some(dm) = this
+                                    .fixtures
+                                    .dms
+                                    .iter()
+                                    .find(|dm| {
+                                        dm.kind() == ConversationKind::Im
+                                            && dm.user.as_ref() == Some(user)
+                                    })
+                                    .map(|dm| dm.id.clone())
+                                {
+                                    this.compose_open = false;
+                                    this.select(dm, cx);
+                                    this.send(content.clone(), window, cx);
+                                    return;
+                                }
+                            }
                             if this.bridge.store().is_some() {
                                 this.pending_dm = Some(content.clone());
-                                this.bridge.send(Command::OpenDm { user: user.clone() });
+                                this.bridge.send(Command::OpenDm {
+                                    users: users.clone(),
+                                });
                             } else {
                                 notify(
                                     "Needs a live workspace",
-                                    "Sign in to start a new DM with this person.",
+                                    "Sign in to start a new DM or group conversation.",
                                     window,
                                     cx,
                                 );
@@ -1291,6 +1368,7 @@ impl App {
                 preferences,
                 applied_theme,
                 color_mode,
+                saved_settings,
                 profile,
                 profile_open: false,
                 self_state: SelfState::default(),
@@ -1339,6 +1417,7 @@ impl App {
                 presence: fixtures::PresenceMap::default(),
                 peer_dnd_paused: HashMap::new(),
                 connection: None,
+                usergroups: Vec::new(),
                 member_counts: HashMap::new(),
                 app_counts: HashMap::new(),
                 open_members: None,
@@ -1362,12 +1441,30 @@ impl App {
         });
         // Route member-hover-card trigger reports (mention pills, author names) to this root.
         hover_card::init(&app, cx);
+        // Clicking a macOS notification banner activates the window, opens its conversation,
+        // and scrolls to + highlights the triggering message.
+        let notif_app = app.downgrade();
+        let notif_window = window.window_handle();
+        cx.on_system_notification_response(move |response, cx| {
+            let Some((channel, ts)) = parse_notification_tag(&response.tag) else {
+                return;
+            };
+            cx.activate(true);
+            let _ = notif_window.update(cx, |_, window, cx| {
+                window.activate_window();
+                let _ = notif_app.update(cx, |app, cx| {
+                    app.select(channel, cx);
+                    app.messages.update(cx, |list, cx| list.reveal(&ts, cx));
+                });
+            });
+        });
         app.update(cx, |app, cx| {
             app.push_self_state(cx);
             app.sync_saved(cx);
             app.sync_later_count(cx);
             let channel = app.channel.clone();
             app.load_history(&channel, cx);
+            app.load_draft(cx);
             app.sync_composer_placeholder(cx);
             app.update_menus(cx);
         });
@@ -1441,7 +1538,7 @@ impl App {
             .update(cx, |later, cx| later.take_due(now_secs(), cx));
         for item in due {
             let title = format!("Reminder: {} in {}", item.author, item.label);
-            let tag = format!("later-{}-{}", item.channel, item.ts);
+            let tag = format!("later:{}:{}", item.channel, item.ts);
             self.post_notification(&tag, &title, &item.text, window, cx);
         }
     }
@@ -1830,6 +1927,16 @@ impl App {
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
         self.compose
             .update(cx, |view, cx| view.set_enter_sends(enter_sends, cx));
+        if self
+            .saved_settings
+            .as_ref()
+            .is_some_and(|saved| *saved != settings)
+        {
+            self.saved_settings = Some(settings.clone());
+            if let Some(write) = self.bridge.remember_settings(&settings) {
+                cx.background_executor().spawn(write).detach();
+            }
+        }
         self.push_self_state(cx);
     }
 
@@ -2276,6 +2383,10 @@ impl App {
                 self.focus.focus(window, cx);
             }
         }
+        let frequent = self.emoji_picker.read(cx).frequent().to_vec();
+        if let Some(write) = self.bridge.remember_frequent_emoji(&frequent) {
+            cx.background_executor().spawn(write).detach();
+        }
         cx.notify();
     }
 
@@ -2431,7 +2542,9 @@ impl App {
         {
             self.select(dm, cx);
         } else if self.bridge.store().is_some() {
-            self.bridge.send(Command::OpenDm { user: user.clone() });
+            self.bridge.send(Command::OpenDm {
+                users: vec![user.clone()],
+            });
         } else {
             notify(
                 "Needs a live workspace",
@@ -3110,7 +3223,7 @@ impl App {
                 let pending = self.pending_dm.take();
                 self.select(channel.clone(), cx);
                 if let Some(content) = pending {
-                    self.send(content, cx);
+                    self.deliver_send(content, cx);
                 }
             }
             Event::ChannelManagers { channel, users } => {
@@ -3212,6 +3325,10 @@ impl App {
             Event::ChannelCanvasCreated { channel, canvas_id } if *channel == self.channel => {
                 cx.open_url(&self.canvas_link(canvas_id));
             }
+            Event::Usergroups(groups) => {
+                self.usergroups = groups.clone();
+                self.reload_live(window, cx);
+            }
             _ => {}
         }
     }
@@ -3222,8 +3339,9 @@ impl App {
         let Some(mut snapshot) = self.bridge.snapshot(&self.counts) else {
             return;
         };
-        // Presence is transient (never stored), so the live map rides along every snapshot.
+        // Presence and usergroups are transient (never stored), so they ride along every snapshot.
         snapshot.presence = self.presence.clone();
+        snapshot.usergroups = self.usergroups.clone();
         let fixtures = Arc::new(snapshot);
         // Refresh the views in place, as Slack does: a status change or a new channel keeps
         // every scroll position, collapsed section and open panel.
@@ -3697,7 +3815,7 @@ impl App {
                 format!("{sender}: {text}"),
             ),
         };
-        let tag = format!("message-{channel}-{}", message.ts);
+        let tag = format!("msg:{channel}:{}", message.ts);
         self.system_notification(&tag, &title, &body, cx);
     }
 
@@ -3930,6 +4048,26 @@ impl App {
         let count = self.drafts.read(cx).draft_count();
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
+        self.persist_drafts(cx);
+    }
+
+    /// Persist the active workspace's unsent drafts into the local store off the UI thread.
+    fn persist_drafts(&self, cx: &Context<Self>) {
+        let saved: Vec<SavedDraft> = self
+            .drafts
+            .read(cx)
+            .drafts_for(self.workspace)
+            .into_iter()
+            .map(|entry| SavedDraft {
+                channel: entry.channel,
+                label: entry.label,
+                text: entry.text,
+                at: entry.at,
+            })
+            .collect();
+        if let Some(write) = self.bridge.remember_drafts(&saved) {
+            cx.background_executor().spawn(write).detach();
+        }
     }
 
     /// Put the open conversation's saved draft (or nothing) in the composer.
@@ -4307,7 +4445,7 @@ impl App {
                 } else {
                     format!("{} {SHRUG}", invocation.args)
                 };
-                self.send(MessageContent::plain(text), cx);
+                self.send(MessageContent::plain(text), window, cx);
             }
             SlashKind::Away => {
                 self.self_state.away = !self.self_state.away;
@@ -4357,7 +4495,86 @@ impl App {
         });
     }
 
-    fn send(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+    /// Slack's broadcast confirmation (`F-CORE-083`): warn before posting `@channel`, `@here`,
+    /// or `@everyone` to a channel with 6 or more members.
+    fn send(&mut self, content: MessageContent, window: &mut Window, cx: &mut Context<Self>) {
+        const BROADCAST_WARN_THRESHOLD: usize = 6;
+        if let Some(range) = broadcast_kind(&content) {
+            let conv = self.fixtures.conversation(&self.channel);
+            let is_channel = conv.is_some_and(|c| {
+                matches!(
+                    c.kind(),
+                    ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+                )
+            });
+            let members = self
+                .member_counts
+                .get(&self.channel)
+                .map(|&n| n as usize)
+                .or_else(|| conv.and_then(|c| c.num_members.map(|n| n as usize)))
+                .or_else(|| conv.map(|c| c.members.len()))
+                .unwrap_or(0);
+            if is_channel && members >= BROADCAST_WARN_THRESHOLD {
+                let channel_name = conv
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_else(|| self.channel.to_string());
+                let title = match range {
+                    BroadcastRange::Here => format!("Notify active members in #{channel_name}?"),
+                    _ => format!("Notify everyone in #{channel_name}?"),
+                };
+                let body = format!(
+                    "By using @{range}, you\u{2019}re about to notify {members} people in #{channel_name}. Are you sure you want to continue?"
+                );
+                let this = cx.weak_entity();
+                let send_content = content.clone();
+                let cancel_text = content.text.clone();
+                window.open_dialog(cx, move |dialog, _, cx| {
+                    let muted = cx.theme().muted_foreground;
+                    let this_cancel = this.clone();
+                    let this_send = this.clone();
+                    let send_content = send_content.clone();
+                    let cancel_text = cancel_text.clone();
+                    dialog.title(title.clone()).w(px(460.)).child(
+                        v_flex()
+                            .gap_4()
+                            .child(div().text_color(muted).child(body.clone()))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        Button::new("broadcast-cancel").label("Cancel").on_click(
+                                            move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                let _ = this_cancel.update(cx, |app, cx| {
+                                                    app.composer.update(cx, |composer, cx| {
+                                                        composer.load_draft(&cancel_text, cx);
+                                                    });
+                                                });
+                                            },
+                                        ),
+                                    )
+                                    .child(
+                                        Button::new("broadcast-send")
+                                            .primary()
+                                            .label("Send")
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                let _ = this_send.update(cx, |app, cx| {
+                                                    app.deliver_send(send_content.clone(), cx);
+                                                });
+                                            }),
+                                    ),
+                            ),
+                    )
+                });
+                return;
+            }
+        }
+        self.deliver_send(content, cx);
+    }
+
+    fn deliver_send(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         let channel = self.channel.clone();
         // The local echo shows the same blocks the message posts with.
         let mut message = self
@@ -6104,6 +6321,40 @@ fn build_workspace(
     }
 }
 
+/// Decode a system notification tag (`msg:<channel>:<ts>` or `later:<channel>:<ts>`).
+fn parse_notification_tag(tag: &str) -> Option<(ChannelId, Ts)> {
+    let rest = tag
+        .strip_prefix("msg:")
+        .or_else(|| tag.strip_prefix("later:"))?;
+    let (channel, ts) = rest.split_once(':')?;
+    (!channel.is_empty() && !ts.is_empty()).then(|| (ChannelId::from(channel), Ts::from(ts)))
+}
+
+/// First `@here` / `@channel` / `@everyone` broadcast inside `content`, if any.
+fn broadcast_kind(content: &MessageContent) -> Option<BroadcastRange> {
+    fn scan_elements(elements: &[RichTextElement]) -> Option<BroadcastRange> {
+        elements.iter().find_map(|el| match el {
+            RichTextElement::Broadcast(b) => Some(b.range.clone()),
+            _ => None,
+        })
+    }
+    fn scan_containers(containers: &[RichTextContainer]) -> Option<BroadcastRange> {
+        containers.iter().find_map(|c| match c {
+            RichTextContainer::Section(s) => scan_elements(&s.elements),
+            RichTextContainer::Header(h) => scan_elements(&h.elements),
+            RichTextContainer::Quote(q) => scan_elements(&q.elements),
+            RichTextContainer::List(l) => scan_containers(&l.elements),
+            RichTextContainer::Preformatted(_)
+            | RichTextContainer::Divider(_)
+            | RichTextContainer::Unknown { .. } => None,
+        })
+    }
+    content.blocks.iter().find_map(|block| match block {
+        Block::RichText(rt) => scan_containers(&rt.elements),
+        Block::Unknown { .. } => None,
+    })
+}
+
 /// The root's subscriptions to one workspace's views. Handlers always act on the shown
 /// workspace's fields; parked views are not rendered, so they emit nothing.
 fn subscribe_workspace(
@@ -6378,11 +6629,17 @@ fn subscribe_workspace(
         cx.subscribe_in(
             &views.switcher,
             window,
-            |this: &mut App, _, event: &SwitcherEvent, window, cx| {
-                let SwitcherEvent::Open(channel) = event;
-                window.close_dialog(cx);
-                this.select(channel.clone(), cx);
-                this.focus.focus(window, cx);
+            |this: &mut App, _, event: &SwitcherEvent, window, cx| match event {
+                SwitcherEvent::Open(channel) => {
+                    window.close_dialog(cx);
+                    this.select(channel.clone(), cx);
+                    this.focus.focus(window, cx);
+                }
+                SwitcherEvent::OpenUser(user) => {
+                    window.close_dialog(cx);
+                    this.message_user(user, window, cx);
+                    this.focus.focus(window, cx);
+                }
             },
         ),
     ];
@@ -7059,5 +7316,44 @@ mod tests {
         );
 
         drop(root);
+    }
+
+    #[test]
+    fn notification_tag_round_trips_channel_and_ts() {
+        assert_eq!(
+            parse_notification_tag("msg:C0ENG:1700000001.000200"),
+            Some((ChannelId::from("C0ENG"), Ts::from("1700000001.000200")))
+        );
+        assert_eq!(
+            parse_notification_tag("later:D123:1700000002.000300"),
+            Some((ChannelId::from("D123"), Ts::from("1700000002.000300")))
+        );
+        assert_eq!(parse_notification_tag("other:C1:1.0"), None);
+        assert_eq!(parse_notification_tag("msg:C1:"), None);
+    }
+
+    #[test]
+    fn broadcast_kind_detects_channel_here_and_ignores_plain() {
+        let fixtures = crate::fixtures::load();
+        let plain = crate::composer::content_of("hello team", &fixtures);
+        assert_eq!(broadcast_kind(&plain), None);
+
+        let here = crate::composer::content_of("<!here> standup", &fixtures);
+        assert_eq!(broadcast_kind(&here), Some(BroadcastRange::Here));
+
+        let channel = crate::composer::content_of("> <!channel> deploy", &fixtures);
+        assert_eq!(broadcast_kind(&channel), Some(BroadcastRange::Channel));
+    }
+
+    #[test]
+    fn draft_round_trips_underline_and_usergroup_without_leaking_u_tag_to_mrkdwn() {
+        let fixtures = crate::fixtures::load();
+        let doc =
+            crate::editor::from_mrkdwn("<u>important</u> ping <!subteam^S0ENG> now", &fixtures);
+        assert_eq!(doc.to_draft(), "<u>important</u> ping <!subteam^S0ENG> now");
+        assert_eq!(doc.to_mrkdwn(), "important ping <!subteam^S0ENG> now");
+        let rt = doc.to_rich_text();
+        let round = crate::editor::from_rich_text(&[rt.into()], &fixtures).unwrap();
+        assert_eq!(round.to_draft(), doc.to_draft());
     }
 }

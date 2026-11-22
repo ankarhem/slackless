@@ -112,7 +112,11 @@ fn main() {
             zoom::set_level(level, cx);
         }
         if let Some(mode) = bridge.color_mode() {
-            let palette = fixtures.palette.unwrap_or(theme::Palette::Default);
+            let palette = bridge
+                .settings()
+                .map(|s| s.palette)
+                .or(fixtures.palette)
+                .unwrap_or(theme::Palette::Default);
             theme::activate_with(mode.resolve(cx.window_appearance()), palette, false, cx);
         }
         let fixtures = Arc::new(fixtures);

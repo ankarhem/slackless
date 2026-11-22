@@ -7311,6 +7311,7 @@ dependencies = [
  "gpui-pre",
  "pathfinder_simd",
  "raw-window-handle",
+ "serde",
  "slackless-auth",
  "slackless-core",
  "smallvec",

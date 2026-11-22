@@ -33,7 +33,7 @@ pub enum PreferencesEvent {
 }
 
 /// Slack's Color Mode: Light / Dark / System (follow the computer).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AppearanceMode {
     Light,
     Dark,
@@ -202,7 +202,8 @@ const OPEN_LINKS: [&str; 3] = ["Default browser", "Safari", "Firefox"];
 
 /// Every preference, in memory. Pure-choice settings are indexes into the option tables
 /// next to their controls; what the app acts on is typed.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Settings {
     // Notifications
     pub notify_level: usize,
@@ -413,6 +414,20 @@ impl Preferences {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Restore persisted settings at launch without emitting `Changed`.
+    pub fn load_settings(
+        &mut self,
+        settings: Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keywords = settings.keywords.clone();
+        self.settings = settings;
+        self.keywords
+            .update(cx, |state, cx| state.set_value(keywords, window, cx));
+        cx.notify();
     }
 
     /// Jump to `section` (the DND menu opens Notifications).

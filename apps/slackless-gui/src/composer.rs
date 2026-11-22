@@ -329,9 +329,9 @@ impl Composer {
             .update(cx, |state, cx| state.set_submit_on_enter(enter_sends, cx));
     }
 
-    /// The current draft as mrkdwn, untrimmed.
+    /// The current draft serialized for local persistence (mrkdwn + `<u>` underline).
     pub fn text(&self) -> String {
-        self.editor.doc().to_mrkdwn()
+        self.editor.doc().to_draft()
     }
 
     /// Replace the draft with `draft` (a saved per-conversation draft as mrkdwn, or empty).

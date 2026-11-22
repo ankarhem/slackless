@@ -34,4 +34,4 @@ pub use rich_text::{
     Block, RichTextBlock, RichTextContainer, RichTextDivider, RichTextElement, TextStyle,
 };
 pub use section::{ChannelSection, SectionKind};
-pub use user::{DndStatus, Presence, Profile, Team, User, UserPresence};
+pub use user::{DndStatus, Presence, Profile, Team, User, UserPresence, Usergroup};

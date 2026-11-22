@@ -30,7 +30,7 @@ impl Composer {
         };
         let (popover, border) = (theme.popover, theme.border);
         let hint = match menu.entries.first() {
-            Some(Entry::User(_) | Entry::Broadcast(_)) => "People",
+            Some(Entry::User(_) | Entry::Usergroup(_) | Entry::Broadcast(_)) => "People",
             Some(Entry::Channel(_)) => "Channels",
             Some(Entry::Emoji(_)) => "Emoji",
             Some(Entry::Slash(_)) | None => "Built-in commands",
@@ -133,6 +133,20 @@ impl Composer {
                 ))
                 .child(title(fixtures.user_name(id).to_owned().into()))
                 .children(handle.map(|handle| note(handle.into())))
+            }
+            Entry::Usergroup(id) => {
+                let handle = fixtures.usergroup_handle(id).unwrap_or(id.as_str());
+                let detail = fixtures.usergroup(id).map(|g| match g.user_count {
+                    Some(n) if n > 0 => format!("{} ({n})", g.name),
+                    _ => g.name.clone(),
+                });
+                line.child(
+                    Icon::new(IconName::Users)
+                        .size(px(16.))
+                        .text_color(secondary),
+                )
+                .child(title(format!("@{handle}").into()))
+                .children(detail.filter(|s| !s.is_empty()).map(|s| note(s.into())))
             }
             Entry::Broadcast(range) => {
                 let reach = match range {

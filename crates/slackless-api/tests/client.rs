@@ -943,3 +943,33 @@ async fn conversations_canvases_create_sends_channel_id_and_returns_canvas_id() 
         .unwrap();
     assert_eq!(created.canvas_id, "F07NEW");
 }
+
+#[tokio::test]
+async fn usergroups_list_parses_groups() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/usergroups.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "usergroups": [
+                {
+                    "id": "S0614TZR7",
+                    "name": "Engineering",
+                    "handle": "eng",
+                    "description": "Eng team",
+                    "user_count": 12,
+                    "date_delete": 0
+                }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let groups = api.usergroups_list().await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id.as_str(), "S0614TZR7");
+    assert_eq!(groups[0].handle, "eng");
+    assert_eq!(groups[0].user_count, Some(12));
+    assert!(!groups[0].is_deleted());
+}

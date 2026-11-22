@@ -165,7 +165,7 @@ fn grayscale(theme: &mut Theme) {
 /// Slack's named color themes (Preferences > Appearance & Themes > Color themes), plus a
 /// custom theme built from a sidebar and an accent swatch. `Default` keeps the plain Slack
 /// Light / Dark palette. Hues approximate Slack's.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Palette {
     Default,
     Aubergine,

@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, UserId, UsergroupId};
 
 use super::doc::Doc;
 use super::marks::{Atom, LineKind, Style};
@@ -17,6 +17,10 @@ pub trait Directory {
     fn mention(&self, id: &UserId) -> String;
     /// The name a #channel reference to `id` shows, without the `#`.
     fn channel_name(&self, id: &ChannelId) -> String;
+    /// The handle an @group reference to `id` shows, without the `@`.
+    fn usergroup_handle(&self, id: &UsergroupId) -> String {
+        id.to_string()
+    }
     /// How the emoji `shortcode` shows in a draft: its glyph, or `:name:` for a workspace
     /// custom emoji. `None` when there is no such emoji.
     fn emoji_text(&self, shortcode: &str) -> Option<String>;
@@ -35,6 +39,17 @@ pub(super) const WRAPPERS: [(Style, char); 3] = [
 impl Doc {
     /// The document as Slack mrkdwn, with `&`, `<` and `>` escaped in literal text.
     pub fn to_mrkdwn(&self) -> String {
+        self.write_mrkdwn(false)
+    }
+
+    /// The document serialized for local draft persistence: identical to [`Self::to_mrkdwn`]
+    /// except `Style::UNDERLINE` is preserved as `<u>...</u>` so underlined drafts survive
+    /// channel switches and restarts without leaking raw `<u>` tags into Slack's wire fallback.
+    pub fn to_draft(&self) -> String {
+        self.write_mrkdwn(true)
+    }
+
+    fn write_mrkdwn(&self, keep_underline: bool) -> String {
         let parsed = self.parse();
         let mut out = String::with_capacity(self.text().len() + 16);
         let mut in_code = false;
@@ -82,7 +97,13 @@ impl Doc {
                 }
                 Some(LineKind::Fence) | None => {}
             }
-            write_inline(self, &parsed, line.content.clone(), &mut out);
+            write_inline(
+                self,
+                &parsed,
+                line.content.clone(),
+                keep_underline,
+                &mut out,
+            );
         }
         if in_code {
             out.push_str(FENCE);
@@ -91,13 +112,19 @@ impl Doc {
     }
 }
 
-fn write_inline(doc: &Doc, parsed: &ParsedDoc, range: Range<usize>, out: &mut String) {
+fn write_inline(
+    doc: &Doc,
+    parsed: &ParsedDoc,
+    range: Range<usize>,
+    keep_underline: bool,
+    out: &mut String,
+) {
     // Wrappers currently open, outermost first.
     let mut open: Vec<Style> = Vec::new();
     for piece in parsed.pieces(doc, range) {
         match piece {
             Piece::Text { text, attrs } => {
-                retarget(&mut open, attrs.style, out);
+                retarget(&mut open, attrs.style, keep_underline, out);
                 let is_code = attrs.style.contains(Style::CODE);
                 let label = |out: &mut String| {
                     if is_code {
@@ -125,10 +152,11 @@ fn write_inline(doc: &Doc, parsed: &ParsedDoc, range: Range<usize>, out: &mut St
                 }
             }
             Piece::Atom { atom, style, .. } => {
-                retarget(&mut open, style, out);
+                retarget(&mut open, style, keep_underline, out);
                 let (before, name, after) = match atom {
                     Atom::User(id) => ("<@", id.as_str(), ">"),
                     Atom::Channel(id) => ("<#", id.as_str(), ">"),
+                    Atom::Usergroup(id) => ("<!subteam^", id.as_str(), ">"),
                     Atom::Broadcast(range) => ("<!", range.as_str(), ">"),
                     Atom::Emoji(name) => (":", name.as_ref(), ":"),
                 };
@@ -136,21 +164,44 @@ fn write_inline(doc: &Doc, parsed: &ParsedDoc, range: Range<usize>, out: &mut St
             }
         }
     }
-    retarget(&mut open, Style::NONE, out);
+    retarget(&mut open, Style::NONE, keep_underline, out);
 }
 
 /// Close and open wrapper markers so that exactly those of `want` are open.
-fn retarget(open: &mut Vec<Style>, want: Style, out: &mut String) {
-    let marker = |style: Style| WRAPPERS.iter().find(|(s, _)| *s == style).map(|(_, m)| *m);
+fn retarget(open: &mut Vec<Style>, want: Style, keep_underline: bool, out: &mut String) {
+    let open_tag = |style: Style| -> Option<&'static str> {
+        match style {
+            Style::BOLD => Some("*"),
+            Style::ITALIC => Some("_"),
+            Style::STRIKE => Some("~"),
+            Style::UNDERLINE if keep_underline => Some("<u>"),
+            _ => None,
+        }
+    };
+    let close_tag = |style: Style| -> Option<&'static str> {
+        match style {
+            Style::BOLD => Some("*"),
+            Style::ITALIC => Some("_"),
+            Style::STRIKE => Some("~"),
+            Style::UNDERLINE if keep_underline => Some("</u>"),
+            _ => None,
+        }
+    };
     let keep = open
         .iter()
         .position(|style| !want.contains(*style))
         .unwrap_or(open.len());
-    out.extend(open.drain(keep..).rev().filter_map(marker));
-    for (style, marker) in WRAPPERS {
+    for style in open.drain(keep..).rev() {
+        if let Some(tag) = close_tag(style) {
+            out.push_str(tag);
+        }
+    }
+    for style in [Style::BOLD, Style::ITALIC, Style::STRIKE, Style::UNDERLINE] {
         if want.contains(style) && !open.contains(&style) {
-            open.push(style);
-            out.push(marker);
+            if let Some(tag) = open_tag(style) {
+                open.push(style);
+                out.push_str(tag);
+            }
         }
     }
 }

@@ -683,6 +683,7 @@ pub struct EmojiChoice {
 
 pub enum EmojiPickerEvent {
     Pick(EmojiChoice),
+    ToneChanged(u8),
 }
 
 /// One row of the picker's grid: a section title, or up to [`COLUMNS`] emoji.
@@ -790,6 +791,32 @@ impl EmojiPicker {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.search.read(cx).focus_handle(cx).focus(window, cx);
         cx.notify();
+    }
+
+    /// Restore locally persisted frequent emoji and/or skin tone at launch.
+    pub fn restore(
+        &mut self,
+        frequent: Option<Vec<String>>,
+        tone: Option<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        if let Some(list) = frequent.filter(|list| !list.is_empty()) {
+            self.frequent = list;
+            changed = true;
+        }
+        if let Some(tone) = tone.filter(|t| (1..=6).contains(t)) {
+            self.tone = tone;
+            changed = true;
+        }
+        if changed {
+            self.rebuild();
+            cx.notify();
+        }
+    }
+
+    pub fn frequent(&self) -> &[String] {
+        &self.frequent
     }
 
     fn pick(&mut self, choice: EmojiChoice, cx: &mut Context<Self>) {
@@ -1179,6 +1206,7 @@ impl Render for EmojiPicker {
                             this.tone = tone;
                             this.tones_open = false;
                             this.rebuild();
+                            cx.emit(EmojiPickerEvent::ToneChanged(tone));
                             cx.notify();
                         }))
                 }))

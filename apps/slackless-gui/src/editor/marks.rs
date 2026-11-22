@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use slackless_core::types::rich_text::BroadcastRange;
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, UserId, UsergroupId};
 
 /// A set of inline character formats.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -99,6 +99,7 @@ impl LineKind {
 pub enum Atom {
     User(UserId),
     Channel(ChannelId),
+    Usergroup(UsergroupId),
     Broadcast(BroadcastRange),
     /// Shortcode without colons, in Slack's `name::skin-tone-N` form when toned.
     Emoji(Arc<str>),

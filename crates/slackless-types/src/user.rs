@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::de::{lenient_i64, null_default};
-use crate::ids::{BotId, TeamId, UserId};
+use crate::ids::{BotId, TeamId, UserId, UsergroupId};
 use crate::macros::string_enum;
 
 /// A user object (`users.info`, `users.list`, `client.userBoot.self`, `user_change`).
@@ -181,6 +181,30 @@ impl DndStatus {
                     (self.next_dnd_start_ts, self.next_dnd_end_ts),
                     (Some(start), Some(end)) if now >= start && now < end
                 ))
+    }
+}
+
+/// A workspace user group (`usergroups.list`, `@handle` mentions).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usergroup {
+    pub id: UsergroupId,
+    #[serde(default, deserialize_with = "null_default")]
+    pub name: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub handle: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub user_count: Option<u32>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub date_delete: i64,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Usergroup {
+    pub fn is_deleted(&self) -> bool {
+        self.date_delete > 0
     }
 }
 

@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use gpui_kit::gpui::{Context, Window};
 use slackless_core::types::rich_text::BroadcastRange;
-use slackless_core::types::{ChannelId, UserId};
+use slackless_core::types::{ChannelId, UserId, UsergroupId};
 
 use super::Composer;
 use crate::editor::{Atom, Directory as _, Editor, Lookup, rank, trigger};
@@ -19,6 +19,7 @@ const LIMIT: usize = 8;
 
 pub(super) enum Entry {
     User(UserId),
+    Usergroup(UsergroupId),
     Broadcast(BroadcastRange),
     Channel(ChannelId),
     /// A shortcode without colons.
@@ -106,6 +107,18 @@ fn people(fixtures: &Fixtures, query: &str) -> Vec<Entry> {
             Some((score, user.display_name(), &user.id))
         })
         .collect();
+    let groups = fixtures
+        .usergroups
+        .iter()
+        .filter(|group| !group.is_deleted() && !group.handle.is_empty())
+        .filter_map(|group| {
+            let score = [group.handle.as_str(), group.name.as_str()]
+                .into_iter()
+                .filter_map(|name| rank(name, query))
+                .min()?;
+            Some((score, group.handle.as_str(), &group.id))
+        })
+        .collect();
     let broadcasts = [
         BroadcastRange::Here,
         BroadcastRange::Channel,
@@ -115,11 +128,17 @@ fn people(fixtures: &Fixtures, query: &str) -> Vec<Entry> {
         .into_iter()
         .map(|id| Entry::User(id.clone()))
         .chain(
+            best(groups)
+                .into_iter()
+                .map(|id| Entry::Usergroup(id.clone())),
+        )
+        .chain(
             broadcasts
                 .into_iter()
                 .filter(|range| rank(range.as_str(), query) == Some(0))
                 .map(Entry::Broadcast),
         )
+        .take(LIMIT)
         .collect()
 }
 
@@ -172,6 +191,11 @@ impl Composer {
             Entry::User(id) => {
                 let text = format!("@{}", fixtures.mention(&id));
                 self.editor.insert_atom(menu.range, Atom::User(id), &text);
+            }
+            Entry::Usergroup(id) => {
+                let text = format!("@{}", fixtures.usergroup_handle(&id).unwrap_or(id.as_str()));
+                self.editor
+                    .insert_atom(menu.range, Atom::Usergroup(id), &text);
             }
             Entry::Broadcast(range) => {
                 let text = format!("@{range}");

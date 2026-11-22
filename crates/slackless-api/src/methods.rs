@@ -17,7 +17,7 @@ use crate::types::endpoints::method;
 use crate::types::{
     ApiResponse, Attachment, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation,
     ConversationKind, DndStatus, Empty, File, Latest, Message, RichTextBlock, SectionKind, Team,
-    TeamId, Ts, User, UserId, UserPresence,
+    TeamId, Ts, User, UserId, UserPresence, Usergroup,
 };
 use crate::{Result, SlackApi};
 
@@ -1660,6 +1660,24 @@ impl SlackApi {
         paginate(|cursor| self.users_list(Some(1000), cursor))
             .try_collect()
             .await
+    }
+
+    /// `usergroups.list`: the workspace's active `@handle` user groups.
+    pub async fn usergroups_list(&self) -> Result<Vec<Usergroup>> {
+        let params = vec![
+            ("include_count", "true".to_owned()),
+            ("include_disabled", "false".to_owned()),
+        ];
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default, deserialize_with = "lenient_vec")]
+            usergroups: Vec<Usergroup>,
+        }
+        Ok(self
+            .call::<Wire>(method::USERGROUPS_LIST, params)
+            .await?
+            .data
+            .usergroups)
     }
 
     /// Every page of `users.channelSections.list`: the user's sidebar sections, in the order

@@ -122,6 +122,8 @@ pub enum DraftsEvent {
     SendNow(Entry),
     /// Cancel a pending scheduled message (already removed from the schedule).
     CancelScheduled(Entry),
+    /// A saved draft was deleted from the Drafts tab.
+    Deleted,
     Close,
 }
 
@@ -164,6 +166,27 @@ impl DraftsView {
 
     pub fn draft_count(&self) -> usize {
         self.drafts.len()
+    }
+
+    /// All saved drafts for `workspace`, newest first.
+    pub fn drafts_for(&self, workspace: usize) -> Vec<Entry> {
+        self.drafts
+            .iter()
+            .filter(|d| d.workspace == workspace)
+            .cloned()
+            .collect()
+    }
+
+    /// Restore persisted drafts at launch (replacing any existing entries for their workspaces).
+    pub fn load_drafts(&mut self, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        for entry in entries {
+            if !entry.text.trim().is_empty() {
+                self.drafts
+                    .retain(|d| !(d.workspace == entry.workspace && d.channel == entry.channel));
+                self.drafts.push(entry);
+            }
+        }
+        cx.notify();
     }
 
     pub fn schedule(&mut self, entry: Entry, cx: &mut Context<Self>) {
@@ -276,6 +299,7 @@ impl Render for DraftsView {
                             .tooltip("Delete draft")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.drafts.remove(ix);
+                                cx.emit(DraftsEvent::Deleted);
                                 cx.notify();
                             })),
                     ),
