@@ -2417,6 +2417,11 @@ enum Segment {
         icon: IconName,
         icon_size: f32,
     },
+    /// Slack's inline hex color swatch (`#RRGGBB` + rounded color square, `F-SHELL-087`).
+    ColorSwatch {
+        hex: String,
+        color: Hsla,
+    },
 }
 
 /// Accumulates a paragraph's styled text and link ranges, split only at inline images.
@@ -2534,6 +2539,11 @@ impl ParagraphBuilder {
             icon,
             icon_size,
         });
+    }
+
+    fn push_color_swatch(&mut self, hex: String, color: Hsla) {
+        self.flush();
+        self.segments.push(Segment::ColorSwatch { hex, color });
     }
 
     fn flush(&mut self) {
@@ -2762,6 +2772,28 @@ fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                                 .text_color(theme.link),
                         )
                         .child(label),
+                );
+            }
+            Segment::ColorSwatch { hex, color } => {
+                // Slack renders `#RRGGBB` inline with a crisp rounded color square beside it.
+                row = row.child(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.code_bg)
+                        .child(div().text_color(theme.foreground).child(hex))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(11.))
+                                .rounded(px(2.))
+                                .bg(color)
+                                .border_1()
+                                .border_color(theme.foreground.opacity(0.22)),
+                        ),
                 );
             }
         }
@@ -3474,13 +3506,11 @@ fn push_element(
             builder.push_text(&text, theme, RunFlags::default(), None, None);
         }
         RichTextElement::Color(el) => {
-            builder.push_text(
-                &el.value,
-                theme,
-                RunFlags::default(),
-                hex_color(&el.value),
-                None,
-            );
+            if let Some(color) = hex_color(&el.value) {
+                builder.push_color_swatch(el.value.clone(), color);
+            } else {
+                builder.push_text(&el.value, theme, RunFlags::default(), None, None);
+            }
         }
         RichTextElement::MessageMention(el) => {
             // Slack's chip for a link to a message: a speech bubble and "Author in #channel",
@@ -4634,9 +4664,25 @@ fn date_label_absolute(time: &CivilTime) -> String {
     format!("{} {}", MONTHS[(time.month - 1) as usize], time.day)
 }
 
-/// Offset from UTC in seconds at `unix_secs`, honoring DST, from the platform `localtime`.
+/// Manual timezone offset override in seconds (`i64::MIN` = follow OS timezone, `F-SHELL-100`).
+static TIMEZONE_OVERRIDE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Override the display clock timezone (`None` restores automatic system timezone).
+pub fn set_timezone_override(offset_secs: Option<i64>) {
+    TIMEZONE_OVERRIDE.store(
+        offset_secs.unwrap_or(i64::MIN),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Offset from UTC in seconds at `unix_secs`, honoring manual override or platform `localtime`.
 #[cfg(unix)]
 fn local_utc_offset(unix_secs: i64) -> i64 {
+    let manual = TIMEZONE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if manual != i64::MIN {
+        return manual;
+    }
     /// `struct tm` as laid out by glibc and Darwin: nine `int` fields then
     /// `tm_gmtoff`/`tm_zone`.
     #[repr(C)]
@@ -4686,6 +4732,10 @@ fn local_utc_offset(unix_secs: i64) -> i64 {
 
 #[cfg(not(unix))]
 fn local_utc_offset(_unix_secs: i64) -> i64 {
+    let manual = TIMEZONE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if manual != i64::MIN {
+        return manual;
+    }
     0
 }
 

@@ -6,24 +6,28 @@
 //! `osascript` (see [`Notifier`]).
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use dispatch2::DispatchQueue;
-use objc2::AnyThread as _;
-use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2_app_kit::{NSAboutPanelOptionApplicationIcon, NSApplication, NSImage, NSSound};
+use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _, define_class, msg_send, sel};
+use objc2_app_kit::{
+    NSAboutPanelOptionApplicationIcon, NSApplication, NSImage, NSMenu, NSMenuItem, NSSound,
+    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+};
 use objc2_foundation::{
-    NSArray, NSBundle, NSData, NSDictionary, NSNumber, NSString, NSUserDefaults,
+    NSArray, NSBundle, NSData, NSDictionary, NSInteger, NSNumber, NSObject, NSSize, NSString,
+    NSUserDefaults,
 };
 use security_framework::passwords::{self, PasswordOptions};
 
 use crate::deep_link::{self, DeepLink};
 use crate::{
     AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
-    Result, SecretStore, SoundPlayer,
+    Result, SecretStore, SoundPlayer, StatusBarAction, StatusBarItem, StatusBarState,
 };
 
 /// `errSecItemNotFound`, the documented OSStatus for a missing keychain item.
@@ -256,4 +260,189 @@ fn declared_url_schemes() -> Vec<String> {
         }
     }
     schemes
+}
+
+static STATUS_ACTIONS: LazyLock<Mutex<VecDeque<StatusBarAction>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "SlacklessStatusBarTarget"]
+    #[ivars = ()]
+    struct StatusBarTarget;
+
+    impl StatusBarTarget {
+        #[unsafe(method(showWindow:))]
+        fn show_window(&self, _sender: Option<&AnyObject>) {
+            STATUS_ACTIONS
+                .lock()
+                .expect("status actions mutex poisoned")
+                .push_back(StatusBarAction::ShowWindow);
+            if let Some(mtm) = MainThreadMarker::new() {
+                let app = NSApplication::sharedApplication(mtm);
+                app.unhide(None);
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+            }
+        }
+
+        #[unsafe(method(switchWorkspace:))]
+        fn switch_workspace(&self, sender: Option<&NSMenuItem>) {
+            let tag = sender.map(|item| item.tag()).unwrap_or(0);
+            if tag >= 0 {
+                STATUS_ACTIONS
+                    .lock()
+                    .expect("status actions mutex poisoned")
+                    .push_back(StatusBarAction::SwitchWorkspace(tag as usize));
+            }
+            if let Some(mtm) = MainThreadMarker::new() {
+                let app = NSApplication::sharedApplication(mtm);
+                app.unhide(None);
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+            }
+        }
+
+        #[unsafe(method(toggleDnd:))]
+        fn toggle_dnd(&self, _sender: Option<&AnyObject>) {
+            STATUS_ACTIONS
+                .lock()
+                .expect("status actions mutex poisoned")
+                .push_back(StatusBarAction::ToggleDnd);
+        }
+
+        #[unsafe(method(quitApp:))]
+        fn quit_app(&self, _sender: Option<&AnyObject>) {
+            STATUS_ACTIONS
+                .lock()
+                .expect("status actions mutex poisoned")
+                .push_back(StatusBarAction::Quit);
+        }
+    }
+);
+
+impl StatusBarTarget {
+    fn new() -> Retained<Self> {
+        let this = Self::alloc().set_ivars(());
+        // SAFETY: `NSObject::init` on a freshly allocated subclass instance.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+struct LiveStatusItem {
+    item: Retained<NSStatusItem>,
+    target: Retained<StatusBarTarget>,
+}
+
+thread_local! {
+    static STATUS_ITEM: RefCell<Option<LiveStatusItem>> = const { RefCell::new(None) };
+}
+
+impl StatusBarItem for MacPlatform {
+    fn update_status_bar(&self, icon_png: Option<&[u8]>, state: &StatusBarState) {
+        let icon = icon_png.map(|b| b.to_vec());
+        let state = state.clone();
+        if MainThreadMarker::new().is_some() {
+            apply_status_bar(icon.as_deref(), &state);
+        } else {
+            DispatchQueue::main().exec_async(move || {
+                apply_status_bar(icon.as_deref(), &state);
+            });
+        }
+    }
+
+    fn take_status_bar_action(&self) -> Option<StatusBarAction> {
+        STATUS_ACTIONS
+            .lock()
+            .expect("status actions mutex poisoned")
+            .pop_front()
+    }
+}
+
+fn apply_status_bar(icon_png: Option<&[u8]>, state: &StatusBarState) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let bar = NSStatusBar::systemStatusBar();
+    if !state.visible {
+        STATUS_ITEM.with(|slot| {
+            if let Some(live) = slot.borrow_mut().take() {
+                bar.removeStatusItem(&live.item);
+            }
+        });
+        return;
+    }
+
+    STATUS_ITEM.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let live = borrow.get_or_insert_with(|| {
+            let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+            let target = StatusBarTarget::new();
+            LiveStatusItem { item, target }
+        });
+
+        if let Some(button) = live.item.button(mtm) {
+            if let Some(png) = icon_png {
+                if let Some(img) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png))
+                {
+                    img.setSize(NSSize::new(18., 18.));
+                    img.setTemplate(false);
+                    button.setImage(Some(&img));
+                }
+            }
+            let title = if state.unread_mentions > 0 {
+                format!(" {}", state.unread_mentions)
+            } else if state.dnd_active {
+                " \u{1F319}".to_owned()
+            } else if state.has_unreads {
+                " \u{2022}".to_owned()
+            } else {
+                String::new()
+            };
+            button.setTitle(&NSString::from_str(&title));
+        }
+
+        let menu = NSMenu::new(mtm);
+        let target_obj: &AnyObject = &live.target;
+        let add = |menu: &NSMenu, title: &str, action: objc2::runtime::Sel, tag: NSInteger| {
+            // SAFETY: valid selector on `StatusBarTarget` retained for the menu's lifetime.
+            let mi = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe { mi.setTarget(Some(target_obj)) };
+            mi.setTag(tag);
+            menu.addItem(&mi);
+        };
+
+        add(&menu, "Open Slackless", sel!(showWindow:), -1);
+        if !state.workspaces.is_empty() {
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
+            for (ix, (name, mentions, has_unreads)) in state.workspaces.iter().enumerate() {
+                let label = if *mentions > 0 {
+                    format!("{name} ({mentions})")
+                } else if *has_unreads {
+                    format!("{name} \u{2022}")
+                } else {
+                    name.clone()
+                };
+                add(&menu, &label, sel!(switchWorkspace:), ix as NSInteger);
+            }
+        }
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let dnd_label = if state.dnd_active {
+            "Resume notifications"
+        } else {
+            "Pause notifications (1 hour)"
+        };
+        add(&menu, dnd_label, sel!(toggleDnd:), -1);
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        add(&menu, "Quit Slackless", sel!(quitApp:), -1);
+
+        live.item.setMenu(Some(&menu));
+    });
 }

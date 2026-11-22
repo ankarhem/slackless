@@ -147,6 +147,8 @@ pub enum ActivityEvent {
     },
     /// The error state's Retry: fetch the page again.
     Retry,
+    /// Open the Activity feed in a standalone pop-out window (`F-SHELL-149`).
+    PopOut,
 }
 
 pub struct ActivityFeed {
@@ -177,6 +179,38 @@ impl ActivityFeed {
             load: Load::Idle,
             selected: None,
         })
+    }
+
+    /// Snapshot of currently visible items for a popped-out Activity window (`F-SHELL-149`).
+    pub fn snapshot_for_popout(&self) -> Vec<crate::popout::PopoutActivityRow> {
+        self.visible()
+            .into_iter()
+            .map(|ix| {
+                let item = &self.items[ix];
+                let title = item
+                    .actor
+                    .as_ref()
+                    .and_then(|id| self.fixtures.user(id))
+                    .map(|u| self.fixtures.name_of(u).to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| item.actor_label.clone());
+                let body = match &item.reaction {
+                    Some(emoji) => format!(":{emoji}: {}", item.text),
+                    None => item.text.clone(),
+                };
+                let place = self
+                    .fixtures
+                    .conversation(&item.channel)
+                    .map(|c| self.fixtures.conversation_label(c))
+                    .unwrap_or_else(|| item.channel.to_string());
+                crate::popout::PopoutActivityRow {
+                    title,
+                    body,
+                    context: format!("{place} · {}", list_stamp(&item.ts)),
+                    unread: item.unread,
+                }
+            })
+            .collect()
     }
 
     /// Move keyboard selection up or down across visible Activity items (`F-SHELL-276`).
@@ -605,13 +639,26 @@ impl Render for ActivityFeed {
             .text_color(fg)
             .text_sm()
             .child(
-                div()
+                h_flex()
                     .px_4()
                     .pt_4()
                     .pb_1()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .child("Activity"),
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::BOLD)
+                            .child("Activity"),
+                    )
+                    .child(
+                        Button::new("activity-popout")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::ExternalLink)
+                            .tooltip("Open Activity in new window")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ActivityEvent::PopOut))),
+                    ),
             )
             .child(self.tabs(cx))
             .child(self.toolbar(cx))

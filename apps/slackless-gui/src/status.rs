@@ -356,6 +356,10 @@ pub struct StatusPicker {
     pause: bool,
     /// The workspace the suggestions are for ("For Norce").
     workspace: SharedString,
+    /// Workspace-configured status presets (`F-SHELL-015`); falls back to [`SUGGESTED`] when empty.
+    presets: Vec<(String, String, usize)>,
+    /// Recently saved custom statuses in this session (newest first, max 3).
+    recent: Vec<(String, String, usize)>,
     emoji_open: bool,
     clear_open: bool,
     _subscriptions: Vec<Subscription>,
@@ -391,11 +395,30 @@ impl StatusPicker {
                 clear_after: 0,
                 pause: false,
                 workspace: SharedString::default(),
+                presets: Vec::new(),
+                recent: Vec::new(),
                 emoji_open: false,
                 clear_open: false,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    /// Install workspace-configured suggested statuses (`team.prefs.custom_status_default_suggestions`).
+    pub fn set_presets(&mut self, presets: Vec<(String, String, usize)>, cx: &mut Context<Self>) {
+        self.presets = presets;
+        cx.notify();
+    }
+
+    fn effective_suggestions(&self) -> Vec<(String, String, usize)> {
+        if !self.presets.is_empty() {
+            self.presets.clone()
+        } else {
+            SUGGESTED
+                .iter()
+                .map(|(code, text, clear)| ((*code).to_owned(), (*text).to_owned(), *clear))
+                .collect()
+        }
     }
 
     /// Load `status` (or a blank draft) for `workspace` before the dialog opens.
@@ -442,23 +465,33 @@ impl StatusPicker {
         let status = (!text.is_empty()).then(|| {
             let mut s = UserStatus {
                 emoji: self.emoji.clone(),
-                text,
+                text: text.clone(),
                 clear_after: self.clear_after,
                 pause: self.pause,
                 expiration: None,
             };
             s.expiration = s.clears_at();
+            self.recent.retain(|(_, t, _)| t != &text);
+            self.recent
+                .insert(0, (self.emoji.clone(), text, self.clear_after));
+            self.recent.truncate(3);
             s
         });
         cx.emit(StatusEvent::Save(status));
     }
 
-    fn pick_suggestion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (emoji, text, clear_after) = SUGGESTED[ix];
+    fn pick_suggestion(
+        &mut self,
+        emoji: String,
+        text: String,
+        clear_after: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.load(
             Some(&UserStatus {
-                emoji: emoji.to_owned(),
-                text: text.to_owned(),
+                emoji,
+                text,
                 clear_after,
                 pause: false,
                 expiration: None,
@@ -577,23 +610,26 @@ impl Render for StatusPicker {
         });
 
         let suggestions = (!self.has_text).then(|| {
+            let workspace_list = self.effective_suggestions();
+            let recent_list = self.recent.clone();
             v_flex()
                 .gap_0p5()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(muted)
-                        .pb_1()
-                        .child(format!("For {}", self.workspace)),
-                )
-                .children(
-                    SUGGESTED
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, (code, text, clear))| {
+                .when(!recent_list.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .pb_1()
+                            .child("Recent"),
+                    )
+                    .children(recent_list.into_iter().enumerate().map(
+                        |(ix, (code, text, clear))| {
+                            let clear_label =
+                                CLEAR_AFTER.get(clear).copied().unwrap_or(CLEAR_AFTER[0]);
+                            let (c_click, t_click) = (code.clone(), text.clone());
                             h_flex()
-                                .id(("status-suggestion", ix))
+                                .id(("status-recent", ix))
                                 .items_center()
                                 .gap_2()
                                 .px_2()
@@ -602,18 +638,66 @@ impl Render for StatusPicker {
                                 .cursor_pointer()
                                 .text_sm()
                                 .hover(|el| el.bg(hover))
-                                .child(emoji_glyph(code).unwrap_or("?"))
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(*text))
+                                .child(emoji_glyph(&code).unwrap_or("\u{1F4AC}"))
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(text))
                                 .child(
                                     div()
                                         .text_color(muted)
-                                        .child(format!("\u{2014} {}", CLEAR_AFTER[*clear])),
+                                        .child(format!("\u{2014} {clear_label}")),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.pick_suggestion(ix, window, cx)
+                                    this.pick_suggestion(
+                                        c_click.clone(),
+                                        t_click.clone(),
+                                        clear,
+                                        window,
+                                        cx,
+                                    )
                                 }))
-                        }),
+                        },
+                    ))
+                    .child(div().h(px(6.)))
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(muted)
+                        .pb_1()
+                        .child(format!("For {}", self.workspace)),
                 )
+                .children(workspace_list.into_iter().enumerate().map(
+                    |(ix, (code, text, clear))| {
+                        let clear_label = CLEAR_AFTER.get(clear).copied().unwrap_or(CLEAR_AFTER[0]);
+                        let (c_click, t_click) = (code.clone(), text.clone());
+                        h_flex()
+                            .id(("status-suggestion", ix))
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_sm()
+                            .hover(|el| el.bg(hover))
+                            .child(emoji_glyph(&code).unwrap_or("\u{1F4AC}"))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(text))
+                            .child(
+                                div()
+                                    .text_color(muted)
+                                    .child(format!("\u{2014} {clear_label}")),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.pick_suggestion(
+                                    c_click.clone(),
+                                    t_click.clone(),
+                                    clear,
+                                    window,
+                                    cx,
+                                )
+                            }))
+                    },
+                ))
         });
 
         // Step two: once there is a status, its Duration and the pause checkbox.

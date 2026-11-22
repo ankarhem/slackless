@@ -220,6 +220,8 @@ pub struct Settings {
     pub show_preview: bool,
     pub mute_sounds: bool,
     pub show_dock_badge: bool,
+    /// Show a badge dot on any unread message, not only DMs & mentions (`F-SHELL-178`).
+    pub badge_on_unreads: bool,
     pub schedule_enabled: bool,
     pub schedule_days: usize,
     pub schedule_start: usize,
@@ -271,10 +273,16 @@ pub struct Settings {
     // Mark as read
     pub mark_read: usize,
     pub confirm_mark_all: bool,
+    /// Keep incoming/opened messages unread while the window is in the background (`F-SHELL-112`).
+    pub no_bg_mark_read: bool,
     // Advanced
     pub confirm_unsend: bool,
     pub warn_external: bool,
     pub launch_at_login: bool,
+    /// Show a persistent menu-bar / tray icon with unread counts & quick actions (`F-SHELL-168`).
+    pub show_menu_bar_icon: bool,
+    /// Hide to menu bar instead of quitting when closing the main window (`F-SHELL-141`).
+    pub close_to_tray: bool,
     pub hardware_acceleration: bool,
     pub debug_logging: bool,
     pub open_links: usize,
@@ -381,6 +389,7 @@ impl Default for Settings {
             show_preview: true,
             mute_sounds: false,
             show_dock_badge: true,
+            badge_on_unreads: false,
             schedule_enabled: true,
             schedule_days: 1,
             schedule_start: 9,
@@ -425,9 +434,12 @@ impl Default for Settings {
             announce_incoming: false,
             mark_read: 0,
             confirm_mark_all: true,
+            no_bg_mark_read: true,
             confirm_unsend: true,
             warn_external: true,
             launch_at_login: false,
+            show_menu_bar_icon: true,
+            close_to_tray: false,
             hardware_acceleration: true,
             debug_logging: false,
             open_links: 0,
@@ -442,6 +454,15 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Manual UTC offset in seconds when `timezone_auto` is off (`None` = system timezone).
+    pub fn timezone_offset_secs(&self) -> Option<i64> {
+        if self.timezone_auto {
+            return None;
+        }
+        const OFFSETS: [i64; 5] = [3_600, 0, -18_000, -28_800, 32_400];
+        Some(OFFSETS.get(self.timezone).copied().unwrap_or(0))
+    }
+
     /// `Weekdays, 9:00 AM – 6:00 PM`, or `Off` without a schedule.
     pub fn schedule_summary(&self) -> String {
         if !self.schedule_enabled {
@@ -911,6 +932,12 @@ impl Preferences {
             |s| &mut s.show_dock_badge,
             cx,
         );
+        let badge_unreads = self.checkbox(
+            "notify-badge-unreads",
+            "Also show a dot badge for any unread message (not just DMs & mentions)",
+            |s| &mut s.badge_on_unreads,
+            cx,
+        );
         v_flex()
             .child(self.group(
                 "Notify me about\u{2026}",
@@ -948,7 +975,8 @@ impl Preferences {
                     .child(self.labeled("Notification sound (DMs & mentions)", dm_sound))
                     .child(preview)
                     .child(mute)
-                    .child(dock_badge),
+                    .child(dock_badge)
+                    .child(badge_unreads),
                 cx,
             ))
     }
@@ -1397,9 +1425,20 @@ impl Preferences {
             |s| &mut s.confirm_mark_all,
             cx,
         );
+        let no_bg = self.checkbox(
+            "mark-no-bg",
+            "Keep messages unread while window is in the background",
+            |s| &mut s.no_bg_mark_read,
+            cx,
+        );
         v_flex()
             .child(self.group("When I view a channel", None, mode, cx))
-            .child(self.group("Mark everything read", None, confirm, cx))
+            .child(self.group(
+                "Mark everything read",
+                None,
+                v_flex().gap_1().child(confirm).child(no_bg),
+                cx,
+            ))
     }
 
     fn advanced(&mut self, cx: &mut Context<Self>) -> Div {
@@ -1419,6 +1458,18 @@ impl Preferences {
             "adv-login",
             "Launch slackless at login",
             |s| &mut s.launch_at_login,
+            cx,
+        );
+        let menu_bar = self.checkbox(
+            "adv-menu-bar",
+            "Show slackless icon in the menu bar",
+            |s| &mut s.show_menu_bar_icon,
+            cx,
+        );
+        let close_tray = self.checkbox(
+            "adv-close-tray",
+            "Keep slackless running in the menu bar when closing the window",
+            |s| &mut s.close_to_tray,
             cx,
         );
         let hardware = self.checkbox(
@@ -1564,6 +1615,8 @@ impl Preferences {
                 v_flex()
                     .gap_2()
                     .child(login)
+                    .child(menu_bar)
+                    .child(close_tray)
                     .child(hardware)
                     .child(debug)
                     .child(div().pt_1().child(reset_cache)),

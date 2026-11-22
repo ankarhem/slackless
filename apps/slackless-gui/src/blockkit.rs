@@ -745,8 +745,9 @@ fn button(element: &Json, block: &Json, key: String, kcx: &KitCx) -> Button {
         })
 }
 
-/// A select menu: an outlined button showing the choice, opening a checked option list and
-/// dispatching live `blocks.actions` with Slack's wire selection field.
+/// A select menu: supports both single-select and real multi-select (`multi_*_select`,
+/// `F-COLLAB-775`), opening a checked option list and dispatching live `blocks.actions` with
+/// Slack's wire selection fields.
 fn select(
     element: &Json,
     block: &Json,
@@ -755,6 +756,155 @@ fn select(
     kcx: &KitCx,
     cx: &App,
 ) -> AnyElement {
+    let kind = element["type"].as_str().unwrap_or_default().to_owned();
+    let is_multi = kind.starts_with("multi_");
+    let placeholder = text_of(&element["placeholder"])
+        .unwrap_or("Select an item")
+        .to_owned();
+    let base = action_base(element, block);
+
+    if is_multi {
+        let initial: HashSet<String> = element["initial_options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o["value"].as_str().map(str::to_owned))
+            .chain(
+                element["initial_users"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned)),
+            )
+            .chain(
+                element["initial_conversations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned)),
+            )
+            .chain(
+                element["initial_channels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_owned)),
+            )
+            .collect();
+        let selected_set = kcx
+            .kit
+            .and_then(|kit| kit.read(cx).checked.get(&key).cloned())
+            .unwrap_or_else(|| initial.clone());
+        let selected_labels: Vec<&str> = options
+            .iter()
+            .filter(|(_, v)| selected_set.contains(v))
+            .map(|(l, _)| l.as_str())
+            .collect();
+        let label = match selected_labels.len() {
+            0 => placeholder,
+            1 => selected_labels[0].to_owned(),
+            2 => format!("{}, {}", selected_labels[0], selected_labels[1]),
+            n => format!("{}, +{} more", selected_labels[0], n - 1),
+        };
+        let (kit, on_action, attachment) =
+            (kcx.kit.cloned(), kcx.on_action.clone(), kcx.attachment);
+        let all_opts = options.clone();
+        return Button::new(SharedString::from(format!("bk-{key}")))
+            .outline()
+            .with_size(Size::Small)
+            .label(label)
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (text, value) in &options {
+                    let is_on = selected_set.contains(value);
+                    let (kit, key, value, text_s) =
+                        (kit.clone(), key.clone(), value.clone(), text.clone());
+                    let (initial, base, kind, all_opts, on_action) = (
+                        initial.clone(),
+                        base.clone(),
+                        kind.clone(),
+                        all_opts.clone(),
+                        on_action.clone(),
+                    );
+                    menu = menu.item(PopupMenuItem::new(text.clone()).checked(is_on).on_click(
+                        move |_, window, cx| {
+                            let next_set = if let Some(kit) = &kit {
+                                kit.update(cx, |state, cx| {
+                                    let set = state
+                                        .checked
+                                        .entry(key.clone())
+                                        .or_insert_with(|| initial.clone());
+                                    if !set.insert(value.clone()) {
+                                        set.remove(&value);
+                                    }
+                                    cx.notify();
+                                    set.clone()
+                                })
+                            } else {
+                                let mut set = initial.clone();
+                                if !set.insert(value.clone()) {
+                                    set.remove(&value);
+                                }
+                                set
+                            };
+                            let mut payload = base.clone();
+                            let ordered: Vec<(&str, &str)> = all_opts
+                                .iter()
+                                .filter(|(_, v)| next_set.contains(v))
+                                .map(|(t, v)| (t.as_str(), v.as_str()))
+                                .collect();
+                            match kind.as_str() {
+                                "multi_users_select" => {
+                                    payload["selected_users"] = Json::Array(
+                                        ordered.iter().map(|(_, v)| (*v).into()).collect(),
+                                    );
+                                }
+                                "multi_conversations_select" => {
+                                    payload["selected_conversations"] = Json::Array(
+                                        ordered.iter().map(|(_, v)| (*v).into()).collect(),
+                                    );
+                                }
+                                "multi_channels_select" => {
+                                    payload["selected_channels"] = Json::Array(
+                                        ordered.iter().map(|(_, v)| (*v).into()).collect(),
+                                    );
+                                }
+                                _ => {
+                                    payload["selected_options"] = Json::Array(
+                                        ordered
+                                            .iter()
+                                            .map(|(t, v)| {
+                                                serde_json::json!({
+                                                    "text": { "type": "plain_text", "text": t },
+                                                    "value": v,
+                                                })
+                                            })
+                                            .collect(),
+                                    );
+                                }
+                            }
+                            let verb = if next_set.contains(&value) {
+                                "selected"
+                            } else {
+                                "removed"
+                            };
+                            dispatch_action(
+                                payload,
+                                on_action.as_ref(),
+                                attachment,
+                                &key,
+                                &format!("{verb} \u{201C}{text_s}\u{201D}"),
+                                window,
+                                cx,
+                            );
+                        },
+                    ));
+                }
+                menu
+            })
+            .into_any_element();
+    }
+
     let initial = element["initial_option"]["value"]
         .as_str()
         .or_else(|| element["initial_user"].as_str())
@@ -762,15 +912,10 @@ fn select(
         .or_else(|| element["initial_channel"].as_str())
         .map(str::to_owned);
     let selected = choice(kcx, &key, cx).or(initial);
-    let placeholder = text_of(&element["placeholder"])
-        .unwrap_or("Select an item")
-        .to_owned();
     let label = selected
         .as_ref()
         .and_then(|value| options.iter().find(|(_, option)| option == value))
         .map_or(placeholder, |(label, _)| label.clone());
-    let base = action_base(element, block);
-    let kind = element["type"].as_str().unwrap_or_default().to_owned();
     dropdown(
         key,
         label,
@@ -784,21 +929,8 @@ fn select(
             let mut action = base.clone();
             match kind.as_str() {
                 "users_select" => action["selected_user"] = value.into(),
-                "multi_users_select" => action["selected_users"] = serde_json::json!([value]),
                 "conversations_select" => action["selected_conversation"] = value.into(),
-                "multi_conversations_select" => {
-                    action["selected_conversations"] = serde_json::json!([value]);
-                }
                 "channels_select" => action["selected_channel"] = value.into(),
-                "multi_channels_select" => {
-                    action["selected_channels"] = serde_json::json!([value]);
-                }
-                "multi_static_select" | "multi_external_select" => {
-                    action["selected_options"] = serde_json::json!([{
-                        "text": { "type": "plain_text", "text": text },
-                        "value": value,
-                    }]);
-                }
                 _ => {
                     action["selected_option"] = serde_json::json!({
                         "text": { "type": "plain_text", "text": text },
@@ -898,38 +1030,60 @@ fn dropdown(
         })
 }
 
-/// The `...` overflow menu: each option dispatches a live `blocks.actions` event.
+/// The `...` overflow menu: options with a `url` open it via the link router (`F-COLLAB-777`),
+/// and every choice dispatches a live `blocks.actions` event.
 fn overflow(element: &Json, block: &Json, key: String, kcx: &KitCx) -> impl IntoElement {
-    let options = options(element);
+    let items: Vec<(String, String, Option<String>)> = element["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            Some((
+                text_of(&option["text"])?.to_owned(),
+                option["value"].as_str().unwrap_or_default().to_owned(),
+                option["url"].as_str().map(str::to_owned),
+            ))
+        })
+        .collect();
     let base = action_base(element, block);
-    let (on_action, attachment) = (kcx.on_action.clone(), kcx.attachment);
+    let (on_action, attachment, links) = (kcx.on_action.clone(), kcx.attachment, kcx.links.clone());
     Button::new(SharedString::from(format!("bk-{key}")))
         .ghost()
         .with_size(Size::Small)
         .icon(IconName::Ellipsis)
         .dropdown_menu(move |mut menu, _, _| {
-            for (text, value) in &options {
-                let (key, base, on_action) = (key.clone(), base.clone(), on_action.clone());
-                let (text_s, value_s) = (text.clone(), value.clone());
+            for (text, value, url) in &items {
+                let (key, base, on_action, links) =
+                    (key.clone(), base.clone(), on_action.clone(), links.clone());
+                let (text_s, value_s, url_s) = (text.clone(), value.clone(), url.clone());
                 let detail = format!("chose \u{201C}{text}\u{201D} (value {value})");
-                menu = menu.item(PopupMenuItem::new(text.clone()).on_click(
-                    move |_, window, cx| {
-                        let mut payload = base.clone();
-                        payload["selected_option"] = serde_json::json!({
-                            "text": { "type": "plain_text", "text": text_s },
-                            "value": value_s,
-                        });
-                        dispatch_action(
-                            payload,
-                            on_action.as_ref(),
-                            attachment,
-                            &key,
-                            &detail,
-                            window,
-                            cx,
-                        );
-                    },
-                ));
+                let mut item = PopupMenuItem::new(text.clone());
+                if url.is_some() {
+                    item = item.icon(IconName::ExternalLink);
+                }
+                menu = menu.item(item.on_click(move |_, window, cx| {
+                    if let Some(url) = &url_s {
+                        if let Some(links) = &links {
+                            links(messages::LinkTarget::Url(url.clone().into()), window, cx);
+                        } else {
+                            cx.open_url(url);
+                        }
+                    }
+                    let mut payload = base.clone();
+                    payload["selected_option"] = serde_json::json!({
+                        "text": { "type": "plain_text", "text": text_s },
+                        "value": value_s,
+                    });
+                    dispatch_action(
+                        payload,
+                        on_action.as_ref(),
+                        attachment,
+                        &key,
+                        &detail,
+                        window,
+                        cx,
+                    );
+                }));
             }
             menu
         })
@@ -1053,15 +1207,108 @@ fn radios(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> D
         }))
 }
 
+/// Validate a Block Kit text input element's current value (`F-COLLAB-747`, `776`, `778`, `791`).
+fn validate_text_input(element: &Json, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match element["type"].as_str().unwrap_or_default() {
+        "email_text_input" => {
+            let valid = trimmed.split_once('@').is_some_and(|(local, domain)| {
+                !local.is_empty()
+                    && !local.contains(char::is_whitespace)
+                    && !domain.contains(char::is_whitespace)
+                    && domain.contains('.')
+                    && !domain.starts_with('.')
+                    && !domain.ends_with('.')
+            });
+            (!valid).then(|| "Enter a valid email address.".to_owned())
+        }
+        "url_text_input" => {
+            let valid = (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+                && !trimmed.contains(char::is_whitespace)
+                && trimmed.split("://").nth(1).is_some_and(|rest| {
+                    let host = rest.split('/').next().unwrap_or_default();
+                    !host.is_empty() && host.contains('.')
+                });
+            (!valid).then(|| "Enter a valid URL starting with http:// or https://.".to_owned())
+        }
+        "number_input" => {
+            let decimal_ok = element["is_decimal_allowed"].as_bool().unwrap_or(false);
+            let parsed = if decimal_ok {
+                trimmed.parse::<f64>().ok()
+            } else {
+                trimmed.parse::<i64>().ok().map(|n| n as f64)
+            };
+            let Some(num) = parsed else {
+                return Some(if decimal_ok {
+                    "Enter a valid number.".to_owned()
+                } else {
+                    "Enter a whole number.".to_owned()
+                });
+            };
+            if let Some(min) = element["min_value"]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| element["min_value"].as_f64())
+            {
+                if num < min {
+                    return Some(format!("Must be at least {min}."));
+                }
+            }
+            if let Some(max) = element["max_value"]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| element["max_value"].as_f64())
+            {
+                if num > max {
+                    return Some(format!("Must be at most {max}."));
+                }
+            }
+            None
+        }
+        "plain_text_input" => {
+            let len = value.chars().count();
+            if let Some(min) = element["min_length"].as_u64() {
+                if (len as u64) < min {
+                    return Some(format!("Must be at least {min} characters."));
+                }
+            }
+            if let Some(max) = element["max_length"].as_u64() {
+                if (len as u64) > max {
+                    return Some(format!("Must be at most {max} characters."));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// A text input's textarea when [`prepare_inputs`] created one, else a framed placeholder.
 fn text_input(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
     if let Some(input) = kcx
         .kit
         .and_then(|kit| kit.read(cx).inputs.get(key).cloned())
     {
-        return div()
+        let value = input.read(cx).value();
+        let error = validate_text_input(element, &value);
+        let danger = cx.theme().danger;
+        return v_flex()
             .w_full()
-            .child(Textarea::new(&input))
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .when(error.is_some(), |el| {
+                        el.rounded_md().border_1().border_color(danger)
+                    })
+                    .child(Textarea::new(&input)),
+            )
+            .when_some(error, |col, msg| {
+                col.child(div().text_xs().text_color(danger).child(msg))
+            })
             .into_any_element();
     }
     let theme = cx.theme();
@@ -1846,4 +2093,33 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         } else {
             body.into_any_element()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn validates_email_url_number_and_plain_text_inputs() {
+        let email = json!({ "type": "email_text_input" });
+        assert!(validate_text_input(&email, "").is_none());
+        assert!(validate_text_input(&email, "alice@example.com").is_none());
+        assert!(validate_text_input(&email, "not-an-email").is_some());
+
+        let url = json!({ "type": "url_text_input" });
+        assert!(validate_text_input(&url, "https://slack.com/app").is_none());
+        assert!(validate_text_input(&url, "ftp://bad").is_some());
+
+        let int_num = json!({ "type": "number_input", "is_decimal_allowed": false, "min_value": "1", "max_value": "10" });
+        assert!(validate_text_input(&int_num, "5").is_none());
+        assert!(validate_text_input(&int_num, "5.5").is_some());
+        assert!(validate_text_input(&int_num, "0").is_some());
+        assert!(validate_text_input(&int_num, "11").is_some());
+
+        let plain = json!({ "type": "plain_text_input", "min_length": 3, "max_length": 5 });
+        assert!(validate_text_input(&plain, "hi").is_some());
+        assert!(validate_text_input(&plain, "hey").is_none());
+        assert!(validate_text_input(&plain, "toolong").is_some());
+    }
 }

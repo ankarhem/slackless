@@ -67,6 +67,14 @@ impl ProfilePanel {
         })
     }
 
+    /// Read live-hydrated pronouns & custom fields for `user`, if fetched.
+    pub fn loaded_profile(&self, user: &UserId) -> (Option<String>, Vec<(String, String)>) {
+        self.loaded_profiles
+            .get(user)
+            .map(|p| (p.pronouns.clone(), p.fields.clone()))
+            .unwrap_or_default()
+    }
+
     /// Store live custom fields & pronouns hydrated from `users.profile.get`.
     pub fn set_user_profile(
         &mut self,

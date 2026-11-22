@@ -12,13 +12,12 @@
 //! | [`SoundPlayer`] | play a sound (notification sounds) | `NSSound` from the sound's bytes |
 //! | [`SecretStore`] | named secrets | Keychain generic passwords via `security-framework` |
 //! | [`DeepLinkHandler`] | `slack://` and `https://app.slack.com/client` links | bundle `Info.plist` scheme check + the pure [`DeepLink`] parser |
+//! | [`StatusBarItem`] | macOS menu-bar status item & quick menu | `NSStatusBar` / `NSStatusItem` / `NSMenu` via `objc2` |
 //!
 //! Other platforms get a compiling, non-OS fallback backend so the crate
 //! builds everywhere; its `SecretStore` is in-process memory, its notifier,
-//! badge setter, icon setter, About panel, full-screen item and sound player are no-ops.
-//!
-//! A `StatusItem` trait (`NSStatusItem`, guide §14) is planned but not yet
-//! modeled; it will land here alongside [`BadgeSetter`].
+//! badge setter, icon setter, About panel, full-screen item, sound player and
+//! status-bar item are no-ops.
 
 mod deep_link;
 #[cfg(not(target_os = "macos"))]
@@ -143,6 +142,45 @@ pub trait DeepLinkHandler {
     fn take_link(&self) -> Option<DeepLink>;
 }
 
+/// User actions triggered from the OS menu-bar / tray status item (`F-SHELL-168`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusBarAction {
+    /// Bring the main window to the front (unhiding if hidden in tray).
+    ShowWindow,
+    /// Switch to the workspace at `index` in the workspace rail.
+    SwitchWorkspace(usize),
+    /// Toggle Do Not Disturb / pause notifications.
+    ToggleDnd,
+    /// Quit the application cleanly.
+    Quit,
+}
+
+/// Snapshot rendered into the OS menu-bar / tray status item and its menu.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusBarState {
+    /// Whether the status item is shown in the OS menu bar.
+    pub visible: bool,
+    /// Total unread mentions/DMs across workspaces.
+    pub unread_mentions: u32,
+    /// Whether any workspace has unread messages.
+    pub has_unreads: bool,
+    /// Whether notifications are currently paused / DND is active.
+    pub dnd_active: bool,
+    /// Workspaces listed in the menu: `(name, mentions, has_unreads)`.
+    pub workspaces: Vec<(String, u32, bool)>,
+}
+
+/// Persistent OS menu-bar / system-tray status item (`F-SHELL-168`, `F-SHELL-141`).
+///
+/// macOS: `NSStatusBar::systemStatusBar()` status item + `NSMenu`, updated on the main thread.
+pub trait StatusBarItem {
+    /// Create, update, or hide the menu-bar status item according to `state`.
+    fn update_status_bar(&self, icon_png: Option<&[u8]>, state: &StatusBarState);
+
+    /// Pop the next user action clicked in the status-bar menu, if any.
+    fn take_status_bar_action(&self) -> Option<StatusBarAction>;
+}
+
 #[cfg(target_os = "macos")]
 type Platform = macos::MacPlatform;
 #[cfg(not(target_os = "macos"))]
@@ -161,6 +199,7 @@ pub fn current() -> impl Notifier
 + SoundPlayer
 + SecretStore
 + DeepLinkHandler
++ StatusBarItem
 + Send
 + Sync
 + 'static {

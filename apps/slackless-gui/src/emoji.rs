@@ -523,14 +523,147 @@ fn skin_tone(tone: u8) -> Option<emojis::SkinTone> {
     }
 }
 
+/// Slack-specific shortcode names that differ from the GitHub/CLDR shortcodes in `emojis`.
+fn slack_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "spiral_calendar_pad" => "spiral_calendar",
+        "spiral_note_pad" => "spiral_notepad",
+        "knife_fork_plate" => "plate_with_cutlery",
+        "the_horns" | "sign_of_the_horns" => "metal",
+        "spock-hand" | "spock_hand" => "vulcan_salute",
+        "star-struck" => "star_struck",
+        "heavy_check_mark" => "heavy_check_mark",
+        "mostly_sunny" => "sun_behind_small_cloud",
+        "barely_sunny" => "sun_behind_large_cloud",
+        "partly_sunny_rain" => "sun_behind_rain_cloud",
+        "lightning_cloud" => "cloud_with_lightning",
+        "snow_cloud" => "cloud_with_snow",
+        "rain_cloud" => "cloud_with_rain",
+        "tornado_cloud" => "tornado",
+        "thunder_cloud_and_rain" => "cloud_with_lightning_and_rain",
+        "face_with_hand_over_mouth" => "hand_over_mouth",
+        "face_with_symbols_on_mouth" => "cursing_face",
+        "rolling_on_the_floor_laughing" => "rofl",
+        "smiling_face_with_3_hearts" => "smiling_face_with_three_hearts",
+        "partying_face" => "partying_face",
+        "face_with_cowboy_hat" => "cowboy_hat_face",
+        "clown_face" => "clown_face",
+        "man-shrugging" => "man_shrugging",
+        "woman-shrugging" => "woman_shrugging",
+        "man-facepalming" => "man_facepalming",
+        "woman-facepalming" => "woman_facepalming",
+        "thumbsup_all" => "+1",
+        "hankey" | "poop" | "shit" => "poop",
+        "keycap_star" => "asterisk",
+        "eject" => "eject_button",
+        "black_square_for_stop" => "stop_button",
+        "double_vertical_bar" => "pause_button",
+        "black_circle_for_record" => "record_button",
+        "barber" => "barber",
+        "studio_microphone" => "studio_microphone",
+        "level_slider" => "level_slider",
+        "control_knobs" => "control_knobs",
+        "film_frames" => "film_strip",
+        "admission_tickets" => "tickets",
+        "stadium" => "stadium",
+        "house_buildings" => "houses",
+        "derelict_house_building" => "derelict_house",
+        "cityscape" => "cityscape",
+        "desert_island" => "desert_island",
+        "national_park" => "national_park",
+        "classical_building" => "classical_building",
+        "building_construction" => "building_construction",
+        "linked_paperclips" => "paperclips",
+        "lower_left_ballpoint_pen" => "pen",
+        "lower_left_fountain_pen" => "fountain_pen",
+        "lower_left_paintbrush" => "paintbrush",
+        "lower_left_crayon" => "crayon",
+        "card_index_dividers" => "card_index_dividers",
+        "card_file_box" => "card_file_box",
+        "file_cabinet" => "file_cabinet",
+        "wastebasket" => "wastebasket",
+        "old_key" => "old_key",
+        "compression" => "clamp",
+        "dagger_knife" => "dagger",
+        "crossed_swords" => "crossed_swords",
+        "shield" => "shield",
+        "hammer_and_wrench" => "hammer_and_wrench",
+        "pick" => "pick",
+        "chains" => "chains",
+        "gear" => "gear",
+        "alembic" => "alembic",
+        "scales" => "balance_scale",
+        "couch_and_lamp" => "couch_and_lamp",
+        "shopping_bags" => "shopping",
+        "bellhop_bell" => "bellhop_bell",
+        "bed" => "bed",
+        "frame_with_picture" => "framed_picture",
+        "world_map" => "world_map",
+        "stopwatch" => "stopwatch",
+        "timer_clock" => "timer_clock",
+        "mantelpiece_clock" => "mantelpiece_clock",
+        "thermometer" => "thermometer",
+        "candle" => "candle",
+        "desktop_computer" => "desktop_computer",
+        "printer" => "printer",
+        "three_button_mouse" => "computer_mouse",
+        "trackball" => "trackball",
+        "compression_clamp" => "clamp",
+        "label" => "label",
+        "bookmark_tabs" => "bookmark_tabs",
+        "rolled_up_newspaper" => "newspaper_roll",
+        "ballot_box_with_ballot" => "ballot_box",
+        "white_frowning_face" => "frowning_face",
+        "slightly_smiling_face" => "slightly_smiling_face",
+        "slightly_frowning_face" => "slightly_frowning_face",
+        "upside_down_face" => "upside_down_face",
+        "zipper_mouth_face" => "zipper_mouth_face",
+        "money_mouth_face" => "money_mouth_face",
+        "nerd_face" => "nerd_face",
+        "thinking_face" => "thinking",
+        "face_with_head_bandage" => "face_with_head_bandage",
+        "face_with_thermometer" => "face_with_thermometer",
+        "robot_face" => "robot",
+        "hugging_face" => "hugs",
+        "eye-in-speech-bubble" => "eye_speech_bubble",
+        _ => return None,
+    })
+}
+
 /// Every standard emoji beyond the picker's [`CATALOG`], by the `emojis` crate's GitHub
 /// shortcodes, which match Slack's for nearly all of them. Slack hyphenates multi-person
-/// sequences (`man-woman-girl-boy`) where GitHub underscores them, families under `family_`.
+/// sequences (`man-woman-girl-boy`) where GitHub underscores them, families under `family_`,
+/// prefixes colored circles/squares with `large_` (`large_yellow_circle` -> `yellow_circle`),
+/// and uses `male-`/`female-` where GitHub uses `man_`/`woman_`.
 fn unicode_emoji(name: &str) -> Option<&'static emojis::Emoji> {
+    if let Some(emoji) = emojis::get_by_shortcode(name) {
+        return Some(emoji);
+    }
+    if let Some(alias) = slack_alias(name) {
+        if let Some(emoji) = emojis::get_by_shortcode(alias) {
+            return Some(emoji);
+        }
+    }
     let underscored = name.replace('-', "_");
-    emojis::get_by_shortcode(name)
-        .or_else(|| emojis::get_by_shortcode(&underscored))
-        .or_else(|| emojis::get_by_shortcode(&format!("family_{underscored}")))
+    if let Some(emoji) = emojis::get_by_shortcode(&underscored) {
+        return Some(emoji);
+    }
+    if let Some(stripped) = underscored.strip_prefix("large_") {
+        if let Some(emoji) = emojis::get_by_shortcode(stripped) {
+            return Some(emoji);
+        }
+    }
+    if let Some(rest) = underscored.strip_prefix("female_") {
+        if let Some(emoji) = emojis::get_by_shortcode(&format!("woman_{rest}")) {
+            return Some(emoji);
+        }
+    }
+    if let Some(rest) = underscored.strip_prefix("male_") {
+        if let Some(emoji) = emojis::get_by_shortcode(&format!("man_{rest}")) {
+            return Some(emoji);
+        }
+    }
+    emojis::get_by_shortcode(&format!("family_{underscored}"))
 }
 
 /// One emoji at `size`: the unicode glyph, the workspace custom image, or a literal `:name:`.
@@ -1874,5 +2007,31 @@ mod tests {
     fn getting_work_done_resolves_every_emoji() {
         let missing: Vec<_> = WORK.iter().filter(|name| glyph(name).is_none()).collect();
         assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn slack_circle_square_and_alias_shortcodes_resolve() {
+        for code in [
+            "large_yellow_circle",
+            "large_orange_circle",
+            "large_purple_circle",
+            "large_brown_circle",
+            "large_green_circle",
+            "large_blue_circle",
+            "large_yellow_square",
+            "large_red_square",
+            "spiral_calendar_pad",
+            "spiral_note_pad",
+            "robot_face",
+            "hugging_face",
+            "thinking_face",
+            "female-technologist",
+            "male-technologist",
+        ] {
+            assert!(
+                display_glyph(code).is_some(),
+                "expected Slack shortcode :{code}: to resolve"
+            );
+        }
     }
 }

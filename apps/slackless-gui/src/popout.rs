@@ -23,13 +23,25 @@ use slackless_core::{Command, SharedStore};
 
 use crate::composer::{Composer, ComposerEvent};
 use crate::fixtures::Fixtures;
+use crate::later::LaterItem;
 use crate::messages::{LinkHandler, LinkTarget, message_row_linked};
+
+/// Summary row for a popped-out Activity window (`F-SHELL-149`).
+#[derive(Clone)]
+pub struct PopoutActivityRow {
+    pub title: String,
+    pub body: String,
+    pub context: String,
+    pub unread: bool,
+}
 
 /// What this popped-out native window displays.
 #[derive(Clone)]
 pub enum PopoutKind {
     Conversation(ChannelId),
     Thread { channel: ChannelId, thread_ts: Ts },
+    Activity(Vec<PopoutActivityRow>),
+    Later(Vec<LaterItem>),
 }
 
 /// Callback that forwards commands (`SendMessage`, etc.) to the workspace's live `CoreBridge`.
@@ -89,7 +101,12 @@ impl PopoutWindow {
         let placeholder = match &kind {
             PopoutKind::Conversation(_) => format!("Message {title}"),
             PopoutKind::Thread { .. } => "Reply in thread…".to_owned(),
+            PopoutKind::Activity(_) | PopoutKind::Later(_) => String::new(),
         };
+        let has_composer = matches!(
+            &kind,
+            PopoutKind::Conversation(_) | PopoutKind::Thread { .. }
+        );
         let composer = Composer::new(placeholder.into(), fixtures.clone(), window, cx);
         let initial = load_messages(&kind, &fixtures, store.as_ref(), team.as_ref());
         let sub = cx.subscribe_in(
@@ -102,7 +119,7 @@ impl PopoutWindow {
             },
         );
         // Periodically refresh from the shared SQLite store so live messages appear in the popout.
-        if store.is_some() {
+        if store.is_some() && has_composer {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -156,6 +173,7 @@ impl PopoutWindow {
         let (channel, thread_ts) = match &self.kind {
             PopoutKind::Conversation(ch) => (ch.clone(), None),
             PopoutKind::Thread { channel, thread_ts } => (channel.clone(), Some(thread_ts.clone())),
+            PopoutKind::Activity(_) | PopoutKind::Later(_) => return,
         };
         let mut local =
             self.fixtures
@@ -180,6 +198,9 @@ fn load_messages(
     store: Option<&SharedStore>,
     team: Option<&TeamId>,
 ) -> Vec<Message> {
+    if matches!(kind, PopoutKind::Activity(_) | PopoutKind::Later(_)) {
+        return Vec::new();
+    }
     if let (Some(store), Some(team)) = (store, team) {
         if let Ok(guard) = store.lock() {
             let rows = match kind {
@@ -187,6 +208,7 @@ fn load_messages(
                 PopoutKind::Thread { channel, thread_ts } => {
                     guard.thread_replies(team, channel, thread_ts)
                 }
+                PopoutKind::Activity(_) | PopoutKind::Later(_) => Ok(Vec::new()),
             };
             if let Ok(rows) = rows {
                 return rows
@@ -204,17 +226,19 @@ fn load_messages(
             .get(&(channel.clone(), thread_ts.clone()))
             .cloned()
             .unwrap_or_default(),
+        PopoutKind::Activity(_) | PopoutKind::Later(_) => Vec::new(),
     }
 }
 
 impl Render for PopoutWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg, border, muted, fg) = (
+        let (bg, border, muted, fg, accent) = (
             theme.background,
             theme.border,
             theme.muted_foreground,
             theme.foreground,
+            theme.accent,
         );
         let links: LinkHandler = std::rc::Rc::new(|target, _, cx| {
             if let LinkTarget::Url(url) = target {
@@ -224,7 +248,13 @@ impl Render for PopoutWindow {
         let kind_label = match &self.kind {
             PopoutKind::Conversation(_) => "Conversation",
             PopoutKind::Thread { .. } => "Thread",
+            PopoutKind::Activity(_) => "Activity",
+            PopoutKind::Later(_) => "Later",
         };
+        let has_composer = matches!(
+            &self.kind,
+            PopoutKind::Conversation(_) | PopoutKind::Thread { .. }
+        );
         let header = h_flex()
             .flex_none()
             .h(px(40.))
@@ -254,28 +284,95 @@ impl Render for PopoutWindow {
                     .tooltip("Refresh")
                     .on_click(cx.listener(|this, _, _, cx| this.reload_from_store(cx))),
             );
-        let rows: Vec<_> = self
-            .messages
-            .iter()
-            .map(|msg| message_row_linked(&self.fixtures, msg, None, Some(&links), None, cx))
-            .collect();
-        let body = v_flex()
-            .id("popout-messages")
-            .flex_1()
-            .min_h_0()
-            .px_4()
-            .py_3()
-            .gap_2()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .children(rows);
+        let body = match &self.kind {
+            PopoutKind::Conversation(_) | PopoutKind::Thread { .. } => {
+                let rows: Vec<_> = self
+                    .messages
+                    .iter()
+                    .map(|msg| {
+                        message_row_linked(&self.fixtures, msg, None, Some(&links), None, cx)
+                    })
+                    .collect();
+                v_flex()
+                    .id("popout-messages")
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(rows)
+            }
+            PopoutKind::Activity(items) => v_flex()
+                .id("popout-activity")
+                .flex_1()
+                .min_h_0()
+                .px_4()
+                .py_3()
+                .gap_2()
+                .overflow_y_scroll()
+                .children(items.iter().map(|item| {
+                    v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(if item.unread { accent.opacity(0.2) } else { bg })
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(item.title.clone()),
+                        )
+                        .child(div().text_sm().child(item.body.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(item.context.clone()),
+                        )
+                })),
+            PopoutKind::Later(items) => v_flex()
+                .id("popout-later")
+                .flex_1()
+                .min_h_0()
+                .px_4()
+                .py_3()
+                .gap_2()
+                .overflow_y_scroll()
+                .children(items.iter().map(|item| {
+                    v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(item.author.clone()),
+                                )
+                                .child(div().text_xs().text_color(muted).child(item.label.clone())),
+                        )
+                        .child(div().text_sm().child(item.text.clone()))
+                })),
+        };
 
-        v_flex()
+        let mut root = v_flex()
             .size_full()
             .bg(bg)
             .text_color(fg)
             .child(header)
-            .child(body)
-            .child(div().flex_none().p_2().child(self.composer.clone()))
+            .child(body);
+        if has_composer {
+            root = root.child(div().flex_none().p_2().child(self.composer.clone()));
+        }
+        root
     }
 }

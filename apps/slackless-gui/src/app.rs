@@ -239,7 +239,9 @@ use gpui_kit::gpui::{
     actions, anchored, deferred, div, hsla, point, px, relative,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
-use slackless_core::platform::{self, BadgeSetter, Notifier, SoundPlayer};
+use slackless_core::platform::{
+    self, BadgeSetter, Notifier, SoundPlayer, StatusBarAction, StatusBarItem, StatusBarState,
+};
 use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{
     Block, ChannelId, Conversation, ConversationKind, File, Message, RichTextContainer,
@@ -353,6 +355,11 @@ actions!(
 #[action(namespace = slackless, no_json)]
 pub struct SwitchWorkspace(pub usize);
 
+/// Switch to the conversation header tab at this index (Ctrl+1…9, `F-SHELL-280`).
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = slackless, no_json)]
+pub struct SelectConversationTab(pub usize);
+
 /// Sign out of the workspace at this index (the Slackless menu's Sign Out).
 #[derive(Clone, Debug, PartialEq, gpui::Action)]
 #[action(namespace = slackless, no_json)]
@@ -432,9 +439,9 @@ fn corner_cap(top: bool, chrome: Hsla, outline: Option<Hsla>) -> Vec<Div> {
 /// The thread / profile / pins panel, measured on Slack desktop.
 const FLEXPANE_WIDTH: Pixels = px(540.);
 
-/// The OS integration the root uses: system notifications and the dock badge.
-trait Os: Notifier + BadgeSetter + SoundPlayer {}
-impl<T: Notifier + BadgeSetter + SoundPlayer> Os for T {}
+/// The OS integration the root uses: system notifications, dock badge, sounds and menu-bar icon.
+trait Os: Notifier + BadgeSetter + SoundPlayer + StatusBarItem {}
+impl<T: Notifier + BadgeSetter + SoundPlayer + StatusBarItem> Os for T {}
 
 /// The per-workspace views: rebuilt from that workspace's fixtures, parked while another
 /// workspace is shown.
@@ -637,10 +644,16 @@ pub struct App {
     files: HashMap<ChannelId, Loaded<File>>,
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
-    /// Dock badge + native notifications (`slackless-platform`).
+    /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).
     os: Rc<dyn Os>,
-    /// The badge count last handed to the dock, so it is only set on change.
+    /// Numeric badge count for window title ("N new items").
     badge: Option<u32>,
+    /// The badge label last handed to the dock, so it is only set on change.
+    badge_label: Option<Option<String>>,
+    /// The last status-bar state handed to the OS menu bar, to avoid redundant updates.
+    last_status_bar: Option<StatusBarState>,
+    /// Whether the main window is currently active/focused (guards background mark-as-read).
+    window_active: bool,
     /// The window title last set, so it is only set on change.
     window_title: String,
     /// The pending, debounced save of the window frame (replacing it cancels the last one).
@@ -946,6 +959,14 @@ impl App {
                 (workspace_keys.into_iter().enumerate())
                     .map(|(ix, keys)| KeyBinding::new(keys, SwitchWorkspace(ix), None)),
             );
+            let tab_keys = [
+                "ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6", "ctrl-7", "ctrl-8",
+                "ctrl-9",
+            ];
+            cx.bind_keys(
+                (tab_keys.into_iter().enumerate())
+                    .map(|(ix, keys)| KeyBinding::new(keys, SelectConversationTab(ix), None)),
+            );
             let focus = cx.focus_handle();
             focus.focus(window, cx);
 
@@ -961,6 +982,18 @@ impl App {
             let mut subscriptions = vec![
                 cx.observe_window_bounds(window, |this, window, cx| {
                     this.save_window_state(window, cx);
+                }),
+                cx.observe_window_activation(window, |this, window, cx| {
+                    this.window_active = window.is_window_active();
+                    if this.window_active {
+                        let settings = this.preferences.read(cx).settings();
+                        if settings.no_bg_mark_read && settings.mark_read != 2 {
+                            let ch = this.channel.clone();
+                            if let Some(newest) = this.messages.read(cx).newest_ts() {
+                                this.mark_read(&ch, newest, cx);
+                            }
+                        }
+                    }
                 }),
                 // While the search panel is open, Up/Down/Enter/Escape steer its rows. GPUI
                 // resolves the focused field's own key bindings (caret moves, a newline)
@@ -1279,6 +1312,7 @@ impl App {
                     &later,
                     window,
                     |this: &mut App, _, event: &LaterEvent, window, cx| match event {
+                        LaterEvent::PopOut => this.pop_out_later(cx),
                         LaterEvent::Close => {
                             this.later_open = false;
                             cx.notify();
@@ -1449,6 +1483,7 @@ impl App {
                             });
                         }
                         ActivityEvent::Retry => this.fetch_activity(cx),
+                        ActivityEvent::PopOut => this.pop_out_activity(cx),
                     },
                 ),
                 cx.observe(&activity, |this: &mut App, _, cx| {
@@ -1695,6 +1730,9 @@ impl App {
                 fixture_bookmarks: HashMap::new(),
                 os: Rc::new(platform::current()),
                 badge: None,
+                badge_label: None,
+                last_status_bar: None,
+                window_active: window.is_window_active(),
                 window_title: String::new(),
                 window_state_save: gpui::Task::ready(()),
                 history_generation: 0,
@@ -1747,10 +1785,83 @@ impl App {
                 });
             });
         });
+        // Close-to-tray (`F-SHELL-141`): when enabled, closing the main window hides the app
+        // to the menu bar instead of terminating.
+        let close_app = app.downgrade();
+        window.on_window_should_close(cx, move |_window, cx| {
+            let keep_in_tray = close_app
+                .upgrade()
+                .is_some_and(|a| a.read(cx).preferences.read(cx).settings().close_to_tray);
+            if keep_in_tray {
+                cx.hide();
+                false
+            } else {
+                true
+            }
+        });
+        // Poll actions clicked in the macOS menu-bar status item (`F-SHELL-168`).
+        let status_app = app.downgrade();
+        let status_window = window.window_handle();
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let action = status_app
+                    .upgrade()
+                    .and_then(|a| a.read_with(cx, |app, _| app.os.take_status_bar_action()));
+                let Some(action) = action else {
+                    continue;
+                };
+                match action {
+                    StatusBarAction::ShowWindow => {
+                        let _ = status_window.update(cx, |_, window, cx| {
+                            cx.activate(true);
+                            window.activate_window();
+                        });
+                    }
+                    StatusBarAction::SwitchWorkspace(ix) => {
+                        let _ = status_window.update(cx, |_, window, cx| {
+                            cx.activate(true);
+                            window.activate_window();
+                            let _ = status_app.update(cx, |app, cx| {
+                                app.switch_workspace(ix, window, cx);
+                            });
+                        });
+                    }
+                    StatusBarAction::ToggleDnd => {
+                        let _ = status_window.update(cx, |_, _, cx| {
+                            let _ = status_app.update(cx, |app, cx| {
+                                if app.self_state.paused() {
+                                    app.self_state.paused_until = None;
+                                    if !app.fixtures.sample {
+                                        app.bridge.send(Command::EndDndSnooze);
+                                    }
+                                } else {
+                                    app.self_state.paused_until =
+                                        Some(crate::messages::now_secs() + 3_600);
+                                    if !app.fixtures.sample {
+                                        app.bridge.send(Command::SetDndSnooze { minutes: 60 });
+                                    }
+                                }
+                                app.push_self_state(cx);
+                                app.sync_badge(cx);
+                            });
+                        });
+                    }
+                    StatusBarAction::Quit => {
+                        cx.update(|cx| cx.quit());
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
         app.update(cx, |app, cx| {
             app.push_self_state(cx);
             app.sync_saved(cx);
             app.sync_later_count(cx);
+            app.sync_badge(cx);
             let channel = app.channel.clone();
             app.load_history(&channel, cx);
             app.load_draft(cx);
@@ -2042,17 +2153,50 @@ impl App {
             total_dock = total_dock.saturating_add(badge.mentions);
             badges.push(badge);
         }
+        let mut any_unreads = false;
+        let mut status_workspaces = Vec::with_capacity(ws_count);
+        for (ix, badge) in badges.iter().enumerate() {
+            any_unreads |= badge.has_unreads;
+            let name = self
+                .fixtures
+                .workspaces
+                .get(ix)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("Workspace {}", ix + 1));
+            status_workspaces.push((name, badge.mentions, badge.has_unreads));
+        }
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_workspace_badges(badges, cx));
-        let effective_dock = if self.preferences.read(cx).settings().show_dock_badge {
+        let settings = self.preferences.read(cx).settings().clone();
+        self.badge = Some(if settings.show_dock_badge {
             total_dock
         } else {
             0
+        });
+        let next_label = if !settings.show_dock_badge {
+            None
+        } else if total_dock > 0 {
+            Some(total_dock.to_string())
+        } else if settings.badge_on_unreads && any_unreads {
+            Some("\u{2022}".to_owned())
+        } else {
+            None
         };
-        if self.badge != Some(effective_dock) {
-            self.badge = Some(effective_dock);
-            let label = (effective_dock > 0).then(|| effective_dock.to_string());
-            self.os.set_badge(label.as_deref());
+        if self.badge_label.as_ref() != Some(&next_label) {
+            self.badge_label = Some(next_label.clone());
+            self.os.set_badge(next_label.as_deref());
+        }
+        let status_bar_state = StatusBarState {
+            visible: settings.show_menu_bar_icon,
+            unread_mentions: total_dock,
+            has_unreads: any_unreads,
+            dnd_active: self.self_state.paused(),
+            workspaces: status_workspaces,
+        };
+        if self.last_status_bar.as_ref() != Some(&status_bar_state) {
+            self.last_status_bar = Some(status_bar_state.clone());
+            self.os
+                .update_status_bar(Some(include_bytes!("../icon.png")), &status_bar_state);
         }
     }
 
@@ -2530,6 +2674,7 @@ impl App {
             view.set_excluded_channels(&excluded_channels);
         });
         crate::preferences::set_display_prefs(&settings, cx);
+        crate::messages::set_timezone_override(settings.timezone_offset_secs());
         crate::media::set_download_dir(
             (!settings.download_dir.is_empty())
                 .then(|| std::path::PathBuf::from(&settings.download_dir)),
@@ -2749,6 +2894,45 @@ impl App {
             self.bridge.forwarder(),
             cx,
         );
+    }
+
+    /// Pop out the Activity feed into a separate native GPUI window (`F-SHELL-149`).
+    fn pop_out_activity(&self, cx: &mut Context<Self>) {
+        let rows = self.activity.read(cx).snapshot_for_popout();
+        crate::popout::open_popout(
+            crate::popout::PopoutKind::Activity(rows),
+            "Activity".to_owned(),
+            self.fixtures.clone(),
+            None,
+            None,
+            self.bridge.forwarder(),
+            cx,
+        );
+    }
+
+    /// Pop out Saved / Later items into a separate native GPUI window (`F-SHELL-149`).
+    fn pop_out_later(&self, cx: &mut Context<Self>) {
+        let items = self.later.read(cx).items_for_popout();
+        crate::popout::open_popout(
+            crate::popout::PopoutKind::Later(items),
+            "Saved".to_owned(),
+            self.fixtures.clone(),
+            None,
+            None,
+            self.bridge.forwarder(),
+            cx,
+        );
+    }
+
+    /// Activate the `index`-th tab in the current conversation's header (`Ctrl+1..9`, `F-SHELL-280`).
+    fn select_conversation_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(conv) = self.fixtures.conversation(&self.channel) else {
+            return;
+        };
+        let specs = tabs::derive(conv, self.fixtures.sample);
+        if let Some(spec) = specs.into_iter().nth(index) {
+            self.activate_tab(spec.action, cx);
+        }
     }
 
     /// Reorder workspace tile `from` to `to` in the switcher rail and persist (`F-CORE-003`).
@@ -3279,12 +3463,20 @@ impl App {
             .as_ref()
             .and_then(|u| u.profile.phone.clone())
             .unwrap_or_default();
-        let initial_pronouns = self
-            .fixtures
-            .profile_extras
-            .get(&self.fixtures.self_user)
-            .and_then(|e| e.pronouns.clone())
+        let (loaded_pronouns, loaded_fields) = self
+            .profile
+            .read(cx)
+            .loaded_profile(&self.fixtures.self_user);
+        let initial_pronouns = loaded_pronouns
+            .or_else(|| me.as_ref().and_then(|u| u.profile.pronouns.clone()))
+            .or_else(|| {
+                self.fixtures
+                    .profile_extras
+                    .get(&self.fixtures.self_user)
+                    .and_then(|e| e.pronouns.clone())
+            })
             .unwrap_or_default();
+        let initial_tz = me.as_ref().and_then(|u| u.tz.clone()).unwrap_or_default();
 
         let display_in = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
@@ -3314,6 +3506,13 @@ impl App {
             s.set_value(initial_pronouns, window, cx);
             s
         });
+        let tz_in = cx.new(|cx| {
+            let mut s = TextareaState::new(window, cx)
+                .placeholder("Time zone (e.g. Europe/Stockholm)")
+                .auto_grow(1, 1);
+            s.set_value(initial_tz, window, cx);
+            s
+        });
 
         let this = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -3340,11 +3539,13 @@ impl App {
                     )
             };
             let this_save = this.clone();
-            let (d_save, t_save, p_save, pr_save) = (
+            let (d_save, t_save, p_save, pr_save, tz_save, fields_save) = (
                 display_in.clone(),
                 title_in.clone(),
                 phone_in.clone(),
                 pronouns_in.clone(),
+                tz_in.clone(),
+                loaded_fields.clone(),
             );
             dialog.title("Edit your profile").w(px(460.)).child(
                 v_flex()
@@ -3353,6 +3554,7 @@ impl App {
                     .child(field("Title", &title_in))
                     .child(field("Phone", &phone_in))
                     .child(field("Pronouns", &pronouns_in))
+                    .child(field("Time zone", &tz_in))
                     .child(
                         h_flex()
                             .justify_end()
@@ -3369,19 +3571,31 @@ impl App {
                                     .primary()
                                     .label("Save Changes")
                                     .on_click(move |_, window, cx| {
+                                        let pronouns_val =
+                                            pr_save.read(cx).value().trim().to_owned();
+                                        let tz_val = tz_save.read(cx).value().trim().to_owned();
                                         let update = slackless_core::api::ProfileUpdate {
                                             display_name: Some(
                                                 d_save.read(cx).value().trim().to_owned(),
                                             ),
                                             title: Some(t_save.read(cx).value().trim().to_owned()),
                                             phone: Some(p_save.read(cx).value().trim().to_owned()),
-                                            pronouns: Some(
-                                                pr_save.read(cx).value().trim().to_owned(),
-                                            ),
+                                            pronouns: Some(pronouns_val.clone()),
+                                            tz: (!tz_val.is_empty()).then_some(tz_val),
                                             ..Default::default()
                                         };
                                         if let Some(app) = this_save.upgrade() {
                                             app.update(cx, |app, cx| {
+                                                let me_id = app.fixtures.self_user.clone();
+                                                app.profile.update(cx, |profile, cx| {
+                                                    profile.set_user_profile(
+                                                        me_id,
+                                                        (!pronouns_val.is_empty())
+                                                            .then_some(pronouns_val),
+                                                        fields_save.clone(),
+                                                        cx,
+                                                    );
+                                                });
                                                 if !app.fixtures.sample {
                                                     app.bridge
                                                         .send(Command::UpdateProfile { update });
@@ -3758,7 +3972,9 @@ impl App {
         self.close_hover_card(cx);
         let status = self.self_state.status.clone();
         let workspace = SharedString::from(self.fixtures.workspaces[self.workspace].name.clone());
+        let presets = self.fixtures.status_presets.clone();
         self.status_picker.update(cx, |picker, cx| {
+            picker.set_presets(presets, cx);
             picker.edit(status.as_ref(), workspace, window, cx)
         });
         let picker = self.status_picker.clone();
@@ -5590,14 +5806,17 @@ impl App {
                 if app.history_generation == generation && app.channel == channel {
                     app.resolve_named_users(&history);
                     let newest = history.last().map(|message| message.ts.clone());
-                    let mark_read_mode = app.preferences.read(cx).settings().mark_read;
+                    let settings = app.preferences.read(cx).settings().clone();
+                    let mark_read_mode = settings.mark_read;
                     app.messages.update(cx, |list, cx| {
                         list.set_history(channel.clone(), history, cx);
                         if mark_read_mode == 0 {
                             list.jump_to_unread(cx);
                         }
                     });
-                    if mark_read_mode != 2 {
+                    let allow_mark =
+                        mark_read_mode != 2 && (!settings.no_bg_mark_read || app.window_active);
+                    if allow_mark {
                         if let Some(newest) = newest {
                             app.mark_read(&channel, newest, cx);
                         }
@@ -7407,6 +7626,9 @@ impl Render for App {
             })
             .on_action(cx.listener(|this, switch: &SwitchWorkspace, window, cx| {
                 this.switch_workspace(switch.0, window, cx)
+            }))
+            .on_action(cx.listener(|this, tab: &SelectConversationTab, _, cx| {
+                this.select_conversation_tab(tab.0, cx)
             }))
             .on_action(cx.listener(|this, _: &NextWorkspace, window, cx| {
                 let count = this.parked.len().max(1);

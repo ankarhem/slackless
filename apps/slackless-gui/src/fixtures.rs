@@ -105,6 +105,98 @@ fn quick_reactions(prefs: &crate::blockkit::serde_json::Value) -> Vec<String> {
     }
 }
 
+/// Workspace-configured status suggestions from `team.prefs.custom_status_default_suggestions`
+/// or `prefs.custom_status_presets` (`F-SHELL-015`). Returns `(emoji_shortcode, text, clear_after_ix)`.
+pub fn status_presets_from_prefs(
+    team_extra: &crate::blockkit::serde_json::Map<String, Json>,
+    user_prefs: &Json,
+) -> Vec<(String, String, usize)> {
+    fn duration_to_clear_ix(secs: Option<i64>) -> usize {
+        match secs.unwrap_or(0) {
+            s if s <= 0 => 0,
+            s if s <= 1_800 => 1,
+            s if s <= 3_600 => 2,
+            s if s <= 14_400 => 3,
+            s if s <= 86_400 => 4,
+            _ => 5,
+        }
+    }
+    fn parse_list(val: &Json) -> Vec<(String, String, usize)> {
+        let Some(items) = val.as_array() else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|entry| {
+                if let Some(arr) = entry.as_array() {
+                    let emoji = arr.first()?.as_str()?.trim().trim_matches(':');
+                    let text = arr.get(1)?.as_str()?.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let secs = arr.get(2).and_then(Json::as_i64);
+                    Some((
+                        if emoji.is_empty() {
+                            "speech_balloon".to_owned()
+                        } else {
+                            emoji.to_owned()
+                        },
+                        text.to_owned(),
+                        duration_to_clear_ix(secs),
+                    ))
+                } else if let Some(obj) = entry.as_object() {
+                    let emoji = obj
+                        .get("emoji")
+                        .or_else(|| obj.get("status_emoji"))
+                        .and_then(Json::as_str)
+                        .unwrap_or("speech_balloon")
+                        .trim()
+                        .trim_matches(':');
+                    let text = obj
+                        .get("text")
+                        .or_else(|| obj.get("status_text"))
+                        .and_then(Json::as_str)?
+                        .trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let secs = obj
+                        .get("duration")
+                        .or_else(|| obj.get("default_duration"))
+                        .and_then(Json::as_i64);
+                    Some((
+                        if emoji.is_empty() {
+                            "speech_balloon".to_owned()
+                        } else {
+                            emoji.to_owned()
+                        },
+                        text.to_owned(),
+                        duration_to_clear_ix(secs),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    for candidate in [
+        team_extra
+            .get("prefs")
+            .and_then(|p| p.get("custom_status_default_suggestions")),
+        user_prefs.get("custom_status_default_suggestions"),
+        user_prefs.get("custom_status_presets"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let parsed = parse_list(candidate);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    Vec::new()
+}
+
 /// Live presence per user, shared by every snapshot of a workspace: a `presence_change` lands
 /// in place and repaints, with no store reload.
 pub type PresenceMap = Arc<RwLock<HashMap<UserId, Presence>>>;
@@ -177,6 +269,8 @@ pub struct Fixtures {
     /// The color theme Slack stores for the user, applied at launch; `None` in the sample
     /// workspace, which keeps the reference screenshot's dark look.
     pub palette: Option<crate::theme::Palette>,
+    /// Workspace-configured status presets (`team.prefs.custom_status_default_suggestions`).
+    pub status_presets: Vec<(String, String, usize)>,
 }
 
 /// A custom emoji's picture: a generated sample image, or a live `emoji.list` URL that GPUI's
@@ -1122,6 +1216,7 @@ pub fn load() -> Fixtures {
         real_names_in_mentions: false,
         collapsed_sections: HashSet::new(),
         palette: None,
+        status_presets: Vec::new(),
     }
 }
 
@@ -1268,6 +1363,7 @@ pub fn live(
         "mentions_real_names_override",
         "display_real_names_in_mentions",
     );
+    let status_presets = status_presets_from_prefs(&workspace.extra, &prefs);
     Fixtures {
         workspaces: vec![workspace],
         teams,
@@ -1298,6 +1394,7 @@ pub fn live(
         real_names_in_mentions,
         collapsed_sections,
         palette: crate::theme::palette_from_prefs(&prefs),
+        status_presets,
     }
 }
 

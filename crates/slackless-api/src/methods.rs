@@ -2815,6 +2815,10 @@ pub struct ProfileUpdate {
     pub phone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pronouns: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Value>,
 }
 
 #[derive(Deserialize, Default)]

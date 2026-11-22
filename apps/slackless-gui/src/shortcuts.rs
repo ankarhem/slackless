@@ -134,6 +134,7 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
                 true,
             ),
             (&["\u{2318}", "."], "Toggle right sidebar", true),
+            (&["\u{2303}", "1\u{2013}9"], "Switch conversation tab", true),
             (&["\u{2318}", "/"], "Keyboard shortcuts", true),
             (&["\u{2303}", "\u{2318}", "F"], "Toggle full screen", true),
             (&["\u{2318}", "+ / -"], "Zoom in / out", true),

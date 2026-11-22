@@ -276,6 +276,8 @@ pub enum LaterEvent {
     },
     /// Counts changed (the sidebar's Later row).
     Changed,
+    /// Open Saved / Later in a standalone pop-out window (`F-SHELL-149`).
+    PopOut,
     Close,
 }
 
@@ -533,6 +535,17 @@ impl LaterView {
         cx.emit(LaterEvent::ClearCompleted { workspace: ws });
         cx.emit(LaterEvent::Changed);
         cx.notify();
+    }
+
+    /// Snapshot of currently shown Later items for a popped-out window (`F-SHELL-149`).
+    pub fn items_for_popout(&self) -> Vec<LaterItem> {
+        let ws = self.workspace;
+        let tab = self.tab;
+        self.items
+            .iter()
+            .filter(|item| item.workspace == ws && item.state == tab)
+            .cloned()
+            .collect()
     }
 
     fn count(&self, state: LaterState) -> usize {
@@ -864,6 +877,16 @@ impl Render for LaterView {
                                             })),
                                     )
                                 },
+                            )
+                            .child(
+                                Button::new("later-popout")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip("Open Saved in new window")
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| cx.emit(LaterEvent::PopOut)),
+                                    ),
                             )
                             .child(
                                 Button::new("later-close")

@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crate::deep_link::{self, DeepLink};
 use crate::{
     AboutPanel, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter, Notifier, PlatformError,
-    Result, SecretStore, SoundPlayer,
+    Result, SecretStore, SoundPlayer, StatusBarAction, StatusBarItem, StatusBarState,
 };
 
 /// No-op backend for platforms without a port yet.
@@ -117,5 +117,13 @@ impl DeepLinkHandler for FallbackPlatform {
             .lock()
             .expect("pending link mutex poisoned")
             .take()
+    }
+}
+
+impl StatusBarItem for FallbackPlatform {
+    fn update_status_bar(&self, _icon_png: Option<&[u8]>, _state: &StatusBarState) {}
+
+    fn take_status_bar_action(&self) -> Option<StatusBarAction> {
+        None
     }
 }
