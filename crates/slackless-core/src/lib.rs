@@ -257,6 +257,26 @@ pub enum Command {
     /// Create the conversation's empty channel canvas (`conversations.canvases.create`),
     /// then refresh the stored conversation (its `properties.canvas` lands in the store).
     CreateChannelCanvas(ChannelId),
+    /// Pause the signed-in user's notifications for `minutes` (`dnd.setSnooze`).
+    SetDndSnooze {
+        minutes: u32,
+    },
+    /// Resume the signed-in user's notifications immediately (`dnd.endSnooze`).
+    EndDndSnooze,
+    /// Queue a message for delivery at unix timestamp `post_at` (`chat.scheduleMessage`),
+    /// then reload the workspace's scheduled messages.
+    ScheduleMessage {
+        channel: ChannelId,
+        post_at: u64,
+        content: MessageContent,
+    },
+    /// Fetch pending scheduled messages (`chat.scheduledMessages.list`).
+    LoadScheduledMessages,
+    /// Cancel a pending scheduled message (`chat.deleteScheduledMessage`), then reload.
+    DeleteScheduledMessage {
+        channel: ChannelId,
+        scheduled_message_id: String,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -368,6 +388,16 @@ pub enum Event {
     ChannelCanvasCreated {
         channel: ChannelId,
         canvas_id: String,
+    },
+    /// The signed-in user's DND/snooze status after `dnd.setSnooze` / `dnd.endSnooze`.
+    SelfDndUpdated(types::DndStatus),
+    /// Pending scheduled messages from `chat.scheduledMessages.list`.
+    ScheduledMessagesLoaded(Result<Vec<api::ScheduledMessage>, String>),
+    /// A message was queued via `chat.scheduleMessage`.
+    MessageScheduled {
+        channel: ChannelId,
+        scheduled_message_id: String,
+        post_at: u64,
     },
     /// Slack refused a [`Command::RunCommand`]: the command and Slack's error code
     /// (`unknown_command` for one the workspace does not have).

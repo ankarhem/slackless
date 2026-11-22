@@ -893,6 +893,11 @@ pub enum MessageChange {
         ts: Ts,
         pinned: bool,
     },
+    /// Move the conversation's read cursor back to `ts` so the target message and everything
+    /// after it become unread (`conversations.mark`).
+    MarkUnread {
+        ts: Ts,
+    },
     /// A Block Kit button press for the app that posted the message (`blocks.actions`).
     BlockAction(crate::blockkit::BlockDispatch),
 }

@@ -24,8 +24,9 @@ pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
     AuthTest, BookmarksList, CanvasCreated, ChannelBookmark, ClientCounts, ConversationCounts,
     ConversationView, FilesFilter, HistoryOpts, ListOpts, MessageContent, PinnedItem, PinsList,
-    PostedMessage, SearchChannel, SearchMatch, SearchMessages, SearchOpts, SearchPagination,
-    SearchSort, SectionCreated, ThreadCounts, ThreadSubscription, ThreadsView, UserBoot,
+    PostedMessage, ScheduledMessage, ScheduledMessageCreated, SearchChannel, SearchMatch,
+    SearchMessages, SearchOpts, SearchPagination, SearchSort, SectionCreated, ThreadCounts,
+    ThreadSubscription, ThreadsView, UserBoot,
 };
 pub use pagination::{Page, paginate};
 

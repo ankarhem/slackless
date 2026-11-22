@@ -94,6 +94,8 @@ pub fn when_label(at: u64, now: u64) -> String {
 /// One draft, scheduled or sent message.
 #[derive(Clone)]
 pub struct Entry {
+    /// Slack's `scheduled_message_id` for a live scheduled message (`None` for local entries).
+    pub id: Option<String>,
     /// Index into the workspace list the conversation belongs to.
     pub workspace: usize,
     pub channel: ChannelId,
@@ -118,6 +120,8 @@ pub enum DraftsEvent {
     },
     /// Deliver a scheduled message now (already removed from the schedule).
     SendNow(Entry),
+    /// Cancel a pending scheduled message (already removed from the schedule).
+    CancelScheduled(Entry),
     Close,
 }
 
@@ -166,6 +170,21 @@ impl DraftsView {
         let at = entry.at;
         let index = self.scheduled.partition_point(|s| s.at <= at);
         self.scheduled.insert(index, entry);
+        cx.notify();
+    }
+
+    /// Replace `workspace`'s scheduled list with Slack's authoritative
+    /// `chat.scheduledMessages.list` entries, sorted earliest first.
+    pub fn set_remote_scheduled(
+        &mut self,
+        workspace: usize,
+        mut entries: Vec<Entry>,
+        cx: &mut Context<Self>,
+    ) {
+        self.scheduled.retain(|e| e.workspace != workspace);
+        entries.sort_by_key(|e| e.at);
+        self.scheduled.extend(entries);
+        self.scheduled.sort_by_key(|e| e.at);
         cx.notify();
     }
 
@@ -279,7 +298,8 @@ impl Render for DraftsView {
                                 .with_size(Size::Small)
                                 .label("Cancel")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.scheduled.remove(ix);
+                                    let entry = this.scheduled.remove(ix);
+                                    cx.emit(DraftsEvent::CancelScheduled(entry));
                                     cx.notify();
                                 })),
                         ),

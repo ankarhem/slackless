@@ -21,7 +21,7 @@ use gpui_kit::gpui::{
 };
 use slackless_core::SharedStore;
 use slackless_core::store::{SearchFilters, SearchQuery, Store, StoredMessage};
-use slackless_core::types::{ChannelId, TeamId};
+use slackless_core::types::{ChannelId, TeamId, Ts};
 
 use crate::fixtures::Fixtures;
 use crate::messages::{list_stamp, message_row};
@@ -31,7 +31,7 @@ const RESULT_LIMIT: usize = 50;
 
 pub enum SearchEvent {
     Close,
-    Open(ChannelId),
+    Open { channel: ChannelId, ts: Ts },
 }
 
 pub struct SearchView {
@@ -216,6 +216,7 @@ impl SearchView {
             .map(|c| self.fixtures.conversation_label(c))
             .unwrap_or_else(|| hit.channel.to_string());
         let channel = hit.channel.clone();
+        let ts = hit.message.ts.clone();
         let row = message_row(&self.fixtures, &hit.message, None, cx);
         v_flex()
             .id(("search-hit", ix))
@@ -235,7 +236,10 @@ impl SearchView {
             )
             .child(row)
             .on_click(cx.listener(move |_, _, _, cx| {
-                cx.emit(SearchEvent::Open(channel.clone()));
+                cx.emit(SearchEvent::Open {
+                    channel: channel.clone(),
+                    ts: ts.clone(),
+                });
             }))
     }
 }

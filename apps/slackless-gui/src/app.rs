@@ -599,6 +599,8 @@ pub struct App {
     presence: fixtures::PresenceMap,
     /// Live mode: DM peers whose notifications are paused right now (`dnd.info`).
     peer_dnd_paused: HashMap<UserId, bool>,
+    /// Live mode: latest RTM websocket connection state (drives the offline/reconnecting banner).
+    connection: Option<slackless_core::rtm::ConnectionState>,
     /// Member counts from open-time `conversations.info`, newer than the snapshot's.
     member_counts: HashMap<ChannelId, u32>,
     /// Apps among a channel's members, counted apart from people as Slack's header does.
@@ -1043,6 +1045,14 @@ impl App {
                             this.select(channel.clone(), cx);
                         }
                         DraftsEvent::SendNow(entry) => this.deliver(entry.clone(), window, cx),
+                        DraftsEvent::CancelScheduled(entry) => {
+                            if let Some(id) = entry.id.clone() {
+                                this.bridge.send(Command::DeleteScheduledMessage {
+                                    channel: entry.channel.clone(),
+                                    scheduled_message_id: id,
+                                });
+                            }
+                        }
                     },
                 ),
                 cx.subscribe_in(
@@ -1053,9 +1063,14 @@ impl App {
                             this.later_open = false;
                             cx.notify();
                         }
-                        LaterEvent::Open { workspace, channel } => {
+                        LaterEvent::Open {
+                            workspace,
+                            channel,
+                            ts,
+                        } => {
                             this.switch_workspace(*workspace, window, cx);
                             this.select(channel.clone(), cx);
+                            this.messages.update(cx, |list, cx| list.reveal(ts, cx));
                         }
                         LaterEvent::Unsaved { workspace, ts } => {
                             if *workspace == this.workspace {
@@ -1323,6 +1338,7 @@ impl App {
                 counts: HashMap::new(),
                 presence: fixtures::PresenceMap::default(),
                 peer_dnd_paused: HashMap::new(),
+                connection: None,
                 member_counts: HashMap::new(),
                 app_counts: HashMap::new(),
                 open_members: None,
@@ -1914,6 +1930,16 @@ impl App {
             UserMenuEvent::Pause(until) => {
                 self.self_state.paused_until = *until;
                 self.user_menu_open = false;
+                if !self.fixtures.sample {
+                    match *until {
+                        Some(ts) => {
+                            let secs = ts.saturating_sub(now_secs() as i64).max(0) as u64;
+                            let minutes = secs.div_ceil(60).max(1) as u32;
+                            self.bridge.send(Command::SetDndSnooze { minutes });
+                        }
+                        None => self.bridge.send(Command::EndDndSnooze),
+                    }
+                }
             }
             UserMenuEvent::OpenProfile => {
                 self.user_menu_open = false;
@@ -2192,6 +2218,10 @@ impl App {
                 channel,
                 ts: ts.clone(),
                 pinned: *pinned,
+            },
+            MessageChange::MarkUnread { ts } => Command::MarkRead {
+                channel,
+                ts: ts.clone(),
             },
             MessageChange::BlockAction(dispatch) => Command::BlockAction {
                 bot: dispatch.bot.clone(),
@@ -3151,6 +3181,34 @@ impl App {
                 }
                 cx.notify();
             }
+            Event::Connection(state) => {
+                self.connection = Some(state.clone());
+                cx.notify();
+            }
+            Event::SelfDndUpdated(status) => {
+                self.self_state.paused_until = status
+                    .snooze_enabled
+                    .then_some(status.snooze_endtime)
+                    .flatten();
+                self.push_self_state(cx);
+            }
+            Event::ScheduledMessagesLoaded(Ok(list)) => {
+                let workspace = self.workspace;
+                let entries: Vec<Entry> = list
+                    .iter()
+                    .map(|m| Entry {
+                        id: Some(m.id.clone()),
+                        workspace,
+                        channel: m.channel_id.clone(),
+                        label: self.label(&m.channel_id),
+                        text: m.text.clone(),
+                        at: m.post_at,
+                    })
+                    .collect();
+                self.drafts.update(cx, |drafts, cx| {
+                    drafts.set_remote_scheduled(workspace, entries, cx)
+                });
+            }
             Event::ChannelCanvasCreated { channel, canvas_id } if *channel == self.channel => {
                 cx.open_url(&self.canvas_link(canvas_id));
             }
@@ -3860,6 +3918,7 @@ impl App {
             return;
         }
         let entry = Entry {
+            id: None,
             workspace: self.workspace,
             channel: self.channel.clone(),
             label: self.label(&self.channel),
@@ -3891,6 +3950,9 @@ impl App {
         self.drafts_open = true;
         self.later_open = false;
         self.searching = false;
+        if !self.fixtures.sample {
+            self.bridge.send(Command::LoadScheduledMessages);
+        }
         cx.notify();
     }
 
@@ -4137,12 +4199,22 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let post_at = when.at(now_secs());
+        if !self.fixtures.sample {
+            let content = composer::content_of(&text, &self.fixtures);
+            self.bridge.send(Command::ScheduleMessage {
+                channel: self.channel.clone(),
+                post_at,
+                content,
+            });
+        }
         let entry = Entry {
+            id: None,
             workspace: self.workspace,
             channel: self.channel.clone(),
             label: self.label(&self.channel),
             text,
-            at: when.at(now_secs()),
+            at: post_at,
         };
         self.drafts
             .update(cx, |drafts, cx| drafts.schedule(entry, cx));
@@ -4158,6 +4230,12 @@ impl App {
     /// Deliver a scheduled message now; it shows in the transcript when its workspace is the
     /// shown one (a parked workspace's transcript is not touched).
     fn deliver(&mut self, mut entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = entry.id.take() {
+            self.bridge.send(Command::DeleteScheduledMessage {
+                channel: entry.channel.clone(),
+                scheduled_message_id: id,
+            });
+        }
         // A scheduled message is kept as its draft text; it posts as the draft would have.
         let content = composer::content_of(&entry.text, &self.fixtures);
         if entry.workspace == self.workspace {
@@ -4289,6 +4367,7 @@ impl App {
         self.messages
             .update(cx, |list, cx| list.append(channel.clone(), message, cx));
         let entry = Entry {
+            id: None,
             workspace: self.workspace,
             channel: channel.clone(),
             label: self.label(&channel),
@@ -4398,7 +4477,10 @@ impl Render for App {
             };
             let bookmark_bar = (!bookmark_list.is_empty() || pin_count.is_some_and(|n| n > 0))
                 .then(|| bookmarks::bar(bookmark_list, pin_count, self.pins_open, clicks, cx));
-            let column = v_flex().size_full().child(header);
+            let column = v_flex()
+                .size_full()
+                .children(self.connection_banner(cx))
+                .child(header);
             let column = match (&self.huddle, self.huddle_open) {
                 (Some((_, bar)), true) => column.child(bar.clone()),
                 _ => column,
@@ -5112,6 +5194,45 @@ impl App {
                             ),
                     ),
             )
+    }
+
+    /// Offline / reconnecting notice at the top of the conversation column while Slack's RTM
+    /// socket is dropped (`F-SHELL-169`). Hidden once connected or in fixture mode.
+    fn connection_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        use slackless_core::rtm::ConnectionState;
+        let text = match self.connection.as_ref()? {
+            ConnectionState::Connected { .. } | ConnectionState::Connecting => return None,
+            ConnectionState::Reconnecting { attempt, delay, .. } => {
+                let secs = delay.as_secs();
+                if secs > 0 {
+                    format!("Offline — reconnecting to Slack in {secs}s (attempt {attempt})…")
+                } else {
+                    format!("Offline — reconnecting to Slack (attempt {attempt})…")
+                }
+            }
+            ConnectionState::Disconnected { reason } => {
+                format!("Disconnected from Slack ({reason})")
+            }
+        };
+        let theme = cx.theme();
+        Some(
+            h_flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_4()
+                .py_1p5()
+                .bg(theme.warning.opacity(0.18))
+                .border_b_1()
+                .border_color(theme.warning.opacity(0.35))
+                .child(
+                    Icon::new(IconName::WifiOff)
+                        .size(px(14.))
+                        .text_color(theme.warning),
+                )
+                .child(div().text_xs().text_color(theme.foreground).child(text)),
+        )
     }
 
     /// Slack's paused-notifications strip for a DM whose peer has do-not-disturb on: a
@@ -6094,7 +6215,10 @@ fn subscribe_workspace(
                     this.searching = false;
                     cx.notify();
                 }
-                SearchEvent::Open(channel) => this.select(channel.clone(), cx),
+                SearchEvent::Open { channel, ts } => {
+                    this.select(channel.clone(), cx);
+                    this.messages.update(cx, |list, cx| list.reveal(ts, cx));
+                }
             },
         ),
         cx.subscribe_in(

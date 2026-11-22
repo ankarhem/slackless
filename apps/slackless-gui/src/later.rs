@@ -122,6 +122,7 @@ pub enum LaterEvent {
     Open {
         workspace: usize,
         channel: ChannelId,
+        ts: Ts,
     },
     /// An item was removed from Later; message views drop their saved marker.
     Unsaved {
@@ -538,11 +539,15 @@ impl Render for LaterView {
                             ),
                     )
                     .child(actions)
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(LaterEvent::Open {
-                            workspace,
-                            channel: channel.clone(),
-                        });
+                    .on_click(cx.listener({
+                        let open_ts = item.ts.clone();
+                        move |_, _, _, cx| {
+                            cx.emit(LaterEvent::Open {
+                                workspace,
+                                channel: channel.clone(),
+                                ts: open_ts.clone(),
+                            });
+                        }
                     }))
             })
             .collect();

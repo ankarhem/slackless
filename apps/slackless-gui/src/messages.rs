@@ -158,6 +158,24 @@ pub(crate) const THEME_ORDER_STRIDE: u64 = 4096;
 /// room for the paragraphs inside the message. The transcript reads top-down in
 /// chronological order, so `ts` order is reading order; the shift keeps paragraphs of
 /// adjacent messages from interleaving. See [`SelectableParagraph`].
+/// A timestamp 1 microsecond before `ts`, used as the `conversations.mark` cursor when
+/// marking the oldest loaded message unread.
+fn ts_just_before(ts: &Ts) -> Ts {
+    let Some((secs, frac)) = ts.as_str().split_once('.') else {
+        return Ts::new("0.000000");
+    };
+    let (Ok(secs), Ok(micros)) = (secs.parse::<u64>(), frac.parse::<u64>()) else {
+        return Ts::new("0.000000");
+    };
+    if micros > 0 {
+        Ts::new(format!("{secs}.{:06}", micros - 1))
+    } else if secs > 0 {
+        Ts::new(format!("{}.999999", secs - 1))
+    } else {
+        Ts::new("0.000000")
+    }
+}
+
 pub(crate) fn message_order(ts: &Ts) -> u64 {
     /// `ts` (`secs.micros`) as milliseconds.
     fn millis(ts: &Ts) -> Option<u64> {
@@ -241,6 +259,8 @@ struct MessageData {
     active: Option<Ts>,
     /// Root of the thread open beside the list, tinted while it shows.
     open_thread: Option<Ts>,
+    /// Message briefly highlighted after jumping to it (from search, Later, pins, or links).
+    highlighted: Option<Ts>,
     /// The message being edited in place; its WYSIWYG draft is `edit_composer`.
     editing: Option<Ts>,
     edit_composer: Entity<Composer>,
@@ -259,6 +279,10 @@ pub struct MessageList {
     requested_older: Option<Ts>,
     /// A "Jump to…" target (unix seconds) waiting for older history to land.
     pending_jump: Option<i64>,
+    /// Target message to highlight once a pending jump finishes loading.
+    pending_highlight: Option<Ts>,
+    /// Timer that clears the jump-to highlight after a short flash.
+    highlight_clear: gpui_kit::gpui::Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -314,6 +338,7 @@ impl MessageList {
                 saved: HashSet::new(),
                 active: None,
                 open_thread: None,
+                highlighted: None,
                 editing: None,
                 edit_composer,
             });
@@ -325,6 +350,8 @@ impl MessageList {
                 scroller,
                 requested_older: None,
                 pending_jump: None,
+                pending_highlight: None,
+                highlight_clear: gpui_kit::gpui::Task::ready(()),
                 _subscriptions: subscriptions,
             }
         })
@@ -867,31 +894,51 @@ impl MessageList {
         self.scroll_to_time(since, cx);
     }
 
-    /// The jump's older history landed (or ran out): scroll to its target.
+    /// The jump's older history landed (or ran out): scroll to its target and highlight it.
     pub fn finish_jump(&mut self, cx: &mut Context<Self>) {
+        if let Some(ts) = self.pending_highlight.take() {
+            self.pending_jump = None;
+            if let Some(ix) = self
+                .data
+                .read(cx)
+                .messages
+                .iter()
+                .position(|message| message.ts >= ts)
+            {
+                self.scroller
+                    .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+                self.flash_highlight(ts, cx);
+                return;
+            }
+        }
         if let Some(since) = self.pending_jump.take() {
             self.scroll_to_time(since, cx);
         }
     }
 
-    /// A permalink landed on `ts` (the root's [`LinkTarget::Url`] handling): scroll the
-    /// transcript onto it, asking the root for older history first when the loaded window
-    /// starts after it — the date divider's "Jump to…" machinery.
+    /// A permalink, search hit, or saved item landed on `ts`: scroll the transcript onto it
+    /// and briefly highlight the row, asking the root for older history first when the loaded
+    /// window starts after it.
     pub fn reveal(&mut self, ts: &Ts, cx: &mut Context<Self>) {
         let since = ts.secs().unwrap_or(0);
-        match self
-            .data
-            .read(cx)
-            .messages
-            .iter()
-            .position(|message| &message.ts >= ts)
-        {
-            Some(ix) => {
+        let target = {
+            let messages = &self.data.read(cx).messages;
+            messages
+                .iter()
+                .position(|message| &message.ts >= ts)
+                .map(|ix| (ix, messages[ix].ts.clone()))
+        };
+        match target {
+            Some((ix, landed))
+                if &landed == ts || self.oldest_loaded(cx).as_ref().is_none_or(|o| o <= ts) =>
+            {
                 self.scroller
                     .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
+                self.flash_highlight(landed, cx);
             }
-            None => {
+            _ => {
                 self.pending_jump = Some(since);
+                self.pending_highlight = Some(ts.clone());
                 cx.emit(MessageListEvent::NeedHistorySince {
                     channel: self.channel.clone(),
                     since,
@@ -899,6 +946,23 @@ impl MessageList {
                 self.scroll_to_time(since, cx);
             }
         }
+    }
+
+    fn flash_highlight(&mut self, ts: Ts, cx: &mut Context<Self>) {
+        self.data
+            .update(cx, |data, _| data.highlighted = Some(ts.clone()));
+        self.refresh(cx);
+        self.highlight_clear = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(2500))
+                .await;
+            let _ = this.update(cx, |list, cx| {
+                if list.data.read(cx).highlighted.as_ref() == Some(&ts) {
+                    list.data.update(cx, |data, _| data.highlighted = None);
+                    list.refresh(cx);
+                }
+            });
+        });
     }
 
     /// The oldest message of the open conversation's loaded window.
@@ -978,17 +1042,23 @@ impl MessageList {
         self.set_saved(ts, saved, cx);
     }
 
-    /// Fixture-mode unread marker: move the read cursor to just before `ts`, so the New
-    /// divider sits above it.
+    /// Move the read cursor to just before `ts` so `ts` (and everything newer) is marked
+    /// unread both locally (New divider above `ts`) and on Slack (`conversations.mark`).
     fn mark_unread(&mut self, ts: &Ts, cx: &mut Context<Self>) {
-        self.data.update(cx, |data, _| {
+        let cursor = self.data.update(cx, |data, _| {
             let before = data
                 .messages
                 .iter()
                 .take_while(|message| &message.ts < ts)
                 .last()
                 .map(|message| message.ts.clone());
-            data.last_read = Some(before.unwrap_or_else(|| Ts::new("0.000000")));
+            let cursor = before.unwrap_or_else(|| ts_just_before(ts));
+            data.last_read = Some(cursor.clone());
+            cursor
+        });
+        cx.emit(MessageListEvent::Changed {
+            channel: self.channel.clone(),
+            change: MessageChange::MarkUnread { ts: cursor },
         });
         self.refresh(cx);
     }
@@ -1426,6 +1496,7 @@ fn transcript_row(
     let hover_bg = theme.secondary.opacity(0.5);
     let saved_bg = theme.warning.opacity(0.08);
     let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
+    let highlighted = store.highlighted.as_ref() == Some(&message.ts);
     let thread_bg = crate::theme::thread_root(cx);
     let editing_bg = crate::theme::editing_row(cx);
     let menu_handler = handler.clone();
@@ -1446,8 +1517,9 @@ fn transcript_row(
                 .when(message.is_ephemeral, |card| {
                     card.child(actions::ephemeral_banner(cx))
                 })
-                .when(thread_open, |card| card.bg(thread_bg))
-                .when(!saved && !thread_open, |card| {
+                .when(highlighted, |card| card.bg(editing_bg))
+                .when(!highlighted && thread_open, |card| card.bg(thread_bg))
+                .when(!saved && !highlighted && !thread_open, |card| {
                     card.hover(|card| card.bg(hover_bg))
                 })
         })

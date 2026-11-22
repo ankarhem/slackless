@@ -5,8 +5,9 @@ use std::future::Future;
 
 use crate::api::{
     self, ActionContainer, ActivityEntry, ActivityFeed, ChannelBookmark, ClientCounts, FilesFilter,
-    HistoryOpts, ListOpts, MessageContent, Page, PinnedItem, PostedMessage, SearchMessages,
-    SearchOpts, SectionCreated, SlackApi, ThreadsView, UserBoot,
+    HistoryOpts, ListOpts, MessageContent, Page, PinnedItem, PostedMessage, ScheduledMessage,
+    ScheduledMessageCreated, SearchMessages, SearchOpts, SectionCreated, SlackApi, ThreadsView,
+    UserBoot,
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, DndStatus, File,
@@ -267,6 +268,26 @@ pub trait Backend: Clone + Send + Sync + 'static {
     /// returning the canvas file id.
     fn create_canvas(&self, channel: ChannelId)
     -> impl Future<Output = api::Result<String>> + Send;
+    /// Pause the signed-in user's notifications for `minutes` (`dnd.setSnooze`).
+    fn set_dnd_snooze(&self, minutes: u32) -> impl Future<Output = api::Result<DndStatus>> + Send;
+    /// End the signed-in user's active notification snooze (`dnd.endSnooze`).
+    fn end_dnd_snooze(&self) -> impl Future<Output = api::Result<DndStatus>> + Send;
+    /// Queue a message for delivery at unix timestamp `post_at` (`chat.scheduleMessage`).
+    fn schedule_message(
+        &self,
+        channel: ChannelId,
+        post_at: u64,
+        content: MessageContent,
+    ) -> impl Future<Output = api::Result<ScheduledMessageCreated>> + Send;
+    /// List pending scheduled messages (`chat.scheduledMessages.list`).
+    fn scheduled_messages(&self)
+    -> impl Future<Output = api::Result<Vec<ScheduledMessage>>> + Send;
+    /// Delete a pending scheduled message (`chat.deleteScheduledMessage`).
+    fn delete_scheduled_message(
+        &self,
+        channel: ChannelId,
+        scheduled_message_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -594,5 +615,36 @@ impl Backend for SlackApi {
             .conversations_canvases_create(&channel)
             .await?
             .canvas_id)
+    }
+
+    async fn set_dnd_snooze(&self, minutes: u32) -> api::Result<DndStatus> {
+        self.dnd_set_snooze(minutes).await
+    }
+
+    async fn end_dnd_snooze(&self) -> api::Result<DndStatus> {
+        self.dnd_end_snooze().await
+    }
+
+    async fn schedule_message(
+        &self,
+        channel: ChannelId,
+        post_at: u64,
+        content: MessageContent,
+    ) -> api::Result<ScheduledMessageCreated> {
+        self.chat_schedule_message(&channel, post_at, &content, None)
+            .await
+    }
+
+    async fn scheduled_messages(&self) -> api::Result<Vec<ScheduledMessage>> {
+        self.chat_scheduled_messages_list(None).await
+    }
+
+    async fn delete_scheduled_message(
+        &self,
+        channel: ChannelId,
+        scheduled_message_id: String,
+    ) -> api::Result<()> {
+        self.chat_delete_scheduled_message(&channel, &scheduled_message_id)
+            .await
     }
 }

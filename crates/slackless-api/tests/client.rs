@@ -668,6 +668,86 @@ async fn pins_add_and_remove_post_channel_and_timestamp() {
 }
 
 #[tokio::test]
+async fn dnd_snooze_and_scheduled_message_methods_match_wire_format() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/dnd.setSnooze"))
+        .and(body_string_contains("num_minutes=60"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "snooze_enabled": true,
+            "snooze_endtime": 1760003600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/dnd.endSnooze"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "snooze_enabled": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.scheduleMessage"))
+        .and(body_string_contains("channel=C1"))
+        .and(body_string_contains("post_at=1760010000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "scheduled_message_id": "Q123",
+            "channel": "C1",
+            "post_at": 1760010000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.scheduledMessages.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "scheduled_messages": [
+                {"id": "Q123", "channel_id": "C1", "post_at": 1760010000, "date_created": 1760000000, "text": "hello later"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.deleteScheduledMessage"))
+        .and(body_string_contains("channel=C1"))
+        .and(body_string_contains("scheduled_message_id=Q123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let snoozed = api.dnd_set_snooze(60).await.unwrap();
+    assert!(snoozed.snooze_enabled);
+    let resumed = api.dnd_end_snooze().await.unwrap();
+    assert!(!resumed.snooze_enabled);
+
+    let channel = ChannelId::from("C1");
+    let created = api
+        .chat_schedule_message(
+            &channel,
+            1760010000,
+            &MessageContent::plain("hello later"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.scheduled_message_id, "Q123");
+    let list = api.chat_scheduled_messages_list(None).await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].text, "hello later");
+    api.chat_delete_scheduled_message(&channel, "Q123")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn channel_managers_reads_the_manager_role_on_the_channel() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))

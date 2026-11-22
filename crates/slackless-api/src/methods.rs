@@ -323,6 +323,32 @@ pub struct PostedMessage {
     pub client_msg_id: Option<String>,
 }
 
+/// Response to `chat.scheduleMessage`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ScheduledMessageCreated {
+    pub scheduled_message_id: String,
+    pub channel: ChannelId,
+    pub post_at: u64,
+}
+
+/// One pending scheduled message returned by `chat.scheduledMessages.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ScheduledMessage {
+    pub id: String,
+    pub channel_id: ChannelId,
+    pub post_at: u64,
+    #[serde(default)]
+    pub date_created: u64,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduledMessagesList {
+    #[serde(default)]
+    scheduled_messages: Vec<ScheduledMessage>,
+}
+
 /// `search.messages` `messages` object.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct SearchMessages {
@@ -1486,6 +1512,57 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `chat.scheduleMessage`: queue a message for delivery at unix timestamp `post_at`.
+    pub async fn chat_schedule_message(
+        &self,
+        channel: &ChannelId,
+        post_at: u64,
+        content: &MessageContent,
+        thread_ts: Option<&Ts>,
+    ) -> Result<ScheduledMessageCreated> {
+        let mut params = vec![
+            ("channel", channel.to_string()),
+            ("post_at", post_at.to_string()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(thread_ts) = thread_ts {
+            params.push(("thread_ts", thread_ts.to_string()));
+        }
+        content.push(&mut params)?;
+        Ok(self.call(method::CHAT_SCHEDULE_MESSAGE, params).await?.data)
+    }
+
+    /// `chat.scheduledMessages.list`: pending scheduled messages (all channels when `None`).
+    pub async fn chat_scheduled_messages_list(
+        &self,
+        channel: Option<&ChannelId>,
+    ) -> Result<Vec<ScheduledMessage>> {
+        let mut params = Vec::new();
+        if let Some(channel) = channel {
+            params.push(("channel", channel.to_string()));
+        }
+        Ok(self
+            .call::<ScheduledMessagesList>(method::CHAT_SCHEDULED_MESSAGES_LIST, params)
+            .await?
+            .data
+            .scheduled_messages)
+    }
+
+    /// `chat.deleteScheduledMessage`: cancel a pending scheduled message.
+    pub async fn chat_delete_scheduled_message(
+        &self,
+        channel: &ChannelId,
+        scheduled_message_id: &str,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("scheduled_message_id", scheduled_message_id.to_owned()),
+        ];
+        self.call::<Empty>(method::CHAT_DELETE_SCHEDULED_MESSAGE, params)
+            .await?;
+        Ok(())
+    }
+
     /// `reactions.add`. `name` may include surrounding colons and a `::skin-tone-N` suffix.
     pub async fn reactions_add(&self, channel: &ChannelId, ts: &Ts, name: &str) -> Result<()> {
         self.reaction(method::REACTIONS_ADD, channel, ts, name)
@@ -1542,6 +1619,17 @@ impl SlackApi {
     pub async fn dnd_info(&self, user: &UserId) -> Result<DndStatus> {
         let params = vec![("user", user.to_string())];
         Ok(self.call(method::DND_INFO, params).await?.data)
+    }
+
+    /// `dnd.setSnooze`: pause the signed-in user's notifications for `num_minutes`.
+    pub async fn dnd_set_snooze(&self, num_minutes: u32) -> Result<DndStatus> {
+        let params = vec![("num_minutes", num_minutes.to_string())];
+        Ok(self.call(method::DND_SET_SNOOZE, params).await?.data)
+    }
+
+    /// `dnd.endSnooze`: resume the signed-in user's notifications immediately.
+    pub async fn dnd_end_snooze(&self) -> Result<DndStatus> {
+        Ok(self.call(method::DND_END_SNOOZE, Vec::new()).await?.data)
     }
 
     /// `users.getPresence`: one user's current presence. Read-only.

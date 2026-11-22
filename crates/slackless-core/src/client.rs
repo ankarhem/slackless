@@ -934,6 +934,56 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::SetDndSnooze { minutes } => {
+                self.spawn("dnd.setSnooze", async move {
+                    let status = backend.set_dnd_snooze(minutes).await?;
+                    events.emit(Event::SelfDndUpdated(status));
+                    Ok(())
+                });
+            }
+            Command::EndDndSnooze => {
+                self.spawn("dnd.endSnooze", async move {
+                    let status = backend.end_dnd_snooze().await?;
+                    events.emit(Event::SelfDndUpdated(status));
+                    Ok(())
+                });
+            }
+            Command::ScheduleMessage {
+                channel,
+                post_at,
+                content,
+            } => {
+                self.spawn("chat.scheduleMessage", async move {
+                    let created = backend
+                        .schedule_message(channel.clone(), post_at, content)
+                        .await?;
+                    events.emit(Event::MessageScheduled {
+                        channel: created.channel,
+                        scheduled_message_id: created.scheduled_message_id,
+                        post_at: created.post_at,
+                    });
+                    let list = backend.scheduled_messages().await;
+                    answer_load(&events, list, Event::ScheduledMessagesLoaded)
+                });
+            }
+            Command::LoadScheduledMessages => {
+                self.spawn("chat.scheduledMessages.list", async move {
+                    let list = backend.scheduled_messages().await;
+                    answer_load(&events, list, Event::ScheduledMessagesLoaded)
+                });
+            }
+            Command::DeleteScheduledMessage {
+                channel,
+                scheduled_message_id,
+            } => {
+                self.spawn("chat.deleteScheduledMessage", async move {
+                    backend
+                        .delete_scheduled_message(channel, scheduled_message_id)
+                        .await?;
+                    let list = backend.scheduled_messages().await;
+                    answer_load(&events, list, Event::ScheduledMessagesLoaded)
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -1535,6 +1585,8 @@ pub(crate) mod tests {
         /// `pins.add` / `pins.remove` asks: (channel, ts, pinned?).
         pin_calls: Vec<(ChannelId, Ts, bool)>,
         canvas_creations: Vec<ChannelId>,
+        snooze_calls: Vec<Option<u32>>,
+        scheduled: Vec<api::ScheduledMessage>,
         /// Every tab load (`pins.list`, `bookmarks.list`, `files.list`) fails.
         fail_tab_loads: bool,
         /// The `activity.feed` answer.
@@ -2391,6 +2443,62 @@ pub(crate) mod tests {
             self.state.lock().unwrap().canvas_creations.push(channel);
             Ok("F07NEW".to_owned())
         }
+
+        async fn set_dnd_snooze(&self, minutes: u32) -> api::Result<DndStatus> {
+            self.state.lock().unwrap().snooze_calls.push(Some(minutes));
+            Ok(DndStatus {
+                snooze_enabled: true,
+                snooze_endtime: Some(minutes as i64 * 60),
+                ..Default::default()
+            })
+        }
+
+        async fn end_dnd_snooze(&self) -> api::Result<DndStatus> {
+            self.state.lock().unwrap().snooze_calls.push(None);
+            Ok(DndStatus {
+                snooze_enabled: false,
+                ..Default::default()
+            })
+        }
+
+        async fn schedule_message(
+            &self,
+            channel: ChannelId,
+            post_at: u64,
+            content: MessageContent,
+        ) -> api::Result<api::ScheduledMessageCreated> {
+            let mut state = self.state.lock().unwrap();
+            let id = format!("Q{}", state.scheduled.len() + 1);
+            state.scheduled.push(api::ScheduledMessage {
+                id: id.clone(),
+                channel_id: channel.clone(),
+                post_at,
+                date_created: 1_760_000_000,
+                text: content.text,
+            });
+            Ok(api::ScheduledMessageCreated {
+                scheduled_message_id: id,
+                channel,
+                post_at,
+            })
+        }
+
+        async fn scheduled_messages(&self) -> api::Result<Vec<api::ScheduledMessage>> {
+            Ok(self.state.lock().unwrap().scheduled.clone())
+        }
+
+        async fn delete_scheduled_message(
+            &self,
+            _channel: ChannelId,
+            scheduled_message_id: String,
+        ) -> api::Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .scheduled
+                .retain(|m| m.id != scheduled_message_id);
+            Ok(())
+        }
     }
 
     pub(crate) fn fake_core_parts() -> (SharedStore, Emitter, UnboundedReceiver<Event>) {
@@ -2551,6 +2659,54 @@ pub(crate) mod tests {
         assert_eq!(channel, c1());
         assert!(pins.is_ok(), "the refreshed list lands");
         assert_eq!(fake.pin_calls(), vec![(c1(), ts, true)]);
+    }
+
+    #[tokio::test]
+    async fn dnd_snooze_and_scheduled_messages_commands_emit_updates() {
+        let fake = FakeBackend::default();
+        let (store, events, mut rx) = fake_core_parts();
+        let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events);
+
+        core.handle(Command::SetDndSnooze { minutes: 30 });
+        let Event::SelfDndUpdated(status) = next(&mut rx).await else {
+            panic!("expected SelfDndUpdated");
+        };
+        assert!(status.snooze_enabled);
+
+        core.handle(Command::EndDndSnooze);
+        let Event::SelfDndUpdated(status) = next(&mut rx).await else {
+            panic!("expected SelfDndUpdated");
+        };
+        assert!(!status.snooze_enabled);
+
+        core.handle(Command::ScheduleMessage {
+            channel: c1(),
+            post_at: 1_760_010_000,
+            content: MessageContent::plain("later"),
+        });
+        let Event::MessageScheduled {
+            channel,
+            scheduled_message_id,
+            post_at,
+        } = next(&mut rx).await
+        else {
+            panic!("expected MessageScheduled");
+        };
+        assert_eq!(channel, c1());
+        assert_eq!(post_at, 1_760_010_000);
+        let Event::ScheduledMessagesLoaded(Ok(list)) = next(&mut rx).await else {
+            panic!("expected ScheduledMessagesLoaded");
+        };
+        assert_eq!(list.len(), 1);
+
+        core.handle(Command::DeleteScheduledMessage {
+            channel: c1(),
+            scheduled_message_id,
+        });
+        let Event::ScheduledMessagesLoaded(Ok(list)) = next(&mut rx).await else {
+            panic!("expected refreshed empty ScheduledMessagesLoaded");
+        };
+        assert!(list.is_empty());
     }
 
     #[tokio::test]
