@@ -93,6 +93,9 @@ pub(super) struct RunTheme {
     pub(super) emoji_text_mode: bool,
     /// Active dark/light appearance mode (used for syntax-highlighted code runs).
     pub(super) dark: bool,
+    /// When `true` (Block Kit `mrkdwn` `verbatim: true`, `F-COLLAB-758`), skip auto-linking
+    /// raw un-bracketed URLs.
+    pub(super) verbatim: bool,
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
     /// within its message (GPUI keys interaction and accessibility state by the id path)
     /// and counts its selection document order.
@@ -136,6 +139,7 @@ impl RunTheme {
             underline_links: crate::preferences::display_prefs(cx).underline_links,
             emoji_text_mode: crate::preferences::display_prefs(cx).emoji_text_mode,
             dark: theme.mode.is_dark(),
+            verbatim: false,
             base_font,
             paragraphs: Cell::new(0),
             key,
@@ -2106,8 +2110,22 @@ pub(crate) fn render_block(
 /// literal. With a link handler (see [`KitCx`]) the text is selectable and its links route
 /// through it.
 pub(crate) fn mrkdwn(text: &str, kcx: &KitCx, muted: bool, edited: bool, cx: &App) -> Div {
+    mrkdwn_with_verbatim(text, kcx, muted, edited, false, cx)
+}
+
+/// Render Slack `mrkdwn`, honoring Block Kit's `verbatim` flag (`F-COLLAB-758`): when `verbatim`
+/// is `true`, raw un-bracketed URLs stay literal instead of being auto-linked.
+pub(crate) fn mrkdwn_with_verbatim(
+    text: &str,
+    kcx: &KitCx,
+    muted: bool,
+    edited: bool,
+    verbatim: bool,
+    cx: &App,
+) -> Div {
     let (key, order) = kcx.text_theme();
     let mut theme = RunTheme::body(cx, key.into(), order, kcx.links.clone());
+    theme.verbatim = verbatim;
     if muted {
         theme.foreground = theme.muted;
     }
@@ -2295,14 +2313,41 @@ pub(crate) fn unescape(text: &str) -> String {
 }
 
 /// Plain mrkdwn text with Slack's HTML escapes undone; inline code gets its wash.
+/// Unless `theme.verbatim` is set (Block Kit `verbatim: true`, `F-COLLAB-758`) or inside inline
+/// code, bare `https://` / `http://` URLs are auto-linked.
 pub(super) fn push_mrkdwn_text(
     builder: &mut ParagraphBuilder,
     text: &str,
     theme: &RunTheme,
     run: RunFlags,
 ) {
-    let bg = run.code.then_some(theme.code_bg);
-    builder.push_text(&unescape(text), theme, run, None, bg);
+    let unescaped = unescape(text);
+    if run.code || theme.verbatim {
+        let bg = run.code.then_some(theme.code_bg);
+        builder.push_text(&unescaped, theme, run, None, bg);
+        return;
+    }
+    let mut rest = unescaped.as_str();
+    while let Some(pos) = rest.find("https://").or_else(|| rest.find("http://")) {
+        let (before, tail) = rest.split_at(pos);
+        if !before.is_empty() {
+            builder.push_text(before, theme, run, None, None);
+        }
+        let raw_end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+            .unwrap_or(tail.len());
+        let url = tail[..raw_end].trim_end_matches(['.', ',', ';', ':', ')', ']']);
+        if url.len() > "https://".len() {
+            builder.push_link(url.to_owned(), url.to_owned(), run, theme);
+            rest = &tail[url.len()..];
+        } else {
+            builder.push_text(&tail[..raw_end.max(1)], theme, run, None, None);
+            rest = &tail[raw_end.max(1)..];
+        }
+    }
+    if !rest.is_empty() {
+        builder.push_text(rest, theme, run, None, None);
+    }
 }
 
 /// Open or close the style `marker` stands for. A marker opens at a word start when a closing

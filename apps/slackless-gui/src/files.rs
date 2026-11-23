@@ -72,6 +72,9 @@ pub fn attachments(
         } else {
             match thumbnail(fixtures, file) {
                 Some(source) => image_attachment(file, ix, source, on_open, cx),
+                None if file.is_external || file.external_type.is_some() => {
+                    external_file_card(file, cx)
+                }
                 None => file_card(file, cx),
             }
         });
@@ -1290,6 +1293,112 @@ impl RenderOnce for SnippetCard {
             .children(truncation_notice)
             .children(toggle_row)
     }
+}
+
+/// Human-readable provider label for an external Slack file (`F-COLLAB-586`).
+fn external_provider_label(file: &File) -> String {
+    match file
+        .external_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gdrive" => "Google Drive".to_owned(),
+        "dropbox" => "Dropbox".to_owned(),
+        "box" => "Box".to_owned(),
+        "onedrive" | "sharepoint" => "OneDrive".to_owned(),
+        "notion" => "Notion".to_owned(),
+        "figma" => "Figma".to_owned(),
+        "jira" => "Jira".to_owned(),
+        "github" => "GitHub".to_owned(),
+        other if !other.is_empty() => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => "External file".to_owned(),
+            }
+        }
+        _ => "External file".to_owned(),
+    }
+}
+
+/// Compact external file title preview card (`F-COLLAB-586`): shows provider badge, clickable
+/// title, and an open-in-browser affordance.
+fn external_file_card(file: &File, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (icon, tile) = file_icon(file, cx);
+    let provider = external_provider_label(file);
+    let kind = file
+        .pretty_type
+        .clone()
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&provider));
+    let subtitle = match kind {
+        Some(k) => format!("{provider} \u{b7} {k}"),
+        None => provider,
+    };
+    let open_url = file
+        .permalink
+        .clone()
+        .or_else(|| file.url_private.clone())
+        .or_else(|| file.permalink_public.clone());
+    let mut card = h_flex()
+        .id(SharedString::from(format!("ext-file-card-{}", file.id)))
+        .w(px(CARD_W))
+        .max_w_full()
+        .items_center()
+        .gap_3()
+        .p_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            div()
+                .size(px(36.))
+                .flex_none()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(tile)
+                .child(
+                    Icon::new(icon)
+                        .text_color(crate::theme::avatar_foreground())
+                        .size(px(18.)),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.link)
+                        .child(file_name(file)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(subtitle),
+                ),
+        )
+        .child(
+            Icon::new(IconName::ExternalLink)
+                .text_color(theme.muted_foreground)
+                .size(px(15.)),
+        );
+    if let Some(url) = open_url {
+        card = card
+            .cursor_pointer()
+            .hover(|c| c.bg(theme.secondary))
+            .on_click(move |_, _, cx| cx.open_url(&url));
+    }
+    div().child(card)
 }
 
 fn file_card(file: &File, cx: &App) -> Div {

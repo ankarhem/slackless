@@ -57,7 +57,8 @@ use render::{
 };
 pub(crate) use render::{
     clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp, local_offset_now,
-    mrkdwn, mrkdwn_preview, now_secs, render_block, selectable_code, short_date, unescape,
+    mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, render_block, selectable_code,
+    short_date, unescape,
 };
 #[cfg(test)]
 mod tests;

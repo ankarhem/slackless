@@ -272,6 +272,18 @@ fn collect_json_urls(value: &crate::blockkit::serde_json::Value, out: &mut Vec<(
                             ));
                         }
                     }
+                    "slack_file" => {
+                        if let Some(url) = child.get("url").and_then(|v| v.as_str()) {
+                            out.push((
+                                url.to_owned(),
+                                if alt.is_empty() {
+                                    url_tail(url)
+                                } else {
+                                    alt.clone()
+                                },
+                            ));
+                        }
+                    }
                     "alt_text" => alt = child.as_str().unwrap_or_default().to_owned(),
                     _ => collect_json_urls(child, out),
                 }
