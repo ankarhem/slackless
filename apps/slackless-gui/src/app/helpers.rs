@@ -551,3 +551,38 @@ pub(super) fn mentions_me(text: &str, me: &UserId, keywords: &str) -> bool {
         .filter(|keyword| !keyword.is_empty())
         .any(|keyword| lower.contains(&keyword.to_lowercase()))
 }
+
+#[cfg(test)]
+mod notification_tag_tests {
+    use super::parse_notification_target;
+    use slackless_core::types::{ChannelId, Ts};
+
+    #[test]
+    fn parses_foreground_and_background_workspace_notification_tags() {
+        assert_eq!(
+            parse_notification_target("bg:2:C0ABC:1700000001.000100"),
+            Some((
+                Some(2),
+                ChannelId::from("C0ABC"),
+                Ts::from("1700000001.000100")
+            ))
+        );
+        assert_eq!(
+            parse_notification_target("msg:D0XYZ:1700000002.000200"),
+            Some((
+                None,
+                ChannelId::from("D0XYZ"),
+                Ts::from("1700000002.000200")
+            ))
+        );
+        assert_eq!(
+            parse_notification_target("later:C0ENG:1700000003.000300"),
+            Some((
+                None,
+                ChannelId::from("C0ENG"),
+                Ts::from("1700000003.000300")
+            ))
+        );
+        assert_eq!(parse_notification_target("bg:bad:C0:1.0"), None);
+    }
+}

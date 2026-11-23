@@ -755,7 +755,7 @@ fn context_line(item: &Item, dim: Hsla, cx: &App) -> impl IntoElement {
                         .bg(cx.theme().accent.opacity(0.4))
                         .child(glyph),
                 )
-                .child("to:")
+                .child("to your message")
         }
         RowContext::Dm => row.child("Direct message"),
         RowContext::App => row.child("App"),

@@ -846,8 +846,10 @@ impl Render for LaterView {
                     );
                 let (workspace, channel) = (item.workspace, item.channel.clone());
                 let completed = item.state == LaterState::Completed;
+                let row_group = SharedString::from(format!("later-row-grp-{ix}"));
                 h_flex()
                     .id(("later-row", ix))
+                    .group(row_group.clone())
                     .items_start()
                     .gap_3()
                     .px_4()
@@ -915,7 +917,11 @@ impl Render for LaterView {
                                 }
                             })),
                     )
-                    .child(actions)
+                    .child(
+                        actions
+                            .opacity(0.6)
+                            .group_hover(row_group, |el| el.opacity(1.0)),
+                    )
             })
             .collect();
 

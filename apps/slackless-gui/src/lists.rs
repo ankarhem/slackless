@@ -3003,6 +3003,12 @@ mod tests {
             filter_and_sort_rows(&data, &fixtures, "zebra", None),
             vec![0]
         );
+        let csv = "Task,Due,Done\r\n\"Ship \"\"v2\"\", fast\",2026-12-01,true\r\nCleanup,2026-12-05,false\n";
+        let parsed = parse_csv_rows(csv);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0], vec!["Task", "Due", "Done"]);
+        assert_eq!(parsed[1], vec!["Ship \"v2\", fast", "2026-12-01", "true"]);
+        assert_eq!(parsed[2], vec!["Cleanup", "2026-12-05", "false"]);
 
         // RFC 4180 CSV export resolves select labels and preserves column order.
         let mut csv_data = data.clone();

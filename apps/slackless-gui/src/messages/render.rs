@@ -3055,3 +3055,17 @@ pub(super) fn civil_from_days(days: i64) -> (i32, u32, u32) {
     } as u32;
     ((year + i64::from(month <= 2)) as i32, month, day)
 }
+
+#[cfg(test)]
+mod huddle_card_tests {
+    use super::format_huddle_duration;
+
+    #[test]
+    fn formats_huddle_durations_cleanly() {
+        assert_eq!(format_huddle_duration(16), "16s");
+        assert_eq!(format_huddle_duration(120), "2m");
+        assert_eq!(format_huddle_duration(724), "12m 4s");
+        assert_eq!(format_huddle_duration(3600), "1h");
+        assert_eq!(format_huddle_duration(3900), "1h 5m");
+    }
+}
