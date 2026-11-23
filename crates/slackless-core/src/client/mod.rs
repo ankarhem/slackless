@@ -1609,6 +1609,23 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::DeleteChannel(channel) => {
+                self.spawn("admin.conversations.delete", async move {
+                    backend.delete_channel(channel.clone()).await?;
+                    let id = channel.clone();
+                    with_store(&store, move |s| {
+                        if let Some(mut conv) = s.conversation(&ws, &id)? {
+                            conv.is_archived = true;
+                            conv.is_member = false;
+                            s.upsert_conversation(&ws, &conv)?;
+                        }
+                        Ok::<_, StoreError>(())
+                    })
+                    .await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    Ok(())
+                });
+            }
             Command::ConvertChannelToPrivate(channel) => {
                 self.spawn("conversations.convertToPrivate", async move {
                     let updated = backend.convert_channel_to_private(channel.clone()).await?;

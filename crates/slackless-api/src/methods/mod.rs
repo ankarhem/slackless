@@ -556,6 +556,15 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `admin.conversations.delete`: permanently delete a channel (`F-CORE-053`; requires
+    /// workspace admin privileges).
+    pub async fn admin_conversations_delete(&self, channel: &ChannelId) -> Result<()> {
+        let params = vec![("channel_id", channel.to_string())];
+        self.call::<Empty>(method::ADMIN_CONVERSATIONS_DELETE, params)
+            .await?;
+        Ok(())
+    }
+
     /// `conversations.convertToPrivate`: convert a public channel or group DM into a private
     /// channel (`F-CORE-049`, `F-CORE-072`).
     pub async fn conversations_convert_to_private(

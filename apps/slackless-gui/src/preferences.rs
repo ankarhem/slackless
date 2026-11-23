@@ -284,6 +284,10 @@ pub struct Settings {
     pub urgent_dm_override: bool,
     /// Automatically set `"In focus mode"` status while Focus mode is active (`F-SHELL-039`).
     pub focus_auto_status: bool,
+    /// Sync active macOS Calendar busy events to an automatic `"In a meeting"` status (`F-SHELL-024`).
+    pub calendar_status_sync: bool,
+    /// Channels where the user follows all new threads automatically (`F-CORE-111`).
+    pub follow_all_threads_channels: Vec<String>,
     pub sound: usize,
     pub dm_sound: usize,
     pub show_preview: bool,
@@ -570,6 +574,8 @@ impl Default for Settings {
             vip_sound: 1,
             urgent_dm_override: true,
             focus_auto_status: true,
+            calendar_status_sync: false,
+            follow_all_threads_channels: Vec::new(),
             sound: 0,
             dm_sound: 0,
             show_preview: true,
@@ -1578,6 +1584,12 @@ impl Preferences {
             |s| &mut s.focus_auto_status,
             cx,
         );
+        let calendar_sync = self.checkbox(
+            "notify-calendar-status-sync",
+            "Sync macOS Calendar busy events to 'In a meeting' status",
+            |s| &mut s.calendar_status_sync,
+            cx,
+        );
         v_flex()
             .child(self.group(
                 "Notify me about\u{2026}",
@@ -1604,7 +1616,8 @@ impl Preferences {
                     .child(vip_box)
                     .child(self.labeled("Notification sound (VIPs)", vip_sound_sel))
                     .child(urgent_override)
-                    .child(focus_status),
+                    .child(focus_status)
+                    .child(calendar_sync),
                 cx,
             ))
             .child(self.group(

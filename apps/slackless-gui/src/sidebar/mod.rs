@@ -165,6 +165,8 @@ pub enum SidebarEvent {
     OpenTools,
     /// The rail's Admin tile: open workspace administration in the browser.
     OpenAdmin,
+    /// Open the "Clean up inactive channels" bulk-leave assistant (`F-CORE-023`, `F-SHELL-070`).
+    OpenCleanupChannels,
 }
 
 /// The nav destinations stacked in the workspace rail.
@@ -2209,6 +2211,15 @@ impl Render for Sidebar {
                         })
                         .ok();
                 };
+                let cleanup = cx.weak_entity();
+                let on_cleanup_channels = move |_: &mut Window, cx: &mut gpui_kit::gpui::App| {
+                    cleanup
+                        .update(cx, |sidebar: &mut Sidebar, cx| {
+                            sidebar.settings_menu_open = false;
+                            cx.emit(SidebarEvent::OpenCleanupChannels);
+                        })
+                        .ok();
+                };
                 sidebar
                     .child(
                         div()
@@ -2233,6 +2244,7 @@ impl Render for Sidebar {
                                 self.active_only,
                                 on_active_only,
                                 on_create_section,
+                                on_cleanup_channels,
                                 cx,
                             )),
                     )

@@ -2115,9 +2115,14 @@ impl App {
             _ => false,
         };
         if reply && !dm && !mentioned {
-            return wanted
+            let channel_followed = settings
+                .follow_all_threads_channels
+                .iter()
+                .any(|id| id == channel.as_str());
+            return (wanted
                 && settings.thread_replies
-                && message.parent_user_id.as_ref() == Some(me);
+                && message.parent_user_id.as_ref() == Some(me))
+                || channel_followed;
         }
         wanted
     }

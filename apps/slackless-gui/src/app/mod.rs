@@ -614,6 +614,10 @@ pub struct App {
     last_right_pane: Option<RightPane>,
     /// The signed-in user's status, presence and notification pause.
     self_state: SelfState,
+    /// True while macOS Calendar sync set an automatic `"In a meeting"` status (`F-SHELL-024`).
+    calendar_status_active: bool,
+    /// Poll counter (10s ticks) so Calendar.app is probed at most once per minute.
+    calendar_sync_ticks: u32,
     status_picker: Entity<StatusPicker>,
     user_menu: Entity<UserMenu>,
     user_menu_open: bool,
@@ -2038,6 +2042,7 @@ impl App {
                         .update_in(cx, |app, window, cx| {
                             app.fire_reminders(window, cx);
                             app.expire_focus(window, cx);
+                            app.poll_calendar_status(window, cx);
                         })
                         .is_err()
                     {
@@ -2111,6 +2116,8 @@ impl App {
                 profile,
                 profile_open: false,
                 self_state: SelfState::default(),
+                calendar_status_active: false,
+                calendar_sync_ticks: 0,
                 status_picker,
                 user_menu,
                 user_menu_open: false,
@@ -3511,6 +3518,7 @@ fn subscribe_workspace(
                 SidebarEvent::OpenFiles => this.open_files(cx),
                 SidebarEvent::OpenTools => this.open_tools(cx),
                 SidebarEvent::OpenAdmin => this.open_admin(window, cx),
+                SidebarEvent::OpenCleanupChannels => this.open_inactive_channels_dialog(window, cx),
                 SidebarEvent::ShowFilesSection(section) => this
                     .files_page
                     .update(cx, |page, cx| page.show_section(*section, window, cx)),

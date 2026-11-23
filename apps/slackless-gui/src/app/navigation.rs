@@ -548,6 +548,88 @@ impl App {
         }
     }
 
+    /// Opt-in native macOS Calendar busy-event status sync (`F-SHELL-024`): probes Calendar.app
+    /// once per minute off the UI thread when `Settings.calendar_status_sync` is enabled, setting
+    /// `:spiral_calendar_pad:` `"In a meeting"` while a non-all-day event is active and clearing
+    /// it once the meeting ends (never overwriting a manual user status or active Focus mode).
+    pub(super) fn poll_calendar_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let enabled = self.preferences.read(cx).settings().calendar_status_sync;
+        if !enabled {
+            if self.calendar_status_active {
+                self.calendar_status_active = false;
+                if self
+                    .self_state
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.text == "In a meeting" && s.emoji == "spiral_calendar_pad")
+                {
+                    self.self_state.set_status(None);
+                    if !self.fixtures.sample {
+                        self.send_status_to_slack(None);
+                    }
+                    self.push_self_state(cx);
+                }
+            }
+            return;
+        }
+        let tick = self.calendar_sync_ticks;
+        self.calendar_sync_ticks = self.calendar_sync_ticks.wrapping_add(1);
+        // Probe immediately on first enabled tick, then once every 60s (6 × 10s).
+        if tick % 6 != 0 || self.self_state.focused() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            cx.spawn_in(window, async move |this, cx| {
+                let busy = cx
+                    .background_executor()
+                    .spawn(async move { probe_macos_calendar_busy() })
+                    .await;
+                let Some(is_busy) = busy else {
+                    return;
+                };
+                let _ = this.update(cx, |app, cx| {
+                    if app.self_state.focused()
+                        || !app.preferences.read(cx).settings().calendar_status_sync
+                    {
+                        return;
+                    }
+                    if is_busy {
+                        if app.self_state.status.is_none() {
+                            let status = crate::status::UserStatus {
+                                emoji: "spiral_calendar_pad".to_owned(),
+                                text: "In a meeting".to_owned(),
+                                clear_after: 0,
+                                pause: false,
+                                expiration: None,
+                            };
+                            app.self_state.set_status(Some(status.clone()));
+                            app.calendar_status_active = true;
+                            if !app.fixtures.sample {
+                                app.send_status_to_slack(Some(&status));
+                            }
+                            app.push_self_state(cx);
+                        }
+                    } else if app.calendar_status_active {
+                        app.calendar_status_active = false;
+                        if app.self_state.status.as_ref().is_some_and(|s| {
+                            s.text == "In a meeting" && s.emoji == "spiral_calendar_pad"
+                        }) {
+                            app.self_state.set_status(None);
+                            if !app.fixtures.sample {
+                                app.send_status_to_slack(None);
+                            }
+                            app.push_self_state(cx);
+                        }
+                    }
+                });
+            })
+            .detach();
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (window, cx);
+    }
+
     /// Toggle the leftmost workspace switcher rail (`Cmd+Shift+S` / View menu) and persist.
     pub(super) fn toggle_workspace_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences.update(cx, |prefs, cx| {
@@ -2382,4 +2464,43 @@ pub(super) fn is_workflow_trigger_url(url: &str) -> bool {
         return false;
     };
     (host == "slack.com" || host.ends_with(".slack.com")) && path.starts_with("shortcuts/Ft")
+}
+
+/// Read-only macOS Calendar.app probe: returns `Some(true)` if a non-all-day event is active
+/// right now, `Some(false)` if free, or `None` if Calendar is unavailable or permission denied.
+#[cfg(target_os = "macos")]
+fn probe_macos_calendar_busy() -> Option<bool> {
+    const SCRIPT: &str = r#"
+tell application "System Events"
+    if not (exists process "Calendar") then return "FREE"
+end tell
+tell application "Calendar"
+    set nowDate to current date
+    repeat with c in calendars
+        try
+            set evs to (every event of c whose start date <= nowDate and end date >= nowDate)
+            repeat with e in evs
+                if (allday event of e) is false then
+                    return "BUSY"
+                end if
+            end repeat
+        end try
+    end repeat
+end tell
+return "FREE"
+"#;
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match stdout.trim() {
+        "BUSY" => Some(true),
+        "FREE" => Some(false),
+        _ => None,
+    }
 }

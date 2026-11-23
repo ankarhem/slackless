@@ -101,6 +101,7 @@ pub mod method {
     pub const CONVERSATIONS_CLOSE: &str = "conversations.close";
     pub const CONVERSATIONS_CONVERT_TO_PRIVATE: &str = "conversations.convertToPrivate";
     pub const CONVERSATIONS_CREATE: &str = "conversations.create";
+    pub const ADMIN_CONVERSATIONS_DELETE: &str = "admin.conversations.delete";
     pub const CONVERSATIONS_GENERIC_INFO: &str = "conversations.genericInfo";
     pub const CONVERSATIONS_HISTORY: &str = "conversations.history";
     pub const CONVERSATIONS_HISTORY_CHANGES: &str = "conversations.historyChanges";

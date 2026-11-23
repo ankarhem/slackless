@@ -52,6 +52,8 @@ pub struct ProfilePanel {
     self_state: SelfState,
     /// Live-hydrated pronouns & custom fields from `users.profile.get` + `team.profile.get`.
     loaded_profiles: HashMap<UserId, LoadedProfile>,
+    /// Preview own profile as teammates see it (`F-SHELL-006`).
+    preview_as_other: bool,
 }
 
 impl EventEmitter<ProfileEvent> for ProfilePanel {}
@@ -64,6 +66,7 @@ impl ProfilePanel {
             back: false,
             self_state: SelfState::default(),
             loaded_profiles: HashMap::new(),
+            preview_as_other: false,
         })
     }
 
@@ -99,6 +102,7 @@ impl ProfilePanel {
     pub fn open(&mut self, user: UserId, back: bool, cx: &mut Context<Self>) {
         self.user = Some(user);
         self.back = back;
+        self.preview_as_other = false;
         cx.notify();
     }
 
@@ -172,6 +176,11 @@ impl Render for ProfilePanel {
             theme.success,
         );
 
+        let is_own_profile = self
+            .user
+            .as_ref()
+            .is_some_and(|id| *id == self.fixtures.self_user);
+        let previewing = is_own_profile && self.preview_as_other;
         let header = h_flex()
             .h(px(46.))
             .flex_none()
@@ -205,6 +214,34 @@ impl Render for ProfilePanel {
                     .font_weight(FontWeight::BOLD)
                     .child("Profile"),
             )
+            .when(is_own_profile, |header| {
+                header.child(
+                    h_flex()
+                        .id("profile-view-as")
+                        .items_center()
+                        .gap_1()
+                        .mr_1()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(border)
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(if previewing { link } else { muted })
+                        .hover(|el| el.bg(hover))
+                        .child(Icon::new(IconName::Eye).size(px(12.)))
+                        .child(if previewing {
+                            "Exit preview"
+                        } else {
+                            "View as"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.preview_as_other = !this.preview_as_other;
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .id("profile-close")
@@ -327,9 +364,10 @@ impl Render for ProfilePanel {
         });
 
         let target = user.id.clone();
+        let viewing_self = is_self && !self.preview_as_other;
         let actions = h_flex()
             .gap_2()
-            .when(is_self, |row| {
+            .when(viewing_self, |row| {
                 row.child(
                     action(
                         "profile-status",
@@ -352,7 +390,7 @@ impl Render for ProfilePanel {
                 )
             })
             // A deactivated person cannot be messaged.
-            .when(!is_self && !user.deleted, |row| {
+            .when(!viewing_self && !user.deleted, |row| {
                 row.child(
                     action(
                         "profile-message",
@@ -420,6 +458,23 @@ impl Render for ProfilePanel {
             .overflow_y_scroll()
             .p_4()
             .gap_3()
+            .when(previewing, |col| {
+                col.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(link.opacity(0.4))
+                        .bg(link.opacity(0.08))
+                        .text_xs()
+                        .text_color(link)
+                        .child(Icon::new(IconName::Eye).size(px(13.)))
+                        .child("Previewing how teammates see your profile"),
+                )
+            })
             .child(h_flex().justify_center().child(photo))
             .child(
                 v_flex()

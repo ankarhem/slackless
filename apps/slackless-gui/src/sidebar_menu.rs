@@ -71,6 +71,7 @@ pub(crate) fn workspace_menu(
     active_only: bool,
     on_active_only: impl Fn(&mut Window, &mut App) + 'static,
     on_create_section: impl Fn(&mut Window, &mut App) + 'static,
+    on_cleanup_channels: impl Fn(&mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<Div> {
     let (border, muted, popover) = (
@@ -112,6 +113,13 @@ pub(crate) fn workspace_menu(
             "Create a channel section",
             false,
             on_create_section,
+            cx,
+        ))
+        .child(menu_row(
+            "menu-cleanup-channels",
+            "Clean up inactive channels\u{2026}",
+            false,
+            on_cleanup_channels,
             cx,
         ))
 }

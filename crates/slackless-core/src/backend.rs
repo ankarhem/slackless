@@ -490,6 +490,10 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
     }
+    /// Permanently delete a channel (`admin.conversations.delete`, `F-CORE-053`).
+    fn delete_channel(&self, _channel: ChannelId) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Invite users to a channel (`conversations.invite`).
     fn invite_to_channel(
         &self,
@@ -1425,6 +1429,10 @@ impl Backend for SlackApi {
 
     async fn unarchive_channel(&self, channel: ChannelId) -> api::Result<()> {
         SlackApi::conversations_unarchive(self, &channel).await
+    }
+
+    async fn delete_channel(&self, channel: ChannelId) -> api::Result<()> {
+        SlackApi::admin_conversations_delete(self, &channel).await
     }
 
     async fn invite_to_channel(

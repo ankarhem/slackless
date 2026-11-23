@@ -1741,6 +1741,13 @@ impl App {
         // `Event::ConversationInfo` lands.
         let stored = self.member_ids(channel, &conversation).to_vec();
         let loading = stored.is_empty() && self.bridge.store().is_some();
+        let following = self
+            .preferences
+            .read(cx)
+            .settings()
+            .follow_all_threads_channels
+            .iter()
+            .any(|id| id == channel.as_str());
         self.details.update(cx, |details, cx| {
             details.open(
                 self.fixtures.clone(),
@@ -1749,7 +1756,8 @@ impl App {
                 loading,
                 tab,
                 cx,
-            )
+            );
+            details.set_follow_all_threads(following, cx);
         });
         self.bridge.send(Command::FetchChannelManagers {
             channel: channel.clone(),
@@ -1890,6 +1898,91 @@ impl App {
                 self.bridge.send(Command::UnarchiveChannel(channel.clone()));
                 actions::notify("Channel unarchived", self.label(channel), window, cx);
             }
+            ChannelDetailsEvent::ToggleFollowThreads(channel) => {
+                let id = channel.as_str().to_owned();
+                let mut enabled = false;
+                self.preferences.update(cx, |prefs, cx| {
+                    let mut next = prefs.settings().clone();
+                    if let Some(pos) = next
+                        .follow_all_threads_channels
+                        .iter()
+                        .position(|c| c == &id)
+                    {
+                        next.follow_all_threads_channels.remove(pos);
+                        enabled = false;
+                    } else {
+                        next.follow_all_threads_channels.push(id.clone());
+                        enabled = true;
+                    }
+                    prefs.load_settings(next, window, cx);
+                });
+                self.apply_preferences(window, cx);
+                actions::notify(
+                    if enabled {
+                        "Following all new threads"
+                    } else {
+                        "Stopped following all threads"
+                    },
+                    self.label(channel),
+                    window,
+                    cx,
+                );
+            }
+            ChannelDetailsEvent::Delete(channel) => {
+                window.close_dialog(cx);
+                let this = cx.weak_entity();
+                let ch = channel.clone();
+                let label = self.label(&ch);
+                window.open_dialog(cx, move |dialog, _, cx| {
+                    let muted = cx.theme().muted_foreground;
+                    let (this, ch) = (this.clone(), ch.clone());
+                    dialog
+                        .title(format!("Delete {label}?"))
+                        .w(px(420.))
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .p_4()
+                                .child(div().text_sm().text_color(muted).child(
+                                    "Deleting permanently removes this channel and its message history for everyone in the workspace. Requires workspace admin permissions.",
+                                ))
+                                .child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("delete-ch-cancel")
+                                                .outline()
+                                                .with_size(Size::Small)
+                                                .label("Cancel")
+                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                        )
+                                        .child(
+                                            Button::new("delete-ch-confirm")
+                                                .danger()
+                                                .with_size(Size::Small)
+                                                .label("Delete permanently")
+                                                .on_click(move |_, window, cx| {
+                                                    window.close_dialog(cx);
+                                                    let _ = this.update(cx, |app, cx| {
+                                                        if !app.fixtures.sample {
+                                                            app.bridge.send(
+                                                                Command::DeleteChannel(ch.clone()),
+                                                            );
+                                                        }
+                                                        actions::notify(
+                                                            "Delete requested",
+                                                            app.label(&ch),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                });
+            }
             ChannelDetailsEvent::ConvertToPrivate(channel) => {
                 window.close_dialog(cx);
                 let this = cx.weak_entity();
@@ -1975,6 +2068,212 @@ impl App {
                 self.open_profile(user.clone(), cx);
             }
         }
+    }
+
+    /// "Clean up inactive channels" bulk-leave assistant (`F-CORE-023`, `F-SHELL-070`): lists
+    /// joined non-general channels ordered by inactivity so users can leave stale channels at once.
+    pub(super) fn open_inactive_channels_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = crate::messages::now_secs();
+        let mut rows: Vec<(ChannelId, String, bool, Option<i64>)> = self
+            .fixtures
+            .channels
+            .iter()
+            .filter(|c| !c.is_general && !c.is_archived && !c.is_im && !c.is_mpim && c.is_member)
+            .map(|c| {
+                let latest_ts = self
+                    .fixtures
+                    .latest
+                    .get(&c.id)
+                    .and_then(|m| m.ts.secs())
+                    .or_else(|| {
+                        c.updated
+                            .map(|u| if u > 10_000_000_000 { u / 1000 } else { u })
+                    });
+                let age_days = latest_ts.map(|ts| ((now - ts).max(0)) / 86_400);
+                (
+                    c.id.clone(),
+                    self.fixtures.conversation_label(c),
+                    c.is_private,
+                    age_days,
+                )
+            })
+            .collect();
+        // Sort oldest / most inactive first (channels with no recent history at the top).
+        rows.sort_by(|a, b| match (a.3, b.3) {
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(da), Some(db)) => db.cmp(&da),
+            (None, None) => a.1.cmp(&b.1),
+        });
+        // Pre-select channels quiet for 30+ days so cleanup takes one click.
+        let initial: HashSet<ChannelId> = rows
+            .iter()
+            .filter(|(_, _, _, days)| days.is_none_or(|d| d >= 30))
+            .take(10)
+            .map(|(id, _, _, _)| id.clone())
+            .collect();
+        let selected = cx.new(|_| initial);
+        let this = cx.weak_entity();
+        let rows = Arc::new(rows);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (border, muted, hover, link) = (
+                cx.theme().border,
+                cx.theme().muted_foreground,
+                cx.theme().accent,
+                cx.theme().link,
+            );
+            let sel_count = selected.read(cx).len();
+            let sel_for_leave = selected.clone();
+            let this_leave = this.clone();
+            let mut list = v_flex()
+                .id("cleanup-channels-list")
+                .max_h(px(340.))
+                .overflow_y_scroll()
+                .gap_1();
+            if rows.is_empty() {
+                list = list.child(
+                    div()
+                        .py_6()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("You have no joined channels eligible for cleanup."),
+                );
+            } else {
+                for (ix, (ch_id, label, is_private, age_days)) in rows.iter().take(80).enumerate() {
+                    let checked = selected.read(cx).contains(ch_id);
+                    let sel_row = selected.clone();
+                    let ch_toggle = ch_id.clone();
+                    let age_text = match age_days {
+                        None => "No recent activity".to_owned(),
+                        Some(0) => "Active today".to_owned(),
+                        Some(1) => "Quiet 1 day".to_owned(),
+                        Some(d) => format!("Quiet {d} days"),
+                    };
+                    let icon = if *is_private {
+                        IconName::Lock
+                    } else {
+                        IconName::Hash
+                    };
+                    list = list.child(
+                        h_flex()
+                            .id(("cleanup-ch-row", ix))
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_2p5()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if checked { link.opacity(0.5) } else { border })
+                            .cursor_pointer()
+                            .hover(move |el| el.bg(hover))
+                            .on_click(move |_, window, cx| {
+                                sel_row.update(cx, |set, cx| {
+                                    if !set.remove(&ch_toggle) {
+                                        set.insert(ch_toggle.clone());
+                                    }
+                                    cx.notify();
+                                });
+                                window.refresh();
+                            })
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .child(
+                                        Icon::new(if checked {
+                                            IconName::Check
+                                        } else {
+                                            IconName::Circle
+                                        })
+                                        .size(px(14.))
+                                        .text_color(if checked { link } else { muted }),
+                                    )
+                                    .child(Icon::new(icon).size(px(13.)).text_color(muted))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .truncate()
+                                            .child(label.clone()),
+                                    ),
+                            )
+                            .child(div().text_xs().text_color(muted).child(age_text)),
+                    );
+                }
+            }
+            dialog
+                .title("Clean up inactive channels")
+                .w(px(500.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .p_4()
+                        .child(div().text_xs().text_color(muted).child(
+                            "Select quiet channels to leave in bulk. Channels with 30+ days of inactivity are pre-selected.",
+                        ))
+                        .child(list)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(format!("{sel_count} selected")),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("cleanup-cancel")
+                                                .outline()
+                                                .with_size(Size::Small)
+                                                .label("Cancel")
+                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                        )
+                                        .child(
+                                            Button::new("cleanup-leave")
+                                                .danger()
+                                                .with_size(Size::Small)
+                                                .disabled(sel_count == 0)
+                                                .label(format!("Leave selected ({sel_count})"))
+                                                .on_click(move |_, window, cx| {
+                                                    let targets: Vec<ChannelId> = sel_for_leave
+                                                        .read(cx)
+                                                        .iter()
+                                                        .cloned()
+                                                        .collect();
+                                                    window.close_dialog(cx);
+                                                    let _ = this_leave.update(cx, |app, cx| {
+                                                        let count = targets.len();
+                                                        for ch in targets {
+                                                            app.leave(ch, window, cx);
+                                                        }
+                                                        if count > 0 {
+                                                            actions::notify(
+                                                                "Left inactive channels",
+                                                                format!(
+                                                                    "Left {count} channel{}",
+                                                                    if count == 1 { "" } else { "s" }
+                                                                ),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        ),
+                )
+        });
     }
 
     /// Confirm permanent deletion of a user-owned file/clip (`files.delete`, `F-CORE-130`).

@@ -261,6 +261,8 @@ pub enum Command {
     /// Unarchive `channel` (`conversations.unarchive`), update the stored record and announce
     /// [`Event::Conversations`].
     UnarchiveChannel(ChannelId),
+    /// Permanently delete `channel` (`admin.conversations.delete`, `F-CORE-053`).
+    DeleteChannel(ChannelId),
     /// Convert a public channel or group DM to a private channel (`conversations.convertToPrivate`,
     /// `F-CORE-049`, `F-CORE-072`).
     ConvertChannelToPrivate(ChannelId),

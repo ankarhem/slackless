@@ -50,6 +50,10 @@ pub enum ChannelDetailsEvent {
     Archive(ChannelId),
     /// Unarchive an archived channel (`conversations.unarchive`).
     Unarchive(ChannelId),
+    /// Permanently delete a channel (`admin.conversations.delete`, `F-CORE-053`).
+    Delete(ChannelId),
+    /// Toggle channel-wide thread auto-following (`F-CORE-111`).
+    ToggleFollowThreads(ChannelId),
     /// Convert a public channel or group DM into a private channel (`conversations.convertToPrivate`).
     ConvertToPrivate(ChannelId),
     /// Open the "Add people" picker for this channel or DM.
@@ -149,6 +153,8 @@ pub struct ChannelDetails {
     local_name: Option<String>,
     local_topic: Option<String>,
     local_purpose: Option<String>,
+    /// Whether the user automatically follows all new threads in this channel (`F-CORE-111`).
+    follow_all_threads: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -184,6 +190,7 @@ impl ChannelDetails {
                 local_name: None,
                 local_topic: None,
                 local_purpose: None,
+                follow_all_threads: false,
                 _subscriptions: subscriptions,
             }
         })
@@ -218,6 +225,12 @@ impl ChannelDetails {
         self.local_name = None;
         self.local_topic = None;
         self.local_purpose = None;
+        cx.notify();
+    }
+
+    /// Update the channel-wide thread following toggle state (`F-CORE-111`).
+    pub fn set_follow_all_threads(&mut self, follow: bool, cx: &mut Context<Self>) {
+        self.follow_all_threads = follow;
         cx.notify();
     }
 
@@ -920,45 +933,118 @@ impl ChannelDetails {
             );
         }
 
-        // Archive / Unarchive channel (on non-general channels).
-        if can_manage {
-            let archived = conversation.is_archived;
-            let arch_channel = self.channel.clone();
-            let danger = crate::theme::danger_text(cx);
+        // Channel-wide thread following (`F-CORE-111`).
+        if !conversation.is_im {
+            let follow_ch = self.channel.clone();
+            let following = self.follow_all_threads;
             cards = cards.child(
                 h_flex()
-                    .id("details-archive")
+                    .id("details-follow-threads")
                     .flex_none()
                     .items_center()
+                    .justify_between()
                     .gap_2()
                     .px_3()
                     .py_2()
                     .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().border)
                     .cursor_pointer()
                     .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if archived { link_color } else { danger })
-                    .hover(move |row| {
-                        row.bg(if archived {
-                            accent_color
-                        } else {
-                            danger.alpha(0.12)
-                        })
-                    })
-                    .child(Icon::new(IconName::Archive).size(px(16.)))
-                    .child(if archived {
-                        "Unarchive channel"
-                    } else {
-                        "Archive channel"
-                    })
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        if archived {
-                            cx.emit(ChannelDetailsEvent::Unarchive(arch_channel.clone()));
-                        } else {
-                            cx.emit(ChannelDetailsEvent::Archive(arch_channel.clone()));
-                        }
+                    .hover(move |row| row.bg(accent_color))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::Bell).size(px(15.)).text_color(
+                                if following {
+                                    link_color
+                                } else {
+                                    muted_foreground
+                                },
+                            ))
+                            .child("Follow all new threads in this channel"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if following {
+                                link_color
+                            } else {
+                                muted_foreground
+                            })
+                            .child(if following { "On" } else { "Off" }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.follow_all_threads = !this.follow_all_threads;
+                        cx.emit(ChannelDetailsEvent::ToggleFollowThreads(follow_ch.clone()));
+                        cx.notify();
                     })),
             );
+        }
+
+        // Archive / Unarchive & Delete channel (on non-general channels).
+        if can_manage {
+            let archived = conversation.is_archived;
+            let arch_channel = self.channel.clone();
+            let del_channel = self.channel.clone();
+            let danger = crate::theme::danger_text(cx);
+            cards = cards
+                .child(
+                    h_flex()
+                        .id("details-archive")
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if archived { link_color } else { danger })
+                        .hover(move |row| {
+                            row.bg(if archived {
+                                accent_color
+                            } else {
+                                danger.alpha(0.12)
+                            })
+                        })
+                        .child(Icon::new(IconName::Archive).size(px(16.)))
+                        .child(if archived {
+                            "Unarchive channel"
+                        } else {
+                            "Archive channel"
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            if archived {
+                                cx.emit(ChannelDetailsEvent::Unarchive(arch_channel.clone()));
+                            } else {
+                                cx.emit(ChannelDetailsEvent::Archive(arch_channel.clone()));
+                            }
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .id("details-delete")
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(danger)
+                        .hover(move |row| row.bg(danger.alpha(0.12)))
+                        .child(Icon::new(IconName::Trash).size(px(16.)))
+                        .child("Delete channel")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ChannelDetailsEvent::Delete(del_channel.clone()));
+                        })),
+                );
         }
 
         // Organizations, on a Slack Connect channel: one row per organization (`rebuild`
