@@ -123,6 +123,7 @@ pub fn open_popout(
     let options = popout_window_options(&title, display_id, slot, cx);
     let _ = open_window(options, cx, move |window, cx| {
         window.set_window_title(&format!("{title} — slackless"));
+        window.activate_window();
         cx.new(|cx| {
             PopoutWindow::new(
                 kind, title, fixtures, store, team, send, later_sync, window, cx,

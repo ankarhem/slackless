@@ -2085,6 +2085,7 @@ pub fn open_preferences_window(
     };
     gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("Preferences — slackless");
+        window.activate_window();
         cx.new(|_| PreferencesWindow { preferences })
     })
     .ok()

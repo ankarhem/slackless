@@ -543,7 +543,7 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                                 )
                                 .child(col.name),
                         )
-                        .child(div().text_sm().child(cell(field, cx))),
+                        .child(h_flex().items_center().text_sm().child(cell(field, cx))),
                 );
             }
             panel
@@ -1140,7 +1140,7 @@ fn render_live_list(
                                 )
                                 .child(col.name.clone()),
                         )
-                        .child(div().text_sm().child(live_cell(
+                        .child(h_flex().items_center().text_sm().child(live_cell(
                             row_cell(rec, col),
                             col,
                             fixtures,
