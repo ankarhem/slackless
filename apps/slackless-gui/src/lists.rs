@@ -6,7 +6,7 @@
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
@@ -472,6 +472,20 @@ fn render_live_list(
                     .min_w_0()
                     .child(Textarea::new(input).appearance(false).bordered(false)),
             )
+            .when(!query.trim().is_empty(), |row| {
+                let clear_input = input.clone();
+                row.child(
+                    Button::new("list-find-clear")
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::X)
+                        .on_click(move |_, window, cx| {
+                            clear_input.update(cx, |state, cx| {
+                                state.set_value(String::new(), window, cx);
+                            });
+                        }),
+                )
+            })
     });
 
     div().id("list-scroll").size_full().overflow_scroll().child(

@@ -693,14 +693,7 @@ impl ChannelDetails {
             theme.accent,
         );
         let conversation = self.conversation().cloned().unwrap_or_default();
-        let mut cards = v_flex()
-            .id("details-about")
-            .flex_1()
-            .min_h_0()
-            .px(px(PAD))
-            .py_4()
-            .gap_2()
-            .overflow_y_scroll();
+        let mut cards = v_flex().w_full().px(px(PAD)).py_4().gap_2();
 
         // Channel name: editable on channels other than #general, with Slack's privacy note on private channels.
         let is_channel = !conversation.is_im && !conversation.is_mpim;
@@ -710,7 +703,6 @@ impl ChannelDetails {
             .clone()
             .or_else(|| conversation.name.clone())
             .unwrap_or_default();
-        let name = format!("# {raw_name}");
         let editing_name = self
             .editing
             .as_ref()
@@ -762,10 +754,20 @@ impl ChannelDetails {
                 );
             }
             c.child(
-                div()
+                h_flex()
+                    .items_center()
+                    .gap_1()
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(name),
+                    .child(
+                        Icon::new(if conversation.is_private {
+                            IconName::Lock
+                        } else {
+                            IconName::Hash
+                        })
+                        .size(px(14.)),
+                    )
+                    .child(raw_name),
             )
         };
         cards = cards.child(name_card);
@@ -949,7 +951,12 @@ impl ChannelDetails {
             }
             cards = cards.child(section);
         }
-        cards
+        div()
+            .id("details-about")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(cards)
     }
 
     /// One of the editable cards (topic, description): the value, or Slack's "Add a …"

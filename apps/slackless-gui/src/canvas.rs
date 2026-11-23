@@ -6,7 +6,7 @@
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
@@ -179,9 +179,9 @@ fn fixture() -> CanvasDoc {
 pub type OpenBrowserFn = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// The Canvas tab body in fixture mode: scrollable, centered, read-only document.
-pub fn canvas_view(cx: &App) -> Stateful<Div> {
+pub fn canvas_view(query: &str, search: Option<&Entity<TextareaState>>, cx: &App) -> Stateful<Div> {
     let canvas = fixture();
-    render_canvas_doc(&canvas, "", None, None, cx)
+    render_canvas_doc(&canvas, query, search, None, cx)
 }
 
 /// Native live Canvas reader (`F-COLLAB-125`, `F-SHELL-266`): shows a loading indicator,
@@ -338,6 +338,20 @@ fn render_canvas_doc(
                     .text_color(theme.muted_foreground)
                     .child(note)
             }))
+            .when(!needle.is_empty(), |row| {
+                let clear_input = input.clone();
+                row.child(
+                    Button::new("canvas-find-clear")
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::X)
+                        .on_click(move |_, window, cx| {
+                            clear_input.update(cx, |state, cx| {
+                                state.set_value(String::new(), window, cx);
+                            });
+                        }),
+                )
+            })
     });
 
     let headings = canvas.outline_headings();

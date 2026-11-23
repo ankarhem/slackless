@@ -2088,7 +2088,7 @@ impl Render for App {
                 }
                 ConversationTab::Canvas => {
                     let view = if self.fixtures.sample {
-                        canvas_view(cx)
+                        canvas_view(&self.canvas_query, Some(&self.canvas_search), cx)
                     } else {
                         let file_id = self.ws.active_canvas.clone().or_else(|| {
                             conversation

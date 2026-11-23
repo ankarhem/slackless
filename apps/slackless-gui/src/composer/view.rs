@@ -219,7 +219,7 @@ impl Render for Composer {
                 weak.update(cx, |composer, cx| composer.on_paste(item, window, cx))
                     .unwrap_or(false)
             });
-        // Slack's private-channel prompt, "Message 🔒name", over the empty draft exactly where
+        // Slack's private-channel prompt, "Message 🔒 name", over the empty draft exactly where
         // the textarea's own (plain-text) placeholder would sit: past the frame's padding and
         // the editor's own (the kit's medium input padding), in the editor's text size and
         // line height.
@@ -242,7 +242,7 @@ impl Render for Composer {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_px()
+                            .gap(px(3.))
                             .child(Icon::new(IconName::Lock).size(px(12.)).text_color(muted))
                             .child(name),
                     )
