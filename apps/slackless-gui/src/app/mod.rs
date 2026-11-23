@@ -440,6 +440,8 @@ pub(super) struct WorkspaceState {
     /// Live mode: last known presence per DM peer (`users.getPresence`, `presence_change`);
     /// injected into every live fixtures snapshot so sidebar rows and headers render dots.
     pub(super) presence: fixtures::PresenceMap,
+    /// Live mode: resolved bot profiles (`bots.info`) shared across every snapshot.
+    pub(super) bots: fixtures::BotProfileMap,
     /// Live mode: DM peers whose notifications are paused right now (`dnd.info`).
     pub(super) peer_dnd_paused: HashMap<UserId, bool>,
     /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.

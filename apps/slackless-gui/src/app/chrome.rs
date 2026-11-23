@@ -366,13 +366,16 @@ impl App {
             .id("status-button")
             .flex_none()
             .items_center()
-            .gap_0p5()
-            .px_1()
-            .h(px(28.))
-            .rounded_sm()
+            .gap_1()
+            .px_1p5()
+            .h(px(26.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(chrome_fg.opacity(0.14))
+            .bg(chrome_fg.opacity(0.06))
             .cursor_pointer()
             .hover(move |el| el.bg(chrome_hover))
-            .child(div().text_base().child(status_glyph))
+            .child(div().text_sm().child(status_glyph))
             .child(
                 Icon::new(IconName::ChevronDown)
                     .text_color(chrome_muted)
@@ -380,11 +383,23 @@ impl App {
             )
             .on_click(cx.listener(|this, _, window, cx| this.open_status_picker(window, cx)));
 
-        // Slack's 40px top bar: the history arrows hug the left of a search pill centred in
-        // the window (the right padding mirrors the traffic lights' inset on the left), with
-        // status and help pinned to the right edge.
-        // Transparent over the root's chrome (and its corner glow), like the rail, and without
-        // the kit's bottom rule: Slack's chrome runs unbroken into the workspace column.
+        let rail_toggle = chrome_icon(
+            "toggle-workspace-rail",
+            IconName::PanelLeft,
+            chrome_muted,
+            chrome_hover,
+        )
+        .tooltip(|window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(
+                "Toggle workspace switcher (\u{2318}\u{21E7}S)",
+            )
+            .build(window, cx)
+        })
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_workspace_rail(window, cx)));
+
+        // Slack's 40px top bar: workspace-rail toggle next to the traffic lights, the history
+        // arrows hugging the left of a search pill centred in the window, with status pill and
+        // help pinned to the right edge.
         TitleBar::new()
             .h(px(40.))
             .bg(gpui_kit::gpui::transparent_black())
@@ -396,6 +411,15 @@ impl App {
                     .h_full()
                     .items_center()
                     .pr(px(80.))
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .left_1()
+                            .top_0()
+                            .h_full()
+                            .items_center()
+                            .child(rail_toggle),
+                    )
                     .child(h_flex().flex_1().min_w_0().justify_end().pr_2().child(nav))
                     .child(search_pill)
                     .child(div().flex_1().min_w_0())

@@ -23,6 +23,30 @@ impl Sidebar {
     /// Slack's workspace switcher: the column left of the tab rail with one tile per signed-in
     /// workspace, the active one ringed.
     pub(crate) fn workspace_switcher(&self, cx: &mut Context<Self>) -> Div {
+        let fg = cx.theme().sidebar_foreground;
+        let dim = fg.opacity(0.65);
+        let hover = fg.opacity(0.10);
+        let add_btn = div()
+            .id("workspace-add")
+            .size(px(36.))
+            .rounded_lg()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(move |el| el.bg(hover))
+            .tooltip(|window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new("Add a workspace").build(window, cx)
+            })
+            .on_click(|_, window, cx| {
+                crate::actions::notify(
+                    "Add a workspace",
+                    "Run `slackless-gui --sign-in` to connect another workspace.",
+                    window,
+                    cx,
+                );
+            })
+            .child(Icon::new(IconName::Plus).text_color(dim).size(px(18.)));
         v_flex()
             .flex_none()
             .h_full()
@@ -38,6 +62,7 @@ impl Sidebar {
                     .map(|(index, team)| self.workspace_tile(index, team, cx))
                     .collect::<Vec<_>>(),
             )
+            .child(add_btn)
     }
 
     /// Slack's tab rail, the left edge of the workspace panel the root rounds: the nav
@@ -542,7 +567,7 @@ impl Sidebar {
     /// DM list's "Find a DM…". Slack's field is a slim 28px box led by its text-search glyph.
     pub(super) fn find_field(&self, field: &Entity<TextareaState>, cx: &Context<Self>) -> Div {
         let fg = cx.theme().sidebar_foreground;
-        let border = cx.theme().sidebar_border;
+        let border = fg.opacity(0.22);
         let dim = fg.opacity(0.65);
         let empty = field.read(cx).value().is_empty();
         let placeholder = if *field == self.dm_find {

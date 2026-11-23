@@ -44,7 +44,7 @@ const MATCHES_SHOWN: usize = 12;
 const HISTORY_SHOWN: usize = 10;
 /// Searches kept (newest first, deduped) behind the shown slice.
 /// The field's resting placeholder; the open panel ghosts the current row over it.
-pub(crate) const SEARCH_PLACEHOLDER: &str = "Search";
+pub(crate) const SEARCH_PLACEHOLDER: &str = "Describe what you are looking for";
 const HISTORY_KEEP: usize = 20;
 
 pub enum SearchMenuEvent {

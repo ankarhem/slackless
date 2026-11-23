@@ -60,6 +60,9 @@ pub enum Command {
     /// (`team.info`, each once per session), stored and announced with
     /// [`Event::SidebarChanged`].
     ResolveUsers(Vec<UserId>),
+    /// Look up bot profiles (`bots.info`) for app/bot messages carrying only `bot_id`, so they
+    /// render with the bot's display name and icon instead of raw `B0...` IDs.
+    ResolveBots(Vec<BotId>),
     /// The user chose "Leave channel": leave it on Slack, then store it as no longer joined
     /// and announce it with [`Event::Conversations`].
     LeaveConversation(ChannelId),
@@ -892,6 +895,11 @@ pub enum Event {
         list_id: String,
         record_id: String,
         messages: Vec<Message>,
+    },
+    /// A bot profile loaded via `bots.info` for messages that only carried `bot_id`.
+    BotProfileLoaded {
+        bot_id: BotId,
+        profile: types::BotProfile,
     },
     /// An app DM's Home tab finished loading (`conversations.info` `return_app_home=true`, `F-COLLAB-480`).
     AppHomeLoaded {

@@ -1930,6 +1930,13 @@ fn author_name_with(message: &Message, fixtures: &Fixtures, display_only: bool) 
             let name = &message.bot_profile.as_ref()?.name;
             (!name.is_empty()).then(|| name.clone())
         })
+        .or_else(|| {
+            let profile = message
+                .bot_id
+                .as_ref()
+                .and_then(|id| fixtures.bot_profile(id))?;
+            (!profile.name.is_empty()).then_some(profile.name)
+        })
         .unwrap_or_else(|| author_key(message))
 }
 

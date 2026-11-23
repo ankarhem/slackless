@@ -432,6 +432,16 @@ impl App {
                     }
                 }
             }
+            Event::BotProfileLoaded { bot_id, profile } => {
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    parked
+                        .state
+                        .bots
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(bot_id.clone(), profile.clone());
+                }
+            }
             Event::Presence { users, presence } => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     parked
@@ -801,6 +811,14 @@ impl App {
                 self.message_posted(channel, message, window, cx)
             }
             Event::Error(error) => eprintln!("slackless: {error}"),
+            Event::BotProfileLoaded { bot_id, profile } => {
+                self.ws
+                    .bots
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(bot_id.clone(), profile.clone());
+                window.refresh();
+            }
             Event::Presence { users, presence } => {
                 // Every snapshot shares this map: update it in place and repaint, with no
                 // store reload however often presence changes.
@@ -1413,6 +1431,7 @@ impl App {
                 }
                 // Presence, usergroups, and app_commands are transient (never stored), so they ride along.
                 snapshot.presence = app.ws.presence.clone();
+                snapshot.bots = app.ws.bots.clone();
                 snapshot.usergroups = app.ws.usergroups.clone();
                 snapshot.app_commands = app.ws.app_commands.clone();
                 app.apply_snapshot(Arc::new(snapshot), window, cx);
@@ -1804,6 +1823,17 @@ impl App {
                 .cloned()
                 .chain(mentions)
         }));
+        let bots: Vec<slackless_core::types::BotId> = messages
+            .iter()
+            .filter(|m| m.bot_profile.is_none())
+            .filter_map(|m| m.bot_id.clone())
+            .filter(|id| self.fixtures.bot_profile(id).is_none())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !bots.is_empty() {
+            self.bridge.send(Command::ResolveBots(bots));
+        }
     }
 
     /// Someone started or kept typing: show them until [`TYPING_TTL`] after their last

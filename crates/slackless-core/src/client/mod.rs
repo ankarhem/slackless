@@ -341,6 +341,8 @@ pub(crate) struct Core<B: Backend> {
     teams_asked: Arc<Mutex<HashSet<TeamId>>>,
     /// Bot profiles read through `bots.info` this session (see `attach_bot_profile`).
     bots: HashMap<BotId, BotProfile>,
+    /// Bot ids already requested via `bots.info` this session (found or not): each is asked once.
+    bots_asked: HashSet<BotId>,
     /// Signed-in user id learned from `client.userBoot` (used to mirror self profile/presence).
     self_user_id: Arc<Mutex<Option<UserId>>>,
     /// Cloud-synced draft ids per channel (`drafts.list` / `drafts.create` / `drafts.update` / `drafts.delete`).
@@ -401,6 +403,7 @@ impl<B: Backend> Core<B> {
             users_asked: HashSet::new(),
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
             bots: HashMap::new(),
+            bots_asked: HashSet::new(),
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
@@ -743,6 +746,30 @@ impl<B: Backend> Core<B> {
                 }
             }
             Command::ResolveUsers(ids) => self.resolve_users(ids),
+            Command::ResolveBots(ids) => {
+                for bot in ids {
+                    if let Some(profile) = self.bots.get(&bot).cloned() {
+                        self.events.emit(Event::BotProfileLoaded {
+                            bot_id: bot,
+                            profile,
+                        });
+                        continue;
+                    }
+                    if !self.bots_asked.insert(bot.clone()) {
+                        continue;
+                    }
+                    let backend = self.backend.clone();
+                    let events = self.events.clone();
+                    self.spawn("bots.info", async move {
+                        let profile = backend.bot_info(bot.clone()).await?;
+                        events.emit(Event::BotProfileLoaded {
+                            bot_id: bot,
+                            profile,
+                        });
+                        Ok(())
+                    });
+                }
+            }
             Command::SetNotifyLevel { channel, level } => {
                 self.spawn("users.prefs.setNotifications", async move {
                     for &(name, value) in level.writes() {
@@ -2632,7 +2659,7 @@ impl<B: Backend> Core<B> {
         let Some(bot) = message
             .bot_id
             .clone()
-            .filter(|_| message.is_ephemeral && message.bot_profile.is_none())
+            .filter(|_| message.bot_profile.is_none())
         else {
             return;
         };

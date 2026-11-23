@@ -116,12 +116,11 @@ fn spec_with_id(
     }
 }
 
-/// Slack's default tab set for a conversation that stores no tab configuration.
+/// Slack's default tab set for a conversation that stores no tab configuration:
+/// matches official Slack's clean `Messages | Add canvas | +` header (users can still add
+/// Files & links or other tabs via `+`).
 fn default_tabs() -> Vec<ConversationTabSpec> {
-    vec![ConversationTabSpec {
-        kind: Some(ConversationTabKind::Files),
-        ..Default::default()
-    }]
+    Vec::new()
 }
 
 /// Prepend the `Home` tab to `specs` for app/bot DMs (`F-COLLAB-480`).
@@ -375,11 +374,7 @@ mod tests {
         };
         assert_eq!(
             row(&conversation, false),
-            [
-                "Messages -> Switch(Messages)",
-                "Add canvas -> AddCanvas",
-                "Files & links -> Switch(Files)",
-            ]
+            ["Messages -> Switch(Messages)", "Add canvas -> AddCanvas",]
         );
     }
 

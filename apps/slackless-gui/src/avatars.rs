@@ -96,9 +96,20 @@ pub fn author_avatar(
     {
         return user_chip(fixtures, user, size);
     }
+    let cached_bot = message
+        .bot_profile
+        .is_none()
+        .then(|| {
+            message
+                .bot_id
+                .as_ref()
+                .and_then(|id| fixtures.bot_profile(id))
+        })
+        .flatten();
     let bot_icon = message
         .bot_profile
         .as_ref()
+        .or(cached_bot.as_ref())
         .and_then(|bot| bot.icons.as_ref())
         .and_then(|icons| {
             [&icons.image_72, &icons.image_48, &icons.image_36]

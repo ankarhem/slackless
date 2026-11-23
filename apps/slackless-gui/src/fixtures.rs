@@ -13,10 +13,10 @@ use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
 use slackless_core::store::Store;
 use slackless_core::types::{
-    Attachment, Block, ChannelId, ChannelSection, Conversation, ConversationKind,
-    ConversationProperties, Edited, File, FileId, Message, MessageSubtype, Presence, Profile,
-    Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TeamId, TextStyle,
-    TopicPurpose, Ts, User, UserId, Usergroup, UsergroupId,
+    Attachment, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation,
+    ConversationKind, ConversationProperties, Edited, File, FileId, Message, MessageSubtype,
+    Presence, Profile, Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TeamId,
+    TextStyle, TopicPurpose, Ts, User, UserId, Usergroup, UsergroupId,
     message::AttachmentField,
     rich_text::{
         EmojiElement, LinkElement, ListStyle, RichTextList, RichTextPreformatted, RichTextSection,
@@ -200,6 +200,8 @@ pub fn status_presets_from_prefs(
 /// Live presence per user, shared by every snapshot of a workspace: a `presence_change` lands
 /// in place and repaints, with no store reload.
 pub type PresenceMap = Arc<RwLock<HashMap<UserId, Presence>>>;
+/// Shared bot-profile cache (`bots.info`) updated in place as history resolves bot messages.
+pub type BotProfileMap = Arc<RwLock<HashMap<BotId, BotProfile>>>;
 
 pub struct Fixtures {
     pub workspaces: Vec<Team>,
@@ -231,6 +233,8 @@ pub struct Fixtures {
     pub archived: Vec<Conversation>,
     /// Last known presence per user (`presence_change` / `users.getPresence`).
     pub presence: PresenceMap,
+    /// Resolved bot profiles (`bots.info`) keyed by `BotId`, shared across snapshots.
+    pub bots: BotProfileMap,
     /// Conversations whose notification level is not "All new posts" (the header bell).
     pub notify_levels: HashMap<ChannelId, NotifyLevel>,
     /// The message hover bar's one-click reactions (none when the user turned them off).
@@ -415,6 +419,7 @@ impl Fixtures {
             directory: apply(&self.directory),
             archived: self.archived.clone(),
             presence: self.presence.clone(),
+            bots: self.bots.clone(),
             notify_levels: self.notify_levels.clone(),
             quick_reactions: self.quick_reactions.clone(),
             frequent_emoji: self.frequent_emoji.clone(),
@@ -435,6 +440,15 @@ impl Fixtures {
             conv_index: OnceLock::new(),
             team_index: OnceLock::new(),
         }
+    }
+
+    /// Resolved bot profile for `bot_id` (from `bots.info`), if cached.
+    pub fn bot_profile(&self, id: &BotId) -> Option<BotProfile> {
+        self.bots
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned()
     }
 
     pub fn conversation(&self, id: &ChannelId) -> Option<&Conversation> {
@@ -1400,6 +1414,7 @@ pub fn load() -> Fixtures {
         directory,
         archived: Vec::new(),
         presence: Arc::new(RwLock::new(presence)),
+        bots: BotProfileMap::default(),
         notify_levels: HashMap::from([(ChannelId::from("C0DESIGN"), NotifyLevel::Muted)]),
         quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
             .map(String::from)
@@ -1583,6 +1598,7 @@ pub fn live(
         directory,
         archived,
         presence: PresenceMap::default(),
+        bots: BotProfileMap::default(),
         notify_levels: slackless_core::notify_levels(&prefs),
         quick_reactions: quick_reactions(&prefs),
         frequent_emoji,

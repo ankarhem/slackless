@@ -260,7 +260,7 @@ impl Render for Composer {
             let md_fg = if markup_active {
                 theme.primary
             } else {
-                theme.muted_foreground
+                theme.muted_foreground.opacity(0.32)
             };
             let md_bg = if markup_active {
                 theme.primary.opacity(0.14)
