@@ -4,6 +4,11 @@ use super::*;
 
 impl App {
     pub(super) fn open_later(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Saved, cx);
+        self.show_later(cx);
+    }
+
+    pub(super) fn show_later(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
         self.later_open = true;
@@ -736,11 +741,40 @@ impl App {
         }
     }
 
-    pub(super) fn select(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
-        if channel != self.channel {
-            self.back.push(self.channel.clone());
+    /// The currently visible place for Back/Forward navigation history.
+    pub(super) fn current_place(&self, cx: &gpui::App) -> NavPlace {
+        if self.threads_open {
+            NavPlace::Threads
+        } else if self.unreads_open {
+            NavPlace::Unreads
+        } else if self.huddles_open {
+            NavPlace::Huddles
+        } else if self.drafts_open {
+            NavPlace::Drafts
+        } else if self.later_open {
+            NavPlace::Saved
+        } else if self.directory_open {
+            NavPlace::Directories
+        } else if self.activity_open {
+            NavPlace::Activity
+        } else if self.sidebar.read(cx).active_nav() == NavItem::Files {
+            NavPlace::Files
+        } else {
+            NavPlace::Channel(self.channel.clone())
+        }
+    }
+
+    /// Record the current place before moving to `dest`.
+    pub(super) fn record_nav(&mut self, dest: &NavPlace, cx: &gpui::App) {
+        let cur = self.current_place(cx);
+        if cur != *dest {
+            self.back.push(cur);
             self.forward.clear();
         }
+    }
+
+    pub(super) fn select(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Channel(channel.clone()), cx);
         self.navigate(channel, cx);
     }
 
@@ -748,25 +782,42 @@ impl App {
     /// later). History is the caller's: [`App::select`] records it, back/forward replay it.
     pub(super) fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.ws.chosen = true;
+        self.activity_open = false;
         self.close_full_column_views(cx);
         self.close_hover_card(cx);
         cx.notify();
         self.show_conversation(channel, cx);
     }
 
-    /// Slack's back arrow (Cmd+[): the conversation before this one.
-    pub(super) fn go_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(previous) = self.back.pop() {
-            self.forward.push(self.channel.clone());
-            self.navigate(previous, cx);
+    fn go_to_place(&mut self, place: NavPlace, window: &mut Window, cx: &mut Context<Self>) {
+        match place {
+            NavPlace::Channel(ch) => self.navigate(ch, cx),
+            NavPlace::Threads => self.show_threads(cx),
+            NavPlace::Unreads => self.show_unreads(window, cx),
+            NavPlace::Huddles => self.show_huddles(cx),
+            NavPlace::Drafts => self.show_drafts(cx),
+            NavPlace::Saved => self.show_later(cx),
+            NavPlace::Directories => self.show_directory(cx),
+            NavPlace::Activity => self.show_activity(cx),
+            NavPlace::Files => self.show_files(cx),
         }
     }
 
-    /// Slack's forward arrow (Cmd+]): undo the last back.
-    pub(super) fn go_forward(&mut self, cx: &mut Context<Self>) {
+    /// Slack's back arrow (Cmd+[, mouse Back): the place before this one.
+    pub(super) fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.back.pop() {
+            let cur = self.current_place(cx);
+            self.forward.push(cur);
+            self.go_to_place(previous, window, cx);
+        }
+    }
+
+    /// Slack's forward arrow (Cmd+], mouse Forward): undo the last back.
+    pub(super) fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(next) = self.forward.pop() {
-            self.back.push(self.channel.clone());
-            self.navigate(next, cx);
+            let cur = self.current_place(cx);
+            self.back.push(cur);
+            self.go_to_place(next, window, cx);
         }
     }
 
@@ -1056,8 +1107,10 @@ impl App {
         self.bridge
             .send(Command::LeaveConversation(channel.clone()));
         self.ws.counts.remove(&channel);
-        self.back.retain(|c| *c != channel);
-        self.forward.retain(|c| *c != channel);
+        self.back
+            .retain(|p| *p != NavPlace::Channel(channel.clone()));
+        self.forward
+            .retain(|p| *p != NavPlace::Channel(channel.clone()));
         self.recent.retain(|c| *c != channel);
         if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
             cx.background_executor().spawn(write).detach();
@@ -1068,8 +1121,8 @@ impl App {
             let next = self
                 .back
                 .pop()
-                .unwrap_or_else(|| first_conversation(&self.fixtures));
-            self.navigate(next, cx);
+                .unwrap_or_else(|| NavPlace::Channel(first_conversation(&self.fixtures)));
+            self.go_to_place(next, window, cx);
         }
     }
 
@@ -1269,6 +1322,8 @@ impl App {
         self.threads_open = false;
         self.unreads_open = false;
         self.unreads_fetched.clear();
+        self.back.clear();
+        self.forward.clear();
         self.huddles_open = false;
         self.directory_open = false;
         self.compose_open = false;
@@ -1277,6 +1332,9 @@ impl App {
         self.profile_open = false;
         self.pins_open = false;
         let fixtures = self.fixtures.clone();
+        self.threads.update(cx, |view, cx| {
+            view.clear_for_workspace(fixtures.clone(), cx)
+        });
         self.later.update(cx, |later, cx| {
             later.set_workspace(index, cx);
             if fixtures.sample {
@@ -1325,6 +1383,11 @@ impl App {
     }
 
     pub(super) fn open_drafts(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Drafts, cx);
+        self.show_drafts(cx);
+    }
+
+    pub(super) fn show_drafts(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
         self.drafts_open = true;
@@ -1382,6 +1445,7 @@ impl App {
         self.huddles_open = false;
         self.directory_open = false;
         self.compose_open = false;
+        self.activity_open = false;
         // The Activity and Files pages are sidebar destinations, so leaving the full-column
         // views returns the rail to Home.
         self.sidebar.update(cx, |sidebar, cx| {
@@ -1390,35 +1454,26 @@ impl App {
         });
     }
 
-    /// The Threads view: local cards at once, Slack's own list (`subscriptions.thread.getView`)
-    /// when the fetch answers - and the local ones stay if it never does.
+    /// The Threads view: fixture cards in sample mode, or Slack's own list
+    /// (`subscriptions.thread.getView`) in live mode — keeping any already-fetched remote cards
+    /// on screen while refreshing silently so there is never a flash of stale/empty content.
     pub(super) fn open_threads(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Threads, cx);
+        self.show_threads(cx);
+    }
+
+    pub(super) fn show_threads(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
-        let cards = local_cards(&self.fixtures);
         let fixtures = self.fixtures.clone();
-        self.threads.update(cx, |view, cx| {
-            view.set_fixtures(fixtures, cx);
-            view.show_local(cards, cx);
-        });
-        if let Some(store) = self.bridge.store().cloned() {
-            let team = self.fixtures.workspaces[self.workspace].id.clone();
-            let me = self.fixtures.self_user.clone();
-            cx.spawn(async move |this, cx| {
-                let cards = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let Ok(store) = store.lock() else {
-                            return Vec::new();
-                        };
-                        store_cards(&store, &team, &me)
-                    })
-                    .await;
-                this.update(cx, |app, cx| {
-                    app.threads
-                        .update(cx, |view, cx| view.show_store(cards, cx));
-                })
-            })
-            .detach();
+        if self.fixtures.sample {
+            let cards = local_cards(&self.fixtures);
+            self.threads.update(cx, |view, cx| {
+                view.set_fixtures(fixtures, cx);
+                view.show_local(cards, cx);
+            });
+        } else {
+            self.threads
+                .update(cx, |view, cx| view.begin_remote_load(fixtures, cx));
             self.bridge.send(Command::FetchThreads);
         }
         self.close_full_column_views(cx);
@@ -1429,10 +1484,41 @@ impl App {
         cx.notify();
     }
 
+    /// Offline / error fallback for Threads: derive cards from the local SQLite store only when
+    /// `subscriptions.thread.getView` fails.
+    pub(super) fn load_threads_store_fallback(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.bridge.store().cloned() else {
+            return;
+        };
+        let team = self.fixtures.workspaces[self.workspace].id.clone();
+        let me = self.fixtures.self_user.clone();
+        cx.spawn(async move |this, cx| {
+            let cards = cx
+                .background_executor()
+                .spawn(async move {
+                    let Ok(store) = store.lock() else {
+                        return Vec::new();
+                    };
+                    store_cards(&store, &team, &me)
+                })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.threads
+                    .update(cx, |view, cx| view.show_store(cards, cx));
+            });
+        })
+        .detach();
+    }
+
     /// The All Unreads view (Slack's `p-unreads_view`, Cmd+Shift+A): the sidebar's unread
     /// order as one card per conversation - its rows from the bundled workspace at once
     /// and, in live mode, from the local store off the UI thread.
     pub(super) fn open_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Unreads, cx);
+        self.show_unreads(window, cx);
+    }
+
+    pub(super) fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
         self.unreads_open = true;
@@ -1488,6 +1574,11 @@ impl App {
 
     /// The Huddles page: the bundled sample huddle, or the stored `huddle_thread` trails live.
     pub(super) fn open_huddles(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Huddles, cx);
+        self.show_huddles(cx);
+    }
+
+    pub(super) fn show_huddles(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         let fixtures = self.fixtures.clone();
         self.huddles
@@ -1521,6 +1612,11 @@ impl App {
 
     /// The directory: the workspace's people and channels.
     pub(super) fn open_directory(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Directories, cx);
+        self.show_directory(cx);
+    }
+
+    pub(super) fn show_directory(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         let fixtures = self.fixtures.clone();
         self.directory
@@ -1581,6 +1677,11 @@ impl App {
     /// (`activity.feed`) lands with the next [`Event::ActivityView`]; the fixture workspace
     /// serves its derived rows.
     pub(super) fn open_activity(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Activity, cx);
+        self.show_activity(cx);
+    }
+
+    pub(super) fn show_activity(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
         self.sidebar
@@ -1607,6 +1708,11 @@ impl App {
     /// (`files.list`, answered by [`Event::FilesLoaded`]); the sample workspace derives them
     /// from its messages.
     pub(super) fn open_files(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Files, cx);
+        self.show_files(cx);
+    }
+
+    pub(super) fn show_files(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
         self.sidebar

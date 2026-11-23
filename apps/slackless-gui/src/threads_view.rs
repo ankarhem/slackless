@@ -74,6 +74,8 @@ pub struct ThreadsView {
     cards: Vec<ThreadCard>,
     /// Slack's own list landed; later store derivations must not overwrite it.
     remote: bool,
+    /// True on the very first live open before `subscriptions.thread.getView` has answered.
+    loading: bool,
     /// The card the shared reply composer is docked to (defaults to card 0 when present).
     active: Option<usize>,
     /// Cards whose "Show N more replies" link has been expanded in-place.
@@ -134,6 +136,7 @@ impl ThreadsView {
                 fixtures,
                 cards: Vec::new(),
                 remote: false,
+                loading: false,
                 active: None,
                 expanded: HashSet::new(),
                 composer,
@@ -164,9 +167,10 @@ impl ThreadsView {
     }
 
     /// Show `cards` (the fixture derivation) and drop any earlier remote list; call when the
-    /// view opens.
+    /// view opens in fixture mode.
     pub fn show_local(&mut self, cards: Vec<ThreadCard>, cx: &mut Context<Self>) {
         self.remote = false;
+        self.loading = false;
         self.cards = cards;
         self.expanded.clear();
         self.active = (!self.cards.is_empty()).then_some(0);
@@ -174,11 +178,36 @@ impl ThreadsView {
         cx.notify();
     }
 
-    /// Show `cards` (the store derivation) unless Slack's own list already landed.
+    /// Live mode open: keep already-fetched remote cards on screen while refreshing silently in
+    /// the background (zero flash). Before the first remote response arrives, show a loading
+    /// state rather than flashing an empty view or stale store-derived cards.
+    pub fn begin_remote_load(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        if !self.remote {
+            self.loading = true;
+        }
+        self.sync_also_send(cx);
+        cx.notify();
+    }
+
+    /// Drop cached threads when switching to another workspace.
+    pub fn clear_for_workspace(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        self.remote = false;
+        self.loading = false;
+        self.cards.clear();
+        self.expanded.clear();
+        self.active = None;
+        self.sync_also_send(cx);
+        cx.notify();
+    }
+
+    /// Show `cards` (the store derivation fallback) unless Slack's own list already landed.
     pub fn show_store(&mut self, cards: Vec<ThreadCard>, cx: &mut Context<Self>) {
         if self.remote {
             return;
         }
+        self.loading = false;
         self.cards = cards;
         self.active = (!self.cards.is_empty()).then_some(0);
         self.sync_also_send(cx);
@@ -188,6 +217,7 @@ impl ThreadsView {
     /// Replace the cards with Slack's own followed threads (`subscriptions.thread.getView`).
     pub fn set_remote(&mut self, view: SlackThreads, cx: &mut Context<Self>) {
         self.remote = true;
+        self.loading = false;
         self.cards = remote_cards(view);
         self.active = self
             .active
@@ -342,6 +372,7 @@ impl Render for ThreadsView {
                 cx,
             ));
         }
+        let loading = self.loading;
         let inner = inner.when(cards.is_empty(), |list| {
             list.child(
                 v_flex()
@@ -355,7 +386,11 @@ impl Render for ThreadsView {
                             .text_color(muted)
                             .size(px(28.)),
                     )
-                    .child("No followed threads yet. Reply in one to follow it."),
+                    .child(if loading {
+                        "Loading threads…"
+                    } else {
+                        "No followed threads yet. Reply in one to follow it."
+                    }),
             )
         });
 
@@ -395,5 +430,68 @@ impl Render for ThreadsView {
                     .overflow_y_scroll()
                     .child(inner),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::gpui::{self, TestAppContext};
+    use slackless_core::api::ThreadSubscription;
+
+    #[gpui::test]
+    fn begin_remote_load_keeps_cached_remote_threads_without_flashing_empty(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let fixtures = Arc::new(crate::fixtures::load());
+        let view_cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let cell = view_cell.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = ThreadsView::new(fixtures.clone(), window, cx);
+            *cell.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = view_cell.borrow_mut().take().unwrap();
+
+        cx.update(|_, cx| {
+            // First live open: loading = true, no stale/empty flash.
+            view.update(cx, |v, cx| v.begin_remote_load(fixtures.clone(), cx));
+            assert!(view.read(cx).loading);
+            assert!(view.read(cx).cards.is_empty());
+
+            // Remote response lands.
+            let remote = SlackThreads {
+                threads: vec![ThreadSubscription {
+                    root: Message {
+                        channel: Some(ChannelId::from("C0ENG")),
+                        ts: Ts::from("1760000001.000100"),
+                        text: "hello".into(),
+                        reply_count: Some(1),
+                        ..Default::default()
+                    },
+                    latest_replies: vec![],
+                    unread_replies: vec![],
+                }],
+                has_more: false,
+                total_unread_replies: 0,
+            };
+            view.update(cx, |v, cx| v.set_remote(remote, cx));
+            assert!(!view.read(cx).loading);
+            assert_eq!(view.read(cx).cards.len(), 1);
+
+            // Re-opening Threads in live mode must keep the fetched remote cards on screen.
+            view.update(cx, |v, cx| v.begin_remote_load(fixtures.clone(), cx));
+            assert!(!view.read(cx).loading);
+            assert_eq!(view.read(cx).cards.len(), 1);
+
+            // Switching workspaces drops the previous workspace's threads cleanly.
+            view.update(cx, |v, cx| v.clear_for_workspace(fixtures.clone(), cx));
+            assert!(!view.read(cx).remote);
+            assert!(view.read(cx).cards.is_empty());
+        });
     }
 }

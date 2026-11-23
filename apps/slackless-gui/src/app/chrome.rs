@@ -259,7 +259,7 @@ impl App {
                     .icon(Icon::new(IconName::ArrowLeft).text_color(chrome_muted))
                     .tooltip("Back")
                     .disabled(self.back.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
             )
             .child(
                 Button::new("nav-forward")
@@ -268,7 +268,7 @@ impl App {
                     .icon(Icon::new(IconName::ArrowRight).text_color(chrome_muted))
                     .tooltip("Forward")
                     .disabled(self.forward.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
             )
             .child(
                 Button::new("nav-history")

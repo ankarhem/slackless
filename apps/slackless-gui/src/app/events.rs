@@ -605,6 +605,14 @@ impl App {
                 window,
                 cx,
             ),
+            Event::CommandFailed { command, error }
+                if command == "subscriptions.thread.getView" =>
+            {
+                // Offline / API error fallback: populate Threads from local SQLite store instead
+                // of leaving the spinner stuck.
+                self.load_threads_store_fallback(cx);
+                eprintln!("slackless: {command} failed ({error})");
+            }
             Event::CommandFailed { command, error } => {
                 notify(command, format!("Slack refused it ({error})."), window, cx)
             }

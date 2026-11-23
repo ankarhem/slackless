@@ -27,6 +27,24 @@ mod macos;
 
 pub use deep_link::{DeepLink, SlackLink, SlackLinkKind, WebClientLink, parse_deep_link};
 
+/// Direction of a hardware mouse Back/Forward navigation gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseNavDirection {
+    Back,
+    Forward,
+}
+
+/// Install a macOS local `NSEvent` monitor for swipe-based mouse Back/Forward events that
+/// GPUI's macOS backend drops (`NSEventType::Swipe` with `phase == None`, sent by Logitech
+/// Options+ / Magic Mouse / 3-finger swipe). Safe to call once at app startup; no-op on
+/// non-macOS platforms.
+pub fn install_mouse_nav_monitor(on_nav: impl Fn(MouseNavDirection) + Send + Sync + 'static) {
+    #[cfg(target_os = "macos")]
+    macos::install_mouse_nav_monitor(on_nav);
+    #[cfg(not(target_os = "macos"))]
+    fallback::install_mouse_nav_monitor(on_nav);
+}
+
 /// Error surfaced by the fallible platform capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlatformError {

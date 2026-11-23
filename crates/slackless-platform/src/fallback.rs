@@ -144,3 +144,8 @@ impl SpellChecker for FallbackPlatform {
 
     fn learn_word(&self, _word: &str) {}
 }
+
+pub(crate) fn install_mouse_nav_monitor(
+    _on_nav: impl Fn(crate::MouseNavDirection) + Send + Sync + 'static,
+) {
+}

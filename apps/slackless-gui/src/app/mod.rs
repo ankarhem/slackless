@@ -232,16 +232,16 @@ use gpui_kit::component::{
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     self, Anchor, AnyElement, AppContext as _, BoxShadow, ClipboardItem, Context, DismissEvent,
-    Div, Edges, Entity, FocusHandle, Focusable as _, FontWeight, Hsla, InputPreference,
-    InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
+    DispatchPhase, Div, Edges, Entity, FocusHandle, Focusable as _, FontWeight, Hsla,
+    InputPreference, InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
     NavigationDirection, ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
-    actions, anchored, deferred, div, hsla, point, px, relative,
+    actions, anchored, canvas, deferred, div, hsla, point, px, relative,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{
-    self, AttentionRequester, BadgeSetter, Notifier, SoundPlayer, StatusBarAction, StatusBarItem,
-    StatusBarState,
+    self, AttentionRequester, BadgeSetter, MouseNavDirection, Notifier, SoundPlayer,
+    StatusBarAction, StatusBarItem, StatusBarState,
 };
 use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{
@@ -502,6 +502,21 @@ enum PickerTarget {
     ThreadMessage(Ts),
 }
 
+/// A destination in the Back / Forward navigation history (title-bar arrows, `Cmd+[`/`Cmd+]`,
+/// and mouse Back/Forward buttons).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) enum NavPlace {
+    Channel(ChannelId),
+    Threads,
+    Unreads,
+    Huddles,
+    Drafts,
+    Saved,
+    Directories,
+    Activity,
+    Files,
+}
+
 /// Which right-hand panel was last closed by `ToggleRightPane` (`Cmd+.`) so pressing it
 /// again restores the same panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -677,10 +692,10 @@ pub struct App {
     history_generation: u64,
     /// Live mode: the newest thread read started; an overtaken read is dropped.
     thread_generation: u64,
-    /// Conversations navigated away from, newest last (Slack's back arrow, Cmd+[).
-    back: Vec<ChannelId>,
-    /// Conversations stepped back from, newest last (the forward arrow, Cmd+]).
-    forward: Vec<ChannelId>,
+    /// Places navigated away from, newest last (Slack's back arrow, Cmd+[, mouse Back).
+    back: Vec<NavPlace>,
+    /// Places stepped back from, newest last (the forward arrow, Cmd+], mouse Forward).
+    forward: Vec<NavPlace>,
     /// Recently left conversations, newest first (the history clock's "Recent" menu).
     recent: Vec<ChannelId>,
     /// What the menu bar shows, so it is rebuilt only when that changes.
@@ -1928,6 +1943,27 @@ impl App {
         // Poll actions clicked in the macOS menu-bar status item (`F-SHELL-168`).
         let status_app = app.downgrade();
         let status_window = window.window_handle();
+        // Catch macOS swipe-based mouse Back/Forward events that GPUI drops (`phase == None`).
+        {
+            use futures::StreamExt as _;
+            let (nav_tx, mut nav_rx) = futures::channel::mpsc::unbounded::<MouseNavDirection>();
+            platform::install_mouse_nav_monitor(move |dir| {
+                let _ = nav_tx.unbounded_send(dir);
+            });
+            let nav_app = app.downgrade();
+            let nav_window = window.window_handle();
+            cx.spawn(async move |cx| {
+                while let Some(dir) = nav_rx.next().await {
+                    let _ = nav_window.update(cx, |_, window, cx| {
+                        let _ = nav_app.update(cx, |app, cx| match dir {
+                            MouseNavDirection::Back => app.go_back(window, cx),
+                            MouseNavDirection::Forward => app.go_forward(window, cx),
+                        });
+                    });
+                }
+            })
+            .detach();
+        }
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor()
@@ -2396,25 +2432,17 @@ impl Render for App {
             }))
             // Only with somewhere to go, so the menu bar greys out Back / Forward as Slack's does.
             .when(!self.back.is_empty(), |root| {
-                root.on_action(cx.listener(|this, _: &NavigateBack, _, cx| this.go_back(cx)))
+                root.on_action(
+                    cx.listener(|this, _: &NavigateBack, window, cx| this.go_back(window, cx)),
+                )
             })
             .when(!self.forward.is_empty(), |root| {
-                root.on_action(cx.listener(|this, _: &NavigateForward, _, cx| this.go_forward(cx)))
+                root.on_action(
+                    cx.listener(|this, _: &NavigateForward, window, cx| {
+                        this.go_forward(window, cx)
+                    }),
+                )
             })
-            // Mouse back / forward buttons (buttons 3 & 4 and swipe-based mice like MX Master).
-            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                match event.button {
-                    MouseButton::Navigate(NavigationDirection::Back) => {
-                        this.go_back(cx);
-                        cx.stop_propagation();
-                    }
-                    MouseButton::Navigate(NavigationDirection::Forward) => {
-                        this.go_forward(cx);
-                        cx.stop_propagation();
-                    }
-                    _ => {}
-                }
-            }))
             .on_action(cx.listener(|this, switch: &SwitchWorkspace, window, cx| {
                 this.switch_workspace(switch.0, window, cx)
             }))
@@ -2597,6 +2625,37 @@ impl Render for App {
             .size_full()
             .bg(chrome)
             .text_color(foreground)
+            // Window-level capture for hardware mouse Back/Forward buttons (buttons 3 & 4 and
+            // swipe-ended events). Registered via `window.on_mouse_event` rather than an element
+            // hitbox so it works unconditionally even over `.occlude()` overlays or dialogs.
+            .child({
+                let nav_app = cx.weak_entity();
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let nav_app = nav_app.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            match event.button {
+                                MouseButton::Navigate(NavigationDirection::Back) => {
+                                    let _ = nav_app.update(cx, |app, cx| app.go_back(window, cx));
+                                    cx.stop_propagation();
+                                }
+                                MouseButton::Navigate(NavigationDirection::Forward) => {
+                                    let _ =
+                                        nav_app.update(cx, |app, cx| app.go_forward(window, cx));
+                                    cx.stop_propagation();
+                                }
+                                _ => {}
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+            })
             .child(div().absolute().top_0().left_0().size(glow_side).bg(glow))
             .child(title_bar)
             .child(

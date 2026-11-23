@@ -566,3 +566,47 @@ impl SpellChecker for MacPlatform {
         checker.learnWord(&NSString::from_str(word));
     }
 }
+
+use std::ptr::NonNull;
+use std::sync::Once;
+
+use block2::RcBlock;
+use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase, NSEventType};
+
+use crate::MouseNavDirection;
+
+static MOUSE_NAV_MONITOR: Once = Once::new();
+
+pub(crate) fn install_mouse_nav_monitor(
+    on_nav: impl Fn(MouseNavDirection) + Send + Sync + 'static,
+) {
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    MOUSE_NAV_MONITOR.call_once(|| {
+        let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            let ev = unsafe { event.as_ref() };
+            // GPUI's macOS backend already turns `NSEventType::Swipe` with `NSEventPhase::Ended`
+            // into `MouseButton::Navigate`, but silently drops `phase == None` swipes (which
+            // Logitech Options+, Magic Mouse, and swipe-based mice emit). Handle only `None`
+            // here so we never double-fire.
+            if ev.r#type() == NSEventType::Swipe && ev.phase() == NSEventPhase::None {
+                let dx = ev.deltaX();
+                if dx > 0.0 {
+                    on_nav(MouseNavDirection::Back);
+                    return std::ptr::null_mut();
+                } else if dx < 0.0 {
+                    on_nav(MouseNavDirection::Forward);
+                    return std::ptr::null_mut();
+                }
+            }
+            event.as_ptr()
+        });
+        // Keep the monitor alive for the lifetime of the process.
+        if let Some(monitor) = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Swipe, &block)
+        } {
+            std::mem::forget(monitor);
+        }
+    });
+}

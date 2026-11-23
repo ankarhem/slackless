@@ -390,3 +390,108 @@ fn workspace_state_defaults_cleanly_for_atomic_swap() {
     assert_eq!(b.active_canvas.as_deref(), Some("F123"));
     assert!(b.pins.contains_key(&ChannelId::from("C1")));
 }
+
+#[gpui::test]
+fn mouse_back_and_forward_navigate_across_channels_and_pages(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+    let fixtures = Arc::new(crate::fixtures::load());
+    let app_cell = Rc::new(std::cell::RefCell::new(None));
+    let cell = app_cell.clone();
+    let (_root, cx) = cx.add_window_view(|window, cx| {
+        let app = App::new(fixtures.clone(), CoreBridge::offline(), window, cx);
+        *cell.borrow_mut() = Some(app.clone());
+        gpui_kit::base::Root::new(app, window, cx)
+    });
+    let app = app_cell.borrow_mut().take().unwrap();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    // Visit: initial channel -> Threads -> Unreads -> #engineering
+    let initial = cx.update(|_, cx| app.read(cx).channel.clone());
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_threads(cx);
+            app.open_unreads(window, cx);
+            app.select(ChannelId::from("C0ENG"), cx);
+        });
+        let _ = window.draw(cx);
+    });
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).current_place(cx),
+            NavPlace::Channel(ChannelId::from("C0ENG"))
+        );
+    });
+
+    // Mouse Back button: #engineering -> Unreads -> Threads -> initial channel
+    cx.simulate_mouse_down(
+        point(px(400.), px(300.)),
+        MouseButton::Navigate(NavigationDirection::Back),
+        gpui::Modifiers::none(),
+    );
+    cx.update(|window, cx| {
+        assert_eq!(app.read(cx).current_place(cx), NavPlace::Unreads);
+        let _ = window.draw(cx);
+    });
+
+    cx.simulate_mouse_down(
+        point(px(400.), px(300.)),
+        MouseButton::Navigate(NavigationDirection::Back),
+        gpui::Modifiers::none(),
+    );
+    cx.update(|window, cx| {
+        assert_eq!(app.read(cx).current_place(cx), NavPlace::Threads);
+        let _ = window.draw(cx);
+    });
+
+    cx.simulate_mouse_down(
+        point(px(400.), px(300.)),
+        MouseButton::Navigate(NavigationDirection::Back),
+        gpui::Modifiers::none(),
+    );
+    cx.update(|window, cx| {
+        assert_eq!(
+            app.read(cx).current_place(cx),
+            NavPlace::Channel(initial.clone())
+        );
+        let _ = window.draw(cx);
+    });
+
+    // Mouse Forward button: initial -> Threads -> Unreads -> #engineering
+    cx.simulate_mouse_down(
+        point(px(400.), px(300.)),
+        MouseButton::Navigate(NavigationDirection::Forward),
+        gpui::Modifiers::none(),
+    );
+    cx.update(|window, cx| {
+        assert_eq!(app.read(cx).current_place(cx), NavPlace::Threads);
+        let _ = window.draw(cx);
+    });
+
+    cx.simulate_mouse_down(
+        point(px(400.), px(300.)),
+        MouseButton::Navigate(NavigationDirection::Forward),
+        gpui::Modifiers::none(),
+    );
+    cx.update(|window, cx| {
+        assert_eq!(app.read(cx).current_place(cx), NavPlace::Unreads);
+        let _ = window.draw(cx);
+    });
+
+    cx.simulate_mouse_down(
+        point(px(400.), px(300.)),
+        MouseButton::Navigate(NavigationDirection::Forward),
+        gpui::Modifiers::none(),
+    );
+    cx.update(|_, cx| {
+        assert_eq!(
+            app.read(cx).current_place(cx),
+            NavPlace::Channel(ChannelId::from("C0ENG"))
+        );
+    });
+}
