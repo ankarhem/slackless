@@ -145,12 +145,59 @@ pub(super) fn code_blocks(
     blocks
 }
 
+/// Visual byte ranges of inline `` `code` `` spans in `doc` for painting crisp rounded bordered
+/// pills in the composer backdrop (matching sent `.c-mrkdwn__code` pills). Uses `outer` when
+/// the caret reveals the backticks and `inner` when the backticks are collapsed.
+pub(super) fn inline_code_spans(
+    doc: &Doc,
+    selection: &Range<usize>,
+    focused: bool,
+) -> Vec<Range<usize>> {
+    let text = doc.text();
+    let parsed = doc.parse();
+    let touches = |range: &Range<usize>| {
+        if !focused {
+            return false;
+        }
+        if selection.is_empty() {
+            selection.start >= range.start && selection.start <= range.end
+        } else {
+            selection.start < range.end && selection.end > range.start
+        }
+    };
+    let splits_selection = |range: &Range<usize>| {
+        (selection.start > range.start && selection.start < range.end)
+            || (selection.end > range.start && selection.end < range.end)
+    };
+    let mut spans = Vec::new();
+    for line in &parsed.lines {
+        if matches!(line.kind, Some(LineKind::Code | LineKind::Fence)) {
+            continue;
+        }
+        for c in &line.inlines {
+            if c.kind != crate::editor::InlineKind::Style(Style::CODE) {
+                continue;
+            }
+            let revealed =
+                touches(&c.outer) || splits_selection(&c.open) || splits_selection(&c.close);
+            let range = if revealed {
+                c.outer.clone()
+            } else {
+                c.inner.clone()
+            };
+            if range.start < range.end && range.end <= text.len() {
+                spans.push(range);
+            }
+        }
+    }
+    spans
+}
+
 /// The theme colors Live Preview draws with.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Palette {
     link: Hsla,
     code: Hsla,
-    code_background: Hsla,
     code_block_fg: Hsla,
     syntax: Hsla,
     danger: Hsla,
@@ -161,7 +208,6 @@ impl Palette {
         Palette {
             link: cx.theme().link,
             code: crate::theme::code_foreground(cx),
-            code_background: cx.theme().secondary,
             code_block_fg: cx.theme().foreground,
             syntax: cx.theme().muted_foreground.opacity(0.6),
             danger: cx.theme().danger,
@@ -213,7 +259,7 @@ impl Palette {
             color,
             font_weight,
             font_style: has(Style::ITALIC).then_some(FontStyle::Italic),
-            background_color: has(Style::CODE).then_some(self.code_background),
+            background_color: None,
             underline: if is_link {
                 Some(UnderlineStyle {
                     thickness: px(1.),
@@ -599,7 +645,6 @@ mod tests {
         Palette {
             link: hsla(0.6, 0.8, 0.5, 1.0),
             code: hsla(0.0, 0.7, 0.5, 1.0),
-            code_background: hsla(0.0, 0.0, 0.2, 1.0),
             code_block_fg: hsla(0.0, 0.0, 0.85, 1.0),
             syntax: hsla(0.0, 0.0, 0.5, 0.6),
             danger: hsla(0.0, 0.8, 0.5, 1.0),
@@ -782,6 +827,17 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(!blocks[0].open_collapsed_empty);
         assert!(blocks[0].close_collapsed);
+    }
+
+    #[test]
+    fn inline_code_spans_tracks_revealed_and_collapsed_ranges() {
+        let doc = Doc::from("see `foo` ok");
+        // Caret outside (`0..0`): backticks hidden, backdrop wraps `foo` (5..8).
+        assert_eq!(inline_code_spans(&doc, &(0..0), true), vec![5..8]);
+        // Caret inside (`6..6`): backticks revealed, backdrop wraps `` `foo` `` (4..9).
+        assert_eq!(inline_code_spans(&doc, &(6..6), true), vec![4..9]);
+        // Blurred with caret inside: backticks hidden, wraps `foo` (5..8).
+        assert_eq!(inline_code_spans(&doc, &(6..6), false), vec![5..8]);
     }
 
     #[test]

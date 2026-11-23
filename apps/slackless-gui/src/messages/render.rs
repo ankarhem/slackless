@@ -669,10 +669,11 @@ pub(super) struct SelectableParagraph {
     pub(super) document_order: u64,
     pub(super) selection: Hsla,
     pub(super) link: Hsla,
-    /// Inline code spans, outlined like Slack's `.c-mrkdwn__code` (a run-level background
-    /// cannot carry a border).
-    pub(super) code: Vec<Range<usize>>,
-    /// Run backgrounds (inline code, mentions, app chips), painted under the selection: as
+    /// Inline code spans and their fill color, rendered as a single rounded bordered pill
+    /// matching Slack's `.c-mrkdwn__code` (kept out of `washes` so fill and border share exact
+    /// geometry with no top/bottom overflow or side gap).
+    pub(super) code: Vec<(Range<usize>, Hsla)>,
+    /// Non-code run backgrounds (mentions, app chips), painted under the selection: as
     /// run backgrounds GPUI paints them with the text, over the highlight.
     pub(super) washes: Vec<(Range<usize>, Hsla)>,
     pub(super) code_border: Hsla,
@@ -704,7 +705,7 @@ impl SelectableParagraph {
         let text: SharedString = text.into();
         // Inline code is the inline-code run with a wash; code blocks carry no run
         // background. An app chip's icon slot is its own run on the link wash.
-        let mut code: Vec<Range<usize>> = Vec::new();
+        let mut code: Vec<(Range<usize>, Hsla)> = Vec::new();
         let mut washes = Vec::new();
         let mut icons = Vec::new();
         let mut at = 0;
@@ -719,9 +720,12 @@ impl SelectableParagraph {
             }
             if run.font.family == theme.code_font.family {
                 match code.last_mut() {
-                    Some(last) if last.end == span.start => last.end = span.end,
-                    _ => code.push(span.clone()),
+                    Some((last, last_wash)) if last.end == span.start && *last_wash == wash => {
+                        last.end = span.end;
+                    }
+                    _ => code.push((span, wash)),
                 }
+                continue;
             }
             washes.push((span, wash));
         }
@@ -772,17 +776,24 @@ impl SelectableParagraph {
         quads
     }
 
-    /// Slack's inline-code outline: a 1px 13% foreground ring with 3px corners, a little
-    /// wider than the glyphs and a little shorter than the line.
-    fn paint_code_outline(&self, layout: &TextLayout, range: Range<usize>, window: &mut Window) {
+    /// Slack's inline-code pill: a single rounded quad carrying both the fill and the 1px 13%
+    /// foreground ring with 3px corners, slightly wider than the glyphs and inset 1px from the
+    /// line box so the fill never pokes outside the border.
+    fn paint_code_box(
+        &self,
+        layout: &TextLayout,
+        range: Range<usize>,
+        wash: Hsla,
+        window: &mut Window,
+    ) {
         for bounds in self.range_quads(layout, range) {
-            let outline = Bounds::from_corners(
+            let pill = Bounds::from_corners(
                 Point::new(bounds.left() - px(2.), bounds.top() + px(1.)),
                 Point::new(bounds.right() + px(2.), bounds.bottom() - px(1.)),
             );
             window.paint_quad(PaintQuad {
-                bounds: outline,
-                background: transparent_black().into(),
+                bounds: pill,
+                background: wash.into(),
                 corner_radii: Corners::all(px(3.)),
                 border_widths: Edges::all(px(1.)),
                 border_color: self.code_border,
@@ -1153,6 +1164,9 @@ impl Element for SelectableParagraph {
         for (range, wash) in &self.washes {
             self.paint_wash(&layout, range.clone(), *wash, window);
         }
+        for (range, wash) in &self.code {
+            self.paint_code_box(&layout, range.clone(), *wash, window);
+        }
         for range in projection.ranges().iter().flatten().cloned() {
             self.paint_selection(&layout, range, window);
         }
@@ -1165,9 +1179,6 @@ impl Element for SelectableParagraph {
             window,
             cx,
         );
-        for range in &self.code {
-            self.paint_code_outline(&layout, range.clone(), window);
-        }
         for &ix in &self.icons {
             self.paint_app_icon(&layout, ix, window, cx);
         }

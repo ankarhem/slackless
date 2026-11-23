@@ -8,7 +8,7 @@ use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, BorderStyle, Bounds, ContentMask, Context, Corners, Div, Edges, ExternalPaths,
     Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, PaintQuad,
-    ParentElement as _, Render, SharedString, Stateful, StatefulInteractiveElement as _,
+    ParentElement as _, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement as _,
     Styled as _, StyledText, Window, canvas, div, point, px, relative, rems,
 };
 
@@ -310,19 +310,22 @@ impl Render for Composer {
 }
 
 impl Composer {
-    /// Paint full-width rounded Slack code-block containers behind the transparent `Textarea`.
-    /// Because GPUI runs `prepaint` across the whole tree before any `paint`, the sibling
-    /// textarea has already stored this frame's `last_layout`/`last_bounds` by the time this
-    /// canvas paints underneath the text, selection, and caret.
+    /// Paint rounded Slack code-block containers and inline-code pills behind the transparent
+    /// `Textarea`. Because GPUI runs `prepaint` across the whole tree before any `paint`, the
+    /// sibling textarea has already stored this frame's `last_layout`/`last_bounds` by the time
+    /// this canvas paints underneath the text, selection, and caret.
     fn code_block_backdrop(&self, editor_focused: bool, cx: &App) -> Option<AnyElement> {
-        let blocks =
-            tokens::code_blocks(self.editor.doc(), &self.editor.selection(), editor_focused);
-        if blocks.is_empty() {
+        let doc = self.editor.doc();
+        let selection = self.editor.selection();
+        let blocks = tokens::code_blocks(doc, &selection, editor_focused);
+        let inline_spans = tokens::inline_code_spans(doc, &selection, editor_focused);
+        if blocks.is_empty() && inline_spans.is_empty() {
             return None;
         }
+        let text = doc.text().to_owned();
         let input = self.input.clone();
         let code_bg = crate::theme::code_block_background(cx);
-        let code_border = cx.theme().foreground.opacity(0.13);
+        let code_border = cx.theme().foreground.opacity(0.16);
         Some(
             canvas(
                 |_, _, _| {},
@@ -411,6 +414,25 @@ impl Composer {
                                 border_style: BorderStyle::default(),
                             });
                         }
+
+                        // Inline `` `code` `` pills: rounded 1px bordered boxes matching sent
+                        // `.c-mrkdwn__code` spans, split per visual line if a span wraps.
+                        for span in &inline_spans {
+                            for quad in inline_code_quads(state, &text, span) {
+                                let pill = Bounds::from_corners(
+                                    point(quad.left() - px(2.), quad.top() + px(1.)),
+                                    point(quad.right() + px(2.), quad.bottom() - px(1.)),
+                                );
+                                window.paint_quad(PaintQuad {
+                                    bounds: pill,
+                                    corner_radii: Corners::all(px(3.)),
+                                    background: code_bg.into(),
+                                    border_widths: Edges::all(px(1.)),
+                                    border_color: code_border,
+                                    border_style: BorderStyle::default(),
+                                });
+                            }
+                        }
                     });
                 },
             )
@@ -447,4 +469,60 @@ impl Composer {
                 .child(StyledText::new(text).with_highlights(names.into_iter().map(|r| (r, bold)))),
         )
     }
+}
+
+/// Visual-line bounding boxes for an inline code range inside `TextareaState`. Fast-paths
+/// single-line spans; splits wrapped spans per visual line so pills never stretch backwards.
+fn inline_code_quads(
+    state: &gpui_kit::component::input::TextareaState,
+    text: &str,
+    range: &std::ops::Range<usize>,
+) -> Vec<Bounds<Pixels>> {
+    let Some(start_b) = state.range_to_bounds(&(range.start..range.start)) else {
+        return Vec::new();
+    };
+    let Some(end_b) = state.range_to_bounds(&(range.end..range.end)) else {
+        return Vec::new();
+    };
+    if start_b.top() == end_b.top() {
+        if end_b.left() > start_b.left() {
+            return vec![Bounds::from_corners(
+                start_b.origin,
+                point(end_b.left(), start_b.bottom()),
+            )];
+        }
+        return Vec::new();
+    }
+    let mut quads: Vec<Bounds<Pixels>> = Vec::new();
+    let mut current: Option<Bounds<Pixels>> = None;
+    let slice = match text.get(range.clone()) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    for (rel, ch) in slice.char_indices() {
+        let start = range.start + rel;
+        let end = start + ch.len_utf8();
+        let Some(b) = state.range_to_bounds(&(start..end)) else {
+            continue;
+        };
+        if b.size.width <= px(0.) {
+            continue;
+        }
+        match &mut current {
+            Some(acc) if (acc.top() - b.top()).abs() < px(1.) => {
+                let left = acc.left().min(b.left());
+                let right = acc.right().max(b.right());
+                *acc = Bounds::from_corners(point(left, acc.top()), point(right, acc.bottom()));
+            }
+            _ => {
+                if let Some(prev) = current.replace(b) {
+                    quads.push(prev);
+                }
+            }
+        }
+    }
+    if let Some(last) = current {
+        quads.push(last);
+    }
+    quads
 }
