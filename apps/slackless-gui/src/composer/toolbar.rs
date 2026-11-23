@@ -631,16 +631,33 @@ impl Composer {
                             .object_fit(ObjectFit::Cover)
                             .flex_none()
                             .into_any_element(),
-                        None => div()
-                            .size(px(36.))
-                            .flex_none()
-                            .rounded_sm()
-                            .bg(secondary)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::File).size(px(18.)).text_color(muted))
-                            .into_any_element(),
+                        None => {
+                            let lower = file.filename.to_ascii_lowercase();
+                            let icon_name = if lower.ends_with(".m4a")
+                                || lower.ends_with(".wav")
+                                || lower.ends_with(".mp3")
+                                || lower.ends_with(".ogg")
+                            {
+                                IconName::Mic
+                            } else if lower.ends_with(".mp4")
+                                || lower.ends_with(".mov")
+                                || lower.ends_with(".webm")
+                            {
+                                IconName::Video
+                            } else {
+                                IconName::File
+                            };
+                            div()
+                                .size(px(36.))
+                                .flex_none()
+                                .rounded_sm()
+                                .bg(secondary)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(icon_name).size(px(18.)).text_color(muted))
+                                .into_any_element()
+                        }
                     };
                     h_flex()
                         .id(("attach-chip", ix))
@@ -700,13 +717,6 @@ impl Composer {
             || (!self.edit_mode && (!self.attachments.is_empty() || self.pending_gif.is_some()));
         let icon = |name: IconName| Icon::new(name).text_color(muted).size(px(15.));
         let separator = || div().w(px(1.)).h(px(16.)).rounded_full().bg(border);
-        // Window chrome: Slack's controls for features slackless does not have yet.
-        let chrome = |id, label: AnyElement, tip: &'static str| {
-            control(id)
-                .text_color(muted)
-                .tooltip(move |window, cx| tip_view(tip, &[], window, cx))
-                .child(label)
-        };
         let button = |id, label: AnyElement| {
             control(id)
                 .cursor_pointer()
@@ -766,16 +776,102 @@ impl Composer {
                         ),
                 )
                 .child(separator())
-                .child(chrome(
-                    "act-video",
-                    icon(IconName::Video).into_any_element(),
-                    "Record video clip",
-                ))
-                .child(chrome(
-                    "act-mic",
-                    icon(IconName::Mic).into_any_element(),
-                    "Record audio clip",
-                ))
+                .child({
+                    let recording_video = matches!(
+                        self.clip_recorder,
+                        Some(super::ActiveClipRecorder::Video { .. })
+                    );
+                    let danger = cx.theme().danger;
+                    let this = cx.entity().downgrade();
+                    if recording_video {
+                        button(
+                            "act-video",
+                            Icon::new(IconName::Square)
+                                .text_color(danger)
+                                .size(px(14.))
+                                .into_any_element(),
+                        )
+                        .bg(danger.opacity(0.14))
+                        .tooltip(|window, cx| tip_view("Stop video clip", &[], window, cx))
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_and_attach_clip(cx)))
+                        .into_any_element()
+                    } else {
+                        Button::new("act-video")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .size(px(28.))
+                            .p_0()
+                            .tooltip("Record video clip")
+                            .child(icon(IconName::Video))
+                            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                                let cam_this = this.clone();
+                                let scr_this = this.clone();
+                                menu.item(
+                                    PopupMenuItem::new("Record camera clip")
+                                        .icon(IconName::Video)
+                                        .on_click(move |_, _, cx| {
+                                            if let Some(c) = cam_this.upgrade() {
+                                                c.update(cx, |composer, cx| {
+                                                    composer.start_video_clip(
+                                                        slackless_core::huddle::ClipVideoSource::Camera(None),
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new("Record screen clip")
+                                        .icon(IconName::Monitor)
+                                        .on_click(move |_, _, cx| {
+                                            if let Some(c) = scr_this.upgrade() {
+                                                c.update(cx, |composer, cx| {
+                                                    composer.start_video_clip(
+                                                        slackless_core::huddle::ClipVideoSource::Screen(
+                                                            "monitor:primary".to_owned(),
+                                                        ),
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                )
+                            })
+                            .into_any_element()
+                    }
+                })
+                .child({
+                    let recording_audio = matches!(
+                        self.clip_recorder,
+                        Some(super::ActiveClipRecorder::Audio(_))
+                    );
+                    let danger = cx.theme().danger;
+                    button(
+                        "act-mic",
+                        if recording_audio {
+                            Icon::new(IconName::Square)
+                                .text_color(danger)
+                                .size(px(14.))
+                                .into_any_element()
+                        } else {
+                            icon(IconName::Mic).into_any_element()
+                        },
+                    )
+                    .when(recording_audio, |el| el.bg(danger.opacity(0.14)))
+                    .tooltip(move |window, cx| {
+                        tip_view(
+                            if recording_audio {
+                                "Stop audio clip"
+                            } else {
+                                "Record audio clip"
+                            },
+                            &[],
+                            window,
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.start_audio_clip(cx)))
+                })
                 .child(separator())
                 .child(
                     button("act-slash", icon(IconName::SquareSlash).into_any_element())

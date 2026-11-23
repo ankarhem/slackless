@@ -475,6 +475,239 @@ fn file_ext(file: &File, default: &str) -> String {
         .unwrap_or_else(|| default.to_owned())
 }
 
+/// Cached clip transcript state (`F-CORE-129`), stored globally so expanded transcripts
+/// survive virtualized message list scrolling.
+#[derive(Clone, Default)]
+struct ClipTranscriptState {
+    expanded: bool,
+    loading: bool,
+    text: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct ClipTranscriptStore {
+    entries: HashMap<FileId, ClipTranscriptState>,
+}
+
+impl Global for ClipTranscriptStore {}
+
+/// Extract inline transcript text from Slack clip metadata (`transcription.preview.content`,
+/// `transcription.text`, `transcript`, or `file.preview` on audio/video clips).
+fn inline_clip_transcript(file: &File) -> Option<String> {
+    if let Some(t) = file.extra.get("transcription") {
+        if let Some(s) = t
+            .get("preview")
+            .and_then(|p| p.get("content"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(s.trim().to_owned());
+        }
+        if let Some(s) = t
+            .get("text")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(s.trim().to_owned());
+        }
+    }
+    if let Some(s) = file
+        .extra
+        .get("transcript")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(s.trim().to_owned());
+    }
+    file.preview
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Optional WebVTT URL (`vtt` or `transcription.vtt`) for lazy transcript loading.
+fn clip_vtt_url(file: &File) -> Option<String> {
+    file.extra
+        .get("vtt")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            file.extra
+                .get("transcription")
+                .and_then(|t| t.get("vtt"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| s.starts_with("http"))
+        .map(ToOwned::to_owned)
+}
+
+/// Strip WebVTT headers, cue numbers, and timestamp arrows into clean readable transcript text.
+fn parse_webvtt(raw: &str) -> String {
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("WEBVTT")
+            || trimmed.starts_with("NOTE")
+            || trimmed.contains("-->")
+            || trimmed.chars().all(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        lines.push(trimmed);
+    }
+    lines.join(" ")
+}
+
+/// Normalized waveform samples (`0.08..=1.0`) from Slack's `audio_wave_samples` metadata.
+fn audio_wave_bars(file: &File) -> Vec<f32> {
+    let Some(arr) = file
+        .extra
+        .get("audio_wave_samples")
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let raw: Vec<f32> = arr
+        .iter()
+        .filter_map(|v| v.as_f64().map(|n| n as f32))
+        .collect();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let max = raw.iter().copied().fold(1.0f32, f32::max);
+    let target = 28usize.min(raw.len());
+    let step = (raw.len() as f32 / target as f32).max(1.0);
+    (0..target)
+        .map(|i| {
+            let ix = ((i as f32 * step) as usize).min(raw.len() - 1);
+            (raw[ix] / max).clamp(0.12, 1.0)
+        })
+        .collect()
+}
+
+/// Expandable clip transcript pill + transcript panel (`F-CORE-129`).
+fn clip_transcript_section(file: &File, cx: &App) -> Option<Div> {
+    let inline = inline_clip_transcript(file);
+    let vtt_url = clip_vtt_url(file);
+    if inline.is_none() && vtt_url.is_none() {
+        return None;
+    }
+    let theme = cx.theme();
+    let file_id = file.id.clone();
+    let state = cx
+        .try_global::<ClipTranscriptStore>()
+        .and_then(|store| store.entries.get(&file_id))
+        .cloned()
+        .unwrap_or_default();
+    let expanded = state.expanded;
+    let body_text = state.text.clone().or(inline);
+    let toggle_id = SharedString::from(format!("clip-transcript-toggle-{}", file.id));
+    let click_id = file.id.clone();
+    let click_vtt = vtt_url.clone();
+    let has_text = body_text.is_some();
+
+    Some(
+        v_flex()
+            .w(px(CARD_W))
+            .max_w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id(toggle_id)
+                    .cursor_pointer()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .w(px(120.))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.muted_foreground)
+                    .hover(|el| el.bg(theme.secondary_hover).text_color(theme.foreground))
+                    .child(
+                        Icon::new(IconName::Captions)
+                            .size(px(13.))
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(if expanded {
+                        "Hide transcript"
+                    } else {
+                        "Transcript"
+                    })
+                    .on_click(move |_, window, cx| {
+                        let store = cx.default_global::<ClipTranscriptStore>();
+                        let entry = store.entries.entry(click_id.clone()).or_default();
+                        entry.expanded = !entry.expanded;
+                        let should_fetch = entry.expanded
+                            && !has_text
+                            && entry.text.is_none()
+                            && !entry.loading
+                            && click_vtt.is_some();
+                        if should_fetch {
+                            entry.loading = true;
+                            entry.error = None;
+                        }
+                        window.refresh();
+                        if should_fetch {
+                            if let (Some(url), Some(fut)) = (
+                                click_vtt.clone(),
+                                click_vtt.clone().and_then(|u| crate::media::fetch(u, cx)),
+                            ) {
+                                let _ = url;
+                                let fid = click_id.clone();
+                                let win = window.window_handle();
+                                cx.spawn(async move |cx| {
+                                    let res = fut.await;
+                                    cx.update(|cx| {
+                                        let store = cx.default_global::<ClipTranscriptStore>();
+                                        let entry = store.entries.entry(fid).or_default();
+                                        entry.loading = false;
+                                        match res {
+                                            Ok(bytes) => {
+                                                let raw = String::from_utf8_lossy(&bytes);
+                                                let parsed = parse_webvtt(&raw);
+                                                entry.text = Some(if parsed.is_empty() {
+                                                    raw.trim().to_owned()
+                                                } else {
+                                                    parsed
+                                                });
+                                            }
+                                            Err(err) => entry.error = Some(err),
+                                        }
+                                        let _ = win.update(cx, |_, window, _| window.refresh());
+                                    });
+                                })
+                                .detach();
+                            }
+                        }
+                    }),
+            )
+            .when(expanded, |col| {
+                col.child(
+                    div()
+                        .px_2p5()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.secondary.opacity(0.45))
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(if state.loading {
+                            "Loading transcript\u{2026}".to_owned()
+                        } else if let Some(err) = state.error {
+                            format!("Could not load transcript: {err}")
+                        } else {
+                            body_text.unwrap_or_else(|| "No transcript available.".to_owned())
+                        }),
+                )
+            }),
+    )
+}
+
 /// Slack-style inline audio player card for uploaded audio files and voice clips.
 fn audio_card(file: &File, cx: &App) -> Div {
     let theme = cx.theme();
@@ -606,7 +839,10 @@ fn audio_card(file: &File, cx: &App) -> Div {
                 crate::media::download(url.clone(), name.clone(), window, cx);
             })
     });
-    h_flex()
+    let wave = audio_wave_bars(file);
+    let has_wave = !wave.is_empty();
+    let transcript = clip_transcript_section(file, cx);
+    let card = h_flex()
         .w(px(CARD_W))
         .max_w_full()
         .items_center()
@@ -630,7 +866,23 @@ fn audio_card(file: &File, cx: &App) -> Div {
                         .text_color(theme.foreground)
                         .child(file_name(file)),
                 )
-                .when(playing || duration_ms.is_some(), |col| {
+                .when(has_wave, |col| {
+                    let total = wave.len();
+                    col.child(h_flex().items_center().gap(px(2.)).h(px(18.)).children(
+                        wave.into_iter().enumerate().map(|(ix, amp)| {
+                            let filled = (ix as f32 / total.max(1) as f32) <= progress;
+                            let h = (4. + amp * 13.).clamp(4., 17.);
+                            div().w(px(3.)).h(px(h)).rounded_full().bg(
+                                if filled && (playing || paused) {
+                                    theme.primary
+                                } else {
+                                    theme.foreground.opacity(0.28)
+                                },
+                            )
+                        }),
+                    ))
+                })
+                .when(!has_wave && (playing || duration_ms.is_some()), |col| {
                     col.child(
                         div()
                             .w_full()
@@ -655,7 +907,8 @@ fn audio_card(file: &File, cx: &App) -> Div {
                 ),
         )
         .children(stop_btn)
-        .children(dl_btn)
+        .children(dl_btn);
+    v_flex().gap_1().child(card).children(transcript)
 }
 
 /// Slack-style inline video card with poster thumbnail, centered play trigger, duration badge,
@@ -770,6 +1023,7 @@ fn video_card(file: &File, cx: &App) -> Div {
                 })
                 .children(download_button(file, group, cx)),
         )
+        .children(clip_transcript_section(file, cx))
 }
 
 const SNIPPET_COLLAPSED_LINES: usize = 5;

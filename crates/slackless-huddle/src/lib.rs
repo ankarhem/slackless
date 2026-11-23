@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod av1;
+pub mod clips;
 pub mod content_share;
 pub mod peer_message;
 pub mod rtc;
@@ -29,6 +30,9 @@ use tokio::sync::mpsc;
 pub use audio::{
     AmbientMusicPlayer, AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe,
     list_audio_devices, play_huddle_chime, play_speaker_test_tone,
+};
+pub use clips::{
+    AudioClipRecorder, ClipVideoSource, RecordedClip, VideoClipRecorder, finish_audio_clip,
 };
 pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;

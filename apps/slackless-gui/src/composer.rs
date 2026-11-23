@@ -35,10 +35,13 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, WindowExt as _, 
 use gpui_kit::gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
     Image, ImageFormat, InteractiveElement as _, ParentElement as _, PathPromptOptions, Pixels,
-    Point, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
-    px,
+    Point, RenderImage, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, Window, div, px,
 };
 use slackless_core::api::{GifItem, MessageContent};
+use slackless_core::huddle::{
+    AudioClipRecorder, ClipVideoSource, VideoClipRecorder, finish_audio_clip,
+};
 use slackless_core::types::Message;
 
 use crate::drafts::SendLater;
@@ -153,6 +156,15 @@ pub enum Placeholder {
     Private(SharedString),
 }
 
+/// An active native audio or video clip recording session inside the composer (`F-CORE-127`, `128`, `131`).
+pub(super) enum ActiveClipRecorder {
+    Audio(AudioClipRecorder),
+    Video {
+        recorder: VideoClipRecorder,
+        is_screen: bool,
+    },
+}
+
 pub struct Composer {
     /// The textarea the draft is typed in.
     input: Entity<TextareaState>,
@@ -224,6 +236,11 @@ pub struct Composer {
     typing_sent: Option<Instant>,
     /// Bounded inline-code target captured on triple-click before `Textarea::select_line` runs.
     pending_code_click: Option<Range<usize>>,
+    /// Active native audio/video clip recorder (`F-CORE-127`, `F-CORE-128`, `F-CORE-131`).
+    pub(super) clip_recorder: Option<ActiveClipRecorder>,
+    pub(super) clip_preview: Option<Arc<RenderImage>>,
+    pub(super) clip_stopping: bool,
+    clip_ticker: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -324,6 +341,10 @@ impl Composer {
                 typing: None,
                 typing_sent: None,
                 pending_code_click: None,
+                clip_recorder: None,
+                clip_preview: None,
+                clip_stopping: false,
+                clip_ticker: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -376,6 +397,182 @@ impl Composer {
             self.sync_presentation(cx);
             cx.notify();
         }
+    }
+
+    /// Start recording a native microphone audio clip (`F-CORE-127`, `F-CORE-131`).
+    pub fn start_audio_clip(&mut self, cx: &mut Context<Self>) {
+        if self.clip_stopping {
+            return;
+        }
+        if self.clip_recorder.is_some() {
+            self.stop_and_attach_clip(cx);
+            return;
+        }
+        self.upload_warning = None;
+        match AudioClipRecorder::start() {
+            Ok(recorder) => {
+                self.clip_recorder = Some(ActiveClipRecorder::Audio(recorder));
+                self.clip_preview = None;
+                self.spawn_clip_ticker(cx);
+                cx.notify();
+            }
+            Err(err) => {
+                self.upload_warning = Some(format!("Audio clip error: {err}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Start recording a native camera or screen video clip (`F-CORE-128`, `F-CORE-131`).
+    pub fn start_video_clip(&mut self, source: ClipVideoSource, cx: &mut Context<Self>) {
+        if self.clip_stopping {
+            return;
+        }
+        if self.clip_recorder.is_some() {
+            self.stop_and_attach_clip(cx);
+            return;
+        }
+        self.upload_warning = None;
+        let is_screen = matches!(source, ClipVideoSource::Screen(_));
+        match VideoClipRecorder::start(source) {
+            Ok(recorder) => {
+                self.clip_recorder = Some(ActiveClipRecorder::Video {
+                    recorder,
+                    is_screen,
+                });
+                self.clip_preview = None;
+                self.spawn_clip_ticker(cx);
+                cx.notify();
+            }
+            Err(err) => {
+                self.upload_warning = Some(format!("Video clip error: {err}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Discard an active clip recording without attaching it.
+    pub fn cancel_clip(&mut self, cx: &mut Context<Self>) {
+        self.clip_ticker = None;
+        self.clip_preview = None;
+        self.clip_stopping = false;
+        if let Some(active) = self.clip_recorder.take() {
+            match active {
+                ActiveClipRecorder::Audio(r) => r.cancel(),
+                ActiveClipRecorder::Video { recorder, .. } => recorder.cancel(),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stop the active clip recorder, encode off the UI thread, and stage as a composer attachment.
+    pub fn stop_and_attach_clip(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.clip_recorder.take() else {
+            return;
+        };
+        self.clip_ticker = None;
+        self.clip_preview = None;
+        self.clip_stopping = true;
+        cx.notify();
+
+        match active {
+            ActiveClipRecorder::Audio(recorder) => match recorder.stop_to_pcm() {
+                Ok((pcm, elapsed_ms)) => {
+                    cx.spawn(async move |this, cx| {
+                        let res = cx
+                            .background_executor()
+                            .spawn(async move { finish_audio_clip(pcm, elapsed_ms) })
+                            .await;
+                        let _ = this.update(cx, |composer, cx| {
+                            composer.clip_stopping = false;
+                            match res {
+                                Ok(clip) => {
+                                    composer.attachments.push(PendingAttachment {
+                                        filename: clip.filename,
+                                        bytes: clip.bytes,
+                                        preview: None,
+                                    });
+                                }
+                                Err(err) => {
+                                    composer.upload_warning =
+                                        Some(format!("Audio clip encoding failed: {err}"));
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(err) => {
+                    self.clip_stopping = false;
+                    self.upload_warning = Some(format!("Audio clip error: {err}"));
+                    cx.notify();
+                }
+            },
+            ActiveClipRecorder::Video { recorder, .. } => {
+                cx.spawn(async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move { recorder.stop() })
+                        .await;
+                    let _ = this.update(cx, |composer, cx| {
+                        composer.clip_stopping = false;
+                        match res {
+                            Ok(clip) => {
+                                composer.attachments.push(PendingAttachment {
+                                    filename: clip.filename,
+                                    bytes: clip.bytes,
+                                    preview: None,
+                                });
+                            }
+                            Err(err) => {
+                                composer.upload_warning =
+                                    Some(format!("Video clip encoding failed: {err}"));
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn spawn_clip_ticker(&mut self, cx: &mut Context<Self>) {
+        self.clip_ticker = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let keep_going = this
+                    .update(cx, |composer, cx| {
+                        let Some(active) = composer.clip_recorder.as_ref() else {
+                            return false;
+                        };
+                        if let ActiveClipRecorder::Video { recorder, .. } = active {
+                            if let Some(vf) = recorder.latest_preview() {
+                                if let Some(buf) =
+                                    image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
+                                        vf.width,
+                                        vf.height,
+                                        (*vf.bgra).clone(),
+                                    )
+                                {
+                                    let frame = image::Frame::new(buf);
+                                    composer.clip_preview =
+                                        Some(Arc::new(RenderImage::new(vec![frame])));
+                                }
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 
     /// Show Slack's "Also send to…" checkbox (unticked) under the draft, or hide it.

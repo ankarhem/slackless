@@ -176,7 +176,7 @@ impl Drop for ScreenCapture {
     }
 }
 
-fn capture_once(source_id: &str) -> Option<xcap::image::RgbaImage> {
+pub(crate) fn capture_once(source_id: &str) -> Option<xcap::image::RgbaImage> {
     if let Some(mon_id) = source_id
         .strip_prefix("monitor:")
         .and_then(|s| s.parse::<u32>().ok())

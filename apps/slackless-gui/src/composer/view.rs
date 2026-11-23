@@ -9,8 +9,8 @@ use gpui_kit::gpui::{
     AnyElement, App, BorderStyle, Bounds, ContentMask, Context, Corners, Div, Edges, ExternalPaths,
     Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, MouseButton,
     MouseDownEvent, PaintQuad, ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, StyledText, Window, canvas, div, point, px,
-    relative, rems,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, StyledText, Window, canvas,
+    div, point, px, relative, rems,
 };
 
 use super::tokens::{self, Palette};
@@ -18,6 +18,167 @@ use super::toolbar::TOOLBAR;
 use super::{BAR_TUCK, Composer, Placeholder};
 
 impl Composer {
+    /// Inline native clip recording bar shown inside the composer while recording or encoding
+    /// an audio/video clip (`F-CORE-127`, `F-CORE-128`, `F-CORE-131`).
+    fn clip_recording_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.clip_recorder.is_none() && !self.clip_stopping {
+            return None;
+        }
+        let theme = cx.theme();
+        let (danger, fg, muted, border, surface, primary, primary_fg) = (
+            theme.danger,
+            theme.foreground,
+            theme.muted_foreground,
+            theme.border,
+            theme.secondary.opacity(0.65),
+            theme.primary,
+            theme.primary_foreground,
+        );
+        if self.clip_stopping {
+            return Some(
+                h_flex()
+                    .mx_2()
+                    .mt_1p5()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(surface)
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::LoaderCircle)
+                            .size(px(14.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child("Encoding clip\u{2026}"),
+                    ),
+            );
+        }
+        let active = self.clip_recorder.as_ref()?;
+        let (label, elapsed_ms, bars, preview) = match active {
+            super::ActiveClipRecorder::Audio(rec) => (
+                "Recording audio clip",
+                rec.elapsed_ms(),
+                Some(rec.live_bars()),
+                None,
+            ),
+            super::ActiveClipRecorder::Video {
+                recorder,
+                is_screen,
+            } => (
+                if *is_screen {
+                    "Recording screen clip"
+                } else {
+                    "Recording video clip"
+                },
+                recorder.elapsed_ms(),
+                None,
+                self.clip_preview.clone(),
+            ),
+        };
+        let secs = elapsed_ms / 1000;
+        let timer = format!("{:02}:{:02}", secs / 60, secs % 60);
+        Some(
+            h_flex()
+                .mx_2()
+                .mt_1p5()
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(danger.opacity(0.45))
+                .bg(danger.opacity(0.08))
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(div().size(px(8.)).rounded_full().bg(danger).flex_none())
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(danger)
+                                .child(timer),
+                        )
+                        .when_some(bars, |row, bars| {
+                            row.child(h_flex().items_center().gap(px(2.)).h(px(20.)).children(
+                                bars.into_iter().map(|level| {
+                                    let h = (4. + level * 14.).clamp(4., 18.);
+                                    div()
+                                        .w(px(2.5))
+                                        .h(px(h))
+                                        .rounded_full()
+                                        .bg(danger.opacity(0.75))
+                                }),
+                            ))
+                        })
+                        .when_some(preview, |row, img_frame| {
+                            row.child(
+                                gpui_kit::gpui::img(img_frame)
+                                    .w(px(56.))
+                                    .h(px(32.))
+                                    .rounded(px(4.))
+                                    .object_fit(gpui_kit::gpui::ObjectFit::Cover),
+                            )
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .flex_none()
+                        .child(
+                            div()
+                                .id("clip-discard")
+                                .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(muted)
+                                .hover(|el| el.bg(theme.secondary_hover).text_color(fg))
+                                .child("Discard")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_clip(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("clip-stop-attach")
+                                .cursor_pointer()
+                                .px_2p5()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(primary)
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(primary_fg)
+                                .hover(|el| el.bg(theme.primary_hover))
+                                .child("Stop & attach")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.stop_and_attach_clip(cx)),
+                                ),
+                        ),
+                ),
+        )
+    }
+
     /// The link prompt floating above the frame: a URL field for the selected text.
     fn link_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
@@ -150,6 +311,7 @@ impl Render for Composer {
                         .child("MD"),
                 )
         });
+        let clip_bar = self.clip_recording_bar(cx);
         let attachments = self.attachments_strip(cx);
         let upload_warning = self.upload_warning.clone().map(|msg| {
             let danger = cx.theme().danger;
@@ -333,6 +495,7 @@ impl Render for Composer {
                             })
                     })
                     .children(toolbar)
+                    .children(clip_bar)
                     .child(
                         div()
                             .relative()
