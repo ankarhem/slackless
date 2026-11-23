@@ -69,6 +69,7 @@ mod threads;
 mod threads_cards;
 mod threads_view;
 mod thumbnail;
+mod tools_page;
 mod unreads;
 mod zoom;
 

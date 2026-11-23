@@ -698,9 +698,12 @@ impl Sidebar {
                 )
             })
             .on_click(cx.listener(move |this, _, _, cx| match item {
-                // Both destinations' pages live in the root, which opens them.
+                // Full-page destinations live in the root, which opens them.
                 NavItem::Activity => cx.emit(SidebarEvent::OpenActivity),
                 NavItem::Files => cx.emit(SidebarEvent::OpenFiles),
+                NavItem::Todos => cx.emit(SidebarEvent::OpenLater),
+                NavItem::Agents => cx.emit(SidebarEvent::OpenTools),
+                NavItem::Admin => cx.emit(SidebarEvent::OpenAdmin),
                 _ => this.show_nav(item, cx),
             }))
     }

@@ -1584,6 +1584,8 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.files_page
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
+        self.tools_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         let keep = self.ws.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
         // Hydrate custom status from Slack's live self profile (preserving active focus mode).

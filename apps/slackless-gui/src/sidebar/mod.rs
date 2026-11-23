@@ -161,6 +161,10 @@ pub enum SidebarEvent {
     OpenFiles,
     /// A Files list-column row: show that page of the Files view.
     ShowFilesSection(FilesSection),
+    /// The rail's Agents & tools tile: open the dedicated native Tools page.
+    OpenTools,
+    /// The rail's Admin tile: open workspace administration in the browser.
+    OpenAdmin,
 }
 
 /// The nav destinations stacked in the workspace rail.
@@ -630,7 +634,10 @@ impl Sidebar {
     /// conversation or another full-column view takes over); nothing to do from any other
     /// destination.
     pub(crate) fn leave_pages(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.active_nav, NavItem::Activity | NavItem::Files) {
+        if matches!(
+            self.active_nav,
+            NavItem::Activity | NavItem::Files | NavItem::Agents | NavItem::Todos
+        ) {
             self.show_nav(NavItem::Home, cx);
         }
     }
@@ -755,6 +762,8 @@ impl Sidebar {
             NavItem::Activity => cx.emit(SidebarEvent::OpenActivity),
             NavItem::Files => cx.emit(SidebarEvent::OpenFiles),
             NavItem::Todos => cx.emit(SidebarEvent::OpenLater),
+            NavItem::Agents => cx.emit(SidebarEvent::OpenTools),
+            NavItem::Admin => cx.emit(SidebarEvent::OpenAdmin),
             _ => {}
         }
     }

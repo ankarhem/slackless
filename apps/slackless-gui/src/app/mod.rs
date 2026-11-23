@@ -530,6 +530,7 @@ pub(super) enum NavPlace {
     Directories,
     Activity,
     Files,
+    Tools,
 }
 
 /// Which right-hand panel was last closed by `ToggleRightPane` (`Cmd+.`) so pressing it
@@ -660,6 +661,9 @@ pub struct App {
     /// The directory; replaces the message column while `directory_open`.
     directory: Entity<DirectoryView>,
     directory_open: bool,
+    /// Native `Agents & tools` view (Apps, Slash commands, Slack Connect).
+    tools_page: Entity<crate::tools_page::ToolsPage>,
+    tools_open: bool,
     /// The "New message" view; replaces the message column while `compose_open`.
     compose: Entity<NewMessageView>,
     compose_open: bool,
@@ -909,6 +913,7 @@ impl App {
             let files_page = FilesPage::new(fixtures.clone(), window, cx);
             let huddles = HuddlesView::new(fixtures.clone(), cx);
             let directory = DirectoryView::new(fixtures.clone(), window, cx);
+            let tools_page = crate::tools_page::ToolsPage::new(fixtures.clone(), window, cx);
             let compose = NewMessageView::new(fixtures.clone(), window, cx);
             let details = ChannelDetails::new(fixtures.clone(), window, cx);
             let canvas_search = cx.new(|cx| {
@@ -1885,6 +1890,48 @@ impl App {
                     },
                 ),
                 cx.subscribe_in(
+                    &tools_page,
+                    window,
+                    |this: &mut App, _, event: &crate::tools_page::ToolsPageEvent, window, cx| {
+                        match event {
+                            crate::tools_page::ToolsPageEvent::OpenAppDm(user) => {
+                                let dm = this
+                                    .fixtures
+                                    .dms
+                                    .iter()
+                                    .find(|c| c.user.as_ref() == Some(user))
+                                    .map(|c| c.id.clone());
+                                if let Some(dm) = dm {
+                                    this.select(dm, cx);
+                                } else if this.bridge.store().is_some() {
+                                    this.bridge.send(Command::OpenDm {
+                                        users: vec![user.clone()],
+                                    });
+                                } else {
+                                    this.open_profile(user.clone(), cx);
+                                }
+                            }
+                            crate::tools_page::ToolsPageEvent::OpenChannel(channel) => {
+                                this.select(channel.clone(), cx);
+                            }
+                            crate::tools_page::ToolsPageEvent::InsertCommand(cmd) => {
+                                this.tools_open = false;
+                                this.sidebar.update(cx, |s, cx| s.leave_pages(cx));
+                                this.composer.update(cx, |composer, cx| {
+                                    composer.load_draft(cmd, cx);
+                                    composer.focus_input(window, cx);
+                                });
+                                cx.notify();
+                            }
+                            crate::tools_page::ToolsPageEvent::Close => {
+                                this.tools_open = false;
+                                this.sidebar.update(cx, |s, cx| s.leave_pages(cx));
+                                cx.notify();
+                            }
+                        }
+                    },
+                ),
+                cx.subscribe_in(
                     &details,
                     window,
                     |this: &mut App, _, event: &ChannelDetailsEvent, window, cx| {
@@ -2089,6 +2136,8 @@ impl App {
                 huddles_open: false,
                 directory,
                 directory_open: false,
+                tools_page,
+                tools_open: false,
                 compose,
                 compose_open: false,
                 details,
@@ -2348,6 +2397,8 @@ impl Render for App {
             v_flex().size_full().child(self.huddles.clone())
         } else if self.directory_open {
             v_flex().size_full().child(self.directory.clone())
+        } else if self.tools_open {
+            v_flex().size_full().child(self.tools_page.clone())
         } else if self.compose_open {
             v_flex().size_full().child(self.compose.clone())
         } else if self.activity_open {
@@ -3458,6 +3509,8 @@ fn subscribe_workspace(
                     cx.notify();
                 }
                 SidebarEvent::OpenFiles => this.open_files(cx),
+                SidebarEvent::OpenTools => this.open_tools(cx),
+                SidebarEvent::OpenAdmin => this.open_admin(window, cx),
                 SidebarEvent::ShowFilesSection(section) => this
                     .files_page
                     .update(cx, |page, cx| page.show_section(*section, window, cx)),

@@ -883,6 +883,8 @@ impl App {
             NavPlace::Saved
         } else if self.directory_open {
             NavPlace::Directories
+        } else if self.tools_open {
+            NavPlace::Tools
         } else if self.activity_open {
             NavPlace::Activity
         } else if self.sidebar.read(cx).active_nav() == NavItem::Files {
@@ -916,6 +918,7 @@ impl App {
             && !self.unreads_open
             && !self.huddles_open
             && !self.directory_open
+            && !self.tools_open
             && !self.compose_open
             && !self.activity_open
             && self.sidebar.read(cx).active_nav() != crate::sidebar::NavItem::Files
@@ -947,6 +950,7 @@ impl App {
             NavPlace::Directories => self.show_directory(cx),
             NavPlace::Activity => self.show_activity(cx),
             NavPlace::Files => self.show_files(cx),
+            NavPlace::Tools => self.show_tools(cx),
         }
     }
 
@@ -1538,6 +1542,7 @@ impl App {
             && !self.unreads_open
             && !self.huddles_open
             && !self.directory_open
+            && !self.tools_open
             && !self.compose_open
             && !self.activity_open
     }
@@ -1908,6 +1913,7 @@ impl App {
         self.forward.clear();
         self.huddles_open = false;
         self.directory_open = false;
+        self.tools_open = false;
         self.compose_open = false;
         self.pending_dm = None;
         self.close_thread(cx);
@@ -1928,6 +1934,8 @@ impl App {
             .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
         // The Files view serves every workspace: its rows follow the shown one.
         self.files_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
+        self.tools_page
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         // Before the draft is loaded: its mentions are named from this workspace.
         self.composer
@@ -2026,6 +2034,7 @@ impl App {
         self.unreads_open = false;
         self.huddles_open = false;
         self.directory_open = false;
+        self.tools_open = false;
         self.compose_open = false;
         self.activity_open = false;
         // The Activity and Files pages are sidebar destinations, so leaving the full-column
@@ -2254,12 +2263,53 @@ impl App {
         match item {
             NavItem::Activity => self.open_activity(cx),
             NavItem::Files => self.open_files(cx),
+            NavItem::Todos => self.open_later(cx),
+            NavItem::Agents => self.open_tools(cx),
             _ => {
                 self.close_full_column_views(cx);
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.show_nav(item, cx));
                 cx.notify();
             }
+        }
+    }
+
+    /// Native `Agents & tools` view (Apps, Slash commands, Slack Connect).
+    pub(super) fn open_tools(&mut self, cx: &mut Context<Self>) {
+        self.record_nav(&NavPlace::Tools, cx);
+        self.show_tools(cx);
+    }
+
+    pub(super) fn show_tools(&mut self, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        let fixtures = self.fixtures.clone();
+        self.tools_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures, cx));
+        self.close_full_column_views(cx);
+        self.tools_open = true;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.show_nav(NavItem::Agents, cx));
+        cx.notify();
+    }
+
+    /// Open Slack workspace administration in the default browser.
+    pub(super) fn open_admin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let domain = self
+            .fixtures
+            .workspaces
+            .get(self.workspace)
+            .or_else(|| self.fixtures.workspaces.first())
+            .map(|t| t.domain.as_str())
+            .filter(|d| !d.is_empty());
+        if let Some(domain) = domain {
+            cx.open_url(&format!("https://{domain}.slack.com/admin"));
+        } else {
+            notify(
+                "Workspace Admin",
+                "Sign in to a workspace to open Slack Admin settings.",
+                window,
+                cx,
+            );
         }
     }
 
