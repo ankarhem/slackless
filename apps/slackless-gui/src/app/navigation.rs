@@ -261,17 +261,34 @@ impl App {
         }
     }
 
-    /// A tab row entry was clicked: switch the column, open the channel canvas in Slack's
-    /// web client, or create the missing canvas.
+    /// A tab row entry was clicked: switch the column, load the live channel canvas in the
+    /// native reader, or create the missing canvas.
     pub(super) fn activate_tab(&mut self, action: TabAction, cx: &mut Context<Self>) {
         match action {
             TabAction::Switch(target) => self.select_tab(target, cx),
-            TabAction::OpenCanvas(file) => cx.open_url(&self.canvas_link(&file)),
+            TabAction::OpenCanvas(file) => self.open_live_canvas(file, cx),
             TabAction::AddCanvas => {
                 self.bridge
                     .send(Command::CreateChannelCanvas(self.channel.clone()));
             }
         }
+    }
+
+    /// Open `file_id` natively inside the in-app Canvas reader (`F-COLLAB-125`), fetching its
+    /// read-only HTML export (`files.info` -> `url_private`) if not cached yet.
+    pub(super) fn open_live_canvas(&mut self, file_id: String, cx: &mut Context<Self>) {
+        self.close_full_column_views(cx);
+        self.active_canvas = Some(file_id.clone());
+        self.tab = ConversationTab::Canvas;
+        let needs_load = match self.canvases.get(&file_id) {
+            None | Some(Err(_)) => true,
+            Some(Ok(_)) => false,
+        };
+        if needs_load && !self.fixtures.sample {
+            self.canvases.remove(&file_id);
+            self.bridge.send(Command::LoadCanvas { file_id });
+        }
+        cx.notify();
     }
 
     /// Show `target`'s body. The Pins tab toggles the right-hand panel over the messages
@@ -788,8 +805,9 @@ impl App {
     }
 
     /// The header's huddle button: the sample workspace toggles its huddle bar; a live
-    /// conversation starts or joins its huddle in Slack's web client (no media stack here).
-    pub(super) fn start_huddle(&mut self, cx: &mut Context<Self>) {
+    /// conversation starts or joins its huddle in Slack's web client (with a confirmation
+    /// warning on channels with 150+ members, `F-COLLAB-055`).
+    pub(super) fn start_huddle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let has_fixture_bar = self
             .huddle
             .as_ref()
@@ -797,8 +815,60 @@ impl App {
         if has_fixture_bar {
             self.huddle_open = !self.huddle_open;
             cx.notify();
+            return;
+        }
+        let member_count = self
+            .member_counts
+            .get(&self.channel)
+            .copied()
+            .or_else(|| {
+                self.fixtures
+                    .conversation(&self.channel)
+                    .and_then(|c| c.num_members)
+            })
+            .unwrap_or(0);
+        let is_channel = self.fixtures.conversation(&self.channel).is_some_and(|c| {
+            matches!(
+                c.kind(),
+                ConversationKind::PublicChannel | ConversationKind::PrivateChannel
+            )
+        });
+        let link = self.huddle_link();
+        if is_channel && member_count >= 150 {
+            let label = self.label(&self.channel);
+            window.open_dialog(cx, move |dialog, _, cx| {
+                let muted = cx.theme().muted_foreground;
+                let link = link.clone();
+                dialog
+                    .title(format!("Start a huddle in {label}?"))
+                    .w(px(440.))
+                    .child(
+                        v_flex()
+                            .gap_4()
+                            .child(div().text_color(muted).child(format!(
+                                "This channel has {member_count} members. Starting a huddle may notify everyone in {label}."
+                            )))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(Button::new("huddle-warn-cancel").label("Cancel").on_click(
+                                        |_, window, cx| window.close_dialog(cx),
+                                    ))
+                                    .child(
+                                        Button::new("huddle-warn-go")
+                                            .primary()
+                                            .label("Start huddle")
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                cx.open_url(&link);
+                                            }),
+                                    ),
+                            ),
+                    )
+            });
         } else {
-            cx.open_url(&self.huddle_link());
+            cx.open_url(&link);
         }
     }
 

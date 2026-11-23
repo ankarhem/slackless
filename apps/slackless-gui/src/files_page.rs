@@ -192,6 +192,10 @@ pub enum FilesPageEvent {
     Load(FilesFilter),
     /// Save a file for Later (`saved.add` with `item_type=file`, `F-CORE-157`).
     SaveFile { file_id: String, name: String },
+    /// Permanently delete a user-owned file/clip (`files.delete`, `F-CORE-130`).
+    DeleteFile { file_id: String, name: String },
+    /// Preview a Slack canvas natively in the in-app Canvas reader (`F-COLLAB-125`).
+    OpenCanvas { file_id: String },
 }
 
 /// Client-side sort order over the loaded files page (`F-CORE-133`).
@@ -337,6 +341,16 @@ impl FilesPage {
         if source == self.section.source() {
             self.refilter();
         }
+        cx.notify();
+    }
+
+    /// Remove a deleted file from all cached sources immediately (`Event::FileDeleted`).
+    pub fn remove_file(&mut self, file_id: &str, cx: &mut Context<Self>) {
+        for rows in &mut self.rows {
+            rows.files.retain(|f| f.id.as_str() != file_id);
+            rows.meta = metas(&self.fixtures, &rows.files);
+        }
+        self.refilter();
         cx.notify();
     }
 
@@ -550,6 +564,7 @@ impl Render for FilesPage {
             }
         } else {
             let this = cx.weak_entity();
+            let self_user = self.fixtures.self_user.clone();
             v_flex()
                 .rounded_lg()
                 .border_1()
@@ -560,6 +575,7 @@ impl Render for FilesPage {
                         &rows.files[index],
                         &rows.meta[index],
                         position > 0,
+                        &self_user,
                         this.clone(),
                         cx,
                     )
@@ -613,13 +629,14 @@ fn state_block(title: Option<&'static str>, line: &'static str, fg: Hsla, dim: H
         .child(div().text_color(dim).child(line))
 }
 
-/// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens the file's
-/// permalink in the browser (a file without one is a plain row) and offers "Save for later"
-/// (`F-CORE-157`).
+/// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens canvases in
+/// the native reader (other files in the browser), offers "Save for later" (`F-CORE-157`), and
+/// offers "Delete file" on files owned by `self_user` (`F-CORE-130`).
 fn file_row(
     file: &File,
     meta: &SharedString,
     divided: bool,
+    self_user: &UserId,
     page: gpui_kit::gpui::WeakEntity<FilesPage>,
     cx: &App,
 ) -> Stateful<Div> {
@@ -627,6 +644,11 @@ fn file_row(
     let (icon, tile) = file_icon(file, cx);
     let file_id = file.id.to_string();
     let file_title = display_name(file).to_owned();
+    let is_own = file.user.as_ref() == Some(self_user);
+    let is_canvas = file.filetype.as_deref() == Some("quip");
+    let page_save = page.clone();
+    let fid_save = file_id.clone();
+    let title_save = file_title.clone();
     let save_btn = Button::new(SharedString::from(format!("files-save-{file_id}")))
         .ghost()
         .with_size(Size::XSmall)
@@ -634,13 +656,32 @@ fn file_row(
         .tooltip("Save file for later")
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
-            let _ = page.update(cx, |_, cx| {
+            let _ = page_save.update(cx, |_, cx| {
                 cx.emit(FilesPageEvent::SaveFile {
-                    file_id: file_id.clone(),
-                    name: file_title.clone(),
+                    file_id: fid_save.clone(),
+                    name: title_save.clone(),
                 });
             });
         });
+    let delete_btn = is_own.then(|| {
+        let page_del = page.clone();
+        let fid_del = file_id.clone();
+        let title_del = file_title.clone();
+        Button::new(SharedString::from(format!("files-del-{file_id}")))
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::Trash)
+            .tooltip("Delete file")
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = page_del.update(cx, |_, cx| {
+                    cx.emit(FilesPageEvent::DeleteFile {
+                        file_id: fid_del.clone(),
+                        name: title_del.clone(),
+                    });
+                });
+            })
+    });
     let row = h_flex()
         .id(SharedString::from(format!("files-row-{}", file.id)))
         .items_center()
@@ -681,7 +722,22 @@ fn file_row(
                         .child(meta.clone()),
                 ),
         )
-        .child(save_btn);
+        .child(save_btn)
+        .children(delete_btn);
+    if is_canvas {
+        let hover = theme.accent;
+        let fid_canvas = file_id.clone();
+        return row
+            .cursor_pointer()
+            .hover(move |row| row.bg(hover))
+            .on_click(move |_, _, cx| {
+                let _ = page.update(cx, |_, cx| {
+                    cx.emit(FilesPageEvent::OpenCanvas {
+                        file_id: fid_canvas.clone(),
+                    });
+                });
+            });
+    }
     let link = file
         .permalink
         .clone()

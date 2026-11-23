@@ -318,6 +318,7 @@ actions!(
         OpenHome,
         OpenLater,
         OpenFiles,
+        OpenMore,
         OpenPeople,
         OpenOwnProfile,
         CreateChannelAction,
@@ -328,6 +329,8 @@ actions!(
         NextConversation,
         PreviousUnread,
         NextUnread,
+        NextSection,
+        PrevSection,
         MarkConversationRead,
         MarkAllRead,
         SearchConversation,
@@ -613,6 +616,14 @@ pub struct App {
     /// Live mode: per channel, its shared files (`files.list`), fetched each time Files &
     /// links opens.
     files: HashMap<ChannelId, Loaded<File>>,
+    /// Live mode: parsed read-only canvases keyed by file id (`files.info` -> `url_private`, `F-COLLAB-125`).
+    canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
+    /// File id of the live canvas currently displayed in `ConversationTab::Canvas`.
+    active_canvas: Option<String>,
+    /// In-canvas Find field (`F-SHELL-266`).
+    canvas_search: Entity<TextareaState>,
+    /// Current in-canvas Find query.
+    canvas_query: String,
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).
@@ -852,6 +863,11 @@ impl App {
             let directory = DirectoryView::new(fixtures.clone(), window, cx);
             let compose = NewMessageView::new(fixtures.clone(), window, cx);
             let details = ChannelDetails::new(fixtures.clone(), window, cx);
+            let canvas_search = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Find in canvas…")
+                    .auto_grow(1, 1)
+            });
             if fixtures.sample {
                 later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
             }
@@ -881,8 +897,11 @@ impl App {
                 KeyBinding::new("cmd-shift-s", ToggleWorkspaceRail, None),
                 KeyBinding::new("cmd-.", ToggleRightPane, None),
                 KeyBinding::new("cmd-shift-backspace", UnsendLastMessage, None),
+                KeyBinding::new("cmd-shift-m", OpenMore, None),
                 KeyBinding::new("ctrl-tab", NextNavTab, None),
                 KeyBinding::new("ctrl-shift-tab", PrevNavTab, None),
+                KeyBinding::new("ctrl-down", NextSection, None),
+                KeyBinding::new("ctrl-up", PrevSection, None),
                 KeyBinding::new("f6", FocusNextPane, None),
                 KeyBinding::new("shift-f6", FocusPrevPane, None),
                 // Slack's View menu shows Cmd++; Cmd+= (no Shift) zooms in too.
@@ -1485,6 +1504,21 @@ impl App {
                             });
                             notify("Saved for later", name.clone(), window, cx);
                         }
+                        FilesPageEvent::DeleteFile { file_id, name } => {
+                            this.confirm_delete_file(file_id.clone(), name.clone(), window, cx);
+                        }
+                        FilesPageEvent::OpenCanvas { file_id } => {
+                            this.open_live_canvas(file_id.clone(), cx);
+                        }
+                    },
+                ),
+                cx.subscribe(
+                    &canvas_search,
+                    |this: &mut App, input, event: &InputEvent, cx| {
+                        if let InputEvent::Change = event {
+                            this.canvas_query = input.read(cx).value().to_string();
+                            cx.notify();
+                        }
                     },
                 ),
                 cx.subscribe_in(
@@ -1721,6 +1755,10 @@ impl App {
                 pins: HashMap::new(),
                 bookmarks: HashMap::new(),
                 files: HashMap::new(),
+                canvases: HashMap::new(),
+                active_canvas: None,
+                canvas_search,
+                canvas_query: String::new(),
                 fixture_bookmarks: HashMap::new(),
                 os: Rc::new(platform::current()),
                 badge: None,
@@ -1984,7 +2022,33 @@ impl Render for App {
                     }
                 }
                 ConversationTab::Canvas => {
-                    column.child(div().flex_1().min_h_0().child(canvas_view(cx)))
+                    let view = if self.fixtures.sample {
+                        canvas_view(cx)
+                    } else {
+                        let file_id = self.active_canvas.clone().or_else(|| {
+                            conversation
+                                .as_ref()
+                                .and_then(|c| c.properties.as_ref())
+                                .and_then(|p| p.canvas.as_ref())
+                                .and_then(|cv| cv.file_id.as_ref())
+                                .map(|f| f.to_string())
+                        });
+                        let loaded = file_id.as_deref().and_then(|id| self.canvases.get(id));
+                        let open_browser = file_id.map(|id| {
+                            let url = self.canvas_link(&id);
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                cx.open_url(&url);
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        crate::canvas::live_canvas_view(
+                            loaded,
+                            &self.canvas_query,
+                            Some(&self.canvas_search),
+                            open_browser,
+                            cx,
+                        )
+                    };
+                    column.child(div().flex_1().min_h_0().child(view))
                 }
                 ConversationTab::List => {
                     column.child(div().flex_1().min_h_0().child(list_view(cx)))
@@ -2373,6 +2437,19 @@ impl Render for App {
                 if this.showing_transcript() {
                     this.messages
                         .update(cx, |m, cx| m.jump(crate::messages::Jump::Recent, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenMore, _, cx| {
+                this.open_directory(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextSection, _, cx| {
+                if let Some(next) = this.sidebar.read(cx).step_section(&this.channel, true) {
+                    this.select(next, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrevSection, _, cx| {
+                if let Some(prev) = this.sidebar.read(cx).step_section(&this.channel, false) {
+                    this.select(prev, cx);
                 }
             }))
             .relative()

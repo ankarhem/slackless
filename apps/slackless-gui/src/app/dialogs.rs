@@ -1664,7 +1664,7 @@ impl App {
                     purpose: purpose.clone(),
                 });
             }
-            ChannelDetailsEvent::StartHuddle => self.start_huddle(cx),
+            ChannelDetailsEvent::StartHuddle => self.start_huddle(window, cx),
             ChannelDetailsEvent::SetNotifyLevel { channel, level } => {
                 self.bridge.send(Command::SetNotifyLevel {
                     channel: channel.clone(),
@@ -1676,6 +1676,52 @@ impl App {
                 self.open_profile(user.clone(), cx);
             }
         }
+    }
+
+    /// Confirm permanent deletion of a user-owned file/clip (`files.delete`, `F-CORE-130`).
+    pub(super) fn confirm_delete_file(
+        &self,
+        file_id: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            let this = this.clone();
+            let file_id = file_id.clone();
+            dialog.title("Delete file?").w(px(420.)).child(
+                v_flex()
+                    .gap_4()
+                    .child(div().text_color(muted).child(format!(
+                        "Permanently delete \"{name}\"? This cannot be undone."
+                    )))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("delete-file-cancel")
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("delete-file-confirm")
+                                    .danger()
+                                    .label("Delete")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        let _ = this.update(cx, |app, _| {
+                                            app.bridge.send(Command::DeleteFile {
+                                                file_id: file_id.clone(),
+                                            });
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+        });
     }
 
     /// Confirm and clear local SQLite message cache (`Preferences -> Advanced -> Clear local cache`).

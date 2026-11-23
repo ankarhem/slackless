@@ -2799,6 +2799,47 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `files.info`: fetch metadata for one file or canvas (`F-COLLAB-125`).
+    pub async fn files_info(&self, file_id: &str) -> Result<File> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            file: File,
+        }
+        let params = vec![("file", file_id.to_owned())];
+        Ok(self
+            .call::<Resp>(method::FILES_INFO, params)
+            .await?
+            .data
+            .file)
+    }
+
+    /// `files.delete`: permanently delete a file/clip uploaded by the user (`F-CORE-130`).
+    pub async fn files_delete(&self, file_id: &str) -> Result<()> {
+        let params = vec![("file", file_id.to_owned())];
+        self.call::<Empty>(method::FILES_DELETE, params).await?;
+        Ok(())
+    }
+
+    /// Fetch a live Slack canvas's read-only HTML export (`files.info` -> `url_private` with
+    /// session cookie, `F-COLLAB-125`). Returns `(title, html)`.
+    pub async fn fetch_canvas_html(&self, file_id: &str) -> Result<(String, String)> {
+        let file = self.files_info(file_id).await?;
+        let title = file
+            .title
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| file.name.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "Canvas".to_owned());
+        let url = file
+            .url_private
+            .as_deref()
+            .or(file.url_private_download.as_deref())
+            .ok_or_else(|| crate::ApiError::Slack("canvas_no_private_url".to_owned()))?;
+        let bytes = self.download_file(url).await?;
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        Ok((title, html))
+    }
+
     /// `saved.update`: transition a saved item's state (`mark`) and/or update or clear (`Some(None)`)
     /// its reminder due time (`date_due`).
     pub async fn saved_update(

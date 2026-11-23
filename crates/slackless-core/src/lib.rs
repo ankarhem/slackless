@@ -331,6 +331,14 @@ pub enum Command {
         file_id: String,
         date_due: Option<u64>,
     },
+    /// Permanently delete a user-owned file/clip (`files.delete`, `F-CORE-130`).
+    DeleteFile {
+        file_id: String,
+    },
+    /// Fetch a live Slack canvas's read-only HTML export (`files.info` + `url_private`, `F-COLLAB-125`).
+    LoadCanvas {
+        file_id: String,
+    },
     /// Update a Later item's state (`mark`) and/or reminder due time (`date_due`, `Some(None)` clears).
     UpdateSavedItem {
         channel: ChannelId,
@@ -625,6 +633,14 @@ pub enum Event {
     /// A queued offline mutation failed while flushing on reconnect; stays persisted until
     /// retried via [`Command::RetryOfflineMutation`] or discarded via [`Command::DiscardOfflineMutation`].
     OfflineMutationFailed(FailedMutation),
+    /// A live Slack canvas HTML export finished loading (`F-COLLAB-125`).
+    CanvasLoaded {
+        file_id: String,
+        title: String,
+        html: Result<String, String>,
+    },
+    /// A user-owned file was deleted via `files.delete` (`F-CORE-130`).
+    FileDeleted { file_id: String },
     /// A non-fatal failure worth surfacing.
     Error(String),
 }

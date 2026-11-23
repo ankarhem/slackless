@@ -837,6 +837,27 @@ impl App {
                     list.set_block_suggestions(key.clone(), options.clone(), cx);
                 });
             }
+            Event::CanvasLoaded {
+                file_id,
+                title,
+                html,
+            } => {
+                let parsed = match html {
+                    Ok(raw) => Ok(crate::canvas::CanvasDoc::from_html(title.clone(), raw)),
+                    Err(err) => Err(err.clone()),
+                };
+                self.canvases.insert(file_id.clone(), parsed);
+                cx.notify();
+            }
+            Event::FileDeleted { file_id } => {
+                self.files_page
+                    .update(cx, |page, cx| page.remove_file(file_id, cx));
+                for list in self.files.values_mut().flatten() {
+                    list.retain(|f| f.id.as_str() != file_id);
+                }
+                notify("File deleted", "Removed file from Slack.", window, cx);
+                cx.notify();
+            }
             _ => {}
         }
     }

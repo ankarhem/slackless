@@ -93,7 +93,11 @@ enum Commands {
     /// List direct messages and group DMs known to the local archive.
     Dms,
     /// Show local SQLite archive statistics (offline).
-    Stats,
+    Stats {
+        /// Include per-table row counts and the top 10 largest channels.
+        #[arg(long)]
+        breakdown: bool,
+    },
     /// Checkpoint WAL, compact unused pages (VACUUM), and optimize FTS5 indexes (offline).
     Vacuum,
     /// List archived thread roots with replies from the local archive (offline).
@@ -204,7 +208,7 @@ async fn dispatch(
         Commands::React { channel, ts, emoji } => run_react(ctx, flag, &channel, &ts, &emoji).await,
         Commands::Channels => cmd_channels(ctx, workspace.as_ref()),
         Commands::Dms => cmd_dms(ctx, workspace.as_ref()),
-        Commands::Stats => cmd_stats(ctx, workspace.as_ref()),
+        Commands::Stats { breakdown } => cmd_stats(ctx, workspace.as_ref(), breakdown),
         Commands::Vacuum => cmd_vacuum(ctx, workspace.as_ref()),
         Commands::Threads { channel, limit } => {
             cmd_threads(ctx, workspace.as_ref(), channel.as_deref(), limit)
@@ -428,7 +432,7 @@ fn cmd_dms(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
+fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>, breakdown: bool) -> Result<ExitCode> {
     let Some(workspace) = workspace else {
         return Ok(empty_local(
             ctx,
@@ -444,7 +448,16 @@ fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
     let stats = store
         .stats(workspace)
         .with_context(|| format!("reading local archive stats for {workspace}"))?;
-    let json = serde_json::json!({
+    let detail = if breakdown {
+        Some(
+            store
+                .storage_breakdown(workspace, 10)
+                .with_context(|| format!("reading archive breakdown for {workspace}"))?,
+        )
+    } else {
+        None
+    };
+    let mut json = serde_json::json!({
         "workspace": workspace.as_str(),
         "db_path": db_path.as_ref().map(|p| p.display().to_string()),
         "db_bytes": stats.db_bytes(),
@@ -454,7 +467,7 @@ fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
         "users": stats.users,
         "offline_queued": stats.offline_queued,
     });
-    let human = format_stats_human(
+    let mut human = format_stats_human(
         workspace.as_str(),
         db_path.as_deref(),
         stats.db_bytes(),
@@ -464,6 +477,39 @@ fn cmd_stats(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
         stats.users,
         stats.offline_queued,
     );
+    if let Some(detail) = detail {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "tables".to_owned(),
+                serde_json::json!(
+                    detail
+                        .tables
+                        .iter()
+                        .map(|(name, rows)| serde_json::json!({"table": name, "rows": rows}))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            obj.insert(
+                "top_channels".to_owned(),
+                serde_json::json!(detail
+                    .top_channels
+                    .iter()
+                    .map(|(id, name, rows)| serde_json::json!({"id": id, "name": name, "messages": rows}))
+                    .collect::<Vec<_>>()),
+            );
+        }
+        human.push_str("\nTables:\n");
+        for (name, rows) in &detail.tables {
+            human.push_str(&format!("  {name:<18} {rows}\n"));
+        }
+        if !detail.top_channels.is_empty() {
+            human.push_str("\nTop channels by message count:\n");
+            for (id, name, rows) in &detail.top_channels {
+                let label = name.as_deref().unwrap_or(id.as_str());
+                human.push_str(&format!("  {label:<28} {rows} ({id})\n"));
+            }
+        }
+    }
     output::emit(ctx.json, &json, &human);
     Ok(ExitCode::SUCCESS)
 }

@@ -491,6 +491,13 @@ pub trait Backend: Clone + Send + Sync + 'static {
         file_id: String,
         date_due: Option<u64>,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Permanently delete a user-owned file/clip (`files.delete`, `F-CORE-130`).
+    fn delete_file(&self, file_id: String) -> impl Future<Output = api::Result<()>> + Send;
+    /// Fetch a live Slack canvas's read-only HTML export (`files.info` + `url_private`, `F-COLLAB-125`).
+    fn fetch_canvas_html(
+        &self,
+        file_id: String,
+    ) -> impl Future<Output = api::Result<(String, String)>> + Send;
 }
 
 impl Backend for SlackApi {
@@ -1085,5 +1092,13 @@ impl Backend for SlackApi {
 
     async fn save_file(&self, file_id: String, date_due: Option<u64>) -> api::Result<()> {
         self.saved_add_file(&file_id, date_due).await
+    }
+
+    async fn delete_file(&self, file_id: String) -> api::Result<()> {
+        self.files_delete(&file_id).await
+    }
+
+    async fn fetch_canvas_html(&self, file_id: String) -> api::Result<(String, String)> {
+        SlackApi::fetch_canvas_html(self, &file_id).await
     }
 }

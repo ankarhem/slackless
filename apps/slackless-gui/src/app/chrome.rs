@@ -73,8 +73,8 @@ impl App {
                 menu.item(
                     PopupMenuItem::new(start)
                         .icon(IconName::Headphones)
-                        .on_click(move |_, _, cx| {
-                            let _ = this.update(cx, |app, cx| app.start_huddle(cx));
+                        .on_click(move |_, window, cx| {
+                            let _ = this.update(cx, |app, cx| app.start_huddle(window, cx));
                         }),
                 )
                 .item(
@@ -1357,7 +1357,9 @@ impl App {
                                             .text_color(success)
                                             .child(live_count.to_string()),
                                     )
-                                    .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_huddle(window, cx)
+                                    }))
                                     .into_any_element()
                             } else {
                                 chrome_icon(
@@ -1370,7 +1372,11 @@ impl App {
                                     },
                                     accent,
                                 )
-                                .on_click(cx.listener(|this, _, _, cx| this.start_huddle(cx)))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.start_huddle(window, cx)
+                                    }),
+                                )
                                 .into_any_element()
                             })
                             .child(self.huddle_menu(cx))

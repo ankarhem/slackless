@@ -63,6 +63,19 @@ impl StoreStats {
     }
 }
 
+/// Detailed per-table row counts and largest channels for `slackless stats --breakdown`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageBreakdown {
+    pub tables: Vec<(String, u64)>,
+    pub top_channels: Vec<(String, Option<String>, u64)>,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch("PRAGMA optimize;");
+    }
+}
+
 /// Durable local-first message store; the rendering source of truth.
 pub struct Store {
     pub(crate) conn: Connection,
@@ -995,6 +1008,71 @@ impl Store {
             offline_queued: offline_queued.max(0) as u64,
             page_count: page_count.max(0) as u64,
             page_size: page_size.max(0) as u64,
+        })
+    }
+
+    /// Detailed per-table counts and the top `top_n` channels by archived message count.
+    pub fn storage_breakdown(&self, workspace: &TeamId, top_n: usize) -> Result<StorageBreakdown> {
+        let ws = workspace.as_str();
+        let table_queries = [
+            (
+                "message_current",
+                "SELECT count(*) FROM message_current WHERE workspace_id = ?1",
+            ),
+            (
+                "message_revision",
+                "SELECT count(*) FROM message_revision WHERE workspace_id = ?1",
+            ),
+            (
+                "reaction",
+                "SELECT count(*) FROM reaction WHERE workspace_id = ?1",
+            ),
+            (
+                "conversation",
+                "SELECT count(*) FROM conversation WHERE workspace_id = ?1",
+            ),
+            (
+                "user",
+                "SELECT count(*) FROM \"user\" WHERE workspace_id = ?1",
+            ),
+            (
+                "custom_emoji",
+                "SELECT count(*) FROM custom_emoji WHERE workspace_id = ?1",
+            ),
+            (
+                "offline_queue",
+                "SELECT count(*) FROM offline_queue WHERE workspace_id = ?1",
+            ),
+        ];
+        let mut tables = Vec::with_capacity(table_queries.len());
+        for (name, sql) in table_queries {
+            let count: i64 = self.conn.query_row(sql, params![ws], |r| r.get(0))?;
+            tables.push((name.to_owned(), count.max(0) as u64));
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.channel_id, c.name, count(*) AS cnt
+             FROM message_current m
+             LEFT JOIN conversation c
+               ON c.workspace_id = m.workspace_id AND c.id = m.channel_id
+             WHERE m.workspace_id = ?1
+             GROUP BY m.channel_id
+             ORDER BY cnt DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![ws, top_n as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?;
+        let mut top_channels = Vec::new();
+        for row in rows {
+            top_channels.push(row?);
+        }
+        Ok(StorageBreakdown {
+            tables,
+            top_channels,
         })
     }
 
@@ -2108,6 +2186,10 @@ mod tests {
         assert_eq!(stats.revisions, 1);
         assert_eq!(stats.offline_queued, 2);
         assert!(stats.db_bytes() > 0);
+        let breakdown = store.storage_breakdown(&ws(), 5).unwrap();
+        assert_eq!(breakdown.top_channels.len(), 1);
+        assert_eq!(breakdown.top_channels[0].0, "C1");
+        assert_eq!(breakdown.top_channels[0].2, 1);
 
         assert_eq!(
             store.list_offline(&ws()).unwrap(),

@@ -1387,6 +1387,60 @@ impl Sidebar {
         found.map(|(id, _)| id.clone())
     }
 
+    /// Jump to the first conversation in the next or previous sidebar section (`F-SHELL-270`).
+    pub fn step_section(&self, from: &ChannelId, forward: bool) -> Option<ChannelId> {
+        let mut heads: Vec<ChannelId> = Vec::new();
+        for section in &self.fixtures.sections {
+            if let Some(first) = section
+                .channel_ids
+                .iter()
+                .find(|id| self.fixtures.conversation(id).is_some())
+            {
+                if !heads.contains(first) {
+                    heads.push(first.clone());
+                }
+            }
+        }
+        if let Some(first_ch) = self.fixtures.channels.first() {
+            if !heads.contains(&first_ch.id) {
+                heads.push(first_ch.id.clone());
+            }
+        }
+        if let Some(first_dm) = self.fixtures.dms.first() {
+            if !heads.contains(&first_dm.id) {
+                heads.push(first_dm.id.clone());
+            }
+        }
+        if heads.is_empty() {
+            return None;
+        }
+        let rows = self.rows.borrow();
+        let cur_row = rows.iter().position(|(id, _)| id == from);
+        let head_positions: Vec<(usize, ChannelId)> = heads
+            .into_iter()
+            .filter_map(|id| rows.iter().position(|(r, _)| r == &id).map(|pos| (pos, id)))
+            .collect();
+        if head_positions.is_empty() {
+            return None;
+        }
+        if forward {
+            let cur = cur_row.unwrap_or(0);
+            head_positions
+                .iter()
+                .find(|(pos, _)| *pos > cur)
+                .or_else(|| head_positions.first())
+                .map(|(_, id)| id.clone())
+        } else {
+            let cur = cur_row.unwrap_or(usize::MAX);
+            head_positions
+                .iter()
+                .rev()
+                .find(|(pos, _)| *pos < cur)
+                .or_else(|| head_positions.last())
+                .map(|(_, id)| id.clone())
+        }
+    }
+
     /// Conversations with unread messages, in sidebar row order: the search pill's
     /// dropdown "Unreads & drafts" section (the root adds drafted conversations).
     pub fn unread_ids(&self) -> Vec<ChannelId> {

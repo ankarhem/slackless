@@ -1634,6 +1634,34 @@ impl<B: Backend> Core<B> {
                     answer_load(&events, loaded, Event::SavedLoaded)
                 });
             }
+            Command::DeleteFile { file_id } => {
+                self.spawn("files.delete", async move {
+                    backend.delete_file(file_id.clone()).await?;
+                    events.emit(Event::FileDeleted { file_id });
+                    Ok(())
+                });
+            }
+            Command::LoadCanvas { file_id } => {
+                self.spawn("files.info(canvas)", async move {
+                    match backend.fetch_canvas_html(file_id.clone()).await {
+                        Ok((title, html)) => {
+                            events.emit(Event::CanvasLoaded {
+                                file_id,
+                                title,
+                                html: Ok(html),
+                            });
+                        }
+                        Err(err) => {
+                            events.emit(Event::CanvasLoaded {
+                                file_id,
+                                title: "Canvas".to_owned(),
+                                html: Err(err.to_string()),
+                            });
+                        }
+                    }
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -3703,6 +3731,17 @@ pub(crate) mod tests {
 
         async fn save_file(&self, _file_id: String, _date_due: Option<u64>) -> api::Result<()> {
             Ok(())
+        }
+
+        async fn delete_file(&self, _file_id: String) -> api::Result<()> {
+            Ok(())
+        }
+
+        async fn fetch_canvas_html(&self, _file_id: String) -> api::Result<(String, String)> {
+            Ok((
+                "Sample canvas".to_owned(),
+                "<h1>Sample canvas</h1><p>Hello</p>".to_owned(),
+            ))
         }
     }
 
