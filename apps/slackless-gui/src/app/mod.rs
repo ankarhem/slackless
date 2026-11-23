@@ -1538,6 +1538,19 @@ impl App {
                             });
                             actions::notify("Reply sent", this.label(channel), window, cx);
                         }
+                        UnreadsEvent::MessageAction {
+                            channel,
+                            message,
+                            action,
+                        } => {
+                            this.handle_unreads_message_action(
+                                channel.clone(),
+                                message.as_ref().clone(),
+                                action.clone(),
+                                window,
+                                cx,
+                            );
+                        }
                         UnreadsEvent::MarkAllRead => this.request_mark_all_read(window, cx),
                     },
                 ),
@@ -2575,9 +2588,9 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &CreateChannelAction, window, cx| {
                 this.open_create_channel(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &PopOutConversation, _, cx| {
+            .on_action(cx.listener(|this, _: &PopOutConversation, window, cx| {
                 let ch = this.channel.clone();
-                this.pop_out_conversation(ch, cx);
+                this.pop_out_conversation(ch, window, cx);
             }))
             .on_action(cx.listener(|this, _: &UnsendLastMessage, window, cx| {
                 this.unsend_last_message(window, cx);
@@ -2983,7 +2996,7 @@ fn subscribe_workspace(
                     this.reorder_workspace(*from, *to, window, cx)
                 }
                 SidebarEvent::OpenInNewWindow(channel) => {
-                    this.pop_out_conversation(channel.clone(), cx)
+                    this.pop_out_conversation(channel.clone(), window, cx)
                 }
                 SidebarEvent::SectionPrefsChanged => {
                     let prefs = this.sidebar.read(cx).export_section_prefs();
@@ -3281,7 +3294,7 @@ fn subscribe_workspace(
                     );
                 }
                 ThreadPanelEvent::PopOut { channel, thread_ts } => {
-                    this.pop_out_thread(channel.clone(), thread_ts.clone(), cx);
+                    this.pop_out_thread(channel.clone(), thread_ts.clone(), window, cx);
                 }
                 ThreadPanelEvent::Later(request) => this.save_for_later(request, cx),
                 ThreadPanelEvent::Changed { channel, change } => this.post_change(channel, change),

@@ -603,12 +603,19 @@ impl App {
     }
 
     /// Pop out `channel` into a separate native GPUI window (`F-CORE-010`, `F-CORE-026`).
-    pub(super) fn pop_out_conversation(&self, channel: ChannelId, cx: &mut Context<Self>) {
+    pub(super) fn pop_out_conversation(
+        &self,
+        channel: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = self.label(&channel);
+        let on_jump = self.popout_jump_handler(window, cx);
         crate::popout::open_popout(
             crate::popout::PopoutKind::Conversation {
                 channel,
                 source: self.messages.downgrade(),
+                on_jump,
             },
             title,
             self.fixtures.clone(),
@@ -620,13 +627,21 @@ impl App {
     }
 
     /// Pop out a thread into a separate native GPUI window (`F-CORE-109`).
-    pub(super) fn pop_out_thread(&self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
+    pub(super) fn pop_out_thread(
+        &self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = format!("Thread in {}", self.label(&channel));
+        let on_jump = self.popout_jump_handler(window, cx);
         crate::popout::open_popout(
             crate::popout::PopoutKind::Thread {
                 channel,
                 thread_ts,
                 source: self.messages.downgrade(),
+                on_jump,
             },
             title,
             self.fixtures.clone(),

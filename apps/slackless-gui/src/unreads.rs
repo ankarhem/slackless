@@ -26,7 +26,7 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
@@ -38,6 +38,7 @@ use slackless_core::NotifyLevel;
 use slackless_core::store::Store;
 use slackless_core::types::{ChannelId, ConversationKind, Message, TeamId, Ts};
 
+use crate::actions::{self, ActionHandler, ActionSet, MenuOrigin, MessageAction};
 use crate::avatars::conversation_avatar;
 use crate::fixtures::Fixtures;
 use crate::messages::{
@@ -217,6 +218,13 @@ pub enum UnreadsEvent {
     MarkRead { channel: ChannelId, ts: Ts },
     /// Quick inline reply sent directly from an unread card (`F-CORE-031`).
     Reply { channel: ChannelId, text: String },
+    /// A message-level action triggered from an unread row's hover toolbar, reaction chips,
+    /// image click, or context menu (react, reply in thread, save, pin, copy, forward, etc.).
+    MessageAction {
+        channel: ChannelId,
+        message: Box<Message>,
+        action: MessageAction,
+    },
     /// "Mark All Messages Read": the root runs it through the user's confirmation setting.
     MarkAllRead,
 }
@@ -266,6 +274,8 @@ pub struct UnreadsView {
     replying: Option<(ChannelId, Entity<TextareaState>)>,
     /// Thread currently open in the right-hand panel so its root row carries Slack's tint.
     open_thread: Option<(ChannelId, Ts)>,
+    /// Message timestamps currently saved for later (mirrored from `LaterView`).
+    saved: HashSet<Ts>,
 }
 
 impl EventEmitter<UnreadsEvent> for UnreadsView {}
@@ -281,7 +291,56 @@ impl UnreadsView {
             sort: UnreadsSort::Recommended,
             replying: None,
             open_thread: None,
+            saved: HashSet::new(),
         })
+    }
+
+    /// Replace the set of saved message timestamps shown with Slack's saved banner/tint.
+    pub fn replace_saved(&mut self, saved: HashSet<Ts>, cx: &mut Context<Self>) {
+        if self.saved != saved {
+            self.saved = saved;
+            cx.notify();
+        }
+    }
+
+    /// Optimistically toggle `name` reaction on `(channel, ts)` inside the unread groups.
+    /// Returns `Some(true)` if added, `Some(false)` if removed, `None` if message wasn't present.
+    pub fn toggle_reaction(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let me = self.fixtures.self_user.clone();
+        let group = self.groups.iter_mut().find(|g| g.channel == *channel)?;
+        let msg = group.messages.iter_mut().find(|m| m.ts == *ts)?;
+        let added = actions::toggle_reaction(msg, &me, name);
+        cx.notify();
+        Some(added)
+    }
+
+    /// Optimistically toggle pinned status on `(channel, ts)` inside the unread groups.
+    pub fn toggle_pin(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let group = self.groups.iter_mut().find(|g| g.channel == *channel)?;
+        let msg = group.messages.iter_mut().find(|m| m.ts == *ts)?;
+        let pinned = actions::toggle_pin(msg, channel);
+        cx.notify();
+        Some(pinned)
+    }
+
+    /// Remove a deleted message from its unread group.
+    pub fn remove_message(&mut self, channel: &ChannelId, ts: &Ts, cx: &mut Context<Self>) {
+        if let Some(group) = self.groups.iter_mut().find(|g| g.channel == *channel) {
+            group.messages.retain(|m| m.ts != *ts);
+        }
+        self.groups.retain(|g| !g.messages.is_empty());
+        cx.notify();
     }
 
     /// Look up one unread message by `(channel, ts)` (seeds the right-hand thread panel when a
@@ -591,6 +650,7 @@ impl Render for UnreadsView {
         } else {
             let replying = self.replying.clone();
             let open_thread = self.open_thread.clone();
+            let saved = self.saved.clone();
             div()
                 .id("unreads-scroll")
                 .flex_1()
@@ -615,6 +675,7 @@ impl Render for UnreadsView {
                                 show_esc_hint,
                                 reply_input,
                                 open_thread.as_ref(),
+                                &saved,
                                 background,
                                 cx,
                             )
@@ -656,6 +717,7 @@ fn card_view(
     show_esc_hint: bool,
     reply_input: Option<Entity<TextareaState>>,
     open_thread: Option<&(ChannelId, Ts)>,
+    saved_set: &HashSet<Ts>,
     background: Hsla,
     cx: &mut Context<UnreadsView>,
 ) -> AnyElement {
@@ -875,6 +937,7 @@ fn card_view(
             view_for_links.update(cx, |_, cx| cx.emit(UnreadsEvent::OpenLink(target.clone())));
         });
         let hover_bg = cx.theme().secondary.opacity(0.5);
+        let saved_bg = cx.theme().warning.opacity(0.08);
         let thread_bg = crate::theme::thread_root(cx);
         let mut rows: Vec<AnyElement> = Vec::with_capacity(group.messages.len());
         let mut prev_day: Option<String> = None;
@@ -891,26 +954,77 @@ fn card_view(
                 );
             }
             let msg_group = SharedString::from(format!("unreads-{ix}-msg-{m_ix}"));
+            let key = format!("unreads-{ix}-row-{}", message.ts.as_str());
             let grouped = (!date_break)
                 .then(|| prev_msg.filter(|prev| same_group(prev, message)))
                 .flatten()
                 .map(|_| msg_group.clone());
-            let is_open_thread =
-                open_thread.is_some_and(|(ch, ts)| *ch == group.channel && *ts == message.ts);
+            let is_saved = saved_set.contains(&message.ts);
+            let is_open_thread = !is_saved
+                && open_thread.is_some_and(|(ch, ts)| *ch == group.channel && *ts == message.ts);
+
+            let view_for_action = view.clone();
+            let ch_for_action = group.channel.clone();
+            let msg_for_action = message.clone();
+            let handler: ActionHandler = Rc::new(move |action, _window, cx| {
+                let ch = ch_for_action.clone();
+                let msg = Box::new(msg_for_action.clone());
+                view_for_action.update(cx, |_, cx| {
+                    cx.emit(UnreadsEvent::MessageAction {
+                        channel: ch,
+                        message: msg,
+                        action,
+                    });
+                });
+            });
+            let set = ActionSet {
+                own: message.user.as_ref() == Some(&fixtures.self_user),
+                reply: true,
+                saved: is_saved,
+                pinned: message.pinned_to.contains(&group.channel),
+            };
+            let mut display = message.clone();
+            let reactions = std::mem::take(&mut display.reactions);
+            let chips = actions::reaction_chips(&key, &reactions, fixtures, Some(&handler), cx)
+                .map(|c| c.pl(px(48.)));
+            let toolbar = actions::hover_toolbar(
+                &key,
+                &fixtures.quick_reactions,
+                set,
+                &handler,
+                msg_group.clone(),
+                cx,
+            )
+            // Keep the first row's bar inside the row so the section header never clips it.
+            .when(m_ix == 0 && !date_break, |bar| bar.top(px(3.)));
+            let menu_handler = handler.clone();
+
             let mut item = v_flex()
+                .id(SharedString::from(key))
                 .group(msg_group.clone())
+                .relative()
                 .px_5()
                 .py_0p5()
+                .when(is_saved, |row| {
+                    row.bg(saved_bg).child(actions::saved_banner(cx))
+                })
                 .when(is_open_thread, |row| row.bg(thread_bg))
-                .when(!is_open_thread, |row| row.hover(move |r| r.bg(hover_bg)))
+                .when(!is_saved && !is_open_thread, |row| {
+                    row.hover(move |r| r.bg(hover_bg))
+                })
                 .child(message_row_linked(
                     fixtures,
-                    message,
-                    None,
+                    &display,
+                    Some(&handler),
                     Some(&links),
                     grouped,
                     cx,
-                ));
+                ))
+                .children(chips)
+                .child(toolbar)
+                .context_menu(move |menu, window, cx| {
+                    actions::actions_menu(menu, set, &menu_handler, MenuOrigin::Context, window, cx)
+                });
             let ch = group.channel.clone();
             let ts = message.ts.clone();
             let view_for_thread = view.clone();
@@ -1393,6 +1507,35 @@ mod tests {
                     2,
                     "the shown group took its stored rows"
                 );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn message_actions_mutate_reactions_pins_and_saved_state(cx: &mut TestAppContext) {
+        let fixtures = Arc::new(fixtures::load());
+        let view = cx.update(|cx| UnreadsView::new(fixtures.clone(), cx));
+        let channel = ChannelId::from("C1");
+        let ts = Ts::from("100.000001");
+        cx.update(|cx| {
+            view.update(cx, |view, cx| {
+                view.show_local(fixtures.clone(), vec![group("C1", &["100.000001"])], cx);
+                assert_eq!(view.toggle_reaction(&channel, &ts, "eyes", cx), Some(true));
+                assert_eq!(view.groups[0].messages[0].reactions.len(), 1);
+                assert_eq!(view.toggle_reaction(&channel, &ts, "eyes", cx), Some(false));
+                assert!(view.groups[0].messages[0].reactions.is_empty());
+
+                assert_eq!(view.toggle_pin(&channel, &ts, cx), Some(true));
+                assert!(view.groups[0].messages[0].pinned_to.contains(&channel));
+                assert_eq!(view.toggle_pin(&channel, &ts, cx), Some(false));
+                assert!(view.groups[0].messages[0].pinned_to.is_empty());
+
+                let saved: HashSet<Ts> = [ts.clone()].into_iter().collect();
+                view.replace_saved(saved, cx);
+                assert!(view.saved.contains(&ts));
+
+                view.remove_message(&channel, &ts, cx);
+                assert!(view.groups.is_empty());
             });
         });
     }
