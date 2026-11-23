@@ -13,7 +13,7 @@ Two kinds of commands exist.
 
 Offline archive commands (`search`, `read`, `channels`, `dms`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
 
-Live Slack commands (`send`, `reply`, `react`, `mark-thread`, `saved`, `files`, `canvas`, `list`, `watch`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`.
+Live Slack commands (`send`, `reply`, `react`, `mark-thread`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`.
 
 ## Setup and auth
 
@@ -455,3 +455,44 @@ slackless huddle invite "#eng" U0123ABC --json
 ```
 
 Native Amazon Chime huddles from the terminal: `devices`, `cameras`, and `screens` run offline to enumerate local microphones/speakers, cameras, and screen-share monitors/windows; `join` connects to Slack's `rooms.join` + Chime DTLS-SRTP media stack until Ctrl+C or `--duration N`; `link` fetches the shareable huddle URL; `invite` rings a member (`rooms.notifyMember`).
+
+### status
+
+```sh
+slackless status show --json
+slackless status set "In a meeting" --emoji spiral_calendar_pad --expires-in 3600 --json
+slackless status clear --json
+```
+
+Inspect, set, or clear your Slack custom status (`users.profile.get` / `users.profile.set`).
+
+### unread
+
+```sh
+slackless unread --json
+```
+
+Live unread summary from `client.counts` across channels, DMs, group DMs, and followed threads (`unread_conversations`, `total_mentions`, `threads_unread`, `items`).
+
+### download
+
+```sh
+slackless download F0123ABC --out ./report.pdf --json
+```
+
+Downloads any Slack file by ID via `files.info` and the authenticated session cookie.
+
+### watch / stats / vacuum / revisions / export
+
+```sh
+slackless watch --channel "#eng" --count 5 --json
+slackless stats --breakdown --json
+slackless vacuum --json
+slackless revisions "#eng" "1739280000.000100" --json
+slackless export "#eng" --format md --limit 200 --out eng.md
+```
+
+- `watch` streams live RTM events over `wss-primary`.
+- `stats` and `vacuum` inspect and compact the local SQLite archive (compressing legacy message JSON rows and reclaiming unused pages).
+- `revisions` prints the append-only edit/deletion history of one message.
+- `export` writes archived messages to Markdown or JSON offline.

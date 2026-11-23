@@ -184,6 +184,21 @@ enum Commands {
         #[command(subcommand)]
         command: HuddleCommand,
     },
+    /// Show, set, or clear your Slack custom status (`users.profile.get` / `users.profile.set`).
+    Status {
+        #[command(subcommand)]
+        command: StatusCommand,
+    },
+    /// Show live unread channels, DMs, mentions, and threads (`client.counts`, needs a stored session).
+    Unread,
+    /// Download a Slack file by ID (`files.info` + authenticated download, needs a stored session).
+    Download {
+        /// Slack file ID (e.g. `F0123ABC`).
+        file_id: String,
+        /// Optional destination file path (defaults to `./<filename>`).
+        #[arg(short, long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+    },
     /// Account and session management.
     Auth {
         #[command(subcommand)]
@@ -286,6 +301,25 @@ enum ListCommand {
 enum ExportFormat {
     Md,
     Json,
+}
+
+#[derive(Subcommand)]
+enum StatusCommand {
+    /// Print your current Slack status.
+    Show,
+    /// Set your Slack custom status text, emoji, and optional expiry.
+    Set {
+        /// Status message text.
+        text: String,
+        /// Emoji shortcode (with or without colons, e.g. `calendar` or `:spiral_calendar_pad:`).
+        #[arg(long)]
+        emoji: Option<String>,
+        /// Automatically clear after N seconds from now (0 = don't clear).
+        #[arg(long, value_name = "SECS")]
+        expires_in: Option<i64>,
+    },
+    /// Clear your Slack custom status.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -509,6 +543,19 @@ async fn dispatch(
                 live::run_huddle_invite(ctx, flag, &channel, &user).await
             }
         },
+        Commands::Status { command } => match command {
+            StatusCommand::Show => live::run_status_show(ctx, flag).await,
+            StatusCommand::Set {
+                text,
+                emoji,
+                expires_in,
+            } => live::run_status_set(ctx, flag, text, emoji, expires_in).await,
+            StatusCommand::Clear => live::run_status_clear(ctx, flag).await,
+        },
+        Commands::Unread => live::run_unread(ctx, flag).await,
+        Commands::Download { file_id, out } => {
+            live::run_download(ctx, flag, &file_id, out.as_deref()).await
+        }
         Commands::Auth { command } => match command {
             AuthCommand::Status => cmd_auth_status(ctx),
             AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),

@@ -1106,6 +1106,271 @@ pub async fn run_huddle_join(
     Ok(exit_code)
 }
 
+/// `status show`
+pub async fn run_status_show(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
+    let session = match resolve_session(flag) {
+        Ok(session) => session,
+        Err(not_signed_in) => return Ok(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
+    };
+    let api = match SlackApi::new(
+        &session.api_base(),
+        session.xoxc_token.clone(),
+        &session.d_cookie,
+    ) {
+        Ok(api) => api,
+        Err(err) => {
+            return Ok(fail(
+                ctx,
+                "client_error",
+                &format!("building the Slack client: {err}"),
+            ));
+        }
+    };
+    match api.users_profile_get(&session.user_id).await {
+        Ok(profile) => {
+            let text = profile.status_text.unwrap_or_default();
+            let emoji = profile.status_emoji.unwrap_or_default();
+            let expiration = profile.status_expiration.unwrap_or(0);
+            let human = if text.is_empty() && emoji.is_empty() {
+                "(no status set)\n".to_owned()
+            } else {
+                format!("{emoji} {text}\n").trim_start().to_owned()
+            };
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "user": session.user_id.as_str(),
+                    "status_text": text,
+                    "status_emoji": emoji,
+                    "status_expiration": expiration,
+                }),
+                &human,
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `status set <TEXT> [--emoji EMOJI] [--expires-in SECS]`
+pub async fn run_status_set(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    text: String,
+    emoji: Option<String>,
+    expires_in: Option<i64>,
+) -> Result<ExitCode> {
+    let (api, _) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let status_emoji = emoji.map(|e| {
+        let trimmed = e.trim().trim_matches(':');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(":{trimmed}:")
+        }
+    });
+    let status_expiration = expires_in.map(|secs| {
+        if secs <= 0 {
+            0
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            now.saturating_add(secs)
+        }
+    });
+    let update = slackless_core::api::ProfileUpdate {
+        status_text: Some(text.clone()),
+        status_emoji: status_emoji.clone(),
+        status_expiration,
+        ..Default::default()
+    };
+    match api.users_profile_set(&update).await {
+        Ok(profile) => {
+            let em = profile.status_emoji.unwrap_or_default();
+            let txt = profile.status_text.unwrap_or(text);
+            let exp = profile.status_expiration.unwrap_or(0);
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "status_text": txt,
+                    "status_emoji": em,
+                    "status_expiration": exp,
+                }),
+                &format!("status set: {em} {txt}\n"),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `status clear`
+pub async fn run_status_clear(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
+    let (api, _) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let update = slackless_core::api::ProfileUpdate {
+        status_text: Some(String::new()),
+        status_emoji: Some(String::new()),
+        status_expiration: Some(0),
+        ..Default::default()
+    };
+    match api.users_profile_set(&update).await {
+        Ok(_) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({ "ok": true, "cleared": true }),
+                "status cleared\n",
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `unread`: live unread channels, DMs, mentions, and threads (`client.counts`).
+pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let counts = match api.client_counts().await {
+        Ok(c) => c,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let archive = Archive::open(&workspace);
+    let label_for = |id: &ChannelId| -> String {
+        archive
+            .as_ref()
+            .and_then(|a| a.resolve_channel(&workspace, id.as_str()))
+            .map(|r| r.label())
+            .unwrap_or_else(|| id.to_string())
+    };
+
+    let mut items = Vec::new();
+    let mut lines = String::new();
+    let mut total_mentions: u32 = 0;
+
+    let groups: [(&str, &[slackless_core::api::ConversationCounts]); 3] = [
+        ("dm", &counts.ims),
+        ("mpim", &counts.mpims),
+        ("channel", &counts.channels),
+    ];
+    for (kind, list) in groups {
+        for c in list.iter().filter(|c| c.is_unread()) {
+            let mentions = c.effective_mentions();
+            total_mentions = total_mentions.saturating_add(mentions);
+            let label = label_for(&c.id);
+            lines.push_str(&format!(
+                "{kind}\t{}\t{label}\tmentions={mentions}\n",
+                c.id.as_str()
+            ));
+            items.push(serde_json::json!({
+                "id": c.id.as_str(),
+                "label": label,
+                "kind": kind,
+                "mentions": mentions,
+                "has_unreads": c.has_unreads,
+                "latest": c.latest.as_ref().map(|t| t.as_str()),
+            }));
+        }
+    }
+    let threads_unread = counts.threads.has_unreads || counts.threads.mention_count > 0;
+    if items.is_empty() && !threads_unread {
+        lines.push_str("all caught up\n");
+    } else if threads_unread {
+        lines.push_str(&format!(
+            "threads\t-\tThreads\tmentions={}\n",
+            counts.threads.mention_count
+        ));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "ok": true,
+            "workspace": workspace.as_str(),
+            "unread_conversations": items.len(),
+            "total_mentions": total_mentions,
+            "threads_unread": threads_unread,
+            "threads_mentions": counts.threads.mention_count,
+            "items": items,
+        }),
+        &lines,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `download <FILE_ID> [--out PATH]`
+pub async fn run_download(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    file_id: &str,
+    out: Option<&std::path::Path>,
+) -> Result<ExitCode> {
+    let (api, _) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let file = match api.files_info(file_id).await {
+        Ok(f) => f,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let Some(url) = file
+        .url_private_download
+        .as_deref()
+        .or(file.url_private.as_deref())
+    else {
+        return Ok(fail(
+            ctx,
+            "no_download_url",
+            "file has no downloadable private URL",
+        ));
+    };
+    let bytes = match api.download_file(url).await {
+        Ok(b) => b,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let fallback_name = file
+        .name
+        .as_deref()
+        .or(file.title.as_deref())
+        .unwrap_or(file_id);
+    let safe_name = std::path::Path::new(fallback_name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("{file_id}.bin"));
+    let dest = out
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(&safe_name));
+    if let Err(err) = std::fs::write(&dest, &bytes) {
+        return Ok(fail(
+            ctx,
+            "write_failed",
+            &format!("writing {}: {err}", dest.display()),
+        ));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "ok": true,
+            "file_id": file_id,
+            "name": safe_name,
+            "bytes": bytes.len(),
+            "path": dest.display().to_string(),
+        }),
+        &format!("downloaded {} ({} bytes)\n", dest.display(), bytes.len()),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
