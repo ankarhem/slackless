@@ -555,7 +555,21 @@ impl App {
                     .flatten()
                     .map(|entry| (entry.id.clone(), entry.clone()))
                     .collect();
-                self.reload_live(window, cx);
+                // Fast path: when every conversation in `counts` is already known in memory,
+                // update counts + `last_read` in-place without re-reading the whole SQLite store.
+                let all_known = !self.fixtures.sample
+                    && !self.fixtures.channels.is_empty()
+                    && self
+                        .ws
+                        .counts
+                        .keys()
+                        .all(|id| self.fixtures.conversation(id).is_some());
+                if all_known {
+                    let updated = Arc::new(self.fixtures.with_counts(self.ws.counts.clone()));
+                    self.apply_snapshot(updated, window, cx);
+                } else {
+                    self.reload_live(window, cx);
+                }
             }
             Event::StoreChanged { channel } => {
                 if *channel == self.channel {
@@ -998,26 +1012,51 @@ impl App {
         }
     }
 
-    /// Live mode: rebuild the workspace views from a fresh store snapshot after its
-    /// conversations or people changed, staying on the open conversation while it exists.
+    /// Live mode: rebuild the workspace snapshot off the UI thread on the read-only WAL
+    /// connection, coalescing rapid bursts (`reload_generation`) so boot and live sync never
+    /// stall frame rendering.
     pub(super) fn reload_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut snapshot) = self.bridge.snapshot(&self.ws.counts) else {
+        let Some(task) = self.bridge.snapshot_async(self.ws.counts.clone()) else {
             return;
         };
-        // Keep the full multi-workspace rail intact while updating this workspace's team info.
-        if let Some(own) = snapshot.workspaces.first().cloned() {
-            if let Some(slot) = self.live_teams.get_mut(self.workspace) {
-                *slot = own;
-            }
-        }
-        if !self.live_teams.is_empty() {
-            snapshot.workspaces = self.live_teams.clone();
-        }
-        // Presence, usergroups, and app_commands are transient (never stored), so they ride along.
-        snapshot.presence = self.ws.presence.clone();
-        snapshot.usergroups = self.ws.usergroups.clone();
-        snapshot.app_commands = self.ws.app_commands.clone();
-        let fixtures = Arc::new(snapshot);
+        self.reload_generation += 1;
+        let generation = self.reload_generation;
+        let workspace = self.workspace;
+        cx.spawn_in(window, async move |this, cx| {
+            let snapshot = cx.background_executor().spawn(task).await;
+            let Some(mut snapshot) = snapshot else {
+                return;
+            };
+            let _ = this.update_in(cx, |app, window, cx| {
+                if app.reload_generation != generation || app.workspace != workspace {
+                    return;
+                }
+                // Keep the full multi-workspace rail intact while updating this workspace's team info.
+                if let Some(own) = snapshot.workspaces.first().cloned() {
+                    if let Some(slot) = app.live_teams.get_mut(app.workspace) {
+                        *slot = own;
+                    }
+                }
+                if !app.live_teams.is_empty() {
+                    snapshot.workspaces = app.live_teams.clone();
+                }
+                // Presence, usergroups, and app_commands are transient (never stored), so they ride along.
+                snapshot.presence = app.ws.presence.clone();
+                snapshot.usergroups = app.ws.usergroups.clone();
+                snapshot.app_commands = app.ws.app_commands.clone();
+                app.apply_snapshot(Arc::new(snapshot), window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Push a freshly built (or in-memory counts-updated) `Arc<Fixtures>` snapshot to all views.
+    pub(super) fn apply_snapshot(
+        &mut self,
+        fixtures: Arc<Fixtures>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Refresh the views in place, as Slack does: a status change or a new channel keeps
         // every scroll position, collapsed section and open panel.
         self.sidebar

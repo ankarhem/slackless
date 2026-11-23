@@ -3,7 +3,7 @@
 //! Both use the real `slackless_types` model, so views render the same either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::gpui::{Image, ImageSource, SharedString};
@@ -15,8 +15,8 @@ use slackless_core::store::Store;
 use slackless_core::types::{
     Attachment, Block, ChannelId, ChannelSection, Conversation, ConversationKind,
     ConversationProperties, Edited, File, FileId, Message, MessageSubtype, Presence, Profile,
-    Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TextStyle, TopicPurpose, Ts,
-    User, UserId, Usergroup, UsergroupId,
+    Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TeamId, TextStyle,
+    TopicPurpose, Ts, User, UserId, Usergroup, UsergroupId,
     message::AttachmentField,
     rich_text::{
         EmojiElement, LinkElement, ListStyle, RichTextList, RichTextPreformatted, RichTextSection,
@@ -271,6 +271,20 @@ pub struct Fixtures {
     pub palette: Option<crate::theme::Palette>,
     /// Workspace-configured status presets (`team.prefs.custom_status_default_suggestions`).
     pub status_presets: Vec<(String, String, usize)>,
+    /// Lazy O(1) lookup index into `users`.
+    user_index: OnceLock<HashMap<UserId, usize>>,
+    /// Lazy O(1) lookup index into `channels` / `dms` / `directory` / `archived`.
+    conv_index: OnceLock<HashMap<ChannelId, (ConvBucket, usize)>>,
+    /// Lazy O(1) lookup index into `teams`.
+    team_index: OnceLock<HashMap<TeamId, usize>>,
+}
+
+#[derive(Clone, Copy)]
+enum ConvBucket {
+    Channel,
+    Dm,
+    Directory,
+    Archived,
 }
 
 /// A custom emoji's picture: a generated sample image, or a live `emoji.list` URL that GPUI's
@@ -316,17 +330,151 @@ impl Fixtures {
         }
     }
 
-    pub fn conversation(&self, id: &ChannelId) -> Option<&Conversation> {
-        self.channels
+    fn conv_map(&self) -> &HashMap<ChannelId, (ConvBucket, usize)> {
+        self.conv_index.get_or_init(|| {
+            let mut map = HashMap::with_capacity(
+                self.channels.len() + self.dms.len() + self.directory.len() + self.archived.len(),
+            );
+            for (ix, c) in self.channels.iter().enumerate() {
+                map.entry(c.id.clone()).or_insert((ConvBucket::Channel, ix));
+            }
+            for (ix, c) in self.dms.iter().enumerate() {
+                map.entry(c.id.clone()).or_insert((ConvBucket::Dm, ix));
+            }
+            for (ix, c) in self.directory.iter().enumerate() {
+                map.entry(c.id.clone())
+                    .or_insert((ConvBucket::Directory, ix));
+            }
+            for (ix, c) in self.archived.iter().enumerate() {
+                map.entry(c.id.clone())
+                    .or_insert((ConvBucket::Archived, ix));
+            }
+            map
+        })
+    }
+
+    fn user_map(&self) -> &HashMap<UserId, usize> {
+        self.user_index.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.users.len());
+            for (ix, u) in self.users.iter().enumerate() {
+                map.entry(u.id.clone()).or_insert(ix);
+            }
+            map
+        })
+    }
+
+    fn team_map(&self) -> &HashMap<TeamId, usize> {
+        self.team_index.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.teams.len());
+            for (ix, t) in self.teams.iter().enumerate() {
+                map.entry(t.id.clone()).or_insert(ix);
+            }
+            map
+        })
+    }
+
+    /// Cheap in-memory clone updating only `counts` and per-conversation `last_read` cursors,
+    /// avoiding a full SQLite store reload on periodic `Event::Counts` refreshes.
+    pub fn with_counts(&self, counts: HashMap<ChannelId, ConversationCounts>) -> Self {
+        let apply = |list: &[Conversation]| -> Vec<Conversation> {
+            list.iter()
+                .map(|c| {
+                    let mut next = c.clone();
+                    if let Some(read) = counts.get(&c.id).and_then(|n| n.last_read.clone()) {
+                        next.last_read = Some(read);
+                    }
+                    next
+                })
+                .collect()
+        };
+        let profile_extras = self
+            .profile_extras
             .iter()
-            .chain(&self.dms)
-            .chain(&self.directory)
-            .chain(&self.archived)
-            .find(|c| c.id == *id)
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    ProfileExtras {
+                        pronouns: v.pronouns.clone(),
+                        fields: v.fields.clone(),
+                    },
+                )
+            })
+            .collect();
+        Fixtures {
+            workspaces: self.workspaces.clone(),
+            teams: self.teams.clone(),
+            self_user: self.self_user.clone(),
+            users: self.users.clone(),
+            usergroups: self.usergroups.clone(),
+            app_commands: self.app_commands.clone(),
+            channels: apply(&self.channels),
+            dms: apply(&self.dms),
+            messages: self.messages.clone(),
+            latest: self.latest.clone(),
+            threads: self.threads.clone(),
+            directory: apply(&self.directory),
+            archived: self.archived.clone(),
+            presence: self.presence.clone(),
+            notify_levels: self.notify_levels.clone(),
+            quick_reactions: self.quick_reactions.clone(),
+            frequent_emoji: self.frequent_emoji.clone(),
+            skin_tone: self.skin_tone,
+            thumbnails: self.thumbnails.clone(),
+            profile_extras,
+            custom_emoji: self.custom_emoji.clone(),
+            block_images: self.block_images.clone(),
+            sample: self.sample,
+            counts,
+            sections: self.sections.clone(),
+            real_names: self.real_names,
+            real_names_in_mentions: self.real_names_in_mentions,
+            collapsed_sections: self.collapsed_sections.clone(),
+            palette: self.palette,
+            status_presets: self.status_presets.clone(),
+            user_index: OnceLock::new(),
+            conv_index: OnceLock::new(),
+            team_index: OnceLock::new(),
+        }
+    }
+
+    pub fn conversation(&self, id: &ChannelId) -> Option<&Conversation> {
+        let map = self.conv_map();
+        if let Some(&(bucket, ix)) = map.get(id) {
+            let candidate = match bucket {
+                ConvBucket::Channel => self.channels.get(ix),
+                ConvBucket::Dm => self.dms.get(ix),
+                ConvBucket::Directory => self.directory.get(ix),
+                ConvBucket::Archived => self.archived.get(ix),
+            };
+            if let Some(conv) = candidate.filter(|c| c.id == *id) {
+                return Some(conv);
+            }
+        }
+        let total =
+            self.channels.len() + self.dms.len() + self.directory.len() + self.archived.len();
+        if map.len() != total {
+            return self
+                .channels
+                .iter()
+                .chain(&self.dms)
+                .chain(&self.directory)
+                .chain(&self.archived)
+                .find(|c| c.id == *id);
+        }
+        None
     }
 
     pub fn user(&self, id: &UserId) -> Option<&User> {
-        self.users.iter().find(|u| u.id == *id)
+        let map = self.user_map();
+        if let Some(&ix) = map.get(id) {
+            if let Some(user) = self.users.get(ix).filter(|u| u.id == *id) {
+                return Some(user);
+            }
+        }
+        if map.len() != self.users.len() {
+            return self.users.iter().find(|u| u.id == *id);
+        }
+        None
     }
 
     pub fn usergroup(&self, id: &UsergroupId) -> Option<&Usergroup> {
@@ -352,11 +500,7 @@ impl Fixtures {
         if self.real_names_in_mentions {
             return self.user_name(id);
         }
-        self.users
-            .iter()
-            .find(|u| u.id == *id)
-            .map(User::display_name)
-            .unwrap_or(id.as_str())
+        self.user(id).map(User::display_name).unwrap_or(id.as_str())
     }
 
     /// The image of the workspace custom emoji `name` (no colons).
@@ -379,16 +523,42 @@ impl Fixtures {
     }
 
     /// A message's text as plain text (Slack's "Copy message"): user mentions resolved to
-    /// `@name`, standard `:emoji:` shown as their glyph, line breaks kept.
+    /// `@name` in a single O(len) pass, standard `:emoji:` shown as their glyph, line breaks kept.
     pub fn plain_text(&self, message: &Message) -> String {
-        let mut text = message.text.clone();
-        for user in &self.users {
-            text = text.replace(
-                &format!("<@{}>", user.id.as_str()),
-                &format!("@{}", user.display_name()),
-            );
+        let raw = message.text.as_str();
+        if !raw.contains("<@") {
+            return with_glyphs(raw);
         }
-        with_glyphs(&text)
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(start) = rest.find("<@") {
+            out.push_str(&rest[..start]);
+            rest = &rest[start + 2..];
+            if let Some(end) = rest.find('>') {
+                let inner = &rest[..end];
+                let (id_str, label) = inner
+                    .split_once('|')
+                    .map_or((inner, None), |(id, lbl)| (id, Some(lbl)));
+                let uid = UserId::from(id_str);
+                if let Some(user) = self.user(&uid) {
+                    out.push('@');
+                    out.push_str(user.display_name());
+                } else if let Some(lbl) = label.filter(|l| !l.is_empty()) {
+                    out.push('@');
+                    out.push_str(lbl);
+                } else {
+                    out.push_str("<@");
+                    out.push_str(inner);
+                    out.push('>');
+                }
+                rest = &rest[end + 1..];
+            } else {
+                out.push_str("<@");
+                break;
+            }
+        }
+        out.push_str(rest);
+        with_glyphs(&out)
     }
 
     /// One-line plain preview of a message: [`Self::plain_text`] on one line, file-only
@@ -409,13 +579,15 @@ impl Fixtures {
         if self.workspaces.first().is_some_and(|own| own.id == *team) {
             return None;
         }
-        self.teams.iter().find(|candidate| candidate.id == *team)
+        let &ix = self.team_map().get(team)?;
+        self.teams.get(ix)
     }
 
     /// The other organizations a Slack Connect conversation is shared with, in Slack's own
     /// order (`shared_team_ids`), as far as their team records are known.
     pub fn shared_teams(&self, conversation: &Conversation) -> Vec<&Team> {
         let own = self.workspaces.first().map(|team| team.id.as_str());
+        let team_map = self.team_map();
         conversation
             .extra
             .get("shared_team_ids")
@@ -424,7 +596,10 @@ impl Fixtures {
             .flatten()
             .filter_map(|id| id.as_str())
             .filter(|id| Some(*id) != own)
-            .filter_map(|id| self.teams.iter().find(|team| team.id.as_str() == id))
+            .filter_map(|id| {
+                let &ix = team_map.get(&TeamId::from(id))?;
+                self.teams.get(ix)
+            })
             .collect()
     }
 
@@ -1243,6 +1418,9 @@ pub fn load() -> Fixtures {
         collapsed_sections: HashSet::new(),
         palette: None,
         status_presets: Vec::new(),
+        user_index: OnceLock::new(),
+        conv_index: OnceLock::new(),
+        team_index: OnceLock::new(),
     }
 }
 
@@ -1421,6 +1599,9 @@ pub fn live(
         collapsed_sections,
         palette: crate::theme::palette_from_prefs(&prefs),
         status_presets,
+        user_index: OnceLock::new(),
+        conv_index: OnceLock::new(),
+        team_index: OnceLock::new(),
     }
 }
 
@@ -1851,4 +2032,59 @@ fn bullet_list(items: &[&str]) -> RichTextContainer {
         offset: None,
         border: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_lookups_plain_text_and_with_counts_work() {
+        let fixtures = load();
+        assert_eq!(
+            fixtures
+                .user(&UserId::from("U0ALICE"))
+                .map(|u| u.name.as_str()),
+            Some("alice")
+        );
+        assert!(
+            fixtures
+                .conversation(&ChannelId::from("C0GENERAL"))
+                .is_some()
+        );
+        assert_eq!(
+            fixtures.plain_text(&msg(
+                "C0GENERAL",
+                1,
+                "U0ALICE",
+                "cc <@U0BOB> and <@U0CARA|cara> :rocket:"
+            )),
+            "cc @bob and @cara 🚀"
+        );
+        let updated = fixtures.with_counts(HashMap::from([(
+            ChannelId::from("C0GENERAL"),
+            ConversationCounts {
+                id: ChannelId::from("C0GENERAL"),
+                last_read: Some(Ts::from("1700000000.000100")),
+                has_unreads: true,
+                mention_count: 2,
+                latest: None,
+                ..Default::default()
+            },
+        )]));
+        assert_eq!(
+            updated
+                .conversation(&ChannelId::from("C0GENERAL"))
+                .and_then(|c| c.last_read.as_ref())
+                .map(Ts::as_str),
+            Some("1700000000.000100")
+        );
+        assert_eq!(
+            updated
+                .counts
+                .get(&ChannelId::from("C0GENERAL"))
+                .map(|c| c.mention_count),
+            Some(2)
+        );
+    }
 }

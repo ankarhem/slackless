@@ -107,11 +107,15 @@ fn main() {
         >,
     >;
     let main_app: MainWindowSlot = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let pending_urls: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(startup_urls));
-    let pending_for_open = pending_urls.clone();
+    let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    if !startup_urls.is_empty() {
+        let _ = url_tx.unbounded_send(startup_urls);
+    }
+    let url_tx_open = url_tx.clone();
     app.on_open_urls(move |urls| {
-        pending_for_open.borrow_mut().extend(urls);
+        if !urls.is_empty() {
+            let _ = url_tx_open.unbounded_send(urls);
+        }
     });
 
     app.run(move |cx| {
@@ -122,65 +126,57 @@ fn main() {
         theme::init(cx);
         menu_bar::init(cx);
 
-        let mut live_pairs: Vec<(fixtures::Fixtures, CoreBridge)> = sessions
+        // Start bridges and read only each workspace's 1-row Team summary for the rail; build the
+        // full SQLite snapshot ONLY for workspace 0 so background workspaces never slow cold launch.
+        let mut live_bridges: Vec<(slackless_core::types::Team, CoreBridge)> = sessions
             .into_iter()
             .filter_map(|session| {
                 let bridge = CoreBridge::start(session, cx)?;
-                let snapshot = bridge.snapshot(&Default::default())?;
-                Some((snapshot, bridge))
+                let team = bridge.team_summary()?;
+                Some((team, bridge))
             })
             .collect();
         // Restore persisted workspace rail order (`F-CORE-003`) if present.
-        if live_pairs.len() > 1 {
-            if let Some(order) = live_pairs
+        if live_bridges.len() > 1 {
+            if let Some(order) = live_bridges
                 .iter()
                 .find_map(|(_, b)| b.workspace_order())
                 .filter(|o| !o.is_empty())
             {
-                live_pairs.sort_by_key(|(snap, _)| {
-                    let id = snap
-                        .workspaces
-                        .first()
-                        .map(|t| t.id.as_str())
-                        .unwrap_or_default();
+                live_bridges.sort_by_key(|(team, _)| {
                     order
                         .iter()
-                        .position(|wanted| wanted == id)
+                        .position(|wanted| wanted == team.id.as_str())
                         .unwrap_or(usize::MAX)
                 });
             }
         }
-        let (fixtures, bridges) = if !live_pairs.is_empty() {
-            let teams: Vec<_> = live_pairs
-                .iter()
-                .filter_map(|(snap, _)| snap.workspaces.first().cloned())
-                .collect();
-            let mut snapshots = Vec::with_capacity(live_pairs.len());
-            let mut bridges = Vec::with_capacity(live_pairs.len());
-            for (snap, bridge) in live_pairs {
-                snapshots.push(snap);
-                bridges.push(bridge);
-            }
+        let (fixtures, bridges) = if !live_bridges.is_empty() {
+            let teams: Vec<_> = live_bridges.iter().map(|(team, _)| team.clone()).collect();
+            let bridges: Vec<CoreBridge> = live_bridges.into_iter().map(|(_, b)| b).collect();
             bridges[0].activate_media(cx);
-            let mut first = snapshots.remove(0);
+            let mut first = bridges[0]
+                .snapshot(&Default::default())
+                .unwrap_or_else(fixtures::load);
             first.workspaces = teams;
             (first, bridges)
         } else {
             (fixtures::load(), vec![CoreBridge::offline()])
         };
         let bridge = &bridges[0];
+        let local = bridge.all_local();
         // Live: the Font and Slack's Color Mode (both remembered locally; Lato and `System`
         // until chosen) over the color theme it stores for the workspace, installed before the
-        // first frame.
-        if let Some(font) = bridge.font() {
+        // first frame (all read from the single batched `local` map).
+        if let Some(font) = CoreBridge::parse_font(&local) {
             theme::set_font(font, cx);
         }
         // The remembered zoom, before the first frame lays out.
-        if let Some(level) = bridge.zoom() {
+        if let Some(level) = CoreBridge::parse_zoom(&local) {
             zoom::set_level(level, cx);
         }
-        if let Some(mode) = bridge.color_mode() {
-            let saved = bridge.settings();
+        if let Some(mode) = bridge.parse_color_mode(&local) {
+            let saved = CoreBridge::parse_settings(&local);
             let palette = saved
                 .as_ref()
                 .map(|s| s.palette)
@@ -202,7 +198,7 @@ fn main() {
         // frame it was left in (`App` saves it as it changes). A saved frame is restored onto a
         // plain window: restoring onto a zoomed one lets AppKit's zoom state skew the frame.
         // The traffic lights sit inside the 40px top bar, vertically centred, as in Slack's.
-        let saved_frame = bridge.window_state();
+        let saved_frame = CoreBridge::parse_window_state(&local);
         let default_bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let window_options = WindowOptions {
             window_bounds: Some(if saved_frame.is_some() {
@@ -220,7 +216,6 @@ fn main() {
         };
 
         let main_app_for_win = main_app.clone();
-        let pending_for_poll = pending_urls.clone();
         let handle = open_window(window_options, cx, move |window, cx| {
             if let Some(state) = saved_frame {
                 // Restore once the window is built, then re-read its size: AppKit's resize
@@ -239,16 +234,10 @@ fn main() {
         .expect("Failed to open window");
         let _ = handle;
         // Drain OS `on_open_urls` and startup CLI deep links (`slack://`, `app.slack.com/client/...`,
-        // `*.slack.com/archives/...`) into the main App window.
+        // `*.slack.com/archives/...`) via an async channel (zero idle polling).
         cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(120))
-                    .await;
-                let urls: Vec<String> = {
-                    let mut guard = pending_for_poll.borrow_mut();
-                    std::mem::take(&mut *guard)
-                };
+            use futures::StreamExt as _;
+            while let Some(urls) = url_rx.next().await {
                 if urls.is_empty() {
                     continue;
                 }

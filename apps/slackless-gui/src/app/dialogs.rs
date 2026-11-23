@@ -1919,8 +1919,14 @@ impl App {
     /// Prune temporary downloaded media cache files (`slackless-media` + `slackless-audio`).
     pub(super) fn prune_media_cache(&self, window: &mut Window, cx: &mut Context<Self>) {
         let mut removed = 0u64;
-        for folder in ["slackless-media", "slackless-audio"] {
-            let dir = std::env::temp_dir().join(folder);
+        let mut dirs: Vec<std::path::PathBuf> = ["slackless-media", "slackless-audio"]
+            .into_iter()
+            .map(|folder| std::env::temp_dir().join(folder))
+            .collect();
+        if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
+            dirs.push(cache);
+        }
+        for dir in dirs {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     if let Ok(meta) = entry.metadata() {

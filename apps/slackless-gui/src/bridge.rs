@@ -21,14 +21,14 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
+use futures::StreamExt as _;
 use gpui_kit::gpui::{self, AppContext as _, Context, Entity, EventEmitter, Subscription, Window};
 use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
 use slackless_core::store::Store;
-use slackless_core::types::{ChannelId, Message, TeamId, Ts};
+use slackless_core::types::{ChannelId, Message, Team, TeamId, Ts};
 use slackless_core::{Client, Command, Event, SharedStore};
 
 use crate::fixtures::{self, Fixtures};
@@ -57,13 +57,12 @@ pub struct SectionPrefs {
     pub sorts: HashMap<String, crate::sidebar_menu::SectionSort>,
 }
 
-/// Idle wait between event polls while the core is running. The guide's pattern would await
-/// the stream directly; without a `futures` dependency a short bounded poll keeps events at
-/// sub-frame latency without spinning the executor.
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
-
-/// Newest messages of a conversation the message list shows in live mode.
+/// Newest messages of a conversation the message list loads on scroll-back / live refresh.
 const HISTORY_LIMIT: usize = 500;
+
+/// Newest messages loaded synchronously for frame-0 cold launch (enough to fill any viewport
+/// while avoiding deserializing 500 messages before the first frame paints).
+const INITIAL_HISTORY_LIMIT: usize = 80;
 
 /// The store's local-state key for the last open conversation.
 const LAST_CONVERSATION: &str = "last_conversation";
@@ -122,9 +121,11 @@ pub struct CoreBridge {
     /// The `futures::channel::mpsc::UnboundedSender` it captures is not nameable here, so it
     /// is wrapped in a closure instead of a field.
     command_sink: Option<Arc<dyn Fn(Command) + Send + Sync>>,
-    /// Live mode: the store the core keeps current; views re-read it to render. Fixture
-    /// mode: `None`.
+    /// Live mode: the store the core keeps current (writer connection). Fixture mode: `None`.
     store: Option<SharedStore>,
+    /// Live mode: dedicated read-only WAL connection so UI queries never block on background
+    /// backfill write transactions. Falls back to `store` when in-memory.
+    reader: Option<SharedStore>,
     /// Live mode: the signed-in session the core runs with.
     session: Option<Session>,
     /// Live mode: authenticated HTTP fetcher for remote images and file downloads.
@@ -140,6 +141,7 @@ impl CoreBridge {
         Self {
             command_sink: None,
             store: None,
+            reader: None,
             session: None,
             fetcher: None,
             hub: None,
@@ -147,11 +149,11 @@ impl CoreBridge {
     }
 
     /// Starts the core live for `session`: opens its durable store and starts slackless-core on
-    /// its dedicated tokio thread (guide section 13). Events flow into gpui through the drain
-    /// task; views receive them via [`CoreBridge::subscribe_in`]. `None` when the store or the
-    /// core cannot be started (the reason is logged).
+    /// its dedicated tokio thread (guide section 13). Events flow into gpui through an async
+    /// stream wakeup (zero polling latency, zero idle wakeups); views receive them via
+    /// [`CoreBridge::subscribe_in`]. `None` when the store or the core cannot be started.
     pub fn start(session: Session, cx: &mut gpui::App) -> Option<Self> {
-        let store = open_store(&session)?;
+        let (store, reader) = open_store(&session)?;
         let handle = match Client::start(session.clone(), store) {
             Ok(handle) => handle,
             Err(e) => {
@@ -166,6 +168,7 @@ impl CoreBridge {
         let mut bridge = Self {
             command_sink: None,
             store: None,
+            reader,
             session: Some(session),
             fetcher: Some(fetcher),
             hub: Some(hub.clone()),
@@ -173,32 +176,64 @@ impl CoreBridge {
 
         let (commands, mut events, store) = handle.into_parts();
         bridge.store = Some(store);
-        let sender = commands.clone();
         bridge.command_sink = Some(Arc::new(move |command| {
             if let Err(e) = commands.unbounded_send(command) {
                 eprintln!("slackless: core has stopped; command dropped ({e})");
             }
         }));
 
-        // Detached: dropping a gpui task cancels it, and the drain must outlive this call.
+        // Detached: await events directly via StreamExt (0ms wakeup, 0 idle CPU polling) and
+        // drain any queued burst in the same tick.
         cx.spawn(async move |cx| {
-            loop {
-                match events.try_recv() {
-                    Ok(event) => cx.update_entity(&hub, |_, cx| cx.emit(event)),
-                    Err(_) => {
-                        // The core's command loop ended (it drains its command channel last),
-                        // so the event channel is closed too once buffered events are gone.
-                        if sender.is_closed() {
-                            break;
-                        }
-                        cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
-                    }
+            while let Some(event) = events.next().await {
+                cx.update_entity(&hub, |_, cx| cx.emit(event));
+                while let Ok(next_ev) = events.try_recv() {
+                    cx.update_entity(&hub, |_, cx| cx.emit(next_ev));
                 }
             }
         })
         .detach();
 
         Some(bridge)
+    }
+
+    fn read_store(&self) -> Option<&SharedStore> {
+        self.reader.as_ref().or(self.store.as_ref())
+    }
+
+    /// Lightweight startup read of just this workspace's `Team` record (1 PK query) so background
+    /// workspaces populate the workspace rail without building full snapshots before frame 0.
+    pub fn team_summary(&self) -> Option<Team> {
+        let session = self.session.as_ref()?;
+        let team = &session.team_id;
+        let domain = session
+            .workspace_url
+            .trim_start_matches("https://")
+            .trim_end_matches('/')
+            .trim_end_matches(".slack.com")
+            .to_owned();
+        let stored = self
+            .read_store()
+            .and_then(|s| s.lock().ok())
+            .and_then(|s| s.team(team).ok().flatten())
+            .filter(|t| !t.name.is_empty());
+        Some(stored.unwrap_or_else(|| Team {
+            id: team.clone(),
+            name: domain.clone(),
+            domain,
+            ..Default::default()
+        }))
+    }
+
+    /// Read all `local_state` keys for this workspace in a single SQLite query.
+    pub fn all_local(&self) -> HashMap<String, String> {
+        let Some(team) = self.session.as_ref().map(|s| &s.team_id) else {
+            return HashMap::new();
+        };
+        let Some(store) = self.read_store().and_then(|s| s.lock().ok()) else {
+            return HashMap::new();
+        };
+        store.all_local(team).unwrap_or_default()
     }
 
     /// Route GPUI remote image fetches (`img(url)`) and file downloads through this
@@ -215,20 +250,33 @@ impl CoreBridge {
     /// state (`counts`). `None` offline.
     pub fn snapshot(&self, counts: &HashMap<ChannelId, ConversationCounts>) -> Option<Fixtures> {
         let session = self.session.as_ref()?;
-        let store = self.store.as_ref()?.lock().ok()?;
+        let store = self.read_store()?.lock().ok()?;
         Some(fixtures::live(session, &store, counts))
     }
 
+    /// Live mode: build a fresh store snapshot off the UI thread on the read-only WAL connection.
+    pub fn snapshot_async(
+        &self,
+        counts: HashMap<ChannelId, ConversationCounts>,
+    ) -> Option<impl Future<Output = Option<Fixtures>> + Send + 'static> {
+        let session = self.session.clone()?;
+        let store = self.read_store()?.clone();
+        Some(async move {
+            let store = store.lock().ok()?;
+            Some(fixtures::live(&session, &store, &counts))
+        })
+    }
+
     /// Synchronous single-page read of `channel`'s newest stored messages for cold-launch
-    /// frame-0 seeding (single indexed SQLite query, ~1–2ms). Returns empty offline.
+    /// frame-0 seeding (bounded to `INITIAL_HISTORY_LIMIT` so cold launch stays sub-millisecond).
     pub fn history_sync(&self, channel: &ChannelId) -> Vec<Message> {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
         };
-        let Some(store) = self.store.as_ref().and_then(|s| s.lock().ok()) else {
+        let Some(store) = self.read_store().and_then(|s| s.lock().ok()) else {
             return Vec::new();
         };
-        match store.channel_history(&session.team_id, channel, None, HISTORY_LIMIT) {
+        match store.channel_history(&session.team_id, channel, None, INITIAL_HISTORY_LIMIT) {
             Ok(rows) => rows
                 .into_iter()
                 .filter(|row| !row.deleted)
@@ -247,7 +295,7 @@ impl CoreBridge {
         before: Option<Ts>,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.store.clone()?;
+        let store = self.read_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -273,7 +321,7 @@ impl CoreBridge {
         channel: ChannelId,
     ) -> Option<impl Future<Output = Option<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.store.clone()?;
+        let store = self.read_store()?.clone();
         Some(async move {
             let store = store.lock().ok()?;
             match store.latest_messages(&team, std::slice::from_ref(&channel)) {
@@ -295,7 +343,7 @@ impl CoreBridge {
     ) -> Option<impl Future<Output = Vec<slackless_core::store::StoredMessage>> + Send + 'static>
     {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.store.clone()?;
+        let store = self.read_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -314,7 +362,7 @@ impl CoreBridge {
         thread_ts: Ts,
     ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
         let team = self.session.as_ref()?.team_id.clone();
-        let store = self.store.clone()?;
+        let store = self.read_store()?.clone();
         Some(async move {
             let Ok(store) = store.lock() else {
                 return Vec::new();
@@ -379,16 +427,6 @@ impl CoreBridge {
         )
     }
 
-    /// The window frame saved by [`Self::remember_window_state`], so the window reopens where
-    /// and how it was left, like Slack's. `None` offline or before the first save.
-    pub fn window_state(&self) -> Option<Vec<u8>> {
-        let hex = self.local(WINDOW_STATE)?;
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-            .collect()
-    }
-
     /// Live mode: a write remembering the window's native state (`Window::native_window_state`),
     /// to run off the UI thread. `None` offline.
     pub fn remember_window_state(
@@ -399,20 +437,6 @@ impl CoreBridge {
         self.write_local(WINDOW_STATE, hex, "window frame")
     }
 
-    /// The Color Mode chosen in Preferences, which Slack keeps on the client rather than in the
-    /// workspace prefs; `System` until one is chosen, following the computer as the user's
-    /// Slack does. `None` offline: the sample workspace keeps its dark reference look.
-    pub fn color_mode(&self) -> Option<AppearanceMode> {
-        self.store.as_ref()?;
-        let saved = self.local(COLOR_MODE);
-        Some(
-            saved
-                .as_deref()
-                .and_then(AppearanceMode::from_key)
-                .unwrap_or(AppearanceMode::System),
-        )
-    }
-
     /// Live mode: a write remembering `mode` as the Color Mode, to run off the UI thread.
     /// `None` offline.
     pub fn remember_color_mode(
@@ -420,13 +444,6 @@ impl CoreBridge {
         mode: AppearanceMode,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
         self.write_local(COLOR_MODE, mode.key().to_owned(), "color mode")
-    }
-
-    /// The search pill's recent searches, newest first, as last recorded; empty until the
-    /// first one. `None` offline.
-    pub fn search_history(&self) -> Option<Vec<String>> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(SEARCH_HISTORY)?).ok()
     }
 
     /// Live mode: a write remembering the search history, to run off the UI thread. `None`
@@ -442,13 +459,6 @@ impl CoreBridge {
         )
     }
 
-    /// The search panel's history toggle, as last chosen; `None` offline or before the
-    /// first choice (the panel then starts with the toggle off, like Slack's).
-    pub fn search_history_shown(&self) -> Option<bool> {
-        self.store.as_ref()?;
-        self.local(SEARCH_HISTORY_SHOWN)?.parse().ok()
-    }
-
     /// Live mode: a write remembering the history toggle, to run off the UI thread. `None`
     /// offline.
     pub fn remember_search_history_shown(
@@ -458,13 +468,6 @@ impl CoreBridge {
         self.write_local(SEARCH_HISTORY_SHOWN, on.to_string(), "history toggle")
     }
 
-    /// The search panel's filter toggle, as last chosen; `None` offline or before the first
-    /// choice.
-    pub fn search_filters_shown(&self) -> Option<bool> {
-        self.store.as_ref()?;
-        self.local(SEARCH_FILTERS_SHOWN)?.parse().ok()
-    }
-
     /// Live mode: a write remembering the filter toggle, to run off the UI thread. `None`
     /// offline.
     pub fn remember_search_filters_shown(
@@ -472,12 +475,6 @@ impl CoreBridge {
         on: bool,
     ) -> Option<impl Future<Output = ()> + Send + 'static> {
         self.write_local(SEARCH_FILTERS_SHOWN, on.to_string(), "filter toggle")
-    }
-
-    /// The recently visited conversations, newest first, as last recorded. `None` offline.
-    pub fn recent_places(&self) -> Option<Vec<ChannelId>> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(RECENT_PLACES)?).ok()
     }
 
     /// Live mode: a write remembering the recently visited conversations, to run off the UI
@@ -493,26 +490,10 @@ impl CoreBridge {
         )
     }
 
-    /// The Font chosen in Preferences, an index into [`theme::FONT_LABELS`]; `None` offline
-    /// or before one is chosen (Lato, Slack's default, applies).
-    pub fn font(&self) -> Option<usize> {
-        let family = self.local(FONT)?;
-        theme::FONT_FAMILIES
-            .iter()
-            .position(|known| *known == family)
-    }
-
     /// Live mode: a write remembering [`theme::FONT_LABELS`]`[font]` as the Font, to run off
     /// the UI thread. `None` offline.
     pub fn remember_font(&self, font: usize) -> Option<impl Future<Output = ()> + Send + 'static> {
         self.write_local(FONT, theme::FONT_FAMILIES[font].to_owned(), "font")
-    }
-
-    /// The zoom chosen in Preferences, a level of [`crate::zoom::FACTORS`]; `None` offline or
-    /// before one is chosen (100% applies).
-    pub fn zoom(&self) -> Option<usize> {
-        let level: usize = self.local(ZOOM)?.parse().ok()?;
-        (level < crate::zoom::FACTORS.len()).then_some(level)
     }
 
     /// Live mode: a write remembering zoom level `level`, to run off the UI thread. `None`
@@ -553,12 +534,6 @@ impl CoreBridge {
         self.write_local(DRAFTS, serde_json::to_string(drafts).ok()?, "drafts")
     }
 
-    /// Saved frequently used emoji shortcodes; `None` offline or before the first pick.
-    pub fn frequent_emoji(&self) -> Option<Vec<String>> {
-        self.store.as_ref()?;
-        serde_json::from_str(&self.local(FREQUENT_EMOJI)?).ok()
-    }
-
     /// Live mode: persist frequently used emoji shortcodes off the UI thread. `None` offline.
     pub fn remember_frequent_emoji(
         &self,
@@ -569,13 +544,6 @@ impl CoreBridge {
             serde_json::to_string(list).ok()?,
             "frequent emoji",
         )
-    }
-
-    /// Saved emoji skin tone (1..=6); `None` offline or before the user picks one.
-    pub fn emoji_tone(&self) -> Option<u8> {
-        self.store.as_ref()?;
-        let tone: u8 = self.local(EMOJI_TONE)?.parse().ok()?;
-        (1..=6).contains(&tone).then_some(tone)
     }
 
     /// Live mode: persist emoji skin tone (1..=6) off the UI thread. `None` offline.
@@ -625,8 +593,79 @@ impl CoreBridge {
     /// This workspace's stored local-state `key`; `None` offline or when unset.
     fn local(&self, key: &str) -> Option<String> {
         let team = &self.session.as_ref()?.team_id;
-        let store = self.store.as_ref()?.lock().ok()?;
+        let store = self.read_store()?.lock().ok()?;
         store.local(team, key).ok().flatten()
+    }
+
+    /// Parse helpers over a pre-loaded `all_local()` map (zero extra SQLite round-trips at launch).
+    pub fn parse_last_conversation(local: &HashMap<String, String>) -> Option<ChannelId> {
+        local
+            .get(LAST_CONVERSATION)
+            .map(|id| ChannelId::from(id.as_str()))
+    }
+
+    pub fn parse_window_state(local: &HashMap<String, String>) -> Option<Vec<u8>> {
+        let hex = local.get(WINDOW_STATE)?;
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+            .collect()
+    }
+
+    pub fn parse_color_mode(&self, local: &HashMap<String, String>) -> Option<AppearanceMode> {
+        self.store.as_ref()?;
+        Some(
+            local
+                .get(COLOR_MODE)
+                .map(String::as_str)
+                .and_then(AppearanceMode::from_key)
+                .unwrap_or(AppearanceMode::System),
+        )
+    }
+
+    pub fn parse_font(local: &HashMap<String, String>) -> Option<usize> {
+        let family = local.get(FONT)?;
+        theme::FONT_FAMILIES
+            .iter()
+            .position(|known| *known == family.as_str())
+    }
+
+    pub fn parse_zoom(local: &HashMap<String, String>) -> Option<usize> {
+        let level: usize = local.get(ZOOM)?.parse().ok()?;
+        (level < crate::zoom::FACTORS.len()).then_some(level)
+    }
+
+    pub fn parse_settings(local: &HashMap<String, String>) -> Option<Settings> {
+        serde_json::from_str(local.get(SETTINGS)?).ok()
+    }
+
+    pub fn parse_search_history(local: &HashMap<String, String>) -> Option<Vec<String>> {
+        serde_json::from_str(local.get(SEARCH_HISTORY)?).ok()
+    }
+
+    pub fn parse_search_history_shown(local: &HashMap<String, String>) -> Option<bool> {
+        local.get(SEARCH_HISTORY_SHOWN)?.parse().ok()
+    }
+
+    pub fn parse_search_filters_shown(local: &HashMap<String, String>) -> Option<bool> {
+        local.get(SEARCH_FILTERS_SHOWN)?.parse().ok()
+    }
+
+    pub fn parse_recent_places(local: &HashMap<String, String>) -> Option<Vec<ChannelId>> {
+        serde_json::from_str(local.get(RECENT_PLACES)?).ok()
+    }
+
+    pub fn parse_drafts(local: &HashMap<String, String>) -> Option<Vec<SavedDraft>> {
+        serde_json::from_str(local.get(DRAFTS)?).ok()
+    }
+
+    pub fn parse_frequent_emoji(local: &HashMap<String, String>) -> Option<Vec<String>> {
+        serde_json::from_str(local.get(FREQUENT_EMOJI)?).ok()
+    }
+
+    pub fn parse_emoji_tone(local: &HashMap<String, String>) -> Option<u8> {
+        let tone: u8 = local.get(EMOJI_TONE)?.parse().ok()?;
+        (1..=6).contains(&tone).then_some(tone)
     }
 
     /// A write storing `value` under this workspace's local-state `key`, to run off the UI
@@ -665,16 +704,21 @@ impl CoreBridge {
     }
 }
 
-/// Opens the durable store for a session. Falls back to an in-memory store when no home
-/// directory is available; returns `None` only if no store can be opened at all.
-fn open_store(session: &Session) -> Option<Store> {
+/// Opens the durable store for a session plus a dedicated read-only WAL connection for lock-free
+/// concurrent UI reads. Falls back to an in-memory store when no home directory is available.
+fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
     match default_store_path(&session.team_id) {
         Some(path) => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             match Store::open(&path) {
-                Ok(store) => Some(store),
+                Ok(store) => {
+                    let reader = Store::open_read_only(&path)
+                        .ok()
+                        .map(|r| Arc::new(Mutex::new(r)));
+                    Some((store, reader))
+                }
                 Err(e) => {
                     eprintln!(
                         "slackless: could not open the local store at {} ({e}); running without a core connection",
@@ -685,7 +729,7 @@ fn open_store(session: &Session) -> Option<Store> {
             }
         }
         None => match Store::open_in_memory() {
-            Ok(store) => Some(store),
+            Ok(store) => Some((store, None)),
             Err(e) => {
                 eprintln!(
                     "slackless: could not open an in-memory store ({e}); running without a core connection"

@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -439,14 +439,22 @@ const GLYPH: f32 = 22.;
 const PICKER_WIDTH: f32 = COLUMNS as f32 * CELL + 32.;
 
 fn lookup(name: &str) -> Option<&'static Emoji> {
-    let name = ALIASES
-        .iter()
-        .find(|(alias, _)| *alias == name)
-        .map_or(name, |(_, target)| *target);
-    CATALOG
-        .iter()
-        .flat_map(|(_, _, list)| list.iter())
-        .find(|emoji| emoji.name == name)
+    static INDEX: OnceLock<HashMap<&'static str, &'static Emoji>> = OnceLock::new();
+    let map = INDEX.get_or_init(|| {
+        let mut map = HashMap::new();
+        for (_, _, list) in CATALOG {
+            for emoji in list.iter() {
+                map.insert(emoji.name, emoji);
+            }
+        }
+        for &(alias, target) in ALIASES {
+            if let Some(&emoji) = map.get(target) {
+                map.insert(alias, emoji);
+            }
+        }
+        map
+    });
+    map.get(name).copied()
 }
 
 /// `wave` from `wave::skin-tone-3`.
@@ -983,7 +991,7 @@ impl EmojiPicker {
             } else {
                 fixtures.frequent_emoji.clone()
             };
-            let mut picker = EmojiPicker {
+            EmojiPicker {
                 tone: fixtures.skin_tone,
                 fixtures,
                 search,
@@ -1007,9 +1015,7 @@ impl EmojiPicker {
                 jumped: None,
                 hovered: None,
                 _subscriptions: subscriptions,
-            };
-            picker.rebuild();
-            picker
+            }
         })
     }
 
@@ -1783,6 +1789,10 @@ impl Render for EmojiPicker {
                 .children(top_tabs)
                 .child(search)
                 .child(self.render_gifs_body(cx));
+        }
+
+        if self.rows.is_empty() && self.query.is_empty() {
+            self.rebuild();
         }
 
         // Slack's category row: outline icons, the section in view (or the one clicked) boxed.

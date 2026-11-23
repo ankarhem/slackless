@@ -86,12 +86,36 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+        let _ = conn.execute_batch(
+            "PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -32000;
+             PRAGMA mmap_size = 134217728;",
+        );
         Self::init(conn)
+    }
+
+    /// Opens a read-only WAL connection to an existing database at `path`, allowing UI reads to
+    /// run concurrently with background write transactions without waiting on the writer mutex.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let _ = conn.execute_batch(
+            "PRAGMA query_only = ON;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -16000;
+             PRAGMA mmap_size = 134217728;",
+        );
+        Ok(Self { conn })
     }
 
     /// A fresh in-memory store (tests, ephemeral sessions).
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        let conn = Connection::open_in_memory()?;
+        let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA cache_size = -32000;");
+        Self::init(conn)
     }
 
     fn init(conn: Connection) -> Result<Self> {
@@ -499,6 +523,23 @@ impl Store {
             .optional()?)
     }
 
+    /// Reads every slackless-local key/value for `workspace` in one query (avoids N separate
+    /// lock + SQLite round-trips at startup).
+    pub fn all_local(&self, workspace: &TeamId) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT key, value FROM local_state WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace.as_str()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+
     /// Sets a slackless-local value for `workspace`, replacing any previous one.
     pub fn set_local(&mut self, workspace: &TeamId, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
@@ -560,10 +601,10 @@ impl Store {
         collect(rows)
     }
 
-    /// Each of `channels`' newest channel-level message (roots, plain messages and thread
-    /// broadcasts; replies excluded), in one query: the DM list's previews, stamps and order
-    /// without loading histories. Deleted messages are included as tombstones; channels
-    /// with nothing stored are absent.
+    /// Each of `channels`' newest undeleted channel-level message (roots, plain messages and
+    /// thread broadcasts; replies excluded), using the `(workspace_id, channel_id, ts_key)` index
+    /// directly (`ORDER BY ts_key DESC LIMIT 1` per channel) so large DM histories are never
+    /// scanned by a window function.
     pub fn latest_messages(
         &self,
         workspace: &TeamId,
@@ -572,37 +613,36 @@ impl Store {
         if channels.is_empty() {
             return Ok(HashMap::new());
         }
-        // The bare `?`s continue the numbering `?1` starts, so the fixed parameters come
-        // before the IN list in the SQL text and in `args` alike.
-        let sql = format!(
-            "SELECT channel_id, json, deleted FROM (
-                 SELECT channel_id, json, deleted,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY channel_id ORDER BY ts_key DESC) AS newest
-                 FROM message_current
-                 WHERE workspace_id = ?1
-                   AND (thread_ts IS NULL OR thread_ts = ts OR subtype = ?)
-                   AND deleted = 0
-                   AND channel_id IN ({slots}))
-             WHERE newest = 1",
-            slots = vec!["?"; channels.len()].join(", ")
-        );
-        let mut args = Vec::with_capacity(channels.len() + 2);
-        args.push(SqlValue::Text(workspace.as_str().to_owned()));
-        args.push(SqlValue::Text(
-            MessageSubtype::ThreadBroadcast.as_str().to_owned(),
-        ));
-        args.extend(
-            channels
-                .iter()
-                .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), raw_row)?;
-        Ok(collect(rows)?
-            .into_iter()
-            .map(|stored| (stored.channel.clone(), stored))
-            .collect())
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT channel_id, json, deleted FROM message_current
+             WHERE workspace_id = ?1 AND channel_id = ?2
+               AND deleted = 0
+               AND (thread_ts IS NULL OR thread_ts = ts OR subtype = ?3)
+             ORDER BY ts_key DESC LIMIT 1",
+        )?;
+        let broadcast = MessageSubtype::ThreadBroadcast.as_str();
+        let ws = workspace.as_str();
+        let mut out = HashMap::with_capacity(channels.len());
+        for channel in channels {
+            let row = stmt
+                .query_row(params![ws, channel.as_str(), broadcast], raw_row)
+                .optional()?;
+            if let Some(raw) = row {
+                let (ch, json, deleted) = raw;
+                let ch_id = ChannelId::from(ch);
+                let mut message: Message = serde_json::from_str(&json)?;
+                message.channel.get_or_insert_with(|| ch_id.clone());
+                out.insert(
+                    channel.clone(),
+                    StoredMessage {
+                        channel: ch_id,
+                        message,
+                        deleted,
+                    },
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Up to `limit` newest undeleted messages sent by `user` across all conversations in
@@ -2219,5 +2259,26 @@ mod tests {
         );
 
         store.vacuum().unwrap();
+    }
+
+    #[test]
+    fn all_local_and_read_only_wal_reader_see_committed_writes() {
+        let dir =
+            std::env::temp_dir().join(format!("slackless-store-ro-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = Store::open(&path).unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        writer.set_local(&ws(), "font", "Lato").unwrap();
+        writer.set_local(&ws(), "zoom", "3").unwrap();
+        let all = reader.all_local(&ws()).unwrap();
+        assert_eq!(all.get("font").map(String::as_str), Some("Lato"));
+        assert_eq!(all.get("zoom").map(String::as_str), Some("3"));
+
+        drop(reader);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

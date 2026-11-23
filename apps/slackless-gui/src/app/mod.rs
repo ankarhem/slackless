@@ -701,6 +701,8 @@ pub struct App {
     history_generation: u64,
     /// Live mode: the newest thread read started; an overtaken read is dropped.
     thread_generation: u64,
+    /// Live mode: the newest async `reload_live` snapshot started; coalesces event bursts.
+    reload_generation: u64,
     /// Places navigated away from, newest last (Slack's back arrow, Cmd+[, mouse Back).
     back: Vec<NavPlace>,
     /// Places stepped back from, newest last (the forward arrow, Cmd+], mouse Forward).
@@ -759,10 +761,11 @@ impl App {
             }
             let bg_counts = vec![HashMap::new(); ws_count];
             let bg_activity_unread = vec![0; ws_count];
+            // Read all workspace `local_state` keys once (1 SQLite query instead of ~10).
+            let local = bridge.all_local();
             // Like Slack, reopen the conversation that was open last; a fresh store falls back
             // to the sidebar's first conversation until the user picks one.
-            let restored = bridge
-                .last_conversation()
+            let restored = CoreBridge::parse_last_conversation(&local)
                 .filter(|channel| fixtures.conversation(channel).is_some());
             let chosen = restored.is_some();
             let channel = restored.unwrap_or_else(|| first_conversation(&fixtures));
@@ -791,17 +794,16 @@ impl App {
             let search_menu = SearchMenu::new(fixtures.clone(), search.clone(), cx);
             // The search panel's remembered state, restored at launch like Slack's: the
             // recent searches, both toggles and the recently visited conversations.
-            if let Some(history) = bridge.search_history() {
+            if let Some(history) = CoreBridge::parse_search_history(&local) {
                 search_menu.update(cx, |menu, cx| menu.set_history(history, cx));
             }
-            if let Some(on) = bridge.search_history_shown() {
+            if let Some(on) = CoreBridge::parse_search_history_shown(&local) {
                 search_menu.update(cx, |menu, cx| menu.set_history_shown(on, cx));
             }
-            if let Some(on) = bridge.search_filters_shown() {
+            if let Some(on) = CoreBridge::parse_search_filters_shown(&local) {
                 search_menu.update(cx, |menu, cx| menu.set_filters_shown(on, cx));
             }
-            let restored_recent = bridge
-                .recent_places()
+            let restored_recent = CoreBridge::parse_recent_places(&local)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|channel| fixtures.conversation(channel).is_some())
@@ -809,7 +811,7 @@ impl App {
             let preferences = Preferences::new(window, cx);
             // Restore persisted Preferences settings first, then overlay the zoom/font/color_mode
             // values `main` installed before the first frame.
-            let mut restored_settings = bridge.settings();
+            let mut restored_settings = CoreBridge::parse_settings(&local);
             if let Some(settings) = restored_settings.clone() {
                 preferences.update(cx, |prefs, cx| prefs.load_settings(settings, window, cx));
             }
@@ -820,7 +822,7 @@ impl App {
             preferences.update(cx, |prefs, cx| prefs.set_zoom(zoom, cx));
             // Live: the remembered Color Mode over Slack's color theme (or persisted palette),
             // as `main` installed it before the first frame.
-            let color_mode = bridge.color_mode();
+            let color_mode = bridge.parse_color_mode(&local);
             let applied_theme = match color_mode {
                 Some(mode) => {
                     let palette = restored_settings
@@ -860,15 +862,15 @@ impl App {
             let status_picker = StatusPicker::new(window, cx);
             let user_menu = UserMenu::new(fixtures.clone(), cx);
             let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
-            let persisted_freq = bridge.frequent_emoji();
-            let persisted_tone = bridge.emoji_tone();
+            let persisted_freq = CoreBridge::parse_frequent_emoji(&local);
+            let persisted_tone = CoreBridge::parse_emoji_tone(&local);
             if persisted_freq.is_some() || persisted_tone.is_some() {
                 emoji_picker.update(cx, |picker, cx| {
                     picker.restore(persisted_freq, persisted_tone, cx);
                 });
             }
             let drafts = DraftsView::new(cx);
-            if let Some(saved_drafts) = bridge.drafts() {
+            if let Some(saved_drafts) = CoreBridge::parse_drafts(&local) {
                 let entries: Vec<Entry> = saved_drafts
                     .into_iter()
                     .map(|d| Entry {
@@ -1975,6 +1977,7 @@ impl App {
                 window_state_save: gpui::Task::ready(()),
                 history_generation: 0,
                 thread_generation: 0,
+                reload_generation: 0,
                 open_members: None,
                 members_hover: (false, false),
                 channel_people: None,
@@ -2111,13 +2114,15 @@ impl App {
             app.sync_later_count(cx);
             app.sync_badge(cx);
             let channel = app.channel.clone();
-            // Cold-launch frame-0 preload: read the initial channel's newest stored page
-            // synchronously (~1–2ms indexed SQLite query) so the first painted frame already
-            // contains the transcript instead of flashing empty.
+            // Cold-launch frame-0 preload: read the initial channel's newest viewport page
+            // synchronously (80 msgs on the read-only WAL connection, <1ms) so frame 0 renders
+            // immediately without a redundant second SQLite read right after.
             let initial_history = app.bridge.history_sync(&channel);
             if !initial_history.is_empty() {
                 app.resolve_named_users(&initial_history);
-                let mark_read_mode = app.preferences.read(cx).settings().mark_read;
+                let newest = initial_history.last().map(|m| m.ts.clone());
+                let settings = app.preferences.read(cx).settings().clone();
+                let mark_read_mode = settings.mark_read;
                 app.messages.update(cx, |list, cx| {
                     list.set_conversation(channel.clone(), cx);
                     list.set_history(channel.clone(), initial_history, cx);
@@ -2125,8 +2130,16 @@ impl App {
                         list.scroll_to_unread_once(cx);
                     }
                 });
+                let allow_mark =
+                    mark_read_mode != 2 && (!settings.no_bg_mark_read || app.window_active);
+                if allow_mark {
+                    if let Some(newest) = newest {
+                        app.mark_read(&channel, newest, cx);
+                    }
+                }
+            } else {
+                app.load_history(&channel, cx);
             }
-            app.load_history(&channel, cx);
             app.load_draft(cx);
             app.sync_composer_placeholder(cx);
             app.update_menus(cx);
