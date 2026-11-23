@@ -76,6 +76,18 @@ pub enum PopoutKind {
         source: WeakEntity<LaterView>,
         on_jump: JumpHandler,
     },
+    /// Popped-out Slack Canvas window (`F-COLLAB-128`, `F-SHELL-148`).
+    Canvas {
+        doc: crate::canvas::CanvasDoc,
+        file_id: Option<String>,
+        open_browser_url: Option<String>,
+        on_jump: JumpHandler,
+    },
+    /// Popped-out Files browser window (`F-COLLAB-127`, `F-SHELL-150`).
+    Files {
+        source: WeakEntity<crate::files_page::FilesPage>,
+        on_jump: JumpHandler,
+    },
 }
 
 /// Callback that forwards commands (`SendMessage`, etc.) to the workspace's live `CoreBridge`.
@@ -149,6 +161,7 @@ pub struct PopoutWindow {
     saved: HashSet<Ts>,
     activity_rows: Vec<PopoutActivityRow>,
     later_items: Vec<LaterItem>,
+    files_items: Vec<(String, String, Option<String>)>,
     composer: Entity<Composer>,
     emoji_picker: Entity<EmojiPicker>,
     picker: Option<(PopoutPickerTarget, Point<Pixels>)>,
@@ -175,7 +188,10 @@ impl PopoutWindow {
         let placeholder = match &kind {
             PopoutKind::Conversation { .. } => format!("Message {title}"),
             PopoutKind::Thread { .. } => "Reply in thread…".to_owned(),
-            PopoutKind::Activity { .. } | PopoutKind::Later { .. } => String::new(),
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. } => String::new(),
         };
         let has_composer = matches!(
             &kind,
@@ -228,7 +244,10 @@ impl PopoutWindow {
             PopoutKind::Conversation { channel, .. } | PopoutKind::Thread { channel, .. } => {
                 Some(channel.clone())
             }
-            PopoutKind::Activity { .. } | PopoutKind::Later { .. } => None,
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. } => None,
         };
         if let (Some(ch), Some((weak_later, workspace))) = (active_channel.clone(), &later_sync) {
             if let Some(later) = weak_later.upgrade() {
@@ -254,6 +273,7 @@ impl PopoutWindow {
         }
         let mut activity_rows = Vec::new();
         let mut later_items = Vec::new();
+        let mut files_items = Vec::new();
         match &kind {
             PopoutKind::Conversation { source, .. } | PopoutKind::Thread { source, .. } => {
                 if let Some(list) = source.upgrade() {
@@ -280,6 +300,16 @@ impl PopoutWindow {
                     }));
                 }
             }
+            PopoutKind::Files { source, .. } => {
+                if let Some(page) = source.upgrade() {
+                    files_items = page.read(cx).snapshot_for_popout();
+                    subscriptions.push(cx.observe(&page, |this, page, cx| {
+                        this.files_items = page.read(cx).snapshot_for_popout();
+                        cx.notify();
+                    }));
+                }
+            }
+            PopoutKind::Canvas { .. } => {}
         }
         // Fallback periodic refresh from the shared SQLite store for conversations that are not
         // currently selected in the main window's `MessageList`.
@@ -315,6 +345,7 @@ impl PopoutWindow {
             saved,
             activity_rows,
             later_items,
+            files_items,
             composer,
             emoji_picker,
             picker: None,
@@ -444,7 +475,9 @@ impl PopoutWindow {
             PopoutKind::Conversation { on_jump, .. }
             | PopoutKind::Thread { on_jump, .. }
             | PopoutKind::Activity { on_jump, .. }
-            | PopoutKind::Later { on_jump, .. } => on_jump.clone(),
+            | PopoutKind::Later { on_jump, .. }
+            | PopoutKind::Canvas { on_jump, .. }
+            | PopoutKind::Files { on_jump, .. } => on_jump.clone(),
         }
     }
 
@@ -707,6 +740,7 @@ impl PopoutWindow {
                 self.messages.retain(|m| m.ts != ts);
                 cx.notify();
             }
+            MessageAction::AddToList => {}
         }
     }
 
@@ -726,6 +760,14 @@ impl PopoutWindow {
                 }
                 return;
             }
+            PopoutKind::Files { source, .. } => {
+                if let Some(page) = source.upgrade() {
+                    self.files_items = page.read(cx).snapshot_for_popout();
+                    cx.notify();
+                }
+                return;
+            }
+            PopoutKind::Canvas { .. } => return,
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {}
         }
         let fresh = load_messages(
@@ -749,7 +791,10 @@ impl PopoutWindow {
             PopoutKind::Thread {
                 channel, thread_ts, ..
             } => (channel.clone(), Some(thread_ts.clone())),
-            PopoutKind::Activity { .. } | PopoutKind::Later { .. } => return,
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. } => return,
         };
         let mut local =
             self.fixtures
@@ -774,7 +819,13 @@ fn load_messages(
     store: Option<&SharedStore>,
     team: Option<&TeamId>,
 ) -> Vec<Message> {
-    if matches!(kind, PopoutKind::Activity { .. } | PopoutKind::Later { .. }) {
+    if matches!(
+        kind,
+        PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. }
+    ) {
         return Vec::new();
     }
     if let (Some(store), Some(team)) = (store, team) {
@@ -786,7 +837,10 @@ fn load_messages(
                 PopoutKind::Thread {
                     channel, thread_ts, ..
                 } => guard.thread_replies(team, channel, thread_ts),
-                PopoutKind::Activity { .. } | PopoutKind::Later { .. } => Ok(Vec::new()),
+                PopoutKind::Activity { .. }
+                | PopoutKind::Later { .. }
+                | PopoutKind::Canvas { .. }
+                | PopoutKind::Files { .. } => Ok(Vec::new()),
             };
             if let Ok(rows) = rows {
                 return rows
@@ -808,7 +862,10 @@ fn load_messages(
             .get(&(channel.clone(), thread_ts.clone()))
             .cloned()
             .unwrap_or_default(),
-        PopoutKind::Activity { .. } | PopoutKind::Later { .. } => Vec::new(),
+        PopoutKind::Activity { .. }
+        | PopoutKind::Later { .. }
+        | PopoutKind::Canvas { .. }
+        | PopoutKind::Files { .. } => Vec::new(),
     }
 }
 
@@ -838,6 +895,8 @@ impl Render for PopoutWindow {
             PopoutKind::Thread { .. } => "Thread",
             PopoutKind::Activity { .. } => "Activity · Live",
             PopoutKind::Later { .. } => "Later · Live",
+            PopoutKind::Canvas { .. } => "Canvas",
+            PopoutKind::Files { .. } => "Files · Live",
         };
         let has_composer = matches!(
             &self.kind,
@@ -1151,6 +1210,86 @@ impl Render for PopoutWindow {
                             )
                             .child(div().text_sm().child(item.text.clone()))
                     }));
+                }
+                list
+            }
+            PopoutKind::Canvas {
+                doc,
+                file_id,
+                open_browser_url,
+                ..
+            } => {
+                let open_browser = open_browser_url.clone().map(|url| {
+                    Rc::new(move |_: &mut Window, cx: &mut App| cx.open_url(&url))
+                        as crate::canvas::OpenBrowserFn
+                });
+                let on_edit = file_id.clone().map(|fid| {
+                    let send = self.send.clone();
+                    Rc::new(move |op, _: &mut Window, _: &mut App| {
+                        (send)(Command::EditCanvas {
+                            file_id: fid.clone(),
+                            op,
+                        });
+                    }) as crate::canvas::CanvasEditFn
+                });
+                let key = file_id.as_deref().unwrap_or("popout-canvas");
+                crate::canvas::render_popout_canvas(
+                    key,
+                    doc,
+                    "",
+                    None,
+                    crate::canvas::CanvasActions {
+                        open_browser,
+                        on_edit,
+                        on_request_access: None,
+                        on_pop_out: None,
+                    },
+                    file_id.is_none(),
+                    cx,
+                )
+            }
+            PopoutKind::Files { .. } => {
+                let mut list = v_flex()
+                    .id("popout-files")
+                    .flex_1()
+                    .min_h_0()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .overflow_y_scroll();
+                if self.files_items.is_empty() {
+                    list = list.child(
+                        div()
+                            .py_6()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("No files visible."),
+                    );
+                } else {
+                    list = list.children(self.files_items.iter().enumerate().map(
+                        |(ix, (name, meta, url))| {
+                            let url_opt = url.clone();
+                            v_flex()
+                                .id(SharedString::from(format!("popout-file-{ix}")))
+                                .gap_0p5()
+                                .p_3()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .when_some(url_opt, |card, link| {
+                                    card.cursor_pointer()
+                                        .hover(|el| el.bg(accent.opacity(0.22)))
+                                        .on_click(move |_, _, cx| cx.open_url(&link))
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(name.clone()),
+                                )
+                                .child(div().text_xs().text_color(muted).child(meta.clone()))
+                        },
+                    ));
                 }
                 list
             }

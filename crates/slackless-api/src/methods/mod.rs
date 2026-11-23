@@ -2030,4 +2030,201 @@ impl SlackApi {
         self.call::<Empty>(method::FILES_UNDELETE, params).await?;
         Ok(())
     }
+
+    /// `canvases.create`: create a standalone canvas or channel-tabbed canvas (`F-COLLAB-119`).
+    pub async fn canvases_create(
+        &self,
+        title: Option<&str>,
+        markdown: Option<&str>,
+        channel_id: Option<&ChannelId>,
+    ) -> Result<CanvasCreated> {
+        let mut params = Vec::new();
+        if let Some(t) = title.filter(|s| !s.is_empty()) {
+            params.push(("title", t.to_owned()));
+        }
+        if let Some(md) = markdown.filter(|s| !s.is_empty()) {
+            let content = serde_json::json!({ "type": "markdown", "markdown": md }).to_string();
+            params.push(("document_content", content));
+        }
+        if let Some(ch) = channel_id {
+            params.push(("channel_id", ch.to_string()));
+        }
+        Ok(self.call(method::CANVASES_CREATE, params).await?.data)
+    }
+
+    /// `canvases.edit`: apply one section-level edit operation to a canvas (`F-COLLAB-132`, `F-SHELL-264`, `F-SHELL-277`).
+    pub async fn canvases_edit(&self, canvas_id: &str, op: &CanvasEditOp) -> Result<()> {
+        let changes = serde_json::Value::Array(vec![op.to_change_json()]).to_string();
+        let params = vec![("canvas_id", canvas_id.to_owned()), ("changes", changes)];
+        self.call::<Empty>(method::CANVASES_EDIT, params).await?;
+        Ok(())
+    }
+
+    /// `canvases.getContent`: fetch a canvas's markdown or HTML body (`canvases.getContent`).
+    pub async fn canvases_get_content(
+        &self,
+        canvas_id: &str,
+        content_type: Option<&str>,
+    ) -> Result<String> {
+        let mut params = vec![("canvas_id", canvas_id.to_owned())];
+        if let Some(ct) = content_type.filter(|s| !s.is_empty()) {
+            params.push(("content_type", ct.to_owned()));
+        }
+        let wire: CanvasContentWire = self.call(method::CANVASES_GET_CONTENT, params).await?.data;
+        Ok(wire.content)
+    }
+
+    /// `canvases.delete`: permanently delete a canvas.
+    pub async fn canvases_delete(&self, canvas_id: &str) -> Result<()> {
+        let params = vec![("canvas_id", canvas_id.to_owned())];
+        self.call::<Empty>(method::CANVASES_DELETE, params).await?;
+        Ok(())
+    }
+
+    /// `files.requestPermission`: request edit (`upgrade`) or comment (`comment_upgrade`) access (`F-COLLAB-129`).
+    pub async fn files_request_permission(&self, file_id: &str, request_type: &str) -> Result<()> {
+        let params = vec![
+            ("file_id", file_id.to_owned()),
+            ("request_type", request_type.to_owned()),
+            ("reason", "IndicatorRequestEditAccessButton".to_owned()),
+        ];
+        self.call::<Empty>(method::FILES_REQUEST_PERMISSION, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `lists.create`: create a new Slack List from scratch (`F-COLLAB-213`).
+    pub async fn lists_create(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        channel_id: Option<&ChannelId>,
+    ) -> Result<String> {
+        let mut params = vec![("name", name.to_owned())];
+        if let Some(desc) = description.filter(|s| !s.is_empty()) {
+            params.push(("description", desc.to_owned()));
+        }
+        if let Some(ch) = channel_id {
+            params.push(("context_channel_id", ch.to_string()));
+        }
+        let wire: ListCreateWire = self.call(method::LISTS_CREATE, params).await?.data;
+        let id = wire
+            .list_id
+            .or_else(|| {
+                wire.list
+                    .as_ref()
+                    .and_then(|v| v.get("id"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_default();
+        Ok(id)
+    }
+
+    /// `lists.records.create` (with `slackLists.items.create` fallback): add an item to a List (`F-COLLAB-226`).
+    pub async fn lists_records_create(
+        &self,
+        list_id: &str,
+        initial_fields: &[ListCellInput],
+        parent_record_id: Option<&str>,
+    ) -> Result<SlackListRow> {
+        let fields_json =
+            Value::Array(initial_fields.iter().map(|c| c.to_json(None)).collect()).to_string();
+        let mut params = vec![
+            ("list_id", list_id.to_owned()),
+            ("initial_fields", fields_json.clone()),
+        ];
+        if let Some(parent) = parent_record_id.filter(|s| !s.is_empty()) {
+            params.push(("parent_record_id", parent.to_owned()));
+        }
+        let wire: ListRecordCreateWire = match self.call(method::LISTS_RECORDS_CREATE, params).await
+        {
+            Ok(resp) => resp.data,
+            Err(_) => {
+                let mut fallback = vec![
+                    ("list_id", list_id.to_owned()),
+                    ("initial_fields", fields_json),
+                ];
+                if let Some(parent) = parent_record_id.filter(|s| !s.is_empty()) {
+                    fallback.push(("parent_item_id", parent.to_owned()));
+                }
+                self.call(method::SLACK_LISTS_ITEMS_CREATE, fallback)
+                    .await?
+                    .data
+            }
+        };
+        let raw = wire.record.or(wire.item);
+        let row = raw
+            .as_ref()
+            .and_then(|v| {
+                parse_list_records(std::slice::from_ref(v))
+                    .into_iter()
+                    .next()
+            })
+            .unwrap_or_default();
+        Ok(row)
+    }
+
+    /// `lists.cells.update` (with `slackLists.items.update` fallback): update one or more cells (`F-COLLAB-227`, `F-COLLAB-248`).
+    pub async fn lists_cells_update(
+        &self,
+        list_id: &str,
+        row_id: &str,
+        cells: &[ListCellInput],
+    ) -> Result<()> {
+        let cells_json =
+            Value::Array(cells.iter().map(|c| c.to_json(Some(row_id))).collect()).to_string();
+        let params = vec![
+            ("list_id", list_id.to_owned()),
+            ("cells", cells_json.clone()),
+        ];
+        if self
+            .call::<Empty>(method::LISTS_CELLS_UPDATE, params)
+            .await
+            .is_err()
+        {
+            let fallback = vec![("list_id", list_id.to_owned()), ("cells", cells_json)];
+            self.call::<Empty>(method::SLACK_LISTS_ITEMS_UPDATE, fallback)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// `lists.records.delete` (with `slackLists.items.delete` fallback): delete one list item (`F-COLLAB-228`).
+    pub async fn lists_records_delete(&self, list_id: &str, row_id: &str) -> Result<()> {
+        let params = vec![("list_id", list_id.to_owned()), ("id", row_id.to_owned())];
+        if self
+            .call::<Empty>(method::LISTS_RECORDS_DELETE, params.clone())
+            .await
+            .is_err()
+        {
+            self.call::<Empty>(method::SLACK_LISTS_ITEMS_DELETE, params)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// `lists.addToList`: add a Slack message to an existing List (`F-COLLAB-231`).
+    pub async fn lists_add_to_list(
+        &self,
+        list_id: &str,
+        channel: &ChannelId,
+        message_ts: &Ts,
+    ) -> Result<String> {
+        let params = vec![
+            ("list_id", list_id.to_owned()),
+            ("channel_id", channel.to_string()),
+            ("message_ts", message_ts.to_string()),
+            ("reason", "add-to-list".to_owned()),
+        ];
+        let wire: ListRecordCreateWire = self.call(method::LISTS_ADD_TO_LIST, params).await?.data;
+        let id = wire
+            .record
+            .as_ref()
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Ok(id)
+    }
 }

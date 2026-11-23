@@ -1,7 +1,9 @@
-//! Read-only Slack List view: renders both the sample workspace's fixture list and live Slack
-//! Lists fetched via `files.info` + `lists.records.list` / `slackLists.items.list` as a
-//! searchable, sortable table with typed columns (text, person, select, date, checkbox,
-//! number, link) (`docs/research/api-canvases-lists.md`).
+//! Editable Slack List view (`F-COLLAB-213`, `F-COLLAB-226..229`, `F-COLLAB-234..239`,
+//! `F-COLLAB-248`): renders both the sample workspace's fixture list and live Slack Lists fetched
+//! via `files.info` + `lists.records.list` / `slackLists.items.list` as a searchable, sortable
+//! Table or Board with typed columns, inline checkbox toggling, "+ Add item", interactive detail
+//! drawer editing (text, date, number, link, select, assignee, checkbox), delete item, and
+//! CSV/JSON export (`docs/research/api-canvases-lists.md`).
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -13,10 +15,14 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Div, Entity, FontWeight, Global, Hsla, InteractiveElement as _, ParentElement as _,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
+    App, AppContext as _, Div, Entity, FontWeight, Global, Hsla, InteractiveElement as _,
+    IntoElement as _, ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, Window, div, px, rgb,
 };
-use slackless_core::api::{SlackListCellValue, SlackListColumn, SlackListData, SlackListRow};
+use slackless_core::api::{
+    ListCellInput, ListCellInputValue, SlackListCellValue, SlackListColumn, SlackListData,
+    SlackListRow,
+};
 
 use crate::canvas::{OpenBrowserFn, read_only_badge};
 use crate::fixtures::Fixtures;
@@ -36,9 +42,15 @@ struct ListPanelState {
     layout: ListLayout,
     hidden_cols: HashSet<String>,
     selected_row: Option<usize>,
+    adding: bool,
+    new_item_input: Option<Entity<TextareaState>>,
+    /// Currently edited `(row_id, col_id, input)` in the item detail drawer.
+    editing_cell: Option<(String, String, Entity<TextareaState>)>,
+    /// Mutable local rows for fixture mode.
+    fixture_rows: Option<Vec<Vec<Field>>>,
 }
 
-/// Persistent per-list UI state (layout mode, hidden columns, open item detail drawer).
+/// Persistent per-list UI state (layout mode, hidden columns, open item detail drawer, inline edits).
 #[derive(Default)]
 struct ListUiStore {
     panels: HashMap<String, ListPanelState>,
@@ -65,6 +77,22 @@ fn mutate_panel(key: &str, f: impl FnOnce(&mut ListPanelState), window: &mut Win
 
 /// Callback invoked when the user clicks a live list column header to sort by `col_idx`.
 pub type SortColumnFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+/// Callback invoked when adding a new item (`lists.records.create`).
+pub type CreateListItemFn = Rc<dyn Fn(Vec<ListCellInput>, &mut Window, &mut App)>;
+/// Callback invoked when updating a single cell (`lists.cells.update`).
+pub type UpdateListCellFn = Rc<dyn Fn(String, ListCellInput, &mut Window, &mut App)>;
+/// Callback invoked when deleting a row (`lists.records.delete`).
+pub type DeleteListItemFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
+/// Optional interactive callbacks for a live Slack List.
+#[derive(Clone, Default)]
+pub struct ListActions {
+    pub on_sort: Option<SortColumnFn>,
+    pub on_create_item: Option<CreateListItemFn>,
+    pub on_update_cell: Option<UpdateListCellFn>,
+    pub on_delete_item: Option<DeleteListItemFn>,
+    pub open_browser: Option<OpenBrowserFn>,
+}
 
 /// A column's field type; drives its header icon and how its cells render.
 #[derive(Clone, Copy)]
@@ -125,11 +153,12 @@ impl Status {
     }
 }
 
+#[derive(Clone)]
 enum Field {
-    Text(&'static str),
-    Person(&'static str),
+    Text(String),
+    Person(String),
     Select(Status),
-    Date(&'static str),
+    Date(String),
     Checkbox(bool),
 }
 
@@ -160,38 +189,38 @@ fn fixture() -> SlackList {
         ],
         rows: vec![
             vec![
-                Text("Sign the macOS build"),
-                Person("Maya Chen"),
+                Text("Sign the macOS build".into()),
+                Person("Maya Chen".into()),
                 Select(Status::Done),
-                Date("Oct 10"),
+                Date("Oct 10".into()),
                 Checkbox(true),
             ],
             vec![
-                Text("Beta invite list"),
-                Person("Leo Park"),
+                Text("Beta invite list".into()),
+                Person("Leo Park".into()),
                 Select(Status::InProgress),
-                Date("Nov 1"),
+                Date("Nov 1".into()),
                 Checkbox(false),
             ],
             vec![
-                Text("Release notes"),
-                Person("Sam Rivera"),
+                Text("Release notes".into()),
+                Person("Sam Rivera".into()),
                 Select(Status::Todo),
-                Date("Nov 20"),
+                Date("Nov 20".into()),
                 Checkbox(false),
             ],
             vec![
-                Text("Native huddle media"),
-                Person("Ana Silva"),
+                Text("Native huddle media".into()),
+                Person("Ana Silva".into()),
                 Select(Status::Blocked),
-                Date("TBD"),
+                Date("TBD".into()),
                 Checkbox(false),
             ],
             vec![
-                Text("Search index migration"),
-                Person("Leo Park"),
+                Text("Search index migration".into()),
+                Person("Leo Park".into()),
                 Select(Status::Done),
-                Date("Oct 28"),
+                Date("Oct 28".into()),
                 Checkbox(true),
             ],
         ],
@@ -290,13 +319,17 @@ fn fields_menu(
         })
 }
 
-/// The List tab body: Table or Board layout, hideable fields, CSV/JSON export, and click-to-open
-/// item detail drawer (`F-COLLAB-229`, `F-COLLAB-234..237`, `F-COLLAB-239`).
+/// The List tab body: Table or Board layout, hideable fields, CSV/JSON export, inline editing,
+/// and click-to-open item detail drawer (`F-COLLAB-226..229`, `F-COLLAB-234..237`, `F-COLLAB-239`).
 pub fn list_view(cx: &App) -> Stateful<Div> {
     const KEY: &str = "fixture";
     let theme = cx.theme();
-    let list = fixture();
+    let mut list = fixture();
     let state = panel_state(KEY, cx);
+    if let Some(custom_rows) = state.fixture_rows.clone() {
+        list.rows = custom_rows;
+    }
+    let default_rows = list.rows.clone();
     let visible_cols: Vec<usize> = list
         .columns
         .iter()
@@ -343,6 +376,7 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
             let selected_bg = theme.accent.opacity(0.28);
             let rows = list.rows.iter().enumerate().map(|(row_ix, fields)| {
                 let is_sel = state.selected_row == Some(row_ix);
+                let base_rows = default_rows.clone();
                 visible_cols.iter().fold(
                     h_flex()
                         .id(("list-fix-row", row_ix))
@@ -368,6 +402,36 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                         }),
                     |row, &col_ix| {
                         let column = &list.columns[col_ix];
+                        let cell_el = if matches!(fields[col_ix], Field::Checkbox(_)) {
+                            let rows_seed = base_rows.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "list-fix-chk-{row_ix}-{col_ix}"
+                                )))
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    mutate_panel(
+                                        KEY,
+                                        |s| {
+                                            let r = s
+                                                .fixture_rows
+                                                .get_or_insert_with(|| rows_seed.clone());
+                                            if let Some(Field::Checkbox(v)) =
+                                                r.get_mut(row_ix).and_then(|f| f.get_mut(col_ix))
+                                            {
+                                                *v = !*v;
+                                            }
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .child(cell(&fields[col_ix], cx))
+                                .into_any_element()
+                        } else {
+                            cell(&fields[col_ix], cx).into_any_element()
+                        };
                         row.child(
                             h_flex()
                                 .w(px(column.width))
@@ -375,7 +439,7 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                                 .items_center()
                                 .px_3()
                                 .py_2()
-                                .child(cell(&fields[col_ix], cx)),
+                                .child(cell_el),
                         )
                     },
                 )
@@ -492,7 +556,8 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
     let detail_drawer = state
         .selected_row
         .and_then(|row_ix| list.rows.get(row_ix).map(|fields| (row_ix, fields)))
-        .map(|(_, fields)| {
+        .map(|(row_ix, fields)| {
+            let rows_seed_del = default_rows.clone();
             let mut panel = v_flex()
                 .w(px(320.))
                 .flex_none()
@@ -517,16 +582,130 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                                 .child("Item details"),
                         )
                         .child(
-                            Button::new("list-fix-detail-close")
-                                .ghost()
-                                .with_size(Size::XSmall)
-                                .icon(IconName::X)
-                                .on_click(|_, window, cx| {
-                                    mutate_panel(KEY, |s| s.selected_row = None, window, cx);
-                                }),
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("list-fix-detail-delete")
+                                        .ghost()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Trash)
+                                        .tooltip("Delete item")
+                                        .on_click(move |_, window, cx| {
+                                            mutate_panel(
+                                                KEY,
+                                                |s| {
+                                                    let r =
+                                                        s.fixture_rows.get_or_insert_with(|| {
+                                                            rows_seed_del.clone()
+                                                        });
+                                                    if row_ix < r.len() {
+                                                        r.remove(row_ix);
+                                                    }
+                                                    s.selected_row = None;
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                )
+                                .child(
+                                    Button::new("list-fix-detail-close")
+                                        .ghost()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::X)
+                                        .on_click(|_, window, cx| {
+                                            mutate_panel(
+                                                KEY,
+                                                |s| s.selected_row = None,
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                ),
                         ),
                 );
-            for (col, field) in list.columns.iter().zip(fields) {
+            for (col_ix, (col, field)) in list.columns.iter().zip(fields).enumerate() {
+                let rows_seed = default_rows.clone();
+                let control = match field {
+                    Field::Select(current) => {
+                        let current = *current;
+                        Button::new(SharedString::from(format!(
+                            "list-fix-sel-{row_ix}-{col_ix}"
+                        )))
+                        .outline()
+                        .with_size(Size::XSmall)
+                        .label(current.label())
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for st in Status::ALL {
+                                let seed = rows_seed.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(st.label())
+                                        .checked(st == current)
+                                        .on_click(move |_, window, cx| {
+                                            mutate_panel(
+                                                KEY,
+                                                |s| {
+                                                    let r = s
+                                                        .fixture_rows
+                                                        .get_or_insert_with(|| seed.clone());
+                                                    if let Some(slot) = r
+                                                        .get_mut(row_ix)
+                                                        .and_then(|f| f.get_mut(col_ix))
+                                                    {
+                                                        *slot = Field::Select(st);
+                                                    }
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                );
+                            }
+                            menu
+                        })
+                        .into_any_element()
+                    }
+                    Field::Checkbox(checked) => {
+                        let checked = *checked;
+                        h_flex()
+                            .id(SharedString::from(format!(
+                                "list-fix-det-chk-{row_ix}-{col_ix}"
+                            )))
+                            .items_center()
+                            .gap_1p5()
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                mutate_panel(
+                                    KEY,
+                                    |s| {
+                                        let r =
+                                            s.fixture_rows.get_or_insert_with(|| rows_seed.clone());
+                                        if let Some(Field::Checkbox(v)) =
+                                            r.get_mut(row_ix).and_then(|f| f.get_mut(col_ix))
+                                        {
+                                            *v = !*v;
+                                        }
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .child(cell(field, cx))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if checked { "Checked" } else { "Unchecked" }),
+                            )
+                            .into_any_element()
+                    }
+                    _ => h_flex()
+                        .items_center()
+                        .text_sm()
+                        .child(cell(field, cx))
+                        .into_any_element(),
+                };
                 panel = panel.child(
                     v_flex()
                         .gap_1()
@@ -543,11 +722,78 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                                 )
                                 .child(col.name),
                         )
-                        .child(h_flex().items_center().text_sm().child(cell(field, cx))),
+                        .child(h_flex().items_center().child(control)),
                 );
             }
             panel
         });
+
+    let add_bar = state.adding.then(|| {
+        state.new_item_input.clone().map(|input| {
+            let input_submit = input.clone();
+            let rows_seed = default_rows.clone();
+            h_flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary.opacity(0.3))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Textarea::new(&input).appearance(false).bordered(false)),
+                )
+                .child(
+                    Button::new("list-fix-add-save")
+                        .primary()
+                        .with_size(Size::XSmall)
+                        .label("Add")
+                        .on_click(move |_, window, cx| {
+                            let text = input_submit.read(cx).value().trim().to_owned();
+                            if !text.is_empty() {
+                                mutate_panel(
+                                    KEY,
+                                    |s| {
+                                        let r =
+                                            s.fixture_rows.get_or_insert_with(|| rows_seed.clone());
+                                        r.push(vec![
+                                            Field::Text(text),
+                                            Field::Person("Unassigned".into()),
+                                            Field::Select(Status::Todo),
+                                            Field::Date("TBD".into()),
+                                            Field::Checkbox(false),
+                                        ]);
+                                        s.adding = false;
+                                        s.new_item_input = None;
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("list-fix-add-cancel")
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::X)
+                        .on_click(|_, window, cx| {
+                            mutate_panel(
+                                KEY,
+                                |s| {
+                                    s.adding = false;
+                                    s.new_item_input = None;
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+        })
+    });
 
     h_flex()
         .id("list-root")
@@ -582,6 +828,28 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                                         .child(format!("{} items", list.rows.len())),
                                 )
                                 .child(div().flex_1())
+                                .child(
+                                    Button::new("list-fix-add-item")
+                                        .primary()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Plus)
+                                        .label("Add item")
+                                        .on_click(|_, window, cx| {
+                                            let input = cx.new(|cx| {
+                                                TextareaState::new(window, cx)
+                                                    .placeholder("New task title…")
+                                            });
+                                            mutate_panel(
+                                                KEY,
+                                                |s| {
+                                                    s.adding = true;
+                                                    s.new_item_input = Some(input);
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                )
                                 .child(layout_switcher(KEY, state.layout, cx))
                                 .child(fields_menu(KEY, toggleable_cols, &state.hidden_cols))
                                 .child({
@@ -623,9 +891,9 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                                                 cx,
                                             );
                                         })
-                                })
-                                .child(read_only_badge(cx)),
+                                }),
                         )
+                        .children(add_bar.flatten())
                         .child(body),
                 ),
         )
@@ -635,8 +903,8 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
 fn cell(field: &Field, cx: &App) -> Div {
     let theme = cx.theme();
     match field {
-        Field::Text(text) => div().truncate().child(*text),
-        Field::Date(text) => div().text_color(theme.muted_foreground).child(*text),
+        Field::Text(text) => div().truncate().child(text.clone()),
+        Field::Date(text) => div().text_color(theme.muted_foreground).child(text.clone()),
         Field::Person(name) => h_flex()
             .gap_1p5()
             .items_center()
@@ -654,7 +922,7 @@ fn cell(field: &Field, cx: &App) -> Div {
                     .text_color(theme::avatar_foreground())
                     .child(team_initials(name)),
             )
-            .child(div().truncate().child(*name)),
+            .child(div().truncate().child(name.clone())),
         Field::Select(status) => {
             let (label, color): (&str, Hsla) = match status {
                 Status::Todo => ("To do", theme.muted_foreground),
@@ -682,8 +950,7 @@ fn cell(field: &Field, cx: &App) -> Div {
     }
 }
 
-/// Native live read-only Slack Lists viewer: shows loading, error with browser fallback, or a
-/// searchable, column-sortable table of typed Slack List records.
+/// Native live editable Slack Lists view (`F-COLLAB-226..229`, `F-COLLAB-234..239`, `F-COLLAB-248`).
 #[allow(clippy::too_many_arguments)]
 pub fn live_list_view(
     loaded: Option<&Result<SlackListData, String>>,
@@ -691,11 +958,11 @@ pub fn live_list_view(
     query: &str,
     search: Option<&Entity<TextareaState>>,
     sort: Option<(usize, bool)>,
-    on_sort: Option<SortColumnFn>,
-    open_browser: Option<OpenBrowserFn>,
+    actions: ListActions,
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let open_browser = actions.open_browser.clone();
     match loaded {
         None => v_flex()
             .id("list-loading")
@@ -745,16 +1012,7 @@ pub fn live_list_view(
                         .on_click(move |_, window, cx| open(window, cx)),
                 )
             }),
-        Some(Ok(data)) => render_live_list(
-            data,
-            fixtures,
-            query,
-            search,
-            sort,
-            on_sort,
-            open_browser,
-            cx,
-        ),
+        Some(Ok(data)) => render_live_list(data, fixtures, query, search, sort, actions, cx),
     }
 }
 
@@ -826,14 +1084,16 @@ fn render_live_list(
     query: &str,
     search: Option<&Entity<TextareaState>>,
     sort: Option<(usize, bool)>,
-    on_sort: Option<SortColumnFn>,
-    open_browser: Option<OpenBrowserFn>,
+    actions: ListActions,
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
     let list_key = data.file_id.clone();
     let state = panel_state(&list_key, cx);
     let visible_indices = filter_and_sort_rows(data, fixtures, query, sort);
+    let on_sort = actions.on_sort.clone();
+    let open_browser = actions.open_browser.clone();
+    let can_edit = actions.on_update_cell.is_some() || actions.on_create_item.is_some();
 
     let primary_ix = data.columns.iter().position(|c| c.is_primary).unwrap_or(0);
     let visible_cols: Vec<usize> = data
@@ -927,6 +1187,40 @@ fn render_live_list(
                 let column = &data.columns[col_ix];
                 let width = live_column_width(column);
                 let val = row_cell(rec, column);
+                let is_checkbox = matches!(
+                    column.kind.as_str(),
+                    "checkbox" | "todo_completed" | "completed"
+                );
+                let cell_el = if is_checkbox {
+                    if let Some(update_cb) = actions.on_update_cell.clone() {
+                        let checked = matches!(val, Some(SlackListCellValue::Checkbox(true)));
+                        let row_id = rec.id.clone();
+                        let col_id = column.id.clone();
+                        div()
+                            .id(SharedString::from(format!(
+                                "list-live-chk-{row_ix}-{col_ix}"
+                            )))
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                update_cb(
+                                    row_id.clone(),
+                                    ListCellInput {
+                                        column_id: col_id.clone(),
+                                        value: ListCellInputValue::Checkbox(!checked),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .child(live_cell(val, column, fixtures, cx))
+                            .into_any_element()
+                    } else {
+                        live_cell(val, column, fixtures, cx).into_any_element()
+                    }
+                } else {
+                    live_cell(val, column, fixtures, cx).into_any_element()
+                };
                 row.child(
                     h_flex()
                         .w(px(width))
@@ -934,7 +1228,7 @@ fn render_live_list(
                         .items_center()
                         .px_3()
                         .py_2()
-                        .child(live_cell(val, column, fixtures, cx)),
+                        .child(cell_el),
                 )
             },
         )
@@ -1090,10 +1384,15 @@ fn render_live_list(
         .and_then(|row_ix| data.rows.get(row_ix))
         .map(|rec| {
             let key_close = list_key.clone();
+            let key_del = list_key.clone();
+            let row_id_del = rec.id.clone();
+            let on_delete = actions.on_delete_item.clone();
             let mut panel = v_flex()
+                .id("list-live-detail")
                 .w(px(340.))
                 .flex_none()
                 .h_full()
+                .overflow_y_scroll()
                 .border_l_1()
                 .border_color(theme.border)
                 .bg(theme.background)
@@ -1114,16 +1413,342 @@ fn render_live_list(
                                 .child("Item details"),
                         )
                         .child(
-                            Button::new("list-live-detail-close")
-                                .ghost()
-                                .with_size(Size::XSmall)
-                                .icon(IconName::X)
-                                .on_click(move |_, window, cx| {
-                                    mutate_panel(&key_close, |s| s.selected_row = None, window, cx);
-                                }),
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .when_some(on_delete, |row, del| {
+                                    row.child(
+                                        Button::new("list-live-detail-delete")
+                                            .ghost()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::Trash)
+                                            .tooltip("Delete item")
+                                            .on_click(move |_, window, cx| {
+                                                mutate_panel(
+                                                    &key_del,
+                                                    |s| s.selected_row = None,
+                                                    window,
+                                                    cx,
+                                                );
+                                                del(row_id_del.clone(), window, cx);
+                                            }),
+                                    )
+                                })
+                                .child(
+                                    Button::new("list-live-detail-close")
+                                        .ghost()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::X)
+                                        .on_click(move |_, window, cx| {
+                                            mutate_panel(
+                                                &key_close,
+                                                |s| {
+                                                    s.selected_row = None;
+                                                    s.editing_cell = None;
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }),
+                                ),
                         ),
                 );
-            for col in &data.columns {
+            for (col_ix, col) in data.columns.iter().enumerate() {
+                let val = row_cell(rec, col);
+                let control = if let Some(update_cb) = actions.on_update_cell.clone() {
+                    let row_id = rec.id.clone();
+                    let col_id = col.id.clone();
+                    match col.kind.as_str() {
+                        "checkbox" | "todo_completed" | "completed" => {
+                            let checked = matches!(val, Some(SlackListCellValue::Checkbox(true)));
+                            h_flex()
+                                .id(SharedString::from(format!("list-det-chk-{col_ix}")))
+                                .items_center()
+                                .gap_1p5()
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| {
+                                    update_cb(
+                                        row_id.clone(),
+                                        ListCellInput {
+                                            column_id: col_id.clone(),
+                                            value: ListCellInputValue::Checkbox(!checked),
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .child(live_cell(val, col, fixtures, cx))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(if checked { "Checked" } else { "Unchecked" }),
+                                )
+                                .into_any_element()
+                        }
+                        "select" | "multi_select" if !col.choices.is_empty() => {
+                            let current = match val {
+                                Some(SlackListCellValue::Select(opts)) => opts.clone(),
+                                _ => Vec::new(),
+                            };
+                            let current_label = current
+                                .first()
+                                .and_then(|v| col.choices.iter().find(|c| c.value == *v))
+                                .map(|c| c.label.clone())
+                                .unwrap_or_else(|| "Select…".to_owned());
+                            let choices = col.choices.clone();
+                            Button::new(SharedString::from(format!("list-det-sel-{col_ix}")))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .label(current_label)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for ch in &choices {
+                                        let cb = update_cb.clone();
+                                        let rid = row_id.clone();
+                                        let cid = col_id.clone();
+                                        let opt_val = ch.value.clone();
+                                        let checked = current.contains(&opt_val);
+                                        menu = menu.item(
+                                            PopupMenuItem::new(ch.label.clone())
+                                                .checked(checked)
+                                                .on_click(move |_, window, cx| {
+                                                    cb(
+                                                        rid.clone(),
+                                                        ListCellInput {
+                                                            column_id: cid.clone(),
+                                                            value: ListCellInputValue::Select(
+                                                                vec![opt_val.clone()],
+                                                            ),
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                })
+                                .into_any_element()
+                        }
+                        "user" | "todo_assignee" | "assignee" => {
+                            let current: Vec<String> = match val {
+                                Some(SlackListCellValue::Users(u)) => {
+                                    u.iter().map(ToString::to_string).collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            let label = match val {
+                                Some(SlackListCellValue::Users(u)) if !u.is_empty() => u
+                                    .iter()
+                                    .map(|id| fixtures.user_name(id))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                _ => "Assign…".to_owned(),
+                            };
+                            let users: Vec<(slackless_core::types::UserId, String)> = fixtures
+                                .users
+                                .iter()
+                                .filter(|u| !u.deleted && !u.is_bot)
+                                .take(40)
+                                .map(|u| (u.id.clone(), fixtures.user_name(&u.id).to_owned()))
+                                .collect();
+                            Button::new(SharedString::from(format!("list-det-usr-{col_ix}")))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::User)
+                                .label(label)
+                                .dropdown_menu(move |mut menu, _, _| {
+                                    for (uid, name) in &users {
+                                        let cb = update_cb.clone();
+                                        let rid = row_id.clone();
+                                        let cid = col_id.clone();
+                                        let uid_val = uid.clone();
+                                        let checked = current.contains(&uid.to_string());
+                                        menu = menu.item(
+                                            PopupMenuItem::new(name.clone())
+                                                .checked(checked)
+                                                .on_click(move |_, window, cx| {
+                                                    cb(
+                                                        rid.clone(),
+                                                        ListCellInput {
+                                                            column_id: cid.clone(),
+                                                            value: ListCellInputValue::Users(vec![
+                                                                uid_val.clone(),
+                                                            ]),
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                        );
+                                    }
+                                    menu
+                                })
+                                .into_any_element()
+                        }
+                        kind if !matches!(
+                            kind,
+                            "created_by" | "last_edited_by" | "created_time" | "last_edited_time"
+                        ) =>
+                        {
+                            let editing_this =
+                                state.editing_cell.as_ref().and_then(|(er, ec, ed)| {
+                                    (er == &row_id && ec == &col_id).then(|| ed.clone())
+                                });
+                            if let Some(input) = editing_this {
+                                let input_save = input.clone();
+                                let key_save = list_key.clone();
+                                let key_cancel = list_key.clone();
+                                let kind_owned = kind.to_owned();
+                                v_flex()
+                                    .w_full()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .px_2()
+                                            .py_1()
+                                            .child(
+                                                Textarea::new(&input)
+                                                    .appearance(false)
+                                                    .bordered(false),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .justify_end()
+                                            .gap_1()
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "list-det-cancel-{col_ix}"
+                                                )))
+                                                .ghost()
+                                                .with_size(Size::XSmall)
+                                                .label("Cancel")
+                                                .on_click(move |_, window, cx| {
+                                                    mutate_panel(
+                                                        &key_cancel,
+                                                        |s| s.editing_cell = None,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .child(
+                                                Button::new(SharedString::from(format!(
+                                                    "list-det-save-{col_ix}"
+                                                )))
+                                                .primary()
+                                                .with_size(Size::XSmall)
+                                                .label("Save")
+                                                .on_click(move |_, window, cx| {
+                                                    let raw = input_save
+                                                        .read(cx)
+                                                        .value()
+                                                        .trim()
+                                                        .to_owned();
+                                                    let cell_val = match kind_owned.as_str() {
+                                                        "date" | "todo_due_date" | "due_date" => {
+                                                            if raw.is_empty() {
+                                                                ListCellInputValue::Date(Vec::new())
+                                                            } else {
+                                                                ListCellInputValue::Date(vec![raw])
+                                                            }
+                                                        }
+                                                        "number" | "rating" | "currency" => {
+                                                            if let Ok(n) = raw.parse::<f64>() {
+                                                                ListCellInputValue::Number(vec![n])
+                                                            } else {
+                                                                ListCellInputValue::Text(raw)
+                                                            }
+                                                        }
+                                                        "link" => ListCellInputValue::Link {
+                                                            url: raw,
+                                                            display_name: None,
+                                                        },
+                                                        _ => ListCellInputValue::Text(raw),
+                                                    };
+                                                    mutate_panel(
+                                                        &key_save,
+                                                        |s| s.editing_cell = None,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                    update_cb(
+                                                        row_id.clone(),
+                                                        ListCellInput {
+                                                            column_id: col_id.clone(),
+                                                            value: cell_val,
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                let initial = match val {
+                                    Some(SlackListCellValue::Text(s))
+                                    | Some(SlackListCellValue::Date(s))
+                                    | Some(SlackListCellValue::Number(s)) => s.clone(),
+                                    Some(SlackListCellValue::Link { url, .. }) => url.clone(),
+                                    _ => String::new(),
+                                };
+                                let key_ed = list_key.clone();
+                                let rid_ed = row_id.clone();
+                                let cid_ed = col_id.clone();
+                                let hover = theme.secondary.opacity(0.4);
+                                h_flex()
+                                    .id(SharedString::from(format!("list-det-edit-{col_ix}")))
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .px_1p5()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(move |el| el.bg(hover))
+                                    .on_click(move |_, window, cx| {
+                                        let input = cx.new(|cx| {
+                                            TextareaState::new(window, cx)
+                                                .default_value(initial.clone())
+                                        });
+                                        mutate_panel(
+                                            &key_ed,
+                                            |s| {
+                                                s.editing_cell =
+                                                    Some((rid_ed.clone(), cid_ed.clone(), input));
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .child(live_cell(val, col, fixtures, cx))
+                                    .child(
+                                        Icon::new(IconName::Pencil)
+                                            .size(px(12.))
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .into_any_element()
+                            }
+                        }
+                        _ => h_flex()
+                            .items_center()
+                            .text_sm()
+                            .child(live_cell(val, col, fixtures, cx))
+                            .into_any_element(),
+                    }
+                } else {
+                    h_flex()
+                        .items_center()
+                        .text_sm()
+                        .child(live_cell(val, col, fixtures, cx))
+                        .into_any_element()
+                };
                 panel = panel.child(
                     v_flex()
                         .gap_1()
@@ -1140,16 +1765,82 @@ fn render_live_list(
                                 )
                                 .child(col.name.clone()),
                         )
-                        .child(h_flex().items_center().text_sm().child(live_cell(
-                            row_cell(rec, col),
-                            col,
-                            fixtures,
-                            cx,
-                        ))),
+                        .child(h_flex().w_full().items_center().text_sm().child(control)),
                 );
             }
             panel
         });
+
+    let add_bar = state.adding.then(|| {
+        state.new_item_input.clone().and_then(|input| {
+            let create_cb = actions.on_create_item.clone()?;
+            let primary_col_id = data.columns.get(primary_ix)?.id.clone();
+            let input_submit = input.clone();
+            let key_save = list_key.clone();
+            let key_cancel = list_key.clone();
+            Some(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary.opacity(0.3))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Textarea::new(&input).appearance(false).bordered(false)),
+                    )
+                    .child(
+                        Button::new("list-live-add-save")
+                            .primary()
+                            .with_size(Size::XSmall)
+                            .label("Add")
+                            .on_click(move |_, window, cx| {
+                                let text = input_submit.read(cx).value().trim().to_owned();
+                                if !text.is_empty() {
+                                    mutate_panel(
+                                        &key_save,
+                                        |s| {
+                                            s.adding = false;
+                                            s.new_item_input = None;
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                    create_cb(
+                                        vec![ListCellInput {
+                                            column_id: primary_col_id.clone(),
+                                            value: ListCellInputValue::Text(text),
+                                        }],
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("list-live-add-cancel")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::X)
+                            .on_click(move |_, window, cx| {
+                                mutate_panel(
+                                    &key_cancel,
+                                    |s| {
+                                        s.adding = false;
+                                        s.new_item_input = None;
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
+        })
+    });
 
     let find_bar = search.map(|input| {
         h_flex()
@@ -1246,6 +1937,34 @@ fn render_live_list(
                                         }),
                                 )
                                 .child(div().flex_1())
+                                .when(
+                                    actions.on_create_item.is_some() && !data.columns.is_empty(),
+                                    |row| {
+                                        let key_add = list_key.clone();
+                                        row.child(
+                                            Button::new("list-live-add-item")
+                                                .primary()
+                                                .with_size(Size::XSmall)
+                                                .icon(IconName::Plus)
+                                                .label("Add item")
+                                                .on_click(move |_, window, cx| {
+                                                    let input = cx.new(|cx| {
+                                                        TextareaState::new(window, cx)
+                                                            .placeholder("New item title…")
+                                                    });
+                                                    mutate_panel(
+                                                        &key_add,
+                                                        |s| {
+                                                            s.adding = true;
+                                                            s.new_item_input = Some(input);
+                                                        },
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                        )
+                                    },
+                                )
                                 .children(find_bar)
                                 .child(layout_switcher(&list_key, state.layout, cx))
                                 .when(!toggleable_cols.is_empty(), |row| {
@@ -1295,7 +2014,7 @@ fn render_live_list(
                                             );
                                         })
                                 })
-                                .child(read_only_badge(cx))
+                                .when(!can_edit, |row| row.child(read_only_badge(cx)))
                                 .when_some(open_browser, |row, open| {
                                     row.child(
                                         Button::new("list-open-browser")
@@ -1307,6 +2026,7 @@ fn render_live_list(
                                     )
                                 }),
                         )
+                        .children(add_bar.flatten())
                         .child(body),
                 ),
         )
@@ -1545,7 +2265,7 @@ fn fixture_to_csv(list: &SlackList) -> String {
                 out.push(',');
             }
             let val = match field {
-                Field::Text(s) | Field::Person(s) | Field::Date(s) => *s,
+                Field::Text(s) | Field::Person(s) | Field::Date(s) => s.as_str(),
                 Field::Select(Status::Todo) => "To do",
                 Field::Select(Status::InProgress) => "In progress",
                 Field::Select(Status::Blocked) => "Blocked",
@@ -1657,9 +2377,7 @@ fn fixture_to_json(list: &SlackList) -> String {
             let mut obj = Map::new();
             for (col, field) in list.columns.iter().zip(fields) {
                 let val = match field {
-                    Field::Text(s) | Field::Person(s) | Field::Date(s) => {
-                        Value::String((*s).into())
-                    }
+                    Field::Text(s) | Field::Person(s) | Field::Date(s) => Value::String(s.clone()),
                     Field::Select(Status::Todo) => Value::String("To do".into()),
                     Field::Select(Status::InProgress) => Value::String("In progress".into()),
                     Field::Select(Status::Blocked) => Value::String("Blocked".into()),

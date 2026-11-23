@@ -68,6 +68,11 @@ pub enum ThreadPanelEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Add this message to a Slack List (`lists.addToList`, `F-COLLAB-231`).
+    AddToList {
+        channel: ChannelId,
+        ts: Ts,
+    },
     /// The header menu followed or unfollowed the open thread (already shown here); the root
     /// tells Slack. `last_read` is the thread's newest message.
     SetSubscribed {
@@ -719,6 +724,14 @@ impl ThreadPanel {
             MessageAction::ViewHistory => {
                 if let Some((channel, _)) = &self.thread {
                     cx.emit(ThreadPanelEvent::ViewHistory {
+                        channel: channel.clone(),
+                        ts: ts.clone(),
+                    });
+                }
+            }
+            MessageAction::AddToList => {
+                if let Some((channel, _)) = &self.thread {
+                    cx.emit(ThreadPanelEvent::AddToList {
                         channel: channel.clone(),
                         ts: ts.clone(),
                     });

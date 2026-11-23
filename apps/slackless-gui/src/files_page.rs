@@ -234,8 +234,14 @@ pub enum FilesPageEvent {
     RestoreFile { file_id: String, title: String },
     /// Preview a Slack canvas natively in the in-app Canvas reader (`F-COLLAB-125`).
     OpenCanvas { file_id: String },
-    /// Preview a Slack List natively in the in-app read-only Lists viewer.
+    /// Preview a Slack List natively in the in-app editable Lists view.
     OpenList { file_id: String },
+    /// Create a standalone canvas (`canvases.create`, `F-COLLAB-119`).
+    CreateCanvas { title: String },
+    /// Create a new Slack List from scratch (`lists.create`, `F-COLLAB-213`).
+    CreateList { name: String },
+    /// Pop out the Files browser into its own window (`F-COLLAB-127`, `F-SHELL-150`).
+    PopOut,
 }
 
 /// Client-side sort order over the loaded files page (`F-CORE-133`).
@@ -617,15 +623,69 @@ impl Render for FilesPage {
             )
         };
         let section = self.section;
+        let this_hdr = cx.weak_entity();
+        let this_pop = cx.weak_entity();
+        let show_new_canvas = matches!(section, FilesSection::All | FilesSection::Canvases);
+        let show_new_list = matches!(section, FilesSection::All | FilesSection::Lists);
         let header = v_flex()
             .gap_3()
             .pt_5()
             .pb_3()
             .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::BOLD)
-                    .child(section.title()),
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .child(section.title()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .when(show_new_canvas, |row| {
+                                let page = this_hdr.clone();
+                                row.child(
+                                    Button::new("files-new-canvas")
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Plus)
+                                        .label("New canvas")
+                                        .on_click(move |_, window, cx| {
+                                            open_new_canvas_dialog(page.clone(), window, cx);
+                                        }),
+                                )
+                            })
+                            .when(show_new_list, |row| {
+                                let page = this_hdr.clone();
+                                row.child(
+                                    Button::new("files-new-list")
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Plus)
+                                        .label("New list")
+                                        .on_click(move |_, window, cx| {
+                                            open_new_list_dialog(page.clone(), window, cx);
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("files-popout")
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::ExternalLink)
+                                    .label("Pop out")
+                                    .tooltip("Open Files in a new window")
+                                    .on_click(move |_, _, cx| {
+                                        let _ = this_pop.update(cx, |_, cx| {
+                                            cx.emit(FilesPageEvent::PopOut);
+                                        });
+                                    }),
+                            ),
+                    ),
             )
             .child(self.search_field(cx));
         let chips = self.chips(cx);
@@ -906,7 +966,162 @@ fn state_block(title: Option<&'static str>, line: &'static str, fg: Hsla, dim: H
         .child(div().text_color(dim).child(line))
 }
 
-/// Modal dialog to create a custom file collection (`files.collections.create`, `F-CORE-133`).
+impl FilesPage {
+    /// Snapshot visible files for a popped-out Files browser window (`F-COLLAB-127`, `F-SHELL-150`).
+    pub fn snapshot_for_popout(&self) -> Vec<(String, String, Option<String>)> {
+        let rows = &self.rows[self.section.source().index()];
+        self.shown
+            .iter()
+            .filter_map(|&ix| {
+                let file = rows.files.get(ix)?;
+                let meta = rows.meta.get(ix).map(|s| s.to_string()).unwrap_or_default();
+                let url = file.permalink.clone().or_else(|| file.url_private.clone());
+                Some((display_name(file).to_owned(), meta, url))
+            })
+            .collect()
+    }
+
+    /// Snapshot known Slack List `(file_id, title)` pairs for the "Add to list" message action (`F-COLLAB-231`).
+    pub fn known_lists(&self) -> Vec<(String, String)> {
+        self.rows[Source::Workspace.index()]
+            .files
+            .iter()
+            .filter(|f| f.filetype.as_deref() == Some("list"))
+            .map(|f| (f.id.to_string(), display_name(f).to_owned()))
+            .collect()
+    }
+}
+
+fn open_new_canvas_dialog(
+    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::gpui::Focusable as _;
+    let title_state = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder("Canvas title (e.g. Launch runbook)")
+            .auto_grow(1, 1)
+    });
+    title_state.read(cx).focus_handle(cx).focus(window, cx);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (border, bg) = (theme.border, theme.background);
+        let title_c = title_state.clone();
+        let page_c = page.clone();
+        dialog.title("Create standalone canvas").w(px(380.)).child(
+            v_flex()
+                .gap_3()
+                .p_4()
+                .child(
+                    div()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .child(
+                            Textarea::new(&title_state)
+                                .appearance(false)
+                                .bordered(false),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("files-new-canvas-cancel")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("files-new-canvas-create")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Create")
+                                .on_click(move |_, window, cx| {
+                                    let title = title_c.read(cx).value().trim().to_owned();
+                                    let title = if title.is_empty() {
+                                        "Untitled canvas".to_owned()
+                                    } else {
+                                        title
+                                    };
+                                    window.close_dialog(cx);
+                                    let _ = page_c.update(cx, |_, cx| {
+                                        cx.emit(FilesPageEvent::CreateCanvas { title });
+                                    });
+                                }),
+                        ),
+                ),
+        )
+    });
+}
+
+fn open_new_list_dialog(
+    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::gpui::Focusable as _;
+    let name_state = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder("List name (e.g. Q4 release checklist)")
+            .auto_grow(1, 1)
+    });
+    name_state.read(cx).focus_handle(cx).focus(window, cx);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (border, bg) = (theme.border, theme.background);
+        let name_c = name_state.clone();
+        let page_c = page.clone();
+        dialog.title("Create list").w(px(380.)).child(
+            v_flex()
+                .gap_3()
+                .p_4()
+                .child(
+                    div()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .child(Textarea::new(&name_state).appearance(false).bordered(false)),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("files-new-list-cancel")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("files-new-list-create")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Create")
+                                .on_click(move |_, window, cx| {
+                                    let name = name_c.read(cx).value().trim().to_owned();
+                                    if name.is_empty() {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    let _ = page_c.update(cx, |_, cx| {
+                                        cx.emit(FilesPageEvent::CreateList { name });
+                                    });
+                                }),
+                        ),
+                ),
+        )
+    });
+}
+
 fn open_new_collection_dialog(
     page: gpui_kit::gpui::WeakEntity<FilesPage>,
     window: &mut Window,

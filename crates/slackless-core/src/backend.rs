@@ -621,12 +621,80 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<(String, String)>> + Send {
         async { Ok((String::new(), String::new())) }
     }
+    /// Create a standalone or channel-tabbed canvas (`canvases.create`, `F-COLLAB-119`).
+    fn canvases_create(
+        &self,
+        _title: Option<String>,
+        _markdown: Option<String>,
+        _channel: Option<ChannelId>,
+    ) -> impl Future<Output = api::Result<api::CanvasCreated>> + Send {
+        async { Ok(api::CanvasCreated::default()) }
+    }
+    /// Apply a section-level edit to a canvas (`canvases.edit`, `F-COLLAB-132`, `F-SHELL-264`).
+    fn canvases_edit(
+        &self,
+        _file_id: String,
+        _op: api::CanvasEditOp,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Request edit or comment access on a file/canvas (`files.requestPermission`, `F-COLLAB-129`).
+    fn files_request_permission(
+        &self,
+        _file_id: String,
+        _request_type: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Fetch a live Slack List's schema and rows (`files.info` + `lists.records.list`).
     fn fetch_list(
         &self,
         _file_id: String,
     ) -> impl Future<Output = api::Result<api::SlackListData>> + Send {
         async { Ok(api::SlackListData::default()) }
+    }
+    /// Create a new Slack List (`lists.create`, `F-COLLAB-213`).
+    fn lists_create(
+        &self,
+        _name: String,
+        _description: Option<String>,
+        _channel: Option<ChannelId>,
+    ) -> impl Future<Output = api::Result<String>> + Send {
+        async { Ok(String::new()) }
+    }
+    /// Add an item to a Slack List (`lists.records.create`, `F-COLLAB-226`).
+    fn lists_records_create(
+        &self,
+        _list_id: String,
+        _initial_fields: Vec<api::ListCellInput>,
+    ) -> impl Future<Output = api::Result<api::SlackListRow>> + Send {
+        async { Ok(api::SlackListRow::default()) }
+    }
+    /// Update one or more cells of a Slack List item (`lists.cells.update`, `F-COLLAB-227`).
+    fn lists_cells_update(
+        &self,
+        _list_id: String,
+        _row_id: String,
+        _cells: Vec<api::ListCellInput>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Delete an item from a Slack List (`lists.records.delete`, `F-COLLAB-228`).
+    fn lists_records_delete(
+        &self,
+        _list_id: String,
+        _row_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Add a message to a Slack List (`lists.addToList`, `F-COLLAB-231`).
+    fn lists_add_to_list(
+        &self,
+        _list_id: String,
+        _channel: ChannelId,
+        _ts: Ts,
+    ) -> impl Future<Output = api::Result<String>> + Send {
+        async { Ok(String::new()) }
     }
     /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true`) and
     /// dispatch `apps.home.dispatchOpenEvent` (`F-COLLAB-480`).
@@ -1298,8 +1366,74 @@ impl Backend for SlackApi {
         SlackApi::fetch_canvas_html(self, &file_id).await
     }
 
+    async fn canvases_create(
+        &self,
+        title: Option<String>,
+        markdown: Option<String>,
+        channel: Option<ChannelId>,
+    ) -> api::Result<api::CanvasCreated> {
+        SlackApi::canvases_create(
+            self,
+            title.as_deref(),
+            markdown.as_deref(),
+            channel.as_ref(),
+        )
+        .await
+    }
+
+    async fn canvases_edit(&self, file_id: String, op: api::CanvasEditOp) -> api::Result<()> {
+        SlackApi::canvases_edit(self, &file_id, &op).await
+    }
+
+    async fn files_request_permission(
+        &self,
+        file_id: String,
+        request_type: String,
+    ) -> api::Result<()> {
+        SlackApi::files_request_permission(self, &file_id, &request_type).await
+    }
+
     async fn fetch_list(&self, file_id: String) -> api::Result<api::SlackListData> {
         SlackApi::fetch_list(self, &file_id).await
+    }
+
+    async fn lists_create(
+        &self,
+        name: String,
+        description: Option<String>,
+        channel: Option<ChannelId>,
+    ) -> api::Result<String> {
+        SlackApi::lists_create(self, &name, description.as_deref(), channel.as_ref()).await
+    }
+
+    async fn lists_records_create(
+        &self,
+        list_id: String,
+        initial_fields: Vec<api::ListCellInput>,
+    ) -> api::Result<api::SlackListRow> {
+        SlackApi::lists_records_create(self, &list_id, &initial_fields, None).await
+    }
+
+    async fn lists_cells_update(
+        &self,
+        list_id: String,
+        row_id: String,
+        cells: Vec<api::ListCellInput>,
+    ) -> api::Result<()> {
+        SlackApi::lists_cells_update(self, &list_id, &row_id, &cells).await
+    }
+
+    async fn lists_records_delete(&self, list_id: String, row_id: String) -> api::Result<()> {
+        SlackApi::lists_records_delete(self, &list_id, &row_id).await
+    }
+
+    async fn lists_add_to_list(
+        &self,
+        list_id: String,
+        channel: ChannelId,
+        ts: Ts,
+    ) -> api::Result<String> {
+        SlackApi::lists_add_to_list(self, &list_id, &channel, &ts).await
     }
 
     async fn load_app_home(&self, channel: ChannelId) -> api::Result<api::AppHomeResponse> {

@@ -1703,6 +1703,25 @@ impl App {
                         FilesPageEvent::OpenList { file_id } => {
                             this.open_live_list(file_id.clone(), cx);
                         }
+                        FilesPageEvent::CreateCanvas { title } => {
+                            this.bridge.send(Command::CreateCanvas {
+                                title: title.clone(),
+                                markdown: format!("# {title}\n\n"),
+                                channel: None,
+                            });
+                            notify("Creating canvas", title.clone(), window, cx);
+                        }
+                        FilesPageEvent::CreateList { name } => {
+                            this.bridge.send(Command::CreateList {
+                                name: name.clone(),
+                                description: None,
+                                channel: None,
+                            });
+                            notify("Creating list", name.clone(), window, cx);
+                        }
+                        FilesPageEvent::PopOut => {
+                            this.pop_out_files(window, cx);
+                        }
                     },
                 ),
                 cx.subscribe(
@@ -2270,7 +2289,22 @@ impl Render for App {
                 }
                 ConversationTab::Canvas => {
                     let view = if self.fixtures.sample {
-                        canvas_view(&self.canvas_query, Some(&self.canvas_search), cx)
+                        let this_pop = cx.weak_entity();
+                        let on_pop_out: crate::canvas::CanvasPopOutFn =
+                            Rc::new(move |doc, window, cx| {
+                                let _ = this_pop.update(cx, |app, cx| {
+                                    app.pop_out_canvas(doc, None, window, cx);
+                                });
+                            });
+                        canvas_view(
+                            &self.canvas_query,
+                            Some(&self.canvas_search),
+                            crate::canvas::CanvasActions {
+                                on_pop_out: Some(on_pop_out),
+                                ..Default::default()
+                            },
+                            cx,
+                        )
                     } else {
                         let file_id = self.ws.active_canvas.clone().or_else(|| {
                             conversation
@@ -2281,17 +2315,56 @@ impl Render for App {
                                 .map(|f| f.to_string())
                         });
                         let loaded = file_id.as_deref().and_then(|id| self.ws.canvases.get(id));
-                        let open_browser = file_id.map(|id| {
-                            let url = self.canvas_link(&id);
+                        let open_browser = file_id.as_ref().map(|id| {
+                            let url = self.canvas_link(id);
                             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                                 cx.open_url(&url);
                             }) as crate::canvas::OpenBrowserFn
                         });
+                        let on_edit = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |op, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::EditCanvas {
+                                        file_id: fid.clone(),
+                                        op,
+                                    });
+                                });
+                            }) as crate::canvas::CanvasEditFn
+                        });
+                        let on_request_access = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::RequestFilePermission {
+                                        file_id: fid.clone(),
+                                        request_type: "upgrade".to_owned(),
+                                    });
+                                });
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let on_pop_out = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |doc, window: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.pop_out_canvas(doc, Some(fid.clone()), window, cx);
+                                });
+                            }) as crate::canvas::CanvasPopOutFn
+                        });
                         crate::canvas::live_canvas_view(
+                            file_id.as_deref().unwrap_or("live-canvas"),
                             loaded,
                             &self.canvas_query,
                             Some(&self.canvas_search),
-                            open_browser,
+                            crate::canvas::CanvasActions {
+                                open_browser,
+                                on_edit,
+                                on_request_access,
+                                on_pop_out,
+                            },
                             cx,
                         )
                     };
@@ -2303,8 +2376,8 @@ impl Render for App {
                     } else {
                         let file_id = self.ws.active_list.clone();
                         let loaded = file_id.as_deref().and_then(|id| self.ws.lists.get(id));
-                        let open_browser = file_id.map(|id| {
-                            let url = self.canvas_link(&id);
+                        let open_browser = file_id.as_ref().map(|id| {
+                            let url = self.canvas_link(id);
                             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                                 cx.open_url(&url);
                             }) as crate::canvas::OpenBrowserFn
@@ -2321,14 +2394,56 @@ impl Render for App {
                                     cx.notify();
                                 });
                             });
+                        let on_create_item = file_id.as_ref().map(|id| {
+                            let lid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |initial_fields, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::CreateListItem {
+                                        list_id: lid.clone(),
+                                        initial_fields,
+                                    });
+                                });
+                            }) as crate::lists::CreateListItemFn
+                        });
+                        let on_update_cell = file_id.as_ref().map(|id| {
+                            let lid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |row_id, cell, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::UpdateListCell {
+                                        list_id: lid.clone(),
+                                        row_id,
+                                        cells: vec![cell],
+                                    });
+                                });
+                            }) as crate::lists::UpdateListCellFn
+                        });
+                        let on_delete_item = file_id.as_ref().map(|id| {
+                            let lid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |row_id, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::DeleteListItem {
+                                        list_id: lid.clone(),
+                                        row_id,
+                                    });
+                                });
+                            }) as crate::lists::DeleteListItemFn
+                        });
                         crate::lists::live_list_view(
                             loaded,
                             &self.fixtures,
                             &self.list_query,
                             Some(&self.list_search),
                             self.list_sort,
-                            Some(on_sort),
-                            open_browser,
+                            crate::lists::ListActions {
+                                on_sort: Some(on_sort),
+                                on_create_item,
+                                on_update_cell,
+                                on_delete_item,
+                                open_browser,
+                            },
                             cx,
                         )
                     };
@@ -3255,6 +3370,9 @@ fn subscribe_workspace(
                 MessageListEvent::ViewHistory { channel, ts } => {
                     this.open_revision_history(channel.clone(), ts.clone(), window, cx)
                 }
+                MessageListEvent::AddToList { channel, ts } => {
+                    this.open_add_to_list_dialog(channel.clone(), ts.clone(), window, cx)
+                }
                 MessageListEvent::NeedHistorySince { channel, since } => {
                     this.load_since(channel, *since, cx);
                 }
@@ -3322,6 +3440,9 @@ fn subscribe_workspace(
                 ThreadPanelEvent::Forward(link) => this.open_compose(link, window, cx),
                 ThreadPanelEvent::ViewHistory { channel, ts } => {
                     this.open_revision_history(channel.clone(), ts.clone(), window, cx)
+                }
+                ThreadPanelEvent::AddToList { channel, ts } => {
+                    this.open_add_to_list_dialog(channel.clone(), ts.clone(), window, cx)
                 }
                 ThreadPanelEvent::Reply {
                     channel,

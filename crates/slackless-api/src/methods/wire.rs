@@ -2157,3 +2157,193 @@ pub(super) struct RecentlyDeletedWire {
     #[serde(default, deserialize_with = "lenient_vec")]
     pub(super) files: Vec<DeletedFileWire>,
 }
+
+/// One section-level edit operation for `canvases.edit` (`F-COLLAB-132`, `F-SHELL-264`, `F-SHELL-277`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanvasEditOp {
+    InsertAtStart {
+        markdown: String,
+    },
+    InsertAtEnd {
+        markdown: String,
+    },
+    InsertAfter {
+        section_id: String,
+        markdown: String,
+    },
+    InsertBefore {
+        section_id: String,
+        markdown: String,
+    },
+    /// Replace `section_id`, or the entire canvas when `section_id` is `None`.
+    Replace {
+        section_id: Option<String>,
+        markdown: String,
+    },
+    Delete {
+        section_id: String,
+    },
+    Rename {
+        title: String,
+    },
+}
+
+impl CanvasEditOp {
+    pub(super) fn to_change_json(&self) -> Value {
+        let doc = |md: &str| serde_json::json!({ "type": "markdown", "markdown": md });
+        match self {
+            Self::InsertAtStart { markdown } => serde_json::json!({
+                "operation": "insert_at_start",
+                "document_content": doc(markdown),
+            }),
+            Self::InsertAtEnd { markdown } => serde_json::json!({
+                "operation": "insert_at_end",
+                "document_content": doc(markdown),
+            }),
+            Self::InsertAfter {
+                section_id,
+                markdown,
+            } => serde_json::json!({
+                "operation": "insert_after",
+                "section_id": section_id,
+                "document_content": doc(markdown),
+            }),
+            Self::InsertBefore {
+                section_id,
+                markdown,
+            } => serde_json::json!({
+                "operation": "insert_before",
+                "section_id": section_id,
+                "document_content": doc(markdown),
+            }),
+            Self::Replace {
+                section_id,
+                markdown,
+            } => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("operation".to_owned(), Value::String("replace".to_owned()));
+                if let Some(id) = section_id.as_deref().filter(|s| !s.is_empty()) {
+                    obj.insert("section_id".to_owned(), Value::String(id.to_owned()));
+                }
+                obj.insert("document_content".to_owned(), doc(markdown));
+                Value::Object(obj)
+            }
+            Self::Delete { section_id } => serde_json::json!({
+                "operation": "delete",
+                "section_id": section_id,
+            }),
+            Self::Rename { title } => serde_json::json!({
+                "operation": "rename",
+                "title_content": doc(title),
+            }),
+        }
+    }
+}
+
+/// Typed cell update payload for `lists.cells.update` / `lists.records.create` (`F-COLLAB-226`, `F-COLLAB-227`, `F-COLLAB-248`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListCellInput {
+    pub column_id: String,
+    pub value: ListCellInputValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListCellInputValue {
+    Text(String),
+    Checkbox(bool),
+    Select(Vec<String>),
+    Users(Vec<UserId>),
+    Date(Vec<String>),
+    Number(Vec<f64>),
+    Link {
+        url: String,
+        display_name: Option<String>,
+    },
+    Clear,
+}
+
+impl ListCellInput {
+    pub(super) fn to_json(&self, row_id: Option<&str>) -> Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(row_id) = row_id {
+            obj.insert("row_id".to_owned(), Value::String(row_id.to_owned()));
+        }
+        obj.insert(
+            "column_id".to_owned(),
+            Value::String(self.column_id.clone()),
+        );
+        match &self.value {
+            ListCellInputValue::Text(text) => {
+                let elements = if text.starts_with("https://") || text.starts_with("http://") {
+                    serde_json::json!([{ "type": "link", "url": text }])
+                } else {
+                    serde_json::json!([{ "type": "text", "text": text }])
+                };
+                obj.insert(
+                    "rich_text".to_owned(),
+                    serde_json::json!([{
+                        "type": "rich_text",
+                        "elements": [{
+                            "type": "rich_text_section",
+                            "elements": elements
+                        }]
+                    }]),
+                );
+            }
+            ListCellInputValue::Checkbox(checked) => {
+                obj.insert("checkbox".to_owned(), Value::Bool(*checked));
+            }
+            ListCellInputValue::Select(opts) => {
+                obj.insert("select".to_owned(), serde_json::json!(opts));
+            }
+            ListCellInputValue::Users(users) => {
+                let ids: Vec<String> = users.iter().map(ToString::to_string).collect();
+                obj.insert("user".to_owned(), serde_json::json!(ids));
+            }
+            ListCellInputValue::Date(dates) => {
+                obj.insert("date".to_owned(), serde_json::json!(dates));
+            }
+            ListCellInputValue::Number(nums) => {
+                obj.insert("number".to_owned(), serde_json::json!(nums));
+            }
+            ListCellInputValue::Link { url, display_name } => {
+                let mut item = serde_json::Map::new();
+                item.insert("original_url".to_owned(), Value::String(url.clone()));
+                item.insert(
+                    "display_as_url".to_owned(),
+                    Value::Bool(display_name.as_deref().is_none_or(str::is_empty)),
+                );
+                if let Some(name) = display_name.as_deref().filter(|s| !s.is_empty()) {
+                    item.insert("display_name".to_owned(), Value::String(name.to_owned()));
+                }
+                obj.insert("link".to_owned(), Value::Array(vec![Value::Object(item)]));
+            }
+            ListCellInputValue::Clear => {
+                obj.insert("rich_text".to_owned(), Value::Array(Vec::new()));
+            }
+        }
+        Value::Object(obj)
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct CanvasContentWire {
+    #[serde(default)]
+    pub(super) content: String,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct ListCreateWire {
+    #[serde(default)]
+    pub(super) list: Option<Value>,
+    #[serde(default)]
+    pub(super) list_id: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct ListRecordCreateWire {
+    #[serde(default)]
+    pub(super) record: Option<Value>,
+    #[serde(default)]
+    pub(super) item: Option<Value>,
+}

@@ -1,19 +1,27 @@
-//! Native read-only canvas reader (`F-COLLAB-125`, `F-SHELL-266`): renders both the sample
-//! workspace's fixture canvas and live Slack canvases fetched via `files.info` -> `url_private`
-//! HTML export (headings, paragraphs, bullets, checklists, code blocks, quotes, tables, dividers),
-//! with an in-canvas Find bar and an "Open in browser to edit" button.
+//! Native Slack Canvas reader & section editor (`F-COLLAB-125`, `F-COLLAB-128`, `F-COLLAB-129`,
+//! `F-COLLAB-132`, `F-SHELL-261`, `F-SHELL-264`, `F-SHELL-266`, `F-SHELL-268`, `F-SHELL-277`):
+//! renders both the sample workspace's fixture canvas and live Slack canvases fetched via
+//! `files.info` -> `url_private` HTML export (keeping `temp:C:...` section IDs), with an
+//! in-canvas Find bar, collapsible Outline, interactive checklist toggling, markdown section
+//! editor with formatting toolbar and undo/redo, Request edit access, Pop-out window, and
+//! "Open in browser".
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, h_flex, v_flex,
+};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Div, Entity, FontWeight, InteractiveElement as _, ObjectFit, ParentElement as _, Stateful,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
+    App, AppContext as _, Div, Entity, FontWeight, Global, InteractiveElement as _, ObjectFit,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Window, div, img, px,
 };
+use slackless_core::api::CanvasEditOp;
 
 /// One block of a canvas document, in reading order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,25 +72,91 @@ impl CanvasBlock {
             Self::Divider => false,
         }
     }
+    /// Serialize this block to Slack canvas markdown (`canvases.edit`).
+    pub fn to_markdown(&self) -> String {
+        match self {
+            Self::Heading { level, text } => {
+                let hashes = "#".repeat((*level).clamp(1, 3) as usize);
+                format!("{hashes} {text}")
+            }
+            Self::Paragraph(text) => text.clone(),
+            Self::Bullets(items) => items
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Checklist(items) => items
+                .iter()
+                .map(|(done, item)| {
+                    if *done {
+                        format!("- [x] {item}")
+                    } else {
+                        format!("- [ ] {item}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::CodeBlock(code) => format!("```\n{code}\n```"),
+            Self::Quote(text) => format!("> {text}"),
+            Self::Table { header, rows } => {
+                let mut lines = Vec::new();
+                lines.push(format!("| {} |", header.join(" | ")));
+                lines.push(format!(
+                    "| {} |",
+                    header.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+                ));
+                for row in rows {
+                    lines.push(format!("| {} |", row.join(" | ")));
+                }
+                lines.join("\n")
+            }
+            Self::Image { url, alt, .. } => format!("![{alt}]({url})"),
+            Self::Divider => "---".to_owned(),
+        }
+    }
 }
 
-/// A parsed canvas document ready to render in the native reader.
+/// A parsed canvas document ready to render in the native reader/editor.
 #[derive(Clone, Debug)]
 pub struct CanvasDoc {
     pub title: String,
     pub meta: String,
     pub blocks: Vec<CanvasBlock>,
+    /// Optional Quip section IDs (`temp:C:...`) aligned 1:1 with `blocks` when parsed from HTML.
+    pub section_ids: Vec<Option<String>>,
 }
 
 impl CanvasDoc {
-    /// Parse a live Slack canvas HTML export (`url_private`) into structured blocks.
+    /// Parse a live Slack canvas HTML export (`url_private`) into structured blocks + section IDs.
     pub fn from_html(title: String, html: &str) -> Self {
-        let blocks = parse_canvas_html(html);
+        let (blocks, section_ids) = parse_canvas_html_with_ids(html);
         Self {
             title,
-            meta: "Live canvas · read-only preview".to_owned(),
+            meta: "Live canvas".to_owned(),
             blocks,
+            section_ids,
         }
+    }
+
+    /// Parse lightweight markdown back into [`CanvasBlock`]s (for local preview & fixture edits).
+    pub fn from_markdown(title: String, meta: String, markdown: &str) -> Self {
+        let blocks = parse_canvas_markdown(markdown);
+        let section_ids = vec![None; blocks.len()];
+        Self {
+            title,
+            meta,
+            blocks,
+            section_ids,
+        }
+    }
+
+    /// Serialize the entire canvas back into Slack canvas markdown (`canvases.edit`).
+    pub fn to_markdown(&self) -> String {
+        self.blocks
+            .iter()
+            .map(CanvasBlock::to_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Headings in document order (`(level, text)`) for the collapsible outline strip.
@@ -101,102 +175,163 @@ impl CanvasDoc {
 
 /// The sample canvas every conversation shows in fixture mode.
 fn fixture() -> CanvasDoc {
+    let blocks = vec![
+        CanvasBlock::Heading {
+            level: 1,
+            text: "Q4 launch plan".into(),
+        },
+        CanvasBlock::Paragraph(
+            "This canvas tracks everything we need to ship the desktop client before the \
+             end of the quarter. Owners update their rows; the channel gets a weekly digest."
+                .into(),
+        ),
+        CanvasBlock::Heading {
+            level: 2,
+            text: "Goals".into(),
+        },
+        CanvasBlock::Bullets(vec![
+            "Native desktop client with feature parity for messaging".into(),
+            "Offline search over the local archive".into(),
+            "Huddles via the browser fallback until native media lands".into(),
+        ]),
+        CanvasBlock::Heading {
+            level: 2,
+            text: "Launch checklist".into(),
+        },
+        CanvasBlock::Checklist(vec![
+            (true, "Sign the macOS build".into()),
+            (true, "Fixture-driven screenshots for the docs".into()),
+            (false, "Beta invite list reviewed by support".into()),
+            (false, "Release notes drafted".into()),
+        ]),
+        CanvasBlock::Divider,
+        CanvasBlock::Heading {
+            level: 2,
+            text: "Milestones".into(),
+        },
+        CanvasBlock::Table {
+            header: vec![
+                "Milestone".into(),
+                "Owner".into(),
+                "Due".into(),
+                "Status".into(),
+            ],
+            rows: vec![
+                vec![
+                    "Private beta".into(),
+                    "Maya Chen".into(),
+                    "Oct 14".into(),
+                    "Done".into(),
+                ],
+                vec![
+                    "Public beta".into(),
+                    "Leo Park".into(),
+                    "Nov 4".into(),
+                    "In progress".into(),
+                ],
+                vec![
+                    "General availability".into(),
+                    "Sam Rivera".into(),
+                    "Dec 2".into(),
+                    "Not started".into(),
+                ],
+            ],
+        },
+        CanvasBlock::Heading {
+            level: 3,
+            text: "Open questions".into(),
+        },
+        CanvasBlock::Paragraph(
+            "Do we gate huddles behind a setting while they open in the browser?".into(),
+        ),
+    ];
+    let section_ids = vec![None; blocks.len()];
     CanvasDoc {
         title: "Q4 launch plan".into(),
         meta: "Canvas · last edited by Maya Chen".into(),
-        blocks: vec![
-            CanvasBlock::Heading {
-                level: 1,
-                text: "Q4 launch plan".into(),
-            },
-            CanvasBlock::Paragraph(
-                "This canvas tracks everything we need to ship the desktop client before the \
-                 end of the quarter. Owners update their rows; the channel gets a weekly digest."
-                    .into(),
-            ),
-            CanvasBlock::Heading {
-                level: 2,
-                text: "Goals".into(),
-            },
-            CanvasBlock::Bullets(vec![
-                "Native desktop client with feature parity for messaging".into(),
-                "Offline search over the local archive".into(),
-                "Huddles via the browser fallback until native media lands".into(),
-            ]),
-            CanvasBlock::Heading {
-                level: 2,
-                text: "Launch checklist".into(),
-            },
-            CanvasBlock::Checklist(vec![
-                (true, "Sign the macOS build".into()),
-                (true, "Fixture-driven screenshots for the docs".into()),
-                (false, "Beta invite list reviewed by support".into()),
-                (false, "Release notes drafted".into()),
-            ]),
-            CanvasBlock::Divider,
-            CanvasBlock::Heading {
-                level: 2,
-                text: "Milestones".into(),
-            },
-            CanvasBlock::Table {
-                header: vec![
-                    "Milestone".into(),
-                    "Owner".into(),
-                    "Due".into(),
-                    "Status".into(),
-                ],
-                rows: vec![
-                    vec![
-                        "Private beta".into(),
-                        "Maya Chen".into(),
-                        "Oct 14".into(),
-                        "Done".into(),
-                    ],
-                    vec![
-                        "Public beta".into(),
-                        "Leo Park".into(),
-                        "Nov 4".into(),
-                        "In progress".into(),
-                    ],
-                    vec![
-                        "General availability".into(),
-                        "Sam Rivera".into(),
-                        "Dec 2".into(),
-                        "Not started".into(),
-                    ],
-                ],
-            },
-            CanvasBlock::Heading {
-                level: 3,
-                text: "Open questions".into(),
-            },
-            CanvasBlock::Paragraph(
-                "Do we gate huddles behind a setting while they open in the browser?".into(),
-            ),
-        ],
+        blocks,
+        section_ids,
     }
 }
 
 /// Callback invoked when the user clicks "Open in browser" to edit a live canvas.
 pub type OpenBrowserFn = Rc<dyn Fn(&mut Window, &mut App)>;
+/// Callback invoked when the user edits a live canvas (`canvases.edit`).
+pub type CanvasEditFn = Rc<dyn Fn(CanvasEditOp, &mut Window, &mut App)>;
+/// Callback invoked when the user pops a canvas out into its own window (`F-COLLAB-128`).
+pub type CanvasPopOutFn = Rc<dyn Fn(CanvasDoc, &mut Window, &mut App)>;
 
-/// The Canvas tab body in fixture mode: scrollable, centered, read-only document.
-pub fn canvas_view(query: &str, search: Option<&Entity<TextareaState>>, cx: &App) -> Stateful<Div> {
-    let canvas = fixture();
-    render_canvas_doc(&canvas, query, search, None, cx)
+/// Optional interactive callbacks wired by the host window (`app/mod.rs` or `popout.rs`).
+#[derive(Clone, Default)]
+pub struct CanvasActions {
+    pub open_browser: Option<OpenBrowserFn>,
+    pub on_edit: Option<CanvasEditFn>,
+    pub on_request_access: Option<OpenBrowserFn>,
+    pub on_pop_out: Option<CanvasPopOutFn>,
 }
 
-/// Native live Canvas reader (`F-COLLAB-125`, `F-SHELL-266`): shows a loading indicator,
-/// error state with browser fallback, or the parsed live canvas with an in-canvas Find input
-/// and an "Open in browser" action.
+#[derive(Clone, Default)]
+struct CanvasUiState {
+    editing: bool,
+    editor: Option<Entity<TextareaState>>,
+    undo_stack: Vec<String>,
+    redo_stack: Vec<String>,
+    /// Local copy for fixture mode or optimistic live edits.
+    local_doc: Option<CanvasDoc>,
+    access_requested: bool,
+}
+
+#[derive(Default)]
+struct CanvasUiStore {
+    panels: HashMap<String, CanvasUiState>,
+}
+
+impl Global for CanvasUiStore {}
+
+fn ui_state(key: &str, cx: &App) -> CanvasUiState {
+    cx.try_global::<CanvasUiStore>()
+        .and_then(|s| s.panels.get(key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn mutate_ui(key: &str, f: impl FnOnce(&mut CanvasUiState), window: &mut Window, cx: &mut App) {
+    let entry = cx
+        .default_global::<CanvasUiStore>()
+        .panels
+        .entry(key.to_owned())
+        .or_default();
+    f(entry);
+    window.refresh();
+}
+
+/// The Canvas tab body in fixture mode: scrollable, centered, editable document.
+pub fn canvas_view(
+    query: &str,
+    search: Option<&Entity<TextareaState>>,
+    actions: CanvasActions,
+    cx: &App,
+) -> Stateful<Div> {
+    const KEY: &str = "fixture";
+    let state = ui_state(KEY, cx);
+    let canvas = state.local_doc.unwrap_or_else(fixture);
+    render_canvas_doc(KEY, &canvas, query, search, actions, true, cx)
+}
+
+/// Native live Canvas reader & editor (`F-COLLAB-125`, `F-COLLAB-132`, `F-SHELL-264`, `F-SHELL-266`):
+/// shows loading, error state with browser fallback, or the parsed live canvas with Find, Outline,
+/// interactive checklists, markdown section editor with formatting toolbar & undo/redo, Request edit
+/// access, Pop-out window, and "Open in browser".
 pub fn live_canvas_view(
+    file_id: &str,
     loaded: Option<&Result<CanvasDoc, String>>,
     query: &str,
     search: Option<&Entity<TextareaState>>,
-    open_browser: Option<OpenBrowserFn>,
+    actions: CanvasActions,
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let open_browser = actions.open_browser.clone();
     match loaded {
         None => v_flex()
             .id("canvas-loading")
@@ -246,23 +381,43 @@ pub fn live_canvas_view(
                         .on_click(move |_, window, cx| open(window, cx)),
                 )
             }),
-        Some(Ok(doc)) => render_canvas_doc(doc, query, search, open_browser, cx),
+        Some(Ok(doc)) => render_canvas_doc(file_id, doc, query, search, actions, false, cx),
     }
 }
 
+/// Standalone render helper for a popped-out Canvas window (`F-COLLAB-128`, `F-SHELL-148`).
+pub fn render_popout_canvas(
+    key: &str,
+    doc: &CanvasDoc,
+    query: &str,
+    search: Option<&Entity<TextareaState>>,
+    actions: CanvasActions,
+    is_fixture: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let state = ui_state(key, cx);
+    let active = state.local_doc.as_ref().unwrap_or(doc);
+    render_canvas_doc(key, active, query, search, actions, is_fixture, cx)
+}
+
 fn render_canvas_doc(
+    key: &str,
     canvas: &CanvasDoc,
     query: &str,
     search: Option<&Entity<TextareaState>>,
-    open_browser: Option<OpenBrowserFn>,
+    actions: CanvasActions,
+    is_fixture: bool,
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let ui = ui_state(key, cx);
+    let can_edit = is_fixture || actions.on_edit.is_some();
     let needle = query.trim().to_lowercase();
-    let filtered: Vec<&CanvasBlock> = canvas
+    let filtered: Vec<(usize, &CanvasBlock)> = canvas
         .blocks
         .iter()
-        .filter(|b| b.matches(&needle))
+        .enumerate()
+        .filter(|(_, b)| b.matches(&needle))
         .collect();
     let match_note = (!needle.is_empty()).then(|| {
         format!(
@@ -276,8 +431,81 @@ fn render_canvas_doc(
         )
     });
 
+    let key_edit = key.to_owned();
+    let canvas_for_edit = canvas.clone();
+    let edit_toggle = can_edit.then(|| {
+        Button::new(SharedString::from(format!("canvas-edit-toggle-{key}")))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(if ui.editing {
+                IconName::Eye
+            } else {
+                IconName::Pencil
+            })
+            .label(if ui.editing { "Preview" } else { "Edit" })
+            .tooltip("Toggle canvas reader / markdown editor")
+            .on_click(move |_, window, cx| {
+                let md = canvas_for_edit.to_markdown();
+                let should_open = !ui_state(&key_edit, cx).editing;
+                let editor = if should_open {
+                    Some(cx.new(|cx| {
+                        TextareaState::new(window, cx)
+                            .auto_grow(10, 24)
+                            .default_value(md.clone())
+                            .placeholder("Write canvas markdown…")
+                    }))
+                } else {
+                    None
+                };
+                mutate_ui(
+                    &key_edit,
+                    |s| {
+                        s.editing = should_open;
+                        if let Some(ed) = editor {
+                            s.undo_stack = vec![md];
+                            s.redo_stack.clear();
+                            s.editor = Some(ed);
+                        }
+                    },
+                    window,
+                    cx,
+                );
+            })
+    });
+
+    let key_req = key.to_owned();
+    let req_btn = actions.on_request_access.clone().map(|req| {
+        let already = ui.access_requested;
+        Button::new(SharedString::from(format!("canvas-request-access-{key}")))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::Lock)
+            .label(if already {
+                "Access requested"
+            } else {
+                "Request edit"
+            })
+            .disabled(already)
+            .on_click(move |_, window, cx| {
+                mutate_ui(&key_req, |s| s.access_requested = true, window, cx);
+                req(window, cx);
+            })
+    });
+
+    let popout_btn = actions.on_pop_out.clone().map(|pop| {
+        let doc = canvas.clone();
+        Button::new(SharedString::from(format!("canvas-popout-{key}")))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::ExternalLink)
+            .label("Pop out")
+            .tooltip("Open canvas in a new window")
+            .on_click(move |_, window, cx| pop(doc.clone(), window, cx))
+    });
+
     let header = h_flex()
         .items_center()
+        .flex_wrap()
         .gap_2()
         .child(
             Icon::new(IconName::LayoutTemplate)
@@ -301,8 +529,11 @@ fn render_canvas_doc(
                         .child(canvas.meta.clone()),
                 ),
         )
-        .child(read_only_badge(cx))
-        .when_some(open_browser, |row, open| {
+        .when(!can_edit, |row| row.child(read_only_badge(cx)))
+        .children(edit_toggle)
+        .children(req_btn)
+        .children(popout_btn)
+        .when_some(actions.open_browser.clone(), |row, open| {
             row.child(
                 Button::new("canvas-open-browser")
                     .outline()
@@ -404,7 +635,188 @@ fn render_canvas_doc(
             }))
     });
 
-    let document = if filtered.is_empty() {
+    let document = if ui.editing {
+        if let Some(editor) = ui.editor.clone() {
+            let insert_snippet = |label: &'static str, snippet: &'static str| {
+                let ed = editor.clone();
+                let k = key.to_owned();
+                Button::new(SharedString::from(format!("canvas-fmt-{k}-{label}")))
+                    .outline()
+                    .with_size(Size::XSmall)
+                    .label(label)
+                    .on_click(move |_, window, cx| {
+                        let current = ed.read(cx).value().to_string();
+                        let next = if current.trim().is_empty() {
+                            snippet.to_owned()
+                        } else {
+                            format!("{current}\n\n{snippet}")
+                        };
+                        mutate_ui(
+                            &k,
+                            |s| {
+                                if s.undo_stack.last().map(String::as_str) != Some(current.as_str())
+                                {
+                                    s.undo_stack.push(current);
+                                }
+                                s.redo_stack.clear();
+                            },
+                            window,
+                            cx,
+                        );
+                        ed.update(cx, |state, cx| state.set_value(next, window, cx));
+                    })
+            };
+
+            let can_undo = ui.undo_stack.len() > 1;
+            let can_redo = !ui.redo_stack.is_empty();
+            let ed_undo = editor.clone();
+            let k_undo = key.to_owned();
+            let ed_redo = editor.clone();
+            let k_redo = key.to_owned();
+            let ed_save = editor.clone();
+            let k_save = key.to_owned();
+            let k_cancel = key.to_owned();
+            let on_edit_save = actions.on_edit.clone();
+            let title_save = canvas.title.clone();
+            let meta_save = canvas.meta.clone();
+
+            let toolbar = h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary.opacity(0.35))
+                .child(insert_snippet("H1", "# Heading"))
+                .child(insert_snippet("H2", "## Section"))
+                .child(insert_snippet("H3", "### Subheading"))
+                .child(insert_snippet("Bullet", "- List item"))
+                .child(insert_snippet("Checklist", "- [ ] Task item"))
+                .child(insert_snippet("Quote", "> Quoted note"))
+                .child(insert_snippet("Code", "```\ncode\n```"))
+                .child(insert_snippet("Divider", "---"))
+                .child(div().flex_1())
+                .child(
+                    Button::new(SharedString::from(format!("canvas-undo-{key}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::Undo)
+                        .tooltip("Undo canvas edit")
+                        .disabled(!can_undo)
+                        .on_click(move |_, window, cx| {
+                            let current = ed_undo.read(cx).value().to_string();
+                            let mut target = None;
+                            mutate_ui(
+                                &k_undo,
+                                |s| {
+                                    if s.undo_stack.len() > 1 {
+                                        s.redo_stack.push(current);
+                                        let _ = s.undo_stack.pop();
+                                        target = s.undo_stack.last().cloned();
+                                    }
+                                },
+                                window,
+                                cx,
+                            );
+                            if let Some(prev) = target {
+                                ed_undo.update(cx, |st, cx| st.set_value(prev, window, cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("canvas-redo-{key}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::Redo)
+                        .tooltip("Redo canvas edit")
+                        .disabled(!can_redo)
+                        .on_click(move |_, window, cx| {
+                            let mut target = None;
+                            mutate_ui(
+                                &k_redo,
+                                |s| {
+                                    if let Some(next) = s.redo_stack.pop() {
+                                        s.undo_stack.push(next.clone());
+                                        target = Some(next);
+                                    }
+                                },
+                                window,
+                                cx,
+                            );
+                            if let Some(next) = target {
+                                ed_redo.update(cx, |st, cx| st.set_value(next, window, cx));
+                            }
+                        }),
+                );
+
+            let footer = h_flex()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new(SharedString::from(format!("canvas-cancel-{key}")))
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Cancel")
+                        .on_click(move |_, window, cx| {
+                            mutate_ui(&k_cancel, |s| s.editing = false, window, cx);
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("canvas-save-{key}")))
+                        .primary()
+                        .with_size(Size::Small)
+                        .icon(IconName::Check)
+                        .label("Save changes")
+                        .on_click(move |_, window, cx| {
+                            let markdown = ed_save.read(cx).value().to_string();
+                            let updated = CanvasDoc::from_markdown(
+                                title_save.clone(),
+                                meta_save.clone(),
+                                &markdown,
+                            );
+                            mutate_ui(
+                                &k_save,
+                                |s| {
+                                    s.editing = false;
+                                    if is_fixture {
+                                        s.local_doc = Some(updated);
+                                    }
+                                },
+                                window,
+                                cx,
+                            );
+                            if let Some(cb) = &on_edit_save {
+                                cb(
+                                    CanvasEditOp::Replace {
+                                        section_id: None,
+                                        markdown,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                );
+
+            v_flex()
+                .gap_3()
+                .child(toolbar)
+                .child(
+                    div()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .p_2()
+                        .child(Textarea::new(&editor).appearance(false).bordered(false)),
+                )
+                .child(footer)
+        } else {
+            v_flex()
+        }
+    } else if filtered.is_empty() {
         v_flex().py_8().items_center().child(
             div()
                 .text_sm()
@@ -416,9 +828,46 @@ fn render_canvas_doc(
                 }),
         )
     } else {
-        filtered.into_iter().fold(v_flex().gap_3(), |doc, block| {
-            doc.child(render_block(block, cx))
-        })
+        filtered
+            .into_iter()
+            .fold(v_flex().gap_3(), |doc_col, (block_ix, block)| {
+                let on_toggle = can_edit.then(|| {
+                    let key_t = key.to_owned();
+                    let canvas_t = canvas.clone();
+                    let on_edit_t = actions.on_edit.clone();
+                    Rc::new(move |item_ix: usize, window: &mut Window, cx: &mut App| {
+                        let mut updated = canvas_t.clone();
+                        let section_id = updated.section_ids.get(block_ix).and_then(|s| s.clone());
+                        if let Some(CanvasBlock::Checklist(items)) =
+                            updated.blocks.get_mut(block_ix)
+                        {
+                            if let Some((done, _)) = items.get_mut(item_ix) {
+                                *done = !*done;
+                            }
+                            let section_md = CanvasBlock::Checklist(items.clone()).to_markdown();
+                            let full_md = updated.to_markdown();
+                            if is_fixture {
+                                mutate_ui(&key_t, |s| s.local_doc = Some(updated), window, cx);
+                            }
+                            if let Some(cb) = &on_edit_t {
+                                let op = if let Some(sid) = section_id {
+                                    CanvasEditOp::Replace {
+                                        section_id: Some(sid),
+                                        markdown: section_md,
+                                    }
+                                } else {
+                                    CanvasEditOp::Replace {
+                                        section_id: None,
+                                        markdown: full_md,
+                                    }
+                                };
+                                cb(op, window, cx);
+                            }
+                        }
+                    }) as Rc<dyn Fn(usize, &mut Window, &mut App)>
+                });
+                doc_col.child(render_block(block_ix, block, on_toggle, cx))
+            })
     };
 
     div()
@@ -462,7 +911,14 @@ pub fn read_only_badge(cx: &App) -> Div {
         .child("Read-only")
 }
 
-fn render_block(block: &CanvasBlock, cx: &App) -> Div {
+type ToggleCheckFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+fn render_block(
+    block_ix: usize,
+    block: &CanvasBlock,
+    on_toggle_check: Option<ToggleCheckFn>,
+    cx: &App,
+) -> Div {
     let theme = cx.theme();
     match block {
         CanvasBlock::Heading { level, text } => {
@@ -509,19 +965,33 @@ fn render_block(block: &CanvasBlock, cx: &App) -> Div {
                 .child(div().flex_1().child(item.clone()))
         })),
         CanvasBlock::Checklist(items) => {
+            let hover_bg = theme.secondary.opacity(0.4);
             v_flex()
                 .gap_1p5()
                 .pl_1()
-                .children(items.iter().map(|(done, item)| {
+                .children(items.iter().enumerate().map(|(item_ix, (done, item))| {
                     let (icon, color) = if *done {
                         (IconName::SquareCheck, theme.success)
                     } else {
                         (IconName::Square, theme.muted_foreground)
                     };
+                    let toggle = on_toggle_check.clone();
                     h_flex()
+                        .id(SharedString::from(format!(
+                            "canvas-chk-{block_ix}-{item_ix}"
+                        )))
                         .gap_2()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
                         .items_center()
                         .text_sm()
+                        .when(toggle.is_some(), |row| {
+                            row.cursor_pointer().hover(move |el| el.bg(hover_bg))
+                        })
+                        .when_some(toggle, |row, cb| {
+                            row.on_click(move |_, window, cx| cb(item_ix, window, cx))
+                        })
                         .child(Icon::new(icon).text_color(color).size(px(16.)))
                         .child(
                             div()
@@ -601,14 +1071,23 @@ fn render_block(block: &CanvasBlock, cx: &App) -> Div {
 }
 
 /// Lightweight parser converting Slack's Quip/Canvas HTML export into structured [`CanvasBlock`]s.
+#[cfg(test)]
 pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
+    parse_canvas_html_with_ids(html).0
+}
+
+/// Like [`parse_canvas_html`], also returning each block's Quip `id` attribute (`temp:C:...`)
+/// when present so `canvases.edit` can target individual sections.
+pub fn parse_canvas_html_with_ids(html: &str) -> (Vec<CanvasBlock>, Vec<Option<String>>) {
     let body = extract_tag_inner(html, "body").unwrap_or(html);
     let mut blocks = Vec::new();
+    let mut ids = Vec::new();
     let mut rest = body;
     while let Some(open_pos) = rest.find('<') {
         let before = clean_text(&rest[..open_pos]);
         if !before.is_empty() {
             blocks.push(CanvasBlock::Paragraph(before));
+            ids.push(None);
         }
         rest = &rest[open_pos..];
         let Some(gt) = rest.find('>') else {
@@ -625,8 +1104,10 @@ pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
+        let section_id = extract_attr(trimmed, "id").filter(|s| !s.is_empty());
         if tag_name == "hr" {
             blocks.push(CanvasBlock::Divider);
+            ids.push(section_id);
             continue;
         }
         if tag_name == "img" {
@@ -643,6 +1124,7 @@ pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
                         width,
                         height,
                     });
+                    ids.push(section_id);
                 }
             }
             continue;
@@ -664,6 +1146,7 @@ pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
             };
             let inner = &rest[..end];
             rest = &rest[end + close.len()..];
+            let prev_len = blocks.len();
             match tag_name.as_str() {
                 "h1" | "h2" | "h3" | "h4" => {
                     let text = clean_text(&strip_tags(inner));
@@ -716,11 +1199,143 @@ pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
                 }
                 _ => {}
             }
+            if blocks.len() > prev_len {
+                ids.push(section_id);
+            }
         }
     }
     let tail = clean_text(&strip_tags(rest));
     if !tail.is_empty() {
         blocks.push(CanvasBlock::Paragraph(tail));
+        ids.push(None);
+    }
+    (blocks, ids)
+}
+
+/// Lightweight Slack canvas markdown parser (headings, bullets, checklists, code fences,
+/// blockquotes, horizontal rules, pipe tables, paragraphs).
+pub fn parse_canvas_markdown(markdown: &str) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            let mut code = Vec::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim().starts_with("```") {
+                code.push(lines[i]);
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1;
+            }
+            blocks.push(CanvasBlock::CodeBlock(code.join("\n")));
+            continue;
+        }
+        if trimmed == "---" || trimmed == "***" {
+            blocks.push(CanvasBlock::Divider);
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            blocks.push(CanvasBlock::Heading {
+                level: 3,
+                text: rest.trim().to_owned(),
+            });
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            blocks.push(CanvasBlock::Heading {
+                level: 2,
+                text: rest.trim().to_owned(),
+            });
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            blocks.push(CanvasBlock::Heading {
+                level: 1,
+                text: rest.trim().to_owned(),
+            });
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("> ") {
+            blocks.push(CanvasBlock::Quote(rest.trim().to_owned()));
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("- [ ] ")
+            || trimmed.starts_with("- [x] ")
+            || trimmed.starts_with("- [X] ")
+        {
+            let mut items = Vec::new();
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if let Some(rest) = t.strip_prefix("- [ ] ") {
+                    items.push((false, rest.trim().to_owned()));
+                    i += 1;
+                } else if let Some(rest) = t
+                    .strip_prefix("- [x] ")
+                    .or_else(|| t.strip_prefix("- [X] "))
+                {
+                    items.push((true, rest.trim().to_owned()));
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(CanvasBlock::Checklist(items));
+            continue;
+        }
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            let mut items = Vec::new();
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if let Some(rest) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+                    items.push(rest.trim().to_owned());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(CanvasBlock::Bullets(items));
+            continue;
+        }
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let split_row = |r: &str| -> Vec<String> {
+                r.trim_matches('|')
+                    .split('|')
+                    .map(|c| c.trim().to_owned())
+                    .collect()
+            };
+            let header = split_row(trimmed);
+            i += 1;
+            if i < lines.len() && lines[i].trim().starts_with('|') && lines[i].contains("---") {
+                i += 1;
+            }
+            let mut rows = Vec::new();
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if t.starts_with('|') && t.ends_with('|') {
+                    rows.push(split_row(t));
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(CanvasBlock::Table { header, rows });
+            continue;
+        }
+        blocks.push(CanvasBlock::Paragraph(trimmed.to_owned()));
+        i += 1;
     }
     blocks
 }
@@ -936,5 +1551,32 @@ mod tests {
             doc.outline_headings(),
             vec![(1, "Launch Plan"), (2, "Milestones"), (3, "Risks")]
         );
+    }
+
+    #[test]
+    fn preserves_section_ids_and_roundtrips_canvas_markdown() {
+        let html = r#"<html><body>
+            <h1 id="temp:C:h1">Runbook</h1>
+            <ul id="temp:C:chk1" class="checklist">
+                <li data-checked="true">Verify backup</li>
+                <li data-checked="false">Cut release</li>
+            </ul>
+            <p id="temp:C:p1">All clear.</p>
+        </body></html>"#;
+        let doc = CanvasDoc::from_html("Runbook".into(), html);
+        assert_eq!(
+            doc.section_ids,
+            vec![
+                Some("temp:C:h1".to_owned()),
+                Some("temp:C:chk1".to_owned()),
+                Some("temp:C:p1".to_owned()),
+            ]
+        );
+        let md = doc.to_markdown();
+        assert!(md.contains("# Runbook"));
+        assert!(md.contains("- [x] Verify backup"));
+        assert!(md.contains("- [ ] Cut release"));
+        let reparsed = CanvasDoc::from_markdown("Runbook".into(), "Live".into(), &md);
+        assert_eq!(reparsed.blocks, doc.blocks);
     }
 }

@@ -698,6 +698,56 @@ impl App {
         );
     }
 
+    /// Pop out a Slack Canvas into its own native window (`F-COLLAB-128`, `F-SHELL-148`).
+    pub(super) fn pop_out_canvas(
+        &self,
+        doc: crate::canvas::CanvasDoc,
+        file_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = doc.title.clone();
+        let open_browser_url = file_id.as_deref().map(|id| self.canvas_link(id));
+        let on_jump = self.popout_jump_handler(window, cx);
+        let display_id = window.display(cx).map(|d| d.id());
+        crate::popout::open_popout(
+            crate::popout::PopoutKind::Canvas {
+                doc,
+                file_id,
+                open_browser_url,
+                on_jump,
+            },
+            title,
+            self.fixtures.clone(),
+            None,
+            None,
+            self.bridge.forwarder(),
+            None,
+            display_id,
+            cx,
+        );
+    }
+
+    /// Pop out the live Files browser into a separate native GPUI window (`F-COLLAB-127`, `F-SHELL-150`).
+    pub(super) fn pop_out_files(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_jump = self.popout_jump_handler(window, cx);
+        let display_id = window.display(cx).map(|d| d.id());
+        crate::popout::open_popout(
+            crate::popout::PopoutKind::Files {
+                source: self.files_page.downgrade(),
+                on_jump,
+            },
+            "Files".to_owned(),
+            self.fixtures.clone(),
+            None,
+            None,
+            self.bridge.forwarder(),
+            None,
+            display_id,
+            cx,
+        );
+    }
+
     /// Activate the `index`-th tab in the current conversation's header (`Ctrl+1..9`, `F-SHELL-280`).
     pub(super) fn select_conversation_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(conv) = self.fixtures.conversation(&self.channel) else {

@@ -221,6 +221,11 @@ pub enum MessageListEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Add this message to a Slack List (`lists.addToList`, `F-COLLAB-231`).
+    AddToList {
+        channel: ChannelId,
+        ts: Ts,
+    },
     /// "Jump to…" needs history older than the loaded window: the root pages it in until it
     /// reaches `since` (unix seconds), then calls [`MessageList::finish_jump`].
     NeedHistorySince {
@@ -818,6 +823,10 @@ impl MessageList {
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
             MessageAction::OpenImage(origin) => self.open_image(ts, &origin, cx),
             MessageAction::ViewHistory => cx.emit(MessageListEvent::ViewHistory {
+                channel,
+                ts: ts.clone(),
+            }),
+            MessageAction::AddToList => cx.emit(MessageListEvent::AddToList {
                 channel,
                 ts: ts.clone(),
             }),

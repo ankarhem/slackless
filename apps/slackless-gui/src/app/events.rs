@@ -938,6 +938,19 @@ impl App {
                 self.ws.canvases.insert(file_id.clone(), parsed);
                 cx.notify();
             }
+            Event::CanvasCreated {
+                file_id,
+                title,
+                channel: _,
+            } => {
+                if !file_id.is_empty() {
+                    self.open_live_canvas(file_id.clone(), cx);
+                }
+                notify("Canvas created", title.clone(), window, cx);
+            }
+            Event::FilePermissionRequested { file_id: _ } => {
+                notify("Access requested", "Edit access request sent.", window, cx);
+            }
             Event::ListLoaded { file_id, list } => {
                 let value = match list {
                     Ok(data) => Ok((**data).clone()),
@@ -945,6 +958,23 @@ impl App {
                 };
                 self.ws.lists.insert(file_id.clone(), value);
                 cx.notify();
+            }
+            Event::ListCreated { file_id, name } => {
+                if !file_id.is_empty() {
+                    self.open_live_list(file_id.clone(), cx);
+                }
+                notify("List created", name.clone(), window, cx);
+            }
+            Event::MessageAddedToList { list_id, .. } => {
+                self.bridge.send(Command::LoadList {
+                    file_id: list_id.clone(),
+                });
+                notify(
+                    "Added to list",
+                    "Message added as a new list item.",
+                    window,
+                    cx,
+                );
             }
             Event::AppHomeLoaded { channel, home } => {
                 let value = match home {

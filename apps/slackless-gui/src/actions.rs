@@ -84,6 +84,8 @@ pub enum MessageAction {
     OpenImage(crate::image_viewer::ImageOrigin),
     /// Open the durable local SQLite revision history log for this message.
     ViewHistory,
+    /// Add this message as a new item in a Slack List (`lists.addToList`, `F-COLLAB-231`).
+    AddToList,
 }
 
 /// Which actions apply to one message.
@@ -400,6 +402,12 @@ fn menu_rows(set: ActionSet, origin: MenuOrigin) -> Vec<MenuRow> {
         action: MessageAction::TogglePin,
         hint: None,
     };
+    let add_to_list = MenuRow::Item {
+        label: "Add to list…",
+        icon: IconName::ListChecks,
+        action: MessageAction::AddToList,
+        hint: None,
+    };
     let history = MenuRow::Item {
         label: "View edit history",
         icon: IconName::Clock,
@@ -426,6 +434,7 @@ fn menu_rows(set: ActionSet, origin: MenuOrigin) -> Vec<MenuRow> {
         copy_text,
         MenuRow::Separator,
         pin,
+        add_to_list,
         history,
     ]);
     if origin == MenuOrigin::Context {

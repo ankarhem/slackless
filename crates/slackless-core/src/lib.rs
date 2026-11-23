@@ -345,9 +345,53 @@ pub enum Command {
     LoadCanvas {
         file_id: String,
     },
+    /// Create a standalone (or channel-tabbed) canvas (`canvases.create`, `F-COLLAB-119`).
+    CreateCanvas {
+        title: String,
+        markdown: String,
+        channel: Option<ChannelId>,
+    },
+    /// Apply a section-level edit to a canvas (`canvases.edit`, `F-COLLAB-132`, `F-SHELL-264`, `F-SHELL-277`).
+    EditCanvas {
+        file_id: String,
+        op: api::CanvasEditOp,
+    },
+    /// Request edit (`upgrade`) or comment (`comment_upgrade`) access on a canvas/list (`F-COLLAB-129`).
+    RequestFilePermission {
+        file_id: String,
+        request_type: String,
+    },
     /// Fetch a live Slack List's schema and records (`files.info` + `lists.records.list`).
     LoadList {
         file_id: String,
+    },
+    /// Create a new Slack List (`lists.create`, `F-COLLAB-213`).
+    CreateList {
+        name: String,
+        description: Option<String>,
+        channel: Option<ChannelId>,
+    },
+    /// Add an item to a Slack List (`lists.records.create`, `F-COLLAB-226`).
+    CreateListItem {
+        list_id: String,
+        initial_fields: Vec<api::ListCellInput>,
+    },
+    /// Update one or more cells of a Slack List item (`lists.cells.update`, `F-COLLAB-227`, `F-COLLAB-248`).
+    UpdateListCell {
+        list_id: String,
+        row_id: String,
+        cells: Vec<api::ListCellInput>,
+    },
+    /// Delete an item from a Slack List (`lists.records.delete`, `F-COLLAB-228`).
+    DeleteListItem {
+        list_id: String,
+        row_id: String,
+    },
+    /// Add a Slack message to an existing List (`lists.addToList`, `F-COLLAB-231`).
+    AddMessageToList {
+        list_id: String,
+        channel: ChannelId,
+        ts: Ts,
     },
     /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true` +
     /// `apps.home.dispatchOpenEvent`, `F-COLLAB-480`).
@@ -685,11 +729,23 @@ pub enum Event {
         title: String,
         html: Result<String, String>,
     },
+    /// A standalone canvas was created via `canvases.create` (`F-COLLAB-119`).
+    CanvasCreated {
+        file_id: String,
+        title: String,
+        channel: Option<ChannelId>,
+    },
+    /// Access was requested on a canvas/list (`files.requestPermission`, `F-COLLAB-129`).
+    FilePermissionRequested { file_id: String },
     /// A live Slack List finished loading (`files.info` + `lists.records.list`).
     ListLoaded {
         file_id: String,
         list: Result<Box<api::SlackListData>, String>,
     },
+    /// A new Slack List was created via `lists.create` (`F-COLLAB-213`).
+    ListCreated { file_id: String, name: String },
+    /// A message was added to a Slack List (`lists.addToList`, `F-COLLAB-231`).
+    MessageAddedToList { list_id: String, record_id: String },
     /// An app DM's Home tab finished loading (`conversations.info` `return_app_home=true`, `F-COLLAB-480`).
     AppHomeLoaded {
         channel: ChannelId,

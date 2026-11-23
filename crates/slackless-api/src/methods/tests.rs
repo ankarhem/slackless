@@ -673,3 +673,56 @@ fn parses_app_home_wire_and_view_action_container() {
         serde_json::json!({ "type": "view", "view_id": "V0HOME1" })
     );
 }
+
+#[test]
+fn serializes_canvas_edit_ops_and_list_cell_inputs() {
+    let replace = CanvasEditOp::Replace {
+        section_id: Some("temp:C:abc123".into()),
+        markdown: "- [x] Done".into(),
+    }
+    .to_change_json();
+    assert_eq!(replace["operation"], "replace");
+    assert_eq!(replace["section_id"], "temp:C:abc123");
+    assert_eq!(replace["document_content"]["markdown"], "- [x] Done");
+
+    let whole = CanvasEditOp::Replace {
+        section_id: None,
+        markdown: "# Title".into(),
+    }
+    .to_change_json();
+    assert!(whole.get("section_id").is_none());
+
+    let rename = CanvasEditOp::Rename {
+        title: "Q4 Plan".into(),
+    }
+    .to_change_json();
+    assert_eq!(rename["operation"], "rename");
+    assert_eq!(rename["title_content"]["markdown"], "Q4 Plan");
+
+    let text_cell = ListCellInput {
+        column_id: "Col01".into(),
+        value: ListCellInputValue::Text("Ship release".into()),
+    }
+    .to_json(Some("Rec01"));
+    assert_eq!(text_cell["row_id"], "Rec01");
+    assert_eq!(text_cell["column_id"], "Col01");
+    assert_eq!(
+        text_cell["rich_text"][0]["elements"][0]["elements"][0]["text"],
+        "Ship release"
+    );
+
+    let chk_cell = ListCellInput {
+        column_id: "Col02".into(),
+        value: ListCellInputValue::Checkbox(true),
+    }
+    .to_json(Some("Rec01"));
+    assert_eq!(chk_cell["checkbox"], true);
+
+    let sel_cell = ListCellInput {
+        column_id: "Col03".into(),
+        value: ListCellInputValue::Select(vec!["OptDone".into()]),
+    }
+    .to_json(None);
+    assert!(sel_cell.get("row_id").is_none());
+    assert_eq!(sel_cell["select"], serde_json::json!(["OptDone"]));
+}

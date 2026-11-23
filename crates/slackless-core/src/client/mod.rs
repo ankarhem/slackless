@@ -1669,6 +1669,61 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::CreateCanvas {
+                title,
+                markdown,
+                channel,
+            } => {
+                self.spawn("canvases.create", async move {
+                    let created = backend
+                        .canvases_create(
+                            Some(title.clone()),
+                            (!markdown.is_empty()).then_some(markdown),
+                            channel.clone(),
+                        )
+                        .await?;
+                    events.emit(Event::CanvasCreated {
+                        file_id: created.canvas_id,
+                        title,
+                        channel,
+                    });
+                    Ok(())
+                });
+            }
+            Command::EditCanvas { file_id, op } => {
+                self.spawn("canvases.edit", async move {
+                    backend.canvases_edit(file_id.clone(), op).await?;
+                    match backend.fetch_canvas_html(file_id.clone()).await {
+                        Ok((title, html)) => {
+                            events.emit(Event::CanvasLoaded {
+                                file_id,
+                                title,
+                                html: Ok(html),
+                            });
+                        }
+                        Err(err) => {
+                            events.emit(Event::CanvasLoaded {
+                                file_id,
+                                title: "Canvas".to_owned(),
+                                html: Err(err.to_string()),
+                            });
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Command::RequestFilePermission {
+                file_id,
+                request_type,
+            } => {
+                self.spawn("files.requestPermission", async move {
+                    backend
+                        .files_request_permission(file_id.clone(), request_type)
+                        .await?;
+                    events.emit(Event::FilePermissionRequested { file_id });
+                    Ok(())
+                });
+            }
             Command::LoadList { file_id } => {
                 self.spawn("lists.records.list", async move {
                     let list = backend
@@ -1677,6 +1732,90 @@ impl<B: Backend> Core<B> {
                         .map(Box::new)
                         .map_err(|e| e.to_string());
                     events.emit(Event::ListLoaded { file_id, list });
+                    Ok(())
+                });
+            }
+            Command::CreateList {
+                name,
+                description,
+                channel,
+            } => {
+                self.spawn("lists.create", async move {
+                    let file_id = backend
+                        .lists_create(name.clone(), description, channel)
+                        .await?;
+                    events.emit(Event::ListCreated { file_id, name });
+                    Ok(())
+                });
+            }
+            Command::CreateListItem {
+                list_id,
+                initial_fields,
+            } => {
+                self.spawn("lists.records.create", async move {
+                    let _ = backend
+                        .lists_records_create(list_id.clone(), initial_fields)
+                        .await?;
+                    let list = backend
+                        .fetch_list(list_id.clone())
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string());
+                    events.emit(Event::ListLoaded {
+                        file_id: list_id,
+                        list,
+                    });
+                    Ok(())
+                });
+            }
+            Command::UpdateListCell {
+                list_id,
+                row_id,
+                cells,
+            } => {
+                self.spawn("lists.cells.update", async move {
+                    backend
+                        .lists_cells_update(list_id.clone(), row_id, cells)
+                        .await?;
+                    let list = backend
+                        .fetch_list(list_id.clone())
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string());
+                    events.emit(Event::ListLoaded {
+                        file_id: list_id,
+                        list,
+                    });
+                    Ok(())
+                });
+            }
+            Command::DeleteListItem { list_id, row_id } => {
+                self.spawn("lists.records.delete", async move {
+                    backend
+                        .lists_records_delete(list_id.clone(), row_id)
+                        .await?;
+                    let list = backend
+                        .fetch_list(list_id.clone())
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string());
+                    events.emit(Event::ListLoaded {
+                        file_id: list_id,
+                        list,
+                    });
+                    Ok(())
+                });
+            }
+            Command::AddMessageToList {
+                list_id,
+                channel,
+                ts,
+            } => {
+                self.spawn("lists.addToList", async move {
+                    let record_id = backend
+                        .lists_add_to_list(list_id.clone(), channel, ts)
+                        .await?;
+                    events.emit(Event::MessageAddedToList { list_id, record_id });
                     Ok(())
                 });
             }

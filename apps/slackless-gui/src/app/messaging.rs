@@ -1085,6 +1085,9 @@ impl App {
             MessageAction::ViewHistory => {
                 self.open_revision_history(channel, ts, window, cx);
             }
+            MessageAction::AddToList => {
+                self.open_add_to_list_dialog(channel, ts, window, cx);
+            }
             MessageAction::BlockAction { action, attachment } => {
                 if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
                     &message,
@@ -1312,6 +1315,9 @@ impl App {
             MessageAction::ViewHistory => {
                 self.open_revision_history(channel, ts, window, cx);
             }
+            MessageAction::AddToList => {
+                self.open_add_to_list_dialog(channel, ts, window, cx);
+            }
             MessageAction::BlockAction { action, attachment } => {
                 if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
                     &message,
@@ -1329,5 +1335,151 @@ impl App {
                     .update(cx, |t, cx| t.remove_message(&channel, &ts, cx));
             }
         }
+    }
+
+    /// Open a dialog to add `(channel, ts)` as an item in a Slack List (`lists.addToList`, `F-COLLAB-231`).
+    pub(super) fn open_add_to_list_dialog(
+        &mut self,
+        channel: ChannelId,
+        ts: Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut lists: Vec<(String, String)> = self
+            .ws
+            .lists
+            .iter()
+            .filter_map(|(id, res)| res.as_ref().ok().map(|d| (id.clone(), d.title.clone())))
+            .collect();
+        for (id, title) in self.files_page.read(cx).known_lists() {
+            if !lists.iter().any(|(existing, _)| existing == &id) {
+                lists.push((id, title));
+            }
+        }
+        let default_id = self
+            .ws
+            .active_list
+            .clone()
+            .or_else(|| lists.first().map(|(id, _)| id.clone()))
+            .unwrap_or_default();
+        let id_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("List file ID (e.g. F0123456789)")
+                .default_value(default_id)
+                .auto_grow(1, 1)
+        });
+        let this = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, bg, hover, muted) = (
+                theme.border,
+                theme.background,
+                theme.accent,
+                theme.muted_foreground,
+            );
+            let input_c = id_input.clone();
+            let this_ok = this.clone();
+            let ch_ok = channel.clone();
+            let ts_ok = ts.clone();
+            let picks = lists.clone();
+            let this_pick = this.clone();
+            let ch_pick = channel.clone();
+            let ts_pick = ts.clone();
+            dialog.title("Add message to list").w(px(400.)).child(
+                v_flex()
+                    .gap_3()
+                    .p_4()
+                    .when(!picks.is_empty(), |col| {
+                        col.child(
+                            v_flex()
+                                .gap_1()
+                                .child(div().text_xs().text_color(muted).child("Workspace lists"))
+                                .children(picks.into_iter().enumerate().map(
+                                    |(ix, (lid, title))| {
+                                        let this_row = this_pick.clone();
+                                        let ch_row = ch_pick.clone();
+                                        let ts_row = ts_pick.clone();
+                                        let lid_click = lid.clone();
+                                        h_flex()
+                                            .id(("add-to-list-pick", ix))
+                                            .items_center()
+                                            .justify_between()
+                                            .px_2p5()
+                                            .py_1p5()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(border)
+                                            .cursor_pointer()
+                                            .hover(move |el| el.bg(hover))
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                let _ = this_row.update(cx, |app, _| {
+                                                    app.bridge.send(Command::AddMessageToList {
+                                                        list_id: lid_click.clone(),
+                                                        channel: ch_row.clone(),
+                                                        ts: ts_row.clone(),
+                                                    });
+                                                });
+                                            })
+                                            .child(div().text_sm().child(title))
+                                            .child(div().text_xs().text_color(muted).child(lid))
+                                    },
+                                )),
+                        )
+                    })
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("Or enter a list ID"),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .bg(bg)
+                                    .child(
+                                        Textarea::new(&id_input).appearance(false).bordered(false),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("add-to-list-cancel")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("add-to-list-submit")
+                                    .primary()
+                                    .with_size(Size::Small)
+                                    .label("Add to list")
+                                    .on_click(move |_, window, cx| {
+                                        let list_id = input_c.read(cx).value().trim().to_owned();
+                                        if list_id.is_empty() {
+                                            return;
+                                        }
+                                        window.close_dialog(cx);
+                                        let _ = this_ok.update(cx, |app, _| {
+                                            app.bridge.send(Command::AddMessageToList {
+                                                list_id,
+                                                channel: ch_ok.clone(),
+                                                ts: ts_ok.clone(),
+                                            });
+                                        });
+                                    }),
+                            ),
+                    ),
+            )
+        });
     }
 }
