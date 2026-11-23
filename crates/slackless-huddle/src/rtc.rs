@@ -101,6 +101,8 @@ pub struct ChimeRtcPeer {
     bytes_sent: Arc<AtomicU64>,
     packets_received: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
+    total_packets_sent: Arc<AtomicU64>,
+    total_packets_received: Arc<AtomicU64>,
 }
 
 impl ChimeRtcPeer {
@@ -172,12 +174,15 @@ impl ChimeRtcPeer {
 
         let packets_received = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
+        let total_packets_received = Arc::new(AtomicU64::new(0));
         let rx_pkts = Arc::clone(&packets_received);
         let rx_bytes = Arc::clone(&bytes_received);
+        let rx_total = Arc::clone(&total_packets_received);
         pc.on_track(Box::new(move |track, _, _| {
             let tx = inbound_opus_tx.clone();
             let rx_pkts = Arc::clone(&rx_pkts);
             let rx_bytes = Arc::clone(&rx_bytes);
+            let rx_total = Arc::clone(&rx_total);
             Box::pin(async move {
                 if track.kind() != RTPCodecType::Audio {
                     return;
@@ -187,6 +192,7 @@ impl ChimeRtcPeer {
                         continue;
                     }
                     rx_pkts.fetch_add(1, Ordering::Relaxed);
+                    rx_total.fetch_add(1, Ordering::Relaxed);
                     rx_bytes.fetch_add(rtp.payload.len() as u64, Ordering::Relaxed);
                     if tx.send(rtp.payload.to_vec()).is_err() {
                         break;
@@ -207,6 +213,8 @@ impl ChimeRtcPeer {
             bytes_sent: Arc::new(AtomicU64::new(0)),
             packets_received,
             bytes_received,
+            total_packets_sent: Arc::new(AtomicU64::new(0)),
+            total_packets_received,
         })
     }
 
@@ -258,8 +266,21 @@ impl ChimeRtcPeer {
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
         self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(len, Ordering::Relaxed);
         Ok(())
+    }
+
+    pub fn connection_state(&self) -> RTCPeerConnectionState {
+        self.pc.connection_state()
+    }
+
+    pub fn total_packets_sent(&self) -> u64 {
+        self.total_packets_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn total_packets_received(&self) -> u64 {
+        self.total_packets_received.load(Ordering::Relaxed)
     }
 
     /// Sample and reset 1-second delta counters for Chime's `CLIENT_METRIC` frame.

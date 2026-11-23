@@ -64,6 +64,9 @@ async fn run_session(
         output_device: config.output_device.clone(),
         error: None,
         udp_blocked: false,
+        packets_sent: 0,
+        packets_received: 0,
+        pongs_sent: 0,
     };
     let _ = updates.send(HuddleUpdate::State(snap.clone()));
 
@@ -172,8 +175,14 @@ async fn run_connected_loop(
         inbound_opus_rx,
     )?;
 
-    snap.phase = HuddlePhase::Connected;
-    let _ = updates.send(HuddleUpdate::State(snap.clone()));
+    // Only transition to `Connected` once WebRTC ICE + DTLS-SRTP actually connects.
+    let mut ever_connected = peer.connection_state() == RTCPeerConnectionState::Connected;
+    if ever_connected {
+        snap.phase = HuddlePhase::Connected;
+        snap.started_at_secs = now_secs();
+        let _ = updates.send(HuddleUpdate::State(snap.clone()));
+    }
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
 
     // 6. Main event loop: RTP TX, signaling RX (PING_PONG, AUDIO_STREAM_ID_INFO, AUDIO_METADATA),
     //    1s CLIENT_METRIC cadence, 100ms local RMS tick, and live control commands.
@@ -187,15 +196,32 @@ async fn run_connected_loop(
     let mut result = Ok(());
 
     while !leave_requested {
+        let connect_timeout = async {
+            if ever_connected {
+                std::future::pending::<()>().await;
+            } else {
+                tokio::time::sleep_until(connect_deadline).await;
+            }
+        };
         tokio::select! {
+            _ = connect_timeout => {
+                result = Err(HuddleError::UdpBlocked);
+                break;
+            }
             Some(opus_pkt) = outbound_opus_rx.recv() => {
                 let _ = peer.write_opus_frame(opus_pkt).await;
             }
             Some(pc_state) = pc_state_rx.recv() => {
                 match pc_state {
                     RTCPeerConnectionState::Connected => {
+                        if !ever_connected {
+                            ever_connected = true;
+                            snap.started_at_secs = now_secs();
+                        }
                         if snap.phase != HuddlePhase::Connected {
                             snap.phase = HuddlePhase::Connected;
+                            snap.packets_sent = peer.total_packets_sent();
+                            snap.packets_received = peer.total_packets_received();
                             let _ = updates.send(HuddleUpdate::State(snap.clone()));
                         }
                     }
@@ -215,7 +241,9 @@ async fn run_connected_loop(
                     Ok(Some(frame)) => {
                         if let Some(pp) = frame.ping_pong {
                             if let Some(id) = pp.ping_id {
-                                let _ = signal.send_frame(&build_pong_frame(id)).await;
+                                if signal.send_frame(&build_pong_frame(id)).await.is_ok() {
+                                    snap.pongs_sent = snap.pongs_sent.saturating_add(1);
+                                }
                             }
                         }
                         if let Some(info) = frame.audio_stream_id_info {
@@ -338,6 +366,8 @@ async fn run_connected_loop(
     }
 
     // 7. Clean teardown: send Chime LEAVE, wait briefly for LEAVE_ACK, close audio & PeerConnection.
+    snap.packets_sent = peer.total_packets_sent();
+    snap.packets_received = peer.total_packets_received();
     snap.phase = HuddlePhase::Leaving;
     let _ = updates.send(HuddleUpdate::State(snap.clone()));
     let _ = signal.send_frame(&build_leave_frame()).await;

@@ -110,6 +110,9 @@ pub struct HuddleSessionSnapshot {
     pub output_device: Option<String>,
     pub error: Option<String>,
     pub udp_blocked: bool,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub pongs_sent: u32,
 }
 
 /// Live speaking / audio-level update pushed at ~10 Hz while connected.

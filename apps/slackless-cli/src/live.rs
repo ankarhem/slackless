@@ -966,12 +966,21 @@ pub async fn run_huddle_join(
                                 "channel": snap.channel.as_str(),
                                 "call_id": snap.call_id,
                                 "muted": snap.muted,
+                                "packets_sent": snap.packets_sent,
+                                "packets_received": snap.packets_received,
+                                "pongs_sent": snap.pongs_sent,
                                 "error": snap.error,
                                 "udp_blocked": snap.udp_blocked,
                             }),
                             &format!(
-                                "huddle {display}\t{phase}{}\n",
-                                snap.error.as_deref().map(|e| format!("\t{e}")).unwrap_or_default()
+                                "huddle {display}\t{phase}\ttx={} rx={} pongs={}{}\n",
+                                snap.packets_sent,
+                                snap.packets_received,
+                                snap.pongs_sent,
+                                snap.error
+                                    .as_deref()
+                                    .map(|e| format!("\t{e}"))
+                                    .unwrap_or_default()
                             ),
                         );
                         if snap.phase == slackless_core::huddle::HuddlePhase::Failed {
@@ -989,15 +998,33 @@ pub async fn run_huddle_join(
         }
     }
 
-    // Drain briefly so Chime receives the LEAVE frame before process exit.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    // Drain briefly so Chime receives the LEAVE frame before process exit, printing final stats.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while let Some(upd) = upd_rx.recv().await {
-            if matches!(
-                upd,
-                slackless_core::huddle::HuddleUpdate::State(s)
-                    if s.phase == slackless_core::huddle::HuddlePhase::Idle
-            ) {
-                break;
+            if let slackless_core::huddle::HuddleUpdate::State(snap) = upd {
+                let phase = format!("{:?}", snap.phase);
+                output::emit(
+                    ctx.json,
+                    &serde_json::json!({
+                        "event": "state",
+                        "phase": phase,
+                        "channel": snap.channel.as_str(),
+                        "call_id": snap.call_id,
+                        "muted": snap.muted,
+                        "packets_sent": snap.packets_sent,
+                        "packets_received": snap.packets_received,
+                        "pongs_sent": snap.pongs_sent,
+                        "error": snap.error,
+                        "udp_blocked": snap.udp_blocked,
+                    }),
+                    &format!(
+                        "huddle {display}\t{phase}\ttx={} rx={} pongs={}\n",
+                        snap.packets_sent, snap.packets_received, snap.pongs_sent
+                    ),
+                );
+                if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
+                    break;
+                }
             }
         }
     })
