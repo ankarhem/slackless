@@ -25,8 +25,12 @@ impl App {
         thread_ts: Ts,
         cx: &mut Context<Self>,
     ) {
+        let seed_root = self
+            .messages
+            .read(cx)
+            .message_by_ts(&channel, &thread_ts, cx);
         self.thread.update(cx, |panel, cx| {
-            panel.open(channel.clone(), thread_ts.clone(), cx)
+            panel.open(channel.clone(), thread_ts.clone(), seed_root, cx)
         });
         self.sync_thread_bar(cx);
         // Live mode: show the stored thread now, then fetch its full history from Slack
@@ -1536,9 +1540,11 @@ impl App {
         let order = self.sidebar.read(cx).unread_ids();
         let groups = local_groups(&self.fixtures, &order);
         let fixtures = self.fixtures.clone();
-        self.unreads
-            .update(cx, |view, cx| view.show_local(fixtures, groups.clone(), cx));
         if let Some(store) = self.bridge.store().cloned() {
+            // Live mode: keep already-loaded store groups on screen while refreshing off-thread
+            // (never flash empty `local_groups` placeholders).
+            self.unreads
+                .update(cx, |view, cx| view.begin_live_refresh(fixtures, cx));
             let team = self.fixtures.workspaces[self.workspace].id.clone();
             let targets = store_targets(&self.fixtures, &groups);
             cx.spawn(async move |this, cx| {
@@ -1569,6 +1575,9 @@ impl App {
                 })
             })
             .detach();
+        } else {
+            self.unreads
+                .update(cx, |view, cx| view.show_local(fixtures, groups, cx));
         }
     }
 
@@ -1581,9 +1590,10 @@ impl App {
     pub(super) fn show_huddles(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         let fixtures = self.fixtures.clone();
-        self.huddles
-            .update(cx, |view, cx| view.show_local(&fixtures, cx));
         if let Some(store) = self.bridge.store().cloned() {
+            // Live mode: keep cached rows visible while refreshing from SQLite.
+            self.huddles
+                .update(cx, |view, cx| view.begin_live_load(fixtures, cx));
             let team = self.fixtures.workspaces[self.workspace].id.clone();
             cx.spawn(async move |this, cx| {
                 let huddles = cx
@@ -1601,6 +1611,9 @@ impl App {
                 })
             })
             .detach();
+        } else {
+            self.huddles
+                .update(cx, |view, cx| view.show_local(&fixtures, cx));
         }
         self.close_full_column_views(cx);
         self.huddles_open = true;

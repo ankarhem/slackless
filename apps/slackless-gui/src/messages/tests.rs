@@ -519,3 +519,44 @@ fn initial_unread_scroll_fires_once_and_ignores_backfill_refreshes(cx: &mut Test
         });
     });
 }
+
+#[gpui::test]
+fn recent_channel_history_cache_avoids_blank_flash_on_switch(cx: &mut TestAppContext) {
+    with_transcript("C0ENG", cx, |harness, cx| {
+        cx.update(|_, cx| {
+            let list = harness.read(cx).list.clone();
+            let c1 = ChannelId::from("C_LIVE_1");
+            let c2 = ChannelId::from("C_LIVE_2");
+            list.update(cx, |list, cx| {
+                // Simulate live mode (`sample = false`) so LRU eviction runs.
+                let mut live = crate::fixtures::load();
+                live.sample = false;
+                list.set_fixtures(Arc::new(live), cx);
+
+                let m1 = Message {
+                    ts: Ts::from("1700000001.000100"),
+                    text: "channel 1 msg".into(),
+                    ..Default::default()
+                };
+                let m2 = Message {
+                    ts: Ts::from("1700000002.000100"),
+                    text: "channel 2 msg".into(),
+                    ..Default::default()
+                };
+                list.set_conversation(c1.clone(), cx);
+                list.set_history(c1.clone(), vec![m1.clone()], cx);
+                list.set_conversation(c2.clone(), cx);
+                list.set_history(c2.clone(), vec![m2.clone()], cx);
+
+                // Switching back to c1 immediately populates data.messages on frame 0.
+                list.set_conversation(c1.clone(), cx);
+                assert_eq!(list.data.read(cx).messages.len(), 1);
+                assert_eq!(list.data.read(cx).messages[0].ts, m1.ts);
+                assert_eq!(
+                    list.message_by_ts(&c2, &m2.ts, cx).map(|m| m.text),
+                    Some("channel 2 msg".to_owned())
+                );
+            });
+        });
+    });
+}

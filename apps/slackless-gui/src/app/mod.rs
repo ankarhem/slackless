@@ -454,6 +454,9 @@ pub(super) struct WorkspaceState {
     pub(super) member_counts: HashMap<ChannelId, u32>,
     /// Apps among a channel's members, counted apart from people as Slack's header does.
     pub(super) app_counts: HashMap<ChannelId, u32>,
+    /// Cached per-channel member lists from `Event::ConversationInfo` so returning to a Slack
+    /// Connect channel renders its amber banner on frame 0 without waiting on a refetch.
+    pub(super) members_cache: HashMap<ChannelId, Vec<UserId>>,
     /// Live mode: channels whose stored history has no older page left; the transcript
     /// stops asking for them.
     pub(super) history_complete: HashSet<ChannelId>,
@@ -2025,6 +2028,21 @@ impl App {
             app.sync_later_count(cx);
             app.sync_badge(cx);
             let channel = app.channel.clone();
+            // Cold-launch frame-0 preload: read the initial channel's newest stored page
+            // synchronously (~1–2ms indexed SQLite query) so the first painted frame already
+            // contains the transcript instead of flashing empty.
+            let initial_history = app.bridge.history_sync(&channel);
+            if !initial_history.is_empty() {
+                app.resolve_named_users(&initial_history);
+                let mark_read_mode = app.preferences.read(cx).settings().mark_read;
+                app.messages.update(cx, |list, cx| {
+                    list.set_conversation(channel.clone(), cx);
+                    list.set_history(channel.clone(), initial_history, cx);
+                    if mark_read_mode == 0 {
+                        list.scroll_to_unread_once(cx);
+                    }
+                });
+            }
             app.load_history(&channel, cx);
             app.load_draft(cx);
             app.sync_composer_placeholder(cx);

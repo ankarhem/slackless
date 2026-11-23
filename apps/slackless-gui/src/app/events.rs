@@ -678,6 +678,11 @@ impl App {
                 if let Some(apps) = num_apps {
                     self.ws.app_counts.insert(channel.clone(), *apps);
                 }
+                if !members.is_empty() {
+                    self.ws
+                        .members_cache
+                        .insert(channel.clone(), members.clone());
+                }
                 // A late answer for a channel left since is moot: the open one's follows.
                 if *channel == self.channel {
                     if !members.is_empty() {

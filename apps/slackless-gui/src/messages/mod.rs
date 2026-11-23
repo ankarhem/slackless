@@ -253,11 +253,18 @@ struct MessageData {
     edit_composer: Entity<Composer>,
 }
 
+/// Maximum number of recently visited channels kept warm in [`MessageList`] so switching
+/// back to a recent channel renders on frame 0 without flashing an empty transcript while
+/// SQLite refreshes in the background.
+const HISTORY_CACHE_CHANNELS: usize = 20;
+
 pub struct MessageList {
     fixtures: Arc<Fixtures>,
     channel: ChannelId,
-    /// Per-conversation history, oldest first (fixture history plus local sends).
+    /// Per-conversation history, oldest first (fixture history or bounded recent-channel LRU).
     messages: HashMap<ChannelId, Vec<Message>>,
+    /// Most-recently-used order for live cached channels (newest at the back).
+    history_lru: Vec<ChannelId>,
     /// Projection of the current conversation that the row renderer reads.
     data: Entity<MessageData>,
     scroller: Entity<MessageScrollerState>,
@@ -343,6 +350,7 @@ impl MessageList {
                 fixtures,
                 channel,
                 messages,
+                history_lru: Vec::new(),
                 data,
                 scroller,
                 requested_older: None,
@@ -402,8 +410,36 @@ impl MessageList {
         edit_composer.update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
 
+    fn touch_cache(&mut self, channel: &ChannelId) {
+        if self.fixtures.sample {
+            return;
+        }
+        self.history_lru.retain(|c| c != channel);
+        self.history_lru.push(channel.clone());
+        while self.history_lru.len() > HISTORY_CACHE_CHANNELS {
+            let oldest = self.history_lru.remove(0);
+            if oldest != self.channel {
+                self.messages.remove(&oldest);
+            }
+        }
+    }
+
+    /// Look up an already-loaded message by timestamp (used to seed `ThreadPanel` on frame 0).
+    pub fn message_by_ts(&self, channel: &ChannelId, ts: &Ts, cx: &App) -> Option<Message> {
+        if *channel == self.channel {
+            if let Some(m) = self.data.read(cx).messages.iter().find(|m| &m.ts == ts) {
+                return Some(m.clone());
+            }
+        }
+        self.messages
+            .get(channel)
+            .and_then(|history| history.iter().find(|m| &m.ts == ts))
+            .cloned()
+    }
+
     pub fn set_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
-        self.channel = channel;
+        self.channel = channel.clone();
+        self.touch_cache(&channel);
         self.pending_initial_unread_jump = true;
         self.sync(cx);
     }
@@ -438,8 +474,6 @@ impl MessageList {
         // A refresh may overtake an in-flight older-page read; forget the request so the top
         // of the list re-asks.
         self.requested_older = None;
-        // Live history lives in the store: keep only the open conversation's in memory.
-        self.messages.retain(|kept, _| *kept == channel);
         let merged = match (
             self.messages.remove(&channel),
             history.first().map(|message| message.ts.clone()),
@@ -456,7 +490,8 @@ impl MessageList {
             _ => history,
         };
         let visible = channel == self.channel;
-        self.messages.insert(channel, merged);
+        self.messages.insert(channel.clone(), merged);
+        self.touch_cache(&channel);
         if !visible {
             return;
         }

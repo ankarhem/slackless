@@ -853,7 +853,7 @@ impl App {
     }
 
     /// The freshest member ids of `channel`: the core's announcement while it is the open
-    /// channel, else the conversation row (the sample workspace's lists).
+    /// channel, else the per-workspace cache from an earlier visit, else the conversation row.
     pub(super) fn member_ids<'a>(
         &'a self,
         channel: &ChannelId,
@@ -861,7 +861,12 @@ impl App {
     ) -> &'a [UserId] {
         match &self.open_members {
             Some((open, members)) if open == channel => members,
-            _ => &conversation.members,
+            _ => self
+                .ws
+                .members_cache
+                .get(channel)
+                .map(Vec::as_slice)
+                .unwrap_or(&conversation.members),
         }
     }
 

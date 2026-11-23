@@ -2306,7 +2306,20 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         body = body.children(messages::render_block(nested_block, ix, &nested, false, cx));
     }
     if let Some(url) = attachment.image_url.as_deref() {
-        body = body.child(picture(Some(url), "attachment image", 360., 160., kcx, cx));
+        let img_w = attachment
+            .extra
+            .get("image_width")
+            .and_then(serde_json::Value::as_i64);
+        let img_h = attachment
+            .extra
+            .get("image_height")
+            .and_then(serde_json::Value::as_i64);
+        let (w, h) = if img_w.is_some() && img_h.is_some() {
+            crate::files::fit(img_w, img_h)
+        } else {
+            (360., 200.)
+        };
+        body = body.child(picture(Some(url), "attachment image", w, h, kcx, cx));
     }
     // Legacy attachment fallback text (`F-COLLAB-655`) when rich fields are all absent.
     let empty_rich = attachment.title.is_none()

@@ -219,6 +219,25 @@ impl CoreBridge {
         Some(fixtures::live(session, &store, counts))
     }
 
+    /// Synchronous single-page read of `channel`'s newest stored messages for cold-launch
+    /// frame-0 seeding (single indexed SQLite query, ~1–2ms). Returns empty offline.
+    pub fn history_sync(&self, channel: &ChannelId) -> Vec<Message> {
+        let Some(session) = self.session.as_ref() else {
+            return Vec::new();
+        };
+        let Some(store) = self.store.as_ref().and_then(|s| s.lock().ok()) else {
+            return Vec::new();
+        };
+        match store.channel_history(&session.team_id, channel, None, HISTORY_LIMIT) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| !row.deleted)
+                .map(|row| row.message)
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Live mode: a read of `channel`'s stored history (oldest first, without deleted
     /// messages) to run off the UI thread: the newest `HISTORY_LIMIT` messages, or the
     /// `HISTORY_LIMIT` before `before` when paging older on scroll-back. `None` offline.

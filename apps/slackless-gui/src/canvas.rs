@@ -11,8 +11,8 @@ use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Div, Entity, FontWeight, InteractiveElement as _, ParentElement as _, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
+    App, Div, Entity, FontWeight, InteractiveElement as _, ObjectFit, ParentElement as _, Stateful,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
 };
 
 /// One block of a canvas document, in reading order.
@@ -33,10 +33,12 @@ pub enum CanvasBlock {
         header: Vec<String>,
         rows: Vec<Vec<String>>,
     },
-    /// Embedded canvas image (`img[src]` with optional alt caption).
+    /// Embedded canvas image (`img[src]` with optional alt caption and reserved dimensions).
     Image {
         url: String,
         alt: String,
+        width: Option<u32>,
+        height: Option<u32>,
     },
     Divider,
 }
@@ -58,7 +60,7 @@ impl CanvasBlock {
             Self::Table { header, rows } => {
                 header.iter().any(|s| has(s)) || rows.iter().any(|r| r.iter().any(|s| has(s)))
             }
-            Self::Image { alt, url } => has(alt) || has(url),
+            Self::Image { alt, url, .. } => has(alt) || has(url),
             Self::Divider => false,
         }
     }
@@ -559,24 +561,41 @@ fn render_block(block: &CanvasBlock, cx: &App) -> Div {
                         .children(row.iter().map(|text| cell(text)))
                 }))
         }
-        CanvasBlock::Image { url, alt } => v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .overflow_hidden()
-                    .child(img(url.clone()).max_w(px(640.)).max_h(px(360.))),
-            )
-            .when(!alt.is_empty(), |col| {
-                col.child(
+        CanvasBlock::Image {
+            url,
+            alt,
+            width,
+            height,
+        } => {
+            let (box_w, box_h) = match (*width, *height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => {
+                    let scale = (640. / w as f32).min(360. / h as f32).min(1.);
+                    ((w as f32 * scale).max(64.), (h as f32 * scale).max(48.))
+                }
+                _ => (480., 270.),
+            };
+            v_flex()
+                .gap_1()
+                .child(
                     div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(alt.clone()),
+                        .w(px(box_w))
+                        .h(px(box_h))
+                        .rounded_md()
+                        .bg(theme.muted.opacity(0.3))
+                        .border_1()
+                        .border_color(theme.border)
+                        .overflow_hidden()
+                        .child(img(url.clone()).size_full().object_fit(ObjectFit::Contain)),
                 )
-            }),
+                .when(!alt.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(alt.clone()),
+                    )
+                })
+        }
         CanvasBlock::Divider => div().h(px(1.)).w_full().bg(theme.border),
     }
 }
@@ -614,9 +633,15 @@ pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
             if let Some(src) = extract_attr(trimmed, "src") {
                 if src.starts_with("https://") || src.starts_with("http://") {
                     let alt = extract_attr(trimmed, "alt").unwrap_or_default();
+                    let width = extract_attr(trimmed, "width")
+                        .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
+                    let height = extract_attr(trimmed, "height")
+                        .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
                     blocks.push(CanvasBlock::Image {
                         url: decode_entities(&src),
                         alt: clean_text(&alt),
+                        width,
+                        height,
                     });
                 }
             }
@@ -891,14 +916,19 @@ mod tests {
     fn parses_canvas_images_and_extracts_heading_outline() {
         let html = r#"<html><body>
             <h1>Launch Plan</h1>
-            <img src="https://files.slack.com/files-pri/T1-F1/arch.png" alt="Architecture diagram" />
+            <img src="https://files.slack.com/files-pri/T1-F1/arch.png" alt="Architecture diagram" width="800" height="400" />
             <h2>Milestones</h2>
             <h3>Risks</h3>
         </body></html>"#;
         let doc = CanvasDoc::from_html("Launch Plan".into(), html);
         assert!(doc.blocks.iter().any(|b| matches!(
             b,
-            CanvasBlock::Image { url, alt }
+            CanvasBlock::Image {
+                url,
+                alt,
+                width: Some(800),
+                height: Some(400),
+            }
                 if url == "https://files.slack.com/files-pri/T1-F1/arch.png"
                 && alt == "Architecture diagram"
         )));

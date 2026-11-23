@@ -142,12 +142,20 @@ const AVATAR_SIZE: f32 = 36.;
 const AVATAR_GAP: f32 = 12.;
 const TEXT_INSET: f32 = AVATAR_SIZE + AVATAR_GAP;
 
+/// Recently opened threads cached in memory so reopening a thread renders on frame 0.
+const THREAD_CACHE_MAX: usize = 16;
+
 pub struct ThreadPanel {
     fixtures: Arc<Fixtures>,
     /// `(channel, root ts)` of the open thread.
     thread: Option<(ChannelId, Ts)>,
     root: Option<Message>,
     replies: Vec<Message>,
+    /// True while waiting for the first SQLite/remote replies load on an uncached live thread.
+    loading: bool,
+    /// Bounded LRU cache of `(root, replies)` per `(channel, thread_ts)`.
+    cache: std::collections::HashMap<(ChannelId, Ts), (Option<Message>, Vec<Message>)>,
+    cache_lru: Vec<(ChannelId, Ts)>,
     /// Whether the "Replying in thread" hint above the composer shows (Reply in thread action).
     reply_hint: bool,
     /// Message currently edited in place; its WYSIWYG draft lives in `edit_composer`.
@@ -258,6 +266,9 @@ impl ThreadPanel {
                 thread: None,
                 root: None,
                 replies: Vec::new(),
+                loading: false,
+                cache: std::collections::HashMap::new(),
+                cache_lru: Vec::new(),
                 reply_hint: false,
                 editing: None,
                 edit_composer,
@@ -314,13 +325,40 @@ impl ThreadPanel {
             .update(cx, |composer, cx| composer.insert_emoji(choice, window, cx));
     }
 
-    pub fn open(&mut self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
-        self.root = self
+    fn cache_put(&mut self, key: (ChannelId, Ts), root: Option<Message>, replies: Vec<Message>) {
+        self.cache.insert(key.clone(), (root, replies));
+        self.cache_lru.retain(|k| k != &key);
+        self.cache_lru.push(key);
+        while self.cache_lru.len() > THREAD_CACHE_MAX {
+            let oldest = self.cache_lru.remove(0);
+            self.cache.remove(&oldest);
+        }
+    }
+
+    pub fn open(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        seed_root: Option<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (channel.clone(), thread_ts.clone());
+        let cached = self.cache.get(&key).cloned();
+        let fixture_root = self
             .fixtures
             .messages
             .get(&channel)
             .and_then(|history| history.iter().find(|m| m.ts == thread_ts))
             .cloned();
+        if let Some((cached_root, cached_replies)) = cached {
+            self.root = cached_root.or(seed_root).or(fixture_root);
+            self.replies = cached_replies;
+            self.loading = false;
+        } else {
+            self.root = seed_root.or(fixture_root);
+            self.replies = self.fixtures.threads.get(&key).cloned().unwrap_or_default();
+            self.loading = !self.fixtures.sample && self.replies.is_empty();
+        }
         let target =
             self.fixtures
                 .conversation(&channel)
@@ -333,8 +371,6 @@ impl ThreadPanel {
                 });
         self.composer
             .update(cx, |composer, cx| composer.set_also_send(target, cx));
-        let key = (channel, thread_ts);
-        self.replies = self.fixtures.threads.get(&key).cloned().unwrap_or_default();
         self.thread = Some(key);
         self.reply_hint = false;
         self.editing = None;
@@ -371,17 +407,26 @@ impl ThreadPanel {
         messages: Vec<Message>,
         cx: &mut Context<Self>,
     ) {
-        if self.thread.as_ref() != Some(&(channel, thread_ts.clone())) {
+        let key = (channel, thread_ts.clone());
+        if self.thread.as_ref() != Some(&key) {
             return;
         }
-        self.root = messages
+        let loaded_root = messages
             .first()
             .filter(|message| message.ts == thread_ts)
             .cloned();
-        self.replies = match self.root.is_some() {
+        let loaded_replies: Vec<Message> = match loaded_root.is_some() {
             true => messages.into_iter().skip(1).collect(),
             false => messages,
         };
+        if loaded_root.is_some() {
+            self.root = loaded_root;
+        }
+        if !loaded_replies.is_empty() || !self.loading {
+            self.replies = loaded_replies;
+        }
+        self.loading = false;
+        self.cache_put(key, self.root.clone(), self.replies.clone());
         cx.notify();
     }
 
@@ -1064,7 +1109,17 @@ impl Render for ThreadPanel {
                     1 => "1 reply".to_owned(),
                     n => format!("{n} replies"),
                 };
-                if !self.replies.is_empty() {
+                if self.loading && self.replies.is_empty() {
+                    rows.push(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Loading replies…")
+                            .into_any_element(),
+                    );
+                } else if !self.replies.is_empty() {
                     rows.push(
                         h_flex()
                             .items_center()

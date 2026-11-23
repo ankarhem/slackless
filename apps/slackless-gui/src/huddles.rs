@@ -53,6 +53,7 @@ pub enum HuddlesEvent {
 pub struct HuddlesView {
     fixtures: Arc<Fixtures>,
     huddles: Vec<RecentHuddle>,
+    loading: bool,
 }
 
 impl EventEmitter<HuddlesEvent> for HuddlesView {}
@@ -62,6 +63,7 @@ impl HuddlesView {
         cx.new(|_| HuddlesView {
             fixtures,
             huddles: Vec::new(),
+            loading: false,
         })
     }
 
@@ -71,8 +73,19 @@ impl HuddlesView {
         cx.notify();
     }
 
+    /// Live mode open: keep already-loaded rows visible while refreshing from SQLite, showing
+    /// a loading state only on the very first empty visit.
+    pub fn begin_live_load(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        if self.huddles.is_empty() {
+            self.loading = true;
+        }
+        cx.notify();
+    }
+
     /// Fixture mode: the bundled sample workspace's live huddle.
     pub fn show_local(&mut self, fixtures: &Fixtures, cx: &mut Context<Self>) {
+        self.loading = false;
         self.huddles = huddle::fixture(fixtures)
             .map(|huddle| RecentHuddle {
                 channel: huddle.channel,
@@ -87,6 +100,7 @@ impl HuddlesView {
 
     /// Live mode: the store scan's recent huddles.
     pub fn set_huddles(&mut self, huddles: Vec<RecentHuddle>, cx: &mut Context<Self>) {
+        self.loading = false;
         self.huddles = huddles;
         cx.notify();
     }
@@ -213,6 +227,7 @@ impl Render for HuddlesView {
                     .overflow_y_scroll()
                     .children(rows)
                     .when(self.huddles.is_empty(), |list| {
+                        let loading = self.loading;
                         list.child(
                             v_flex()
                                 .items_center()
@@ -225,12 +240,16 @@ impl Render for HuddlesView {
                                         .text_color(muted)
                                         .size(px(28.)),
                                 )
-                                .child("No recent huddles.")
-                                .child(
-                                    div().text_xs().child(
+                                .child(if loading {
+                                    "Loading huddles…"
+                                } else {
+                                    "No recent huddles."
+                                })
+                                .when(!loading, |col| {
+                                    col.child(div().text_xs().child(
                                         "Start one from a conversation's headphones button.",
-                                    ),
-                                ),
+                                    ))
+                                }),
                         )
                     }),
             )

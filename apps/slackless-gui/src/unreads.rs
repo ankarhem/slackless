@@ -252,6 +252,8 @@ impl UnreadsSort {
 pub struct UnreadsView {
     fixtures: Arc<Fixtures>,
     groups: Vec<UnreadGroup>,
+    /// True during the very first live store read before any groups have landed.
+    loading: bool,
     /// Conversations whose cards the user collapsed.
     collapsed: HashSet<ChannelId>,
     /// The keyboard-focused group (Up/Down move it, Left/Right fold it, Esc marks it read).
@@ -269,11 +271,22 @@ impl UnreadsView {
         cx.new(|_| UnreadsView {
             fixtures,
             groups: Vec::new(),
+            loading: false,
             collapsed: HashSet::new(),
             focused: None,
             sort: UnreadsSort::Recommended,
             replying: None,
         })
+    }
+
+    /// Live mode open/refresh: keep existing store-loaded groups visible while the background
+    /// SQLite read runs (no flash of empty `"Open conversation to load messages."` placeholders).
+    pub fn begin_live_refresh(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        if self.groups.is_empty() {
+            self.loading = true;
+        }
+        cx.notify();
     }
 
     /// Show `groups` (the fixture or snapshot derivation); call when the view opens or the
@@ -285,6 +298,7 @@ impl UnreadsView {
         cx: &mut Context<Self>,
     ) {
         self.fixtures = fixtures;
+        self.loading = false;
         self.set_groups(groups, cx);
     }
 
@@ -320,6 +334,7 @@ impl UnreadsView {
             }
         }
         merged.sort_by_key(|group| keep.iter().position(|channel| *channel == group.channel));
+        self.loading = false;
         self.set_groups(merged, cx);
     }
 
@@ -515,12 +530,20 @@ impl Render for UnreadsView {
             )
             .child(sort_menu);
 
+        let loading = self.loading;
         let body = if groups.is_empty() {
             v_flex()
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .child(
+                .child(if loading {
+                    v_flex()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("Loading unread messages…")
+                } else {
                     v_flex()
                         .items_center()
                         .gap_2()
@@ -540,8 +563,8 @@ impl Render for UnreadsView {
                                 .text_sm()
                                 .text_color(muted)
                                 .child("You're all caught up."),
-                        ),
-                )
+                        )
+                })
                 .into_any_element()
         } else {
             let replying = self.replying.clone();
