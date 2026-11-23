@@ -1850,7 +1850,7 @@ fn render_live_list(
                 );
             }
             panel = panel.child(render_record_comments_section(
-                &list_key, &rec.id, &state, cx,
+                &list_key, &rec.id, &state, fixtures, cx,
             ));
             panel
         });
@@ -2185,10 +2185,23 @@ fn render_live_list(
                                             .label("Share")
                                             .tooltip("Manage workspace access for this list")
                                             .dropdown_menu(move |menu, _, _| {
+                                                let sa_owner = set_access.clone();
                                                 let sa_read = set_access.clone();
                                                 let sa_write = set_access.clone();
                                                 let sa_none = set_access.clone();
                                                 menu.item(
+                                                    PopupMenuItem::new(
+                                                        "Workspace: Owner (full control)",
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        sa_owner(
+                                                            "owner".to_owned(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }),
+                                                )
+                                                .item(
                                                     PopupMenuItem::new("Workspace: Can edit")
                                                         .on_click(move |_, window, cx| {
                                                             sa_write(
@@ -2661,6 +2674,7 @@ fn render_record_comments_section(
     list_key: &str,
     record_id: &str,
     state: &ListPanelState,
+    fixtures: &Fixtures,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
@@ -2728,6 +2742,34 @@ fn render_record_comments_section(
 
     if let Some(input) = state.comment_input.clone() {
         let input_send = input.clone();
+        let draft_val = input.read(cx).value().to_string();
+        // Inline `@mention` autocomplete (`F-COLLAB-251`) when typing `@<query>` at the end.
+        let mention_matches: Vec<(String, String, slackless_core::types::UserId)> = draft_val
+            .rsplit_once('@')
+            .filter(|(before, token)| {
+                (before.is_empty()
+                    || before
+                        .chars()
+                        .last()
+                        .is_some_and(|c| c.is_whitespace() || c == '('))
+                    && !token.contains(char::is_whitespace)
+            })
+            .map(|(_, token)| {
+                let q = token.to_ascii_lowercase();
+                fixtures
+                    .users
+                    .iter()
+                    .filter(|u| !u.deleted && !u.is_bot)
+                    .filter(|u| {
+                        q.is_empty()
+                            || u.name.to_ascii_lowercase().contains(&q)
+                            || u.display_name().to_ascii_lowercase().contains(&q)
+                    })
+                    .take(5)
+                    .map(|u| (u.display_name().to_owned(), u.name.clone(), u.id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         section = section
             .child(
                 div()
@@ -2738,6 +2780,48 @@ fn render_record_comments_section(
                     .py_1()
                     .child(Textarea::new(&input).appearance(false).bordered(false)),
             )
+            .when(!mention_matches.is_empty(), |col| {
+                let mut picks = v_flex()
+                    .gap_0p5()
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover);
+                for (ix, (disp, handle, uid)) in mention_matches.into_iter().enumerate() {
+                    let input_pick = input.clone();
+                    let draft_base = draft_val.clone();
+                    let handle_insert = handle.clone();
+                    picks = picks.child(
+                        h_flex()
+                            .id(("list-comment-mention", ix))
+                            .items_center()
+                            .gap_1p5()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_xs()
+                            .hover(|el| el.bg(theme.accent))
+                            .child(crate::avatars::user_chip(fixtures, &uid, 18.))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(disp))
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("@{handle}")),
+                            )
+                            .on_click(move |_, window, cx| {
+                                let next = match draft_base.rsplit_once('@') {
+                                    Some((prefix, _)) => format!("{prefix}@{handle_insert} "),
+                                    None => format!("{draft_base}@{handle_insert} "),
+                                };
+                                input_pick.update(cx, |st, cx| st.set_value(next, window, cx));
+                                window.refresh();
+                            }),
+                    );
+                }
+                col.child(picks)
+            })
             .child(
                 h_flex().justify_end().child(
                     Button::new("list-item-comment-post")

@@ -17,15 +17,41 @@ use crate::avatars::user_chip;
 use crate::directory::{DirectoryEvent, DirectoryView};
 use crate::fixtures::Fixtures;
 
-/// People matching `needle` (name or title, case-insensitive), by name.
+/// People matching `needle` (name, title, pronouns, contact info, or custom profile fields;
+/// case-insensitive, `F-SHELL-005`), sorted by name.
 pub(super) fn people(fixtures: &Fixtures, needle: &str) -> Vec<UserId> {
     let mut people: Vec<UserId> = fixtures
         .users
         .iter()
         .filter(|user| {
+            if needle.is_empty() {
+                return true;
+            }
             let name = fixtures.user_name(&user.id).to_lowercase();
-            let title = user.profile.title.as_deref().unwrap_or_default();
-            needle.is_empty() || name.contains(needle) || title.to_lowercase().contains(needle)
+            if name.contains(needle) || user.name.to_lowercase().contains(needle) {
+                return true;
+            }
+            let profile_match = [
+                user.profile.title.as_deref(),
+                user.profile.pronouns.as_deref(),
+                user.profile.email.as_deref(),
+                user.profile.phone.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|v| v.to_lowercase().contains(needle));
+            if profile_match {
+                return true;
+            }
+            fixtures.profile_extras.get(&user.id).is_some_and(|extra| {
+                extra
+                    .pronouns
+                    .as_deref()
+                    .is_some_and(|p| p.to_lowercase().contains(needle))
+                    || extra.fields.iter().any(|(k, v)| {
+                        k.to_lowercase().contains(needle) || v.to_lowercase().contains(needle)
+                    })
+            })
         })
         .map(|user| user.id.clone())
         .collect();

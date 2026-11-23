@@ -1370,7 +1370,18 @@ fn org_row(
                 .child(format!("{members} members")),
         );
     if is_host {
-        row = row.child(div().text_xs().text_color(muted).child("Channel owner"));
+        row = row.child(
+            div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(muted.opacity(0.35))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(muted)
+                .child("Channel owner"),
+        );
     }
     if conversation.is_private {
         row = row.child(div().text_xs().text_color(muted).child("Private"));

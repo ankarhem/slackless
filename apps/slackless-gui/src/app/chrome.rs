@@ -1067,8 +1067,19 @@ impl App {
                 format!("{} from {from}", if people == 1 { "is" } else { "are" }),
             )
         };
+        let owner_suffix = channel_details::host_team(conversation)
+            .and_then(|host_id| {
+                self.fixtures
+                    .teams
+                    .iter()
+                    .chain(&self.fixtures.workspaces)
+                    .find(|t| t.id == host_id)
+                    .map(|t| t.name.clone())
+            })
+            .map(|name| format!(" \u{b7} Owned by {name}"))
+            .unwrap_or_default();
         teams.truncate(3);
-        Some((teams, count, rest))
+        Some((teams, count, format!("{rest}{owner_suffix}")))
     }
 
     /// Recompute [`Self::connect_orgs`] for the open conversation: only a Slack Connect

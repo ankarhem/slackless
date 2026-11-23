@@ -353,6 +353,8 @@ pub struct Settings {
     pub announce_incoming: bool,
     /// Hide extra chrome (workspace rail, decorative gradients) for a clean single-column feel (`F-SHELL-109`).
     pub simplified_layout: bool,
+    /// Enable translucent macOS window vibrancy tint (`F-SHELL-110`).
+    pub window_transparency: bool,
     // Mark as read
     pub mark_read: usize,
     pub confirm_mark_all: bool,
@@ -361,6 +363,8 @@ pub struct Settings {
     // Advanced
     pub confirm_unsend: bool,
     pub warn_external: bool,
+    /// Comma-separated URL schemes allowed without an explicit protocol warning (`F-SHELL-193`).
+    pub protocol_allowlist: String,
     pub launch_at_login: bool,
     /// Show a persistent menu-bar / tray icon with unread counts & quick actions (`F-SHELL-168`).
     pub show_menu_bar_icon: bool,
@@ -629,11 +633,13 @@ impl Default for Settings {
             reduce_motion: false,
             announce_incoming: false,
             simplified_layout: false,
+            window_transparency: false,
             mark_read: 0,
             confirm_mark_all: true,
             no_bg_mark_read: true,
             confirm_unsend: true,
             warn_external: true,
+            protocol_allowlist: "https, http, mailto, slack".to_owned(),
             launch_at_login: false,
             show_menu_bar_icon: true,
             close_to_tray: false,
@@ -744,6 +750,7 @@ pub struct Preferences {
     keywords: Entity<TextareaState>,
     vip_input: Entity<TextareaState>,
     excluded_channels: Entity<TextareaState>,
+    protocol_allowlist_input: Entity<TextareaState>,
     proxy_input: Entity<TextareaState>,
     custom_sidebar_hex: Entity<TextareaState>,
     custom_accent_hex: Entity<TextareaState>,
@@ -787,6 +794,13 @@ impl Preferences {
                     .placeholder("e.g. random, alerts, noisy-bot")
                     .auto_grow(1, 2);
                 state.set_value(settings.excluded_channels.clone(), window, cx);
+                state
+            });
+            let protocol_allowlist_input = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("https, http, mailto, slack")
+                    .auto_grow(1, 1);
+                state.set_value(settings.protocol_allowlist.clone(), window, cx);
                 state
             });
             let proxy_input = cx.new(|cx| {
@@ -847,6 +861,16 @@ impl Preferences {
                     },
                 ),
                 cx.subscribe_in(
+                    &protocol_allowlist_input,
+                    window,
+                    |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.protocol_allowlist = field.read(cx).value().to_string();
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
+                cx.subscribe_in(
                     &proxy_input,
                     window,
                     |this: &mut Preferences, field, event: &InputEvent, _, cx| {
@@ -864,6 +888,7 @@ impl Preferences {
                 keywords,
                 vip_input,
                 excluded_channels,
+                protocol_allowlist_input,
                 proxy_input,
                 custom_sidebar_hex,
                 custom_accent_hex,
@@ -904,6 +929,7 @@ impl Preferences {
         let keywords = settings.keywords.clone();
         let vip_users = settings.vip_users.clone();
         let excluded = settings.excluded_channels.clone();
+        let protocols = settings.protocol_allowlist.clone();
         let proxy = settings.proxy_url.clone();
         slackless_core::api::set_proxy_url(Some(proxy.clone()));
         slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
@@ -915,6 +941,8 @@ impl Preferences {
             .update(cx, |state, cx| state.set_value(vip_users, window, cx));
         self.excluded_channels
             .update(cx, |state, cx| state.set_value(excluded, window, cx));
+        self.protocol_allowlist_input
+            .update(cx, |state, cx| state.set_value(protocols, window, cx));
         self.proxy_input
             .update(cx, |state, cx| state.set_value(proxy, window, cx));
         if let Some((sb, ac)) = rgb_pair {
@@ -2250,6 +2278,12 @@ impl Preferences {
             cx,
         );
         let motion = self.checkbox("a11y-motion", "Reduce motion", |s| &mut s.reduce_motion, cx);
+        let transparency = self.checkbox(
+            "a11y-transparency",
+            "Translucent window background (macOS vibrancy)",
+            |s| &mut s.window_transparency,
+            cx,
+        );
         let announce = self.checkbox(
             "a11y-announce",
             "Read incoming messages aloud with a screen reader",
@@ -2271,7 +2305,8 @@ impl Preferences {
                         .gap_1()
                         .child(animate)
                         .child(underline)
-                        .child(motion),
+                        .child(motion)
+                        .child(transparency),
                     cx,
                 ),
             )
@@ -2502,6 +2537,19 @@ impl Preferences {
             |s| &mut s.ask_download_location,
             cx,
         );
+        let protocol_input = div()
+            .w(px(420.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(excluded_border)
+            .text_sm()
+            .child(
+                Textarea::new(&self.protocol_allowlist_input)
+                    .appearance(false)
+                    .bordered(false),
+            );
         let network_group = self.network_diagnostics_group(cx);
         v_flex()
             .child(self.group(
@@ -2524,7 +2572,11 @@ impl Preferences {
             .child(self.group(
                 "Other options",
                 None,
-                v_flex().gap_1().child(unsend).child(external),
+                v_flex()
+                    .gap_2()
+                    .child(unsend)
+                    .child(external)
+                    .child(self.labeled("Allowed URL protocols (comma-separated)", protocol_input)),
                 cx,
             ))
             .child(self.group("Open links in", None, links, cx))

@@ -141,7 +141,8 @@ impl App {
         }
     }
 
-    /// Open an external browser URL, prompting first when `Settings.warn_external` is enabled
+    /// Open an external browser URL, prompting first when the URL scheme is outside
+    /// `Settings.protocol_allowlist` (`F-SHELL-193`) or when `Settings.warn_external` is enabled
     /// and the URL looks suspicious (non-HTTPS, punycode `xn--`, credential `@`, or IP host).
     pub(super) fn open_external_url(
         &mut self,
@@ -149,50 +150,54 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let warn = self.preferences.read(cx).settings().warn_external && is_suspicious_url(url);
+        let settings = self.preferences.read(cx).settings();
+        let blocked_scheme = !is_protocol_allowed(url, &settings.protocol_allowlist);
+        let warn = blocked_scheme || (settings.warn_external && is_suspicious_url(url));
         if !warn {
             cx.open_url(url);
             return;
         }
         let target = url.to_owned();
+        let prompt_msg = if blocked_scheme {
+            "This link uses a URL protocol outside your allowed protocol list (Preferences \u{2192} Advanced). Verify the destination before opening it:"
+        } else {
+            "This link uses an unencrypted or unusual address. Verify the destination before opening it:"
+        };
         window.open_dialog(cx, move |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
             let open_target = target.clone();
-            dialog
-                .title("Open external link?")
-                .w(px(460.))
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(div().text_sm().text_color(muted).child(
-                            "This link uses an unencrypted or unusual address. Verify the destination before opening it:",
-                        ))
-                        .child(
-                            div()
-                                .p_2()
-                                .rounded_md()
-                                .bg(cx.theme().secondary)
-                                .text_xs()
-                                .child(target.clone()),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(Button::new("ext-url-cancel").label("Cancel").on_click(
-                                    |_, window, cx| window.close_dialog(cx),
-                                ))
-                                .child(
-                                    Button::new("ext-url-open")
-                                        .primary()
-                                        .label("Open link")
-                                        .on_click(move |_, window, cx| {
-                                            window.close_dialog(cx);
-                                            cx.open_url(&open_target);
-                                        }),
-                                ),
-                        ),
-                )
+            dialog.title("Open external link?").w(px(460.)).child(
+                v_flex()
+                    .gap_3()
+                    .child(div().text_sm().text_color(muted).child(prompt_msg))
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded_md()
+                            .bg(cx.theme().secondary)
+                            .text_xs()
+                            .child(target.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("ext-url-cancel")
+                                    .label("Cancel")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                Button::new("ext-url-open")
+                                    .primary()
+                                    .label("Open link")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        cx.open_url(&open_target);
+                                    }),
+                            ),
+                    ),
+            )
         });
     }
 
@@ -2452,6 +2457,22 @@ impl App {
             .is_some_and(|(channel, _)| *channel == self.channel)
             || self.ws.active_huddles.contains_key(&self.channel)
     }
+}
+
+/// Whether `url`'s scheme is permitted by the comma-separated `allowlist` (`F-SHELL-193`).
+pub(super) fn is_protocol_allowed(url: &str, allowlist: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.trim().to_ascii_lowercase();
+    if scheme.is_empty() {
+        return false;
+    }
+    allowlist
+        .split([',', ' ', ';'])
+        .map(|s| s.trim().trim_end_matches(':').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .any(|allowed| allowed == scheme)
 }
 
 /// Whether `url` is a Slack Workflow Builder link trigger (`https://slack.com/shortcuts/Ft...`,
