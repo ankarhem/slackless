@@ -28,7 +28,8 @@ impl App {
         let seed_root = self
             .messages
             .read(cx)
-            .message_by_ts(&channel, &thread_ts, cx);
+            .message_by_ts(&channel, &thread_ts, cx)
+            .or_else(|| self.unreads.read(cx).message_by_ts(&channel, &thread_ts));
         self.thread.update(cx, |panel, cx| {
             panel.open(channel.clone(), thread_ts.clone(), seed_root, cx)
         });
@@ -38,6 +39,9 @@ impl App {
         self.load_thread(&channel, &thread_ts, cx);
         self.messages.update(cx, |list, cx| {
             list.set_open_thread(Some(thread_ts.clone()), cx)
+        });
+        self.unreads.update(cx, |unreads, cx| {
+            unreads.set_open_thread(Some((channel.clone(), thread_ts.clone())), cx)
         });
         self.bridge.send(Command::OpenThread { channel, thread_ts });
         self.thread_open = true;
@@ -55,6 +59,8 @@ impl App {
         self.thread_open = false;
         self.messages
             .update(cx, |list, cx| list.set_open_thread(None, cx));
+        self.unreads
+            .update(cx, |unreads, cx| unreads.set_open_thread(None, cx));
     }
 
     pub(super) fn toggle_pins(&mut self, cx: &mut Context<Self>) {

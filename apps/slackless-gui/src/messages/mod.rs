@@ -1567,105 +1567,19 @@ fn transcript_row(
             Some(&handler),
             cx,
         ));
-        if let Some(reply_count) = message.reply_count.filter(|&count| count > 0) {
-            let reply = handler.clone();
-            // Slack's thread summary (`.c-message__reply_bar`): the repliers' faces and the
-            // reply count, 4px under the message. Hovering the message raises it into a card
-            // (white, 13% foreground ring) with "Last reply …" and a chevron; hovering the
-            // bar itself swaps that line for "View thread".
-            let faces = message
-                .reply_users
-                .iter()
-                .take(4)
-                .map(|user| crate::avatars::user_chip(fixtures, user, 24.));
-            let label = if reply_count == 1 {
-                "1 reply".to_owned()
-            } else {
-                format!("{reply_count} replies")
-            };
-            let last_reply = message
-                .latest_reply
-                .as_ref()
-                .and_then(|ts| ts.secs())
-                .map(|secs| format!("Last reply {}", crate::image_viewer::relative_stamp(secs)));
-            let theme = cx.theme();
-            let (surface, edge, muted, link) = (
-                theme.background,
-                theme.foreground.opacity(0.13),
-                theme.muted_foreground,
-                theme.link,
-            );
-            body = body.child(
-                h_flex()
-                    .id(SharedString::from(format!(
-                        "thread-{}",
-                        message.ts.as_str()
-                    )))
-                    .group("reply-bar")
-                    .max_w(px(600.))
-                    .h(px(34.))
-                    // 4px under the message; under reaction pills Slack pulls the bar up into
-                    // the space their row keeps below them, leaving the same 4px.
-                    .mt(if message.reactions.is_empty() {
-                        px(4.)
-                    } else {
-                        px(4.) - actions::REACTIONS_BOTTOM
-                    })
-                    .ml(px(-5.))
-                    .p_1()
-                    .gap_1()
-                    .items_center()
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(edge.opacity(0.))
-                    .text_size(px(13.))
-                    .cursor_pointer()
-                    .group_hover("msg", |bar| bar.bg(surface).border_color(edge))
-                    .children(faces)
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(link)
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .min_w_0()
-                            .ml_1()
-                            .text_color(muted)
-                            .whitespace_nowrap()
-                            .opacity(0.)
-                            .group_hover("msg", |line| line.opacity(1.))
-                            .children(last_reply.map(|last| {
-                                div()
-                                    .group_hover("reply-bar", |line| line.opacity(0.))
-                                    .child(last)
-                            }))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .opacity(0.)
-                                    .group_hover("reply-bar", |line| line.opacity(1.))
-                                    .child("View thread"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .ml_auto()
-                            .opacity(0.)
-                            .group_hover("msg", |arrow| arrow.opacity(1.))
-                            .child(
-                                Icon::new(IconName::ChevronRight)
-                                    .size(px(16.))
-                                    .text_color(muted),
-                            ),
-                    )
-                    .on_click(move |_, window, cx| reply(MessageAction::ReplyInThread, window, cx)),
-            );
+        if let Some(bar) = reply_bar(
+            fixtures,
+            message,
+            SharedString::from(format!("thread-{}", message.ts.as_str())),
+            "msg".into(),
+            "reply-bar".into(),
+            {
+                let reply = handler.clone();
+                move |window, cx| reply(MessageAction::ReplyInThread, window, cx)
+            },
+            cx,
+        ) {
+            body = body.child(bar);
         }
     }
 
@@ -1796,6 +1710,125 @@ fn transcript_row(
             )
         });
     row.child(card)
+}
+
+/// Slack's thread summary bar (`.c-message__reply_bar`): the repliers' 24px faces and bold
+/// link reply count, 4px under the message. Hovering the enclosing message row (`row_group`)
+/// raises it into a card (`surface`, 13% foreground ring) with `"Last reply …"` and a right
+/// chevron; hovering the bar itself (`reply_group`) swaps that line for `"View thread"`.
+/// Shared between [`MessageList`] and [`crate::unreads::UnreadsView`] so thread replies render
+/// identically everywhere.
+pub(crate) fn reply_bar(
+    fixtures: &Fixtures,
+    message: &Message,
+    id: impl Into<gpui_kit::gpui::ElementId>,
+    row_group: SharedString,
+    reply_group: SharedString,
+    on_open: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Option<gpui_kit::gpui::Stateful<Div>> {
+    let reply_count = message.reply_count.filter(|&count| count > 0)?;
+    let faces = message
+        .reply_users
+        .iter()
+        .take(4)
+        .map(|user| crate::avatars::user_chip(fixtures, user, 24.));
+    let label = if reply_count == 1 {
+        "1 reply".to_owned()
+    } else {
+        format!("{reply_count} replies")
+    };
+    let last_reply = message
+        .latest_reply
+        .as_ref()
+        .and_then(|ts| ts.secs())
+        .map(|secs| format!("Last reply {}", crate::image_viewer::relative_stamp(secs)));
+    let theme = cx.theme();
+    let (surface, edge, muted, link) = (
+        theme.background,
+        theme.foreground.opacity(0.13),
+        theme.muted_foreground,
+        theme.link,
+    );
+    let hover_meta = match last_reply {
+        Some(last) => div()
+            .relative()
+            .min_w_0()
+            .ml_1()
+            .text_color(muted)
+            .whitespace_nowrap()
+            .opacity(0.)
+            .group_hover(row_group.clone(), |line| line.opacity(1.))
+            .child(
+                div()
+                    .group_hover(reply_group.clone(), |line| line.opacity(0.))
+                    .child(last),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .opacity(0.)
+                    .group_hover(reply_group.clone(), |line| line.opacity(1.))
+                    .child("View thread"),
+            ),
+        None => div()
+            .min_w_0()
+            .ml_1()
+            .text_color(muted)
+            .whitespace_nowrap()
+            .opacity(0.)
+            .group_hover(row_group.clone(), |line| line.opacity(1.))
+            .child("View thread"),
+    };
+    Some(
+        h_flex()
+            .id(id.into())
+            .group(reply_group)
+            .max_w(px(600.))
+            .h(px(34.))
+            // 4px under the message; under reaction pills Slack pulls the bar up into
+            // the space their row keeps below them, leaving the same 4px.
+            .mt(if message.reactions.is_empty() {
+                px(4.)
+            } else {
+                px(4.) - actions::REACTIONS_BOTTOM
+            })
+            .ml(px(-5.))
+            .p_1()
+            .gap_1()
+            .items_center()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(edge.opacity(0.))
+            .text_size(px(13.))
+            .cursor_pointer()
+            .group_hover(row_group.clone(), move |bar| {
+                bar.bg(surface).border_color(edge)
+            })
+            .children(faces)
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(link)
+                    .child(label),
+            )
+            .child(hover_meta)
+            .child(
+                div()
+                    .ml_auto()
+                    .opacity(0.)
+                    .group_hover(row_group, |arrow| arrow.opacity(1.))
+                    .child(
+                        Icon::new(IconName::ChevronRight)
+                            .size(px(16.))
+                            .text_color(muted),
+                    ),
+            )
+            .on_click(move |_, window, cx| on_open(window, cx)),
+    )
 }
 
 /// Two consecutive messages group into one card when they share an author, land on the same

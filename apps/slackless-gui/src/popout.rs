@@ -335,34 +335,47 @@ impl Render for PopoutWindow {
             &self.kind,
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
         );
-        let header = h_flex()
-            .flex_none()
+        let header = TitleBar::new()
             .h(px(40.))
-            .pl(px(76.))
-            .pr_3()
-            .items_center()
-            .justify_between()
+            .bg(bg)
             .border_b_1()
             .border_color(border)
             .child(
                 h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .pr_3()
                     .items_center()
-                    .gap_2()
+                    .justify_between()
                     .child(
-                        div()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(fg)
-                            .child(self.title.clone()),
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(fg)
+                                    .child(self.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(kind_label),
+                            ),
                     )
-                    .child(div().text_xs().text_color(muted).child(kind_label)),
-            )
-            .child(
-                Button::new("popout-refresh")
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .icon(IconName::RefreshCw)
-                    .tooltip("Refresh")
-                    .on_click(cx.listener(|this, _, _, cx| this.reload_from_store(cx))),
+                    .child(
+                        Button::new("popout-refresh")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::RefreshCw)
+                            .tooltip("Refresh")
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_from_store(cx))),
+                    ),
             );
         let body = match &self.kind {
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {

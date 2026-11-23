@@ -1437,7 +1437,6 @@ impl App {
                     window,
                     |this: &mut App, _, event: &ThreadsEvent, window, cx| match event {
                         ThreadsEvent::Open { channel, thread_ts } => {
-                            this.threads_open = false;
                             this.select(channel.clone(), cx);
                             this.open_thread(channel.clone(), thread_ts.clone(), cx);
                         }
@@ -1518,12 +1517,9 @@ impl App {
                     window,
                     |this: &mut App, _, event: &UnreadsEvent, window, cx| match event {
                         UnreadsEvent::OpenConversation(channel) => {
-                            this.unreads_open = false;
                             this.select(channel.clone(), cx);
                         }
                         UnreadsEvent::OpenThread { channel, thread_ts } => {
-                            this.unreads_open = false;
-                            this.select(channel.clone(), cx);
                             this.open_thread(channel.clone(), thread_ts.clone(), cx);
                         }
                         UnreadsEvent::OpenLink(target) => {
@@ -1653,13 +1649,11 @@ impl App {
                     window,
                     |this: &mut App, _, event: &HuddlesEvent, _, cx| match event {
                         HuddlesEvent::Open(channel) => {
-                            this.huddles_open = false;
                             this.select(channel.clone(), cx);
                             this.huddle_open = this.huddle_here();
                             cx.notify();
                         }
                         HuddlesEvent::OpenThread(channel, ts) => {
-                            this.huddles_open = false;
                             this.select(channel.clone(), cx);
                             this.open_thread(channel.clone(), ts.clone(), cx);
                             cx.notify();

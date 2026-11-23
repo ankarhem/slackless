@@ -653,4 +653,69 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
         });
         let _ = window.draw(cx);
     });
+
+    // 4. Opening a thread from All Unreads opens the right-hand ThreadPanel WITHOUT
+    //    leaving Unreads, AND navigating from Unreads records Unreads in Back history.
+    let (unreads_entity, eng_thread_ts) = cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.show_unreads(window, cx);
+            assert!(app.unreads_open);
+            let ts = app
+                .fixtures
+                .messages
+                .get(&ChannelId::from("C0ENG"))
+                .and_then(|msgs| msgs.iter().find(|m| m.reply_count.unwrap_or(0) > 0))
+                .map(|m| m.ts.clone())
+                .expect("engineering has a thread root");
+            (app.unreads.clone(), ts)
+        })
+    });
+    cx.update(|_, cx| {
+        unreads_entity.update(cx, |_, cx| {
+            cx.emit(UnreadsEvent::OpenThread {
+                channel: ChannelId::from("C0ENG"),
+                thread_ts: eng_thread_ts.clone(),
+            });
+        });
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+        app.read_with(cx, |app, cx| {
+            assert!(
+                app.unreads_open,
+                "clicking replies in Unreads must keep the Unreads panel open"
+            );
+            assert!(
+                app.thread_open,
+                "clicking replies in Unreads must open the right-hand thread panel"
+            );
+            assert_eq!(
+                app.thread.read(cx).open_thread(),
+                Some((ChannelId::from("C0ENG"), eng_thread_ts)),
+            );
+        });
+    });
+
+    // Navigating to a conversation from Unreads must push `NavPlace::Unreads` onto Back.
+    cx.update(|_, cx| {
+        unreads_entity.update(cx, |_, cx| {
+            cx.emit(UnreadsEvent::OpenConversation(ChannelId::from("C0ENG")));
+        });
+    });
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            assert!(!app.unreads_open);
+            assert_eq!(
+                app.current_place(cx),
+                NavPlace::Channel(ChannelId::from("C0ENG"))
+            );
+            app.go_back(window, cx);
+            assert!(
+                app.unreads_open,
+                "Back button after navigating from Unreads must return to Unreads"
+            );
+            assert_eq!(app.current_place(cx), NavPlace::Unreads);
+        });
+        let _ = window.draw(cx);
+    });
 }

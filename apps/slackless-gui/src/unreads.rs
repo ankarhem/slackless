@@ -38,9 +38,11 @@ use slackless_core::NotifyLevel;
 use slackless_core::store::Store;
 use slackless_core::types::{ChannelId, ConversationKind, Message, TeamId, Ts};
 
-use crate::avatars::{conversation_avatar, user_chip};
+use crate::avatars::conversation_avatar;
 use crate::fixtures::Fixtures;
-use crate::messages::{LinkHandler, LinkTarget, day_label, message_row_linked, same_group};
+use crate::messages::{
+    LinkHandler, LinkTarget, day_label, message_row_linked, reply_bar, same_group,
+};
 use crate::sidebar::mentions_user;
 
 /// Channel-level rows scanned per conversation in live mode; beyond it the conversation is
@@ -262,6 +264,8 @@ pub struct UnreadsView {
     sort: UnreadsSort,
     /// Active inline reply composer on one unread card (`F-CORE-031`).
     replying: Option<(ChannelId, Entity<TextareaState>)>,
+    /// Thread currently open in the right-hand panel so its root row carries Slack's tint.
+    open_thread: Option<(ChannelId, Ts)>,
 }
 
 impl EventEmitter<UnreadsEvent> for UnreadsView {}
@@ -276,7 +280,26 @@ impl UnreadsView {
             focused: None,
             sort: UnreadsSort::Recommended,
             replying: None,
+            open_thread: None,
         })
+    }
+
+    /// Look up one unread message by `(channel, ts)` (seeds the right-hand thread panel when a
+    /// thread is opened directly from All Unreads).
+    pub fn message_by_ts(&self, channel: &ChannelId, ts: &Ts) -> Option<Message> {
+        self.groups
+            .iter()
+            .find(|group| group.channel == *channel)
+            .and_then(|group| group.messages.iter().find(|msg| msg.ts == *ts))
+            .cloned()
+    }
+
+    /// Highlight the unread row whose thread is currently open in the right-hand panel.
+    pub fn set_open_thread(&mut self, open: Option<(ChannelId, Ts)>, cx: &mut Context<Self>) {
+        if self.open_thread != open {
+            self.open_thread = open;
+            cx.notify();
+        }
     }
 
     /// Live mode open/refresh: keep existing store-loaded groups visible while the background
@@ -419,9 +442,8 @@ impl UnreadsView {
         }
     }
 
-    /// Collapse or expand group `ix` (its chevron), focusing it as a click does.
+    /// Collapse or expand group `ix` (its chevron) without triggering keyboard-focus styling.
     fn toggle(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.focused = Some(ix);
         if let Some(group) = self.groups.get(ix) {
             let channel = group.channel.clone();
             if !self.collapsed.remove(&channel) {
@@ -568,6 +590,7 @@ impl Render for UnreadsView {
                 .into_any_element()
         } else {
             let replying = self.replying.clone();
+            let open_thread = self.open_thread.clone();
             div()
                 .id("unreads-scroll")
                 .flex_1()
@@ -591,6 +614,7 @@ impl Render for UnreadsView {
                                 focused == Some(ix),
                                 show_esc_hint,
                                 reply_input,
+                                open_thread.as_ref(),
                                 background,
                                 cx,
                             )
@@ -631,6 +655,7 @@ fn card_view(
     focused: bool,
     show_esc_hint: bool,
     reply_input: Option<Entity<TextareaState>>,
+    open_thread: Option<&(ChannelId, Ts)>,
     background: Hsla,
     cx: &mut Context<UnreadsView>,
 ) -> AnyElement {
@@ -683,6 +708,7 @@ fn card_view(
     });
 
     let header = h_flex()
+        .relative()
         .flex_none()
         .group(SharedString::from(format!("unreads-hdr-{ix}")))
         .h(px(44.))
@@ -694,7 +720,17 @@ fn card_view(
         .border_b_1()
         .when(ix > 0, |header| header.border_t_1())
         .border_color(border)
-        .when(focused, |header| header.border_l_2().border_color(link))
+        .when(focused, |header| {
+            header.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(link),
+            )
+        })
         .child(
             h_flex()
                 .min_w_0()
@@ -834,9 +870,12 @@ fn card_view(
         // The section's rows share one link handler: @mentions (and their hover cards),
         // #channels and URLs route out as the view's own event.
         let view = cx.entity();
+        let view_for_links = view.clone();
         let links: LinkHandler = Rc::new(move |target, _window, cx| {
-            view.update(cx, |_, cx| cx.emit(UnreadsEvent::OpenLink(target.clone())));
+            view_for_links.update(cx, |_, cx| cx.emit(UnreadsEvent::OpenLink(target.clone())));
         });
+        let hover_bg = cx.theme().secondary.opacity(0.5);
+        let thread_bg = crate::theme::thread_root(cx);
         let mut rows: Vec<AnyElement> = Vec::with_capacity(group.messages.len());
         let mut prev_day: Option<String> = None;
         let mut prev_msg: Option<&Message> = None;
@@ -851,56 +890,49 @@ fn card_view(
                     unreads_date_divider(day.clone(), border, background, cx).into_any_element(),
                 );
             }
+            let msg_group = SharedString::from(format!("unreads-{ix}-msg-{m_ix}"));
             let grouped = (!date_break)
                 .then(|| prev_msg.filter(|prev| same_group(prev, message)))
                 .flatten()
-                .map(|_| SharedString::from(format!("unreads-{ix}-msg-{m_ix}")));
-            let mut item = v_flex().px_5().child(message_row_linked(
+                .map(|_| msg_group.clone());
+            let is_open_thread =
+                open_thread.is_some_and(|(ch, ts)| *ch == group.channel && *ts == message.ts);
+            let mut item = v_flex()
+                .group(msg_group.clone())
+                .px_5()
+                .py_0p5()
+                .when(is_open_thread, |row| row.bg(thread_bg))
+                .when(!is_open_thread, |row| row.hover(move |r| r.bg(hover_bg)))
+                .child(message_row_linked(
+                    fixtures,
+                    message,
+                    None,
+                    Some(&links),
+                    grouped,
+                    cx,
+                ));
+            let ch = group.channel.clone();
+            let ts = message.ts.clone();
+            let view_for_thread = view.clone();
+            let reply_group = SharedString::from(format!("unreads-{ix}-reply-{m_ix}"));
+            if let Some(bar) = reply_bar(
                 fixtures,
                 message,
-                None,
-                Some(&links),
-                grouped,
+                ("unreads-thread-chip", ix * 1000 + m_ix),
+                msg_group,
+                reply_group,
+                move |_, cx| {
+                    view_for_thread.update(cx, |_, cx| {
+                        cx.emit(UnreadsEvent::OpenThread {
+                            channel: ch.clone(),
+                            thread_ts: ts.clone(),
+                        });
+                    });
+                },
                 cx,
-            ));
-            if let Some(reply_count) = message.reply_count.filter(|&c| c > 0) {
-                let faces: Vec<_> = message
-                    .reply_users
-                    .iter()
-                    .take(4)
-                    .map(|u| user_chip(fixtures, u, 20.))
-                    .collect();
-                let reply_label = if reply_count == 1 {
-                    "1 reply".to_owned()
-                } else {
-                    format!("{reply_count} replies")
-                };
-                let ch = group.channel.clone();
-                let ts = message.ts.clone();
-                item = item.child(
-                    h_flex()
-                        .id(("unreads-thread-chip", ix * 1000 + m_ix))
-                        .pl(px(44.))
-                        .pt_1()
-                        .items_center()
-                        .gap_1p5()
-                        .cursor_pointer()
-                        .children(faces)
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(link)
-                                .hover(|el| el.underline())
-                                .child(reply_label),
-                        )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(UnreadsEvent::OpenThread {
-                                channel: ch.clone(),
-                                thread_ts: ts.clone(),
-                            });
-                        })),
-                );
+            ) {
+                // Align flush with `message_row_linked`'s body (36px avatar + 12px gap).
+                item = item.child(div().pl(px(48.)).child(bar));
             }
             rows.push(item.into_any_element());
             prev_day = Some(day);

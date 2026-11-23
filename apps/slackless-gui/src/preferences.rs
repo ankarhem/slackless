@@ -1950,25 +1950,25 @@ struct PreferencesWindow {
 
 impl Render for PreferencesWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::TitleBar;
         let theme = cx.theme();
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
-                h_flex()
-                    .flex_none()
+                TitleBar::new()
                     .h(px(38.))
-                    .pl(px(76.))
-                    .pr_4()
-                    .items_center()
+                    .bg(theme.background)
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Preferences"),
+                        h_flex().flex_1().h_full().pr_4().items_center().child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .child("Preferences"),
+                        ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.preferences.clone()))
