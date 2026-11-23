@@ -65,8 +65,10 @@ impl App {
             }
         }
         let enter_sends = settings.enter_sends;
+        let format_markup = settings.format_markup;
         self.composer.update(cx, |composer, cx| {
             composer.set_enter_sends(enter_sends, cx);
+            composer.set_format_markup(format_markup, cx);
             composer.set_spellcheck(settings.spellcheck, settings.spellcheck_language(), cx);
         });
         self.messages
@@ -98,6 +100,7 @@ impl App {
             show_files: settings.show_files,
             show_later: settings.show_later,
             icons_only: settings.tab_style == 1,
+            order: settings.nav_order,
         };
         let home_prefs = crate::sidebar::HomePrefs {
             show: settings.show,
@@ -106,6 +109,7 @@ impl App {
             separate_private: settings.separate_private,
             profile_photos: settings.profile_photos,
             compact: settings.sidebar_compact,
+            show_muted: settings.show_muted_channels,
         };
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_nav_prefs(nav_prefs, cx);

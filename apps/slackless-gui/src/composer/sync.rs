@@ -305,6 +305,7 @@ impl Composer {
             doc,
             &selection,
             self.was_focused,
+            self.format_markup,
             palette,
             &self.misspellings,
         );
@@ -347,6 +348,7 @@ impl Composer {
             doc,
             &selection,
             self.was_focused,
+            self.format_markup,
             palette,
             &self.misspellings,
         );
@@ -370,6 +372,7 @@ impl Composer {
             doc,
             &selection,
             self.was_focused,
+            self.format_markup,
             palette,
             &self.misspellings,
         );

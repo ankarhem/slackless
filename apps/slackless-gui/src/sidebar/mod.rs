@@ -164,7 +164,7 @@ pub enum SidebarEvent {
 }
 
 /// The nav destinations stacked in the workspace rail.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum NavItem {
     Home,
     Dms,
@@ -199,17 +199,6 @@ impl NavItem {
             NavItem::Admin => IconName::Settings,
         }
     }
-
-    /// Every rail destination, top to bottom.
-    const ALL: [NavItem; 7] = [
-        NavItem::Home,
-        NavItem::Dms,
-        NavItem::Activity,
-        NavItem::Files,
-        NavItem::Todos,
-        NavItem::Agents,
-        NavItem::Admin,
-    ];
 }
 
 /// Which Home sidebar shortcut page currently owns the main column (`None` = a conversation).
@@ -223,7 +212,7 @@ pub enum HomePage {
     Directories,
 }
 
-/// Navigation rail visibility and label style driven by Preferences -> Navigation (`F-SHELL-062`).
+/// Navigation rail visibility, order, and label style driven by Preferences -> Navigation (`F-CORE-013`, `F-CORE-014`, `F-SHELL-062`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NavPrefs {
     pub show_home: bool,
@@ -232,6 +221,8 @@ pub struct NavPrefs {
     pub show_files: bool,
     pub show_later: bool,
     pub icons_only: bool,
+    /// Display order of the 5 configurable tabs (`0=Home, 1=DMs, 2=Activity, 3=Files, 4=Later`).
+    pub order: [usize; 5],
 }
 
 impl Default for NavPrefs {
@@ -243,11 +234,20 @@ impl Default for NavPrefs {
             show_files: true,
             show_later: true,
             icons_only: false,
+            order: [0, 1, 2, 3, 4],
         }
     }
 }
 
 impl NavPrefs {
+    const CONFIGURABLE: [NavItem; 5] = [
+        NavItem::Home,
+        NavItem::Dms,
+        NavItem::Activity,
+        NavItem::Files,
+        NavItem::Todos,
+    ];
+
     fn shows(self, item: NavItem) -> bool {
         match item {
             NavItem::Home => self.show_home,
@@ -258,9 +258,28 @@ impl NavPrefs {
             NavItem::Agents | NavItem::Admin => true,
         }
     }
+
+    pub(super) fn ordered_items(self) -> Vec<NavItem> {
+        let mut items = Vec::with_capacity(7);
+        for &idx in &self.order {
+            if let Some(&item) = Self::CONFIGURABLE.get(idx) {
+                if !items.contains(&item) {
+                    items.push(item);
+                }
+            }
+        }
+        for item in Self::CONFIGURABLE {
+            if !items.contains(&item) {
+                items.push(item);
+            }
+        }
+        items.push(NavItem::Agents);
+        items.push(NavItem::Admin);
+        items
+    }
 }
 
-/// Home sidebar display preferences driven by Preferences -> Home (`F-CORE-024`, `F-SHELL-066`, `F-SHELL-072`).
+/// Home sidebar display preferences driven by Preferences -> Home (`F-CORE-022`, `F-CORE-024`, `F-SHELL-066`, `F-SHELL-072`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HomePrefs {
     pub show: usize,
@@ -269,6 +288,7 @@ pub struct HomePrefs {
     pub separate_private: bool,
     pub profile_photos: bool,
     pub compact: bool,
+    pub show_muted: bool,
 }
 
 impl Default for HomePrefs {
@@ -280,6 +300,7 @@ impl Default for HomePrefs {
             separate_private: false,
             profile_photos: true,
             compact: false,
+            show_muted: false,
         }
     }
 }
@@ -355,6 +376,8 @@ pub struct Sidebar {
     /// locally this session, seeded from the fixtures on first change (`None`: pristine).
     /// Live sections arrive via the store and never touch this.
     pub(super) local_sections: Option<Vec<ChannelSection>>,
+    /// Locally starred conversations when the workspace has no server `SectionKind::Stars` (`F-CORE-019`).
+    pub(super) local_starred: HashSet<ChannelId>,
     /// Fixture mode's notification-level overrides (a live write lands through the store's
     /// prefs on the next snapshot).
     pub(super) notify_override: HashMap<ChannelId, NotifyLevel>,
@@ -486,6 +509,7 @@ impl Sidebar {
                 section_filters: HashMap::new(),
                 section_sorts: HashMap::new(),
                 local_sections: None,
+                local_starred: HashSet::new(),
                 notify_override: HashMap::new(),
                 rows: RefCell::default(),
 
@@ -861,6 +885,67 @@ impl Sidebar {
         cx.emit(SidebarEvent::MoveChannel { channel, from, to });
     }
 
+    /// Whether `channel` is currently starred (either in the server `Stars` section or in
+    /// the local starred set, `F-CORE-019`).
+    pub(crate) fn is_starred(&self, channel: &ChannelId) -> bool {
+        if self.local_starred.contains(channel) {
+            return true;
+        }
+        self.section_set().iter().any(|section| {
+            section.kind == SectionKind::Stars && section.channel_ids.contains(channel)
+        })
+    }
+
+    /// Star or unstar `channel` (`F-CORE-019`). Uses Slack's `Stars` channel section when
+    /// present on the workspace, otherwise toggles the local Starred section at the top of Home.
+    pub(crate) fn toggle_star(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        let sections = self.section_set();
+        let stars_section = sections
+            .iter()
+            .find(|section| section.kind == SectionKind::Stars);
+        if let Some(stars) = stars_section {
+            let currently_in_stars = stars.channel_ids.contains(&channel);
+            let stars_id = stars.id.clone();
+            if self.fixtures.sample {
+                let mut updated = sections;
+                if let Some(target) = updated.iter_mut().find(|s| s.id == stars_id) {
+                    if currently_in_stars {
+                        target.channel_ids.retain(|id| *id != channel);
+                    } else {
+                        target.channel_ids.push(channel.clone());
+                    }
+                }
+                self.local_sections = Some(updated);
+                cx.notify();
+            } else if currently_in_stars {
+                self.local_starred.remove(&channel);
+                cx.emit(SidebarEvent::MoveChannel {
+                    channel,
+                    from: Some(stars_id),
+                    to: None,
+                });
+                cx.notify();
+            } else {
+                let from = sections
+                    .iter()
+                    .find(|s| s.kind == SectionKind::Standard && s.channel_ids.contains(&channel))
+                    .map(|s| s.id.clone());
+                self.local_starred.insert(channel.clone());
+                cx.emit(SidebarEvent::MoveChannel {
+                    channel,
+                    from,
+                    to: Some(stars_id),
+                });
+                cx.notify();
+            }
+            return;
+        }
+        if !self.local_starred.remove(&channel) {
+            self.local_starred.insert(channel);
+        }
+        cx.notify();
+    }
+
     /// One notification-level choice: fixture mode keeps it locally (the snapshot carries
     /// live ones); live mode asks the root for the `Command::SetNotifyLevel` path.
     pub(crate) fn set_notify(
@@ -1190,7 +1275,8 @@ impl Sidebar {
         if conversation.id == self.selected {
             return None;
         }
-        let muted = self.notify_level(&conversation.id) == Some(NotifyLevel::Muted);
+        let muted = !self.home_prefs.show_muted
+            && self.notify_level(&conversation.id) == Some(NotifyLevel::Muted);
         let listed = if muted || !open {
             unread.mentions > 0
         } else {
@@ -2148,6 +2234,7 @@ mod tests {
             show_files: true,
             show_later: false,
             icons_only: true,
+            order: [2, 1, 0, 4, 3],
         };
         assert!(!prefs.shows(NavItem::Home));
         assert!(prefs.shows(NavItem::Dms));
@@ -2155,6 +2242,18 @@ mod tests {
         assert!(prefs.shows(NavItem::Files));
         assert!(!prefs.shows(NavItem::Todos));
         assert!(prefs.shows(NavItem::Admin));
+        assert_eq!(
+            prefs.ordered_items(),
+            vec![
+                NavItem::Activity,
+                NavItem::Dms,
+                NavItem::Home,
+                NavItem::Todos,
+                NavItem::Files,
+                NavItem::Agents,
+                NavItem::Admin,
+            ]
+        );
     }
 
     #[test]

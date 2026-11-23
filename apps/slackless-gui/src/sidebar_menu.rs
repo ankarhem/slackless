@@ -716,6 +716,8 @@ pub(crate) struct ChannelMenuInput {
     pub link: String,
     /// A channel (not a DM): leave applies.
     pub is_channel: bool,
+    /// Currently in Starred (`F-CORE-019`).
+    pub starred: bool,
     /// The custom section holding the channel, if any: (id, name).
     pub from: Option<(String, String)>,
     /// The user's custom sections to move into: (id, name, emoji).
@@ -737,10 +739,13 @@ pub(crate) fn channel_menu(
         label,
         link,
         is_channel,
+        starred,
         from,
         sections,
         level,
     } = input;
+    let star_sidebar = sidebar.clone();
+    let star_channel = channel.clone();
     let details_sidebar = sidebar.clone();
     let details_channel = channel.clone();
     let (copy_link, copy_name) = (
@@ -750,6 +755,19 @@ pub(crate) fn channel_menu(
     let move_sidebar = sidebar.clone();
     let move_channel = channel.clone();
     let mut menu = menu
+        .item(
+            PopupMenuItem::new(if starred {
+                "Unstar conversation"
+            } else {
+                "Star conversation"
+            })
+            .icon(IconName::Star)
+            .on_click(move |_, _, cx| {
+                let _ = star_sidebar.update(cx, |sidebar, cx| {
+                    sidebar.toggle_star(star_channel.clone(), cx)
+                });
+            }),
+        )
         .item(
             PopupMenuItem::new("Channel details").on_click(move |_, _, cx| {
                 let _ = details_sidebar.update(cx, |sidebar, cx| {

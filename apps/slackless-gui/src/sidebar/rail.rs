@@ -79,7 +79,7 @@ impl Sidebar {
                     .border_color(outline)
             })
             .when(!dark, |rail| rail.border_r_1().border_color(outline));
-        for item in NavItem::ALL {
+        for item in self.nav_prefs.ordered_items() {
             if !self.nav_prefs.shows(item) {
                 continue;
             }

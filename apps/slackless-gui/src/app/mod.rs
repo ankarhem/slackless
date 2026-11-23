@@ -3561,6 +3561,19 @@ fn subscribe_workspace(
                 ThreadPanelEvent::AddToList { channel, ts } => {
                     this.open_add_to_list_dialog(channel.clone(), ts.clone(), window, cx)
                 }
+                ThreadPanelEvent::SendToChannel {
+                    channel,
+                    thread_ts,
+                    content,
+                } => {
+                    this.bridge.send(Command::SendMessage {
+                        channel: channel.clone(),
+                        content: content.clone(),
+                        thread_ts: Some(thread_ts.clone()),
+                        broadcast: true,
+                    });
+                    window.push_notification("Sent reply to channel", cx);
+                }
                 ThreadPanelEvent::Reply {
                     channel,
                     thread_ts,

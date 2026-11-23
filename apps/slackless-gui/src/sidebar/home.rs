@@ -405,14 +405,46 @@ impl Sidebar {
                 ));
             }
         }
+        let has_server_stars = sections.iter().any(|s| s.kind == SectionKind::Stars);
+        if !has_server_stars && !self.local_starred.is_empty() {
+            let starred_rows: Vec<Conversation> = channels
+                .iter()
+                .chain(&self.fixtures.dms)
+                .filter(|c| self.local_starred.contains(&c.id) && home_keep(c))
+                .cloned()
+                .collect();
+            if !starred_rows.is_empty() {
+                list.extend(
+                    self.section(
+                        "local-starred".into(),
+                        (
+                            "Starred",
+                            Some(
+                                Icon::new(IconName::Star)
+                                    .size(px(14.))
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.75))
+                                    .into_any_element(),
+                            ),
+                        ),
+                        &starred_rows,
+                        watermark,
+                        None,
+                        cx,
+                    ),
+                );
+            }
+        }
         if sections.is_empty() {
-            let filtered_ch: Vec<Conversation> =
-                channels.iter().filter(|c| home_keep(c)).cloned().collect();
+            let filtered_ch: Vec<Conversation> = channels
+                .iter()
+                .filter(|c| !self.local_starred.contains(&c.id) && home_keep(c))
+                .cloned()
+                .collect();
             let filtered_dm: Vec<Conversation> = self
                 .fixtures
                 .dms
                 .iter()
-                .filter(|c| home_keep(c))
+                .filter(|c| !self.local_starred.contains(&c.id) && home_keep(c))
                 .cloned()
                 .collect();
             if self.home_prefs.separate_private {
@@ -485,6 +517,11 @@ impl Sidebar {
             .collect();
         ranked.sort_by_key(|section| rank(&section.kind));
         let mut claimed: HashMap<&ChannelId, &str> = HashMap::new();
+        if !has_server_stars {
+            for id in &self.local_starred {
+                claimed.entry(id).or_insert("local-starred");
+            }
+        }
         for section in ranked {
             for id in &section.channel_ids {
                 claimed.entry(id).or_insert(section.id.as_str());
@@ -967,6 +1004,7 @@ impl Sidebar {
                 conversation.kind(),
                 ConversationKind::PublicChannel | ConversationKind::PrivateChannel
             ),
+            starred: self.is_starred(&conversation.id),
             from: section
                 .filter(|section| section.kind == SectionKind::Standard)
                 .map(|section| (section.id.clone(), section.name.clone())),

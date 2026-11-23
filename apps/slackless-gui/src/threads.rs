@@ -73,6 +73,12 @@ pub enum ThreadPanelEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Broadcast an existing thread reply back into the parent channel (`F-CORE-106`).
+    SendToChannel {
+        channel: ChannelId,
+        thread_ts: Ts,
+        content: MessageContent,
+    },
     /// The header menu followed or unfollowed the open thread (already shown here); the root
     /// tells Slack. `last_read` is the thread's newest message.
     SetSubscribed {
@@ -737,6 +743,18 @@ impl ThreadPanel {
                     });
                 }
             }
+            MessageAction::SendToChannel => {
+                if let Some((channel, thread_ts)) = self.thread.clone() {
+                    if let Some(reply) = self.replies.iter().find(|m| m.ts == *ts) {
+                        let content = crate::composer::content_of(&reply.text, &self.fixtures);
+                        cx.emit(ThreadPanelEvent::SendToChannel {
+                            channel,
+                            thread_ts,
+                            content,
+                        });
+                    }
+                }
+            }
             MessageAction::OpenImage(origin) => {
                 // The viewer pages through the thread's images, root first.
                 let Some((channel, _)) = self.thread.clone() else {
@@ -981,6 +999,7 @@ impl ThreadPanel {
                 .thread
                 .as_ref()
                 .is_some_and(|(channel, _)| message.pinned_to.contains(channel)),
+            in_thread: !is_root,
         };
         let row_group = SharedString::from(format!("thread-row-group-{}", ts.as_str()));
         let hover_bg = cx.theme().secondary.opacity(0.5);

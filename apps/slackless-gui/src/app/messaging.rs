@@ -1199,6 +1199,7 @@ impl App {
             MessageAction::AddToList => {
                 self.open_add_to_list_dialog(channel, ts, window, cx);
             }
+            MessageAction::SendToChannel => {}
             MessageAction::BlockAction { action, attachment } => {
                 if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
                     &message,
@@ -1428,6 +1429,16 @@ impl App {
             }
             MessageAction::AddToList => {
                 self.open_add_to_list_dialog(channel, ts, window, cx);
+            }
+            MessageAction::SendToChannel => {
+                let content = crate::composer::content_of(&message.text, &self.fixtures);
+                self.bridge.send(Command::SendMessage {
+                    channel,
+                    content,
+                    thread_ts: Some(thread_ts),
+                    broadcast: true,
+                });
+                window.push_notification("Sent reply to channel", cx);
             }
             MessageAction::BlockAction { action, attachment } => {
                 if let Some(dispatch) = crate::blockkit::BlockDispatch::new(

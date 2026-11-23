@@ -848,6 +848,7 @@ impl MessageList {
                 channel,
                 ts: ts.clone(),
             }),
+            MessageAction::SendToChannel => {}
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
                 let dispatch = self
@@ -1027,6 +1028,7 @@ impl MessageList {
                     reply: true,
                     saved: data.saved.contains(&message.ts),
                     pinned: message.pinned_to.contains(&self.channel),
+                    in_thread: false,
                 },
                 None => return,
             };
@@ -1648,10 +1650,14 @@ fn transcript_row(
         reply: true,
         saved,
         pinned: message.pinned_to.contains(&store.channel),
+        in_thread: false,
     };
+    let keyword_hit = !set.own && crate::preferences::matches_highlight_keyword(&message.text, cx);
     let theme = cx.theme();
     let hover_bg = theme.secondary.opacity(0.5);
     let saved_bg = theme.warning.opacity(0.08);
+    let keyword_bg = theme.warning.opacity(0.11);
+    let keyword_bar = theme.warning;
     let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
     let highlighted = store.highlighted.as_ref() == Some(&message.ts);
     let active_row = store.active.as_ref() == Some(&message.ts);
@@ -1696,6 +1702,9 @@ fn transcript_row(
                     .when(saved, |card| {
                         card.bg(saved_bg).child(actions::saved_banner(cx))
                     })
+                    .when(!saved && keyword_hit, |card| {
+                        card.bg(keyword_bg).border_l_2().border_color(keyword_bar)
+                    })
                     .when(is_ephemeral, |card| {
                         card.child(actions::ephemeral_banner(&row_key, Some(&handler), cx))
                     })
@@ -1704,9 +1713,10 @@ fn transcript_row(
                     .when(!highlighted && !thread_open && active_row, |card| {
                         card.bg(hover_bg)
                     })
-                    .when(!saved && !highlighted && !thread_open && revealed, |card| {
-                        card.bg(hover_bg)
-                    })
+                    .when(
+                        !saved && !keyword_hit && !highlighted && !thread_open && revealed,
+                        |card| card.bg(hover_bg),
+                    )
             })
             .child(
                 h_flex()

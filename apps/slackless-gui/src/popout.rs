@@ -804,6 +804,20 @@ impl PopoutWindow {
                 cx.notify();
             }
             MessageAction::AddToList => {}
+            MessageAction::SendToChannel => {
+                if let PopoutKind::Thread {
+                    channel, thread_ts, ..
+                } = &self.kind
+                {
+                    let content = crate::composer::content_of(&message.text, &self.fixtures);
+                    (self.send)(Command::SendMessage {
+                        channel: channel.clone(),
+                        content,
+                        thread_ts: Some(thread_ts.clone()),
+                        broadcast: true,
+                    });
+                }
+            }
         }
     }
 
@@ -3635,6 +3649,8 @@ impl Render for PopoutWindow {
                         reply: is_conversation,
                         saved: is_saved,
                         pinned: msg.pinned_to.contains(&channel),
+                        in_thread: !is_conversation
+                            && matches!(&self.kind, PopoutKind::Thread { thread_ts, .. } if msg.ts != *thread_ts),
                     };
                     let mut display = msg.clone();
                     let reactions = std::mem::take(&mut display.reactions);

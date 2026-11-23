@@ -351,11 +351,13 @@ impl Palette {
 }
 
 /// Project `doc` into Obsidian Live Preview tokens and text decorations for the given
-/// `selection`, `focused` state, and optional spellcheck misspelling spans (`F-SHELL-098`).
+/// `selection`, `focused` state, `format_markup` mode (`F-CORE-079`/`080`), and optional
+/// spellcheck misspelling spans (`F-SHELL-098`).
 pub(super) fn project(
     doc: &Doc,
     selection: &Range<usize>,
     focused: bool,
+    format_markup: bool,
     palette: Palette,
     misspellings: &[Range<usize>],
 ) -> (InputContent, Vec<TextDecoration>) {
@@ -370,7 +372,7 @@ pub(super) fn project(
     }
 
     let touches = |range: &Range<usize>| {
-        focused && selection.end >= range.start && selection.start <= range.end
+        !format_markup || (focused && selection.end >= range.start && selection.start <= range.end)
     };
     // Never place a token whose open interior contains a selection endpoint, even when
     // blurred: gpui-base atomically rejects any `set_tokens` that splits a selection.
@@ -739,7 +741,7 @@ mod tests {
         let end = doc.text().len();
 
         // Caret on `paragraph`: all 3 headings show H1/H2/H3 badges.
-        let (content, _) = project(&doc, &(end..end), true, palette, &[]);
+        let (content, _) = project(&doc, &(end..end), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![
@@ -750,7 +752,7 @@ mod tests {
         );
 
         // Caret moves onto `# Heading 1`: `# ` reveals as editable muted markdown; H2/H3 stay badges.
-        let (content, decorations) = project(&doc, &(4..4), true, palette, &[]);
+        let (content, decorations) = project(&doc, &(4..4), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![("h2".into(), "## ".into()), ("h3".into(), "### ".into())]
@@ -763,7 +765,7 @@ mod tests {
         );
 
         // Unfocused: all 3 headings collapse back to H1/H2/H3 badges even if caret is on line 1.
-        let (content, _) = project(&doc, &(4..4), false, palette, &[]);
+        let (content, _) = project(&doc, &(4..4), false, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![
@@ -781,7 +783,7 @@ mod tests {
         let end = doc.text().len();
 
         // Caret at end (`here`): both *bold* and [docs](url) collapse their syntax markers.
-        let (content, _) = project(&doc, &(end..end), true, palette, &[]);
+        let (content, _) = project(&doc, &(end..end), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![
@@ -793,7 +795,7 @@ mod tests {
         );
 
         // Caret inside `*bold*`: `*` markers reveal in muted syntax color; link stays collapsed.
-        let (content, decorations) = project(&doc, &(6..6), true, palette, &[]);
+        let (content, decorations) = project(&doc, &(6..6), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![
@@ -814,7 +816,7 @@ mod tests {
 
         // Caret inside `[docs](https://x.dev)`: link syntax reveals; `*bold*` stays collapsed.
         let link_pos = doc.text().find("docs").unwrap() + 1;
-        let (content, _) = project(&doc, &(link_pos..link_pos), true, palette, &[]);
+        let (content, _) = project(&doc, &(link_pos..link_pos), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![("hide".into(), "*".into()), ("hide".into(), "*".into())]
@@ -826,7 +828,7 @@ mod tests {
         let palette = test_palette();
         // Caret inside multi-byte `# ` prefix when blurred: must NOT tokenize `0..2`.
         let heading = Doc::from("# Hello *world*");
-        let (content, _) = project(&heading, &(1..1), false, palette, &[]);
+        let (content, _) = project(&heading, &(1..1), false, true, palette, &[]);
         assert!(
             !content
                 .tokens()
@@ -836,7 +838,7 @@ mod tests {
         );
 
         // When active on `# Hello *world*`, heading weight must not paint over `*` delimiters.
-        let (_, decorations) = project(&heading, &(10..10), true, palette, &[]);
+        let (_, decorations) = project(&heading, &(10..10), true, true, palette, &[]);
         assert!(
             !decorations
                 .iter()
@@ -852,7 +854,7 @@ mod tests {
 
         // Caret inside code body (`wrong` is bytes 4..9): fences collapse, and code body uses
         // neutral `code_block_fg` with no per-glyph background (backdrop is painted full-width).
-        let (content, decorations) = project(&doc, &(6..6), true, palette, &[]);
+        let (content, decorations) = project(&doc, &(6..6), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![
@@ -875,7 +877,7 @@ mod tests {
         assert_eq!(blocks[0].body_lines, vec![4..9]);
 
         // Caret on opening fence line (0..3): opening fence reveals in syntax color; closing stays collapsed.
-        let (content, decorations) = project(&doc, &(2..2), true, palette, &[]);
+        let (content, decorations) = project(&doc, &(2..2), true, true, palette, &[]);
         assert_eq!(
             token_ids(&content),
             vec![("code-close".into(), "```".into())]
@@ -955,7 +957,14 @@ mod tests {
         let doc = Doc::from("hello wrld");
         let palette = test_palette();
         let span = 6..10;
-        let (_, decorations) = project(&doc, &(0..0), true, palette, std::slice::from_ref(&span));
+        let (_, decorations) = project(
+            &doc,
+            &(0..0),
+            true,
+            true,
+            palette,
+            std::slice::from_ref(&span),
+        );
         assert!(decorations.iter().any(|d| {
             d.range == (6..10)
                 && d.style

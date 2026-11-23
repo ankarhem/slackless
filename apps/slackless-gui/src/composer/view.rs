@@ -94,18 +94,60 @@ impl Render for Composer {
         let context_bar = self.context_bar.clone().map(|bar| bar(window, cx));
         let has_bar = context_bar.is_some();
         let toolbar = self.show_toolbar.then(|| {
+            let markup_active = !self.format_markup;
+            let theme = cx.theme();
+            let md_fg = if markup_active {
+                theme.primary
+            } else {
+                theme.muted_foreground
+            };
+            let md_bg = if markup_active {
+                theme.primary.opacity(0.14)
+            } else {
+                theme.secondary.opacity(0.)
+            };
+            let md_hover = theme.secondary_hover;
             h_flex()
                 .items_center()
-                .gap_0p5()
+                .justify_between()
                 .px_1p5()
                 // Slack's band: 4px around 28px buttons.
                 .py(px(5.))
                 .rounded_t_lg()
                 .bg(band)
-                .children(
-                    TOOLBAR
-                        .iter()
-                        .map(|slot| self.tool_button(slot, focused, cx)),
+                .child(
+                    h_flex().items_center().gap_0p5().children(
+                        TOOLBAR
+                            .iter()
+                            .map(|slot| self.tool_button(slot, focused, cx)),
+                    ),
+                )
+                .child(
+                    div()
+                        .id("fmt-markup-mode")
+                        .cursor_pointer()
+                        .h(px(22.))
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .bg(md_bg)
+                        .hover(move |el| el.bg(md_hover))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(md_fg)
+                        .tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(
+                                "Toggle raw markup mode (show formatting characters)",
+                            )
+                            .build(window, cx)
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_format_markup(!this.format_markup, cx);
+                        }))
+                        .child("MD"),
                 )
         });
         let attachments = self.attachments_strip(cx);

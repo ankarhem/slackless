@@ -982,6 +982,7 @@ fn card_view(
                 reply: true,
                 saved: is_saved,
                 pinned: message.pinned_to.contains(&group.channel),
+                in_thread: false,
             };
             let mut display = message.clone();
             let reactions = std::mem::take(&mut display.reactions);

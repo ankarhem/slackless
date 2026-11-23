@@ -381,6 +381,7 @@ fn render_thread_message(
         reply: true,
         saved: is_saved,
         pinned: msg.pinned_to.contains(&card.channel),
+        in_thread: msg.ts != card.thread_ts,
     };
     let mut display = msg.clone();
     let reactions = std::mem::take(&mut display.reactions);

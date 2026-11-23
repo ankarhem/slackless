@@ -86,6 +86,8 @@ pub enum MessageAction {
     ViewHistory,
     /// Add this message as a new item in a Slack List (`lists.addToList`, `F-COLLAB-231`).
     AddToList,
+    /// Broadcast an existing thread reply back into the parent channel (`F-CORE-106`).
+    SendToChannel,
 }
 
 /// Which actions apply to one message.
@@ -100,6 +102,8 @@ pub struct ActionSet {
     /// Currently pinned to the conversation: the pin action reads "Unpin from
     /// conversation".
     pub pinned: bool,
+    /// Message is a reply inside a thread: offer "Also send to channel" (`F-CORE-106`).
+    pub in_thread: bool,
 }
 
 pub type ActionHandler = Rc<dyn Fn(MessageAction, &mut Window, &mut App)>;
@@ -558,6 +562,14 @@ fn menu_rows(set: ActionSet, origin: MenuOrigin) -> Vec<MenuRow> {
         add_to_list,
         history,
     ]);
+    if set.in_thread {
+        rows.push(MenuRow::Item {
+            label: "Also send to channel",
+            icon: IconName::Send,
+            action: MessageAction::SendToChannel,
+            hint: None,
+        });
+    }
     if origin == MenuOrigin::Context {
         rows.push(forward);
         if set.reply {
@@ -1115,6 +1127,7 @@ mod tests {
             reply: true,
             saved: false,
             pinned: false,
+            in_thread: false,
         }
     }
 
@@ -1248,6 +1261,7 @@ mod tests {
                     reply: true,
                     saved: false,
                     pinned: false,
+                    in_thread: false,
                 };
                 v_flex()
                     .w(px(500.))

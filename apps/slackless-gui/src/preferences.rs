@@ -16,6 +16,7 @@
 //! emits `PreferencesEvent::Changed`.
 
 use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
@@ -296,6 +297,8 @@ pub struct Settings {
     pub show_activity: bool,
     pub show_files: bool,
     pub show_later: bool,
+    /// Custom order of the 5 configurable rail tabs (`0=Home, 1=DMs, 2=Activity, 3=Files, 4=Later`; `F-CORE-014`).
+    pub nav_order: [usize; 5],
     pub tab_style: usize,
     // Home
     pub show: usize,
@@ -304,6 +307,8 @@ pub struct Settings {
     pub separate_private: bool,
     pub profile_photos: bool,
     pub sidebar_compact: bool,
+    /// Keep muted conversations visible in their sidebar sections instead of hiding them (`F-CORE-022`).
+    pub show_muted_channels: bool,
     // Appearance & Themes
     pub mode: AppearanceMode,
     pub palette: Palette,
@@ -440,6 +445,21 @@ pub fn display_prefs(cx: &App) -> DisplayPrefs {
     cx.try_global::<DisplayPrefs>().copied().unwrap_or_default()
 }
 
+pub struct KeywordPrefs(pub Vec<String>);
+
+impl Global for KeywordPrefs {}
+
+pub fn matches_highlight_keyword(text: &str, cx: &App) -> bool {
+    let Some(prefs) = cx.try_global::<KeywordPrefs>() else {
+        return false;
+    };
+    if prefs.0.is_empty() || text.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    prefs.0.iter().any(|kw| lower.contains(kw.as_str()))
+}
+
 pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
     cx.set_global(DisplayPrefs {
         compact: settings.density == 1,
@@ -454,6 +474,13 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         animate_emoji: settings.animate_emoji,
         reduce_motion: settings.reduce_motion,
     });
+    let keywords: Vec<String> = settings
+        .keywords
+        .split([',', '\n'])
+        .map(|k| k.trim().to_lowercase())
+        .filter(|k| k.len() >= 2)
+        .collect();
+    cx.set_global(KeywordPrefs(keywords));
 }
 
 impl Settings {
@@ -520,6 +547,7 @@ impl Default for Settings {
             show_activity: true,
             show_files: true,
             show_later: true,
+            nav_order: [0, 1, 2, 3, 4],
             tab_style: 0,
             show: 0,
             sort: 0,
@@ -527,6 +555,7 @@ impl Default for Settings {
             separate_private: false,
             profile_photos: true,
             sidebar_compact: false,
+            show_muted_channels: false,
             mode: AppearanceMode::Dark,
             palette: Palette::Default,
             window_gradient: true,
@@ -1513,27 +1542,64 @@ impl Preferences {
     }
 
     fn navigation(&mut self, cx: &mut Context<Self>) -> Div {
-        let home = self.checkbox("nav-home", "Home", |s| &mut s.show_home, cx);
-        let dms = self.checkbox("nav-dms", "DMs", |s| &mut s.show_dms, cx);
-        let activity = self.checkbox("nav-activity", "Activity", |s| &mut s.show_activity, cx);
-        let files = self.checkbox("nav-files", "Files", |s| &mut s.show_files, cx);
-        let later = self.checkbox("nav-later", "Later", |s| &mut s.show_later, cx);
+        let order = self.settings.nav_order;
+        let rows: Vec<Div> = order
+            .iter()
+            .enumerate()
+            .map(|(pos, &slot)| {
+                let (id, label, flag): (&'static str, &'static str, Flag) = match slot {
+                    0 => ("nav-home", "Home", |s| &mut s.show_home),
+                    1 => ("nav-dms", "DMs", |s| &mut s.show_dms),
+                    2 => ("nav-activity", "Activity", |s| &mut s.show_activity),
+                    3 => ("nav-files", "Files", |s| &mut s.show_files),
+                    _ => ("nav-later", "Later / To-dos", |s| &mut s.show_later),
+                };
+                let cb = self.checkbox(id, label, flag, cx);
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(cb)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(("nav-up", pos))
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::ChevronUp)
+                                    .disabled(pos == 0)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if pos > 0 {
+                                            this.settings.nav_order.swap(pos - 1, pos);
+                                            this.changed(cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("nav-down", pos))
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::ChevronDown)
+                                    .disabled(pos + 1 >= order.len())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if pos + 1 < this.settings.nav_order.len() {
+                                            this.settings.nav_order.swap(pos, pos + 1);
+                                            this.changed(cx);
+                                        }
+                                    })),
+                            ),
+                    )
+            })
+            .collect();
         let style = self.radios("nav-style", &TAB_STYLES, |s| &mut s.tab_style, cx);
         v_flex()
-            .child(
-                self.group(
-                    "Show these tabs",
-                    Some("Choose which tabs appear in the navigation bar on the left."),
-                    v_flex()
-                        .gap_1()
-                        .child(home)
-                        .child(dms)
-                        .child(activity)
-                        .child(files)
-                        .child(later),
-                    cx,
-                ),
-            )
+            .child(self.group(
+                "Show & order navigation tabs",
+                Some("Choose which tabs appear in the left rail and reorder them."),
+                v_flex().gap_1().children(rows),
+                cx,
+            ))
             .child(self.group("Tab appearance", None, style, cx))
     }
 
@@ -1564,6 +1630,12 @@ impl Preferences {
             |s| &mut s.sidebar_compact,
             cx,
         );
+        let show_muted = self.checkbox(
+            "home-show-muted",
+            "Show muted conversations in sidebar",
+            |s| &mut s.show_muted_channels,
+            cx,
+        );
         v_flex()
             .child(
                 self.group(
@@ -1585,7 +1657,8 @@ impl Preferences {
                         .child(unreads)
                         .child(private)
                         .child(photos)
-                        .child(compact_rows),
+                        .child(compact_rows)
+                        .child(show_muted),
                     cx,
                 ),
             )

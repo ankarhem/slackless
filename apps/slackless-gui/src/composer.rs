@@ -190,6 +190,9 @@ pub struct Composer {
     also_send: Option<(AlsoSendTarget, bool)>,
     /// Whether the top formatting toolbar is visible (toggled by the `Aa` button).
     show_toolbar: bool,
+    /// When `true` (default), Live Preview hides markdown delimiters away from the caret (`F-CORE-079`).
+    /// When `false` (Markup mode, `F-CORE-080`), formatting characters stay visible while typing.
+    format_markup: bool,
     /// Whether the bottom-left `+` attachments/shortcuts dropdown menu is open (`+` -> `×`).
     plus_open: bool,
     /// Timestamp of the last `+` toggle, so double-clicking `+` uploads directly like Slack.
@@ -304,6 +307,7 @@ impl Composer {
                 scheduling: !edit_mode,
                 also_send: None,
                 show_toolbar: true,
+                format_markup: true,
                 plus_open: false,
                 plus_last_click: None,
                 edit_mode,
@@ -362,6 +366,16 @@ impl Composer {
     pub fn set_scheduling(&mut self, scheduling: bool, cx: &mut Context<Self>) {
         self.scheduling = scheduling;
         cx.notify();
+    }
+
+    /// Toggle Live Preview Markdown autoformat (`true`, `F-CORE-079`) vs raw Markup mode
+    /// (`false`, `F-CORE-080`, always keeping formatting delimiters visible).
+    pub fn set_format_markup(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.format_markup != enabled {
+            self.format_markup = enabled;
+            self.sync_presentation(cx);
+            cx.notify();
+        }
     }
 
     /// Show Slack's "Also send to…" checkbox (unticked) under the draft, or hide it.
