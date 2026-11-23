@@ -38,6 +38,8 @@ pub enum PreferencesEvent {
     CompactStorage,
     /// User asked to prune cached media/temp files on disk.
     PruneMediaCache,
+    /// User asked to export captured HTTP net-log JSON (`F-SHELL-158`).
+    ExportNetLog,
 }
 
 /// Snapshot of local SQLite & media cache metrics shown in Preferences -> Advanced.
@@ -255,11 +257,17 @@ pub struct Settings {
     pub desktop_notifications: bool,
     pub notify_level: usize,
     pub mobile_different: bool,
+    /// Mobile notification level override when `mobile_different` is checked (`F-SHELL-043`).
+    pub mobile_notify_level: usize,
     /// Mobile handoff idle wait index into [`MOBILE_HANDOFF`] (`push_idle_wait`, `F-CORE-155`).
     pub mobile_handoff: usize,
     /// Automatically pause notifications while a custom status is active (`F-SHELL-017`).
     pub status_pauses_notifications: bool,
     pub thread_replies: bool,
+    /// "Also notify me about" extras (`F-SHELL-045`): `@channel` / `@here` mentions, huddle invites, and Slackbot/app reminders.
+    pub notify_channel_mentions: bool,
+    pub notify_huddle_invites: bool,
+    pub notify_reminders: bool,
     pub keywords: String,
     pub sound: usize,
     pub dm_sound: usize,
@@ -272,6 +280,8 @@ pub struct Settings {
     pub bounce_dock: bool,
     pub schedule_enabled: bool,
     pub schedule_days: usize,
+    /// Per-weekday flags (`Sun..Sat`, index 0 = Sunday) used when `schedule_days == 2` ("Custom") (`F-SHELL-034`, `F-SHELL-035`).
+    pub schedule_custom_days: [bool; 7],
     pub schedule_start: usize,
     pub schedule_end: usize,
     // Navigation
@@ -348,6 +358,10 @@ pub struct Settings {
     pub download_dir: String,
     /// Prompt for a save location before every file download (`F-SHELL-190`).
     pub ask_download_location: bool,
+    /// Optional HTTP/HTTPS/SOCKS proxy URL applied to Slack API requests (`F-SHELL-192`).
+    pub proxy_url: String,
+    /// Capture redacted HTTP request/response diagnostics in memory (`F-SHELL-158`).
+    pub net_log_enabled: bool,
 }
 
 /// Active rendering preferences cached as a GPUI global so every message list, thread panel,
@@ -420,8 +434,16 @@ impl Settings {
         let local = utc + crate::messages::local_offset_now();
         let hour = (local.rem_euclid(86_400) / 3_600) as usize;
         // 1970-01-01 was a Thursday; 0 is Sunday.
-        let weekday = (local.div_euclid(86_400) + 4).rem_euclid(7);
-        let on_day = self.schedule_days != 1 || (1..=5).contains(&weekday);
+        let weekday = (local.div_euclid(86_400) + 4).rem_euclid(7) as usize;
+        let on_day = match self.schedule_days {
+            0 => true,
+            1 => (1..=5).contains(&weekday),
+            _ => self
+                .schedule_custom_days
+                .get(weekday)
+                .copied()
+                .unwrap_or(true),
+        };
         let (start, end) = (self.schedule_start, self.schedule_end);
         let in_hours = if start <= end {
             (start..end).contains(&hour)
@@ -438,9 +460,13 @@ impl Default for Settings {
             desktop_notifications: true,
             notify_level: 1,
             mobile_different: false,
+            mobile_notify_level: 1,
             mobile_handoff: 0,
             status_pauses_notifications: false,
             thread_replies: true,
+            notify_channel_mentions: true,
+            notify_huddle_invites: true,
+            notify_reminders: true,
             keywords: "deploy, incident".to_owned(),
             sound: 0,
             dm_sound: 0,
@@ -451,6 +477,7 @@ impl Default for Settings {
             bounce_dock: true,
             schedule_enabled: true,
             schedule_days: 1,
+            schedule_custom_days: [false, true, true, true, true, true, false],
             schedule_start: 9,
             schedule_end: 18,
             show_home: true,
@@ -509,6 +536,8 @@ impl Default for Settings {
             show_workspace_rail: true,
             download_dir: String::new(),
             ask_download_location: false,
+            proxy_url: String::new(),
+            net_log_enabled: false,
         }
     }
 }
@@ -537,7 +566,20 @@ impl Settings {
 
     /// Slack's `global_desktop` notification level key for [`Self::notify_level`] (`F-CORE-147`).
     pub fn notify_level_wire(&self) -> &'static str {
-        match self.notify_level {
+        Self::level_wire(self.notify_level)
+    }
+
+    /// Slack's `global_mobile` notification level key (`F-SHELL-043`).
+    pub fn mobile_notify_level_wire(&self) -> &'static str {
+        Self::level_wire(if self.mobile_different {
+            self.mobile_notify_level
+        } else {
+            self.notify_level
+        })
+    }
+
+    fn level_wire(index: usize) -> &'static str {
+        match index {
             0 => "everything",
             2 => "nothing",
             _ => "mentions_dms",
@@ -577,6 +619,7 @@ pub struct Preferences {
     open_select: Option<&'static str>,
     keywords: Entity<TextareaState>,
     excluded_channels: Entity<TextareaState>,
+    proxy_input: Entity<TextareaState>,
     custom_sidebar_hex: Entity<TextareaState>,
     custom_accent_hex: Entity<TextareaState>,
     slack_theme_import: Entity<TextareaState>,
@@ -602,6 +645,13 @@ impl Preferences {
                     .placeholder("e.g. random, alerts, noisy-bot")
                     .auto_grow(1, 2);
                 state.set_value(settings.excluded_channels.clone(), window, cx);
+                state
+            });
+            let proxy_input = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("http://127.0.0.1:8080 or socks5://127.0.0.1:1080")
+                    .auto_grow(1, 1);
+                state.set_value(settings.proxy_url.clone(), window, cx);
                 state
             });
             let custom_sidebar_hex = cx.new(|cx| {
@@ -644,6 +694,16 @@ impl Preferences {
                         }
                     },
                 ),
+                cx.subscribe_in(
+                    &proxy_input,
+                    window,
+                    |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.proxy_url = field.read(cx).value().trim().to_owned();
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
             ];
             Preferences {
                 section: Section::Notifications,
@@ -651,6 +711,7 @@ impl Preferences {
                 open_select: None,
                 keywords,
                 excluded_channels,
+                proxy_input,
                 custom_sidebar_hex,
                 custom_accent_hex,
                 slack_theme_import,
@@ -679,12 +740,17 @@ impl Preferences {
     ) {
         let keywords = settings.keywords.clone();
         let excluded = settings.excluded_channels.clone();
+        let proxy = settings.proxy_url.clone();
+        slackless_core::api::set_proxy_url(Some(proxy.clone()));
+        slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
         let rgb_pair = settings.palette.rgb_pair();
         self.settings = settings;
         self.keywords
             .update(cx, |state, cx| state.set_value(keywords, window, cx));
         self.excluded_channels
             .update(cx, |state, cx| state.set_value(excluded, window, cx));
+        self.proxy_input
+            .update(cx, |state, cx| state.set_value(proxy, window, cx));
         if let Some((sb, ac)) = rgb_pair {
             self.custom_sidebar_hex.update(cx, |state, cx| {
                 state.set_value(theme::format_hex_rgb(sb), window, cx)
@@ -1010,6 +1076,17 @@ impl Preferences {
             |s| &mut s.mobile_different,
             cx,
         );
+        let mobile_level = if self.settings.mobile_different {
+            let sel = self.select(
+                "notify-mobile-level",
+                &NOTIFY_LEVELS,
+                |s| &mut s.mobile_notify_level,
+                cx,
+            );
+            Some(self.labeled("On mobile, notify me about:", sel))
+        } else {
+            None
+        };
         let mobile_handoff_select = self.select(
             "notify-mobile-handoff",
             &MOBILE_HANDOFF,
@@ -1030,6 +1107,24 @@ impl Preferences {
             "notify-threads",
             "Notify me about replies to threads I'm following",
             |s| &mut s.thread_replies,
+            cx,
+        );
+        let ch_mentions = self.checkbox(
+            "notify-ch-mentions",
+            "Notify me about @channel, @here, and @everyone mentions",
+            |s| &mut s.notify_channel_mentions,
+            cx,
+        );
+        let huddle_invites = self.checkbox(
+            "notify-huddle-invites",
+            "Notify me when someone invites me to a huddle",
+            |s| &mut s.notify_huddle_invites,
+            cx,
+        );
+        let reminders = self.checkbox(
+            "notify-reminders",
+            "Notify me about Slackbot reminders and scheduled alerts",
+            |s| &mut s.notify_reminders,
             cx,
         );
         let border = cx.theme().input;
@@ -1058,6 +1153,43 @@ impl Preferences {
             |s| &mut s.schedule_days,
             cx,
         );
+        let custom_days_row = (self.settings.schedule_days == 2).then(|| {
+            const LABELS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            let theme = cx.theme();
+            let (accent, fg, muted, border) = (
+                theme.primary,
+                crate::theme::avatar_foreground(),
+                theme.muted_foreground,
+                theme.border,
+            );
+            h_flex()
+                .flex_wrap()
+                .gap_1p5()
+                .children(LABELS.iter().enumerate().map(|(ix, label)| {
+                    let active = self.settings.schedule_custom_days[ix];
+                    div()
+                        .id(("schedule-day-chip", ix))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .text_xs()
+                        .cursor_pointer()
+                        .when(active, |d| {
+                            d.bg(accent)
+                                .border_color(accent)
+                                .text_color(fg)
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .when(!active, |d| d.border_color(border).text_color(muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings.schedule_custom_days[ix] =
+                                !this.settings.schedule_custom_days[ix];
+                            this.changed(cx);
+                        }))
+                        .child(*label)
+                }))
+        });
         let start = self.select("schedule-start", &HOURS, |s| &mut s.schedule_start, cx);
         let end = self.select("schedule-end", &HOURS, |s| &mut s.schedule_end, cx);
         let sound = self.select("notify-sound", &SOUNDS, |s| &mut s.sound, cx);
@@ -1101,9 +1233,13 @@ impl Preferences {
                     .child(desktop)
                     .child(level)
                     .child(mobile)
+                    .children(mobile_level)
                     .child(mobile_handoff)
                     .child(status_pause)
-                    .child(threads),
+                    .child(threads)
+                    .child(ch_mentions)
+                    .child(huddle_invites)
+                    .child(reminders),
                 cx,
             ))
             .child(self.group(
@@ -1114,11 +1250,12 @@ impl Preferences {
             ))
             .child(self.group(
                 "Notification schedule",
-                Some("You'll only receive notifications in the hours you choose. Outside of those times, notifications will be paused."),
+                Some("Your personal schedule overrides workspace default Do Not Disturb hours. Outside of these times, notifications will be paused."),
                 v_flex()
                     .gap_3()
                     .child(schedule_on)
                     .child(self.labeled("Allow notifications", days))
+                    .children(custom_days_row)
                     .child(h_flex().gap_4().items_start().child(self.labeled("From", start)).child(self.labeled("To", end))),
                 cx,
             ))
@@ -1943,6 +2080,7 @@ impl Preferences {
             |s| &mut s.ask_download_location,
             cx,
         );
+        let network_group = self.network_diagnostics_group(cx);
         v_flex()
             .child(self.group(
                 "Search",
@@ -1960,6 +2098,7 @@ impl Preferences {
                 v_flex().gap_2().child(download_row).child(ask_dl),
                 cx,
             ))
+            .child(network_group)
             .child(self.group(
                 "Other options",
                 None,
@@ -1985,6 +2124,61 @@ impl Preferences {
                 storage_summary,
                 cx,
             ))
+    }
+
+    fn network_diagnostics_group(&mut self, cx: &mut Context<Self>) -> Div {
+        let dl_border = cx.theme().input;
+        let proxy_field = div()
+            .w(px(420.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(dl_border)
+            .text_sm()
+            .child(
+                Textarea::new(&self.proxy_input)
+                    .appearance(false)
+                    .bordered(false),
+            );
+        let net_log_toggle = self.checkbox(
+            "adv-net-log",
+            "Capture HTTP net-log diagnostics (credentials redacted; last 500 requests)",
+            |s| &mut s.net_log_enabled,
+            cx,
+        );
+        let net_log_count = slackless_core::api::net_log_snapshot().len();
+        let net_log_actions = h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("adv-net-log-export")
+                    .outline()
+                    .with_size(Size::Small)
+                    .icon(IconName::Download)
+                    .label(format!("Export net log ({net_log_count})"))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog))),
+            )
+            .child(
+                Button::new("adv-net-log-clear")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .label("Clear")
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        slackless_core::api::clear_net_log();
+                        cx.notify();
+                    })),
+            );
+        self.group(
+            "Network & diagnostics",
+            Some("Optional HTTP/HTTPS/SOCKS proxy (leave empty to use system environment variables) and redacted HTTP net-log capture."),
+            v_flex()
+                .gap_2()
+                .child(self.labeled("Proxy URL (applies to new connections)", proxy_field))
+                .child(net_log_toggle)
+                .child(net_log_actions),
+            cx,
+        )
     }
 }
 
@@ -2177,5 +2371,19 @@ mod tests {
         assert_eq!(s.schedule_days_wire(), "every_day");
         s.schedule_days = 1;
         assert_eq!(s.schedule_days_wire(), "weekdays");
+        s.schedule_days = 2;
+        assert_eq!(s.schedule_days_wire(), "custom");
+
+        s.notify_level = 0;
+        s.mobile_different = false;
+        assert_eq!(s.mobile_notify_level_wire(), "everything");
+        s.mobile_different = true;
+        s.mobile_notify_level = 2;
+        assert_eq!(s.mobile_notify_level_wire(), "nothing");
+
+        s.schedule_enabled = true;
+        s.schedule_days = 2;
+        s.schedule_custom_days = [false; 7];
+        assert!(!s.notifications_allowed_now());
     }
 }

@@ -1,18 +1,129 @@
 //! Transport: base URL, auth (form `token` + `Cookie: d=`), rate-limit retries, response
 //! decoding.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderValue, RETRY_AFTER};
 use reqwest::{Request, Response, StatusCode};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 
 use crate::types::ApiResponse;
 use crate::types::endpoints;
 use crate::{ApiError, Result};
+
+/// Maximum entries retained in the in-memory diagnostic net-log ring buffer (`F-SHELL-158`).
+const MAX_NET_LOG_ENTRIES: usize = 500;
+
+static NET_LOG_ENABLED: AtomicBool = AtomicBool::new(false);
+static NET_LOG: OnceLock<Mutex<VecDeque<NetLogEntry>>> = OnceLock::new();
+static PROXY_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// One redacted HTTP request/response entry captured when net-log diagnostics are enabled (`F-SHELL-158`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NetLogEntry {
+    pub timestamp_ms: u64,
+    pub method: String,
+    pub url: String,
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Enable or disable in-memory HTTP net-log capture (`F-SHELL-158`).
+pub fn set_net_log_enabled(enabled: bool) {
+    NET_LOG_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether HTTP net-log capture is currently enabled.
+pub fn net_log_enabled() -> bool {
+    NET_LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Snapshot captured net-log entries (oldest first).
+pub fn net_log_snapshot() -> Vec<NetLogEntry> {
+    NET_LOG
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Clear all captured net-log entries.
+pub fn clear_net_log() {
+    if let Ok(mut g) = NET_LOG.get_or_init(|| Mutex::new(VecDeque::new())).lock() {
+        g.clear();
+    }
+}
+
+/// Export captured net-log entries as pretty-printed JSON (credentials never logged).
+pub fn net_log_export_json() -> String {
+    let entries = net_log_snapshot();
+    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// Configure an explicit HTTP/HTTPS/SOCKS proxy URL for new [`SlackApi`] clients (`F-SHELL-192`).
+/// Passing `None` or an empty string clears the override (falling back to standard env vars).
+pub fn set_proxy_url(url: Option<String>) {
+    let cleaned = url.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    if let Ok(mut g) = PROXY_URL.get_or_init(|| Mutex::new(None)).lock() {
+        *g = cleaned;
+    }
+}
+
+/// Currently configured proxy URL override, or `SLACKLESS_PROXY` env var if set.
+pub fn proxy_url() -> Option<String> {
+    if let Ok(g) = PROXY_URL.get_or_init(|| Mutex::new(None)).lock() {
+        if g.is_some() {
+            return g.clone();
+        }
+    }
+    std::env::var("SLACKLESS_PROXY")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn redact_url(url: &Url) -> String {
+    let mut clean = url.clone();
+    clean.set_query(None);
+    clean.set_fragment(None);
+    clean.to_string()
+}
+
+fn record_net_log(
+    method: &str,
+    url: &Url,
+    status: Option<u16>,
+    elapsed: Duration,
+    error: Option<String>,
+) {
+    if !NET_LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let entry = NetLogEntry {
+        timestamp_ms,
+        method: method.to_owned(),
+        url: redact_url(url),
+        status,
+        elapsed_ms: elapsed.as_millis() as u64,
+        error,
+    };
+    if let Ok(mut g) = NET_LOG.get_or_init(|| Mutex::new(VecDeque::new())).lock() {
+        if g.len() >= MAX_NET_LOG_ENTRIES {
+            g.pop_front();
+        }
+        g.push_back(entry);
+    }
+}
 
 /// How many times a request is retried after HTTP 429 before giving up with
 /// [`ApiError::RateLimited`].
@@ -54,10 +165,14 @@ impl fmt::Debug for SlackApi {
 impl SlackApi {
     /// A client for the API base `base_url` (e.g. `https://acme.slack.com/api/`), the session
     /// token (`xoxc-...`) and the `d` cookie value (`xoxd-...`, raw or already URL-encoded).
+    /// Honors [`set_proxy_url`] / `SLACKLESS_PROXY` (plus standard `HTTPS_PROXY` / `HTTP_PROXY`
+    /// environment variables, `F-SHELL-192`).
     pub fn new(base_url: &str, token: impl Into<String>, d_cookie: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(BROWSER_USER_AGENT)
-            .build()?;
+        let mut builder = reqwest::Client::builder().user_agent(BROWSER_USER_AGENT);
+        if let Some(proxy) = proxy_url() {
+            builder = builder.proxy(reqwest::Proxy::all(&proxy)?);
+        }
+        let http = builder.build()?;
         Self::with_http_client(http, base_url, token, d_cookie)
     }
 
@@ -241,7 +356,36 @@ impl SlackApi {
     async fn send_with_retry(&self, build: impl Fn() -> Result<Request>) -> Result<Response> {
         let mut attempt = 0;
         loop {
-            let resp = self.http.execute(build()?).await?;
+            let req = build()?;
+            let capture = NET_LOG_ENABLED.load(Ordering::Relaxed);
+            let meta =
+                capture.then(|| (req.method().to_string(), req.url().clone(), Instant::now()));
+            let resp = match self.http.execute(req).await {
+                Ok(resp) => {
+                    if let Some((method, url, started)) = meta {
+                        record_net_log(
+                            &method,
+                            &url,
+                            Some(resp.status().as_u16()),
+                            started.elapsed(),
+                            None,
+                        );
+                    }
+                    resp
+                }
+                Err(err) => {
+                    if let Some((method, url, started)) = meta {
+                        record_net_log(
+                            &method,
+                            &url,
+                            None,
+                            started.elapsed(),
+                            Some(err.to_string()),
+                        );
+                    }
+                    return Err(err.into());
+                }
+            };
             if resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 return Ok(resp);
             }
@@ -355,5 +499,21 @@ mod tests {
         assert!(!ok("http://files.slack.com/files-pri/T1-F1/a.png"));
         assert!(!ok("https://files.slack.com.evil.example/x"));
         assert!(!ok("https://example.com/x"));
+    }
+
+    #[test]
+    fn net_log_redacts_query_strings_and_caps_entries() {
+        clear_net_log();
+        set_net_log_enabled(true);
+        let url =
+            Url::parse("https://acme.slack.com/api/auth.test?token=xoxc-secret#frag").unwrap();
+        record_net_log("POST", &url, Some(200), Duration::from_millis(12), None);
+        let snap = net_log_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].url, "https://acme.slack.com/api/auth.test");
+        assert_eq!(snap[0].status, Some(200));
+        assert!(!net_log_export_json().contains("xoxc-secret"));
+        set_net_log_enabled(false);
+        clear_net_log();
     }
 }

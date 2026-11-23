@@ -477,6 +477,17 @@ pub trait Backend: Clone + Send + Sync + 'static {
             })
         }
     }
+    /// End active DND session (`dnd.endDnd`, `F-SHELL-034`).
+    fn dnd_end_dnd(&self) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Batch DND status lookup (`dnd.teamInfo`, `F-SHELL-035`).
+    fn dnd_team_info(
+        &self,
+        _users: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<HashMap<UserId, slackless_types::DndStatus>>> + Send {
+        async { Ok(HashMap::new()) }
+    }
     /// Write a single user preference back to Slack (`users.prefs.set`).
     fn set_user_pref(
         &self,
@@ -1144,6 +1155,17 @@ impl Backend for SlackApi {
 
     async fn gif_search(&self, query: String, limit: u32) -> api::Result<Vec<api::GifItem>> {
         SlackApi::gif_search(self, &query, limit).await
+    }
+
+    async fn dnd_end_dnd(&self) -> api::Result<()> {
+        SlackApi::dnd_end_dnd(self).await
+    }
+
+    async fn dnd_team_info(
+        &self,
+        users: Vec<UserId>,
+    ) -> api::Result<HashMap<UserId, slackless_types::DndStatus>> {
+        SlackApi::dnd_team_info(self, &users).await
     }
 
     async fn saved_list(&self, filter: &'static str) -> api::Result<Vec<api::SavedItem>> {

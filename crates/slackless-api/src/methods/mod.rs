@@ -939,6 +939,38 @@ impl SlackApi {
         Ok(self.call(method::DND_END_SNOOZE, Vec::new()).await?.data)
     }
 
+    /// `dnd.endDnd`: end the signed-in user's active do-not-disturb session (`F-SHELL-034`).
+    pub async fn dnd_end_dnd(&self) -> Result<()> {
+        self.call::<Empty>(method::DND_END_DND, Vec::new()).await?;
+        Ok(())
+    }
+
+    /// `dnd.teamInfo`: batch DND status lookup for up to 50 users per request (`F-SHELL-035`).
+    pub async fn dnd_team_info(&self, users: &[UserId]) -> Result<HashMap<UserId, DndStatus>> {
+        #[derive(Deserialize, Default)]
+        struct DndTeamWire {
+            #[serde(default)]
+            users: HashMap<UserId, DndStatus>,
+        }
+        let mut out = HashMap::new();
+        for chunk in users.chunks(50) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let csv = chunk
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let wire: DndTeamWire = self
+                .call(method::DND_TEAM_INFO, vec![("users", csv)])
+                .await?
+                .data;
+            out.extend(wire.users);
+        }
+        Ok(out)
+    }
+
     /// `users.getPresence`: one user's current presence. Read-only.
     pub async fn users_get_presence(&self, user: &UserId) -> Result<UserPresence> {
         let params = vec![("user", user.to_string())];

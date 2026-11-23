@@ -172,11 +172,39 @@ impl App {
                             !settings.mobile_different,
                         );
                     }
+                    if settings.mobile_different
+                        && (prev.mobile_notify_level != settings.mobile_notify_level
+                            || !prev.mobile_different)
+                    {
+                        sync_global_notif(
+                            "global_mobile",
+                            settings.mobile_notify_level_wire().to_owned(),
+                            false,
+                        );
+                    }
                     if prev.thread_replies != settings.thread_replies {
                         sync_global_notif(
                             "threads_everything",
                             settings.thread_replies.to_string(),
                             false,
+                        );
+                    }
+                    if prev.notify_channel_mentions != settings.notify_channel_mentions {
+                        sync_pref(
+                            "suppress_at_channel_global",
+                            (!settings.notify_channel_mentions).to_string(),
+                        );
+                    }
+                    if prev.notify_huddle_invites != settings.notify_huddle_invites {
+                        sync_pref(
+                            "huddle_invite_notifications",
+                            settings.notify_huddle_invites.to_string(),
+                        );
+                    }
+                    if prev.notify_reminders != settings.notify_reminders {
+                        sync_pref(
+                            "reminder_notifications",
+                            settings.notify_reminders.to_string(),
                         );
                     }
                     if prev.show_preview != settings.show_preview {
@@ -212,6 +240,24 @@ impl App {
                     if prev.schedule_days != settings.schedule_days {
                         sync_pref("dnd_days", settings.schedule_days_wire().to_owned());
                     }
+                    if prev.schedule_custom_days != settings.schedule_custom_days
+                        && settings.schedule_days == 2
+                    {
+                        const DAY_KEYS: [&str; 7] = [
+                            "dnd_enabled_sunday",
+                            "dnd_enabled_monday",
+                            "dnd_enabled_tuesday",
+                            "dnd_enabled_wednesday",
+                            "dnd_enabled_thursday",
+                            "dnd_enabled_friday",
+                            "dnd_enabled_saturday",
+                        ];
+                        for (ix, key) in DAY_KEYS.iter().enumerate() {
+                            if prev.schedule_custom_days[ix] != settings.schedule_custom_days[ix] {
+                                sync_pref(key, settings.schedule_custom_days[ix].to_string());
+                            }
+                        }
+                    }
                     if prev.schedule_start != settings.schedule_start {
                         sync_pref(
                             "dnd_end_hour",
@@ -232,6 +278,12 @@ impl App {
                 }
                 if prev.launch_at_login != settings.launch_at_login {
                     sync_launch_at_login(settings.launch_at_login);
+                }
+                if prev.proxy_url != settings.proxy_url {
+                    slackless_core::api::set_proxy_url(Some(settings.proxy_url.clone()));
+                }
+                if prev.net_log_enabled != settings.net_log_enabled {
+                    slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
                 }
                 self.saved_settings = Some(settings.clone());
                 if let Some(write) = self.bridge.remember_settings(&settings) {

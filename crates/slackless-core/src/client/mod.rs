@@ -1113,6 +1113,27 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::EndDnd => {
+                self.spawn("dnd.endDnd", async move {
+                    backend.dnd_end_dnd().await?;
+                    events.emit(Event::SelfDndUpdated(slackless_types::DndStatus::default()));
+                    Ok(())
+                });
+            }
+            Command::LoadTeamDnd(users) => {
+                self.spawn("dnd.teamInfo", async move {
+                    let map = backend.dnd_team_info(users).await?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    let paused = map
+                        .into_iter()
+                        .map(|(uid, status)| (uid, status.paused(now)))
+                        .collect();
+                    events.emit(Event::TeamDndLoaded(paused));
+                    Ok(())
+                });
+            }
             Command::ScheduleMessage {
                 channel,
                 post_at,

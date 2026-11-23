@@ -294,6 +294,10 @@ pub enum Command {
     },
     /// Resume the signed-in user's notifications immediately (`dnd.endSnooze`).
     EndDndSnooze,
+    /// End the signed-in user's active DND session (`dnd.endDnd`, `F-SHELL-034`).
+    EndDnd,
+    /// Batch-fetch DND status for a list of users (`dnd.teamInfo`, `F-SHELL-035`).
+    LoadTeamDnd(Vec<UserId>),
     /// Queue a message for delivery at unix timestamp `post_at` (`chat.scheduleMessage`),
     /// optionally inside a thread (`thread_ts`), then reload scheduled messages.
     ScheduleMessage {
@@ -602,6 +606,8 @@ pub enum Event {
     /// A user's notifications are paused (snooze or their do-not-disturb window); fetched
     /// when their DM opens. Ephemeral: front-ends keep it in memory, it is never stored.
     DndPaused { user: UserId, paused: bool },
+    /// Batch DND status results from `dnd.teamInfo` (`F-SHELL-035`).
+    TeamDndLoaded(std::collections::HashMap<UserId, bool>),
     /// Local store matches for a [`Command::Search`], newest first.
     SearchResults {
         query: String,

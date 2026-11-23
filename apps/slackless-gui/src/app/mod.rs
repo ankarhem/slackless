@@ -1291,6 +1291,30 @@ impl App {
                         PreferencesEvent::ResetCache => this.confirm_reset_cache(window, cx),
                         PreferencesEvent::CompactStorage => this.compact_storage(window, cx),
                         PreferencesEvent::PruneMediaCache => this.prune_media_cache(window, cx),
+                        PreferencesEvent::ExportNetLog => {
+                            let json = slackless_core::api::net_log_export_json();
+                            let configured =
+                                this.preferences.read(cx).settings().download_dir.clone();
+                            let dir = if !configured.is_empty() {
+                                std::path::PathBuf::from(configured)
+                            } else {
+                                std::env::var_os("HOME")
+                                    .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+                                    .unwrap_or_else(std::env::temp_dir)
+                            };
+                            let path = dir.join("slackless-net-log.json");
+                            match std::fs::write(&path, json) {
+                                Ok(()) => notify(
+                                    "Net log exported",
+                                    format!("Saved to {}", path.display()),
+                                    window,
+                                    cx,
+                                ),
+                                Err(err) => {
+                                    notify("Net log export failed", err.to_string(), window, cx)
+                                }
+                            }
+                        }
                     },
                 ),
                 cx.observe_window_appearance(window, |this: &mut App, window, cx| {

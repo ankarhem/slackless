@@ -18,7 +18,10 @@ mod methods;
 mod pagination;
 
 pub use assets::AssetClient;
-pub use client::{MAX_RATE_LIMIT_RETRIES, SlackApi};
+pub use client::{
+    MAX_RATE_LIMIT_RETRIES, NetLogEntry, SlackApi, clear_net_log, net_log_enabled,
+    net_log_export_json, net_log_snapshot, proxy_url, set_net_log_enabled, set_proxy_url,
+};
 pub use error::ApiError;
 pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
