@@ -8,6 +8,7 @@
 //! connection to start.
 
 mod archive;
+mod live;
 mod output;
 mod session;
 mod write;
@@ -130,10 +131,149 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
     },
+    /// Mark a followed thread read or unread (`subscriptions.thread.mark`, needs a stored session).
+    MarkThread {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Thread root ts.
+        thread_ts: String,
+        /// Read cursor ts (defaults to `thread_ts`).
+        ts: Option<String>,
+        /// Mark the thread unread instead of read.
+        #[arg(long)]
+        unread: bool,
+    },
+    /// Manage Later / Saved items (needs a stored session).
+    Saved {
+        #[command(subcommand)]
+        command: SavedCommand,
+    },
+    /// List workspace or channel files (`files.list`, needs a stored session).
+    Files {
+        /// Optional channel id, #name, or @handle to filter by.
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+        /// Optional Slack file types filter (e.g. `canvas`, `images`, `pdfs`).
+        #[arg(long, value_name = "TYPES")]
+        types: Option<String>,
+        /// Maximum number of files (1..=200).
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        limit: u32,
+    },
+    /// Read, create, or edit Slack Canvases (needs a stored session).
+    Canvas {
+        #[command(subcommand)]
+        command: CanvasCommand,
+    },
+    /// Read, create, or mutate Slack Lists (needs a stored session).
+    List {
+        #[command(subcommand)]
+        command: ListCommand,
+    },
+    /// Stream live Slack messages and events over the realtime websocket (needs a stored session).
+    Watch {
+        /// Optional channel id, #name, or @handle to filter events to.
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+        /// Stop after emitting N matching events.
+        #[arg(long, value_name = "N")]
+        count: Option<usize>,
+    },
     /// Account and session management.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SavedCommand {
+    /// List saved items (`in_progress`, `completed`, or `archived`).
+    List {
+        #[arg(long, default_value = "in_progress")]
+        filter: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+    /// Save a message for Later (`saved.add`).
+    Add {
+        channel: String,
+        ts: String,
+        /// Optional reminder due time (unix epoch seconds).
+        #[arg(long)]
+        due: Option<u64>,
+    },
+    /// Mark a saved item completed (`saved.update`).
+    Done { channel: String, ts: String },
+    /// Remove a saved item from Later (`saved.delete`).
+    Delete { channel: String, ts: String },
+}
+
+#[derive(Subcommand)]
+enum CanvasCommand {
+    /// Fetch a canvas's markdown (or HTML with `--html`).
+    Read {
+        file_id: String,
+        #[arg(long)]
+        html: bool,
+    },
+    /// Create a standalone or channel-tabbed canvas (`canvases.create`).
+    Create {
+        title: String,
+        #[arg(long)]
+        markdown: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Edit a canvas via `canvases.edit` (replace whole canvas or one section, or `--append`).
+    Edit {
+        file_id: String,
+        markdown: String,
+        #[arg(long)]
+        section: Option<String>,
+        #[arg(long)]
+        append: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ListReadFormat {
+    Table,
+    Csv,
+    Json,
+}
+
+#[derive(Subcommand)]
+enum ListCommand {
+    /// Fetch a Slack List and print it as table, CSV, or JSON.
+    Read {
+        list_id: String,
+        #[arg(long, value_enum, default_value_t = ListReadFormat::Table)]
+        format: ListReadFormat,
+    },
+    /// Create a new Slack List (`lists.create`).
+    Create {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Add an item to a Slack List (`lists.records.create`).
+    AddItem {
+        list_id: String,
+        title: String,
+        /// Optional column ID (defaults to the list's primary column).
+        #[arg(long)]
+        column: Option<String>,
+    },
+    /// Delete an item from a Slack List (`lists.records.delete`).
+    DeleteItem { list_id: String, row_id: String },
+    /// Add a Slack message to an existing List (`lists.addToList`).
+    AddMessage {
+        list_id: String,
+        channel: String,
+        ts: String,
     },
 }
 
@@ -229,6 +369,79 @@ async fn dispatch(
             limit,
             out.as_deref(),
         ),
+        Commands::MarkThread {
+            channel,
+            thread_ts,
+            ts,
+            unread,
+        } => live::run_mark_thread(ctx, flag, &channel, &thread_ts, ts.as_deref(), unread).await,
+        Commands::Saved { command } => match command {
+            SavedCommand::List { filter, limit } => {
+                live::run_saved_list(ctx, flag, &filter, limit).await
+            }
+            SavedCommand::Add { channel, ts, due } => {
+                live::run_saved_add(ctx, flag, &channel, &ts, due).await
+            }
+            SavedCommand::Done { channel, ts } => {
+                live::run_saved_done(ctx, flag, &channel, &ts).await
+            }
+            SavedCommand::Delete { channel, ts } => {
+                live::run_saved_delete(ctx, flag, &channel, &ts).await
+            }
+        },
+        Commands::Files {
+            channel,
+            types,
+            limit,
+        } => live::run_files(ctx, flag, channel.as_deref(), types, limit).await,
+        Commands::Canvas { command } => match command {
+            CanvasCommand::Read { file_id, html } => {
+                live::run_canvas_read(ctx, flag, &file_id, html).await
+            }
+            CanvasCommand::Create {
+                title,
+                markdown,
+                channel,
+            } => {
+                live::run_canvas_create(ctx, flag, &title, markdown.as_deref(), channel.as_deref())
+                    .await
+            }
+            CanvasCommand::Edit {
+                file_id,
+                markdown,
+                section,
+                append,
+            } => live::run_canvas_edit(ctx, flag, &file_id, markdown, section, append).await,
+        },
+        Commands::List { command } => match command {
+            ListCommand::Read { list_id, format } => {
+                live::run_list_read(ctx, flag, &list_id, format).await
+            }
+            ListCommand::Create {
+                name,
+                description,
+                channel,
+            } => {
+                live::run_list_create(ctx, flag, &name, description.as_deref(), channel.as_deref())
+                    .await
+            }
+            ListCommand::AddItem {
+                list_id,
+                title,
+                column,
+            } => live::run_list_add_item(ctx, flag, &list_id, title, column).await,
+            ListCommand::DeleteItem { list_id, row_id } => {
+                live::run_list_delete_item(ctx, flag, &list_id, &row_id).await
+            }
+            ListCommand::AddMessage {
+                list_id,
+                channel,
+                ts,
+            } => live::run_list_add_message(ctx, flag, &list_id, &channel, &ts).await,
+        },
+        Commands::Watch { channel, count } => {
+            live::run_watch(ctx, flag, channel.as_deref(), count).await
+        }
         Commands::Auth { command } => match command {
             AuthCommand::Status => cmd_auth_status(ctx),
             AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),

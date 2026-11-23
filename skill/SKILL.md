@@ -11,9 +11,9 @@ description: This skill should be used when an AI agent needs to search, read, s
 
 Two kinds of commands exist.
 
-Read commands (`search`, `read`, `channels`, `dms`, `auth status`) work offline against the local archive, the same SQLite file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
+Offline archive commands (`search`, `read`, `channels`, `dms`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
 
-Write commands (`send`, `reply`, `react`) post to Slack over REST using a stored session, one request per invocation, no websocket to keep alive. They need credentials, which come from a one-time interactive sign-in (`slackless auth login` or the desktop app).
+Live Slack commands (`send`, `reply`, `react`, `mark-thread`, `saved`, `files`, `canvas`, `list`, `watch`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`).
 
 ## Setup and auth
 
@@ -188,6 +188,93 @@ JSON output:
 `user` is the peer's user id, `user_name` its resolved display name when the archive has one. For a group DM (`kind: "mpim"`), `name` holds the group's name and `user` is null.
 
 Human output is `id<TAB>peer<TAB>user_id<TAB>kind`.
+
+### stats / vacuum / threads / revisions / export (offline archive)
+
+```
+slackless stats [--breakdown]
+slackless vacuum
+slackless threads [--channel CHANNEL] [--limit N]
+slackless revisions <CHANNEL> <TS>
+slackless export <CHANNEL> [--format md|json] [--limit N] [--out PATH]
+```
+
+- `stats` prints SQLite database size, message/revision/conversation/user counts, offline queue count, and (with `--breakdown`) per-table counts and the top 10 largest channels.
+- `vacuum` checkpoints WAL, compacts pages (`VACUUM`), and optimizes FTS5 indexes.
+- `threads` lists locally archived thread roots that have replies, newest first.
+- `revisions` prints the immutable append-only edit & deletion history recorded for one message.
+- `export` exports a conversation's archived messages as Markdown or JSON (stdout or `--out PATH`).
+
+### mark-thread
+
+```
+slackless mark-thread <CHANNEL> <THREAD_TS> [TS] [--unread]
+```
+
+Mark a followed thread read (`read: true`) or unread (`--unread`, `read: false`) via `subscriptions.thread.mark`. `[TS]` defaults to `<THREAD_TS>`.
+
+JSON output:
+
+```json
+{
+  "ok": true,
+  "channel": "C0123ABC",
+  "thread_ts": "1739280000.000100",
+  "ts": "1739280456.000300",
+  "read": true
+}
+```
+
+### saved
+
+```
+slackless saved list [--filter in_progress|completed|archived] [--limit N]
+slackless saved add <CHANNEL> <TS> [--due UNIX_SECS]
+slackless saved done <CHANNEL> <TS>
+slackless saved delete <CHANNEL> <TS>
+```
+
+List, create, complete, or remove Later / Saved items.
+
+### files
+
+```
+slackless files [--channel CHANNEL] [--types TYPES] [--limit N]
+```
+
+List workspace or channel files via `files.list` (for example `--types canvas` for canvases).
+
+### canvas
+
+```
+slackless canvas read <FILE_ID> [--html]
+slackless canvas create <TITLE> [--markdown MD] [--channel CHANNEL]
+slackless canvas edit <FILE_ID> <MARKDOWN> [--section SECTION_ID] [--append]
+```
+
+- `read` fetches markdown via `canvases.getContent` (falling back to HTML export, or forcing HTML with `--html`).
+- `create` creates a standalone or channel-tabbed canvas via `canvases.create`.
+- `edit` updates a canvas via `canvases.edit` (replaces the whole document, replaces `--section SECTION_ID`, or appends with `--append`).
+
+### list
+
+```
+slackless list read <LIST_ID> [--format table|csv|json]
+slackless list create <NAME> [--description DESC] [--channel CHANNEL]
+slackless list add-item <LIST_ID> <TITLE> [--column COL_ID]
+slackless list delete-item <LIST_ID> <ROW_ID>
+slackless list add-message <LIST_ID> <CHANNEL> <TS>
+```
+
+Read, export, create, and mutate Slack Lists (`fetch_list`, `lists.create`, `lists.records.create`, `lists.records.delete`, `lists.addToList`).
+
+### watch
+
+```
+slackless watch [--channel CHANNEL] [--count N]
+```
+
+Stream live Slack `message`, `reaction_added`, and `thread_marked` events over the realtime websocket. Under `--json`, emits one JSON object per line (NDJSON). Pass `--count N` to exit cleanly after `N` matching events.
 
 ### auth status
 
