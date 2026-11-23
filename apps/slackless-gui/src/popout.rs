@@ -3159,7 +3159,7 @@ impl PopoutWindow {
             rgb(0xE01E5A),
         );
         let send = self.send.clone();
-        let loopback = slackless_core::huddle::detect_system_audio_loopback();
+        let loopback = slackless_core::huddle::system_audio_source_label();
         v_flex()
             .max_w(px(560.))
             .p_3()

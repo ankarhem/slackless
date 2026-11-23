@@ -6,6 +6,8 @@ pub mod audio;
 pub mod av1;
 pub mod clips;
 pub mod content_share;
+#[cfg(target_os = "macos")]
+pub mod macos_audio_tap;
 pub mod peer_message;
 pub mod rtc;
 pub mod screen;
@@ -34,7 +36,7 @@ pub use audio::{
 pub use clips::{
     AudioClipRecorder, ClipVideoSource, RecordedClip, VideoClipRecorder, finish_audio_clip,
 };
-pub use content_share::detect_system_audio_loopback;
+pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
 pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};

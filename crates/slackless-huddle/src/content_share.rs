@@ -50,6 +50,18 @@ pub fn detect_system_audio_loopback() -> Option<String> {
     None
 }
 
+/// Human-readable status of system audio capture for screen sharing (`F-COLLAB-022`).
+/// Prefers macOS 14.2+ native CoreAudio Process Tap (zero driver needed), then virtual loopback.
+pub fn system_audio_source_label() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::macos_audio_tap::supports_native_system_audio_tap() {
+            return Some("macOS Native System Audio".to_owned());
+        }
+    }
+    detect_system_audio_loopback()
+}
+
 /// Running `#content` screen-share session handle.
 pub struct ContentShareSession {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -131,86 +143,107 @@ impl ContentShareSession {
         let running = Arc::new(AtomicBool::new(true));
         let running_audio = Arc::clone(&running);
         let rtc_audio = Arc::clone(&rtc);
-        let loopback_device = detect_system_audio_loopback();
         let loopback_pcm: Arc<Mutex<VecDeque<i16>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(48_000 * 2)));
         let loopback_capture_running = Arc::clone(&running);
         let loopback_pcm_tx = Arc::clone(&loopback_pcm);
-        if let Some(dev_name) = loopback_device.clone() {
-            let _ = std::thread::Builder::new()
-                .name("slackless-screen-audio".to_owned())
-                .spawn(move || {
-                    let host = cpal::default_host();
-                    let Some(dev) = host.input_devices().ok().and_then(|mut it| {
-                        it.find(|d| d.name().ok().as_deref() == Some(dev_name.as_str()))
-                    }) else {
-                        return;
-                    };
-                    let Ok(supported) = dev.default_input_config() else {
-                        return;
-                    };
-                    let fmt = supported.sample_format();
-                    let ch = supported.channels() as usize;
-                    let cfg: cpal::StreamConfig = supported.into();
-                    let push = move |stereo: Vec<i16>| {
-                        if let Ok(mut q) = loopback_pcm_tx.lock() {
-                            if q.len() > 48_000 * 4 {
-                                q.drain(..48_000);
+
+        // Priority 1 (macOS 14.2+): Zero-driver CoreAudio Process Tap (`F-COLLAB-022`).
+        #[cfg(target_os = "macos")]
+        let native_tap = if crate::macos_audio_tap::supports_native_system_audio_tap() {
+            crate::macos_audio_tap::SystemAudioTap::start(Arc::clone(&loopback_pcm)).ok()
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
+        let native_tap: Option<()> = None;
+
+        let loopback_device = if native_tap.is_some() {
+            Some("macOS Native System Audio".to_owned())
+        } else {
+            detect_system_audio_loopback()
+        };
+
+        if native_tap.is_none() {
+            if let Some(dev_name) = loopback_device.clone() {
+                let _ = std::thread::Builder::new()
+                    .name("slackless-screen-audio".to_owned())
+                    .spawn(move || {
+                        let host = cpal::default_host();
+                        let Some(dev) = host.input_devices().ok().and_then(|mut it| {
+                            it.find(|d| d.name().ok().as_deref() == Some(dev_name.as_str()))
+                        }) else {
+                            return;
+                        };
+                        let Ok(supported) = dev.default_input_config() else {
+                            return;
+                        };
+                        let fmt = supported.sample_format();
+                        let ch = supported.channels() as usize;
+                        let cfg: cpal::StreamConfig = supported.into();
+                        let push = move |stereo: Vec<i16>| {
+                            if let Ok(mut q) = loopback_pcm_tx.lock() {
+                                if q.len() > 48_000 * 4 {
+                                    q.drain(..48_000);
+                                }
+                                q.extend(stereo);
                             }
-                            q.extend(stereo);
+                        };
+                        let stream = match fmt {
+                            SampleFormat::F32 => dev
+                                .build_input_stream(
+                                    &cfg,
+                                    move |data: &[f32], _| {
+                                        let mut out =
+                                            Vec::with_capacity((data.len() / ch.max(1)) * 2);
+                                        for frame in data.chunks(ch.max(1)) {
+                                            let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
+                                            let r = (frame
+                                                .get(1)
+                                                .copied()
+                                                .unwrap_or(frame[0])
+                                                .clamp(-1.0, 1.0)
+                                                * 32767.0)
+                                                as i16;
+                                            out.push(l);
+                                            out.push(r);
+                                        }
+                                        push(out);
+                                    },
+                                    |_| {},
+                                    None,
+                                )
+                                .ok(),
+                            SampleFormat::I16 => dev
+                                .build_input_stream(
+                                    &cfg,
+                                    move |data: &[i16], _| {
+                                        let mut out =
+                                            Vec::with_capacity((data.len() / ch.max(1)) * 2);
+                                        for frame in data.chunks(ch.max(1)) {
+                                            out.push(frame[0]);
+                                            out.push(*frame.get(1).unwrap_or(&frame[0]));
+                                        }
+                                        push(out);
+                                    },
+                                    |_| {},
+                                    None,
+                                )
+                                .ok(),
+                            _ => None,
+                        };
+                        let Some(stream) = stream else { return };
+                        let _ = stream.play();
+                        while loopback_capture_running.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(50));
                         }
-                    };
-                    let stream = match fmt {
-                        SampleFormat::F32 => dev
-                            .build_input_stream(
-                                &cfg,
-                                move |data: &[f32], _| {
-                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
-                                    for frame in data.chunks(ch.max(1)) {
-                                        let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
-                                        let r = (frame
-                                            .get(1)
-                                            .copied()
-                                            .unwrap_or(frame[0])
-                                            .clamp(-1.0, 1.0)
-                                            * 32767.0)
-                                            as i16;
-                                        out.push(l);
-                                        out.push(r);
-                                    }
-                                    push(out);
-                                },
-                                |_| {},
-                                None,
-                            )
-                            .ok(),
-                        SampleFormat::I16 => dev
-                            .build_input_stream(
-                                &cfg,
-                                move |data: &[i16], _| {
-                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
-                                    for frame in data.chunks(ch.max(1)) {
-                                        out.push(frame[0]);
-                                        out.push(*frame.get(1).unwrap_or(&frame[0]));
-                                    }
-                                    push(out);
-                                },
-                                |_| {},
-                                None,
-                            )
-                            .ok(),
-                        _ => None,
-                    };
-                    let Some(stream) = stream else { return };
-                    let _ = stream.play();
-                    while loopback_capture_running.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                });
+                    });
+            }
         }
-        // Feed live system loopback audio (when available, `F-COLLAB-022`) or 20ms stereo Opus
+        // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) or 20ms stereo Opus
         // silence (matching official Chime SDK) on the `#content` audio m-line.
         tokio::spawn(async move {
+            let _tap_guard = native_tap;
             let Ok(mut enc) =
                 opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
             else {

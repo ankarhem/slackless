@@ -305,13 +305,15 @@ pub fn finish_audio_clip(pcm: Vec<i16>, elapsed_ms: u64) -> Result<RecordedClip>
     })
 }
 
-/// Live camera or screen video clip recorder (`F-CORE-128`).
+/// Live camera or screen video clip recorder (`F-CORE-128`) with synchronized microphone audio.
 pub struct VideoClipRecorder {
     running: Arc<AtomicBool>,
     latest_preview: Arc<Mutex<Option<VideoFrame>>>,
     frames: Arc<Mutex<Vec<EncodedH264Frame>>>,
+    audio_pcm: Arc<Mutex<Vec<i16>>>,
     dimensions: Arc<Mutex<(u32, u32)>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    audio_worker: Option<std::thread::JoinHandle<()>>,
     started_at: Instant,
 }
 
@@ -320,12 +322,14 @@ struct EncodedH264Frame {
 }
 
 impl VideoClipRecorder {
-    /// Start capturing camera or screen frames into H.264.
+    /// Start capturing camera or screen frames into H.264 plus synchronized microphone audio.
     pub fn start(source: ClipVideoSource) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let latest_preview: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
         let frames: Arc<Mutex<Vec<EncodedH264Frame>>> =
             Arc::new(Mutex::new(Vec::with_capacity(120)));
+        let audio_pcm: Arc<Mutex<Vec<i16>>> =
+            Arc::new(Mutex::new(Vec::with_capacity((SAMPLE_RATE as usize) * 15)));
         let dimensions: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((0, 0)));
 
         let run_flag = Arc::clone(&running);
@@ -333,6 +337,26 @@ impl VideoClipRecorder {
         let frames_cb = Arc::clone(&frames);
         let dims_cb = Arc::clone(&dimensions);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+
+        // Optional synchronized microphone capture thread (fails gracefully if no mic is available).
+        let audio_run = Arc::clone(&running);
+        let audio_buf = Arc::clone(&audio_pcm);
+        let audio_worker = std::thread::Builder::new()
+            .name("slackless-video-clip-audio".to_owned())
+            .spawn(move || {
+                let Ok(rec) = AudioClipRecorder::start() else {
+                    return;
+                };
+                while audio_run.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                if let Ok((pcm, _)) = rec.stop_to_pcm() {
+                    if let Ok(mut dst) = audio_buf.lock() {
+                        *dst = pcm;
+                    }
+                }
+            })
+            .ok();
 
         let worker = std::thread::Builder::new()
             .name("slackless-video-clip".to_owned())
@@ -448,8 +472,10 @@ impl VideoClipRecorder {
             running,
             latest_preview,
             frames,
+            audio_pcm,
             dimensions,
             worker: Some(worker),
+            audio_worker,
             started_at: Instant::now(),
         })
     }
@@ -467,13 +493,19 @@ impl VideoClipRecorder {
         if let Some(h) = self.worker.take() {
             let _ = h.join();
         }
+        if let Some(h) = self.audio_worker.take() {
+            let _ = h.join();
+        }
     }
 
-    /// Stop capturing and mux all H.264 frames into a standalone `.mp4` clip.
+    /// Stop capturing and mux H.264 video (+ synchronized AAC audio when available) into `.mp4`.
     pub fn stop(mut self) -> Result<RecordedClip> {
         let elapsed_ms = self.elapsed_ms();
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.audio_worker.take() {
             let _ = h.join();
         }
         let preview_frame = self.latest_preview();
@@ -486,15 +518,26 @@ impl VideoClipRecorder {
         if frames.is_empty() || w < 2 || h < 2 {
             return Err(HuddleError::Video("no video frames captured".into()));
         }
+        let pcm = self.audio_pcm.lock().map(|g| g.clone()).unwrap_or_default();
+        let aac_track = (!pcm.is_empty())
+            .then(|| {
+                let wav = encode_wav_pcm16(&pcm, SAMPLE_RATE, 1);
+                transcode_wav_to_aac_adts(&wav).and_then(|adts| parse_adts_frames(&adts))
+            })
+            .flatten();
         let fps = ((frames.len() as u64 * 1000) / elapsed_ms.max(250)).clamp(4, 30) as u32;
-        let mp4 = mux_h264_mp4(w, h, fps, &frames)?;
+        let mp4 = mux_h264_aac_mp4(w, h, fps, &frames, aac_track.as_ref())?;
         let slug = timestamp_slug();
         Ok(RecordedClip {
             filename: format!("video-clip-{slug}.mp4"),
             mime: "video/mp4".to_owned(),
             bytes: mp4,
             duration_ms: elapsed_ms,
-            waveform: Vec::new(),
+            waveform: if pcm.is_empty() {
+                Vec::new()
+            } else {
+                downsample_waveform(&pcm, 32)
+            },
             preview_frame,
         })
     }
@@ -504,6 +547,9 @@ impl Drop for VideoClipRecorder {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.audio_worker.take() {
             let _ = h.join();
         }
     }
@@ -655,6 +701,99 @@ fn transcode_wav_to_m4a(_wav: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// On macOS, transcode PCM WAV bytes into ADTS AAC frames via `/usr/bin/afconvert` for MP4 muxing.
+#[cfg(target_os = "macos")]
+fn transcode_wav_to_aac_adts(wav: &[u8]) -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir();
+    let stamp = timestamp_slug();
+    let pid = std::process::id();
+    let wav_path = dir.join(format!("slackless-vidclip-{pid}-{stamp}.wav"));
+    let aac_path = dir.join(format!("slackless-vidclip-{pid}-{stamp}.aac"));
+    std::fs::write(&wav_path, wav).ok()?;
+    let status = std::process::Command::new("/usr/bin/afconvert")
+        .args(["-f", "adts", "-d", "aac", "-b", "96000"])
+        .arg(&wav_path)
+        .arg(&aac_path)
+        .status()
+        .ok()?;
+    let _ = std::fs::remove_file(&wav_path);
+    if !status.success() {
+        let _ = std::fs::remove_file(&aac_path);
+        return None;
+    }
+    let bytes = std::fs::read(&aac_path).ok();
+    let _ = std::fs::remove_file(&aac_path);
+    bytes.filter(|b| !b.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn transcode_wav_to_aac_adts(_wav: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+/// Decoded raw AAC-LC frames ready for ISO-BMFF `mp4a`/`esds` track muxing.
+#[derive(Debug, Clone)]
+pub struct AacAudioTrack {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub audio_specific_config: [u8; 2],
+    pub frames: Vec<Vec<u8>>,
+}
+
+const ADTS_SAMPLE_RATES: [u32; 13] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+    7_350,
+];
+
+/// Parse an ADTS AAC bitstream into raw access units + 2-byte MPEG-4 `AudioSpecificConfig`.
+pub fn parse_adts_frames(data: &[u8]) -> Option<AacAudioTrack> {
+    let mut pos = 0usize;
+    let mut frames = Vec::new();
+    let mut header_meta: Option<(u32, u16, [u8; 2])> = None;
+
+    while pos + 7 <= data.len() {
+        if data[pos] != 0xFF || (data[pos + 1] & 0xF0) != 0xF0 {
+            pos += 1;
+            continue;
+        }
+        let protection_absent = (data[pos + 1] & 0x01) != 0;
+        let header_len = if protection_absent { 7 } else { 9 };
+        if pos + header_len > data.len() {
+            break;
+        }
+        let profile_object_type = ((data[pos + 2] >> 6) & 0x03) + 1; // 2 = AAC-LC
+        let sr_idx = ((data[pos + 2] >> 2) & 0x0F) as usize;
+        let ch_cfg = ((data[pos + 2] & 0x01) << 2) | ((data[pos + 3] >> 6) & 0x03);
+        let frame_len = (((data[pos + 3] & 0x03) as usize) << 11)
+            | ((data[pos + 4] as usize) << 3)
+            | (((data[pos + 5] >> 5) & 0x07) as usize);
+        if frame_len <= header_len || pos + frame_len > data.len() {
+            break;
+        }
+        if header_meta.is_none() {
+            let sr = *ADTS_SAMPLE_RATES.get(sr_idx)?;
+            let channels = (ch_cfg as u16).max(1);
+            // AudioSpecificConfig: 5 bits objectType | 4 bits freqIndex | 4 bits chanConfig | 3 bits 0
+            let asc0 = (profile_object_type << 3) | ((sr_idx as u8) >> 1);
+            let asc1 = (((sr_idx as u8) & 0x01) << 7) | ((ch_cfg & 0x0F) << 3);
+            header_meta = Some((sr, channels, [asc0, asc1]));
+        }
+        frames.push(data[pos + header_len..pos + frame_len].to_vec());
+        pos += frame_len;
+    }
+
+    let (sample_rate, channels, audio_specific_config) = header_meta?;
+    if frames.is_empty() {
+        return None;
+    }
+    Some(AacAudioTrack {
+        sample_rate,
+        channels,
+        audio_specific_config,
+        frames,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pure-Rust ISO-BMFF H.264 `.mp4` muxer (`ftyp` + `mdat` + `moov`/`avcC`)
 // ---------------------------------------------------------------------------
@@ -708,6 +847,17 @@ fn mp4_full_box(fourcc: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Ve
 
 /// Mux Annex-B H.264 access units into a self-contained ISO-BMFF `.mp4` container.
 pub fn mux_h264_mp4(width: u32, height: u32, fps: u32, frames: &[Vec<u8>]) -> Result<Vec<u8>> {
+    mux_h264_aac_mp4(width, height, fps, frames, None)
+}
+
+/// Mux Annex-B H.264 video frames + optional raw AAC-LC audio track into an ISO-BMFF `.mp4`.
+pub fn mux_h264_aac_mp4(
+    width: u32,
+    height: u32,
+    fps: u32,
+    frames: &[Vec<u8>],
+    audio: Option<&AacAudioTrack>,
+) -> Result<Vec<u8>> {
     let fps = fps.max(1);
     let timescale: u32 = 90_000;
     let sample_delta: u32 = timescale / fps;
@@ -772,8 +922,18 @@ pub fn mux_h264_mp4(width: u32, height: u32, fps: u32, frames: &[Vec<u8>]) -> Re
     ftyp_body.extend_from_slice(b"isomiso2avc1mp41");
     let ftyp = mp4_box(b"ftyp", &ftyp_body);
 
-    let mdat_data_offset = (ftyp.len() + 8) as u32;
+    let video_chunk_offset = (ftyp.len() + 8) as u32;
+    let audio_chunk_offset = (ftyp.len() + 8 + mdat_payload.len()) as u32;
+    let mut audio_sizes: Vec<u32> = Vec::new();
+    if let Some(a) = audio {
+        audio_sizes.reserve(a.frames.len());
+        for frame in &a.frames {
+            mdat_payload.extend_from_slice(frame);
+            audio_sizes.push(frame.len() as u32);
+        }
+    }
     let mdat = mp4_box(b"mdat", &mdat_payload);
+    let mdat_data_offset = video_chunk_offset;
 
     let total_duration = sample_sizes.len() as u32 * sample_delta;
 
@@ -917,6 +1077,7 @@ pub fn mux_h264_mp4(width: u32, height: u32, fps: u32, frames: &[Vec<u8>]) -> Re
     trak_body.extend_from_slice(&mdia);
     let trak = mp4_box(b"trak", &trak_body);
 
+    let next_track_id: u32 = if audio.is_some() { 3 } else { 2 };
     let mut mvhd_body = Vec::new();
     mvhd_body.extend_from_slice(&0u32.to_be_bytes());
     mvhd_body.extend_from_slice(&0u32.to_be_bytes());
@@ -929,12 +1090,24 @@ pub fn mux_h264_mp4(width: u32, height: u32, fps: u32, frames: &[Vec<u8>]) -> Re
         mvhd_body.extend_from_slice(&m.to_be_bytes());
     }
     mvhd_body.extend_from_slice(&[0u8; 24]); // pre_defined
-    mvhd_body.extend_from_slice(&2u32.to_be_bytes()); // next_track_id
+    mvhd_body.extend_from_slice(&next_track_id.to_be_bytes());
     let mvhd = mp4_full_box(b"mvhd", 0, 0, &mvhd_body);
 
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&mvhd);
     moov_body.extend_from_slice(&trak);
+    if let Some(a) = audio {
+        if !audio_sizes.is_empty() {
+            let audio_trak = build_aac_mp4_trak(
+                a,
+                &audio_sizes,
+                audio_chunk_offset,
+                total_duration,
+                unity_matrix,
+            );
+            moov_body.extend_from_slice(&audio_trak);
+        }
+    }
     let moov = mp4_box(b"moov", &moov_body);
 
     let mut out = Vec::with_capacity(ftyp.len() + mdat.len() + moov.len());
@@ -942,6 +1115,152 @@ pub fn mux_h264_mp4(width: u32, height: u32, fps: u32, frames: &[Vec<u8>]) -> Re
     out.extend_from_slice(&mdat);
     out.extend_from_slice(&moov);
     Ok(out)
+}
+
+fn build_aac_mp4_trak(
+    audio: &AacAudioTrack,
+    sample_sizes: &[u32],
+    chunk_offset: u32,
+    movie_duration: u32,
+    unity_matrix: [u32; 9],
+) -> Vec<u8> {
+    let audio_timescale = audio.sample_rate.max(8_000);
+    let sample_delta = 1024u32; // AAC-LC frame length
+    let audio_duration = sample_sizes.len() as u32 * sample_delta;
+
+    // MPEG-4 ES_Descriptor (`esds`) carrying DecoderSpecificInfo = AudioSpecificConfig.
+    let asc = audio.audio_specific_config;
+    let dec_spec = vec![0x05, 0x02, asc[0], asc[1]];
+    let mut dec_cfg = vec![
+        0x04,
+        (13 + dec_spec.len()) as u8,
+        0x40, // objectTypeIndication: MPEG-4 Audio
+        0x15, // streamType=Audio (5<<2 | 1)
+        0x00,
+        0x00,
+        0x00, // bufferSizeDB
+    ];
+    dec_cfg.extend_from_slice(&128_000u32.to_be_bytes()); // maxBitrate
+    dec_cfg.extend_from_slice(&96_000u32.to_be_bytes()); // avgBitrate
+    dec_cfg.extend_from_slice(&dec_spec);
+    let sl_cfg = [0x06u8, 0x01, 0x02];
+    let mut es_desc = vec![
+        0x03,
+        (3 + dec_cfg.len() + sl_cfg.len()) as u8,
+        0x00,
+        0x02, // ES_ID = 2
+        0x00, // flags
+    ];
+    es_desc.extend_from_slice(&dec_cfg);
+    es_desc.extend_from_slice(&sl_cfg);
+    let esds = mp4_full_box(b"esds", 0, 0, &es_desc);
+
+    let mut mp4a_body = Vec::new();
+    mp4a_body.extend_from_slice(&[0u8; 6]); // reserved
+    mp4a_body.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+    mp4a_body.extend_from_slice(&[0u8; 8]); // reserved
+    mp4a_body.extend_from_slice(&audio.channels.to_be_bytes());
+    mp4a_body.extend_from_slice(&16u16.to_be_bytes()); // sampleSize
+    mp4a_body.extend_from_slice(&0u32.to_be_bytes()); // pre_defined + reserved
+    mp4a_body.extend_from_slice(&(audio_timescale << 16).to_be_bytes()); // 16.16 fixed point
+    mp4a_body.extend_from_slice(&esds);
+    let mp4a = mp4_box(b"mp4a", &mp4a_body);
+
+    let mut stsd_body = Vec::new();
+    stsd_body.extend_from_slice(&1u32.to_be_bytes());
+    stsd_body.extend_from_slice(&mp4a);
+    let stsd = mp4_full_box(b"stsd", 0, 0, &stsd_body);
+
+    let mut stts_body = Vec::new();
+    stts_body.extend_from_slice(&1u32.to_be_bytes());
+    stts_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
+    stts_body.extend_from_slice(&sample_delta.to_be_bytes());
+    let stts = mp4_full_box(b"stts", 0, 0, &stts_body);
+
+    let mut stsc_body = Vec::new();
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    stsc_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
+    stsc_body.extend_from_slice(&1u32.to_be_bytes());
+    let stsc = mp4_full_box(b"stsc", 0, 0, &stsc_body);
+
+    let mut stsz_body = Vec::new();
+    stsz_body.extend_from_slice(&0u32.to_be_bytes());
+    stsz_body.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
+    for &sz in sample_sizes {
+        stsz_body.extend_from_slice(&sz.to_be_bytes());
+    }
+    let stsz = mp4_full_box(b"stsz", 0, 0, &stsz_body);
+
+    let mut stco_body = Vec::new();
+    stco_body.extend_from_slice(&1u32.to_be_bytes());
+    stco_body.extend_from_slice(&chunk_offset.to_be_bytes());
+    let stco = mp4_full_box(b"stco", 0, 0, &stco_body);
+
+    let mut stbl_body = Vec::new();
+    for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+        stbl_body.extend_from_slice(b);
+    }
+    let stbl = mp4_box(b"stbl", &stbl_body);
+
+    let smhd = mp4_full_box(b"smhd", 0, 0, &[0u8; 4]);
+    let url_box = mp4_full_box(b"url ", 0, 1, &[]);
+    let mut dref_body = Vec::new();
+    dref_body.extend_from_slice(&1u32.to_be_bytes());
+    dref_body.extend_from_slice(&url_box);
+    let dref = mp4_full_box(b"dref", 0, 0, &dref_body);
+    let dinf = mp4_box(b"dinf", &dref);
+
+    let mut minf_body = Vec::new();
+    minf_body.extend_from_slice(&smhd);
+    minf_body.extend_from_slice(&dinf);
+    minf_body.extend_from_slice(&stbl);
+    let minf = mp4_box(b"minf", &minf_body);
+
+    let mut mdhd_body = Vec::new();
+    mdhd_body.extend_from_slice(&0u32.to_be_bytes());
+    mdhd_body.extend_from_slice(&0u32.to_be_bytes());
+    mdhd_body.extend_from_slice(&audio_timescale.to_be_bytes());
+    mdhd_body.extend_from_slice(&audio_duration.to_be_bytes());
+    mdhd_body.extend_from_slice(&0x55C4u16.to_be_bytes());
+    mdhd_body.extend_from_slice(&0u16.to_be_bytes());
+    let mdhd = mp4_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+    let mut hdlr_body = Vec::new();
+    hdlr_body.extend_from_slice(&0u32.to_be_bytes());
+    hdlr_body.extend_from_slice(b"soun");
+    hdlr_body.extend_from_slice(&[0u8; 12]);
+    hdlr_body.extend_from_slice(b"SoundHandler\0");
+    let hdlr = mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+    let mut mdia_body = Vec::new();
+    mdia_body.extend_from_slice(&mdhd);
+    mdia_body.extend_from_slice(&hdlr);
+    mdia_body.extend_from_slice(&minf);
+    let mdia = mp4_box(b"mdia", &mdia_body);
+
+    let mut tkhd_body = Vec::new();
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_body.extend_from_slice(&2u32.to_be_bytes()); // track_id = 2
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes());
+    tkhd_body.extend_from_slice(&movie_duration.to_be_bytes());
+    tkhd_body.extend_from_slice(&[0u8; 8]);
+    tkhd_body.extend_from_slice(&0u16.to_be_bytes());
+    tkhd_body.extend_from_slice(&1u16.to_be_bytes()); // alternate_group
+    tkhd_body.extend_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0
+    tkhd_body.extend_from_slice(&0u16.to_be_bytes());
+    for m in unity_matrix {
+        tkhd_body.extend_from_slice(&m.to_be_bytes());
+    }
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // width = 0
+    tkhd_body.extend_from_slice(&0u32.to_be_bytes()); // height = 0
+    let tkhd = mp4_full_box(b"tkhd", 0, 0x0000_0003, &tkhd_body);
+
+    let mut trak_body = Vec::new();
+    trak_body.extend_from_slice(&tkhd);
+    trak_body.extend_from_slice(&mdia);
+    mp4_box(b"trak", &trak_body)
 }
 
 #[cfg(test)]
@@ -993,5 +1312,38 @@ mod tests {
         assert!(mp4.windows(4).any(|w| w == b"avcC"));
         assert!(mp4.windows(4).any(|w| w == b"stsz"));
         assert!(mp4.windows(4).any(|w| w == b"stco"));
+
+        let audio = AacAudioTrack {
+            sample_rate: 48_000,
+            channels: 1,
+            audio_specific_config: [0x11, 0x88],
+            frames: vec![
+                vec![0x21, 0x00, 0x49, 0x90, 0x02, 0x19],
+                vec![0x21, 0x00, 0x49, 0x90],
+            ],
+        };
+        let av_mp4 = mux_h264_aac_mp4(w as u32, h as u32, 12, &frames, Some(&audio))
+            .expect("mux dual-track mp4");
+        assert!(av_mp4.windows(4).any(|w| w == b"avcC"));
+        assert!(av_mp4.windows(4).any(|w| w == b"mp4a"));
+        assert!(av_mp4.windows(4).any(|w| w == b"esds"));
+        assert!(av_mp4.windows(4).any(|w| w == b"soun"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn afconvert_adts_parses_and_muxes_into_dual_track_mp4() {
+        // 0.25s 440Hz sine at 48 kHz mono -> real macOS afconvert ADTS -> parse_adts_frames.
+        let pcm: Vec<i16> = (0..12_000)
+            .map(|i| {
+                ((i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 12_000.0) as i16
+            })
+            .collect();
+        let wav = encode_wav_pcm16(&pcm, 48_000, 1);
+        let adts = transcode_wav_to_aac_adts(&wav).expect("afconvert adts");
+        let track = parse_adts_frames(&adts).expect("parse adts");
+        assert_eq!(track.sample_rate, 48_000);
+        assert_eq!(track.channels, 1);
+        assert!(track.frames.len() >= 10);
     }
 }
