@@ -611,6 +611,7 @@ impl App {
     ) {
         let title = self.label(&channel);
         let on_jump = self.popout_jump_handler(window, cx);
+        let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutKind::Conversation {
                 channel,
@@ -622,6 +623,7 @@ impl App {
             self.bridge.store().cloned(),
             self.bridge.team_id().cloned(),
             self.bridge.forwarder(),
+            display_id,
             cx,
         );
     }
@@ -636,6 +638,7 @@ impl App {
     ) {
         let title = format!("Thread in {}", self.label(&channel));
         let on_jump = self.popout_jump_handler(window, cx);
+        let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutKind::Thread {
                 channel,
@@ -648,6 +651,7 @@ impl App {
             self.bridge.store().cloned(),
             self.bridge.team_id().cloned(),
             self.bridge.forwarder(),
+            display_id,
             cx,
         );
     }
@@ -655,6 +659,7 @@ impl App {
     /// Pop out the live Activity feed into a separate native GPUI window (`F-SHELL-149`).
     pub(super) fn pop_out_activity(&self, window: &mut Window, cx: &mut Context<Self>) {
         let on_jump = self.popout_jump_handler(window, cx);
+        let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutKind::Activity {
                 source: self.activity.downgrade(),
@@ -665,6 +670,7 @@ impl App {
             None,
             None,
             self.bridge.forwarder(),
+            display_id,
             cx,
         );
     }
@@ -672,6 +678,7 @@ impl App {
     /// Pop out the live Saved / Later view into a separate native GPUI window (`F-SHELL-149`).
     pub(super) fn pop_out_later(&self, window: &mut Window, cx: &mut Context<Self>) {
         let on_jump = self.popout_jump_handler(window, cx);
+        let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
             crate::popout::PopoutKind::Later {
                 source: self.later.downgrade(),
@@ -682,6 +689,7 @@ impl App {
             None,
             None,
             self.bridge.forwarder(),
+            display_id,
             cx,
         );
     }

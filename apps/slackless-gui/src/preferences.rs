@@ -2063,16 +2063,19 @@ impl Render for PreferencesWindow {
     }
 }
 
-/// Open Preferences in a standalone native GPUI window (`920 x 640`, `F-CORE-011`).
+/// Open Preferences in a standalone native GPUI window (`920 x 640`, `F-CORE-011`), centered
+/// on `display_id` (the main window's display) or the primary display if `None`.
 pub fn open_preferences_window(
     preferences: Entity<Preferences>,
+    display_id: Option<gpui_kit::gpui::DisplayId>,
     cx: &mut gpui_kit::gpui::App,
 ) -> Option<gpui_kit::gpui::AnyWindowHandle> {
     use gpui_kit::component::TitleBar;
     use gpui_kit::gpui::{Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, size};
-    let bounds = Bounds::centered(None, size(px(920.), px(640.)), cx);
+    let bounds = Bounds::centered(display_id, size(px(920.), px(640.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id,
         titlebar: Some(TitlebarOptions {
             title: Some(SharedString::from("Preferences")),
             traffic_light_position: Some(point(px(8.), px(12.))),

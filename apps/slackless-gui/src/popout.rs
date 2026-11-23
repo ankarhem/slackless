@@ -15,7 +15,7 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FontWeight,
+    App, AppContext as _, Bounds, ClipboardItem, Context, DisplayId, Entity, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, WeakEntity,
     Window, WindowBounds, WindowOptions, div, point, px, size,
@@ -77,7 +77,23 @@ pub enum PopoutKind {
 /// Callback that forwards commands (`SendMessage`, etc.) to the workspace's live `CoreBridge`.
 pub type CommandForward = Arc<dyn Fn(Command) + Send + Sync>;
 
-/// Open a new native GPUI window showing `kind`.
+fn popout_window_options(title: &str, display_id: Option<DisplayId>, cx: &App) -> WindowOptions {
+    let bounds = Bounds::centered(display_id, size(px(720.), px(640.)), cx);
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id,
+        titlebar: Some(TitlebarOptions {
+            title: Some(SharedString::from(title.to_owned())),
+            traffic_light_position: Some(point(px(8.), px(12.))),
+            ..TitleBar::title_bar_options()
+        }),
+        ..TitleBar::window_options()
+    }
+}
+
+/// Open a new native GPUI window showing `kind`, centered on `display_id` (the main window's
+/// display) or the primary display if `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn open_popout(
     kind: PopoutKind,
     title: String,
@@ -85,18 +101,10 @@ pub fn open_popout(
     store: Option<SharedStore>,
     team: Option<TeamId>,
     send: CommandForward,
+    display_id: Option<DisplayId>,
     cx: &mut App,
 ) {
-    let bounds = Bounds::centered(None, size(px(720.), px(640.)), cx);
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions {
-            title: Some(SharedString::from(title.clone())),
-            traffic_light_position: Some(point(px(8.), px(12.))),
-            ..TitleBar::title_bar_options()
-        }),
-        ..TitleBar::window_options()
-    };
+    let options = popout_window_options(&title, display_id, cx);
     let _ = open_window(options, cx, move |window, cx| {
         window.set_window_title(&format!("{title} — slackless"));
         cx.new(|cx| PopoutWindow::new(kind, title, fixtures, store, team, send, window, cx))
@@ -1012,5 +1020,22 @@ mod tests {
             vec!["add:eyes", "rm:eyes", "save", "unsave", "pin:true"]
         );
         assert_eq!(*jumped.lock().unwrap(), vec![(channel, Some(ts), true)]);
+    }
+
+    #[gpui::test]
+    fn open_popout_targets_the_requested_display(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let second_display = DisplayId::from(2u64);
+        cx.simulate_display_added(second_display, None);
+
+        cx.update(|cx| {
+            let opts = popout_window_options("# general", Some(second_display), cx);
+            assert_eq!(opts.display_id, Some(second_display));
+            assert!(opts.window_bounds.is_some());
+            assert!(opts.titlebar.is_some());
+
+            let default_opts = popout_window_options("# general", None, cx);
+            assert_eq!(default_opts.display_id, None);
+        });
     }
 }

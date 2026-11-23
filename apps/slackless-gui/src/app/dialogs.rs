@@ -1168,7 +1168,7 @@ impl App {
     pub(super) fn open_preferences(
         &mut self,
         section: Option<Section>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.refresh_storage_stats(cx);
@@ -1187,8 +1187,9 @@ impl App {
             }
             self.prefs_window = None;
         }
+        let display_id = window.display(cx).map(|d| d.id());
         self.prefs_window =
-            crate::preferences::open_preferences_window(self.preferences.clone(), cx);
+            crate::preferences::open_preferences_window(self.preferences.clone(), display_id, cx);
     }
 
     pub(super) fn open_status_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
