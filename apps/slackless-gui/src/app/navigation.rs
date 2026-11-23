@@ -151,10 +151,11 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let settings = self.preferences.read(cx).settings();
+        let browser_choice = settings.open_links;
         let blocked_scheme = !is_protocol_allowed(url, &settings.protocol_allowlist);
         let warn = blocked_scheme || (settings.warn_external && is_suspicious_url(url));
         if !warn {
-            cx.open_url(url);
+            launch_external_url(url, browser_choice, cx);
             return;
         }
         let target = url.to_owned();
@@ -193,7 +194,7 @@ impl App {
                                     .label("Open link")
                                     .on_click(move |_, window, cx| {
                                         window.close_dialog(cx);
-                                        cx.open_url(&open_target);
+                                        launch_external_url(&open_target, browser_choice, cx);
                                     }),
                             ),
                     ),
@@ -2457,6 +2458,31 @@ impl App {
             .is_some_and(|(channel, _)| *channel == self.channel)
             || self.ws.active_huddles.contains_key(&self.channel)
     }
+}
+
+/// Open `url` in the browser selected in Preferences -> Advanced (`0 = Default`, `1 = Safari`,
+/// `2 = Firefox`). Falls back to the system default handler on non-macOS or launch errors.
+fn launch_external_url(url: &str, browser_choice: usize, cx: &mut gpui::App) {
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = match browser_choice {
+            1 => Some("Safari"),
+            2 => Some("Firefox"),
+            _ => None,
+        };
+        if let Some(app_name) = app_name {
+            if std::process::Command::new("open")
+                .args(["-a", app_name, url])
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = browser_choice;
+    cx.open_url(url);
 }
 
 /// Whether `url`'s scheme is permitted by the comma-separated `allowlist` (`F-SHELL-193`).

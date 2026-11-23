@@ -2052,6 +2052,15 @@ impl App {
         );
         let tag = format!("msg:{channel}:{}", message.ts);
         self.system_notification_kind(&tag, &title, &body, is_dm_or_mention, cx);
+        if self.preferences.read(cx).settings().announce_incoming {
+            #[cfg(target_os = "macos")]
+            {
+                let announcement: String = format!("{title}. {body}").chars().take(160).collect();
+                let _ = std::process::Command::new("say")
+                    .args(["-r", "210", &announcement])
+                    .spawn();
+            }
+        }
     }
 
     /// Slack's desktop notification rules for a message just posted: never your own, while

@@ -86,6 +86,14 @@ impl App {
             view.set_excluded_channels(&excluded_channels);
         });
         crate::preferences::set_display_prefs(&settings, cx);
+        window.set_background_appearance(if settings.window_transparency {
+            gpui::WindowBackgroundAppearance::Blurred
+        } else {
+            gpui::WindowBackgroundAppearance::Opaque
+        });
+        slackless_core::api::set_net_log_enabled(
+            settings.net_log_enabled || settings.debug_logging,
+        );
         crate::messages::set_timezone_override(settings.timezone_offset_secs());
         crate::media::set_download_dir(
             (!settings.download_dir.is_empty())

@@ -172,7 +172,7 @@ impl Store {
         // whenever a message is edited, tombstoned, or re-observed with a different revision key,
         // archive the existing `message_current` row first and append the incoming revision.
         let needs_revision = match &current {
-            None => !edit_ts.is_empty(),
+            None => false,
             Some((_, true)) => true,
             Some((current_edit, false)) => current_edit.as_str() != edit_ts,
         };

@@ -431,6 +431,7 @@ pub struct DisplayPrefs {
     pub convert_emoticons: bool,
     pub emoji_text_mode: bool,
     pub inline_media: bool,
+    pub large_files: bool,
     pub link_previews: bool,
     pub underline_links: bool,
     pub animate_emoji: bool,
@@ -447,6 +448,7 @@ impl Default for DisplayPrefs {
             convert_emoticons: true,
             emoji_text_mode: false,
             inline_media: true,
+            large_files: true,
             link_previews: true,
             underline_links: false,
             animate_emoji: true,
@@ -485,6 +487,7 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         convert_emoticons: settings.convert_emoticons,
         emoji_text_mode: settings.emoji_text_mode,
         inline_media: settings.inline_media,
+        large_files: settings.large_files,
         link_previews: settings.link_previews,
         underline_links: settings.underline_links,
         animate_emoji: settings.animate_emoji,
@@ -2370,7 +2373,7 @@ impl Preferences {
         );
         let hardware = self.checkbox(
             "adv-hw",
-            "Use hardware acceleration",
+            "Use hardware acceleration (Metal GPU — active on macOS)",
             |s| &mut s.hardware_acceleration,
             cx,
         );

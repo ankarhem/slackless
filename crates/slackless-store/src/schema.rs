@@ -236,7 +236,24 @@ CREATE TRIGGER message_current_au AFTER UPDATE OF text, file_names ON message_cu
 END;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
+/// Version 7: prune single-revision non-deleted rows from `message_revision` (messages that had
+/// already been edited once on Slack prior to sync and have no separate prior revision locally;
+/// their sole revision lives compressed in `message_current`).
+const V7: &str = r#"
+DROP TRIGGER IF EXISTS message_revision_no_delete;
+DELETE FROM message_revision
+WHERE deleted = 0
+  AND (workspace_id, channel_id, ts) NOT IN (
+      SELECT workspace_id, channel_id, ts
+      FROM message_revision
+      GROUP BY workspace_id, channel_id, ts
+      HAVING COUNT(*) > 1 OR MAX(deleted) = 1
+  );
+CREATE TRIGGER message_revision_no_delete BEFORE DELETE ON message_revision
+BEGIN SELECT RAISE(ABORT, 'message_revision is append-only'); END;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

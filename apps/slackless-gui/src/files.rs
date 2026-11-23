@@ -36,12 +36,17 @@ pub fn attachments(
     if message.files.is_empty() {
         return None;
     }
+    let show_large = crate::preferences::display_prefs(cx).large_files;
+    let inline_allowed = |file: &File| show_large || file.size.unwrap_or(0) <= 2 * 1024 * 1024;
     let mut column = v_flex().gap_2().pt_1();
     let images: Vec<GalleryImage> = message
         .files
         .iter()
         .enumerate()
         .filter_map(|(ix, file)| {
+            if !inline_allowed(file) {
+                return None;
+            }
             Some(GalleryImage {
                 ix,
                 source: thumbnail(fixtures, file)?,
@@ -70,7 +75,10 @@ pub fn attachments(
                 order_base,
             })
         } else {
-            match thumbnail(fixtures, file) {
+            match inline_allowed(file)
+                .then(|| thumbnail(fixtures, file))
+                .flatten()
+            {
                 Some(source) => image_attachment(file, ix, source, on_open, cx),
                 None if file.is_external || file.external_type.is_some() => {
                     external_file_card(file, cx)
