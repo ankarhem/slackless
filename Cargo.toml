@@ -18,6 +18,7 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+strip = "debuginfo"
 
 [workspace.dependencies]
 slackless-types = { path = "crates/slackless-types" }

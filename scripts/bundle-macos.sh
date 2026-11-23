@@ -6,14 +6,15 @@
 # Usage:
 #   scripts/bundle-macos.sh                # build debug binary and assemble Slackless.app
 #   scripts/bundle-macos.sh --release      # build release binary and assemble Slackless.app
-#   scripts/bundle-macos.sh --no-build     # bundle existing target/debug/slackless-gui
-#   scripts/bundle-macos.sh --install      # also install to ~/Applications/Slackless.app
+#   scripts/bundle-macos.sh --debug        # force debug binary (even with --install)
+#   scripts/bundle-macos.sh --no-build     # bundle existing target/<profile>/slackless-gui
+#   scripts/bundle-macos.sh --install      # build release (unless --debug) & install to ~/Applications/Slackless.app
 #   scripts/bundle-macos.sh --install-cli  # also build & install ~/.local/bin/slackless
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROFILE="debug"
+PROFILE=""
 DO_BUILD=1
 DO_INSTALL=0
 DO_INSTALL_CLI=0
@@ -21,6 +22,7 @@ DO_INSTALL_CLI=0
 for arg in "$@"; do
   case "$arg" in
     --release) PROFILE="release" ;;
+    --debug) PROFILE="debug" ;;
     --no-build) DO_BUILD=0 ;;
     --install) DO_INSTALL=1 ;;
     --install-cli) DO_INSTALL_CLI=1 ;;
@@ -30,6 +32,14 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+if [[ -z "$PROFILE" ]]; then
+  if [[ "$DO_INSTALL" -eq 1 ]]; then
+    PROFILE="release"
+  else
+    PROFILE="debug"
+  fi
+fi
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
   PKGS=(-p slackless-gui)
