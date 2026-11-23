@@ -268,6 +268,10 @@ pub struct MessageList {
     pending_jump: Option<i64>,
     /// Target message to highlight once a pending jump finishes loading.
     pending_highlight: Option<Ts>,
+    /// Whether the current conversation still owes its one-time initial scroll to the first
+    /// unread message (`mark_read == 0`). Cleared once scrolled or as soon as the user scrolls,
+    /// so background backfill pages (`Event::StoreChanged`) never yank the reader back.
+    pending_initial_unread_jump: bool,
     /// Timer that clears the jump-to highlight after a short flash.
     highlight_clear: gpui_kit::gpui::Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -314,6 +318,9 @@ impl MessageList {
                     },
                 ),
                 cx.observe(&scroller, |list: &mut MessageList, scroller, cx| {
+                    if !scroller.read(cx).is_following_tail() {
+                        list.pending_initial_unread_jump = false;
+                    }
                     list.request_older_near_top(&scroller, cx)
                 }),
             ];
@@ -341,6 +348,7 @@ impl MessageList {
                 requested_older: None,
                 pending_jump: None,
                 pending_highlight: None,
+                pending_initial_unread_jump: false,
                 highlight_clear: gpui_kit::gpui::Task::ready(()),
                 _subscriptions: subscriptions,
             }
@@ -396,6 +404,7 @@ impl MessageList {
 
     pub fn set_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.channel = channel;
+        self.pending_initial_unread_jump = true;
         self.sync(cx);
     }
 
@@ -452,26 +461,34 @@ impl MessageList {
             return;
         }
         let history = history_of(&self.messages, &self.channel);
-        let (unchanged, extends, added) = {
+        let (unchanged, prefix, tail_added, preserves_window) = {
             let shown = &self.data.read(cx).messages;
-            (
-                *shown == history,
-                history.len() >= shown.len()
-                    && history.first().map(|m| &m.ts) == shown.first().map(|m| &m.ts),
-                history.len().saturating_sub(shown.len()),
-            )
+            if *shown == history {
+                (true, 0, 0, true)
+            } else if let Some(first_shown) = shown.first() {
+                let prefix = history.iter().take_while(|m| m.ts < first_shown.ts).count();
+                let matches_start = history.get(prefix).is_some_and(|m| m.ts == first_shown.ts);
+                let preserves = matches_start && history.len() >= prefix + shown.len();
+                let tail_added = (history.len().saturating_sub(prefix)).saturating_sub(shown.len());
+                (false, prefix, tail_added, preserves)
+            } else {
+                (false, 0, 0, false)
+            }
         };
         if unchanged {
             return;
         }
-        if !extends {
+        if !preserves_window {
             return self.sync(cx);
         }
         self.data.update(cx, |data, _| data.messages = history);
         self.scroller.update(cx, |scroller, cx| {
-            if added > 0 {
-                scroller.append(added, cx);
-            } else {
+            if prefix > 0 {
+                scroller.prepend(prefix, cx);
+            }
+            if tail_added > 0 {
+                scroller.append(tail_added, cx);
+            } else if prefix == 0 {
                 scroller.remeasure(cx);
             }
         });
@@ -984,6 +1001,23 @@ impl MessageList {
     /// Jump to the first unread message in the open conversation (`Cmd+J`). Returns `true`
     /// when an unread message was found and scrolled into view.
     pub fn jump_to_unread(&mut self, cx: &mut Context<Self>) -> bool {
+        self.pending_initial_unread_jump = false;
+        self.scroll_to_first_unread(true, cx)
+    }
+
+    /// One-time unread scroll when opening a conversation (`mark_read == 0`): scrolls cleanly
+    /// to the first unread message without flashing or remeasuring, and disarms itself so
+    /// subsequent `Event::StoreChanged` refreshes (e.g. background backfill) never pull the
+    /// reader back while scrolling.
+    pub fn scroll_to_unread_once(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.pending_initial_unread_jump || self.data.read(cx).messages.is_empty() {
+            return false;
+        }
+        self.pending_initial_unread_jump = false;
+        self.scroll_to_first_unread(false, cx)
+    }
+
+    fn scroll_to_first_unread(&mut self, highlight: bool, cx: &mut Context<Self>) -> bool {
         let target = {
             let data = self.data.read(cx);
             let Some(last_read) = data.last_read.as_ref() else {
@@ -998,7 +1032,9 @@ impl MessageList {
         if let Some((ix, ts)) = target {
             self.scroller
                 .update(cx, |scroller, cx| scroller.scroll_to_item(ix, cx));
-            self.flash_highlight(ts, cx);
+            if highlight {
+                self.flash_highlight(ts, cx);
+            }
             true
         } else {
             false

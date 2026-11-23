@@ -234,7 +234,7 @@ use gpui_kit::gpui::{
     self, Anchor, AnyElement, AppContext as _, BoxShadow, ClipboardItem, Context, DismissEvent,
     Div, Edges, Entity, FocusHandle, Focusable as _, FontWeight, Hsla, InputPreference,
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, MouseDownEvent,
-    ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
+    NavigationDirection, ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, SystemNotification, Window,
     actions, anchored, deferred, div, hsla, point, px, relative,
 };
@@ -1418,16 +1418,43 @@ impl App {
                             this.select(channel.clone(), cx);
                             this.open_thread(channel.clone(), thread_ts.clone(), cx);
                         }
+                        ThreadsEvent::OpenLink(target) => {
+                            this.open_link(target.clone(), window, cx);
+                        }
+                        ThreadsEvent::ExpandThread { channel, thread_ts } => {
+                            this.bridge.send(Command::OpenThread {
+                                channel: channel.clone(),
+                                thread_ts: thread_ts.clone(),
+                            });
+                            if let Some(read) =
+                                this.bridge.thread(channel.clone(), thread_ts.clone())
+                            {
+                                let (ch, ts) = (channel.clone(), thread_ts.clone());
+                                cx.spawn(async move |this, cx| {
+                                    let msgs = cx.background_executor().spawn(read).await;
+                                    let _ = this.update(cx, |app, cx| {
+                                        app.resolve_named_users(&msgs);
+                                        let replies: Vec<_> =
+                                            msgs.into_iter().filter(|m| m.ts != ts).collect();
+                                        app.threads.update(cx, |view, cx| {
+                                            view.set_card_replies(&ch, &ts, replies, cx);
+                                        });
+                                    });
+                                })
+                                .detach();
+                            }
+                        }
                         ThreadsEvent::Reply {
                             channel,
                             thread_ts,
                             content,
+                            broadcast,
                         } => {
                             this.bridge.send(Command::SendMessage {
                                 channel: channel.clone(),
                                 content: content.clone(),
                                 thread_ts: Some(thread_ts.clone()),
-                                broadcast: false,
+                                broadcast: *broadcast,
                             });
                         }
                         ThreadsEvent::ReplyWithFiles {
@@ -1461,10 +1488,6 @@ impl App {
                             let thread = this.threads.read(cx).active_thread();
                             this.run_slash(invocation, thread, window, cx)
                         }
-                        ThreadsEvent::Close => {
-                            this.threads_open = false;
-                            cx.notify();
-                        }
                     },
                 ),
                 cx.subscribe_in(
@@ -1474,6 +1497,11 @@ impl App {
                         UnreadsEvent::OpenConversation(channel) => {
                             this.unreads_open = false;
                             this.select(channel.clone(), cx);
+                        }
+                        UnreadsEvent::OpenThread { channel, thread_ts } => {
+                            this.unreads_open = false;
+                            this.select(channel.clone(), cx);
+                            this.open_thread(channel.clone(), thread_ts.clone(), cx);
                         }
                         UnreadsEvent::OpenLink(target) => {
                             this.open_link(target.clone(), window, cx);
@@ -2373,6 +2401,20 @@ impl Render for App {
             .when(!self.forward.is_empty(), |root| {
                 root.on_action(cx.listener(|this, _: &NavigateForward, _, cx| this.go_forward(cx)))
             })
+            // Mouse back / forward buttons (buttons 3 & 4 and swipe-based mice like MX Master).
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                match event.button {
+                    MouseButton::Navigate(NavigationDirection::Back) => {
+                        this.go_back(cx);
+                        cx.stop_propagation();
+                    }
+                    MouseButton::Navigate(NavigationDirection::Forward) => {
+                        this.go_forward(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .on_action(cx.listener(|this, switch: &SwitchWorkspace, window, cx| {
                 this.switch_workspace(switch.0, window, cx)
             }))

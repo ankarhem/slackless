@@ -633,17 +633,21 @@ impl Sidebar {
 
     /// One of Home's shortcut rows above the sections (Unreads, Threads, …): outline icon and
     /// label, bold while it has something new, with an optional trailing count.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn nav_row(
         &self,
         id: &'static str,
         icon: IconName,
         label: &'static str,
         bold: bool,
+        active: bool,
         trailing: Option<String>,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let theme = cx.theme();
-        let color = if bold {
+        let color = if active {
+            theme.sidebar_accent_foreground
+        } else if bold {
             theme.sidebar_foreground
         } else {
             theme.sidebar_foreground.opacity(0.75)
@@ -661,13 +665,16 @@ impl Sidebar {
             .rounded_md()
             .text_color(color)
             .cursor_pointer()
-            .hover(|row| row.bg(hover))
+            .when(active, |row| row.bg(theme.sidebar_accent))
+            .when(!active, |row| row.hover(|row| row.bg(hover)))
             .child(Icon::new(icon).text_color(color).size(px(16.)))
             .child(
                 div()
                     .flex_1()
                     .font_weight(if bold {
                         FontWeight::BOLD
+                    } else if active {
+                        FontWeight::SEMIBOLD
                     } else {
                         FontWeight::NORMAL
                     })
@@ -743,7 +750,7 @@ impl Sidebar {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let id = conversation.id.clone();
-        let selected = id == self.selected;
+        let selected = self.active_home_page.is_none() && id == self.selected;
         let unread = self.unread_in(conversation, watermark);
         let label = self.fixtures.conversation_label(conversation);
         // Focus mode marks new activity with a subtle dot instead of bolding and counts.

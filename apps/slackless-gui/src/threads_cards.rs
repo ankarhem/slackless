@@ -1,28 +1,36 @@
 //! The Threads view's data and card rendering: the [`ThreadCard`] model, its derivations
 //! (Slack's own `subscriptions.thread.getView` list, the bundled sample workspace, the local
-//! store) and one card's element. The view entity lives in [`crate::threads_view`].
+//! store) and one card's element, matching Slack's `p-threads_view` layout (channel + participants
+//! header above a rounded bordered card containing the root, a clickable "Show N more replies"
+//! link, the latest replies, and a bordered reply composer with "Also send to #channel").
+//! The view entity lives in [`crate::threads_view`].
 //!
 //! A thread is followed when the signed-in user is among its repliers or authored its root -
 //! the store-side rule Slack's own list answers server-side.
 
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    px,
 };
 use slackless_core::api::ThreadsView as SlackThreads;
 use slackless_core::store::Store;
-use slackless_core::types::{ChannelId, Message, TeamId, Ts, UserId};
+use slackless_core::types::{ChannelId, ConversationKind, Message, TeamId, Ts, UserId};
 
+use crate::avatars::conversation_avatar;
 use crate::composer::Composer;
 use crate::fixtures::Fixtures;
-use crate::messages::{list_stamp, message_row};
+use crate::messages::{LinkHandler, message_row_linked, same_group};
 use crate::threads_view::{ThreadsEvent, ThreadsView};
 
-/// How many latest replies a card shows, like Slack's Threads view.
+/// How many latest replies a collapsed card shows, matching Slack's Threads view.
 const SHOWN_REPLIES: usize = 2;
 
 /// Root-history rows scanned per conversation when deriving local cards.
@@ -34,7 +42,7 @@ pub struct ThreadCard {
     pub channel: ChannelId,
     pub thread_ts: Ts,
     pub root: Message,
-    /// The latest replies, oldest first (the full count rides the divider row).
+    /// Known replies, oldest first (collapsed cards slice to the latest [`SHOWN_REPLIES`]).
     pub replies: Vec<Message>,
     pub reply_total: u32,
     pub unread: u32,
@@ -53,12 +61,6 @@ impl ThreadCard {
     }
 }
 
-/// The latest `SHOWN_REPLIES` of `replies`, oldest first.
-fn latest(replies: &[Message]) -> Vec<Message> {
-    let at = replies.len().saturating_sub(SHOWN_REPLIES);
-    replies[at..].to_vec()
-}
-
 /// A card from a root and its full reply list.
 fn card(channel: ChannelId, root: Message, replies: &[Message]) -> ThreadCard {
     ThreadCard {
@@ -66,7 +68,7 @@ fn card(channel: ChannelId, root: Message, replies: &[Message]) -> ThreadCard {
         reply_total: root
             .reply_count
             .unwrap_or_else(|| u32::try_from(replies.len()).unwrap_or(u32::MAX)),
-        replies: latest(replies),
+        replies: replies.to_vec(),
         unread: 0,
         channel,
         root,
@@ -146,7 +148,7 @@ pub fn remote_cards(view: SlackThreads) -> Vec<ThreadCard> {
             }
             Some(ThreadCard {
                 thread_ts: root.thread_ts.clone().unwrap_or_else(|| root.ts.clone()),
-                replies: latest(&thread.latest_replies),
+                replies: thread.latest_replies,
                 reply_total: root.reply_count.unwrap_or_default(),
                 unread: u32::try_from(thread.unread_replies.len()).unwrap_or(u32::MAX),
                 channel,
@@ -158,98 +160,174 @@ pub fn remote_cards(view: SlackThreads) -> Vec<ThreadCard> {
     cards
 }
 
-/// One card: the clickable channel header, the root message, the reply divider and the
-/// latest replies, and the reply affordance (the docked composer while `active`).
+/// Slack's thread participant subtitle below the channel name, e.g.
+/// `"Linus Brännström, Jira, and David Michaelsen"` or `"Veljko Rajic and you"`.
+pub(crate) fn participant_summary(fixtures: &Fixtures, card: &ThreadCard) -> String {
+    let me = &fixtures.self_user;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut saw_me = false;
+
+    for msg in std::iter::once(&card.root).chain(&card.replies) {
+        if let Some(u) = &msg.user {
+            if u == me {
+                saw_me = true;
+            } else {
+                let name = fixtures.user_name(u).to_owned();
+                if !name.is_empty() && seen.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+        } else if let Some(bot) = msg.username.as_deref().filter(|s| !s.is_empty()) {
+            let name = bot.to_owned();
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    for u in &card.root.reply_users {
+        if u == me {
+            saw_me = true;
+        } else {
+            let name = fixtures.user_name(u).to_owned();
+            if !name.is_empty() && seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    if saw_me {
+        names.push("you".to_owned());
+    }
+    format_name_list(&names)
+}
+
+fn format_name_list(names: &[String]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1 => names[0].clone(),
+        2 => format!("{} and {}", names[0], names[1]),
+        3 => format!("{}, {}, and {}", names[0], names[1], names[2]),
+        n => {
+            let others = n - 3;
+            format!(
+                "{}, {}, {}, and {} {}",
+                names[0],
+                names[1],
+                names[2],
+                others,
+                if others == 1 { "other" } else { "others" }
+            )
+        }
+    }
+}
+
+/// One followed thread group matching official Slack's Threads view:
+/// 1. Channel header + participants subtitle above the card (click opens thread in channel)
+/// 2. Rounded bordered card containing:
+///    - Root message
+///    - Clickable blue `"Show N more replies"` link when replies are hidden
+///    - Latest replies (or all replies when expanded), with consecutive same-author grouping
+///    - Bordered reply composer (`Composer` with `"Also send to #channel"` when active, or a
+///      matching bordered `"Reply..."` box that activates & focuses it on click).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn card_view(
     fixtures: &Arc<Fixtures>,
     ix: usize,
     card: &ThreadCard,
     active: bool,
+    expanded: bool,
     composer: &Entity<Composer>,
     cx: &mut Context<ThreadsView>,
 ) -> AnyElement {
     let theme = cx.theme();
-    let (border, muted, hover, danger, danger_foreground) = (
+    let (border, muted, background, link, danger, danger_foreground) = (
         theme.border,
         theme.muted_foreground,
-        theme.accent,
+        theme.background,
+        theme.link,
         theme.danger,
         theme.danger_foreground,
     );
-    let label = fixtures
-        .conversation(&card.channel)
+    let conversation = fixtures.conversation(&card.channel);
+    let kind = conversation.map(|c| c.kind());
+    let raw_label = conversation
         .map(|c| fixtures.conversation_label(c))
         .unwrap_or_else(|| card.channel.to_string());
+    let channel_name = match kind {
+        Some(ConversationKind::PublicChannel) | Some(ConversationKind::PrivateChannel) => {
+            raw_label.trim_start_matches("# ").to_owned()
+        }
+        _ => raw_label,
+    };
+    let badge = match kind {
+        Some(ConversationKind::Im) | Some(ConversationKind::Mpim) => conversation
+            .map(|c| conversation_avatar(fixtures, c, 18., background, cx).into_any_element())
+            .unwrap_or_else(|| div().into_any_element()),
+        Some(ConversationKind::PrivateChannel) => Icon::new(IconName::Lock)
+            .text_color(theme.foreground)
+            .size(px(14.))
+            .into_any_element(),
+        _ => Icon::new(IconName::Hash)
+            .text_color(theme.foreground)
+            .size(px(14.))
+            .into_any_element(),
+    };
+    let participants = participant_summary(fixtures, card);
     let open = (card.channel.clone(), card.thread_ts.clone());
-    let shown: Vec<Message> = latest(&card.replies);
 
-    let body = v_flex()
-        .min_w_0()
-        .gap_1()
-        .child(message_row(fixtures, &card.root, None, cx))
-        .when(card.reply_total > 0, |body| {
-            body.child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{} replies", card.reply_total)),
-                    )
-                    .child(div().flex_1().h(px(1.)).bg(border)),
-            )
+    let shown: &[Message] = if expanded || card.replies.len() <= SHOWN_REPLIES {
+        &card.replies
+    } else {
+        let start = card.replies.len() - SHOWN_REPLIES;
+        &card.replies[start..]
+    };
+    let hidden = if expanded {
+        0
+    } else {
+        card.reply_total.saturating_sub(shown.len() as u32)
+    };
+
+    let view = cx.entity();
+    let links: LinkHandler = Rc::new(move |target, _window, cx| {
+        view.update(cx, |_, cx| cx.emit(ThreadsEvent::OpenLink(target.clone())));
+    });
+
+    let expand_key = (card.channel.clone(), card.thread_ts.clone());
+    let mut prev_reply: Option<&Message> = None;
+    let reply_rows: Vec<AnyElement> = shown
+        .iter()
+        .enumerate()
+        .map(|(r_ix, reply)| {
+            let grouped = prev_reply
+                .filter(|prev| same_group(prev, reply))
+                .map(|_| SharedString::from(format!("thread-{ix}-reply-{r_ix}")));
+            prev_reply = Some(reply);
+            message_row_linked(fixtures, reply, None, Some(&links), grouped, cx).into_any_element()
         })
-        .children(
-            shown
-                .iter()
-                .map(|reply| message_row(fixtures, reply, None, cx)),
-        )
-        .child(if active {
-            composer.clone().into_any_element()
-        } else {
-            h_flex()
-                .id(("thread-reply-bar", ix))
-                .mx_1()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_color(muted)
-                .hover(|bar| bar.bg(hover))
-                .child("Reply...")
-                .on_click(cx.listener(move |this, _, window: &mut Window, cx| {
-                    this.activate(Some(ix), window, cx);
-                }))
-                .into_any_element()
-        });
+        .collect();
 
-    v_flex()
-        .id(("thread-card", ix))
-        .px_4()
-        .py_3()
-        .gap_1()
-        .border_b_1()
-        .border_color(border)
+    let header = v_flex()
+        .id(("thread-card-head", ix))
+        .gap_0p5()
+        .mb_2()
+        .cursor_pointer()
+        .on_click(cx.listener(move |_, _, _, cx| {
+            cx.emit(ThreadsEvent::Open {
+                channel: open.0.clone(),
+                thread_ts: open.1.clone(),
+            });
+        }))
         .child(
             h_flex()
-                .id(("thread-card-head", ix))
                 .items_center()
-                .gap_2()
-                .cursor_pointer()
-                .hover(|head| head.bg(hover))
-                .rounded_md()
-                .px_1()
-                .child(
-                    Icon::new(gpui_kit::assets::IconName::MessageSquareText)
-                        .text_color(muted)
-                        .size(px(14.)),
-                )
+                .gap_1p5()
+                .child(badge)
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(label.trim_start_matches("# ").to_owned()),
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::BOLD)
+                        .hover(|el| el.underline())
+                        .child(channel_name),
                 )
                 .when(card.unread > 0, |head| {
                     head.child(
@@ -261,21 +339,122 @@ pub(super) fn card_view(
                             .text_color(danger_foreground)
                             .child(card.unread.to_string()),
                     )
-                })
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(list_stamp(&card.thread_ts)),
-                )
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.emit(ThreadsEvent::Open {
-                        channel: open.0.clone(),
-                        thread_ts: open.1.clone(),
-                    });
-                })),
+                }),
         )
-        .child(body)
+        .when(!participants.is_empty(), |head| {
+            head.child(div().text_xs().text_color(muted).child(participants))
+        });
+
+    let reply_footer = if active {
+        div().mt_2().child(composer.clone()).into_any_element()
+    } else {
+        h_flex()
+            .id(("thread-reply-bar", ix))
+            .mx_4()
+            .mt_2()
+            .px_3()
+            .py_2()
+            .h(px(40.))
+            .items_center()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(border)
+            .cursor_text()
+            .text_sm()
+            .text_color(muted)
+            .hover(|bar| bar.border_color(muted))
+            .child("Reply...")
+            .on_click(cx.listener(move |this, _, window: &mut Window, cx| {
+                this.activate(Some(ix), window, cx);
+            }))
+            .into_any_element()
+    };
+
+    let card_box = v_flex()
+        .min_w_0()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .pt_3()
+        .when(!active, |box_el| box_el.pb_3())
+        .child(div().px_4().child(message_row_linked(
+            fixtures,
+            &card.root,
+            None,
+            Some(&links),
+            None,
+            cx,
+        )))
+        .when(hidden > 0, |box_el| {
+            let label = if hidden == 1 {
+                "Show 1 more reply".to_owned()
+            } else {
+                format!("Show {hidden} more replies")
+            };
+            box_el.child(
+                div()
+                    .id(("thread-expand", ix))
+                    .px_4()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(link)
+                    .cursor_pointer()
+                    .hover(|el| el.underline())
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expand(expand_key.0.clone(), expand_key.1.clone(), cx);
+                    })),
+            )
+        })
+        .when(!reply_rows.is_empty(), |box_el| {
+            box_el.child(v_flex().px_4().pt_1().gap_1().children(reply_rows))
+        })
+        .child(reply_footer);
+
+    v_flex()
+        .id(("thread-card", ix))
+        .w_full()
+        .flex_none()
+        .child(header)
+        .child(card_box)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures;
+
+    #[test]
+    fn participant_summary_formats_names_with_self_last() {
+        let fixtures = fixtures::load();
+        let cards = local_cards(&fixtures);
+        assert!(!cards.is_empty());
+        let summary = participant_summary(&fixtures, &cards[0]);
+        assert!(
+            summary.ends_with("you"),
+            "self participant should appear last as 'you', got: {summary}"
+        );
+    }
+
+    #[test]
+    fn format_name_list_handles_various_counts() {
+        assert_eq!(format_name_list(&[]), "");
+        assert_eq!(format_name_list(&["Alice".into()]), "Alice");
+        assert_eq!(
+            format_name_list(&["Alice".into(), "you".into()]),
+            "Alice and you"
+        );
+        assert_eq!(
+            format_name_list(&["Alice".into(), "Bob".into(), "Cara".into()]),
+            "Alice, Bob, and Cara"
+        );
+        assert_eq!(
+            format_name_list(&["A".into(), "B".into(), "C".into(), "D".into(), "E".into()]),
+            "A, B, C, and 2 others"
+        );
+    }
 }

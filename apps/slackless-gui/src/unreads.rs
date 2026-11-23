@@ -26,20 +26,21 @@ use std::sync::Arc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
-    Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _,
+    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use slackless_core::NotifyLevel;
 use slackless_core::store::Store;
 use slackless_core::types::{ChannelId, ConversationKind, Message, TeamId, Ts};
 
-use crate::avatars::conversation_avatar;
+use crate::avatars::{conversation_avatar, user_chip};
 use crate::fixtures::Fixtures;
-use crate::messages::{LinkHandler, LinkTarget, message_row_linked};
+use crate::messages::{LinkHandler, LinkTarget, day_label, message_row_linked, same_group};
 use crate::sidebar::mentions_user;
 
 /// Channel-level rows scanned per conversation in live mode; beyond it the conversation is
@@ -206,6 +207,8 @@ pub enum UnreadsEvent {
     /// A card's conversation (its name, or the placeholder of a channel without rows) was
     /// clicked: open it.
     OpenConversation(ChannelId),
+    /// A message's reply-count chip was clicked: open the thread in its conversation.
+    OpenThread { channel: ChannelId, thread_ts: Ts },
     /// A link inside a message (@mention, #channel, URL) was activated.
     OpenLink(LinkTarget),
     /// The group's "Mark as Read" (or Esc): move the read cursor to `ts`.
@@ -216,6 +219,36 @@ pub enum UnreadsEvent {
     MarkAllRead,
 }
 
+/// Sort order for the All Unreads sections, matching Slack's header dropdown.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum UnreadsSort {
+    #[default]
+    Recommended,
+    Newest,
+    Oldest,
+    Alphabetical,
+}
+
+impl UnreadsSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Recommended => "Sorted by recommended order",
+            Self::Newest => "Sorted by newest",
+            Self::Oldest => "Sorted by oldest",
+            Self::Alphabetical => "Sorted alphabetically",
+        }
+    }
+
+    fn menu_label(self) -> &'static str {
+        match self {
+            Self::Recommended => "Recommended order",
+            Self::Newest => "Newest first",
+            Self::Oldest => "Oldest first",
+            Self::Alphabetical => "Alphabetical",
+        }
+    }
+}
+
 pub struct UnreadsView {
     fixtures: Arc<Fixtures>,
     groups: Vec<UnreadGroup>,
@@ -223,6 +256,8 @@ pub struct UnreadsView {
     collapsed: HashSet<ChannelId>,
     /// The keyboard-focused group (Up/Down move it, Left/Right fold it, Esc marks it read).
     focused: Option<usize>,
+    /// Active sort order for unread sections.
+    sort: UnreadsSort,
     /// Active inline reply composer on one unread card (`F-CORE-031`).
     replying: Option<(ChannelId, Entity<TextareaState>)>,
 }
@@ -236,6 +271,7 @@ impl UnreadsView {
             groups: Vec::new(),
             collapsed: HashSet::new(),
             focused: None,
+            sort: UnreadsSort::Recommended,
             replying: None,
         })
     }
@@ -289,10 +325,40 @@ impl UnreadsView {
 
     fn set_groups(&mut self, groups: Vec<UnreadGroup>, cx: &mut Context<Self>) {
         self.groups = groups;
+        self.apply_sort();
         self.collapsed
             .retain(|channel| self.groups.iter().any(|group| &group.channel == channel));
         self.focused = self.focused.filter(|ix| *ix < self.groups.len());
         cx.notify();
+    }
+
+    fn set_sort(&mut self, sort: UnreadsSort, cx: &mut Context<Self>) {
+        self.sort = sort;
+        self.apply_sort();
+        cx.notify();
+    }
+
+    fn apply_sort(&mut self) {
+        match self.sort {
+            UnreadsSort::Recommended => {}
+            UnreadsSort::Newest => {
+                self.groups.sort_by(|a, b| b.newest_ts.cmp(&a.newest_ts));
+            }
+            UnreadsSort::Oldest => {
+                self.groups.sort_by(|a, b| a.newest_ts.cmp(&b.newest_ts));
+            }
+            UnreadsSort::Alphabetical => {
+                let fixtures = &self.fixtures;
+                self.groups.sort_by_cached_key(|g| {
+                    fixtures
+                        .conversation(&g.channel)
+                        .map(|c| fixtures.conversation_label(c))
+                        .unwrap_or_else(|| g.channel.to_string())
+                        .trim_start_matches("# ")
+                        .to_lowercase()
+                });
+            }
+        }
     }
 
     /// Live refresh: keep the groups, draw them from `fixtures`.
@@ -403,44 +469,51 @@ impl Render for UnreadsView {
         let focused = self.focused;
         let collapsed: HashSet<ChannelId> = self.collapsed.clone();
         let fixtures = self.fixtures.clone();
+        let sort = self.sort;
+        let this = cx.entity().downgrade();
 
-        // Slack's header: the bold title beside its conversation count, and the outline
-        // "Mark All Messages Read" once anything is left.
+        // Official Slack header: bold "Unreads" followed by subtle filter & sort dropdowns,
+        // with "Mark All Messages Read" at the bottom of the stream.
+        let sort_menu = Button::new("unreads-sort")
+            .ghost()
+            .with_size(Size::XSmall)
+            .text_color(muted)
+            .label(sort.label())
+            .dropdown_caret(true)
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                for choice in [
+                    UnreadsSort::Recommended,
+                    UnreadsSort::Newest,
+                    UnreadsSort::Oldest,
+                    UnreadsSort::Alphabetical,
+                ] {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.menu_label())
+                            .checked(choice == sort)
+                            .on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |view, cx| view.set_sort(choice, cx));
+                            }),
+                    );
+                }
+                menu
+            });
+
         let header = h_flex()
             .flex_none()
-            .h(px(50.))
-            .px_4()
+            .h(px(49.))
+            .px_5()
             .items_center()
-            .justify_between()
+            .gap_3()
             .border_b_1()
             .border_color(border)
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("Unreads"),
-                    )
-                    .when(!groups.is_empty(), |title| {
-                        title.child(div().text_sm().text_color(muted).child(format!(
-                            "{} conversation{}",
-                            groups.len(),
-                            if groups.len() == 1 { "" } else { "s" }
-                        )))
-                    }),
+                div()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::BOLD)
+                    .child("Unreads"),
             )
-            .when(!groups.is_empty(), |header| {
-                header.child(
-                    Button::new("unreads-mark-all-top")
-                        .outline()
-                        .with_size(Size::Small)
-                        .label("Mark All Messages Read")
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(UnreadsEvent::MarkAllRead))),
-                )
-            });
+            .child(sort_menu);
 
         let body = if groups.is_empty() {
             v_flex()
@@ -472,40 +545,44 @@ impl Render for UnreadsView {
                 .into_any_element()
         } else {
             let replying = self.replying.clone();
-            v_flex()
+            div()
                 .id("unreads-scroll")
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .px_4()
-                .py_3()
-                .gap_3()
-                .children((0..groups.len()).map(|ix| {
-                    let reply_input = replying
-                        .as_ref()
-                        .filter(|(ch, _)| *ch == groups[ix].channel)
-                        .map(|(_, input)| input.clone());
-                    card_view(
-                        &fixtures,
-                        ix,
-                        &groups[ix],
-                        collapsed.contains(&groups[ix].channel),
-                        focused == Some(ix),
-                        reply_input,
-                        background,
-                        cx,
-                    )
-                }))
                 .child(
-                    h_flex().flex_none().justify_center().py_6().child(
-                        Button::new("unreads-mark-all-bottom")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label("Mark All Messages Read")
-                            .on_click(
-                                cx.listener(|_, _, _, cx| cx.emit(UnreadsEvent::MarkAllRead)),
+                    v_flex()
+                        .w_full()
+                        .children((0..groups.len()).map(|ix| {
+                            let reply_input = replying
+                                .as_ref()
+                                .filter(|(ch, _)| *ch == groups[ix].channel)
+                                .map(|(_, input)| input.clone());
+                            let show_esc_hint =
+                                focused == Some(ix) || (focused.is_none() && ix == 0);
+                            card_view(
+                                &fixtures,
+                                ix,
+                                &groups[ix],
+                                collapsed.contains(&groups[ix].channel),
+                                focused == Some(ix),
+                                show_esc_hint,
+                                reply_input,
+                                background,
+                                cx,
+                            )
+                        }))
+                        .child(
+                            h_flex().flex_none().justify_center().py_6().child(
+                                Button::new("unreads-mark-all-bottom")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .label("Mark All Messages Read")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(UnreadsEvent::MarkAllRead)
+                                    })),
                             ),
-                    ),
+                        ),
                 )
                 .into_any_element()
         };
@@ -518,9 +595,10 @@ impl Render for UnreadsView {
     }
 }
 
-/// One conversation's card: the header (collapse chevron, conversation badge, bold name,
-/// mention pill, unread count, "Mark as Read") over its unread messages, oldest first - or,
-/// while collapsed, nothing, and while its rows lag, the line that loads them.
+/// One conversation's edge-to-edge section matching official Slack's Unreads view:
+/// a tinted full-width section bar (collapse chevron, channel icon + bold name on left;
+/// message count, optional `Press [Esc] to` hint, and outline `Mark as Read` button on right)
+/// over full-width messages with date dividers, consecutive-message grouping, and reply chips.
 #[allow(clippy::too_many_arguments)]
 fn card_view(
     fixtures: &Fixtures,
@@ -528,18 +606,20 @@ fn card_view(
     group: &UnreadGroup,
     collapsed: bool,
     focused: bool,
+    show_esc_hint: bool,
     reply_input: Option<Entity<TextareaState>>,
     background: Hsla,
     cx: &mut Context<UnreadsView>,
 ) -> AnyElement {
     let theme = cx.theme();
-    let (border, muted, danger, danger_foreground, link, hover) = (
+    let (border, muted, danger, danger_foreground, link, hover, strip_bg) = (
         theme.border,
         theme.muted_foreground,
         theme.danger,
         theme.danger_foreground,
         theme.link,
         theme.accent,
+        theme.muted.opacity(0.42),
     );
     let conversation = fixtures.conversation(&group.channel);
     let label = conversation
@@ -551,16 +631,16 @@ fn card_view(
     let badge = match kind {
         Some(ConversationKind::Im) | Some(ConversationKind::Mpim) => conversation
             .map(|conversation| {
-                conversation_avatar(fixtures, conversation, 20., background, cx).into_any_element()
+                conversation_avatar(fixtures, conversation, 18., background, cx).into_any_element()
             })
             .unwrap_or_else(|| div().into_any_element()),
         Some(ConversationKind::PrivateChannel) => Icon::new(IconName::Lock)
-            .text_color(muted)
-            .size(px(16.))
+            .text_color(theme.foreground)
+            .size(px(14.))
             .into_any_element(),
         _ => Icon::new(IconName::Hash)
-            .text_color(muted)
-            .size(px(16.))
+            .text_color(theme.foreground)
+            .size(px(14.))
             .into_any_element(),
     };
     let name = match kind {
@@ -571,25 +651,36 @@ fn card_view(
     };
     let open = group.channel.clone();
 
+    let count_label = (!group.messages.is_empty()).then(|| {
+        if group.messages.len() == 1 {
+            "1 message".to_owned()
+        } else {
+            format!("{} messages", group.messages.len())
+        }
+    });
+
     let header = h_flex()
         .flex_none()
-        .h(px(48.))
-        .px_4()
+        .group(SharedString::from(format!("unreads-hdr-{ix}")))
+        .h(px(44.))
+        .px_5()
         .items_center()
         .justify_between()
         .gap_2()
-        .when(!collapsed, |header| {
-            header.border_b_1().border_color(border)
-        })
+        .bg(strip_bg)
+        .border_b_1()
+        .when(ix > 0, |header| header.border_t_1())
+        .border_color(border)
+        .when(focused, |header| header.border_l_2().border_color(link))
         .child(
             h_flex()
                 .min_w_0()
                 .items_center()
-                .gap_2()
+                .gap_1p5()
                 .child(
                     div()
                         .id(("unreads-collapse", ix))
-                        .size(px(28.))
+                        .size(px(24.))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -603,7 +694,7 @@ fn card_view(
                                 IconName::ChevronDown
                             })
                             .text_color(muted)
-                            .size(px(16.)),
+                            .size(px(14.)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle(ix, cx))),
                 )
@@ -612,20 +703,20 @@ fn card_view(
                         .id(("unreads-open", ix))
                         .min_w_0()
                         .items_center()
-                        .gap_1()
+                        .gap_1p5()
                         .rounded_md()
                         .px_1()
                         .cursor_pointer()
-                        .hover(|name| name.bg(hover))
                         .on_click(cx.listener(move |_, _, _, cx| {
                             cx.emit(UnreadsEvent::OpenConversation(open.clone()))
                         }))
                         .child(badge)
                         .child(
                             div()
-                                .text_size(px(16.))
+                                .text_size(px(14.))
                                 .font_weight(FontWeight::BOLD)
                                 .truncate()
+                                .hover(|el| el.underline())
                                 .child(name),
                         )
                         .when(group.mention_count > 0, |row| {
@@ -638,38 +729,59 @@ fn card_view(
                                     .text_color(danger_foreground)
                                     .child(group.mention_count.to_string()),
                             )
-                        })
-                        .when(!group.messages.is_empty(), |row| {
-                            row.child(div().text_sm().text_color(muted).child(
-                                if group.messages.len() == 1 {
-                                    "1 message".to_owned()
-                                } else {
-                                    format!("{} messages", group.messages.len())
-                                },
-                            ))
                         }),
                 ),
         )
         .child(
             h_flex()
+                .flex_none()
                 .items_center()
-                .gap_1()
+                .gap_2p5()
                 .child({
                     let reply_channel = group.channel.clone();
-                    Button::new(("unreads-reply-btn", ix))
-                        .ghost()
-                        .with_size(Size::Small)
-                        .icon(IconName::Reply)
-                        .label("Reply")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.start_reply(reply_channel.clone(), window, cx);
-                        }))
+                    div()
+                        .invisible()
+                        .group_hover(SharedString::from(format!("unreads-hdr-{ix}")), |el| {
+                            el.visible()
+                        })
+                        .child(
+                            Button::new(("unreads-reply-btn", ix))
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::Reply)
+                                .tooltip("Quick reply")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.start_reply(reply_channel.clone(), window, cx);
+                                })),
+                        )
+                })
+                .children(count_label.map(|label| div().text_xs().text_color(muted).child(label)))
+                .when(show_esc_hint, |row| {
+                    row.child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Press")
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(border)
+                                    .text_color(theme.foreground)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Esc"),
+                            )
+                            .child("to"),
+                    )
                 })
                 .child(
                     Button::new(("unreads-mark-read", ix))
-                        .ghost()
+                        .outline()
                         .with_size(Size::Small)
-                        .icon(IconName::Check)
                         .label("Mark as Read")
                         .on_click(cx.listener(move |this, _, _, cx| this.mark_read(ix, cx))),
                 ),
@@ -683,8 +795,8 @@ fn card_view(
         Some(
             div()
                 .id(("unreads-load", ix))
-                .px_4()
-                .py_3()
+                .px_5()
+                .py_4()
                 .text_sm()
                 .text_color(muted)
                 .cursor_pointer()
@@ -696,20 +808,87 @@ fn card_view(
                 .into_any_element(),
         )
     } else {
-        // The card's rows share one link handler: @mentions (and their hover cards),
+        // The section's rows share one link handler: @mentions (and their hover cards),
         // #channels and URLs route out as the view's own event.
         let view = cx.entity();
         let links: LinkHandler = Rc::new(move |target, _window, cx| {
             view.update(cx, |_, cx| cx.emit(UnreadsEvent::OpenLink(target.clone())));
         });
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(group.messages.len());
+        let mut prev_day: Option<String> = None;
+        let mut prev_msg: Option<&Message> = None;
+        for (m_ix, message) in group.messages.iter().enumerate() {
+            let day = day_label(&message.ts);
+            let date_break = match prev_day.as_deref() {
+                None => day != "Today",
+                Some(prev) => prev != day,
+            };
+            if date_break {
+                rows.push(
+                    unreads_date_divider(day.clone(), border, background, cx).into_any_element(),
+                );
+            }
+            let grouped = (!date_break)
+                .then(|| prev_msg.filter(|prev| same_group(prev, message)))
+                .flatten()
+                .map(|_| SharedString::from(format!("unreads-{ix}-msg-{m_ix}")));
+            let mut item = v_flex().px_5().child(message_row_linked(
+                fixtures,
+                message,
+                None,
+                Some(&links),
+                grouped,
+                cx,
+            ));
+            if let Some(reply_count) = message.reply_count.filter(|&c| c > 0) {
+                let faces: Vec<_> = message
+                    .reply_users
+                    .iter()
+                    .take(4)
+                    .map(|u| user_chip(fixtures, u, 20.))
+                    .collect();
+                let reply_label = if reply_count == 1 {
+                    "1 reply".to_owned()
+                } else {
+                    format!("{reply_count} replies")
+                };
+                let ch = group.channel.clone();
+                let ts = message.ts.clone();
+                item = item.child(
+                    h_flex()
+                        .id(("unreads-thread-chip", ix * 1000 + m_ix))
+                        .pl(px(44.))
+                        .pt_1()
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .children(faces)
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(link)
+                                .hover(|el| el.underline())
+                                .child(reply_label),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(UnreadsEvent::OpenThread {
+                                channel: ch.clone(),
+                                thread_ts: ts.clone(),
+                            });
+                        })),
+                );
+            }
+            rows.push(item.into_any_element());
+            prev_day = Some(day);
+            prev_msg = Some(message);
+        }
         Some(
             v_flex()
-                .px_4()
+                .w_full()
                 .py_3()
-                .gap_2()
-                .children(group.messages.iter().map(|message| {
-                    message_row_linked(fixtures, message, None, Some(&links), None, cx)
-                }))
+                .gap_1()
+                .children(rows)
                 .into_any_element(),
         )
     };
@@ -719,7 +898,7 @@ fn card_view(
             h_flex()
                 .items_end()
                 .gap_2()
-                .px_4()
+                .px_5()
                 .py_2()
                 .border_t_1()
                 .border_color(border)
@@ -756,16 +935,42 @@ fn card_view(
 
     v_flex()
         .id(("unreads-card", ix))
+        .w_full()
         .flex_none()
-        .rounded(px(12.))
-        .border_1()
-        .border_color(if focused { link } else { border })
-        .bg(cx.theme().background)
-        .overflow_hidden()
+        .bg(background)
         .child(header)
         .children(body)
         .children(reply_box)
         .into_any_element()
+}
+
+/// Centered date pill on a full-width hairline, matching Slack's Unreads view ("Yesterday").
+fn unreads_date_divider(
+    label: String,
+    border: Hsla,
+    background: Hsla,
+    cx: &App,
+) -> gpui_kit::gpui::Div {
+    let fg = cx.theme().foreground;
+    h_flex()
+        .w_full()
+        .items_center()
+        .py_1p5()
+        .child(div().flex_1().h(px(1.)).bg(border))
+        .child(
+            div()
+                .px_3()
+                .py_1()
+                .rounded_full()
+                .bg(background)
+                .border_1()
+                .border_color(fg.opacity(0.14))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(fg)
+                .child(label),
+        )
+        .child(div().flex_1().h(px(1.)).bg(border))
 }
 
 #[cfg(test)]

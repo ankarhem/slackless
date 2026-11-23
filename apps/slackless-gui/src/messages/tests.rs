@@ -475,3 +475,47 @@ fn one_key_reply_and_pin_emit_the_transcript_events(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+fn initial_unread_scroll_fires_once_and_ignores_backfill_refreshes(cx: &mut TestAppContext) {
+    with_transcript("D0ALICE", cx, |harness, cx| {
+        cx.update(|_, cx| {
+            let list = harness.read(cx).list.clone();
+            let channel = ChannelId::from("D0ALICE");
+            list.update(cx, |list, cx| {
+                list.set_conversation(channel.clone(), cx);
+                assert!(
+                    list.scroll_to_unread_once(cx),
+                    "first open of unread channel should jump once"
+                );
+                assert!(
+                    !list.scroll_to_unread_once(cx),
+                    "subsequent StoreChanged/backfill loads must not jump back to unread"
+                );
+                // Prepending older history via set_history must preserve the window (not reset
+                // to tail or re-arm unread jump).
+                let mut expanded = vec![
+                    Message {
+                        ts: Ts::from("1000.000001"),
+                        text: "older 1".into(),
+                        ..Default::default()
+                    },
+                    Message {
+                        ts: Ts::from("1000.000002"),
+                        text: "older 2".into(),
+                        ..Default::default()
+                    },
+                ];
+                let before_len = list.data.read(cx).messages.len();
+                expanded.extend(list.data.read(cx).messages.clone());
+                list.set_history(channel, expanded, cx);
+                assert_eq!(list.data.read(cx).messages.len(), before_len + 2);
+                assert!(!list.scroller.read(cx).is_following_tail());
+                assert!(
+                    !list.scroll_to_unread_once(cx),
+                    "prepended backfill page must not re-arm unread jump"
+                );
+            });
+        });
+    });
+}

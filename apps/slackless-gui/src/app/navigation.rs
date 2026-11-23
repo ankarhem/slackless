@@ -5,9 +5,11 @@ use super::*;
 impl App {
     pub(super) fn open_later(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
+        self.close_full_column_views(cx);
         self.later_open = true;
-        self.drafts_open = false;
-        self.searching = false;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::Saved), cx)
+        });
         self.bridge.send(Command::LoadSaved);
         cx.notify();
     }
@@ -1324,9 +1326,11 @@ impl App {
 
     pub(super) fn open_drafts(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
+        self.close_full_column_views(cx);
         self.drafts_open = true;
-        self.later_open = false;
-        self.searching = false;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::Drafts), cx)
+        });
         if !self.fixtures.sample {
             self.bridge.send(Command::LoadScheduledMessages);
             self.bridge.send(Command::FetchCloudDrafts);
@@ -1380,8 +1384,10 @@ impl App {
         self.compose_open = false;
         // The Activity and Files pages are sidebar destinations, so leaving the full-column
         // views returns the rail to Home.
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.leave_pages(cx));
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.leave_pages(cx);
+            sidebar.set_home_page(None, cx);
+        });
     }
 
     /// The Threads view: local cards at once, Slack's own list (`subscriptions.thread.getView`)
@@ -1417,6 +1423,9 @@ impl App {
         }
         self.close_full_column_views(cx);
         self.threads_open = true;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::Threads), cx)
+        });
         cx.notify();
     }
 
@@ -1427,6 +1436,9 @@ impl App {
         self.save_draft(cx);
         self.close_full_column_views(cx);
         self.unreads_open = true;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::Unreads), cx)
+        });
         self.focus.focus(window, cx);
         self.refresh_unreads(cx);
         cx.notify();
@@ -1501,6 +1513,9 @@ impl App {
         }
         self.close_full_column_views(cx);
         self.huddles_open = true;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::Huddles), cx)
+        });
         cx.notify();
     }
 
@@ -1512,6 +1527,9 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
         self.close_full_column_views(cx);
         self.directory_open = true;
+        self.sidebar.update(cx, |s, cx| {
+            s.set_home_page(Some(crate::sidebar::HomePage::Directories), cx)
+        });
         cx.notify();
     }
 

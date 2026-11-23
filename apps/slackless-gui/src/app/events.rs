@@ -574,6 +574,27 @@ impl App {
                         }
                     }
                 }
+                // Any expanded card in the Threads view refreshes when its replies land.
+                if self.threads_open {
+                    let expanded = self.threads.read(cx).expanded_in(channel);
+                    for thread_ts in expanded {
+                        if let Some(read) = self.bridge.thread(channel.clone(), thread_ts.clone()) {
+                            let (ch, ts) = (channel.clone(), thread_ts);
+                            cx.spawn(async move |this, cx| {
+                                let msgs = cx.background_executor().spawn(read).await;
+                                let _ = this.update(cx, |app, cx| {
+                                    app.resolve_named_users(&msgs);
+                                    let replies: Vec<_> =
+                                        msgs.into_iter().filter(|m| m.ts != ts).collect();
+                                    app.threads.update(cx, |view, cx| {
+                                        view.set_card_replies(&ch, &ts, replies, cx);
+                                    });
+                                });
+                            })
+                            .detach();
+                        }
+                    }
+                }
             }
             Event::AuthExpired(error) => eprintln!(
                 "slackless: Slack rejected the saved session ({error}); sign in again with `slackless-gui --sign-in`"
@@ -1017,7 +1038,7 @@ impl App {
                     app.messages.update(cx, |list, cx| {
                         list.set_history(channel.clone(), history, cx);
                         if mark_read_mode == 0 {
-                            list.jump_to_unread(cx);
+                            list.scroll_to_unread_once(cx);
                         }
                     });
                     let allow_mark =

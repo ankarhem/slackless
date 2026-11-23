@@ -212,6 +212,17 @@ impl NavItem {
     ];
 }
 
+/// Which Home sidebar shortcut page currently owns the main column (`None` = a conversation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HomePage {
+    Unreads,
+    Threads,
+    Huddles,
+    Drafts,
+    Saved,
+    Directories,
+}
+
 /// Navigation rail visibility and label style driven by Preferences -> Navigation (`F-SHELL-062`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NavPrefs {
@@ -293,6 +304,9 @@ pub(super) struct Unread {
 pub struct Sidebar {
     pub(super) fixtures: Arc<Fixtures>,
     pub(super) selected: ChannelId,
+    /// When a Home shortcut page (Unreads, Threads, Huddles, Drafts, Saved, Directories) is
+    /// open, that row carries the sidebar selection highlight instead of `selected`.
+    pub(super) active_home_page: Option<HomePage>,
     pub(super) active_workspace: usize,
     pub(super) active_nav: NavItem,
     /// The Files list column's selected row: the page the Files view shows.
@@ -449,6 +463,7 @@ impl Sidebar {
             Sidebar {
                 fixtures,
                 selected,
+                active_home_page: None,
                 active_workspace: 0,
                 active_nav: NavItem::Home,
                 files_section: FilesSection::All,
@@ -532,7 +547,16 @@ impl Sidebar {
     /// Mark `channel` selected without emitting (the root opened it from elsewhere).
     pub fn set_selected(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         self.selected = channel;
+        self.active_home_page = None;
         cx.notify();
+    }
+
+    /// Highlight one of the Home shortcut rows (Unreads, Threads, …) instead of a channel.
+    pub fn set_home_page(&mut self, page: Option<HomePage>, cx: &mut Context<Self>) {
+        if self.active_home_page != page {
+            self.active_home_page = page;
+            cx.notify();
+        }
     }
 
     /// Highlight workspace `index` in the rail (the root built this sidebar for it).
@@ -1895,6 +1919,7 @@ impl Render for Sidebar {
                         IconName::Inbox,
                         "Unreads",
                         total.count > 0 && !focus,
+                        self.active_home_page == Some(HomePage::Unreads),
                         None,
                         cx,
                     )
@@ -1906,6 +1931,7 @@ impl Render for Sidebar {
                         IconName::MessageSquareText,
                         "Threads",
                         self.threads_unread.0 && !focus,
+                        self.active_home_page == Some(HomePage::Threads),
                         None,
                         cx,
                     )
@@ -1913,13 +1939,22 @@ impl Render for Sidebar {
                         row.child(count_pill(self.threads_unread.1, true, cx))
                     })
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenThreads))),
-                    self.nav_row("huddles", IconName::Headphones, "Huddles", false, None, cx)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles))),
+                    self.nav_row(
+                        "huddles",
+                        IconName::Headphones,
+                        "Huddles",
+                        false,
+                        self.active_home_page == Some(HomePage::Huddles),
+                        None,
+                        cx,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles))),
                     self.nav_row(
                         "drafts",
                         IconName::Send,
                         "Drafts & sent",
                         false,
+                        self.active_home_page == Some(HomePage::Drafts),
                         (self.draft_count > 0).then(|| self.draft_count.to_string()),
                         cx,
                     )
@@ -1929,6 +1964,7 @@ impl Render for Sidebar {
                         IconName::Bookmark,
                         "Saved",
                         false,
+                        self.active_home_page == Some(HomePage::Saved),
                         (self.later_count > 0).then(|| self.later_count.to_string()),
                         cx,
                     )
@@ -1938,6 +1974,7 @@ impl Render for Sidebar {
                         IconName::BookUser,
                         "Directories",
                         false,
+                        self.active_home_page == Some(HomePage::Directories),
                         None,
                         cx,
                     )

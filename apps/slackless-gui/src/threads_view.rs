@@ -1,7 +1,8 @@
 //! The Threads view (the sidebar's "Threads" row): every followed thread as one card - the
-//! conversation, the root message and the latest replies - with a single reply composer
-//! docked to the card being answered (click a card's reply bar to move it). Cards, their
-//! derivations and the card element live in [`crate::threads_cards`].
+//! channel + participants header above a rounded bordered card with the root message, a
+//! clickable "Show N more replies" expander, the latest replies, and a docked reply composer
+//! with "Also send to #channel" (click another card's bordered "Reply..." bar to move it).
+//! Cards, their derivations and the card element live in [`crate::threads_cards`].
 //!
 //! Data: live mode asks the core for Slack's own list (`subscriptions.thread.getView`,
 //! [`slackless_core::Command::FetchThreads`]) and shows store-derived cards until it lands -
@@ -9,15 +10,16 @@
 //! workspace.
 //!
 //! `ThreadsView::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<ThreadsView>`
-//! `ThreadsView::show_local / show_store / set_remote / set_fixtures / set_enter_sends`
-//! emits `ThreadsEvent::Open { channel, thread_ts }` / `Reply { .. }` / `PickEmoji(point)`
-//! / `SlashCommand(Invocation)` / `Close`
+//! `ThreadsView::show_local / show_store / set_remote / set_card_replies / set_fixtures / set_enter_sends`
+//! emits `ThreadsEvent::Open { channel, thread_ts }` / `OpenLink(LinkTarget)`
+//! / `ExpandThread { channel, thread_ts }` / `Reply { .. }` / `PickEmoji(point)`
+//! / `SlashCommand(Invocation)`
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
@@ -25,29 +27,38 @@ use gpui_kit::gpui::{
     Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::{MessageContent, ThreadsView as SlackThreads};
-use slackless_core::types::{ChannelId, Ts};
+use slackless_core::types::{ChannelId, ConversationKind, Message, Ts};
 
-use crate::composer::{Composer, ComposerEvent, PendingAttachment};
+use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, PendingAttachment};
 use crate::fixtures::Fixtures;
+use crate::messages::LinkTarget;
 use crate::slash::{Invocation, SHRUG, SlashKind};
 use crate::threads_cards::{ThreadCard, card_view, remote_cards};
 
 pub enum ThreadsEvent {
-    /// A card was clicked: open the conversation with the thread panel on `thread_ts`.
+    /// A card's channel header was clicked: open the conversation with the thread panel on `thread_ts`.
     Open {
-        channel: slackless_core::types::ChannelId,
-        thread_ts: slackless_core::types::Ts,
+        channel: ChannelId,
+        thread_ts: Ts,
+    },
+    /// A link inside a thread card message (@mention, #channel, URL) was activated.
+    OpenLink(LinkTarget),
+    /// The user clicked "Show N more replies" on a card: ask the root to load full replies.
+    ExpandThread {
+        channel: ChannelId,
+        thread_ts: Ts,
     },
     /// The user replied; the card already shows the reply locally.
     Reply {
-        channel: slackless_core::types::ChannelId,
-        thread_ts: slackless_core::types::Ts,
+        channel: ChannelId,
+        thread_ts: Ts,
         content: MessageContent,
+        broadcast: bool,
     },
     /// The user replied with attached files (and optional message text).
     ReplyWithFiles {
-        channel: slackless_core::types::ChannelId,
-        thread_ts: slackless_core::types::Ts,
+        channel: ChannelId,
+        thread_ts: Ts,
         content: Option<MessageContent>,
         files: Vec<PendingAttachment>,
     },
@@ -56,7 +67,6 @@ pub enum ThreadsEvent {
     PickGif(Point<Pixels>),
     /// A slash command other than /shrug, which replies here; the root dispatches it.
     SlashCommand(Invocation),
-    Close,
 }
 
 pub struct ThreadsView {
@@ -64,8 +74,10 @@ pub struct ThreadsView {
     cards: Vec<ThreadCard>,
     /// Slack's own list landed; later store derivations must not overwrite it.
     remote: bool,
-    /// The card the shared reply composer is docked to.
+    /// The card the shared reply composer is docked to (defaults to card 0 when present).
     active: Option<usize>,
+    /// Cards whose "Show N more replies" link has been expanded in-place.
+    expanded: HashSet<(ChannelId, Ts)>,
     composer: Entity<Composer>,
     _subscriptions: Vec<Subscription>,
 }
@@ -73,7 +85,7 @@ pub struct ThreadsView {
 impl EventEmitter<ThreadsEvent> for ThreadsView {}
 
 impl ThreadsView {
-    pub fn new(fixtures: Arc<Fixtures>, window: &mut Window, cx: &mut App) -> Entity<ThreadsView> {
+    pub fn new(fixtures: Arc<Fixtures>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let composer = Composer::new("Reply...".into(), fixtures.clone(), window, cx);
             composer.update(cx, |composer, cx| composer.set_scheduling(false, cx));
@@ -123,10 +135,32 @@ impl ThreadsView {
                 cards: Vec::new(),
                 remote: false,
                 active: None,
+                expanded: HashSet::new(),
                 composer,
                 _subscriptions: subscriptions,
             }
         })
+    }
+
+    fn sync_also_send(&self, cx: &mut Context<Self>) {
+        let target = self
+            .active
+            .and_then(|ix| self.cards.get(ix))
+            .and_then(|card| {
+                self.fixtures
+                    .conversation(&card.channel)
+                    .map(|conversation| match conversation.kind() {
+                        ConversationKind::Im | ConversationKind::Mpim => {
+                            AlsoSendTarget::DirectMessage
+                        }
+                        kind => AlsoSendTarget::Channel {
+                            name: conversation.name.clone().unwrap_or_default().into(),
+                            private: kind == ConversationKind::PrivateChannel,
+                        },
+                    })
+            });
+        self.composer
+            .update(cx, |composer, cx| composer.set_also_send(target, cx));
     }
 
     /// Show `cards` (the fixture derivation) and drop any earlier remote list; call when the
@@ -134,7 +168,9 @@ impl ThreadsView {
     pub fn show_local(&mut self, cards: Vec<ThreadCard>, cx: &mut Context<Self>) {
         self.remote = false;
         self.cards = cards;
-        self.active = None;
+        self.expanded.clear();
+        self.active = (!self.cards.is_empty()).then_some(0);
+        self.sync_also_send(cx);
         cx.notify();
     }
 
@@ -144,7 +180,8 @@ impl ThreadsView {
             return;
         }
         self.cards = cards;
-        self.active = None;
+        self.active = (!self.cards.is_empty()).then_some(0);
+        self.sync_also_send(cx);
         cx.notify();
     }
 
@@ -152,15 +189,39 @@ impl ThreadsView {
     pub fn set_remote(&mut self, view: SlackThreads, cx: &mut Context<Self>) {
         self.remote = true;
         self.cards = remote_cards(view);
-        if let Some(active) = self.active {
-            self.active = (active < self.cards.len()).then_some(active);
-        }
+        self.active = self
+            .active
+            .filter(|&ix| ix < self.cards.len())
+            .or_else(|| (!self.cards.is_empty()).then_some(0));
+        self.sync_also_send(cx);
         cx.notify();
+    }
+
+    /// Fill an expanded card with its full replies (fetched from the store or Slack).
+    pub fn set_card_replies(
+        &mut self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        replies: Vec<Message>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|c| &c.channel == channel && &c.thread_ts == thread_ts)
+        {
+            if !replies.is_empty() {
+                card.reply_total = card.reply_total.max(replies.len() as u32);
+                card.replies = replies;
+                cx.notify();
+            }
+        }
     }
 
     /// Live refresh: keep the cards, draw them from `fixtures`.
     pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
         self.fixtures = fixtures;
+        self.sync_also_send(cx);
         cx.notify();
     }
 
@@ -205,6 +266,9 @@ impl ThreadsView {
         let Some(card) = self.cards.get_mut(ix) else {
             return;
         };
+        let broadcast = self
+            .composer
+            .update(cx, |composer, cx| composer.take_also_send(cx));
         // The local echo shows the same blocks the reply posts with.
         let mut message = self.fixtures.local_message(
             &card.channel,
@@ -219,18 +283,40 @@ impl ThreadsView {
             channel: card.channel.clone(),
             thread_ts: card.thread_ts.clone(),
             content,
+            broadcast,
         });
         cx.notify();
     }
 
-    /// Dock the reply composer to card `ix`.
+    /// Dock the reply composer to card `ix` and focus it.
     pub(super) fn activate(
         &mut self,
         ix: Option<usize>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.active = ix;
+        self.sync_also_send(cx);
+        if ix.is_some() {
+            self.composer
+                .update(cx, |composer, cx| composer.focus_input(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Expanded `(channel, thread_ts)` pairs matching `channel`, for live store refreshes.
+    pub fn expanded_in(&self, channel: &ChannelId) -> Vec<Ts> {
+        self.expanded
+            .iter()
+            .filter(|(ch, _)| ch == channel)
+            .map(|(_, ts)| ts.clone())
+            .collect()
+    }
+
+    /// Expand hidden replies on `(channel, thread_ts)` in-place.
+    pub(super) fn expand(&mut self, channel: ChannelId, thread_ts: Ts, cx: &mut Context<Self>) {
+        self.expanded.insert((channel.clone(), thread_ts.clone()));
+        cx.emit(ThreadsEvent::ExpandThread { channel, thread_ts });
         cx.notify();
     }
 }
@@ -238,25 +324,25 @@ impl ThreadsView {
 impl Render for ThreadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, foreground) = (theme.border, theme.muted_foreground, theme.foreground);
+        let (border, muted, background) = (theme.border, theme.muted_foreground, theme.background);
         let unread: u32 = self.cards.iter().map(|card| card.unread).sum();
         let cards: Vec<(usize, ThreadCard)> = self.cards.iter().cloned().enumerate().collect();
-        let mut list = v_flex()
-            .id("threads-list")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll();
+        let mut inner = v_flex().w_full().px_5().py_4().gap_6();
         for (ix, card) in &cards {
-            list = list.child(card_view(
+            let expanded = self
+                .expanded
+                .contains(&(card.channel.clone(), card.thread_ts.clone()));
+            inner = inner.child(card_view(
                 &self.fixtures,
                 *ix,
                 card,
                 self.active == Some(*ix),
+                expanded,
                 &self.composer,
                 cx,
             ));
         }
-        let list = list.when(cards.is_empty(), |list| {
+        let inner = inner.when(cards.is_empty(), |list| {
             list.child(
                 v_flex()
                     .items_center()
@@ -275,44 +361,39 @@ impl Render for ThreadsView {
 
         v_flex()
             .size_full()
+            .bg(background)
             .child(
                 h_flex()
                     .flex_none()
                     .items_center()
-                    .justify_between()
-                    .px_4()
-                    .h(px(46.))
+                    .px_5()
+                    .h(px(49.))
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(border)
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
+                        div()
+                            .text_size(px(18.))
                             .font_weight(FontWeight::BOLD)
-                            .child(
-                                Icon::new(IconName::MessageSquareText)
-                                    .text_color(foreground)
-                                    .size(px(16.)),
-                            )
-                            .child("Threads")
-                            .when(unread > 0, |title| {
-                                title.child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::NORMAL)
-                                        .text_color(muted)
-                                        .child(format!("{unread} unread")),
-                                )
-                            }),
+                            .child("Threads"),
                     )
-                    .child(
-                        Button::new("threads-close")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::X)
-                            .tooltip("Close")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ThreadsEvent::Close))),
-                    ),
+                    .when(unread > 0, |title| {
+                        title.child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::NORMAL)
+                                .text_color(muted)
+                                .child(format!("{unread} unread")),
+                        )
+                    }),
             )
-            .child(div().h(px(1.)).border_b_1().border_color(border))
-            .child(list)
+            .child(
+                div()
+                    .id("threads-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(inner),
+            )
     }
 }
