@@ -373,6 +373,17 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
                         "image" => Some(image_element(element, kcx, 20., cx)),
                         "tag" => Some(tag_element(element, cx).into_any_element()),
                         "citation" => Some(citation_element(element, ix * 19 + n, kcx, cx)),
+                        "color" => Some(color_element(element, cx).into_any_element()),
+                        "url_source" => Some(url_source_element(element, ix * 19 + n, kcx, cx)),
+                        "work_object" => Some(work_object_element(element, ix * 19 + n, kcx, cx)),
+                        "workflow" => Some(workflow_link_element(element, ix * 19 + n, kcx, cx)),
+                        "file" => Some(file_block(element, cx).into_any_element()),
+                        "canvas" | "canvas_unfurl" => {
+                            Some(canvas_element(element, ix * 19 + n, kcx, cx).into_any_element())
+                        }
+                        "list_record" | "slack_list_record" => Some(
+                            list_record_element(element, ix * 19 + n, kcx, cx).into_any_element(),
+                        ),
                         _ => text_object(element, kcx, true, cx),
                     },
                 ))
@@ -418,6 +429,12 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             "task_card" => task_card_block(raw, ix, kcx, cx).into_any_element(),
             "plan" => plan_block(raw, ix, kcx, cx).into_any_element(),
             "file" => file_block(raw, cx).into_any_element(),
+            "data_visualization" | "chart" => data_visualization_block(raw, cx).into_any_element(),
+            "layout" | "columns" => layout_block(raw, ix, kcx, cx).into_any_element(),
+            "canvas" | "canvas_unfurl" => canvas_element(raw, ix, kcx, cx).into_any_element(),
+            "list_record" | "slack_list_record" => {
+                list_record_element(raw, ix, kcx, cx).into_any_element()
+            }
             other => div()
                 .text_xs()
                 .italic()
@@ -574,13 +591,33 @@ fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
         .border_color(border)
         .bg(bg);
     if let Some(prov) = provider {
+        let icon_el: AnyElement = if let Some(icon_url) = raw["provider_icon_url"].as_str() {
+            div()
+                .size(px(14.))
+                .flex_none()
+                .overflow_hidden()
+                .rounded(px(3.))
+                .child(
+                    crate::media::Picture::new(ImageSource::from(SharedString::from(
+                        icon_url.to_owned(),
+                    )))
+                    .fit(ObjectFit::Cover)
+                    .radius(px(3.)),
+                )
+                .into_any_element()
+        } else {
+            Icon::new(IconName::Video)
+                .size(px(12.))
+                .text_color(muted)
+                .into_any_element()
+        };
         card = card.child(
             h_flex()
                 .items_center()
-                .gap_1()
+                .gap_1p5()
                 .text_xs()
                 .text_color(muted)
-                .child(Icon::new(IconName::Video).size(px(12.)).text_color(muted))
+                .child(icon_el)
                 .child(prov),
         );
     }
@@ -588,6 +625,7 @@ fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
     if let Some(desc) = description {
         card = card.child(div().text_xs().text_color(muted).child(desc));
     }
+    let direct_video_url = raw["video_url"].as_str().map(str::to_owned);
     if let Some(thumb) = thumb_url {
         let thumb_box = div()
             .relative()
@@ -610,21 +648,29 @@ fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                     .justify_center()
                     .child(
                         div()
-                            .size(px(36.))
+                            .size(px(40.))
                             .rounded_full()
-                            .bg(gpui_kit::gpui::hsla(0., 0., 0., 0.65))
+                            .bg(gpui_kit::gpui::hsla(0., 0., 0., 0.68))
                             .flex()
                             .items_center()
                             .justify_center()
                             .child(
                                 Icon::new(IconName::Play)
-                                    .size(px(16.))
+                                    .size(px(18.))
                                     .text_color(gpui_kit::gpui::hsla(0., 0., 1., 0.95)),
                             ),
                     ),
             );
-        if let Some(href) = url {
-            let target = LinkTarget::Url(href.into());
+        if let Some(href) = direct_video_url.clone().or(url) {
+            let is_direct_media = {
+                let lower = href.to_ascii_lowercase();
+                lower.ends_with(".mp4")
+                    || lower.ends_with(".mov")
+                    || lower.ends_with(".webm")
+                    || lower.contains("files.slack.com")
+            };
+            let vid_id = format!("bk-video-{}-{ix}", kcx.ts.as_str());
+            let target = LinkTarget::Url(href.clone().into());
             let links = kcx.links.clone();
             card = card.child(
                 div()
@@ -634,7 +680,17 @@ fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                     )))
                     .cursor_pointer()
                     .on_click(move |_, window, cx| {
-                        messages::route_link(links.as_ref(), target.clone(), window, cx)
+                        if is_direct_media {
+                            crate::media::play_video(
+                                vid_id.clone(),
+                                href.clone(),
+                                "mp4".to_owned(),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            messages::route_link(links.as_ref(), target.clone(), window, cx);
+                        }
                     })
                     .child(thumb_box),
             );
@@ -816,6 +872,43 @@ fn card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
         .border_color(theme.border)
         .bg(theme.muted);
     if let Some(title) = text_of(&raw["title"]).or_else(|| raw["title"].as_str()) {
+        let slack_icon: Option<AnyElement> = raw["icon_url"]
+            .as_str()
+            .or_else(|| raw["slack_icon"]["url"].as_str())
+            .map(|u| {
+                div()
+                    .size(px(18.))
+                    .flex_none()
+                    .overflow_hidden()
+                    .rounded(px(4.))
+                    .child(
+                        crate::media::Picture::new(ImageSource::from(SharedString::from(
+                            u.to_owned(),
+                        )))
+                        .fit(ObjectFit::Cover)
+                        .radius(px(4.)),
+                    )
+                    .into_any_element()
+            })
+            .or_else(|| {
+                raw["slack_icon"]
+                    .as_str()
+                    .or_else(|| raw["icon"].as_str())
+                    .map(|name| {
+                        let icon = match name {
+                            "canvas" | "document" => IconName::FileText,
+                            "list" | "checklist" => IconName::ListChecks,
+                            "workflow" | "lightning" => IconName::Zap,
+                            "calendar" => IconName::Calendar,
+                            "warning" | "alert" => IconName::TriangleAlert,
+                            _ => IconName::Sparkles,
+                        };
+                        Icon::new(icon)
+                            .size(px(15.))
+                            .text_color(theme.link)
+                            .into_any_element()
+                    })
+            });
         let title_el: AnyElement = match raw["title_url"].as_str().or_else(|| raw["url"].as_str()) {
             Some(href) => routed_link(
                 format!("bk-card-title-{}-{ix}", kcx.ts.as_str()),
@@ -833,7 +926,13 @@ fn card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                 .child(plain_label(title, cx))
                 .into_any_element(),
         };
-        card = card.child(title_el);
+        card = card.child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .children(slack_icon)
+                .child(title_el),
+        );
     }
     if let Some(sub) = text_of(&raw["subtitle"]).or_else(|| raw["subtitle"].as_str()) {
         card = card.child(
@@ -1157,13 +1256,20 @@ fn carousel_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
     )
 }
 
-/// Slack's Block Kit `file` block: compact reference chip for an embedded remote file.
+/// Slack's Block Kit `file` block/element (`F-COLLAB-750`): compact card for an embedded remote file.
 fn file_block(raw: &Json, cx: &App) -> Div {
     let theme = cx.theme();
-    let label = raw["external_id"]
+    let label = raw["title"]
         .as_str()
+        .or_else(|| text_of(&raw["title"]))
+        .or_else(|| raw["name"].as_str())
+        .or_else(|| raw["external_id"].as_str())
         .or_else(|| raw["file_id"].as_str())
         .unwrap_or("Attached file");
+    let kind = raw["filetype"]
+        .as_str()
+        .or_else(|| raw["mimetype"].as_str())
+        .map(str::to_uppercase);
     h_flex()
         .items_center()
         .gap_2()
@@ -1174,13 +1280,513 @@ fn file_block(raw: &Json, cx: &App) -> Div {
         .border_color(theme.border)
         .bg(theme.muted)
         .text_xs()
-        .text_color(theme.muted_foreground)
+        .text_color(theme.foreground)
         .child(
             Icon::new(IconName::File)
                 .size(px(14.))
                 .text_color(theme.muted_foreground),
         )
-        .child(label.to_owned())
+        .child(plain_label(label, cx))
+        .when_some(kind, |row, k| {
+            row.child(
+                div()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("· {k}")),
+            )
+        })
+}
+
+/// Block Kit `data_visualization` / `chart` block (`F-COLLAB-720`): compact horizontal bar chart
+/// & summary table for bot/app numeric series (`data`, `points`, or `series`).
+fn data_visualization_block(raw: &Json, cx: &App) -> Div {
+    let theme = cx.theme();
+    let title = text_of(&raw["title"])
+        .or_else(|| raw["title"].as_str())
+        .unwrap_or("Chart");
+    let subtitle = text_of(&raw["subtitle"]).or_else(|| raw["subtitle"].as_str());
+    let mut rows: Vec<(String, f64)> = Vec::new();
+    let source = raw["data"]
+        .as_array()
+        .or_else(|| raw["points"].as_array())
+        .or_else(|| {
+            raw["series"]
+                .as_array()
+                .and_then(|s| s.first())
+                .and_then(|first| {
+                    first["data"]
+                        .as_array()
+                        .or_else(|| first["points"].as_array())
+                })
+        });
+    if let Some(items) = source {
+        for (idx, item) in items.iter().take(12).enumerate() {
+            let label = item["label"]
+                .as_str()
+                .or_else(|| item["name"].as_str())
+                .or_else(|| item["x"].as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Item {}", idx + 1));
+            let val = item["value"]
+                .as_f64()
+                .or_else(|| item["y"].as_f64())
+                .or_else(|| item.as_f64())
+                .unwrap_or(0.0);
+            rows.push((label, val));
+        }
+    }
+    let max_val = rows.iter().map(|(_, v)| v.abs()).fold(1.0f64, f64::max);
+
+    let mut card = v_flex()
+        .w_full()
+        .max_w(px(520.))
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::Activity)
+                        .size(px(14.))
+                        .text_color(theme.link),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(plain_label(title, cx)),
+                ),
+        )
+        .when_some(subtitle, |col, sub| {
+            col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(plain_label(sub, cx)),
+            )
+        });
+    if rows.is_empty() {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("No data points provided."),
+        );
+    } else {
+        for (label, val) in rows {
+            let pct = ((val.abs() / max_val) * 180.0).clamp(6.0, 180.0) as f32;
+            let formatted = if (val.fract()).abs() < 1e-6 {
+                format!("{}", val as i64)
+            } else {
+                format!("{val:.2}")
+            };
+            card = card.child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .truncate()
+                            .text_color(theme.muted_foreground)
+                            .child(plain_label(&label, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(10.))
+                            .rounded_full()
+                            .bg(theme.secondary)
+                            .overflow_hidden()
+                            .child(div().h_full().w(px(pct)).rounded_full().bg(theme.primary)),
+                    )
+                    .child(
+                        div()
+                            .w(px(54.))
+                            .text_right()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.foreground)
+                            .child(formatted),
+                    ),
+            );
+        }
+    }
+    card
+}
+
+/// Block Kit `layout` / `columns` block (`F-COLLAB-726`): renders multi-column child blocks side by side.
+fn layout_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let columns = raw["columns"]
+        .as_array()
+        .or_else(|| raw["elements"].as_array())
+        .or_else(|| raw["blocks"].as_array());
+    let mut row = h_flex().w_full().min_w_0().items_start().gap_3();
+    if let Some(cols) = columns {
+        for (c_ix, col) in cols.iter().enumerate() {
+            if let Some(nested) = col["blocks"]
+                .as_array()
+                .or_else(|| col["elements"].as_array())
+            {
+                let mut col_box = v_flex().flex_1().min_w_0().gap_1p5();
+                for (b_ix, child) in nested.iter().enumerate() {
+                    let kind = child["type"].as_str().unwrap_or_default();
+                    if let Some(el) = block(kind, child, ix * 53 + c_ix * 11 + b_ix, kcx, cx) {
+                        col_box = col_box.child(el);
+                    }
+                }
+                row = row.child(col_box);
+            } else {
+                let kind = col["type"].as_str().unwrap_or("section");
+                if let Some(el) = block(kind, col, ix * 53 + c_ix, kcx, cx) {
+                    row = row.child(div().flex_1().min_w_0().child(el));
+                }
+            }
+        }
+    }
+    row
+}
+
+/// Block Kit `canvas` / `canvas_unfurl` element (`F-COLLAB-737`, `F-COLLAB-738`).
+fn canvas_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let title = text_of(&raw["title"])
+        .or_else(|| raw["title"].as_str())
+        .or_else(|| raw["canvas_title"].as_str())
+        .unwrap_or("Canvas");
+    let preview = text_of(&raw["preview"])
+        .or_else(|| raw["preview"].as_str())
+        .or_else(|| raw["excerpt"].as_str())
+        .or_else(|| text_of(&raw["text"]));
+    let url = raw["url"]
+        .as_str()
+        .or_else(|| raw["permalink"].as_str())
+        .map(str::to_owned);
+    let title_el: AnyElement = match url {
+        Some(href) => routed_link(
+            format!("bk-canvas-{}-{ix}", kcx.ts.as_str()),
+            plain_label(title, cx),
+            href,
+            kcx,
+            FontWeight::SEMIBOLD,
+            cx,
+        )
+        .into_any_element(),
+        None => div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.foreground)
+            .child(plain_label(title, cx))
+            .into_any_element(),
+    };
+    v_flex()
+        .w_full()
+        .max_w(px(480.))
+        .gap_1()
+        .p_2p5()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::FileText)
+                        .size(px(14.))
+                        .text_color(theme.link),
+                )
+                .child(title_el)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Canvas"),
+                ),
+        )
+        .when_some(preview, |col, p| {
+            col.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(plain_label(p, cx)),
+            )
+        })
+}
+
+/// Block Kit `list_record` element (`F-COLLAB-755`): structured Slack List item card.
+fn list_record_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let title = text_of(&raw["title"])
+        .or_else(|| raw["title"].as_str())
+        .or_else(|| raw["record_title"].as_str())
+        .or_else(|| raw["name"].as_str())
+        .unwrap_or("List item");
+    let list_name = raw["list_title"]
+        .as_str()
+        .or_else(|| raw["list_name"].as_str());
+    let status = raw["status"].as_str();
+    let url = raw["url"]
+        .as_str()
+        .or_else(|| raw["permalink"].as_str())
+        .map(str::to_owned);
+    let title_el: AnyElement = match url {
+        Some(href) => routed_link(
+            format!("bk-listrec-{}-{ix}", kcx.ts.as_str()),
+            plain_label(title, cx),
+            href,
+            kcx,
+            FontWeight::SEMIBOLD,
+            cx,
+        )
+        .into_any_element(),
+        None => div()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.foreground)
+            .child(plain_label(title, cx))
+            .into_any_element(),
+    };
+    h_flex()
+        .w_full()
+        .max_w(px(480.))
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .p_2p5()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            h_flex()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::ListChecks)
+                        .size(px(14.))
+                        .text_color(theme.link),
+                )
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(title_el)
+                        .when_some(list_name, |col, ln| {
+                            col.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(plain_label(ln, cx)),
+                            )
+                        }),
+                ),
+        )
+        .when_some(status, |row, st| {
+            row.child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_full()
+                    .bg(theme.secondary)
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(plain_label(st, cx)),
+            )
+        })
+}
+
+/// Parse `#RGB` or `#RRGGBB` hex string into GPUI `Hsla` for Block Kit `color` elements (`F-COLLAB-743`).
+fn parse_hex_color(raw: &str) -> Option<Hsla> {
+    let hex = raw.trim().trim_start_matches('#');
+    let rgb_u32 = match hex.len() {
+        6 => u32::from_str_radix(hex, 16).ok()?,
+        3 => {
+            let r = u32::from_str_radix(&hex[0..1], 16).ok()?;
+            let g = u32::from_str_radix(&hex[1..2], 16).ok()?;
+            let b = u32::from_str_radix(&hex[2..3], 16).ok()?;
+            ((r * 17) << 16) | ((g * 17) << 8) | (b * 17)
+        }
+        _ => return None,
+    };
+    Some(gpui_kit::gpui::rgb(rgb_u32).into())
+}
+
+/// Block Kit `color` element (`F-COLLAB-743`): inline swatch pill with parsed color dot + hex label.
+fn color_element(raw: &Json, cx: &App) -> Div {
+    let theme = cx.theme();
+    let hex = raw["value"]
+        .as_str()
+        .or_else(|| raw["color"].as_str())
+        .unwrap_or("#888888");
+    let swatch = parse_hex_color(hex).unwrap_or(theme.primary);
+    h_flex()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .py_0p5()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .child(
+            div()
+                .size(px(10.))
+                .rounded_full()
+                .bg(swatch)
+                .border_1()
+                .border_color(theme.foreground.opacity(0.2)),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.foreground)
+                .child(hex.to_owned()),
+        )
+}
+
+/// Block Kit `work_object` mention link (`F-COLLAB-772`).
+fn work_object_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let label = raw["title"]
+        .as_str()
+        .or_else(|| text_of(&raw["title"]))
+        .or_else(|| raw["entity_type"].as_str())
+        .unwrap_or("Work object");
+    let url = raw["url"]
+        .as_str()
+        .or_else(|| raw["external_ref"]["url"].as_str());
+    let inner: AnyElement = match url {
+        Some(href) => routed_link(
+            format!("bk-wo-{}-{ix}", kcx.ts.as_str()),
+            plain_label(label, cx),
+            href.to_owned(),
+            kcx,
+            FontWeight::MEDIUM,
+            cx,
+        )
+        .into_any_element(),
+        None => div()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.foreground)
+            .child(plain_label(label, cx))
+            .into_any_element(),
+    };
+    h_flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .child(
+            Icon::new(IconName::Briefcase)
+                .size(px(12.))
+                .text_color(theme.link),
+        )
+        .child(inner)
+        .into_any_element()
+}
+
+/// Block Kit `workflow` mention link (`F-COLLAB-773`).
+fn workflow_link_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let label = raw["title"]
+        .as_str()
+        .or_else(|| text_of(&raw["title"]))
+        .or_else(|| raw["name"].as_str())
+        .unwrap_or("Workflow");
+    let url = raw["trigger"]["url"]
+        .as_str()
+        .or_else(|| raw["url"].as_str());
+    let inner: AnyElement = match url {
+        Some(href) => routed_link(
+            format!("bk-wf-{}-{ix}", kcx.ts.as_str()),
+            plain_label(label, cx),
+            href.to_owned(),
+            kcx,
+            FontWeight::MEDIUM,
+            cx,
+        )
+        .into_any_element(),
+        None => div()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.foreground)
+            .child(plain_label(label, cx))
+            .into_any_element(),
+    };
+    h_flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .child(
+            Icon::new(IconName::Zap)
+                .size(px(12.))
+                .text_color(theme.link),
+        )
+        .child(inner)
+        .into_any_element()
+}
+
+/// Block Kit `url_source` attribution chip (`F-COLLAB-792`).
+fn url_source_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let url = raw["url"].as_str().unwrap_or_default();
+    let label = raw["text"]
+        .as_str()
+        .or_else(|| text_of(&raw["text"]))
+        .or_else(|| raw["title"].as_str())
+        .unwrap_or(url);
+    let inner: AnyElement = if !url.is_empty() {
+        routed_link(
+            format!("bk-urlsrc-{}-{ix}", kcx.ts.as_str()),
+            plain_label(label, cx),
+            url.to_owned(),
+            kcx,
+            FontWeight::NORMAL,
+            cx,
+        )
+        .into_any_element()
+    } else {
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(plain_label(label, cx))
+            .into_any_element()
+    };
+    h_flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .py_0p5()
+        .rounded_full()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            Icon::new(IconName::Globe)
+                .size(px(11.))
+                .text_color(theme.muted_foreground),
+        )
+        .child(inner)
+        .into_any_element()
 }
 
 /// Slack's Block Kit `table` block: first row tinted as a header, column alignment from
@@ -1837,6 +2443,15 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
         "image" => image_element(element, kcx, 20., cx),
         "tag" => tag_element(element, cx).into_any_element(),
         "citation" => citation_element(element, 0, kcx, cx),
+        "color" => color_element(element, cx).into_any_element(),
+        "file" => file_block(element, cx).into_any_element(),
+        "canvas" | "canvas_unfurl" => canvas_element(element, 0, kcx, cx).into_any_element(),
+        "list_record" | "slack_list_record" => {
+            list_record_element(element, 0, kcx, cx).into_any_element()
+        }
+        "work_object" => work_object_element(element, 0, kcx, cx),
+        "workflow" => workflow_link_element(element, 0, kcx, cx),
+        "url_source" => url_source_element(element, 0, kcx, cx),
         kind if TEXT_INPUTS.contains(&kind) => text_input(element, block, &key, kcx, cx),
         other => div()
             .text_xs()
@@ -2645,6 +3260,37 @@ fn overflow(element: &Json, block: &Json, key: String, kcx: &KitCx) -> impl Into
         })
 }
 
+/// Option item metadata preserving `text` (honoring `plain_text` vs `mrkdwn`, `F-COLLAB-760`)
+/// and optional `description` subtext (`F-COLLAB-759`).
+struct RichOption {
+    label: String,
+    value: String,
+    text_obj: Json,
+    description: Option<Json>,
+}
+
+fn rich_options(element: &Json) -> Vec<RichOption> {
+    element["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            let label = text_of(&option["text"])?.to_owned();
+            let value = option["value"].as_str()?.to_owned();
+            let description = option
+                .get("description")
+                .filter(|d| d.is_object() && text_of(d).is_some())
+                .cloned();
+            Some(RichOption {
+                label,
+                value,
+                text_obj: option["text"].clone(),
+                description,
+            })
+        })
+        .collect()
+}
+
 fn checkboxes(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
     let initial: HashSet<String> = element["initial_options"]
         .as_array()
@@ -2658,68 +3304,97 @@ fn checkboxes(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) 
         .unwrap_or_else(|| initial.clone());
     let base = action_base(element, block);
     let all_options = options(element);
-    v_flex()
-        .gap_1p5()
-        .children(all_options.clone().into_iter().map(|(text, value)| {
-            let is_checked = checked.contains(&value);
-            let (kit, key, initial) = (kcx.kit.cloned(), key.clone(), initial.clone());
-            let (on_action, attachment, base, opts) = (
-                kcx.on_action.clone(),
-                kcx.attachment,
-                base.clone(),
-                all_options.clone(),
-            );
-            Checkbox::new(SharedString::from(format!("bk-{key}-{value}")))
-                .label(text.clone())
-                .checked(is_checked)
-                .on_click(move |now: &bool, window, cx| {
-                    let selected_set = if let Some(kit) = &kit {
-                        kit.update(cx, |state, cx| {
-                            let set = state
-                                .checked
-                                .entry(key.clone())
-                                .or_insert_with(|| initial.clone());
-                            if *now {
-                                set.insert(value.clone());
-                            } else {
-                                set.remove(&value);
-                            }
-                            cx.notify();
-                            set.clone()
-                        })
-                    } else {
-                        let mut set = initial.clone();
+    let rich = rich_options(element);
+    v_flex().gap_1p5().children(rich.into_iter().map(|opt| {
+        let RichOption {
+            label: text,
+            value,
+            text_obj,
+            description,
+        } = opt;
+        let is_checked = checked.contains(&value);
+        let (kit, key, initial) = (kcx.kit.cloned(), key.clone(), initial.clone());
+        let (on_action, attachment, base, opts) = (
+            kcx.on_action.clone(),
+            kcx.attachment,
+            base.clone(),
+            all_options.clone(),
+        );
+        let desc_el = description
+            .as_ref()
+            .and_then(|d| text_object(d, kcx, true, cx));
+        let rich_label = (text_obj["type"].as_str() == Some("mrkdwn"))
+            .then(|| text_object(&text_obj, kcx, false, cx))
+            .flatten();
+        let cb = Checkbox::new(SharedString::from(format!("bk-{key}-{value}")))
+            .when(rich_label.is_none(), |c| c.label(plain_label(&text, cx)))
+            .checked(is_checked)
+            .on_click(move |now: &bool, window, cx| {
+                let selected_set = if let Some(kit) = &kit {
+                    kit.update(cx, |state, cx| {
+                        let set = state
+                            .checked
+                            .entry(key.clone())
+                            .or_insert_with(|| initial.clone());
                         if *now {
                             set.insert(value.clone());
                         } else {
                             set.remove(&value);
                         }
-                        set
-                    };
-                    let mut payload = base.clone();
-                    payload["selected_options"] = Json::Array(
-                        opts.iter()
-                            .filter(|(_, v)| selected_set.contains(v))
-                            .map(|(t, v)| {
-                                serde_json::json!({
-                                    "text": { "type": "plain_text", "text": t },
-                                    "value": v,
-                                })
+                        cx.notify();
+                        set.clone()
+                    })
+                } else {
+                    let mut set = initial.clone();
+                    if *now {
+                        set.insert(value.clone());
+                    } else {
+                        set.remove(&value);
+                    }
+                    set
+                };
+                let mut payload = base.clone();
+                payload["selected_options"] = Json::Array(
+                    opts.iter()
+                        .filter(|(_, v)| selected_set.contains(v))
+                        .map(|(t, v)| {
+                            serde_json::json!({
+                                "text": { "type": "plain_text", "text": t },
+                                "value": v,
                             })
-                            .collect(),
-                    );
-                    let verb = if *now { "checked" } else { "unchecked" };
-                    dispatch_action(
-                        payload,
-                        on_action.as_ref(),
-                        attachment,
-                        &key,
-                        &format!("{verb} \u{201C}{text}\u{201D}"),
-                        window,
-                        cx,
-                    );
-                })
-        }))
+                        })
+                        .collect(),
+                );
+                let verb = if *now { "checked" } else { "unchecked" };
+                dispatch_action(
+                    payload,
+                    on_action.as_ref(),
+                    attachment,
+                    &key,
+                    &format!("{verb} \u{201C}{text}\u{201D}"),
+                    window,
+                    cx,
+                );
+            });
+        v_flex()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(cb)
+                    .children(rich_label),
+            )
+            .when_some(desc_el, |col, desc| {
+                col.child(
+                    div()
+                        .pl(px(22.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(desc),
+                )
+            })
+    }))
 }
 
 fn radios(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> Div {
@@ -2731,7 +3406,13 @@ fn radios(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> D
     let base = action_base(element, block);
     v_flex()
         .gap_1p5()
-        .children(options(element).into_iter().map(|(text, value)| {
+        .children(rich_options(element).into_iter().map(|opt| {
+            let RichOption {
+                label: text,
+                value,
+                text_obj,
+                description,
+            } = opt;
             let checked = selected.as_ref() == Some(&value);
             let (kit, key, base, on_action, attachment) = (
                 kcx.kit.cloned(),
@@ -2740,8 +3421,16 @@ fn radios(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> D
                 kcx.on_action.clone(),
                 kcx.attachment,
             );
-            Radio::new(SharedString::from(format!("bk-{key}-{value}")))
-                .label(text.clone())
+            let desc_el = description
+                .as_ref()
+                .and_then(|d| text_object(d, kcx, true, cx));
+            let rich_label = (text_obj["type"].as_str() == Some("mrkdwn"))
+                .then(|| text_object(&text_obj, kcx, false, cx))
+                .flatten();
+            let r = Radio::new(SharedString::from(format!("bk-{key}-{value}")))
+                .when(rich_label.is_none(), |rad| {
+                    rad.label(plain_label(&text, cx))
+                })
                 .checked(checked)
                 .on_click(move |_, window, cx| {
                     set_choice(kit.as_ref(), &key, &value, cx);
@@ -2759,6 +3448,24 @@ fn radios(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &App) -> D
                         window,
                         cx,
                     );
+                });
+            v_flex()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(r)
+                        .children(rich_label),
+                )
+                .when_some(desc_el, |col, desc| {
+                    col.child(
+                        div()
+                            .pl(px(22.))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(desc),
+                    )
                 })
         }))
 }
@@ -4343,5 +5050,31 @@ mod tests {
                 "/tmp/spec.pdf"
             );
         });
+    }
+
+    #[test]
+    fn parses_hex_colors_and_rich_option_descriptions() {
+        assert!(parse_hex_color("#2BAC76").is_some());
+        assert!(parse_hex_color("#0f8").is_some());
+        assert!(parse_hex_color("not-a-color").is_none());
+
+        let el = json!({
+            "type": "radio_buttons",
+            "options": [
+                {
+                    "text": { "type": "mrkdwn", "text": "*Fast* path" },
+                    "value": "fast",
+                    "description": { "type": "plain_text", "text": "Skips optional checks" }
+                }
+            ]
+        });
+        let parsed = rich_options(&el);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].value, "fast");
+        assert_eq!(parsed[0].text_obj["type"], "mrkdwn");
+        assert_eq!(
+            parsed[0].description.as_ref().and_then(text_of),
+            Some("Skips optional checks")
+        );
     }
 }
