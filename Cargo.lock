@@ -9203,6 +9203,7 @@ dependencies = [
 name = "slackless-store"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "rusqlite",
  "serde_json",
  "slackless-types",

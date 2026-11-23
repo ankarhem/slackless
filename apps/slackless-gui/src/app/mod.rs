@@ -729,6 +729,8 @@ pub struct App {
     thread_generation: u64,
     /// Live mode: the newest async `reload_live` snapshot started; coalesces event bursts.
     reload_generation: u64,
+    /// Debounced snapshot reload handle; replacing cancels pending reads during hydration bursts.
+    reload_task: gpui::Task<()>,
     /// Places navigated away from, newest last (Slack's back arrow, Cmd+[, mouse Back).
     back: Vec<NavPlace>,
     /// Places stepped back from, newest last (the forward arrow, Cmd+], mouse Forward).
@@ -2169,6 +2171,7 @@ impl App {
                 history_generation: 0,
                 thread_generation: 0,
                 reload_generation: 0,
+                reload_task: gpui::Task::ready(()),
                 open_members: None,
                 members_hover: (false, false),
                 channel_people: None,

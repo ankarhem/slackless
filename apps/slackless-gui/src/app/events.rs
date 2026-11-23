@@ -1427,16 +1427,31 @@ impl App {
     }
 
     /// Live mode: rebuild the workspace snapshot off the UI thread on the read-only WAL
-    /// connection, coalescing rapid bursts (`reload_generation`) so boot and live sync never
-    /// stall frame rendering.
+    /// connection, debouncing rapid event bursts (40ms) so boot hydration builds `Fixtures` once
+    /// instead of spawning concurrent duplicate SQLite reads and peaking heap memory.
     pub(super) fn reload_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(task) = self.bridge.snapshot_async(self.ws.counts.clone()) else {
+        if self.bridge.store().is_none() {
             return;
-        };
+        }
         self.reload_generation += 1;
         let generation = self.reload_generation;
         let workspace = self.workspace;
-        cx.spawn_in(window, async move |this, cx| {
+        self.reload_task = cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(40))
+                .await;
+            let task = this
+                .update(cx, |app, _| {
+                    if app.reload_generation != generation || app.workspace != workspace {
+                        return None;
+                    }
+                    app.bridge.snapshot_async(app.ws.counts.clone())
+                })
+                .ok()
+                .flatten();
+            let Some(task) = task else {
+                return;
+            };
             let snapshot = cx.background_executor().spawn(task).await;
             let Some(mut snapshot) = snapshot else {
                 return;
@@ -1461,8 +1476,7 @@ impl App {
                 snapshot.app_commands = app.ws.app_commands.clone();
                 app.apply_snapshot(Arc::new(snapshot), window, cx);
             });
-        })
-        .detach();
+        });
     }
 
     /// Fast in-memory update pushing `self.ws.counts` (and updated per-conversation `last_read`

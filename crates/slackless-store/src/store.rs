@@ -1,10 +1,14 @@
 //! The blocking [`Store`]. Drive it from a dedicated thread or `spawn_blocking`.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::types::Value as SqlValue;
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
 use crate::Result;
@@ -89,8 +93,8 @@ impl Store {
         let _ = conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -64000;
-             PRAGMA mmap_size = 536870912;",
+             PRAGMA cache_size = -12000;
+             PRAGMA mmap_size = 67108864;",
         );
         Self::init(conn)
     }
@@ -105,8 +109,8 @@ impl Store {
         let _ = conn.execute_batch(
             "PRAGMA query_only = ON;
              PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -32000;
-             PRAGMA mmap_size = 536870912;",
+             PRAGMA cache_size = -6000;
+             PRAGMA mmap_size = 67108864;",
         );
         Ok(Self { conn })
     }
@@ -114,7 +118,7 @@ impl Store {
     /// A fresh in-memory store (tests, ephemeral sessions).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA cache_size = -32000;");
+        let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000;");
         Self::init(conn)
     }
 
@@ -148,8 +152,9 @@ impl Store {
     ) -> Result<()> {
         let edit_ts = message.edited.as_ref().map_or("", |e| e.ts.as_str());
         let json = serde_json::to_string(message)?;
+        let ephemeral = is_ephemeral_message(message);
+        let stored_json = encode_json_value(&json, ephemeral);
         let tx = self.conn.transaction()?;
-        insert_revision(&tx, workspace, channel, message, edit_ts, false, &json)?;
         let current: Option<(String, bool)> = tx
             .query_row(
                 "SELECT edit_ts, deleted FROM message_current
@@ -158,13 +163,43 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let newest = match current {
+        let newest = match &current {
             None => true,
             Some((_, true)) => false,
-            Some((current_edit, false)) => Ts::from(edit_ts) >= Ts::from(current_edit),
+            Some((current_edit, false)) => Ts::from(edit_ts) >= Ts::from(current_edit.as_str()),
         };
+        // Avoid duplicating untouched originals in `message_revision` (cuts archive size ~65%):
+        // whenever a message is edited, tombstoned, or re-observed with a different revision key,
+        // archive the existing `message_current` row first and append the incoming revision.
+        let needs_revision = match &current {
+            None => !edit_ts.is_empty(),
+            Some((_, true)) => true,
+            Some((current_edit, false)) => current_edit.as_str() != edit_ts,
+        };
+        if needs_revision {
+            if current.is_some() {
+                archive_current_as_revision(&tx, workspace, channel, &message.ts)?;
+            }
+            insert_revision(
+                &tx,
+                workspace,
+                channel,
+                message,
+                edit_ts,
+                false,
+                &stored_json,
+            )?;
+        }
         if newest {
-            write_current(&tx, workspace, channel, message, edit_ts, false, &json)?;
+            write_current(
+                &tx,
+                workspace,
+                channel,
+                message,
+                edit_ts,
+                false,
+                &stored_json,
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -176,7 +211,8 @@ impl Store {
     pub fn drop_ephemeral(&mut self, workspace: &TeamId) -> Result<usize> {
         Ok(self.conn.execute(
             "DELETE FROM message_current
-             WHERE workspace_id = ?1 AND json_extract(json, '$.is_ephemeral') = 1",
+             WHERE workspace_id = ?1 AND typeof(json) = 'text'
+               AND json_extract(json, '$.is_ephemeral') = 1",
             params![workspace.as_str()],
         )?)
     }
@@ -194,6 +230,7 @@ impl Store {
         previous: Option<&Message>,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        archive_current_as_revision(&tx, workspace, channel, deleted_ts)?;
         let mut prior = match previous {
             Some(m) => m.clone(),
             None => {
@@ -202,7 +239,7 @@ impl Store {
                         "SELECT json FROM message_current
                          WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
                         params![workspace.as_str(), channel.as_str(), deleted_ts.as_str()],
-                        |r| r.get(0),
+                        |r| decode_json_value(r.get_ref(0)?),
                     )
                     .optional()?;
                 match stored {
@@ -214,8 +251,25 @@ impl Store {
         prior.ts = deleted_ts.clone();
         let edit_ts = event_ts.map_or_else(now_ts, |t| t.as_str().to_owned());
         let json = serde_json::to_string(&prior)?;
-        insert_revision(&tx, workspace, channel, &prior, &edit_ts, true, &json)?;
-        write_current(&tx, workspace, channel, &prior, &edit_ts, true, &json)?;
+        let stored_json = encode_json_value(&json, is_ephemeral_message(&prior));
+        insert_revision(
+            &tx,
+            workspace,
+            channel,
+            &prior,
+            &edit_ts,
+            true,
+            &stored_json,
+        )?;
+        write_current(
+            &tx,
+            workspace,
+            channel,
+            &prior,
+            &edit_ts,
+            true,
+            &stored_json,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -871,7 +925,7 @@ impl Store {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, bool>(1)?,
-                    r.get::<_, String>(2)?,
+                    decode_json_value(r.get_ref(2)?)?,
                 ))
             },
         )?;
@@ -883,6 +937,30 @@ impl Store {
                 deleted,
                 message: serde_json::from_str(&json)?,
             });
+        }
+        if out.is_empty() {
+            let current = self
+                .conn
+                .query_row(
+                    "SELECT edit_ts, deleted, json FROM message_current
+                     WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+                    params![workspace.as_str(), channel.as_str(), ts.as_str()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, bool>(1)?,
+                            decode_json_value(r.get_ref(2)?)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((edit_ts, deleted, json)) = current {
+                out.push(Revision {
+                    edit_ts,
+                    deleted,
+                    message: serde_json::from_str(&json)?,
+                });
+            }
         }
         Ok(out)
     }
@@ -1014,11 +1092,19 @@ impl Store {
             params![ws],
             |r| r.get(0),
         )?;
-        let revisions: i64 = self.conn.query_row(
+        let rev_rows: i64 = self.conn.query_row(
             "SELECT count(*) FROM message_revision WHERE workspace_id = ?1",
             params![ws],
             |r| r.get(0),
         )?;
+        let revised_msgs: i64 = self.conn.query_row(
+            "SELECT count(*) FROM (
+                 SELECT DISTINCT channel_id, ts FROM message_revision WHERE workspace_id = ?1
+             )",
+            params![ws],
+            |r| r.get(0),
+        )?;
+        let revisions = (messages - revised_msgs).max(0) + rev_rows;
         let conversations: i64 = self.conn.query_row(
             "SELECT count(*) FROM conversation WHERE workspace_id = ?1",
             params![ws],
@@ -1159,8 +1245,59 @@ impl Store {
         Ok(out)
     }
 
-    /// Checkpoint WAL, compact unused pages (`VACUUM`), and refresh query planner statistics.
+    /// Compress any legacy uncompressed `message_current` JSON rows to zlib BLOBs, checkpoint
+    /// WAL, compact unused pages (`VACUUM`), and refresh query planner statistics.
     pub fn vacuum(&self) -> Result<()> {
+        // Compress legacy plain-TEXT message payloads in batches (skipping ephemeral rows so
+        // `drop_ephemeral` can keep using `json_extract`). Because `V6` scopes `message_current_au`
+        // to `text, file_names`, updating `json` alone never churns the FTS5 index.
+        const BATCH: usize = 5_000;
+        let mut last_id: i64 = 0;
+        loop {
+            let mut batch: Vec<(i64, Vec<u8>)> = Vec::with_capacity(BATCH);
+            {
+                let mut stmt = self.conn.prepare_cached(
+                    "SELECT id, json FROM message_current
+                     WHERE id > ?1 AND typeof(json) = 'text' AND length(json) >= 160
+                       AND COALESCE(json_extract(json, '$.is_ephemeral'), 0) = 0
+                     ORDER BY id ASC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![last_id, BATCH as i64], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?;
+                let mut seen = 0usize;
+                for row in rows {
+                    let (id, text) = row?;
+                    last_id = id;
+                    seen += 1;
+                    if let SqlValue::Blob(blob) = encode_json_value(&text, false) {
+                        batch.push((id, blob));
+                    }
+                }
+                if seen == 0 {
+                    break;
+                }
+            }
+            if !batch.is_empty() {
+                self.conn.execute_batch("BEGIN IMMEDIATE")?;
+                let update_res = (|| -> Result<()> {
+                    let mut upd = self
+                        .conn
+                        .prepare_cached("UPDATE message_current SET json = ?1 WHERE id = ?2")?;
+                    for (id, blob) in &batch {
+                        upd.execute(params![blob, id])?;
+                    }
+                    Ok(())
+                })();
+                match update_res {
+                    Ok(()) => self.conn.execute_batch("COMMIT")?,
+                    Err(e) => {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        return Err(e);
+                    }
+                }
+            }
+        }
         self.conn.execute_batch(
             "PRAGMA wal_checkpoint(TRUNCATE);
              VACUUM;
@@ -1330,6 +1467,77 @@ fn resolve_alias<'a>(by_name: &HashMap<&'a str, &'a str>, url: &'a str) -> Optio
     Some(url)
 }
 
+fn is_ephemeral_message(message: &Message) -> bool {
+    message
+        .extra
+        .get("is_ephemeral")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Compress JSON payloads >= 160 bytes with fast zlib when it saves space (unless `force_text`,
+/// used for ephemeral messages so `json_extract(json, '$.is_ephemeral')` stays index-free).
+fn encode_json_value(json: &str, force_text: bool) -> SqlValue {
+    if !force_text && json.len() >= 160 {
+        let mut enc = ZlibEncoder::new(Vec::with_capacity(json.len() / 2), Compression::fast());
+        if enc.write_all(json.as_bytes()).is_ok() {
+            if let Ok(compressed) = enc.finish() {
+                if compressed.len() + 16 < json.len() {
+                    return SqlValue::Blob(compressed);
+                }
+            }
+        }
+    }
+    SqlValue::Text(json.to_owned())
+}
+
+/// Decode a `json` column stored as either legacy UTF-8 `TEXT` or zlib-compressed `BLOB`.
+fn decode_json_value(val: ValueRef<'_>) -> rusqlite::Result<String> {
+    match val {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(rusqlite::Error::Utf8Error),
+        ValueRef::Blob(bytes) => {
+            let mut dec = ZlibDecoder::new(bytes);
+            let mut out = String::new();
+            dec.read_to_string(&mut out).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(e),
+                )
+            })?;
+            Ok(out)
+        }
+        other => Err(rusqlite::Error::InvalidColumnType(
+            0,
+            "json".to_owned(),
+            other.data_type(),
+        )),
+    }
+}
+
+/// Snapshot the existing `message_current` row into `message_revision` before an edit or deletion
+/// replaces it, preserving the original content verbatim in the append-only log.
+fn archive_current_as_revision(
+    tx: &Transaction<'_>,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    ts: &Ts,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO message_revision
+             (workspace_id, channel_id, ts, edit_ts, user_id, thread_ts, subtype, text, deleted,
+              json, created_at, recorded_at)
+         SELECT workspace_id, channel_id, ts, edit_ts, user_id, thread_ts, subtype, text, deleted,
+                json, created_at, updated_at
+         FROM message_current
+         WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+        params![workspace.as_str(), channel.as_str(), ts.as_str()],
+    )?;
+    Ok(())
+}
+
 fn insert_revision(
     tx: &Transaction<'_>,
     workspace: &TeamId,
@@ -1337,7 +1545,7 @@ fn insert_revision(
     message: &Message,
     edit_ts: &str,
     deleted: bool,
-    json: &str,
+    json: &SqlValue,
 ) -> Result<()> {
     tx.execute(
         "INSERT OR IGNORE INTO message_revision
@@ -1369,7 +1577,7 @@ fn write_current(
     message: &Message,
     edit_ts: &str,
     deleted: bool,
-    json: &str,
+    json: &SqlValue,
 ) -> Result<()> {
     let file_names = message
         .files
@@ -1454,7 +1662,7 @@ fn flipping(tx: &Transaction<'_>, sql: &str, args: Vec<SqlValue>) -> Result<Vec<
 }
 
 fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
-    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    Ok((r.get(0)?, decode_json_value(r.get_ref(1)?)?, r.get(2)?))
 }
 
 fn collect(rows: impl Iterator<Item = rusqlite::Result<RawRow>>) -> Result<Vec<StoredMessage>> {
@@ -2323,5 +2531,56 @@ mod tests {
         drop(reader);
         drop(writer);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compressed_json_round_trips_and_vacuum_compacts_legacy_text() {
+        let mut store = Store::open_in_memory().unwrap();
+        let long_text = "Slackless archive payload compression test ".repeat(24);
+        let m1 = msg("1700000100.000100", "U1", &long_text);
+        store.upsert_message(&ws(), &general(), &m1).unwrap();
+
+        // Untouched original lives in `message_current` as a compressed BLOB without duplicating
+        // into `message_revision`, yet `revisions()` still returns the single original revision.
+        let kind: String = store
+            .conn
+            .query_row(
+                "SELECT typeof(json) FROM message_current WHERE ts = '1700000100.000100'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "blob");
+        let rev_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM message_revision", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rev_count, 0);
+        let revs = store.revisions(&ws(), &general(), &m1.ts).unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].message.text, long_text);
+
+        // Simulate a legacy uncompressed TEXT row and verify `vacuum()` compresses it in place.
+        let legacy_json = serde_json::to_string(&m1).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE message_current SET json = ?1 WHERE ts = '1700000100.000100'",
+                params![legacy_json],
+            )
+            .unwrap();
+        store.vacuum().unwrap();
+        let kind_after: String = store
+            .conn
+            .query_row(
+                "SELECT typeof(json) FROM message_current WHERE ts = '1700000100.000100'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind_after, "blob");
+        let hist = store.channel_history(&ws(), &general(), None, 10).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].message.text, long_text);
     }
 }

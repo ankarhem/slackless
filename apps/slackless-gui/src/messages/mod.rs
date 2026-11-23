@@ -264,7 +264,7 @@ struct MessageData {
 /// Maximum number of recently visited channels kept warm in [`MessageList`] so switching
 /// back to a recent channel renders on frame 0 without flashing an empty transcript while
 /// SQLite refreshes in the background.
-const HISTORY_CACHE_CHANNELS: usize = 20;
+const HISTORY_CACHE_CHANNELS: usize = 10;
 
 pub struct MessageList {
     fixtures: Arc<Fixtures>,

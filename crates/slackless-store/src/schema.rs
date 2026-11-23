@@ -183,7 +183,60 @@ CREATE TABLE bot_profile (
 ) WITHOUT ROWID;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
+/// Version 6: rebuild `message_revision` as a ROWID table (eliminating WITHOUT ROWID B-tree bloat
+/// on large JSON rows) retaining only edited/deleted/multi-revision history (untouched originals
+/// live in `message_current`), and scope the FTS5 update trigger to `text, file_names` so payload
+/// compaction never churns the full-text index.
+const V6: &str = r#"
+DROP TRIGGER IF EXISTS message_revision_no_update;
+DROP TRIGGER IF EXISTS message_revision_no_delete;
+CREATE TABLE message_revision_v6 (
+    id           INTEGER PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    ts           TEXT NOT NULL,
+    edit_ts      TEXT NOT NULL,
+    user_id      TEXT,
+    thread_ts    TEXT,
+    subtype      TEXT,
+    text         TEXT NOT NULL,
+    deleted      INTEGER NOT NULL DEFAULT 0,
+    json         TEXT NOT NULL,
+    created_at   INTEGER,
+    recorded_at  INTEGER NOT NULL,
+    UNIQUE (workspace_id, channel_id, ts, edit_ts)
+);
+CREATE INDEX message_revision_lookup ON message_revision_v6 (workspace_id, channel_id, ts);
+INSERT INTO message_revision_v6
+    (workspace_id, channel_id, ts, edit_ts, user_id, thread_ts, subtype, text, deleted,
+     json, created_at, recorded_at)
+SELECT r.workspace_id, r.channel_id, r.ts, r.edit_ts, r.user_id, r.thread_ts, r.subtype,
+       r.text, r.deleted, r.json, r.created_at, r.recorded_at
+FROM message_revision r
+WHERE r.deleted = 1
+   OR r.edit_ts != ''
+   OR (r.workspace_id, r.channel_id, r.ts) IN (
+       SELECT workspace_id, channel_id, ts
+       FROM message_revision
+       GROUP BY workspace_id, channel_id, ts
+       HAVING COUNT(*) > 1
+   );
+DROP TABLE message_revision;
+ALTER TABLE message_revision_v6 RENAME TO message_revision;
+CREATE TRIGGER message_revision_no_update BEFORE UPDATE ON message_revision
+BEGIN SELECT RAISE(ABORT, 'message_revision is append-only'); END;
+CREATE TRIGGER message_revision_no_delete BEFORE DELETE ON message_revision
+BEGIN SELECT RAISE(ABORT, 'message_revision is append-only'); END;
+
+DROP TRIGGER IF EXISTS message_current_au;
+CREATE TRIGGER message_current_au AFTER UPDATE OF text, file_names ON message_current BEGIN
+    INSERT INTO message_fts (message_fts, rowid, text, file_names)
+    VALUES ('delete', old.id, old.text, old.file_names);
+    INSERT INTO message_fts (rowid, text, file_names) VALUES (new.id, new.text, new.file_names);
+END;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
