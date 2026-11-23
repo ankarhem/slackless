@@ -355,6 +355,36 @@ pub fn format_hex_rgb(rgb: u32) -> String {
     format!("#{:06X}", rgb & 0x00FF_FFFF)
 }
 
+/// Parse a Slack shareable / legacy comma-separated hex theme string (`F-SHELL-078`, `F-SHELL-079`)
+/// into `(sidebar, accent)` RGB values. Accepts Slack's classic 8- or 10-color format
+/// (`column_bg,menu_bg,active_item,active_item_text,hover_item,text_color,active_presence,mention_badge[,top_nav_bg,top_nav_text]`)
+/// as well as a shorthand 2-color `sidebar,accent` string.
+pub fn parse_slack_theme_string(input: &str) -> Option<(u32, u32)> {
+    let colors: Vec<u32> = input
+        .split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(parse_hex_rgb)
+        .collect::<Option<Vec<_>>>()?;
+    match colors.as_slice() {
+        [sidebar, accent] => Some((*sidebar, *accent)),
+        [sidebar, _, accent, ..] => Some((*sidebar, *accent)),
+        _ => None,
+    }
+}
+
+/// Export `palette` as Slack's shareable 8-color comma-separated hex theme string (`F-SHELL-078`).
+pub fn format_slack_theme_string(palette: Palette, dark: bool) -> String {
+    let (sidebar, accent) = palette.rgb_pair().unwrap_or(if dark {
+        (0x13_18_1D, 0x05_66_96)
+    } else {
+        (0x3F_0E_40, 0x11_64_A3)
+    });
+    let sb = format_hex_rgb(sidebar);
+    let ac = format_hex_rgb(accent);
+    format!("{sb},{sb},{ac},#FFFFFF,{sb},#FFFFFF,#2BAC76,#CD2553")
+}
+
 /// A custom-builder swatch as a theme color.
 pub fn swatch_color(hex: u32) -> Hsla {
     color(hex)
@@ -797,5 +827,22 @@ mod tests {
             accent: 0x44_55_66,
         };
         assert_eq!(p.rgb_pair(), Some((0x11_22_33, 0x44_55_66)));
+
+        // Slack's classic 8-color and 10-color theme strings (`F-SHELL-078`, `F-SHELL-079`).
+        let legacy = "#3F0E40,#350D36,#1164A3,#FFFFFF,#350D36,#FFFFFF,#2BAC76,#CD2553";
+        assert_eq!(
+            parse_slack_theme_string(legacy),
+            Some((0x3F_0E_40, 0x11_64_A3))
+        );
+        assert_eq!(
+            parse_slack_theme_string("#123456, #abcdef"),
+            Some((0x12_34_56, 0xAB_CD_EF))
+        );
+        assert_eq!(parse_slack_theme_string("#123456"), None);
+        let exported = format_slack_theme_string(p, true);
+        assert_eq!(
+            parse_slack_theme_string(&exported),
+            Some((0x11_22_33, 0x44_55_66))
+        );
     }
 }

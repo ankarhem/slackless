@@ -216,7 +216,20 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                             .label("CSV")
                             .tooltip("Download list as CSV")
                             .on_click(move |_, window, cx| {
-                                export_csv(csv.clone(), suggested.clone(), window, cx);
+                                export_file(csv.clone(), suggested.clone(), "CSV", window, cx);
+                            })
+                    })
+                    .child({
+                        let json = fixture_to_json(&list);
+                        let suggested = format!("{}.json", sanitize_filename(list.title));
+                        Button::new("list-export-json-fixture")
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Download)
+                            .label("JSON")
+                            .tooltip("Download list as JSON")
+                            .on_click(move |_, window, cx| {
+                                export_file(json.clone(), suggested.clone(), "JSON", window, cx);
                             })
                     })
                     .child(read_only_badge(cx)),
@@ -558,7 +571,20 @@ fn render_live_list(
                             .label("CSV")
                             .tooltip("Download list as CSV")
                             .on_click(move |_, window, cx| {
-                                export_csv(csv.clone(), suggested.clone(), window, cx);
+                                export_file(csv.clone(), suggested.clone(), "CSV", window, cx);
+                            })
+                    })
+                    .child({
+                        let json = list_to_json(data, fixtures);
+                        let suggested = format!("{}.json", sanitize_filename(&data.title));
+                        Button::new("list-export-json")
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Download)
+                            .label("JSON")
+                            .tooltip("Download list as JSON")
+                            .on_click(move |_, window, cx| {
+                                export_file(json.clone(), suggested.clone(), "JSON", window, cx);
                             })
                     })
                     .child(read_only_badge(cx))
@@ -912,7 +938,106 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn export_csv(csv: String, suggested: String, window: &mut Window, cx: &mut App) {
+fn fixture_to_json(list: &SlackList) -> String {
+    use crate::blockkit::serde_json::{Map, Value, json};
+    let rows: Vec<Value> = list
+        .rows
+        .iter()
+        .map(|fields| {
+            let mut obj = Map::new();
+            for (col, field) in list.columns.iter().zip(fields) {
+                let val = match field {
+                    Field::Text(s) | Field::Person(s) | Field::Date(s) => {
+                        Value::String((*s).into())
+                    }
+                    Field::Select(Status::Todo) => Value::String("To do".into()),
+                    Field::Select(Status::InProgress) => Value::String("In progress".into()),
+                    Field::Select(Status::Blocked) => Value::String("Blocked".into()),
+                    Field::Select(Status::Done) => Value::String("Done".into()),
+                    Field::Checkbox(b) => Value::Bool(*b),
+                };
+                obj.insert(col.name.to_owned(), val);
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    let payload = json!({
+        "title": list.title,
+        "columns": list.columns.iter().map(|c| c.name).collect::<Vec<_>>(),
+        "items": rows,
+    });
+    crate::blockkit::serde_json::to_string_pretty(&payload).unwrap_or_default()
+}
+
+/// Serialize a live Slack List to pretty-printed JSON (`F-COLLAB-218`), resolving user IDs and
+/// select option labels cleanly.
+pub fn list_to_json(data: &SlackListData, fixtures: &Fixtures) -> String {
+    use crate::blockkit::serde_json::{Map, Value, json};
+    let items: Vec<Value> = data
+        .rows
+        .iter()
+        .map(|row| {
+            let mut obj = Map::new();
+            obj.insert("id".to_owned(), Value::String(row.id.clone()));
+            for col in &data.columns {
+                let val = match row_cell(row, col) {
+                    None | Some(SlackListCellValue::Empty) => Value::Null,
+                    Some(SlackListCellValue::Text(s)) | Some(SlackListCellValue::Date(s)) => {
+                        Value::String(s.clone())
+                    }
+                    Some(SlackListCellValue::Number(n)) => n
+                        .parse::<f64>()
+                        .ok()
+                        .and_then(crate::blockkit::serde_json::Number::from_f64)
+                        .map(Value::Number)
+                        .unwrap_or_else(|| Value::String(n.clone())),
+                    Some(SlackListCellValue::Checkbox(b)) => Value::Bool(*b),
+                    Some(SlackListCellValue::Link { label, url }) => json!({
+                        "label": label,
+                        "url": url,
+                    }),
+                    Some(SlackListCellValue::Users(users)) => Value::Array(
+                        users
+                            .iter()
+                            .map(|u| Value::String(fixtures.user_name(u).to_owned()))
+                            .collect(),
+                    ),
+                    Some(SlackListCellValue::Select(opts)) => Value::Array(
+                        opts.iter()
+                            .map(|opt| {
+                                let label = col
+                                    .choices
+                                    .iter()
+                                    .find(|c| c.value == *opt)
+                                    .map(|c| c.label.as_str())
+                                    .unwrap_or(opt.as_str());
+                                Value::String(label.to_owned())
+                            })
+                            .collect(),
+                    ),
+                };
+                obj.insert(col.name.clone(), val);
+            }
+            Value::Object(obj)
+        })
+        .collect();
+    let payload = json!({
+        "file_id": data.file_id,
+        "title": data.title,
+        "description": data.description,
+        "columns": data.columns.iter().map(|c| json!({ "id": c.id, "name": c.name, "type": c.kind })).collect::<Vec<_>>(),
+        "items": items,
+    });
+    crate::blockkit::serde_json::to_string_pretty(&payload).unwrap_or_default()
+}
+
+fn export_file(
+    content: String,
+    suggested: String,
+    format_label: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let dir = std::env::var_os("HOME")
         .map(|home| std::path::PathBuf::from(home).join("Downloads"))
         .filter(|p| p.is_dir())
@@ -923,11 +1048,11 @@ fn export_csv(csv: String, suggested: String, window: &mut Window, cx: &mut App)
             let Ok(Ok(Some(path))) = receiver.await else {
                 return;
             };
-            let result = std::fs::write(&path, csv);
+            let result = std::fs::write(&path, content);
             let _ = cx.update(|window, cx| match result {
                 Ok(()) => crate::actions::notify(
                     "List exported",
-                    format!("Saved CSV to {}", path.display()),
+                    format!("Saved {format_label} to {}", path.display()),
                     window,
                     cx,
                 ),
@@ -1032,5 +1157,14 @@ mod tests {
             csv,
             "Task,Status\n\"Zebra, \"\"quoted\"\" work\",To do\nAlpha launch,Done\n"
         );
+
+        // JSON export resolves select labels and preserves metadata + items (`F-COLLAB-218`).
+        let json_str = list_to_json(&data, &fixtures);
+        let parsed: crate::blockkit::serde_json::Value =
+            crate::blockkit::serde_json::from_str(&json_str).expect("valid JSON");
+        assert_eq!(parsed["title"], "Tasks");
+        assert_eq!(parsed["items"][0]["Task"], "Zebra work");
+        assert_eq!(parsed["items"][0]["Status"][0], "To do");
+        assert_eq!(parsed["items"][1]["Status"][0], "Done");
     }
 }

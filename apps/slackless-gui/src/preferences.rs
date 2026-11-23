@@ -579,6 +579,7 @@ pub struct Preferences {
     excluded_channels: Entity<TextareaState>,
     custom_sidebar_hex: Entity<TextareaState>,
     custom_accent_hex: Entity<TextareaState>,
+    slack_theme_import: Entity<TextareaState>,
     storage_stats: Option<StorageInfo>,
     _subscriptions: Vec<Subscription>,
 }
@@ -617,6 +618,11 @@ impl Preferences {
                 state.set_value("#1164A3".to_owned(), window, cx);
                 state
             });
+            let slack_theme_import = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("#3F0E40,#350D36,#1164A3,#FFFFFF,...")
+                    .auto_grow(1, 2)
+            });
             let subscriptions = vec![
                 cx.subscribe_in(
                     &keywords,
@@ -647,6 +653,7 @@ impl Preferences {
                 excluded_channels,
                 custom_sidebar_hex,
                 custom_accent_hex,
+                slack_theme_import,
                 storage_stats: None,
                 _subscriptions: subscriptions,
             }
@@ -1364,6 +1371,83 @@ impl Preferences {
                         })),
                 )
         };
+        let slack_theme_row = {
+            let input_border = cx.theme().input;
+            v_flex().gap_2().child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .max_w(px(360.))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(input_border)
+                            .text_xs()
+                            .child(
+                                Textarea::new(&self.slack_theme_import)
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
+                    )
+                    .child(
+                        Button::new("slack-theme-import")
+                            .outline()
+                            .with_size(Size::Small)
+                            .label("Import")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let raw = this.slack_theme_import.read(cx).value().to_string();
+                                if let Some((sidebar, accent)) =
+                                    theme::parse_slack_theme_string(&raw)
+                                {
+                                    this.settings.palette = Palette::CustomHex { sidebar, accent };
+                                    this.custom_sidebar_hex.update(cx, |s, cx| {
+                                        s.set_value(theme::format_hex_rgb(sidebar), window, cx)
+                                    });
+                                    this.custom_accent_hex.update(cx, |s, cx| {
+                                        s.set_value(theme::format_hex_rgb(accent), window, cx)
+                                    });
+                                    this.changed(cx);
+                                    crate::actions::notify(
+                                        "Theme imported",
+                                        "Applied Slack theme colors.",
+                                        window,
+                                        cx,
+                                    );
+                                } else {
+                                    crate::actions::notify(
+                                        "Invalid theme string",
+                                        "Paste comma-separated #RRGGBB hex values from Slack.",
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("slack-theme-copy")
+                            .outline()
+                            .with_size(Size::Small)
+                            .icon(IconName::Copy)
+                            .label("Copy theme")
+                            .tooltip("Copy Slack-compatible comma-separated hex theme string")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let exported = theme::format_slack_theme_string(
+                                    this.settings.palette,
+                                    is_dark,
+                                );
+                                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
+                                    exported.clone(),
+                                ));
+                                crate::actions::notify("Slack theme copied", exported, window, cx);
+                            })),
+                    ),
+            )
+        };
         let simplified = self.checkbox(
             "appearance-simplified",
             "Simplified layout (hide workspace rail and extra chrome)",
@@ -1381,6 +1465,10 @@ impl Preferences {
                 swatch_row("custom-accent", &CUSTOM_ACCENTS, custom_accent, cx),
             ))
             .child(self.labeled("Custom hex colors (Sidebar / Accent)", custom_hex_row))
+            .child(self.labeled(
+                "Share or import Slack theme (comma-separated hex)",
+                slack_theme_row,
+            ))
             .child(simplified);
 
         let gradient = self.checkbox(

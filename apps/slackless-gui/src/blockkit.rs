@@ -377,6 +377,9 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
         "alert" | "callout" => alert_block(raw, ix, kcx, cx).into_any_element(),
         "card" | "container" => card_block(raw, ix, kcx, cx).into_any_element(),
         "carousel" => carousel_block(raw, ix, kcx, cx).into_any_element(),
+        "context_actions" => context_actions_block(raw, ix, kcx, cx).into_any_element(),
+        "task_card" => task_card_block(raw, ix, kcx, cx).into_any_element(),
+        "plan" => plan_block(raw, ix, kcx, cx).into_any_element(),
         "file" => file_block(raw, cx).into_any_element(),
         other => div()
             .text_xs()
@@ -842,6 +845,251 @@ fn card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
         ));
     }
     card
+}
+
+/// Modern Block Kit `context_actions` block (`F-COLLAB-717`): compact strip of inline
+/// feedback buttons (`positive_button` / `negative_button`), icon buttons, or action elements.
+fn context_actions_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let mut row = h_flex().flex_wrap().items_center().gap_1p5();
+    if let Some(elements) = raw["elements"].as_array() {
+        for (n, element) in elements.iter().enumerate() {
+            match element["type"].as_str().unwrap_or_default() {
+                "feedback_buttons" => {
+                    for (sub_ix, field) in ["positive_button", "negative_button"].iter().enumerate()
+                    {
+                        if let Some(btn) = element.get(*field).filter(|v| v.is_object()) {
+                            let mut synthetic = btn.clone();
+                            synthetic["type"] = "button".into();
+                            if synthetic["action_id"].is_null() {
+                                synthetic["action_id"] = element["action_id"].clone();
+                            }
+                            let key = control_key(kcx.ts, raw, ix * 17 + sub_ix, &synthetic, n);
+                            row = row.child(block_element(&synthetic, raw, key, kcx, cx));
+                        }
+                    }
+                }
+                "icon_button" => {
+                    let mut synthetic = element.clone();
+                    synthetic["type"] = "button".into();
+                    let key = control_key(kcx.ts, raw, ix, &synthetic, n);
+                    row = row.child(block_element(&synthetic, raw, key, kcx, cx));
+                }
+                _ => {
+                    let key = control_key(kcx.ts, raw, ix, element, n);
+                    row = row.child(block_element(element, raw, key, kcx, cx));
+                }
+            }
+        }
+    }
+    row
+}
+
+/// Modern Block Kit `task_card` block (`F-COLLAB-732`): structured status card for agent and
+/// workflow steps with status badge, title, optional details/output, sources, and actions.
+fn task_card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let status = raw["status"].as_str().unwrap_or("pending");
+    let (status_icon, status_label, status_color) = match status {
+        "complete" | "completed" | "done" | "success" => {
+            (IconName::Check, "Complete", theme.success)
+        }
+        "in_progress" | "running" => (IconName::Clock, "In progress", theme.link),
+        "error" | "failed" => (IconName::X, "Error", theme.danger),
+        _ => (IconName::CircleDot, "Pending", theme.muted_foreground),
+    };
+    let title = text_of(&raw["title"])
+        .or_else(|| raw["title"].as_str())
+        .unwrap_or("Task");
+
+    let mut card = v_flex()
+        .w_full()
+        .max_w(px(580.))
+        .gap_1p5()
+        .p_2p5()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(20.))
+                                .rounded_full()
+                                .bg(status_color.opacity(0.16))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(status_icon)
+                                        .size(px(12.))
+                                        .text_color(status_color),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(plain_label(title, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded_sm()
+                        .bg(status_color.opacity(0.14))
+                        .text_xs()
+                        .text_color(status_color)
+                        .child(status_label),
+                ),
+        );
+
+    for key in ["details", "output"] {
+        let field = &raw[key];
+        if field.is_null() {
+            continue;
+        }
+        if field["type"].as_str() == Some("rich_text") {
+            if let Ok(parsed) = serde_json::from_value::<Block>(field.clone()) {
+                card = card.child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .pl(px(28.))
+                        .children(messages::render_block(&parsed, 0, kcx, false, cx)),
+                );
+                continue;
+            }
+        }
+        if let Some(el) = text_object(field, kcx, false, cx).or_else(|| {
+            field
+                .as_str()
+                .map(|s| messages::mrkdwn(s, kcx, false, false, cx).into_any_element())
+        }) {
+            card = card.child(div().pl(px(28.)).child(el));
+        }
+    }
+
+    if let Some(sources) = raw["sources"].as_array().filter(|s| !s.is_empty()) {
+        let mut src_row = h_flex().flex_wrap().items_center().gap_2().pl(px(28.));
+        for (n, src) in sources.iter().enumerate() {
+            if let Some(url) = src["url"].as_str() {
+                let label = src["text"]
+                    .as_str()
+                    .or_else(|| text_of(&src["text"]))
+                    .unwrap_or(url);
+                src_row = src_row.child(routed_link(
+                    format!("bk-task-src-{}-{ix}-{n}", kcx.ts.as_str()),
+                    plain_label(label, cx),
+                    url.to_owned(),
+                    kcx,
+                    FontWeight::NORMAL,
+                    cx,
+                ));
+            }
+        }
+        card = card.child(src_row);
+    }
+
+    if let Some(actions) = raw["actions"].as_array().filter(|a| !a.is_empty()) {
+        card = card.child(
+            h_flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .pl(px(28.))
+                .children(actions.iter().enumerate().map(|(n, element)| {
+                    let key = control_key(kcx.ts, raw, ix, element, n);
+                    block_element(element, raw, key, kcx, cx)
+                })),
+        );
+    }
+
+    card
+}
+
+/// Modern Block Kit `plan` block (`F-COLLAB-728`): titled group of `task_card` steps with
+/// completion progress summary.
+fn plan_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let title = text_of(&raw["title"])
+        .or_else(|| raw["title"].as_str())
+        .unwrap_or("Plan");
+    let tasks = raw["tasks"]
+        .as_array()
+        .or_else(|| raw["blocks"].as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let completed = tasks
+        .iter()
+        .filter(|t| {
+            matches!(
+                t["status"].as_str().unwrap_or_default(),
+                "complete" | "completed" | "done" | "success"
+            )
+        })
+        .count();
+
+    let mut container = v_flex()
+        .w_full()
+        .max_w(px(600.))
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::ListChecks)
+                                .size(px(15.))
+                                .text_color(theme.link),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(plain_label(title, cx)),
+                        ),
+                )
+                .when(!tasks.is_empty(), |hdr| {
+                    hdr.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{completed} of {} complete", tasks.len())),
+                    )
+                }),
+        );
+    for (n, task) in tasks.iter().enumerate() {
+        container = container.child(task_card_block(task, ix * 43 + n, kcx, cx));
+    }
+    container
 }
 
 /// Modern Block Kit `carousel` block (`F-COLLAB-715`): horizontal scrollable strip of cards.
@@ -3199,6 +3447,41 @@ mod tests {
                 "type": "rich_text",
                 "elements": [
                     { "type": "rich_text_section", "elements": [{ "type": "text", "text": "Nested rich text" }] }
+                ]
+            }),
+            json!({
+                "type": "context_actions",
+                "block_id": "ctx_act_1",
+                "elements": [
+                    {
+                        "type": "feedback_buttons",
+                        "action_id": "fb_1",
+                        "positive_button": { "text": { "type": "plain_text", "text": "Helpful" }, "value": "good" },
+                        "negative_button": { "text": { "type": "plain_text", "text": "Not helpful" }, "value": "bad" }
+                    },
+                    {
+                        "type": "icon_button",
+                        "action_id": "del_1",
+                        "text": { "type": "plain_text", "text": "Dismiss" },
+                        "value": "dismiss"
+                    }
+                ]
+            }),
+            json!({
+                "type": "task_card",
+                "task_id": "task_1",
+                "title": "Run test suite",
+                "status": "complete",
+                "details": { "type": "mrkdwn", "text": "Executed *155* unit tests." },
+                "sources": [{ "type": "url", "url": "https://ci.example/run/1", "text": "CI log" }]
+            }),
+            json!({
+                "type": "plan",
+                "title": "Release checklist",
+                "tasks": [
+                    { "task_id": "t1", "title": "Build macOS bundle", "status": "complete" },
+                    { "task_id": "t2", "title": "Publish release notes", "status": "in_progress" },
+                    { "task_id": "t3", "title": "Announce in #general", "status": "pending" }
                 ]
             }),
             json!({
