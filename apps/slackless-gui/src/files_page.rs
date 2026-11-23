@@ -1075,13 +1075,50 @@ fn open_new_list_dialog(
     name_state.read(cx).focus_handle(cx).focus(window, cx);
     window.open_dialog(cx, move |dialog, _, cx| {
         let theme = cx.theme();
-        let (border, bg) = (theme.border, theme.background);
+        let (border, bg, muted) = (theme.border, theme.background, theme.muted_foreground);
         let name_c = name_state.clone();
         let page_c = page.clone();
-        dialog.title("Create list").w(px(380.)).child(
+        let templates = [
+            ("Project tracker", "Project tracker"),
+            ("Bug triage", "Bug triage"),
+            ("Launch checklist", "Launch checklist"),
+            ("Feedback tracker", "Customer feedback"),
+        ];
+        dialog.title("Create list").w(px(420.)).child(
             v_flex()
                 .gap_3()
                 .p_4()
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Start from a template"),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_1p5()
+                                .children(templates.into_iter().map(|(label, preset)| {
+                                    let ns = name_state.clone();
+                                    Button::new(SharedString::from(format!(
+                                        "files-list-tpl-{label}"
+                                    )))
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .label(label)
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            ns.update(cx, |st, cx| {
+                                                st.set_value(preset.to_owned(), window, cx);
+                                            });
+                                        },
+                                    )
+                                })),
+                        ),
+                )
                 .child(
                     div()
                         .rounded_md()

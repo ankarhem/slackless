@@ -2430,6 +2430,23 @@ impl Render for App {
                                 });
                             }) as crate::canvas::CanvasPopOutFn
                         });
+                        let canvas_url = file_id.as_ref().map(|id| self.canvas_link(id));
+                        let on_pin_tab = file_id.as_ref().map(|_| {
+                            let ch = self.channel.clone();
+                            let label = loaded
+                                .and_then(|res| res.as_ref().ok())
+                                .map(|doc| doc.title.clone());
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::AddConversationTab {
+                                        channel: ch.clone(),
+                                        tab_type: "canvas".to_owned(),
+                                        label: label.clone(),
+                                    });
+                                });
+                            }) as crate::canvas::OpenBrowserFn
+                        });
                         crate::canvas::live_canvas_view(
                             file_id.as_deref().unwrap_or("live-canvas"),
                             loaded,
@@ -2440,6 +2457,8 @@ impl Render for App {
                                 on_edit,
                                 on_request_access,
                                 on_pop_out,
+                                on_pin_tab,
+                                canvas_url,
                             },
                             cx,
                         )
@@ -2507,6 +2526,44 @@ impl Render for App {
                                 });
                             }) as crate::lists::DeleteListItemFn
                         });
+                        let on_archive_item = file_id.as_ref().map(|id| {
+                            let lid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |row_id, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::ArchiveListItem {
+                                        list_id: lid.clone(),
+                                        row_id,
+                                    });
+                                });
+                            }) as crate::lists::DeleteListItemFn
+                        });
+                        let on_set_access = file_id.as_ref().map(|id| {
+                            let lid = id.clone();
+                            let ch = self.channel.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |access_level, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::SetListAccess {
+                                        list_id: lid.clone(),
+                                        channel: Some(ch.clone()),
+                                        access_level,
+                                    });
+                                });
+                            }) as crate::lists::SetListAccessFn
+                        });
+                        let on_load_comments = file_id.as_ref().map(|id| {
+                            let lid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |record_id, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::FetchListRecordComments {
+                                        list_id: lid.clone(),
+                                        record_id,
+                                    });
+                                });
+                            }) as crate::lists::DeleteListItemFn
+                        });
                         crate::lists::live_list_view(
                             loaded,
                             &self.fixtures,
@@ -2518,6 +2575,9 @@ impl Render for App {
                                 on_create_item,
                                 on_update_cell,
                                 on_delete_item,
+                                on_archive_item,
+                                on_set_access,
+                                on_load_comments,
                                 open_browser,
                             },
                             cx,

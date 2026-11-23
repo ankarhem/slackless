@@ -268,6 +268,10 @@ pub struct CanvasActions {
     pub on_edit: Option<CanvasEditFn>,
     pub on_request_access: Option<OpenBrowserFn>,
     pub on_pop_out: Option<CanvasPopOutFn>,
+    /// Pin this canvas as a conversation tab (`conversations.addTab`, `F-COLLAB-121`).
+    pub on_pin_tab: Option<OpenBrowserFn>,
+    /// Canonical canvas URL used when copying heading anchor links (`F-SHELL-267`).
+    pub canvas_url: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -279,6 +283,13 @@ struct CanvasUiState {
     /// Local copy for fixture mode or optimistic live edits.
     local_doc: Option<CanvasDoc>,
     access_requested: bool,
+    /// Distraction-free Reader View (`F-COLLAB-198`): hides find bar & outline chrome.
+    reader_mode: bool,
+    /// Docked Canvas Comments drawer (`F-COLLAB-197`, `F-COLLAB-199`).
+    comments_open: bool,
+    comments: Vec<(String, String)>,
+    comment_input: Option<Entity<TextareaState>>,
+    pinned_tab: bool,
 }
 
 #[derive(Default)]
@@ -503,6 +514,71 @@ fn render_canvas_doc(
             .on_click(move |_, window, cx| pop(doc.clone(), window, cx))
     });
 
+    let key_reader = key.to_owned();
+    let reader_btn = Button::new(SharedString::from(format!("canvas-reader-{key}")))
+        .when(ui.reader_mode, |b| b.primary())
+        .when(!ui.reader_mode, |b| b.outline())
+        .with_size(Size::XSmall)
+        .icon(IconName::Eye)
+        .label(if ui.reader_mode {
+            "Exit reader"
+        } else {
+            "Reader"
+        })
+        .tooltip("Toggle distraction-free Reader View")
+        .on_click(move |_, window, cx| {
+            mutate_ui(&key_reader, |s| s.reader_mode = !s.reader_mode, window, cx);
+        });
+
+    let key_comments = key.to_owned();
+    let comment_count = ui.comments.len();
+    let comments_label = if comment_count == 0 {
+        "Comments".to_owned()
+    } else {
+        format!("Comments ({comment_count})")
+    };
+    let comments_btn = Button::new(SharedString::from(format!("canvas-comments-{key}")))
+        .when(ui.comments_open, |b| b.primary())
+        .when(!ui.comments_open, |b| b.outline())
+        .with_size(Size::XSmall)
+        .icon(IconName::MessageSquare)
+        .label(comments_label)
+        .tooltip("Toggle canvas comments drawer")
+        .on_click(move |_, window, cx| {
+            let input = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Add a comment on this canvas…")
+                    .auto_grow(1, 4)
+            });
+            mutate_ui(
+                &key_comments,
+                |s| {
+                    s.comments_open = !s.comments_open;
+                    if s.comments_open && s.comment_input.is_none() {
+                        s.comment_input = Some(input);
+                    }
+                },
+                window,
+                cx,
+            );
+        });
+
+    let key_pin = key.to_owned();
+    let pin_tab_btn = actions.on_pin_tab.clone().map(|pin_cb| {
+        let already = ui.pinned_tab;
+        Button::new(SharedString::from(format!("canvas-pin-tab-{key}")))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::Pin)
+            .label(if already { "Pinned tab" } else { "Pin tab" })
+            .disabled(already)
+            .tooltip("Pin this canvas as a channel tab")
+            .on_click(move |_, window, cx| {
+                mutate_ui(&key_pin, |s| s.pinned_tab = true, window, cx);
+                pin_cb(window, cx);
+            })
+    });
+
     let header = h_flex()
         .items_center()
         .flex_wrap()
@@ -530,6 +606,9 @@ fn render_canvas_doc(
                 ),
         )
         .when(!can_edit, |row| row.child(read_only_badge(cx)))
+        .child(reader_btn)
+        .child(comments_btn)
+        .children(pin_tab_btn)
         .children(edit_toggle)
         .children(req_btn)
         .children(popout_btn)
@@ -637,182 +716,15 @@ fn render_canvas_doc(
 
     let document = if ui.editing {
         if let Some(editor) = ui.editor.clone() {
-            let insert_snippet = |label: &'static str, snippet: &'static str| {
-                let ed = editor.clone();
-                let k = key.to_owned();
-                Button::new(SharedString::from(format!("canvas-fmt-{k}-{label}")))
-                    .outline()
-                    .with_size(Size::XSmall)
-                    .label(label)
-                    .on_click(move |_, window, cx| {
-                        let current = ed.read(cx).value().to_string();
-                        let next = if current.trim().is_empty() {
-                            snippet.to_owned()
-                        } else {
-                            format!("{current}\n\n{snippet}")
-                        };
-                        mutate_ui(
-                            &k,
-                            |s| {
-                                if s.undo_stack.last().map(String::as_str) != Some(current.as_str())
-                                {
-                                    s.undo_stack.push(current);
-                                }
-                                s.redo_stack.clear();
-                            },
-                            window,
-                            cx,
-                        );
-                        ed.update(cx, |state, cx| state.set_value(next, window, cx));
-                    })
-            };
-
-            let can_undo = ui.undo_stack.len() > 1;
-            let can_redo = !ui.redo_stack.is_empty();
-            let ed_undo = editor.clone();
-            let k_undo = key.to_owned();
-            let ed_redo = editor.clone();
-            let k_redo = key.to_owned();
-            let ed_save = editor.clone();
-            let k_save = key.to_owned();
-            let k_cancel = key.to_owned();
-            let on_edit_save = actions.on_edit.clone();
-            let title_save = canvas.title.clone();
-            let meta_save = canvas.meta.clone();
-
-            let toolbar = h_flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                .p_2()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.secondary.opacity(0.35))
-                .child(insert_snippet("H1", "# Heading"))
-                .child(insert_snippet("H2", "## Section"))
-                .child(insert_snippet("H3", "### Subheading"))
-                .child(insert_snippet("Bullet", "- List item"))
-                .child(insert_snippet("Checklist", "- [ ] Task item"))
-                .child(insert_snippet("Quote", "> Quoted note"))
-                .child(insert_snippet("Code", "```\ncode\n```"))
-                .child(insert_snippet("Divider", "---"))
-                .child(div().flex_1())
-                .child(
-                    Button::new(SharedString::from(format!("canvas-undo-{key}")))
-                        .ghost()
-                        .with_size(Size::XSmall)
-                        .icon(IconName::Undo)
-                        .tooltip("Undo canvas edit")
-                        .disabled(!can_undo)
-                        .on_click(move |_, window, cx| {
-                            let current = ed_undo.read(cx).value().to_string();
-                            let mut target = None;
-                            mutate_ui(
-                                &k_undo,
-                                |s| {
-                                    if s.undo_stack.len() > 1 {
-                                        s.redo_stack.push(current);
-                                        let _ = s.undo_stack.pop();
-                                        target = s.undo_stack.last().cloned();
-                                    }
-                                },
-                                window,
-                                cx,
-                            );
-                            if let Some(prev) = target {
-                                ed_undo.update(cx, |st, cx| st.set_value(prev, window, cx));
-                            }
-                        }),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("canvas-redo-{key}")))
-                        .ghost()
-                        .with_size(Size::XSmall)
-                        .icon(IconName::Redo)
-                        .tooltip("Redo canvas edit")
-                        .disabled(!can_redo)
-                        .on_click(move |_, window, cx| {
-                            let mut target = None;
-                            mutate_ui(
-                                &k_redo,
-                                |s| {
-                                    if let Some(next) = s.redo_stack.pop() {
-                                        s.undo_stack.push(next.clone());
-                                        target = Some(next);
-                                    }
-                                },
-                                window,
-                                cx,
-                            );
-                            if let Some(next) = target {
-                                ed_redo.update(cx, |st, cx| st.set_value(next, window, cx));
-                            }
-                        }),
-                );
-
-            let footer = h_flex()
-                .justify_end()
-                .gap_2()
-                .child(
-                    Button::new(SharedString::from(format!("canvas-cancel-{key}")))
-                        .outline()
-                        .with_size(Size::Small)
-                        .label("Cancel")
-                        .on_click(move |_, window, cx| {
-                            mutate_ui(&k_cancel, |s| s.editing = false, window, cx);
-                        }),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("canvas-save-{key}")))
-                        .primary()
-                        .with_size(Size::Small)
-                        .icon(IconName::Check)
-                        .label("Save changes")
-                        .on_click(move |_, window, cx| {
-                            let markdown = ed_save.read(cx).value().to_string();
-                            let updated = CanvasDoc::from_markdown(
-                                title_save.clone(),
-                                meta_save.clone(),
-                                &markdown,
-                            );
-                            mutate_ui(
-                                &k_save,
-                                |s| {
-                                    s.editing = false;
-                                    if is_fixture {
-                                        s.local_doc = Some(updated);
-                                    }
-                                },
-                                window,
-                                cx,
-                            );
-                            if let Some(cb) = &on_edit_save {
-                                cb(
-                                    CanvasEditOp::Replace {
-                                        section_id: None,
-                                        markdown,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }),
-                );
-
-            v_flex()
-                .gap_3()
-                .child(toolbar)
-                .child(
-                    div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.background)
-                        .p_2()
-                        .child(Textarea::new(&editor).appearance(false).bordered(false)),
-                )
-                .child(footer)
+            render_canvas_editor(
+                key,
+                canvas,
+                &ui,
+                editor,
+                actions.on_edit.clone(),
+                is_fixture,
+                cx,
+            )
         } else {
             v_flex()
         }
@@ -866,27 +778,456 @@ fn render_canvas_doc(
                         }
                     }) as Rc<dyn Fn(usize, &mut Window, &mut App)>
                 });
-                doc_col.child(render_block(block_ix, block, on_toggle, cx))
+                let section_id = canvas.section_ids.get(block_ix).and_then(|s| s.as_deref());
+                doc_col.child(render_block(
+                    block_ix,
+                    block,
+                    section_id,
+                    actions.canvas_url.as_deref(),
+                    on_toggle,
+                    cx,
+                ))
             })
     };
 
-    div()
+    let main_scroll = div()
         .id("canvas-scroll")
-        .size_full()
+        .flex_1()
+        .min_w_0()
+        .h_full()
         .overflow_y_scroll()
         .child(
             v_flex()
                 .w_full()
-                .max_w(px(760.))
+                .max_w(px(if ui.reader_mode { 680. } else { 760. }))
                 .mx_auto()
                 .px_8()
                 .py_6()
                 .gap_4()
                 .child(header)
-                .children(find_bar)
-                .children(outline_bar)
+                .when(!ui.reader_mode, |col| {
+                    col.children(find_bar).children(outline_bar)
+                })
                 .child(document),
+        );
+
+    if ui.comments_open {
+        let drawer = render_comments_drawer(key, &ui, cx);
+        h_flex()
+            .id("canvas-root-with-comments")
+            .size_full()
+            .child(main_scroll)
+            .child(drawer)
+    } else {
+        main_scroll
+    }
+}
+
+#[inline(never)]
+fn render_canvas_editor(
+    key: &str,
+    canvas: &CanvasDoc,
+    ui: &CanvasUiState,
+    editor: Entity<TextareaState>,
+    on_edit: Option<CanvasEditFn>,
+    is_fixture: bool,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let insert_snippet = |label: &'static str, snippet: &'static str| {
+        let ed = editor.clone();
+        let k = key.to_owned();
+        Button::new(SharedString::from(format!("canvas-fmt-{k}-{label}")))
+            .outline()
+            .with_size(Size::XSmall)
+            .label(label)
+            .on_click(move |_, window, cx| {
+                let current = ed.read(cx).value().to_string();
+                let next = if current.trim().is_empty() {
+                    snippet.to_owned()
+                } else {
+                    format!("{current}\n\n{snippet}")
+                };
+                push_undo_and_set(&k, &ed, current, next, window, cx);
+            })
+    };
+
+    let can_undo = ui.undo_stack.len() > 1;
+    let can_redo = !ui.redo_stack.is_empty();
+    let ed_undo = editor.clone();
+    let k_undo = key.to_owned();
+    let ed_redo = editor.clone();
+    let k_redo = key.to_owned();
+    let ed_save = editor.clone();
+    let k_save = key.to_owned();
+    let k_cancel = key.to_owned();
+    let title_save = canvas.title.clone();
+    let meta_save = canvas.meta.clone();
+    let ed_cycle = editor.clone();
+    let k_cycle = key.to_owned();
+    let ed_up = editor.clone();
+    let k_up = key.to_owned();
+    let ed_down = editor.clone();
+    let k_down = key.to_owned();
+
+    let snippets = [
+        ("H1", "# Heading"),
+        ("H2", "## Section"),
+        ("H3", "### Subheading"),
+        ("Bullet", "- List item"),
+        ("Checklist", "- [ ] Task item"),
+        ("Quote", "> Quoted note"),
+        ("Code", "```\ncode\n```"),
+        ("Divider", "---"),
+    ];
+    let mut toolbar = h_flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.35));
+    for (label, snippet) in snippets {
+        toolbar = toolbar.child(insert_snippet(label, snippet));
+    }
+    let toolbar = toolbar
+        .child(
+            Button::new(SharedString::from(format!("canvas-cycle-h-{key}")))
+                .outline()
+                .with_size(Size::XSmall)
+                .label("Cycle H")
+                .tooltip("Cycle active line heading level (plain / H1 / H2 / H3)")
+                .on_click(move |_, window, cx| {
+                    let current = ed_cycle.read(cx).value().to_string();
+                    let next = cycle_last_line_heading(&current);
+                    push_undo_and_set(&k_cycle, &ed_cycle, current, next, window, cx);
+                }),
         )
+        .child(
+            Button::new(SharedString::from(format!("canvas-line-up-{key}")))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::ArrowUp)
+                .tooltip("Move active line up")
+                .on_click(move |_, window, cx| {
+                    let current = ed_up.read(cx).value().to_string();
+                    let next = move_last_line(&current, -1);
+                    push_undo_and_set(&k_up, &ed_up, current, next, window, cx);
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("canvas-line-down-{key}")))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::ArrowDown)
+                .tooltip("Move active line down")
+                .on_click(move |_, window, cx| {
+                    let current = ed_down.read(cx).value().to_string();
+                    let next = move_last_line(&current, 1);
+                    push_undo_and_set(&k_down, &ed_down, current, next, window, cx);
+                }),
+        )
+        .child(div().flex_1())
+        .child(
+            Button::new(SharedString::from(format!("canvas-undo-{key}")))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Undo)
+                .tooltip("Undo canvas edit")
+                .disabled(!can_undo)
+                .on_click(move |_, window, cx| {
+                    let current = ed_undo.read(cx).value().to_string();
+                    let mut target = None;
+                    mutate_ui(
+                        &k_undo,
+                        |s| {
+                            if s.undo_stack.len() > 1 {
+                                s.redo_stack.push(current);
+                                let _ = s.undo_stack.pop();
+                                target = s.undo_stack.last().cloned();
+                            }
+                        },
+                        window,
+                        cx,
+                    );
+                    if let Some(prev) = target {
+                        ed_undo.update(cx, |st, cx| st.set_value(prev, window, cx));
+                    }
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("canvas-redo-{key}")))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Redo)
+                .tooltip("Redo canvas edit")
+                .disabled(!can_redo)
+                .on_click(move |_, window, cx| {
+                    let mut target = None;
+                    mutate_ui(
+                        &k_redo,
+                        |s| {
+                            if let Some(next) = s.redo_stack.pop() {
+                                s.undo_stack.push(next.clone());
+                                target = Some(next);
+                            }
+                        },
+                        window,
+                        cx,
+                    );
+                    if let Some(next) = target {
+                        ed_redo.update(cx, |st, cx| st.set_value(next, window, cx));
+                    }
+                }),
+        );
+
+    let footer = h_flex()
+        .justify_end()
+        .gap_2()
+        .child(
+            Button::new(SharedString::from(format!("canvas-cancel-{key}")))
+                .outline()
+                .with_size(Size::Small)
+                .label("Cancel")
+                .on_click(move |_, window, cx| {
+                    mutate_ui(&k_cancel, |s| s.editing = false, window, cx);
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("canvas-save-{key}")))
+                .primary()
+                .with_size(Size::Small)
+                .icon(IconName::Check)
+                .label("Save changes")
+                .on_click(move |_, window, cx| {
+                    let markdown = ed_save.read(cx).value().to_string();
+                    let updated =
+                        CanvasDoc::from_markdown(title_save.clone(), meta_save.clone(), &markdown);
+                    mutate_ui(
+                        &k_save,
+                        |s| {
+                            s.editing = false;
+                            if is_fixture {
+                                s.local_doc = Some(updated);
+                            }
+                        },
+                        window,
+                        cx,
+                    );
+                    if let Some(cb) = &on_edit {
+                        cb(
+                            CanvasEditOp::Replace {
+                                section_id: None,
+                                markdown,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+        );
+
+    v_flex()
+        .gap_3()
+        .child(toolbar)
+        .child(
+            div()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .p_2()
+                .child(Textarea::new(&editor).appearance(false).bordered(false)),
+        )
+        .child(footer)
+}
+
+fn push_undo_and_set(
+    key: &str,
+    editor: &Entity<TextareaState>,
+    current: String,
+    next: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if current == next {
+        return;
+    }
+    mutate_ui(
+        key,
+        |s| {
+            if s.undo_stack.last().map(String::as_str) != Some(current.as_str()) {
+                s.undo_stack.push(current);
+            }
+            s.redo_stack.clear();
+        },
+        window,
+        cx,
+    );
+    editor.update(cx, |state, cx| state.set_value(next, window, cx));
+}
+
+/// Cycle the last non-empty line through plain -> `# ` -> `## ` -> `### ` -> plain (`F-SHELL-262`).
+pub(crate) fn cycle_last_line_heading(markdown: &str) -> String {
+    let mut lines: Vec<String> = markdown.lines().map(str::to_owned).collect();
+    let Some(ix) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
+        return "# Heading".to_owned();
+    };
+    let line = lines[ix].trim_start().to_owned();
+    lines[ix] = if let Some(rest) = line.strip_prefix("### ") {
+        rest.to_owned()
+    } else if let Some(rest) = line.strip_prefix("## ") {
+        format!("### {rest}")
+    } else if let Some(rest) = line.strip_prefix("# ") {
+        format!("## {rest}")
+    } else {
+        format!("# {line}")
+    };
+    lines.join("\n")
+}
+
+/// Swap the last non-empty line with its neighbor (`delta = -1` moves up, `1` moves down, `F-SHELL-269`).
+pub(crate) fn move_last_line(markdown: &str, delta: isize) -> String {
+    let mut lines: Vec<String> = markdown.lines().map(str::to_owned).collect();
+    let Some(ix) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
+        return markdown.to_owned();
+    };
+    let target = ix as isize + delta;
+    if target < 0 || target as usize >= lines.len() {
+        return markdown.to_owned();
+    }
+    lines.swap(ix, target as usize);
+    lines.join("\n")
+}
+
+fn render_comments_drawer(key: &str, ui: &CanvasUiState, cx: &App) -> Div {
+    let theme = cx.theme();
+    let key_close = key.to_owned();
+    let key_submit = key.to_owned();
+    let input_opt = ui.comment_input.clone();
+
+    let mut body = v_flex().flex_1().min_h_0().gap_2();
+    if ui.comments.is_empty() {
+        body = body.child(
+            div()
+                .py_4()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("No comments on this canvas yet. Add a note below to discuss sections with teammates."),
+        );
+    } else {
+        for (author, text) in &ui.comments {
+            body = body.child(
+                v_flex()
+                    .gap_0p5()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary.opacity(0.3))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child(author.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(text.clone()),
+                    ),
+            );
+        }
+    }
+
+    let composer = input_opt.map(|input| {
+        let input_send = input.clone();
+        v_flex()
+            .gap_1p5()
+            .pt_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .px_2()
+                    .py_1()
+                    .child(Textarea::new(&input).appearance(false).bordered(false)),
+            )
+            .child(
+                h_flex().justify_end().child(
+                    Button::new(SharedString::from(format!("canvas-comment-post-{key}")))
+                        .primary()
+                        .with_size(Size::XSmall)
+                        .label("Comment")
+                        .on_click(move |_, window, cx| {
+                            let body_text = input_send.read(cx).value().trim().to_owned();
+                            if body_text.is_empty() {
+                                return;
+                            }
+                            input_send.update(cx, |st, cx| st.set_value(String::new(), window, cx));
+                            mutate_ui(
+                                &key_submit,
+                                |s| s.comments.push(("You".to_owned(), body_text)),
+                                window,
+                                cx,
+                            );
+                        }),
+                ),
+            )
+    });
+
+    v_flex()
+        .w(px(300.))
+        .flex_none()
+        .h_full()
+        .border_l_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .p_3()
+        .gap_3()
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .pb_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::MessageSquare)
+                                .size(px(14.))
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Comments"),
+                        ),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("canvas-comments-close-{key}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::X)
+                        .on_click(move |_, window, cx| {
+                            mutate_ui(&key_close, |s| s.comments_open = false, window, cx);
+                        }),
+                ),
+        )
+        .child(body)
+        .children(composer)
 }
 
 /// "Read-only" pill shared by the canvas and list headers.
@@ -916,21 +1257,55 @@ type ToggleCheckFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 fn render_block(
     block_ix: usize,
     block: &CanvasBlock,
+    section_id: Option<&str>,
+    canvas_url: Option<&str>,
     on_toggle_check: Option<ToggleCheckFn>,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
     match block {
         CanvasBlock::Heading { level, text } => {
+            let slug = section_id.map(str::to_owned).unwrap_or_else(|| {
+                text.to_ascii_lowercase()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect::<String>()
+            });
+            let anchor_url = match canvas_url {
+                Some(base) if !base.is_empty() => format!("{base}#{slug}"),
+                _ => format!("#{slug}"),
+            };
             let heading = div()
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme.foreground);
             let heading = match level {
                 1 => heading.text_2xl(),
-                2 => heading.text_lg().pt_2(),
+                2 => heading.text_lg(),
                 _ => heading.text_base(),
             };
-            heading.child(text.clone())
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .when(*level == 2, |row| row.pt_2())
+                .child(heading.child(text.clone()))
+                .child(
+                    Button::new(SharedString::from(format!("canvas-anchor-{block_ix}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::Link)
+                        .tooltip("Copy heading anchor link")
+                        .on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
+                                anchor_url.clone(),
+                            ));
+                            crate::actions::notify(
+                                "Copied section link",
+                                anchor_url.clone(),
+                                window,
+                                cx,
+                            );
+                        }),
+                )
         }
         CanvasBlock::Paragraph(text) => div().text_sm().line_height(px(22.)).child(text.clone()),
         CanvasBlock::CodeBlock(code) => div()
@@ -1578,5 +1953,30 @@ mod tests {
         assert!(md.contains("- [ ] Cut release"));
         let reparsed = CanvasDoc::from_markdown("Runbook".into(), "Live".into(), &md);
         assert_eq!(reparsed.blocks, doc.blocks);
+    }
+
+    #[test]
+    fn cycles_heading_levels_and_moves_lines() {
+        assert_eq!(
+            cycle_last_line_heading("Notes\nShip it"),
+            "Notes\n# Ship it"
+        );
+        assert_eq!(
+            cycle_last_line_heading("Notes\n# Ship it"),
+            "Notes\n## Ship it"
+        );
+        assert_eq!(
+            cycle_last_line_heading("Notes\n## Ship it"),
+            "Notes\n### Ship it"
+        );
+        assert_eq!(
+            cycle_last_line_heading("Notes\n### Ship it"),
+            "Notes\nShip it"
+        );
+        assert_eq!(
+            move_last_line("First\nSecond\nThird", -1),
+            "First\nThird\nSecond"
+        );
+        assert_eq!(move_last_line("Only", -1), "Only");
     }
 }

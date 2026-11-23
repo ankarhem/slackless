@@ -48,15 +48,45 @@ struct ListPanelState {
     editing_cell: Option<(String, String, Entity<TextareaState>)>,
     /// Mutable local rows for fixture mode.
     fixture_rows: Option<Vec<Vec<Field>>>,
+    /// Optimistically archived record IDs (`F-COLLAB-255`).
+    archived_rows: HashSet<String>,
+    /// Inline item-comment composer input inside the detail drawer (`F-COLLAB-250`, `251`).
+    comment_input: Option<Entity<TextareaState>>,
+    /// Locally posted comments per `(list_id, record_id)` appended alongside server comments.
+    local_comments: HashMap<String, Vec<(String, String)>>,
 }
 
 /// Persistent per-list UI state (layout mode, hidden columns, open item detail drawer, inline edits).
 #[derive(Default)]
 struct ListUiStore {
     panels: HashMap<String, ListPanelState>,
+    /// Server-fetched record comment threads keyed by `(list_id, record_id)` (`F-COLLAB-250`).
+    record_comments: HashMap<(String, String), Vec<(String, String)>>,
 }
 
 impl Global for ListUiStore {}
+
+/// Store loaded comment thread messages for a list record (`Event::ListRecordComments`).
+pub fn set_record_comments(
+    list_id: &str,
+    record_id: &str,
+    comments: Vec<(String, String)>,
+    cx: &mut App,
+) {
+    cx.default_global::<ListUiStore>()
+        .record_comments
+        .insert((list_id.to_owned(), record_id.to_owned()), comments);
+}
+
+fn record_comments(list_id: &str, record_id: &str, cx: &App) -> Vec<(String, String)> {
+    cx.try_global::<ListUiStore>()
+        .and_then(|s| {
+            s.record_comments
+                .get(&(list_id.to_owned(), record_id.to_owned()))
+        })
+        .cloned()
+        .unwrap_or_default()
+}
 
 fn panel_state(key: &str, cx: &App) -> ListPanelState {
     cx.try_global::<ListUiStore>()
@@ -81,8 +111,10 @@ pub type SortColumnFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 pub type CreateListItemFn = Rc<dyn Fn(Vec<ListCellInput>, &mut Window, &mut App)>;
 /// Callback invoked when updating a single cell (`lists.cells.update`).
 pub type UpdateListCellFn = Rc<dyn Fn(String, ListCellInput, &mut Window, &mut App)>;
-/// Callback invoked when deleting a row (`lists.records.delete`).
+/// Callback invoked when deleting, archiving, or loading comments for a row.
 pub type DeleteListItemFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// Callback invoked when updating list sharing access (`slackLists.access.set`, `F-COLLAB-243`).
+pub type SetListAccessFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 /// Optional interactive callbacks for a live Slack List.
 #[derive(Clone, Default)]
@@ -91,6 +123,9 @@ pub struct ListActions {
     pub on_create_item: Option<CreateListItemFn>,
     pub on_update_cell: Option<UpdateListCellFn>,
     pub on_delete_item: Option<DeleteListItemFn>,
+    pub on_archive_item: Option<DeleteListItemFn>,
+    pub on_set_access: Option<SetListAccessFn>,
+    pub on_load_comments: Option<DeleteListItemFn>,
     pub open_browser: Option<OpenBrowserFn>,
 }
 
@@ -1090,7 +1125,14 @@ fn render_live_list(
     let theme = cx.theme();
     let list_key = data.file_id.clone();
     let state = panel_state(&list_key, cx);
-    let visible_indices = filter_and_sort_rows(data, fixtures, query, sort);
+    let visible_indices: Vec<usize> = filter_and_sort_rows(data, fixtures, query, sort)
+        .into_iter()
+        .filter(|&ix| {
+            data.rows
+                .get(ix)
+                .is_none_or(|r| !state.archived_rows.contains(&r.id))
+        })
+        .collect();
     let on_sort = actions.on_sort.clone();
     let open_browser = actions.open_browser.clone();
     let can_edit = actions.on_update_cell.is_some() || actions.on_create_item.is_some();
@@ -1160,6 +1202,8 @@ fn render_live_list(
         let rec = &data.rows[row_ix];
         let is_sel = state.selected_row == Some(row_ix);
         let key_click = list_key.clone();
+        let rec_id_click = rec.id.clone();
+        let load_comments_row = actions.on_load_comments.clone();
         visible_cols.iter().fold(
             h_flex()
                 .id(("list-live-row", row_ix))
@@ -1170,18 +1214,25 @@ fn render_live_list(
                 .when(is_sel, |r| r.bg(selected_bg))
                 .when(!is_sel, |r| r.hover(move |h| h.bg(hover_bg)))
                 .on_click(move |_, window, cx| {
+                    let mut opened = false;
                     mutate_panel(
                         &key_click,
                         |s| {
-                            s.selected_row = if s.selected_row == Some(row_ix) {
-                                None
+                            if s.selected_row == Some(row_ix) {
+                                s.selected_row = None;
                             } else {
-                                Some(row_ix)
-                            };
+                                s.selected_row = Some(row_ix);
+                                opened = true;
+                            }
                         },
                         window,
                         cx,
                     );
+                    if opened {
+                        if let Some(cb) = &load_comments_row {
+                            cb(rec_id_click.clone(), window, cx);
+                        }
+                    }
                 }),
             |row, &col_ix| {
                 let column = &data.columns[col_ix];
@@ -1291,6 +1342,8 @@ fn render_live_list(
                                 let rec = &data.rows[row_ix];
                                 let is_sel = state.selected_row == Some(row_ix);
                                 let key_click = list_key.clone();
+                                let rec_id_card = rec.id.clone();
+                                let load_comments_card = actions.on_load_comments.clone();
                                 let primary_col = &data.columns[primary_ix];
                                 let mut card = v_flex()
                                     .id(("list-live-card", row_ix))
@@ -1309,6 +1362,9 @@ fn render_live_list(
                                             window,
                                             cx,
                                         );
+                                        if let Some(cb) = &load_comments_card {
+                                            cb(rec_id_card.clone(), window, cx);
+                                        }
                                     })
                                     .child(
                                         div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
@@ -1385,8 +1441,11 @@ fn render_live_list(
         .map(|rec| {
             let key_close = list_key.clone();
             let key_del = list_key.clone();
+            let key_arch = list_key.clone();
             let row_id_del = rec.id.clone();
+            let row_id_arch = rec.id.clone();
             let on_delete = actions.on_delete_item.clone();
+            let on_archive = actions.on_archive_item.clone();
             let mut panel = v_flex()
                 .id("list-live-detail")
                 .w(px(340.))
@@ -1416,6 +1475,28 @@ fn render_live_list(
                             h_flex()
                                 .items_center()
                                 .gap_1()
+                                .when_some(on_archive, |row, arch| {
+                                    row.child(
+                                        Button::new("list-live-detail-archive")
+                                            .ghost()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::Archive)
+                                            .tooltip("Archive item")
+                                            .on_click(move |_, window, cx| {
+                                                let rid = row_id_arch.clone();
+                                                mutate_panel(
+                                                    &key_arch,
+                                                    |s| {
+                                                        s.archived_rows.insert(rid.clone());
+                                                        s.selected_row = None;
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                                arch(row_id_arch.clone(), window, cx);
+                                            }),
+                                    )
+                                })
                                 .when_some(on_delete, |row, del| {
                                     row.child(
                                         Button::new("list-live-detail-delete")
@@ -1768,6 +1849,9 @@ fn render_live_list(
                         .child(h_flex().w_full().items_center().text_sm().child(control)),
                 );
             }
+            panel = panel.child(render_record_comments_section(
+                &list_key, &rec.id, &state, cx,
+            ));
             panel
         });
 
@@ -2015,6 +2099,43 @@ fn render_live_list(
                                         })
                                 })
                                 .when(!can_edit, |row| row.child(read_only_badge(cx)))
+                                .when_some(actions.on_set_access.clone(), |row, set_access| {
+                                    row.child(
+                                        Button::new("list-share-access")
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::Users)
+                                            .label("Share")
+                                            .tooltip("Manage workspace access for this list")
+                                            .dropdown_menu(move |menu, _, _| {
+                                                let sa_read = set_access.clone();
+                                                let sa_write = set_access.clone();
+                                                let sa_none = set_access.clone();
+                                                menu.item(
+                                                    PopupMenuItem::new("Workspace: Can edit")
+                                                        .on_click(move |_, window, cx| {
+                                                            sa_write(
+                                                                "write".to_owned(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new("Workspace: View only")
+                                                        .on_click(move |_, window, cx| {
+                                                            sa_read("read".to_owned(), window, cx);
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new("Restrict workspace access")
+                                                        .on_click(move |_, window, cx| {
+                                                            sa_none("none".to_owned(), window, cx);
+                                                        }),
+                                                )
+                                            }),
+                                    )
+                                })
                                 .when_some(open_browser, |row, open| {
                                     row.child(
                                         Button::new("list-open-browser")
@@ -2457,6 +2578,135 @@ pub fn list_to_json(data: &SlackListData, fixtures: &Fixtures) -> String {
         "items": items,
     });
     crate::blockkit::serde_json::to_string_pretty(&payload).unwrap_or_default()
+}
+
+fn render_record_comments_section(
+    list_key: &str,
+    record_id: &str,
+    state: &ListPanelState,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let mut all_comments = record_comments(list_key, record_id, cx);
+    if let Some(local) = state.local_comments.get(record_id) {
+        all_comments.extend(local.iter().cloned());
+    }
+    let key_open = list_key.to_owned();
+    let key_post = list_key.to_owned();
+    let rid_post = record_id.to_owned();
+
+    let mut section = v_flex()
+        .gap_2()
+        .pt_3()
+        .mt_1()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child(
+                    Icon::new(IconName::MessageSquare)
+                        .size(px(12.))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(format!("Comments ({})", all_comments.len())),
+        );
+
+    if all_comments.is_empty() {
+        section = section.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("No comments on this item yet."),
+        );
+    } else {
+        for (author, body) in &all_comments {
+            section = section.child(
+                v_flex()
+                    .gap_0p5()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary.opacity(0.3))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(author.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(body.clone()),
+                    ),
+            );
+        }
+    }
+
+    if let Some(input) = state.comment_input.clone() {
+        let input_send = input.clone();
+        section = section
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .px_2()
+                    .py_1()
+                    .child(Textarea::new(&input).appearance(false).bordered(false)),
+            )
+            .child(
+                h_flex().justify_end().child(
+                    Button::new("list-item-comment-post")
+                        .primary()
+                        .with_size(Size::XSmall)
+                        .label("Post comment")
+                        .on_click(move |_, window, cx| {
+                            let text = input_send.read(cx).value().trim().to_owned();
+                            if text.is_empty() {
+                                return;
+                            }
+                            input_send.update(cx, |st, cx| st.set_value(String::new(), window, cx));
+                            let rid = rid_post.clone();
+                            mutate_panel(
+                                &key_post,
+                                |s| {
+                                    s.local_comments
+                                        .entry(rid)
+                                        .or_default()
+                                        .push(("You".to_owned(), text));
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                ),
+            );
+    } else {
+        section = section.child(
+            Button::new("list-item-comment-add")
+                .outline()
+                .with_size(Size::XSmall)
+                .icon(IconName::MessageSquare)
+                .label("Add comment")
+                .on_click(move |_, window, cx| {
+                    let input = cx.new(|cx| {
+                        TextareaState::new(window, cx)
+                            .placeholder("Write a comment on this item…")
+                            .auto_grow(1, 3)
+                    });
+                    mutate_panel(&key_open, |s| s.comment_input = Some(input), window, cx);
+                }),
+        );
+    }
+
+    section
 }
 
 fn export_file(

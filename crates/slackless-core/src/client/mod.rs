@@ -1856,6 +1856,55 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::ArchiveListItem { list_id, row_id } => {
+                self.spawn("lists.records.archive", async move {
+                    backend
+                        .lists_records_archive(list_id.clone(), row_id)
+                        .await?;
+                    let list = backend
+                        .fetch_list(list_id.clone())
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string());
+                    events.emit(Event::ListLoaded {
+                        file_id: list_id,
+                        list,
+                    });
+                    Ok(())
+                });
+            }
+            Command::SetListAccess {
+                list_id,
+                access_level,
+                channel,
+            } => {
+                self.spawn("slackLists.access.set", async move {
+                    backend
+                        .lists_access_set(list_id, access_level, channel)
+                        .await?;
+                    Ok(())
+                });
+            }
+            Command::FetchListRecordComments { list_id, record_id } => {
+                self.spawn("lists.getThreadsForRecord", async move {
+                    let messages = backend
+                        .lists_get_threads_for_record(list_id.clone(), record_id.clone())
+                        .await
+                        .unwrap_or_default();
+                    events.emit(Event::ListRecordComments {
+                        list_id,
+                        record_id,
+                        messages,
+                    });
+                    Ok(())
+                });
+            }
+            Command::SetUserPhoto { filename, bytes } => {
+                self.spawn("users.setPhoto", async move {
+                    backend.users_set_photo(filename, bytes).await?;
+                    Ok(())
+                });
+            }
             Command::LoadAppHome(channel) => {
                 self.spawn("conversations.info(app_home)", async move {
                     let home = backend

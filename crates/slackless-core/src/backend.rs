@@ -707,6 +707,39 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<String>> + Send {
         async { Ok(String::new()) }
     }
+    /// Archive an item in a Slack List (`lists.records.archive`, `F-COLLAB-255`).
+    fn lists_records_archive(
+        &self,
+        _list_id: String,
+        _row_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Update sharing/access permissions on a Slack List (`slackLists.access.set`, `F-COLLAB-243`).
+    fn lists_access_set(
+        &self,
+        _list_id: String,
+        _access_level: String,
+        _channel: Option<ChannelId>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Load comment thread messages for a List item (`lists.getThreadsForRecord`, `F-COLLAB-250`).
+    fn lists_get_threads_for_record(
+        &self,
+        _list_id: String,
+        _record_id: String,
+    ) -> impl Future<Output = api::Result<Vec<Message>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Upload a new profile photo (`users.setPhoto`, `F-SHELL-004`).
+    fn users_set_photo(
+        &self,
+        _filename: String,
+        _bytes: Vec<u8>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true`) and
     /// dispatch `apps.home.dispatchOpenEvent` (`F-COLLAB-480`).
     fn load_app_home(
@@ -1649,5 +1682,30 @@ impl Backend for SlackApi {
         background_id: String,
     ) -> api::Result<()> {
         SlackApi::huddles_update_background(self, &huddle_id, &background_id).await
+    }
+
+    async fn lists_records_archive(&self, list_id: String, row_id: String) -> api::Result<()> {
+        SlackApi::lists_records_archive(self, &list_id, &row_id).await
+    }
+
+    async fn lists_access_set(
+        &self,
+        list_id: String,
+        access_level: String,
+        channel: Option<ChannelId>,
+    ) -> api::Result<()> {
+        SlackApi::lists_access_set(self, &list_id, &access_level, channel.as_ref()).await
+    }
+
+    async fn lists_get_threads_for_record(
+        &self,
+        list_id: String,
+        record_id: String,
+    ) -> api::Result<Vec<Message>> {
+        SlackApi::lists_get_threads_for_record(self, &list_id, &record_id).await
+    }
+
+    async fn users_set_photo(&self, filename: String, bytes: Vec<u8>) -> api::Result<()> {
+        SlackApi::users_set_photo(self, &filename, &bytes).await
     }
 }

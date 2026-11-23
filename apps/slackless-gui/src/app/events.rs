@@ -1274,6 +1274,28 @@ impl App {
                     cx,
                 );
             }
+            Event::ListRecordComments {
+                list_id,
+                record_id,
+                messages,
+            } => {
+                let items: Vec<(String, String)> = messages
+                    .iter()
+                    .map(|m| {
+                        let author = m
+                            .user
+                            .as_ref()
+                            .and_then(|u| self.fixtures.user(u))
+                            .map(|u| u.display_name().to_owned())
+                            .or_else(|| m.username.clone())
+                            .unwrap_or_else(|| "Teammate".to_owned());
+                        (author, m.text.clone())
+                    })
+                    .collect();
+                crate::lists::set_record_comments(list_id, record_id, items, cx);
+                window.refresh();
+                cx.notify();
+            }
             Event::AppHomeLoaded { channel, home } => {
                 let value = match home {
                     Ok(data) => Ok((**data).clone()),

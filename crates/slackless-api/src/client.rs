@@ -342,6 +342,52 @@ impl SlackApi {
         Ok(())
     }
 
+    /// Posts a `multipart/form-data` API method carrying `token` and a binary file field
+    /// (used by `users.setPhoto`, `F-SHELL-004`).
+    pub(crate) async fn post_multipart_file(
+        &self,
+        api_method: &str,
+        field_name: &str,
+        filename: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<serde_json::Value> {
+        let url = self.base.join(api_method)?;
+        let boundary = "----SlacklessMultipartBoundary7MA4YWxkTrZu0gW";
+        let mut body = Vec::with_capacity(bytes.len() + 512);
+        let safe_name = filename.replace('"', "_");
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n{}\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{safe_name}\"\r\n\
+                 Content-Type: {content_type}\r\n\r\n",
+                self.token
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let ct_header = format!("multipart/form-data; boundary={boundary}");
+        let resp = self
+            .send_with_retry(|| {
+                Ok(self
+                    .http
+                    .post(url.clone())
+                    .header(COOKIE, self.cookie.clone())
+                    .header(CONTENT_TYPE, ct_header.clone())
+                    .body(body.clone())
+                    .build()?)
+            })
+            .await?;
+        let status = resp.status();
+        let resp_bytes = resp.bytes().await?;
+        match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+            Ok(value) => Ok(ApiResponse::<serde_json::Value>::from_value(value)?.data),
+            Err(_) if !status.is_success() => Err(status_error(status, &resp_bytes)),
+            Err(e) => Err(ApiError::Decode(e)),
+        }
+    }
+
     fn is_trusted_file_url(&self, url: &Url) -> bool {
         let same_origin = url.origin() == self.base.origin();
         let slack_host = url.scheme() == "https"

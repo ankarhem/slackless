@@ -4719,8 +4719,7 @@ impl Render for PopoutWindow {
                     crate::canvas::CanvasActions {
                         open_browser,
                         on_edit,
-                        on_request_access: None,
-                        on_pop_out: None,
+                        ..Default::default()
                     },
                     file_id.is_none(),
                     cx,

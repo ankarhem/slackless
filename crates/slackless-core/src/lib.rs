@@ -398,6 +398,27 @@ pub enum Command {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Archive an item in a Slack List (`lists.records.archive`, `F-COLLAB-255`).
+    ArchiveListItem {
+        list_id: String,
+        row_id: String,
+    },
+    /// Update sharing/access permissions on a Slack List (`slackLists.access.set`, `F-COLLAB-243`–`245`).
+    SetListAccess {
+        list_id: String,
+        access_level: String,
+        channel: Option<ChannelId>,
+    },
+    /// Fetch comment thread messages attached to a List item (`lists.getThreadsForRecord`, `F-COLLAB-250`).
+    FetchListRecordComments {
+        list_id: String,
+        record_id: String,
+    },
+    /// Upload a new profile photo for the signed-in user (`users.setPhoto`, `F-SHELL-004`).
+    SetUserPhoto {
+        filename: String,
+        bytes: Vec<u8>,
+    },
     /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true` +
     /// `apps.home.dispatchOpenEvent`, `F-COLLAB-480`).
     LoadAppHome(ChannelId),
@@ -866,6 +887,12 @@ pub enum Event {
     ListCreated { file_id: String, name: String },
     /// A message was added to a Slack List (`lists.addToList`, `F-COLLAB-231`).
     MessageAddedToList { list_id: String, record_id: String },
+    /// Comment thread messages loaded for a Slack List item (`lists.getThreadsForRecord`, `F-COLLAB-250`).
+    ListRecordComments {
+        list_id: String,
+        record_id: String,
+        messages: Vec<Message>,
+    },
     /// An app DM's Home tab finished loading (`conversations.info` `return_app_home=true`, `F-COLLAB-480`).
     AppHomeLoaded {
         channel: ChannelId,

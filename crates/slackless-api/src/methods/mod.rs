@@ -2309,6 +2309,86 @@ impl SlackApi {
         Ok(id)
     }
 
+    /// `lists.records.archive`: archive one list item (`F-COLLAB-255`).
+    pub async fn lists_records_archive(&self, list_id: &str, row_id: &str) -> Result<()> {
+        let params = vec![
+            ("list_id", list_id.to_owned()),
+            ("record_id", row_id.to_owned()),
+            ("id", row_id.to_owned()),
+        ];
+        self.call::<Empty>(method::LISTS_RECORDS_ARCHIVE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `slackLists.access.set`: update list sharing/access permissions (`F-COLLAB-243`–`245`).
+    pub async fn lists_access_set(
+        &self,
+        list_id: &str,
+        access_level: &str,
+        channel: Option<&ChannelId>,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("list_id", list_id.to_owned()),
+            ("access_level", access_level.to_owned()),
+        ];
+        if let Some(ch) = channel {
+            params.push(("channel_ids", ch.to_string()));
+        }
+        let _: Value = self
+            .call(method::SLACK_LISTS_ACCESS_SET, params)
+            .await?
+            .data;
+        Ok(())
+    }
+
+    /// `lists.getThreadsForRecord`: load comment thread messages attached to a list item (`F-COLLAB-250`, `251`).
+    pub async fn lists_get_threads_for_record(
+        &self,
+        list_id: &str,
+        record_id: &str,
+    ) -> Result<Vec<Message>> {
+        let params = vec![
+            ("list_id", list_id.to_owned()),
+            ("record_id", record_id.to_owned()),
+        ];
+        let data: Value = self
+            .call(method::LISTS_GET_THREADS_FOR_RECORD, params)
+            .await?
+            .data;
+        let mut out = Vec::new();
+        if let Some(msgs) = data
+            .get("messages")
+            .and_then(Value::as_array)
+            .or_else(|| data.get("threads").and_then(Value::as_array))
+        {
+            for item in msgs {
+                if let Ok(m) = serde_json::from_value::<Message>(item.clone()) {
+                    out.push(m);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `users.setPhoto`: upload a new profile photo (`F-SHELL-004`).
+    pub async fn users_set_photo(&self, filename: &str, bytes: &[u8]) -> Result<()> {
+        let lower = filename.to_ascii_lowercase();
+        let ct = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+            "image/jpeg"
+        } else if lower.ends_with(".gif") {
+            "image/gif"
+        } else if lower.ends_with(".webp") {
+            "image/webp"
+        } else {
+            "image/png"
+        };
+        let _ = self
+            .post_multipart_file(method::USERS_SET_PHOTO, "image", filename, ct, bytes)
+            .await?;
+        Ok(())
+    }
+
     /// `rooms.join`: create or join a huddle in `channel_id` and obtain Amazon Chime (`free_willy`)
     /// signaling/media credentials (`docs/research/api-huddles.md`). Rejects legacy Screenhero
     /// rooms with [`ApiError::UnsupportedHuddleBackend`].
