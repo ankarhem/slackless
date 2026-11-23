@@ -5139,6 +5139,136 @@ impl App {
         notify("Media cache pruned", msg, window, cx);
     }
 
+    /// Open a modal dialog showing every locally recorded revision of `(channel, ts)` from
+    /// SQLite's immutable append-only `message_revision` log.
+    fn open_revision_history(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fixtures = self.fixtures.clone();
+        let revisions: Vec<(String, bool, String)> =
+            if let (Some(store), Some(team)) = (self.bridge.store(), self.bridge.team_id()) {
+                store
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.revisions(team, &channel, &ts).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|rev| {
+                        let stamp = if rev.edit_ts.is_empty() {
+                            format!("Original · {}", rev.message.ts)
+                        } else if rev.deleted {
+                            format!("Deleted · {}", rev.edit_ts)
+                        } else {
+                            format!("Edited · {}", rev.edit_ts)
+                        };
+                        let text = fixtures.plain_text(&rev.message);
+                        (stamp, rev.deleted, text)
+                    })
+                    .collect()
+            } else {
+                fixtures
+                    .messages
+                    .get(&channel)
+                    .and_then(|list| list.iter().find(|m| m.ts == ts))
+                    .map(|m| {
+                        vec![(
+                            format!("Original · {}", m.ts),
+                            false,
+                            fixtures.plain_text(m),
+                        )]
+                    })
+                    .unwrap_or_default()
+            };
+        let subtitle = format!("{} · {}", self.label(&channel), ts);
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let theme = cx.theme();
+            let (border, muted, danger, card_bg) = (
+                theme.border,
+                theme.muted_foreground,
+                theme.danger,
+                theme.secondary.opacity(0.35),
+            );
+            let mut body = v_flex()
+                .id("revision-history-list")
+                .max_h(px(440.))
+                .overflow_y_scroll()
+                .gap_2()
+                .child(div().text_xs().text_color(muted).child(subtitle.clone()));
+            if revisions.is_empty() {
+                body = body.child(
+                    div()
+                        .py_6()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("No stored revisions found for this message."),
+                );
+            } else {
+                for (ix, (stamp, deleted, text)) in revisions.iter().enumerate() {
+                    let copy_text = text.clone();
+                    body = body.child(
+                        v_flex()
+                            .gap_1()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if *deleted {
+                                danger.opacity(0.45)
+                            } else {
+                                border
+                            })
+                            .bg(if *deleted {
+                                danger.opacity(0.08)
+                            } else {
+                                card_bg
+                            })
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(if *deleted { danger } else { muted })
+                                            .child(format!("#{} · {stamp}", ix + 1)),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!("rev-copy-{ix}")))
+                                            .ghost()
+                                            .with_size(Size::XSmall)
+                                            .label("Copy")
+                                            .on_click(move |_, window, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    copy_text.clone(),
+                                                ));
+                                                notify(
+                                                    "Revision copied",
+                                                    "Copied message text to clipboard.",
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                    ),
+                            )
+                            .child(div().text_sm().child(if text.is_empty() {
+                                "(empty)".to_owned()
+                            } else {
+                                text.clone()
+                            })),
+                    );
+                }
+            }
+            dialog
+                .title(format!("Edit history ({} revisions)", revisions.len()))
+                .w(px(560.))
+                .child(body)
+        });
+    }
+
     /// Export the active conversation's locally archived messages as Markdown or pretty JSON
     /// using a native save dialog.
     fn export_conversation_transcript(
@@ -10351,6 +10481,9 @@ fn subscribe_workspace(
                     index,
                 } => this.open_image_viewer(channel.clone(), images.clone(), *index, window, cx),
                 MessageListEvent::Forward(link) => this.open_compose(link, window, cx),
+                MessageListEvent::ViewHistory { channel, ts } => {
+                    this.open_revision_history(channel.clone(), ts.clone(), window, cx)
+                }
                 MessageListEvent::NeedHistorySince { channel, since } => {
                     this.load_since(channel, *since, cx);
                 }
@@ -10416,6 +10549,9 @@ fn subscribe_workspace(
                     index,
                 } => this.open_image_viewer(channel.clone(), images.clone(), *index, window, cx),
                 ThreadPanelEvent::Forward(link) => this.open_compose(link, window, cx),
+                ThreadPanelEvent::ViewHistory { channel, ts } => {
+                    this.open_revision_history(channel.clone(), ts.clone(), window, cx)
+                }
                 ThreadPanelEvent::Reply {
                     channel,
                     thread_ts,

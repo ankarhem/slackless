@@ -4,10 +4,11 @@
 # delivers native UNUserNotificationCenter banners and OS-wide slack:// deep links.
 #
 # Usage:
-#   scripts/bundle-macos.sh              # build debug binary and assemble Slackless.app
-#   scripts/bundle-macos.sh --release    # build release binary and assemble Slackless.app
-#   scripts/bundle-macos.sh --no-build   # bundle existing target/debug/slackless-gui
-#   scripts/bundle-macos.sh --install    # also install to ~/Applications/Slackless.app
+#   scripts/bundle-macos.sh                # build debug binary and assemble Slackless.app
+#   scripts/bundle-macos.sh --release      # build release binary and assemble Slackless.app
+#   scripts/bundle-macos.sh --no-build     # bundle existing target/debug/slackless-gui
+#   scripts/bundle-macos.sh --install      # also install to ~/Applications/Slackless.app
+#   scripts/bundle-macos.sh --install-cli  # also build & install ~/.local/bin/slackless
 
 set -euo pipefail
 
@@ -15,12 +16,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROFILE="debug"
 DO_BUILD=1
 DO_INSTALL=0
+DO_INSTALL_CLI=0
 
 for arg in "$@"; do
   case "$arg" in
     --release) PROFILE="release" ;;
     --no-build) DO_BUILD=0 ;;
     --install) DO_INSTALL=1 ;;
+    --install-cli) DO_INSTALL_CLI=1 ;;
     *)
       echo "Unknown option: $arg" >&2
       exit 1
@@ -29,10 +32,14 @@ for arg in "$@"; do
 done
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
+  PKGS=(-p slackless-gui)
+  if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
+    PKGS+=(-p slackless-cli)
+  fi
   if [[ "$PROFILE" == "release" ]]; then
-    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p slackless-gui --manifest-path "$ROOT/Cargo.toml"
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release "${PKGS[@]}" --manifest-path "$ROOT/Cargo.toml"
   else
-    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -p slackless-gui --manifest-path "$ROOT/Cargo.toml"
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build "${PKGS[@]}" --manifest-path "$ROOT/Cargo.toml"
   fi
 fi
 
@@ -124,4 +131,19 @@ if [[ "$DO_INSTALL" -eq 1 ]]; then
     "$LSREG" -f "$DEST" >/dev/null 2>&1 || true
   fi
   echo "Installed $DEST"
+fi
+
+if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
+  CLI_BIN="$ROOT/target/$PROFILE/slackless"
+  if [[ ! -x "$CLI_BIN" ]]; then
+    echo "Expected CLI binary not found at $CLI_BIN" >&2
+    exit 1
+  fi
+  mkdir -p "$HOME/.local/bin"
+  cp "$CLI_BIN" "$HOME/.local/bin/slackless"
+  chmod +x "$HOME/.local/bin/slackless"
+  if command -v codesign >/dev/null; then
+    codesign --force --sign - "$HOME/.local/bin/slackless" >/dev/null 2>&1 || true
+  fi
+  echo "Installed $HOME/.local/bin/slackless"
 fi

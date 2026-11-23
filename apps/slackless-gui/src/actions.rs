@@ -82,6 +82,8 @@ pub enum MessageAction {
     DismissEphemeral,
     /// One of the message's images was clicked: open the image viewer on it.
     OpenImage(crate::image_viewer::ImageOrigin),
+    /// Open the durable local SQLite revision history log for this message.
+    ViewHistory,
 }
 
 /// Which actions apply to one message.
@@ -398,6 +400,12 @@ fn menu_rows(set: ActionSet, origin: MenuOrigin) -> Vec<MenuRow> {
         action: MessageAction::TogglePin,
         hint: None,
     };
+    let history = MenuRow::Item {
+        label: "View edit history",
+        icon: IconName::Clock,
+        action: MessageAction::ViewHistory,
+        hint: None,
+    };
     let forward = MenuRow::Item {
         label: "Forward message",
         icon: IconName::Forward,
@@ -418,6 +426,7 @@ fn menu_rows(set: ActionSet, origin: MenuOrigin) -> Vec<MenuRow> {
         copy_text,
         MenuRow::Separator,
         pin,
+        history,
     ]);
     if origin == MenuOrigin::Context {
         rows.push(forward);

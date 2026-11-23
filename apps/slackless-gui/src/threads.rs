@@ -63,6 +63,11 @@ pub enum ThreadPanelEvent {
     OpenLink(LinkTarget),
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
+    /// Open the local SQLite revision history inspector for `(channel, ts)`.
+    ViewHistory {
+        channel: ChannelId,
+        ts: Ts,
+    },
     /// The header menu followed or unfollowed the open thread (already shown here); the root
     /// tells Slack. `last_read` is the thread's newest message.
     SetSubscribed {
@@ -660,6 +665,14 @@ impl ThreadPanel {
                 cx.notify();
             }
             MessageAction::OpenProfile(user) => cx.emit(ThreadPanelEvent::OpenProfile(user)),
+            MessageAction::ViewHistory => {
+                if let Some((channel, _)) = &self.thread {
+                    cx.emit(ThreadPanelEvent::ViewHistory {
+                        channel: channel.clone(),
+                        ts: ts.clone(),
+                    });
+                }
+            }
             MessageAction::OpenImage(origin) => {
                 // The viewer pages through the thread's images, root first.
                 let Some((channel, _)) = self.thread.clone() else {

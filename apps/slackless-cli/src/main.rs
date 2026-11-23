@@ -105,6 +105,13 @@ enum Commands {
         #[arg(long, value_name = "N", default_value_t = 30)]
         limit: usize,
     },
+    /// Show the append-only local revision history (edits & deletions) for one message (offline).
+    Revisions {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// The ts of the message (first column of `slackless read`).
+        ts: String,
+    },
     /// Export a conversation's locally archived messages to JSON or Markdown (offline).
     Export {
         /// Channel id, #name, or @handle.
@@ -201,6 +208,9 @@ async fn dispatch(
         Commands::Vacuum => cmd_vacuum(ctx, workspace.as_ref()),
         Commands::Threads { channel, limit } => {
             cmd_threads(ctx, workspace.as_ref(), channel.as_deref(), limit)
+        }
+        Commands::Revisions { channel, ts } => {
+            cmd_revisions(ctx, workspace.as_ref(), &channel, &ts)
         }
         Commands::Export {
             channel,
@@ -550,6 +560,73 @@ fn cmd_threads(
     output::emit(
         ctx.json,
         &serde_json::json!({"count": rows.len(), "threads": rows}),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_revisions(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    channel_arg: &str,
+    ts: &str,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"count": 0, "revisions": []}),
+            "reading revisions",
+        ));
+    };
+    let archive = Archive::open(workspace);
+    let channel_id = archive
+        .as_ref()
+        .and_then(|a| a.resolve_channel(workspace, channel_arg))
+        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id);
+    let revisions = match open_archive_store(workspace) {
+        Some(store) => store
+            .revisions(workspace, &channel_id, &slackless_core::types::Ts::from(ts))
+            .with_context(|| format!("reading revisions of {channel_id} {ts}"))?,
+        None => Vec::new(),
+    };
+    let json_rows: Vec<_> = revisions
+        .iter()
+        .map(|rev| {
+            serde_json::json!({
+                "edit_ts": rev.edit_ts,
+                "deleted": rev.deleted,
+                "text": rev.message.text,
+            })
+        })
+        .collect();
+    let mut human = String::new();
+    for (ix, rev) in revisions.iter().enumerate() {
+        let kind = if rev.edit_ts.is_empty() {
+            "original"
+        } else if rev.deleted {
+            "deleted"
+        } else {
+            "edited"
+        };
+        let stamp = if rev.edit_ts.is_empty() {
+            ts
+        } else {
+            rev.edit_ts.as_str()
+        };
+        human.push_str(&format!(
+            "#{}\t{kind}\t{stamp}\t{}\n",
+            ix + 1,
+            rev.message.text
+        ));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "channel": channel_id.as_str(),
+            "ts": ts,
+            "count": json_rows.len(),
+            "revisions": json_rows,
+        }),
         &human,
     );
     Ok(ExitCode::SUCCESS)

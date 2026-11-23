@@ -233,6 +233,11 @@ pub enum MessageListEvent {
     },
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
+    /// Open the local SQLite revision history inspector for `(channel, ts)`.
+    ViewHistory {
+        channel: ChannelId,
+        ts: Ts,
+    },
     /// "Jump to…" needs history older than the loaded window: the root pages it in until it
     /// reaches `since` (unix seconds), then calls [`MessageList::finish_jump`].
     NeedHistorySince {
@@ -765,6 +770,10 @@ impl MessageList {
             }
             MessageAction::OpenProfile(user) => cx.emit(MessageListEvent::OpenProfile(user)),
             MessageAction::OpenImage(origin) => self.open_image(ts, &origin, cx),
+            MessageAction::ViewHistory => cx.emit(MessageListEvent::ViewHistory {
+                channel,
+                ts: ts.clone(),
+            }),
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
                 let dispatch = self
