@@ -623,6 +623,7 @@ impl App {
             self.bridge.store().cloned(),
             self.bridge.team_id().cloned(),
             self.bridge.forwarder(),
+            Some((self.later.downgrade(), self.workspace)),
             display_id,
             cx,
         );
@@ -651,6 +652,7 @@ impl App {
             self.bridge.store().cloned(),
             self.bridge.team_id().cloned(),
             self.bridge.forwarder(),
+            Some((self.later.downgrade(), self.workspace)),
             display_id,
             cx,
         );
@@ -670,6 +672,7 @@ impl App {
             None,
             None,
             self.bridge.forwarder(),
+            None,
             display_id,
             cx,
         );
@@ -689,6 +692,7 @@ impl App {
             None,
             None,
             self.bridge.forwarder(),
+            None,
             display_id,
             cx,
         );

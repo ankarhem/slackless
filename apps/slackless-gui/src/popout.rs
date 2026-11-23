@@ -6,19 +6,22 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::TitleBar;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, DisplayId, Entity, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions, div, point, px, size,
+    App, AppContext as _, Bounds, ClipboardItem, Context, DisplayId, Entity, Focusable as _,
+    FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
+    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, point, px,
+    size,
 };
 use gpui_kit::open_window;
 use slackless_core::api::MessageContent;
@@ -27,10 +30,11 @@ use slackless_core::{Command, SharedStore};
 
 use crate::actions::{self, ActionHandler, ActionSet, MenuOrigin, MessageAction};
 use crate::activity::ActivityFeed;
-use crate::composer::{Composer, ComposerEvent};
+use crate::composer::{self, Composer, ComposerEvent};
+use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent, PickerTab};
 use crate::fixtures::Fixtures;
 use crate::image_viewer::{self, ImageOrigin, ImageViewer, ViewerEvent};
-use crate::later::{LaterItem, LaterView};
+use crate::later::{LaterItem, LaterView, SaveRequest};
 use crate::messages::{
     LinkHandler, LinkTarget, MessageList, message_row_linked, reply_bar, same_group,
 };
@@ -77,8 +81,18 @@ pub enum PopoutKind {
 /// Callback that forwards commands (`SendMessage`, etc.) to the workspace's live `CoreBridge`.
 pub type CommandForward = Arc<dyn Fn(Command) + Send + Sync>;
 
-fn popout_window_options(title: &str, display_id: Option<DisplayId>, cx: &App) -> WindowOptions {
-    let bounds = Bounds::centered(display_id, size(px(720.), px(640.)), cx);
+static CASCADE_STEP: AtomicUsize = AtomicUsize::new(0);
+
+fn popout_window_options(
+    title: &str,
+    display_id: Option<DisplayId>,
+    cascade_slot: usize,
+    cx: &App,
+) -> WindowOptions {
+    let mut bounds = Bounds::centered(display_id, size(px(720.), px(640.)), cx);
+    let offset = px((cascade_slot % 5) as f32 * 28.);
+    bounds.origin.x += offset;
+    bounds.origin.y += offset;
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         display_id,
@@ -91,8 +105,8 @@ fn popout_window_options(title: &str, display_id: Option<DisplayId>, cx: &App) -
     }
 }
 
-/// Open a new native GPUI window showing `kind`, centered on `display_id` (the main window's
-/// display) or the primary display if `None`.
+/// Open a new native GPUI window showing `kind`, centered (with cascade offset) on `display_id`
+/// (the main window's display) or the primary display if `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn open_popout(
     kind: PopoutKind,
@@ -101,14 +115,25 @@ pub fn open_popout(
     store: Option<SharedStore>,
     team: Option<TeamId>,
     send: CommandForward,
+    later_sync: Option<(WeakEntity<LaterView>, usize)>,
     display_id: Option<DisplayId>,
     cx: &mut App,
 ) {
-    let options = popout_window_options(&title, display_id, cx);
+    let slot = CASCADE_STEP.fetch_add(1, Ordering::Relaxed);
+    let options = popout_window_options(&title, display_id, slot, cx);
     let _ = open_window(options, cx, move |window, cx| {
         window.set_window_title(&format!("{title} — slackless"));
-        cx.new(|cx| PopoutWindow::new(kind, title, fixtures, store, team, send, window, cx))
+        cx.new(|cx| {
+            PopoutWindow::new(
+                kind, title, fixtures, store, team, send, later_sync, window, cx,
+            )
+        })
     });
+}
+
+enum PopoutPickerTarget {
+    Composer,
+    Message { channel: ChannelId, ts: Ts },
 }
 
 pub struct PopoutWindow {
@@ -118,11 +143,15 @@ pub struct PopoutWindow {
     store: Option<SharedStore>,
     team: Option<TeamId>,
     send: CommandForward,
+    later_sync: Option<(WeakEntity<LaterView>, usize)>,
     messages: Vec<Message>,
     saved: HashSet<Ts>,
     activity_rows: Vec<PopoutActivityRow>,
     later_items: Vec<LaterItem>,
     composer: Entity<Composer>,
+    emoji_picker: Entity<EmojiPicker>,
+    picker: Option<(PopoutPickerTarget, Point<Pixels>)>,
+    editing: Option<(ChannelId, Ts, Entity<TextareaState>)>,
     scroll: ScrollHandle,
     image_viewer: Option<Entity<ImageViewer>>,
     _viewer_sub: Option<Subscription>,
@@ -138,6 +167,7 @@ impl PopoutWindow {
         store: Option<SharedStore>,
         team: Option<TeamId>,
         send: CommandForward,
+        later_sync: Option<(WeakEntity<LaterView>, usize)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -151,16 +181,76 @@ impl PopoutWindow {
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
         );
         let composer = Composer::new(placeholder.into(), fixtures.clone(), window, cx);
+        let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
         let initial = load_messages(&kind, &fixtures, store.as_ref(), team.as_ref());
-        let mut subscriptions = vec![cx.subscribe_in(
-            &composer,
-            window,
-            |this: &mut Self, _, event: &ComposerEvent, _, cx| {
-                if let ComposerEvent::Submit(content) = event {
-                    this.send_content(content.clone(), cx);
-                }
-            },
-        )];
+        let mut subscriptions = vec![
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this: &mut Self, _, event: &ComposerEvent, window, cx| match event {
+                    ComposerEvent::Submit(content) => this.send_content(content.clone(), cx),
+                    ComposerEvent::OpenEmojiPicker(pos) => {
+                        this.open_picker(PopoutPickerTarget::Composer, *pos, window, cx);
+                    }
+                    ComposerEvent::EditLast => {
+                        if let Some(ch) = match &this.kind {
+                            PopoutKind::Conversation { channel, .. }
+                            | PopoutKind::Thread { channel, .. } => Some(channel.clone()),
+                            _ => None,
+                        } {
+                            if let Some(last_own) = this
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|m| m.user.as_ref() == Some(&this.fixtures.self_user))
+                                .cloned()
+                            {
+                                this.start_edit(ch, &last_own, window, cx);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &emoji_picker,
+                window,
+                |this: &mut Self, _, event: &EmojiPickerEvent, window, cx| {
+                    if let EmojiPickerEvent::Pick(choice) = event {
+                        this.pick_emoji(choice, window, cx);
+                    }
+                },
+            ),
+        ];
+        let mut saved = HashSet::new();
+        let active_channel = match &kind {
+            PopoutKind::Conversation { channel, .. } | PopoutKind::Thread { channel, .. } => {
+                Some(channel.clone())
+            }
+            PopoutKind::Activity { .. } | PopoutKind::Later { .. } => None,
+        };
+        if let (Some(ch), Some((weak_later, workspace))) = (active_channel.clone(), &later_sync) {
+            if let Some(later) = weak_later.upgrade() {
+                saved = later
+                    .read(cx)
+                    .saved_in(*workspace)
+                    .into_iter()
+                    .filter(|(c, _)| *c == ch)
+                    .map(|(_, ts)| ts)
+                    .collect();
+                let workspace = *workspace;
+                subscriptions.push(cx.observe(&later, move |this, later, cx| {
+                    this.saved = later
+                        .read(cx)
+                        .saved_in(workspace)
+                        .into_iter()
+                        .filter(|(c, _)| *c == ch)
+                        .map(|(_, ts)| ts)
+                        .collect();
+                    cx.notify();
+                }));
+            }
+        }
         let mut activity_rows = Vec::new();
         let mut later_items = Vec::new();
         match &kind {
@@ -219,16 +309,133 @@ impl PopoutWindow {
             store,
             team,
             send,
+            later_sync,
             messages: initial,
-            saved: HashSet::new(),
+            saved,
             activity_rows,
             later_items,
             composer,
+            emoji_picker,
+            picker: None,
+            editing: None,
             scroll,
             image_viewer: None,
             _viewer_sub: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn open_picker(
+        &mut self,
+        target: PopoutPickerTarget,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.emoji_picker.update(cx, |picker, cx| {
+            picker.open_tab(PickerTab::Emoji, false, window, cx);
+        });
+        self.picker = Some((target, position));
+        cx.notify();
+    }
+
+    fn pick_emoji(&mut self, choice: &EmojiChoice, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, _)) = self.picker.take() else {
+            return;
+        };
+        match target {
+            PopoutPickerTarget::Composer => {
+                self.composer
+                    .update(cx, |c, cx| c.insert_emoji(choice, window, cx));
+            }
+            PopoutPickerTarget::Message { channel, ts } => {
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts) {
+                    if actions::add_reaction(msg, &self.fixtures.self_user, &choice.name) {
+                        (self.send)(Command::AddReaction {
+                            channel,
+                            ts,
+                            name: choice.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_edit(
+        &mut self,
+        channel: ChannelId,
+        message: &Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = self.fixtures.plain_text(message);
+        let input = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx)
+                .placeholder("Edit message…")
+                .auto_grow(1, 6);
+            state.set_value(initial, window, cx);
+            state
+        });
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        self.editing = Some((channel, message.ts.clone(), input));
+        cx.notify();
+    }
+
+    fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((channel, ts, input)) = self.editing.take() else {
+            return;
+        };
+        let text = input.read(cx).value().trim().to_owned();
+        if text.is_empty() {
+            cx.notify();
+            return;
+        }
+        let content = composer::content_of(&text, &self.fixtures);
+        if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts) {
+            actions::apply_edit(msg, &self.fixtures.self_user, content.clone());
+        }
+        (self.send)(Command::EditMessage {
+            channel,
+            ts,
+            content,
+        });
+        cx.notify();
+    }
+
+    fn sync_later_item(
+        &self,
+        channel: &ChannelId,
+        message: &Message,
+        saved: bool,
+        due: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((weak_later, workspace)) = &self.later_sync else {
+            return;
+        };
+        let Some(later) = weak_later.upgrade() else {
+            return;
+        };
+        let author = message
+            .user
+            .as_ref()
+            .map(|u| self.fixtures.user_name(u).to_owned())
+            .or_else(|| message.username.clone())
+            .unwrap_or_else(|| "Message".to_owned());
+        let text = self.fixtures.preview(message);
+        let request = SaveRequest {
+            channel: channel.clone(),
+            ts: message.ts.clone(),
+            author,
+            text,
+            saved,
+            due,
+        };
+        let label = self.title.clone();
+        let workspace = *workspace;
+        later.update(cx, |later, cx| later.save(request, workspace, label, cx));
     }
 
     fn jump_handler(&self) -> JumpHandler {
@@ -317,10 +524,10 @@ impl PopoutWindow {
                     cx.notify();
                 }
             }
-            MessageAction::PickReaction(_) => {
-                actions::notify(
-                    "Emoji picker",
-                    "Use quick reactions here, or open the main window for the full picker.",
+            MessageAction::PickReaction(position) => {
+                self.open_picker(
+                    PopoutPickerTarget::Message { channel, ts },
+                    position,
                     window,
                     cx,
                 );
@@ -352,14 +559,18 @@ impl PopoutWindow {
                 let saved = self.saved.insert(ts.clone());
                 if saved {
                     (self.send)(Command::SaveItem {
-                        channel,
-                        ts,
+                        channel: channel.clone(),
+                        ts: ts.clone(),
                         date_due: None,
                     });
                 } else {
                     self.saved.remove(&ts);
-                    (self.send)(Command::DeleteSavedItem { channel, ts });
+                    (self.send)(Command::DeleteSavedItem {
+                        channel: channel.clone(),
+                        ts: ts.clone(),
+                    });
                 }
+                self.sync_later_item(&channel, &message, saved, None, cx);
                 actions::notify(
                     if saved {
                         "Saved for later"
@@ -373,17 +584,20 @@ impl PopoutWindow {
                 cx.notify();
             }
             MessageAction::RemindMe(remind) => {
+                let due = remind.at(crate::drafts::now_secs());
                 self.saved.insert(ts.clone());
                 (self.send)(Command::SaveItem {
-                    channel,
+                    channel: channel.clone(),
                     ts,
-                    date_due: Some(remind.at(crate::drafts::now_secs())),
+                    date_due: Some(due),
                 });
+                self.sync_later_item(&channel, &message, true, Some(due), cx);
                 actions::notify("Reminder set", remind.label().to_lowercase(), window, cx);
                 cx.notify();
             }
             MessageAction::RemindCustom => {
                 let this = cx.entity().downgrade();
+                let msg_clone = message.clone();
                 crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
                     let _ = this.update(cx, |win, cx| {
                         win.saved.insert(ts.clone());
@@ -392,6 +606,7 @@ impl PopoutWindow {
                             ts: ts.clone(),
                             date_due: Some(due),
                         });
+                        win.sync_later_item(&channel, &msg_clone, true, Some(due), cx);
                         let when = crate::drafts::when_label(due, crate::drafts::now_secs());
                         actions::notify("Reminder set", when, window, cx);
                         cx.notify();
@@ -423,7 +638,10 @@ impl PopoutWindow {
                 (self.send)(Command::MarkRead { channel, ts });
                 actions::notify("Marked unread", String::new(), window, cx);
             }
-            MessageAction::Edit | MessageAction::ViewHistory => {
+            MessageAction::Edit => {
+                self.start_edit(channel, &message, window, cx);
+            }
+            MessageAction::ViewHistory => {
                 let jump = self.jump_handler();
                 jump(channel, Some(ts), false, cx);
             }
@@ -659,9 +877,53 @@ impl Render for PopoutWindow {
                 let channel = channel.clone();
                 let on_jump = on_jump.clone();
                 let view = cx.entity();
-                let mut rows = Vec::with_capacity(self.messages.len());
+                let mut rows: Vec<gpui_kit::gpui::AnyElement> =
+                    Vec::with_capacity(self.messages.len());
                 let mut prev_msg: Option<&Message> = None;
+                let editing = self.editing.clone();
                 for (ix, msg) in self.messages.iter().enumerate() {
+                    if let Some((_, edit_ts, edit_input)) = &editing {
+                        if *edit_ts == msg.ts {
+                            let edit_row = v_flex()
+                                .id(SharedString::from(format!("popout-edit-{ix}")))
+                                .mx_4()
+                                .my_1()
+                                .p_2p5()
+                                .gap_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().ring)
+                                .bg(bg)
+                                .child(Textarea::new(edit_input).appearance(false).bordered(false))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            Button::new("popout-edit-cancel")
+                                                .outline()
+                                                .with_size(Size::XSmall)
+                                                .label("Cancel")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.editing = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("popout-edit-save")
+                                                .primary()
+                                                .with_size(Size::XSmall)
+                                                .label("Save Changes")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.save_edit(cx);
+                                                })),
+                                        ),
+                                );
+                            rows.push(edit_row.into_any_element());
+                            prev_msg = None;
+                            continue;
+                        }
+                    }
                     let msg_group = SharedString::from(format!("popout-msg-{ix}"));
                     let key = format!("popout-row-{}", msg.ts.as_str());
                     let grouped = prev_msg
@@ -752,7 +1014,7 @@ impl Render for PopoutWindow {
                             item = item.child(div().pl(px(48.)).child(bar));
                         }
                     }
-                    rows.push(item);
+                    rows.push(item.into_any_element());
                     prev_msg = Some(msg);
                 }
                 v_flex()
@@ -875,6 +1137,35 @@ impl Render for PopoutWindow {
             }
         };
 
+        let picker_overlay = self.picker.as_ref().map(|(_, pos)| {
+            let viewport = _window.viewport_size();
+            let left = (pos.x - px(180.))
+                .max(px(12.))
+                .min((viewport.width - px(372.)).max(px(12.)));
+            let top = (pos.y - px(390.))
+                .max(px(48.))
+                .min((viewport.height - px(410.)).max(px(48.)));
+            div()
+                .id("popout-picker-backdrop")
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.picker = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.emoji_picker.clone()),
+                )
+        });
+
         let mut root = v_flex()
             .relative()
             .size_full()
@@ -882,8 +1173,12 @@ impl Render for PopoutWindow {
             .text_color(fg)
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, _, cx| {
-                    if event.keystroke.key == "escape" && this.image_viewer.is_some() {
-                        this.close_image_viewer(cx);
+                    if event.keystroke.key == "escape" {
+                        if this.image_viewer.is_some() {
+                            this.close_image_viewer(cx);
+                        } else if this.picker.take().is_some() || this.editing.take().is_some() {
+                            cx.notify();
+                        }
                     }
                 }),
             )
@@ -892,17 +1187,18 @@ impl Render for PopoutWindow {
         if has_composer {
             root = root.child(div().flex_none().p_2().child(self.composer.clone()));
         }
-        root.when_some(self.image_viewer.clone(), |root, viewer| {
-            root.child(
-                div()
-                    .absolute()
-                    .top(px(40.))
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(viewer),
-            )
-        })
+        root.children(picker_overlay)
+            .when_some(self.image_viewer.clone(), |root, viewer| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(40.))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(viewer),
+                )
+            })
     }
 }
 
@@ -924,6 +1220,7 @@ mod tests {
             let tag = match cmd {
                 Command::AddReaction { name, .. } => format!("add:{name}"),
                 Command::RemoveReaction { name, .. } => format!("rm:{name}"),
+                Command::EditMessage { content, .. } => format!("edit:{}", content.text),
                 Command::SaveItem { .. } => "save".to_owned(),
                 Command::DeleteSavedItem { .. } => "unsave".to_owned(),
                 Command::SetPinned { pinned, .. } => format!("pin:{pinned}"),
@@ -939,6 +1236,7 @@ mod tests {
         });
 
         cx.update(gpui_kit::init);
+        let later = cx.update(LaterView::new);
         let mut popout_slot: Option<Entity<PopoutWindow>> = None;
         let vcx = cx.add_window(|window, cx| {
             let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
@@ -954,6 +1252,7 @@ mod tests {
                     None,
                     None,
                     send,
+                    Some((later.downgrade(), 0)),
                     window,
                     cx,
                 )
@@ -982,6 +1281,40 @@ mod tests {
                     window,
                     cx,
                 );
+                // Pick reaction via in-window EmojiPicker
+                win.handle_message_action(
+                    channel.clone(),
+                    first.clone(),
+                    MessageAction::PickReaction(point(px(200.), px(200.))),
+                    window,
+                    cx,
+                );
+                assert!(win.picker.is_some());
+                win.pick_emoji(
+                    &EmojiChoice {
+                        name: "rocket".to_owned(),
+                        glyph: Some("🚀".to_owned()),
+                    },
+                    window,
+                    cx,
+                );
+                assert!(win.picker.is_none());
+                // Inline edit inside the popped-out window
+                win.handle_message_action(
+                    channel.clone(),
+                    first.clone(),
+                    MessageAction::Edit,
+                    window,
+                    cx,
+                );
+                let input = win.editing.as_ref().unwrap().2.clone();
+                input.update(cx, |s, cx| {
+                    s.set_value("Updated inline".to_owned(), window, cx)
+                });
+                win.save_edit(cx);
+                assert!(win.editing.is_none());
+                assert_eq!(win.messages[0].text, "Updated inline");
+
                 win.handle_message_action(
                     channel.clone(),
                     first.clone(),
@@ -1017,7 +1350,15 @@ mod tests {
 
         assert_eq!(
             *sent.lock().unwrap(),
-            vec!["add:eyes", "rm:eyes", "save", "unsave", "pin:true"]
+            vec![
+                "add:eyes",
+                "rm:eyes",
+                "add:rocket",
+                "edit:Updated inline",
+                "save",
+                "unsave",
+                "pin:true"
+            ]
         );
         assert_eq!(*jumped.lock().unwrap(), vec![(channel, Some(ts), true)]);
     }
@@ -1029,12 +1370,16 @@ mod tests {
         cx.simulate_display_added(second_display, None);
 
         cx.update(|cx| {
-            let opts = popout_window_options("# general", Some(second_display), cx);
-            assert_eq!(opts.display_id, Some(second_display));
-            assert!(opts.window_bounds.is_some());
-            assert!(opts.titlebar.is_some());
+            let opts0 = popout_window_options("# general", Some(second_display), 0, cx);
+            let opts1 = popout_window_options("# general", Some(second_display), 1, cx);
+            assert_eq!(opts0.display_id, Some(second_display));
+            assert_eq!(opts1.display_id, Some(second_display));
+            let b0 = opts0.window_bounds.unwrap().get_bounds();
+            let b1 = opts1.window_bounds.unwrap().get_bounds();
+            assert_eq!(b1.origin.x - b0.origin.x, px(28.));
+            assert_eq!(b1.origin.y - b0.origin.y, px(28.));
 
-            let default_opts = popout_window_options("# general", None, cx);
+            let default_opts = popout_window_options("# general", None, 0, cx);
             assert_eq!(default_opts.display_id, None);
         });
     }
