@@ -17,11 +17,11 @@ use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, DisplayId, Entity, Focusable as _,
-    FontWeight, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels,
-    Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, div, point, px,
-    size,
+    Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DisplayId, Edges, Entity,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions, anchored, deferred, div, point, px, size,
 };
 use gpui_kit::open_window;
 use slackless_core::api::MessageContent;
@@ -1138,34 +1138,7 @@ impl Render for PopoutWindow {
             }
         };
 
-        let picker_overlay = self.picker.as_ref().map(|(_, pos)| {
-            let viewport = _window.viewport_size();
-            let left = (pos.x - px(180.))
-                .max(px(12.))
-                .min((viewport.width - px(372.)).max(px(12.)));
-            let top = (pos.y - px(390.))
-                .max(px(48.))
-                .min((viewport.height - px(410.)).max(px(48.)));
-            div()
-                .id("popout-picker-backdrop")
-                .absolute()
-                .inset_0()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.picker = None;
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(left)
-                        .top(top)
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(self.emoji_picker.clone()),
-                )
-        });
+        let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);
 
         let mut root = v_flex()
             .relative()
@@ -1188,18 +1161,58 @@ impl Render for PopoutWindow {
         if has_composer {
             root = root.child(div().flex_none().p_2().child(self.composer.clone()));
         }
-        root.children(picker_overlay)
-            .when_some(self.image_viewer.clone(), |root, viewer| {
-                root.child(
-                    div()
-                        .absolute()
-                        .top(px(40.))
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(viewer),
-                )
-            })
+        root.when_some(picker_pos, |root, pos| {
+            let viewport = _window.viewport_size();
+            let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
+                (true, true) => Anchor::BottomRight,
+                (true, false) => Anchor::BottomLeft,
+                (false, true) => Anchor::TopRight,
+                (false, false) => Anchor::TopLeft,
+            };
+            root.child(
+                div()
+                    .id("popout-picker-backdrop")
+                    .occlude()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                    .absolute()
+                    .inset_0()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.picker = None;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(deferred(
+                anchored()
+                    .position(pos)
+                    .anchor(anchor)
+                    .snap_to_window_with_margin(Edges::all(px(8.)))
+                    .child(
+                        div()
+                            .id("popout-picker-overlay")
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
+                            .child(self.emoji_picker.clone()),
+                    ),
+            ))
+        })
+        .when_some(self.image_viewer.clone(), |root, viewer| {
+            root.child(
+                div()
+                    .id("popout-image-viewer-overlay")
+                    .occlude()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                    .absolute()
+                    .top(px(40.))
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(viewer),
+            )
+        })
     }
 }
 
@@ -1383,5 +1396,79 @@ mod tests {
             let default_opts = popout_window_options("# general", None, 0, cx);
             assert_eq!(default_opts.display_id, None);
         });
+    }
+
+    #[gpui::test]
+    fn popout_emoji_picker_occludes_scroll_wheel_from_messages(cx: &mut TestAppContext) {
+        let fixtures = Arc::new(crate::fixtures::load());
+        let channel = ChannelId::from("C0GENERAL");
+        let send: CommandForward = Arc::new(|_| {});
+        let on_jump: JumpHandler = Rc::new(|_, _, _, _| {});
+
+        cx.update(gpui_kit::init);
+        let mut popout_slot: Option<Entity<PopoutWindow>> = None;
+        let vcx = cx.add_window(|window, cx| {
+            let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
+            let win = cx.new(|cx| {
+                let mut w = PopoutWindow::new(
+                    PopoutKind::Conversation {
+                        channel: channel.clone(),
+                        source: list.downgrade(),
+                        on_jump,
+                    },
+                    "# general".to_owned(),
+                    fixtures.clone(),
+                    None,
+                    None,
+                    send,
+                    None,
+                    window,
+                    cx,
+                );
+                // Ensure the transcript is taller than the viewport so it is scrollable.
+                let seed = w.messages.clone();
+                for i in 0..8 {
+                    for m in &seed {
+                        let mut dup = m.clone();
+                        dup.ts = Ts::from(format!("17600{i}0000.{}", m.ts.as_str()));
+                        w.messages.push(dup);
+                    }
+                }
+                w
+            });
+            popout_slot = Some(win.clone());
+            gpui_kit::component::Root::new(win, window, cx)
+        });
+        let popout = popout_slot.unwrap();
+        let mut vcx = gpui_kit::VisualTestContext::from_window(vcx.into(), cx);
+        vcx.run_until_parked();
+
+        // Open the emoji picker inside the popout window and settle layout.
+        vcx.update(|window, cx| {
+            popout.update(cx, |win, cx| {
+                win.open_picker(
+                    PopoutPickerTarget::Composer,
+                    point(px(360.), px(420.)),
+                    window,
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+
+        let offset_before = vcx.read(|cx| popout.read(cx).scroll.offset());
+        // Scroll inside the emoji picker overlay; the underlying message list must not move.
+        vcx.simulate_event(gpui::ScrollEvent {
+            position: point(px(260.), px(260.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        vcx.run_until_parked();
+        let offset_after = vcx.read(|cx| popout.read(cx).scroll.offset());
+        assert_eq!(
+            offset_before, offset_after,
+            "scrolling over the popout emoji picker must not scroll the underlying messages"
+        );
     }
 }

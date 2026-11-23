@@ -19,18 +19,21 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::input::TextareaState;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Point, Render, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Window, div, px,
+    App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, Point, Render,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::{MessageContent, ThreadsView as SlackThreads};
 use slackless_core::types::{ChannelId, ConversationKind, Message, Ts};
 
-use crate::composer::{AlsoSendTarget, Composer, ComposerEvent, PendingAttachment};
+use crate::actions::{self, MessageAction};
+use crate::composer::{self, AlsoSendTarget, Composer, ComposerEvent, PendingAttachment};
 use crate::fixtures::Fixtures;
+use crate::image_viewer::{self, ImageOrigin, ViewerImage};
 use crate::messages::LinkTarget;
 use crate::slash::{Invocation, SHRUG, SlashKind};
 use crate::threads_cards::{ThreadCard, card_view, remote_cards};
@@ -62,6 +65,20 @@ pub enum ThreadsEvent {
         content: Option<MessageContent>,
         files: Vec<PendingAttachment>,
     },
+    /// A message-level action (reaction, pin, save, edit, delete, image, profile, Block Kit, etc.)
+    /// was triggered on a root message or reply inside a thread card.
+    MessageAction {
+        channel: ChannelId,
+        thread_ts: Ts,
+        message: Box<Message>,
+        action: MessageAction,
+    },
+    /// An inline edit inside a thread card was saved; the card already reflects the updated text.
+    EditMessage {
+        channel: ChannelId,
+        ts: Ts,
+        content: MessageContent,
+    },
     /// The reply composer's emoji button asked for the picker.
     PickEmoji(Point<Pixels>),
     PickGif(Point<Pixels>),
@@ -80,6 +97,10 @@ pub struct ThreadsView {
     active: Option<usize>,
     /// Cards whose "Show N more replies" link has been expanded in-place.
     expanded: HashSet<(ChannelId, Ts)>,
+    /// Saved-for-later message timestamps synced from `LaterView`.
+    saved: HashSet<Ts>,
+    /// Active inline message edit `(channel, ts, textarea)`.
+    editing: Option<(ChannelId, Ts, Entity<TextareaState>)>,
     composer: Entity<Composer>,
     _subscriptions: Vec<Subscription>,
 }
@@ -139,6 +160,8 @@ impl ThreadsView {
                 loading: false,
                 active: None,
                 expanded: HashSet::new(),
+                saved: HashSet::new(),
+                editing: None,
                 composer,
                 _subscriptions: subscriptions,
             }
@@ -197,9 +220,227 @@ impl ThreadsView {
         self.loading = false;
         self.cards.clear();
         self.expanded.clear();
+        self.editing = None;
         self.active = None;
         self.sync_also_send(cx);
         cx.notify();
+    }
+
+    /// Replace the set of saved-for-later message timestamps (synced from `LaterView`).
+    pub fn replace_saved(&mut self, saved: HashSet<Ts>, cx: &mut Context<Self>) {
+        if self.saved != saved {
+            self.saved = saved;
+            cx.notify();
+        }
+    }
+
+    /// Update a single message's saved marker.
+    pub fn set_saved(&mut self, ts: &Ts, saved: bool, cx: &mut Context<Self>) {
+        let changed = if saved {
+            self.saved.insert(ts.clone())
+        } else {
+            self.saved.remove(ts)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn find_message_mut(&mut self, channel: &ChannelId, ts: &Ts) -> Option<&mut Message> {
+        for card in &mut self.cards {
+            if card.channel != *channel {
+                continue;
+            }
+            if card.root.ts == *ts {
+                return Some(&mut card.root);
+            }
+            if let Some(reply) = card.replies.iter_mut().find(|m| m.ts == *ts) {
+                return Some(reply);
+            }
+        }
+        None
+    }
+
+    /// Toggle a reaction on a thread root or reply; returns `Some(added)` when the message exists.
+    pub fn toggle_reaction(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let me = self.fixtures.self_user.clone();
+        let msg = self.find_message_mut(channel, ts)?;
+        let add = actions::toggle_reaction(msg, &me, name);
+        cx.notify();
+        Some(add)
+    }
+
+    /// Add a reaction on a thread root or reply if not already reacted by the signed-in user.
+    pub fn add_reaction(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let me = self.fixtures.self_user.clone();
+        let Some(msg) = self.find_message_mut(channel, ts) else {
+            return false;
+        };
+        if actions::add_reaction(msg, &me, name) {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle a message's pinned state in its channel; returns `Some(pinned)` if found.
+    pub fn toggle_pin(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let msg = self.find_message_mut(channel, ts)?;
+        let pinned = actions::toggle_pin(msg, channel);
+        cx.notify();
+        Some(pinned)
+    }
+
+    /// Remove a deleted or dismissed message from its thread card.
+    pub fn remove_message(&mut self, channel: &ChannelId, ts: &Ts, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if let Some(card_ix) = self
+            .cards
+            .iter()
+            .position(|c| c.channel == *channel && c.root.ts == *ts)
+        {
+            self.cards.remove(card_ix);
+            self.active = self
+                .active
+                .filter(|&ix| ix < self.cards.len())
+                .or_else(|| (!self.cards.is_empty()).then_some(0));
+            changed = true;
+        } else {
+            for card in &mut self.cards {
+                if card.channel != *channel {
+                    continue;
+                }
+                let before = card.replies.len();
+                card.replies.retain(|m| m.ts != *ts);
+                if card.replies.len() < before {
+                    card.reply_total = card.reply_total.saturating_sub(1);
+                    changed = true;
+                }
+            }
+        }
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|(ch, edit_ts, _)| ch == channel && edit_ts == ts)
+        {
+            self.editing = None;
+            changed = true;
+        }
+        if changed {
+            self.sync_also_send(cx);
+            cx.notify();
+        }
+    }
+
+    /// Begin inline editing of `message` inside its thread card.
+    pub fn start_edit(
+        &mut self,
+        channel: ChannelId,
+        message: &Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = self.fixtures.plain_text(message);
+        let input = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx)
+                .placeholder("Edit message…")
+                .auto_grow(1, 6);
+            state.set_value(initial, window, cx);
+            state
+        });
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        self.editing = Some((channel, message.ts.clone(), input));
+        cx.notify();
+    }
+
+    /// Commit the active inline edit and emit [`ThreadsEvent::EditMessage`].
+    pub(super) fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let Some((channel, ts, input)) = self.editing.take() else {
+            return;
+        };
+        let text = input.read(cx).value().trim().to_owned();
+        if text.is_empty() {
+            cx.notify();
+            return;
+        }
+        let content = composer::content_of(&text, &self.fixtures);
+        let me = self.fixtures.self_user.clone();
+        if let Some(msg) = self.find_message_mut(&channel, &ts) {
+            actions::apply_edit(msg, &me, content.clone());
+        }
+        cx.emit(ThreadsEvent::EditMessage {
+            channel,
+            ts,
+            content,
+        });
+        cx.notify();
+    }
+
+    /// Cancel any active inline edit.
+    pub(super) fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Dock and focus the reply composer on the card for `(channel, thread_ts)`.
+    pub fn activate_thread(
+        &mut self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self
+            .cards
+            .iter()
+            .position(|c| c.channel == *channel && c.thread_ts == *thread_ts)
+        {
+            self.activate(Some(ix), window, cx);
+        }
+    }
+
+    /// Collect all images across a thread card (root + replies) and locate `(ts, origin)`.
+    pub fn card_images(
+        &self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        ts: &Ts,
+        origin: &ImageOrigin,
+    ) -> Option<(Vec<ViewerImage>, usize)> {
+        let card = self
+            .cards
+            .iter()
+            .find(|c| c.channel == *channel && c.thread_ts == *thread_ts)?;
+        let mut images = Vec::new();
+        let mut index = None;
+        for msg in std::iter::once(&card.root).chain(&card.replies) {
+            for entry in image_viewer::message_images(&self.fixtures, msg) {
+                if msg.ts == *ts && entry.origin == *origin && index.is_none() {
+                    index = Some(images.len());
+                }
+                images.push(entry.image);
+            }
+        }
+        index.map(|ix| (images, ix))
     }
 
     /// Show `cards` (the store derivation fallback) unless Slack's own list already landed.
@@ -358,6 +599,7 @@ impl Render for ThreadsView {
         let unread: u32 = self.cards.iter().map(|card| card.unread).sum();
         let cards: Vec<(usize, ThreadCard)> = self.cards.iter().cloned().enumerate().collect();
         let mut inner = v_flex().w_full().px_5().py_4().gap_6();
+        let editing = self.editing.clone();
         for (ix, card) in &cards {
             let expanded = self
                 .expanded
@@ -368,6 +610,8 @@ impl Render for ThreadsView {
                 card,
                 self.active == Some(*ix),
                 expanded,
+                &self.saved,
+                editing.as_ref(),
                 &self.composer,
                 cx,
             ));
@@ -397,6 +641,11 @@ impl Render for ThreadsView {
         v_flex()
             .size_full()
             .bg(background)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.editing.is_some() {
+                    this.cancel_edit(cx);
+                }
+            }))
             .child(
                 h_flex()
                     .flex_none()
@@ -493,5 +742,100 @@ mod tests {
             assert!(!view.read(cx).remote);
             assert!(view.read(cx).cards.is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn threads_view_message_actions_mutate_state(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let fixtures = Arc::new(crate::fixtures::load());
+        let cards = crate::threads_cards::local_cards(&fixtures);
+        assert!(!cards.is_empty());
+
+        let view_cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let cell = view_cell.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = ThreadsView::new(fixtures.clone(), window, cx);
+            *cell.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = view_cell.borrow_mut().take().unwrap();
+        let edited: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let edited_cb = edited.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event, _| {
+                if let ThreadsEvent::EditMessage { content, .. } = event {
+                    edited_cb.lock().unwrap().push(content.text.clone());
+                }
+            })
+            .detach();
+        });
+
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.show_local(cards.clone(), cx));
+            let card = view.read(cx).cards[0].clone();
+            let ch = card.channel.clone();
+            let root_ts = card.root.ts.clone();
+            let reply = card.replies[0].clone();
+            let reply_ts = reply.ts.clone();
+
+            // Reactions on root and reply
+            let added = view.update(cx, |v, cx| v.add_reaction(&ch, &root_ts, "rocket", cx));
+            assert!(added);
+            assert!(!view.update(cx, |v, cx| v.add_reaction(&ch, &root_ts, "rocket", cx)));
+            assert_eq!(
+                view.update(cx, |v, cx| v.toggle_reaction(&ch, &root_ts, "rocket", cx)),
+                Some(false)
+            );
+            assert_eq!(
+                view.update(cx, |v, cx| v.toggle_reaction(&ch, &reply_ts, "eyes", cx)),
+                Some(true)
+            );
+
+            // Pinning and saving
+            assert_eq!(
+                view.update(cx, |v, cx| v.toggle_pin(&ch, &reply_ts, cx)),
+                Some(true)
+            );
+            assert_eq!(
+                view.update(cx, |v, cx| v.toggle_pin(&ch, &reply_ts, cx)),
+                Some(false)
+            );
+            view.update(cx, |v, cx| {
+                v.replace_saved(HashSet::from([root_ts.clone()]), cx);
+            });
+            assert!(view.read(cx).saved.contains(&root_ts));
+            view.update(cx, |v, cx| v.set_saved(&root_ts, false, cx));
+            assert!(!view.read(cx).saved.contains(&root_ts));
+
+            // Inline editing
+            view.update(cx, |v, cx| {
+                v.start_edit(ch.clone(), &reply, window, cx);
+                let input = v.editing.as_ref().unwrap().2.clone();
+                input.update(cx, |s, cx| {
+                    s.set_value("Edited reply text".to_owned(), window, cx)
+                });
+                v.save_edit(cx);
+            });
+            assert!(view.read(cx).editing.is_none());
+            assert_eq!(
+                view.read(cx).cards[0]
+                    .replies
+                    .iter()
+                    .find(|m| m.ts == reply_ts)
+                    .unwrap()
+                    .text,
+                "Edited reply text"
+            );
+
+            // Deleting a reply
+            let before_replies = view.read(cx).cards[0].replies.len();
+            view.update(cx, |v, cx| v.remove_message(&ch, &reply_ts, cx));
+            assert_eq!(view.read(cx).cards[0].replies.len(), before_replies - 1);
+        });
+        assert_eq!(*edited.lock().unwrap(), vec!["Edited reply text"]);
     }
 }

@@ -89,6 +89,7 @@ pub(crate) fn workspace_menu(
         .bg(popover)
         .shadow_md()
         .occlude()
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .child(
             div()
                 .px_3()

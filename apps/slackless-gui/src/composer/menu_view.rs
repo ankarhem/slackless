@@ -59,6 +59,7 @@ impl Composer {
         v_flex()
             .id("composer-menu")
             .occlude()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .absolute()
             .left(px(16.))
             .right(px(16.))

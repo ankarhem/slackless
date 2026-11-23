@@ -382,6 +382,7 @@ pub(crate) fn card(
     div()
         .id("member-hover-card")
         .occlude()
+        .on_scroll(|_, _, cx| cx.stop_propagation())
         .w(px(340.))
         .rounded(px(8.))
         .border_1()

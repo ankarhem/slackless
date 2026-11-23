@@ -13,7 +13,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
@@ -24,6 +27,7 @@ use slackless_core::api::ThreadsView as SlackThreads;
 use slackless_core::store::Store;
 use slackless_core::types::{ChannelId, ConversationKind, Message, TeamId, Ts, UserId};
 
+use crate::actions::{self, ActionHandler, ActionSet, MenuOrigin};
 use crate::avatars::conversation_avatar;
 use crate::composer::Composer;
 use crate::fixtures::Fixtures;
@@ -221,12 +225,138 @@ fn format_name_list(names: &[String]) -> String {
     }
 }
 
+/// Render one interactive message row (root or reply) inside a thread card, with hover highlight,
+/// saved banner/tint, interactive reaction chips, floating hover toolbar, context menu, and
+/// inline edit mode.
+#[allow(clippy::too_many_arguments)]
+fn render_thread_message(
+    fixtures: &Arc<Fixtures>,
+    card: &ThreadCard,
+    msg: &Message,
+    key: String,
+    msg_group: SharedString,
+    grouped: Option<SharedString>,
+    is_first_in_card: bool,
+    saved_set: &HashSet<Ts>,
+    editing: Option<&(ChannelId, Ts, Entity<TextareaState>)>,
+    links: &LinkHandler,
+    cx: &mut Context<ThreadsView>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let (bg, ring, hover_bg, saved_bg) = (
+        theme.background,
+        theme.ring,
+        theme.secondary.opacity(0.5),
+        theme.warning.opacity(0.08),
+    );
+    if let Some((edit_ch, edit_ts, edit_input)) = editing {
+        if *edit_ch == card.channel && *edit_ts == msg.ts {
+            return v_flex()
+                .id(SharedString::from(format!("{key}-edit")))
+                .mx_4()
+                .my_1()
+                .p_2p5()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(ring)
+                .bg(bg)
+                .child(Textarea::new(edit_input).appearance(false).bordered(false))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new(SharedString::from(format!("{key}-edit-cancel")))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_edit(cx))),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("{key}-edit-save")))
+                                .primary()
+                                .with_size(Size::XSmall)
+                                .label("Save Changes")
+                                .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
+                        ),
+                )
+                .into_any_element();
+        }
+    }
+
+    let is_saved = saved_set.contains(&msg.ts);
+    let view = cx.entity();
+    let ch_for_action = card.channel.clone();
+    let thread_ts_for_action = card.thread_ts.clone();
+    let msg_for_action = msg.clone();
+    let handler: ActionHandler = Rc::new(move |action, _window, cx| {
+        let ch = ch_for_action.clone();
+        let thread_ts = thread_ts_for_action.clone();
+        let message = Box::new(msg_for_action.clone());
+        view.update(cx, |_, cx| {
+            cx.emit(ThreadsEvent::MessageAction {
+                channel: ch,
+                thread_ts,
+                message,
+                action,
+            });
+        });
+    });
+    let set = ActionSet {
+        own: msg.user.as_ref() == Some(&fixtures.self_user),
+        reply: true,
+        saved: is_saved,
+        pinned: msg.pinned_to.contains(&card.channel),
+    };
+    let mut display = msg.clone();
+    let reactions = std::mem::take(&mut display.reactions);
+    let chips = actions::reaction_chips(&key, &reactions, fixtures, Some(&handler), cx)
+        .map(|c| c.pl(px(48.)));
+    let toolbar = actions::hover_toolbar(
+        &key,
+        &fixtures.quick_reactions,
+        set,
+        &handler,
+        msg_group.clone(),
+        cx,
+    )
+    .when(is_first_in_card, |bar| bar.top(px(3.)));
+    let menu_handler = handler.clone();
+
+    v_flex()
+        .id(SharedString::from(key))
+        .group(msg_group)
+        .relative()
+        .px_4()
+        .py_0p5()
+        .when(is_saved, |row| {
+            row.bg(saved_bg).child(actions::saved_banner(cx))
+        })
+        .when(!is_saved, |row| row.hover(move |r| r.bg(hover_bg)))
+        .child(message_row_linked(
+            fixtures,
+            &display,
+            Some(&handler),
+            Some(links),
+            grouped,
+            cx,
+        ))
+        .children(chips)
+        .child(toolbar)
+        .context_menu(move |menu, window, cx| {
+            actions::actions_menu(menu, set, &menu_handler, MenuOrigin::Context, window, cx)
+        })
+        .into_any_element()
+}
+
 /// One followed thread group matching official Slack's Threads view:
 /// 1. Channel header + participants subtitle above the card (click opens thread in channel)
 /// 2. Rounded bordered card containing:
-///    - Root message
+///    - Root message (with full hover actions, reactions, context menu, and inline edit)
 ///    - Clickable blue `"Show N more replies"` link when replies are hidden
 ///    - Latest replies (or all replies when expanded), with consecutive same-author grouping
+///      and full hover actions, reactions, context menu, and inline edit
 ///    - Bordered reply composer (`Composer` with `"Also send to #channel"` when active, or a
 ///      matching bordered `"Reply..."` box that activates & focuses it on click).
 #[allow(clippy::too_many_arguments)]
@@ -236,6 +366,8 @@ pub(super) fn card_view(
     card: &ThreadCard,
     active: bool,
     expanded: bool,
+    saved_set: &HashSet<Ts>,
+    editing: Option<&(ChannelId, Ts, Entity<TextareaState>)>,
     composer: &Entity<Composer>,
     cx: &mut Context<ThreadsView>,
 ) -> AnyElement {
@@ -292,17 +424,44 @@ pub(super) fn card_view(
         view.update(cx, |_, cx| cx.emit(ThreadsEvent::OpenLink(target.clone())));
     });
 
+    let root_row = render_thread_message(
+        fixtures,
+        card,
+        &card.root,
+        format!("thread-{ix}-root-{}", card.root.ts.as_str()),
+        SharedString::from(format!("thread-{ix}-root")),
+        None,
+        true,
+        saved_set,
+        editing,
+        &links,
+        cx,
+    );
+
     let expand_key = (card.channel.clone(), card.thread_ts.clone());
     let mut prev_reply: Option<&Message> = None;
     let reply_rows: Vec<AnyElement> = shown
         .iter()
         .enumerate()
         .map(|(r_ix, reply)| {
+            let msg_group = SharedString::from(format!("thread-{ix}-reply-{r_ix}"));
             let grouped = prev_reply
                 .filter(|prev| same_group(prev, reply))
-                .map(|_| SharedString::from(format!("thread-{ix}-reply-{r_ix}")));
+                .map(|_| msg_group.clone());
             prev_reply = Some(reply);
-            message_row_linked(fixtures, reply, None, Some(&links), grouped, cx).into_any_element()
+            render_thread_message(
+                fixtures,
+                card,
+                reply,
+                format!("thread-{ix}-reply-{}-{}", r_ix, reply.ts.as_str()),
+                msg_group,
+                grouped,
+                false,
+                saved_set,
+                editing,
+                &links,
+                cx,
+            )
         })
         .collect();
 
@@ -378,14 +537,7 @@ pub(super) fn card_view(
         .bg(background)
         .pt_3()
         .when(!active, |box_el| box_el.pb_3())
-        .child(div().px_4().child(message_row_linked(
-            fixtures,
-            &card.root,
-            None,
-            Some(&links),
-            None,
-            cx,
-        )))
+        .child(root_row)
         .when(hidden > 0, |box_el| {
             let label = if hidden == 1 {
                 "Show 1 more reply".to_owned()
@@ -410,7 +562,7 @@ pub(super) fn card_view(
             )
         })
         .when(!reply_rows.is_empty(), |box_el| {
-            box_el.child(v_flex().px_4().pt_1().gap_1().children(reply_rows))
+            box_el.child(v_flex().pt_1().gap_1().children(reply_rows))
         })
         .child(reply_footer);
 

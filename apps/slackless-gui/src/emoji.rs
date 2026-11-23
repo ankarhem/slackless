@@ -1771,6 +1771,8 @@ impl Render for EmojiPicker {
         if self.tab == PickerTab::Gifs {
             return v_flex()
                 .id("emoji-picker")
+                .occlude()
+                .on_scroll(|_, _, cx| cx.stop_propagation())
                 .w(px(PICKER_WIDTH))
                 .rounded_lg()
                 .border_1()
@@ -1936,6 +1938,8 @@ impl Render for EmojiPicker {
 
         v_flex()
             .id("emoji-picker")
+            .occlude()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .w(px(PICKER_WIDTH))
             .rounded_lg()
             .border_1()

@@ -1231,6 +1231,7 @@ impl Render for UserMenu {
             v_flex()
                 .id("menu-submenu")
                 .occlude()
+                .on_scroll(|_, _, cx| cx.stop_propagation())
                 .absolute()
                 // Flush to the menu's right edge (2pt overlap keeps the hover chain intact
                 // while the pointer crosses), top level with the status box, as Slack drops

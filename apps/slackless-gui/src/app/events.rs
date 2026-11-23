@@ -42,6 +42,8 @@ impl App {
             .update(cx, |list, cx| list.replace_saved(saved.clone(), cx));
         self.thread
             .update(cx, |thread, cx| thread.replace_saved(saved.clone(), cx));
+        self.threads
+            .update(cx, |threads, cx| threads.replace_saved(saved.clone(), cx));
         self.unreads
             .update(cx, |unreads, cx| unreads.replace_saved(saved, cx));
     }

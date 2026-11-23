@@ -1101,6 +1101,7 @@ impl App {
             .ml(px(-100.))
             .pt(px(8.))
             .occlude()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 this.members_hover.1 = *hovered;
                 cx.notify();

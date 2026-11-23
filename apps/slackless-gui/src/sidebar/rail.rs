@@ -290,6 +290,7 @@ impl Sidebar {
             .bottom(px(-8.))
             .pl(px(12.))
             .occlude()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 this.focus_hover.1 = *hovered;
                 cx.notify();

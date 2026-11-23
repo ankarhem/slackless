@@ -1386,6 +1386,9 @@ impl App {
                                     .update(cx, |list, cx| list.set_saved(ts, false, cx));
                                 this.thread
                                     .update(cx, |thread, cx| thread.set_saved(ts, false, cx));
+                                this.threads
+                                    .update(cx, |threads, cx| threads.set_saved(ts, false, cx));
+                                this.sync_saved(cx);
                                 this.bridge.send(Command::DeleteSavedItem {
                                     channel: channel.clone(),
                                     ts: ts.clone(),
@@ -1492,6 +1495,34 @@ impl App {
                                 files.clone(),
                                 window,
                                 cx,
+                            );
+                        }
+                        ThreadsEvent::MessageAction {
+                            channel,
+                            thread_ts,
+                            message,
+                            action,
+                        } => {
+                            this.handle_threads_message_action(
+                                channel.clone(),
+                                thread_ts.clone(),
+                                message.as_ref().clone(),
+                                action.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                        ThreadsEvent::EditMessage {
+                            channel,
+                            ts,
+                            content,
+                        } => {
+                            this.post_change(
+                                channel,
+                                &MessageChange::Edit {
+                                    ts: ts.clone(),
+                                    content: content.clone(),
+                                },
                             );
                         }
                         ThreadsEvent::PickEmoji(position) => {
@@ -2749,6 +2780,8 @@ impl Render for App {
                 root.child(
                     div()
                         .id("user-menu-scrim")
+                        .occlude()
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
                         .absolute()
                         .top_0()
                         .left_0()
@@ -2763,6 +2796,7 @@ impl Render for App {
                     div()
                         .id("user-menu")
                         .occlude()
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
                         .absolute()
                         // Where Slack drops it: beside the tab rail's avatar.
                         .bottom(px(24.))
@@ -2788,6 +2822,8 @@ impl Render for App {
                     root.child(
                         div()
                             .id("emoji-picker-scrim")
+                            .occlude()
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .absolute()
                             .top_0()
                             .left_0()
@@ -2805,6 +2841,7 @@ impl Render for App {
                                 div()
                                     .id("emoji-picker-overlay")
                                     .occlude()
+                                    .on_scroll(|_, _, cx| cx.stop_propagation())
                                     .child(self.emoji_picker.clone()),
                             ),
                     ))
@@ -2822,7 +2859,13 @@ impl Render for App {
                             .position(position)
                             .anchor(Anchor::TopLeft)
                             .snap_to_window_with_margin(Edges::all(px(8.)))
-                            .child(div().id("remind-menu-overlay").occlude().child(menu)),
+                            .child(
+                                div()
+                                    .id("remind-menu-overlay")
+                                    .occlude()
+                                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                                    .child(menu),
+                            ),
                     ))
                 },
             )
@@ -2902,6 +2945,7 @@ impl Render for App {
                                     div()
                                         .id("search-menu-overlay")
                                         .occlude()
+                                        .on_scroll(|_, _, cx| cx.stop_propagation())
                                         .w(bounds.size.width)
                                         .on_mouse_down_out(cx.listener(
                                             |this, event: &MouseDownEvent, window, cx| {
@@ -2928,6 +2972,7 @@ impl Render for App {
                     div()
                         .id("image-viewer-overlay")
                         .occlude()
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
                         .absolute()
                         .top(px(40.))
                         .left_0()

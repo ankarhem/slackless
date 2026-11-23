@@ -2092,6 +2092,8 @@ impl Render for Sidebar {
                     .child(
                         div()
                             .id("workspace-menu-scrim")
+                            .occlude()
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
                             .absolute()
                             .top_0()
                             .left_0()

@@ -556,6 +556,8 @@ impl Render for ImageViewer {
 
         div()
             .id("image-viewer")
+            .occlude()
+            .on_scroll(|_, _, cx| cx.stop_propagation())
             .size_full()
             .flex()
             .flex_col()
