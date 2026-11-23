@@ -2016,6 +2016,9 @@ impl App {
                 }
             });
 
+            let (cached_member_counts, cached_app_counts) =
+                CoreBridge::parse_channel_counts(&local);
+            let cached_bots = fixtures.bots.clone();
             App {
                 fixtures,
                 bridge,
@@ -2027,6 +2030,9 @@ impl App {
                 parked,
                 ws: WorkspaceState {
                     chosen,
+                    bots: cached_bots,
+                    member_counts: cached_member_counts,
+                    app_counts: cached_app_counts,
                     ..Default::default()
                 },
                 channel,

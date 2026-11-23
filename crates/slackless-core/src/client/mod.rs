@@ -390,6 +390,11 @@ impl<B: Backend> Core<B> {
             page_delay: PAGE_DELAY,
             unfurls: unfurls.clone(),
         };
+        let cached_bots = store
+            .lock()
+            .ok()
+            .and_then(|s| s.bot_profiles(&workspace).ok())
+            .unwrap_or_default();
         Self {
             backend,
             store,
@@ -402,7 +407,7 @@ impl<B: Backend> Core<B> {
             presence_peers: Arc::new(Mutex::new(Vec::new())),
             users_asked: HashSet::new(),
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
-            bots: HashMap::new(),
+            bots: cached_bots,
             bots_asked: HashSet::new(),
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -759,9 +764,17 @@ impl<B: Backend> Core<B> {
                         continue;
                     }
                     let backend = self.backend.clone();
+                    let store = Arc::clone(&self.store);
+                    let ws = self.workspace.clone();
                     let events = self.events.clone();
                     self.spawn("bots.info", async move {
                         let profile = backend.bot_info(bot.clone()).await?;
+                        let bot_store = bot.clone();
+                        let profile_store = profile.clone();
+                        let _ = with_store(&store, move |s| {
+                            s.upsert_bot_profile(&ws, &bot_store, &profile_store)
+                        })
+                        .await;
                         events.emit(Event::BotProfileLoaded {
                             bot_id: bot,
                             profile,

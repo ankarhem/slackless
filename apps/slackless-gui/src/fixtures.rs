@@ -1583,6 +1583,7 @@ pub fn live(
         "display_real_names_in_mentions",
     );
     let status_presets = status_presets_from_prefs(&workspace.extra, &prefs);
+    let cached_bots = store.bot_profiles(team).unwrap_or_default();
     Fixtures {
         workspaces: vec![workspace],
         teams,
@@ -1598,7 +1599,7 @@ pub fn live(
         directory,
         archived,
         presence: PresenceMap::default(),
-        bots: BotProfileMap::default(),
+        bots: Arc::new(RwLock::new(cached_bots)),
         notify_levels: slackless_core::notify_levels(&prefs),
         quick_reactions: quick_reactions(&prefs),
         frequent_emoji,

@@ -665,6 +665,51 @@ impl CoreBridge {
         serde_json::from_str(local.get(DRAFTS)?).ok()
     }
 
+    /// Live mode: a write remembering cached `(humans, apps)` member counts per channel so
+    /// cold launches paint header member/app badges immediately on frame 0.
+    pub fn remember_channel_counts(
+        &self,
+        members: &HashMap<ChannelId, u32>,
+        apps: &HashMap<ChannelId, u32>,
+    ) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let mut combined: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
+        for (ch, &n) in members {
+            combined.entry(ch.to_string()).or_default().0 = Some(n);
+        }
+        for (ch, &a) in apps {
+            combined.entry(ch.to_string()).or_default().1 = Some(a);
+        }
+        self.write_local(
+            "channel_counts_cache",
+            serde_json::to_string(&combined).ok()?,
+            "channel counts cache",
+        )
+    }
+
+    pub fn parse_channel_counts(
+        local: &HashMap<String, String>,
+    ) -> (HashMap<ChannelId, u32>, HashMap<ChannelId, u32>) {
+        let mut members = HashMap::new();
+        let mut apps = HashMap::new();
+        let Some(raw) = local.get("channel_counts_cache") else {
+            return (members, apps);
+        };
+        let Ok(parsed) = serde_json::from_str::<HashMap<String, (Option<u32>, Option<u32>)>>(raw)
+        else {
+            return (members, apps);
+        };
+        for (ch, (m, a)) in parsed {
+            let id = ChannelId::from(ch);
+            if let Some(n) = m {
+                members.insert(id.clone(), n);
+            }
+            if let Some(n) = a {
+                apps.insert(id, n);
+            }
+        }
+        (members, apps)
+    }
+
     pub fn parse_frequent_emoji(local: &HashMap<String, String>) -> Option<Vec<String>> {
         serde_json::from_str(local.get(FREQUENT_EMOJI)?).ok()
     }

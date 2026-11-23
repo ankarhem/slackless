@@ -11,8 +11,8 @@ use crate::Result;
 use crate::query::{Has, SearchQuery};
 use crate::schema;
 use crate::types::{
-    ChannelId, ChannelSection, Conversation, ConversationKind, Message, MessageSubtype, Team,
-    TeamId, Ts, User, UserId,
+    BotId, BotProfile, ChannelId, ChannelSection, Conversation, ConversationKind, Message,
+    MessageSubtype, Team, TeamId, Ts, User, UserId,
 };
 
 /// A message as the store currently renders it.
@@ -89,8 +89,8 @@ impl Store {
         let _ = conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -32000;
-             PRAGMA mmap_size = 134217728;",
+             PRAGMA cache_size = -64000;
+             PRAGMA mmap_size = 536870912;",
         );
         Self::init(conn)
     }
@@ -105,8 +105,8 @@ impl Store {
         let _ = conn.execute_batch(
             "PRAGMA query_only = ON;
              PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -16000;
-             PRAGMA mmap_size = 134217728;",
+             PRAGMA cache_size = -32000;
+             PRAGMA mmap_size = 536870912;",
         );
         Ok(Self { conn })
     }
@@ -1114,6 +1114,49 @@ impl Store {
             tables,
             top_channels,
         })
+    }
+
+    /// Persist a resolved `bots.info` profile so cold launches render bot names and icons
+    /// immediately on frame 0 without waiting on network lookups.
+    pub fn upsert_bot_profile(
+        &mut self,
+        workspace: &TeamId,
+        bot_id: &BotId,
+        profile: &BotProfile,
+    ) -> Result<()> {
+        let json = serde_json::to_string(profile)?;
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO bot_profile (workspace_id, bot_id, json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (workspace_id, bot_id) DO UPDATE SET
+                json = excluded.json,
+                updated_at = excluded.updated_at",
+        )?;
+        stmt.execute(params![
+            workspace.as_str(),
+            bot_id.as_str(),
+            json,
+            now_secs()
+        ])?;
+        Ok(())
+    }
+
+    /// All persisted `bots.info` profiles for `workspace`.
+    pub fn bot_profiles(&self, workspace: &TeamId) -> Result<HashMap<BotId, BotProfile>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT bot_id, json FROM bot_profile WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, raw) = row?;
+            if let Ok(profile) = serde_json::from_str::<BotProfile>(&raw) {
+                out.insert(BotId::from(id), profile);
+            }
+        }
+        Ok(out)
     }
 
     /// Checkpoint WAL, compact unused pages (`VACUUM`), and refresh query planner statistics.

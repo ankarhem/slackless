@@ -172,7 +172,18 @@ CREATE TABLE offline_queue (
 CREATE INDEX offline_queue_ws ON offline_queue (workspace_id, id);
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
+/// Version 5: persisted `bots.info` profiles for zero-flash cold boot rendering.
+const V5: &str = r#"
+CREATE TABLE bot_profile (
+    workspace_id TEXT NOT NULL,
+    bot_id       TEXT NOT NULL,
+    json         TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, bot_id)
+) WITHOUT ROWID;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

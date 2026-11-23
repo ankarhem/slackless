@@ -922,6 +922,14 @@ impl App {
                 if let Some(apps) = num_apps {
                     self.ws.app_counts.insert(channel.clone(), *apps);
                 }
+                if num_members.is_some() || num_apps.is_some() {
+                    if let Some(write) = self
+                        .bridge
+                        .remember_channel_counts(&self.ws.member_counts, &self.ws.app_counts)
+                    {
+                        cx.background_executor().spawn(write).detach();
+                    }
+                }
                 if !members.is_empty() {
                     self.ws
                         .members_cache
