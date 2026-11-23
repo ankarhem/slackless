@@ -2314,6 +2314,16 @@ impl<B: Backend> Core<B> {
                     );
                 }
             }
+            Command::SetHuddleAudioOnly(enabled) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetAudioOnly(enabled));
+                }
+            }
             Command::DeclineHuddleInvite { channel, call_id } => {
                 self.spawn("rooms.inviteResponse", async move {
                     backend

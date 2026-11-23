@@ -1028,6 +1028,9 @@ impl App {
                     huddle_link: Some(self.huddle_link()),
                     input_device: settings.huddle_input_device,
                     output_device: settings.huddle_output_device,
+                    aec: settings.huddle_aec,
+                    ns: settings.huddle_ns,
+                    agc: settings.huddle_agc,
                     ..Default::default()
                 };
                 self.mount_huddle_dock(snap, window, cx);
@@ -1138,6 +1141,9 @@ impl App {
             started_at_secs: crate::drafts::now_secs(),
             input_device: audio.input_device.clone(),
             output_device: audio.output_device.clone(),
+            aec: audio.aec,
+            ns: audio.ns,
+            agc: audio.agc,
             ..Default::default()
         };
         self.mount_huddle_dock(initial, window, cx);

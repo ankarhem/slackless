@@ -113,8 +113,10 @@ async fn run_session(
         muted: config.muted,
         video: false,
         blur_background: config.blur_background,
+        audio_only: false,
         sharing: false,
         share_source_id: None,
+        screen_audio_device: None,
         hand_raised: false,
         sticky_emoji: None,
         captions_enabled: false,
@@ -127,10 +129,16 @@ async fn run_session(
         huddle_link: creds.huddle_link.clone(),
         input_device: config.input_device.clone(),
         output_device: config.output_device.clone(),
+        aec: config.aec,
+        ns: config.ns,
+        agc: config.agc,
+        active_video_codec: None,
         error: None,
         udp_blocked: false,
         packets_sent: 0,
         packets_received: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
         pongs_sent: 0,
     };
     let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -387,9 +395,13 @@ async fn run_connected_loop(
                 });
             }
             Some(pkt) = inbound_video_rx.recv() => {
+                if snap.audio_only {
+                    continue;
+                }
                 let is_new = !remote_decoders.contains_key(&pkt.ssrc);
                 if is_new {
                     if let Some(dec) = RemoteVideoDecoder::for_mime(&pkt.mime_type) {
+                        snap.active_video_codec = Some(pkt.mime_type.clone());
                         remote_decoders.insert(pkt.ssrc, dec);
                         last_keyframe_req.insert(pkt.ssrc, Instant::now());
                         peer.request_keyframe(pkt.ssrc).await;
@@ -458,11 +470,14 @@ async fn run_connected_loop(
                         }
                         if let Some(index) = frame.index {
                             // Ignore our own camera and our own `#content` screen share.
-                            let next_raw: Vec<RemoteVideoSource> =
+                            let next_raw: Vec<RemoteVideoSource> = if snap.audio_only {
+                                Vec::new()
+                            } else {
                                 parse_index_sources(&index, &creds.attendee_id)
                                     .into_iter()
                                     .filter(|s| s.attendee_id != self_content_attendee)
-                                    .collect();
+                                    .collect()
+                            };
                             let next_tiles: HashSet<VideoTileKey> = next_raw
                                 .iter()
                                 .map(|s| {
@@ -633,6 +648,21 @@ async fn run_connected_loop(
             _ = metric_tick.tick() => {
                 let stats = peer.take_metrics_snapshot(shared.local_rms());
                 let _ = signal.send_frame(&build_client_metric_frame(stats)).await;
+                let tx_pkts = peer.total_packets_sent();
+                let rx_pkts = peer.total_packets_received();
+                let tx_bytes = peer.total_bytes_sent();
+                let rx_bytes = peer.total_bytes_received();
+                if snap.packets_sent != tx_pkts
+                    || snap.packets_received != rx_pkts
+                    || snap.bytes_sent != tx_bytes
+                    || snap.bytes_received != rx_bytes
+                {
+                    snap.packets_sent = tx_pkts;
+                    snap.packets_received = rx_pkts;
+                    snap.bytes_sent = tx_bytes;
+                    snap.bytes_received = rx_bytes;
+                    let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                }
             }
             _ = level_tick.tick() => {
                 let _ = updates.send(HuddleUpdate::AudioLevels(HuddleAudioLevels {
@@ -654,9 +684,13 @@ async fn run_connected_loop(
                         config.aec = aec;
                         config.ns = ns;
                         config.agc = agc;
+                        snap.aec = aec;
+                        snap.ns = ns;
+                        snap.agc = agc;
                         shared.aec.store(aec, Ordering::Relaxed);
                         shared.ns.store(ns, Ordering::Relaxed);
                         shared.agc.store(agc, Ordering::Relaxed);
+                        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
                     Some(HuddleControl::SetAudioDevices { input, output }) => {
                         config.input_device = input.clone();
@@ -758,6 +792,8 @@ async fn run_connected_loop(
                             .await
                             {
                                 Ok(cs) => {
+                                    snap.screen_audio_device =
+                                        cs.loopback_device().map(ToOwned::to_owned);
                                     content_share = Some(cs);
                                     snap.sharing = true;
                                     snap.share_source_id = Some(src_id.clone());
@@ -906,6 +942,31 @@ async fn run_connected_loop(
                     }
                     Some(HuddleControl::SetCaptionsEnabled(enabled)) => {
                         snap.captions_enabled = enabled;
+                        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                    }
+                    Some(HuddleControl::SetAudioOnly(audio_only)) => {
+                        snap.audio_only = audio_only;
+                        if audio_only {
+                            if let Some(mut cap) = camera_capture.take() {
+                                cap.stop();
+                                snap.video = false;
+                                let _ = updates.send(HuddleUpdate::VideoTileClosed(
+                                    VideoTileKey::LocalCamera,
+                                ));
+                            }
+                            let removed_mids: Vec<String> =
+                                remote_sources.iter().map(|(m, _)| m.clone()).collect();
+                            if !removed_mids.is_empty() {
+                                let upd =
+                                    build_remote_video_update_frame(Vec::new(), removed_mids);
+                                let _ = signal.send_frame(&upd).await;
+                            }
+                            remote_sources.clear();
+                            remote_decoders.clear();
+                            for tile in active_remote_tiles.drain() {
+                                let _ = updates.send(HuddleUpdate::VideoTileClosed(tile));
+                            }
+                        }
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
                     Some(HuddleControl::Leave) | None => {

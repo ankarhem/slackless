@@ -34,6 +34,7 @@ pub use audio::{
 pub use clips::{
     AudioClipRecorder, ClipVideoSource, RecordedClip, VideoClipRecorder, finish_audio_clip,
 };
+pub use content_share::detect_system_audio_loopback;
 pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};
@@ -127,8 +128,10 @@ pub struct HuddleSessionSnapshot {
     pub muted: bool,
     pub video: bool,
     pub blur_background: bool,
+    pub audio_only: bool,
     pub sharing: bool,
     pub share_source_id: Option<String>,
+    pub screen_audio_device: Option<String>,
     pub hand_raised: bool,
     pub sticky_emoji: Option<String>,
     pub captions_enabled: bool,
@@ -141,10 +144,16 @@ pub struct HuddleSessionSnapshot {
     pub huddle_link: Option<String>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    pub aec: bool,
+    pub ns: bool,
+    pub agc: bool,
+    pub active_video_codec: Option<String>,
     pub error: Option<String>,
     pub udp_blocked: bool,
     pub packets_sent: u64,
     pub packets_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
     pub pongs_sent: u32,
 }
 
@@ -294,6 +303,8 @@ pub enum HuddleControl {
     SetTopic(String),
     SetBackground(Option<String>),
     SetCaptionsEnabled(bool),
+    /// Pause all remote video subscriptions & local camera for low-bandwidth audio-only mode (`F-COLLAB-075`).
+    SetAudioOnly(bool),
     Leave,
 }
 

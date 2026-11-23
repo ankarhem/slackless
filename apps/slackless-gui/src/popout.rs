@@ -167,6 +167,14 @@ enum PopoutPickerTarget {
     Message { channel: ChannelId, ts: Ts },
 }
 
+/// Side-by-side right-hand drawer inside the Pop-out Huddle Window (`PopoutKind::Huddle`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HuddleDrawer {
+    Thread,
+    Notes,
+    Diagnostics,
+}
+
 pub struct PopoutWindow {
     kind: PopoutKind,
     title: String,
@@ -194,6 +202,9 @@ pub struct PopoutWindow {
     huddle_stage_bounds: Arc<Mutex<Bounds<Pixels>>>,
     huddle_focused_screen: Option<usize>,
     huddle_topic_editing: Option<Entity<TextareaState>>,
+    huddle_drawer: Option<HuddleDrawer>,
+    huddle_thread_input: Entity<TextareaState>,
+    huddle_thread_local: Vec<Message>,
     huddle_devices: slackless_core::huddle::AudioDevices,
     huddle_screens: Vec<slackless_core::huddle::ScreenSource>,
     composer: Entity<Composer>,
@@ -375,6 +386,11 @@ impl PopoutWindow {
             })
             .detach();
         }
+        let huddle_thread_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Reply in huddle thread…")
+                .auto_grow(1, 4)
+        });
         let scroll = ScrollHandle::new();
         if !initial.is_empty() {
             scroll.scroll_to_bottom();
@@ -406,6 +422,9 @@ impl PopoutWindow {
             huddle_stage_bounds: Arc::new(Mutex::new(Bounds::default())),
             huddle_focused_screen: None,
             huddle_topic_editing: None,
+            huddle_drawer: None,
+            huddle_thread_input,
+            huddle_thread_local: Vec::new(),
             huddle_devices: slackless_core::huddle::AudioDevices::default(),
             huddle_screens: Vec::new(),
             composer,
@@ -1003,15 +1022,7 @@ impl PopoutWindow {
             HuddlePhase::Idle => (muted, "Ended".to_owned()),
         };
 
-        let header = self.render_huddle_titlebar(
-            &snap,
-            status_color,
-            status_text,
-            stage_bg,
-            on_jump,
-            on_open_canvas,
-            cx,
-        );
+        let header = self.render_huddle_titlebar(&snap, status_color, status_text, stage_bg, cx);
 
         let has_screen_share = state
             .video_frames
@@ -1022,11 +1033,60 @@ impl PopoutWindow {
             .id("popout-huddle-stage-container")
             .relative()
             .flex_1()
+            .min_w_0()
             .min_h_0()
-            .w_full()
             .px_4()
             .py_3()
             .gap_3();
+
+        if snap.audio_only {
+            let send_resume = self.send.clone();
+            stage = stage.child(
+                h_flex()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded_xl()
+                    .bg(amber.opacity(0.16))
+                    .border_1()
+                    .border_color(amber.opacity(0.45))
+                    .text_xs()
+                    .text_color(white)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::Headphones)
+                                    .size(px(13.))
+                                    .text_color(amber),
+                            )
+                            .child("Audio-only mode — video paused to save bandwidth"),
+                    )
+                    .child(
+                        div()
+                            .id("popout-huddle-resume-video")
+                            .cursor_pointer()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(rgba(0xFFFFFF18))
+                            .hover(|el| el.bg(rgba(0xFFFFFF2A)))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Resume video")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                (send_resume)(Command::SetHuddleAudioOnly(false));
+                                if this.fixtures.sample {
+                                    if let Some(dock) = this.huddle_dock_entity() {
+                                        dock.update(cx, |d, cx| d.set_audio_only_local(false, cx));
+                                    }
+                                }
+                            })),
+                    ),
+            );
+        }
 
         if let Some(err) = snap.error.clone() {
             stage = stage.child(
@@ -1127,6 +1187,19 @@ impl PopoutWindow {
             );
         }
 
+        let body = h_flex().flex_1().min_h_0().w_full().child(stage).when_some(
+            self.huddle_drawer,
+            |row, drawer| {
+                row.child(self.render_huddle_drawer(
+                    drawer,
+                    &state,
+                    on_jump.clone(),
+                    on_open_canvas.clone(),
+                    cx,
+                ))
+            },
+        );
+
         v_flex()
             .id("popout-huddle-root")
             .relative()
@@ -1141,7 +1214,8 @@ impl PopoutWindow {
                             || this.huddle_reactions_open
                             || this.huddle_theme_open
                             || this.huddle_invite_open
-                            || this.huddle_devices_open)
+                            || this.huddle_devices_open
+                            || this.huddle_drawer.take().is_some())
                     {
                         this.close_huddle_popovers();
                         cx.notify();
@@ -1149,8 +1223,754 @@ impl PopoutWindow {
                 }),
             )
             .child(header)
-            .child(stage)
+            .child(body)
             .child(self.render_huddle_controls(&snap, stage_bg, cx))
+    }
+
+    fn render_huddle_drawer(
+        &self,
+        drawer: HuddleDrawer,
+        state: &crate::huddle_dock::HuddleViewState,
+        on_jump: JumpHandler,
+        on_open_canvas: CanvasOpenHandler,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let content: gpui_kit::gpui::AnyElement = match drawer {
+            HuddleDrawer::Thread => self
+                .render_huddle_thread_drawer(&state.session, on_jump, cx)
+                .into_any_element(),
+            HuddleDrawer::Notes => self
+                .render_huddle_notes_drawer(&state.session, on_open_canvas, cx)
+                .into_any_element(),
+            HuddleDrawer::Diagnostics => self
+                .render_huddle_diagnostics_drawer(state, cx)
+                .into_any_element(),
+        };
+        v_flex()
+            .flex_none()
+            .w(px(340.))
+            .h_full()
+            .bg(rgb(0x1B1D21))
+            .border_l_1()
+            .border_color(rgba(0xFFFFFF16))
+            .text_color(rgb(0xFFFFFF))
+            .child(content)
+    }
+
+    fn huddle_thread_messages(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+    ) -> Vec<Message> {
+        let mut out = if let (Some(store), Some(team)) = (&self.store, &self.team) {
+            store
+                .lock()
+                .ok()
+                .and_then(|guard| {
+                    let rows = if let Some(root_ts) = &snap.thread_root_ts {
+                        guard.thread_replies(team, &snap.channel, root_ts)
+                    } else {
+                        guard.channel_history(team, &snap.channel, None, 20)
+                    };
+                    rows.ok().map(|list| {
+                        list.into_iter()
+                            .filter(|r| !r.deleted)
+                            .map(|r| r.message)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default()
+        } else if let Some(root_ts) = &snap.thread_root_ts {
+            self.fixtures
+                .threads
+                .get(&(snap.channel.clone(), root_ts.clone()))
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            self.fixtures
+                .messages
+                .get(&snap.channel)
+                .map(|list| list.iter().rev().take(12).rev().cloned().collect())
+                .unwrap_or_default()
+        };
+        for local in &self.huddle_thread_local {
+            if !out.iter().any(|m| m.ts == local.ts) {
+                out.push(local.clone());
+            }
+        }
+        out
+    }
+
+    fn render_huddle_thread_drawer(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        on_jump: JumpHandler,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use gpui_kit::component::Icon;
+
+        let (white, muted, border, emerald) = (
+            rgb(0xFFFFFF),
+            rgb(0xABABAD),
+            rgba(0xFFFFFF16),
+            rgb(0x007A5A),
+        );
+        let channel = snap.channel.clone();
+        let thread_ts = snap.thread_root_ts.clone();
+        let jump_ch = channel.clone();
+        let jump_ts = thread_ts.clone();
+        let messages = self.huddle_thread_messages(snap);
+        let send = self.send.clone();
+        let reply_ch = channel.clone();
+        let reply_ts = thread_ts.clone();
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
+                h_flex()
+                    .px_3p5()
+                    .py_2p5()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::MessageSquare)
+                                    .size(px(14.))
+                                    .text_color(muted),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(white)
+                                    .child("Huddle thread"),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("huddle-drawer-thread-pop")
+                                    .size(px(24.))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|el| el.bg(rgba(0xFFFFFF1A)))
+                                    .child(
+                                        Icon::new(IconName::ExternalLink)
+                                            .size(px(13.))
+                                            .text_color(muted),
+                                    )
+                                    .on_click(move |_, _, cx| {
+                                        on_jump(
+                                            jump_ch.clone(),
+                                            jump_ts.clone(),
+                                            jump_ts.is_some(),
+                                            cx,
+                                        );
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("huddle-drawer-close")
+                                    .size(px(24.))
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .hover(|el| el.bg(rgba(0xFFFFFF1A)))
+                                    .child(Icon::new(IconName::X).size(px(13.)).text_color(muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.huddle_drawer = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("huddle-drawer-thread-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_3()
+                    .py_2p5()
+                    .gap_2p5()
+                    .when(messages.is_empty(), |col| {
+                        col.child(div().py_6().text_xs().text_color(muted).child(
+                            "No messages in this huddle thread yet. Drop a link or note below.",
+                        ))
+                    })
+                    .children(messages.into_iter().map(|msg| {
+                        let author = msg
+                            .user
+                            .as_ref()
+                            .map(|u| self.fixtures.user_name(u).to_owned())
+                            .or_else(|| msg.username.clone())
+                            .unwrap_or_else(|| "Slack".to_owned());
+                        v_flex()
+                            .p_2()
+                            .gap_1()
+                            .rounded_lg()
+                            .bg(rgba(0xFFFFFF0A))
+                            .border_1()
+                            .border_color(rgba(0xFFFFFF0F))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(white)
+                                    .child(author),
+                            )
+                            .child(div().text_xs().text_color(rgb(0xD1D2D3)).child(msg.text))
+                    })),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgba(0xFFFFFF22))
+                            .bg(rgb(0x222529))
+                            .px_2()
+                            .py_1()
+                            .child(Textarea::new(&self.huddle_thread_input).appearance(false)),
+                    )
+                    .child(
+                        h_flex().justify_end().child(
+                            div()
+                                .id("huddle-drawer-thread-send")
+                                .cursor_pointer()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(emerald)
+                                .hover(|el| el.bg(rgb(0x008E69)))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(white)
+                                .child("Send")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let raw = this.huddle_thread_input.read(cx).value().to_string();
+                                    let trimmed = raw.trim();
+                                    if trimmed.is_empty() {
+                                        return;
+                                    }
+                                    let content =
+                                        crate::composer::content_of(trimmed, &this.fixtures);
+                                    (send)(Command::SendMessage {
+                                        channel: reply_ch.clone(),
+                                        content,
+                                        thread_ts: reply_ts.clone(),
+                                        broadcast: false,
+                                    });
+                                    this.huddle_thread_local.push(Message {
+                                        ts: Ts::from(format!(
+                                            "{}.000001",
+                                            crate::drafts::now_secs()
+                                        )),
+                                        user: Some(this.fixtures.self_user.clone()),
+                                        text: trimmed.to_owned(),
+                                        ..Default::default()
+                                    });
+                                    this.huddle_thread_input.update(cx, |s, cx| {
+                                        s.set_value("", window, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+    }
+
+    fn render_huddle_notes_drawer(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        on_open_canvas: CanvasOpenHandler,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use gpui_kit::component::Icon;
+
+        let (white, muted, border, emerald) = (
+            rgb(0xFFFFFF),
+            rgb(0xABABAD),
+            rgba(0xFFFFFF16),
+            rgb(0x007A5A),
+        );
+        let send_notes = self.send.clone();
+        let notes_ch = snap.channel.clone();
+        let canvas_id = snap.canvas_file_id.clone();
+        let topic_title = snap
+            .topic
+            .clone()
+            .map(|t| format!("Huddle notes: {t}"))
+            .unwrap_or_else(|| "Huddle notes".to_owned());
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(
+                h_flex()
+                    .px_3p5()
+                    .py_2p5()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Icon::new(IconName::FileText).size(px(14.)).text_color(muted))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(white)
+                                    .child("Huddle notes"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("huddle-drawer-notes-close")
+                            .size(px(24.))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|el| el.bg(rgba(0xFFFFFF1A)))
+                            .child(Icon::new(IconName::X).size(px(13.)).text_color(muted))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.huddle_drawer = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(white)
+                            .child(topic_title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(if canvas_id.is_some() {
+                                "A collaborative Slack canvas is attached to this huddle. Open it in the main window to edit sections and action items live."
+                            } else {
+                                "Start a shared Slack canvas for this huddle to capture notes, links, and follow-up tasks."
+                            }),
+                    )
+                    .child(if let Some(fid) = canvas_id {
+                        h_flex()
+                            .id("huddle-drawer-open-canvas")
+                            .cursor_pointer()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(emerald)
+                            .hover(|el| el.bg(rgb(0x008E69)))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(white)
+                            .child(Icon::new(IconName::FileText).size(px(14.)).text_color(white))
+                            .child("Open huddle canvas")
+                            .on_click(move |_, _, cx| on_open_canvas(fid.clone(), cx))
+                    } else {
+                        h_flex()
+                            .id("huddle-drawer-create-canvas")
+                            .cursor_pointer()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(emerald)
+                            .hover(|el| el.bg(rgb(0x008E69)))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(white)
+                            .child(Icon::new(IconName::Plus).size(px(14.)).text_color(white))
+                            .child("Create huddle notes canvas")
+                            .on_click(move |_, window, cx| {
+                                (send_notes)(Command::CreateCanvas {
+                                    title: topic_title.clone(),
+                                    markdown: "# Huddle notes\n\n- ".to_owned(),
+                                    channel: Some(notes_ch.clone()),
+                                });
+                                actions::notify(
+                                    "Creating huddle notes",
+                                    "Opening a shared canvas for this huddle.",
+                                    window,
+                                    cx,
+                                );
+                            })
+                    }),
+            )
+    }
+
+    /// Troubleshooting, Network Stats HUD & Self-Test drawer (`F-COLLAB-074`, `075`, `076`).
+    fn render_huddle_diagnostics_drawer(
+        &self,
+        state: &crate::huddle_dock::HuddleViewState,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        use gpui_kit::component::Icon;
+        use slackless_core::huddle::{
+            HuddleChime, HuddlePhase, play_huddle_chime, play_speaker_test_tone,
+        };
+
+        let (white, muted, border, emerald, amber, crimson) = (
+            rgb(0xFFFFFF),
+            rgb(0xABABAD),
+            rgba(0xFFFFFF16),
+            rgb(0x2BAC76),
+            rgb(0xECB22E),
+            rgb(0xE01E5A),
+        );
+        let snap = &state.session;
+        let (phase_color, phase_label) = match snap.phase {
+            HuddlePhase::Connected => (emerald, "Connected (UDP TURN Relay)"),
+            HuddlePhase::Joining | HuddlePhase::Connecting => (amber, "Connecting…"),
+            HuddlePhase::Reconnecting => (amber, "Reconnecting…"),
+            HuddlePhase::Failed if snap.udp_blocked => (crimson, "UDP Blocked — Check Firewall"),
+            HuddlePhase::Failed => (crimson, "Connection Failed"),
+            HuddlePhase::Leaving => (muted, "Leaving…"),
+            HuddlePhase::Idle => (muted, "Idle"),
+        };
+        let video_codec = snap
+            .active_video_codec
+            .as_deref()
+            .unwrap_or(if snap.video || snap.sharing {
+                "video/H264 (OpenH264)"
+            } else {
+                "Idle (AV1 / H.264 ready)"
+            })
+            .to_owned();
+        let tx_kb = snap.bytes_sent as f64 / 1024.0;
+        let rx_kb = snap.bytes_received as f64 / 1024.0;
+        let rms_pct = (state.levels.local_rms.clamp(0.0, 1.0) * 100.0) as u32;
+        let audio_only = snap.audio_only;
+        let send_ao = self.send.clone();
+        let test_out = snap.output_device.clone();
+        let chime_out = snap.output_device.clone();
+
+        let stat_row = |label: &'static str, value: String| {
+            h_flex()
+                .justify_between()
+                .items_center()
+                .text_xs()
+                .child(div().text_color(muted).child(label))
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(white)
+                        .child(value),
+                )
+        };
+        let dsp_pill = |label: &'static str, on: bool| {
+            div()
+                .px_2()
+                .py_0p5()
+                .rounded_full()
+                .bg(if on {
+                    emerald.opacity(0.2)
+                } else {
+                    rgba(0xFFFFFF12)
+                })
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(if on { emerald } else { muted })
+                .child(label)
+        };
+
+        v_flex()
+            .id("huddle-drawer-diag-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .px_3p5()
+                    .py_2p5()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::Activity)
+                                    .size(px(14.))
+                                    .text_color(phase_color),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(white)
+                                    .child("Connection & diagnostics"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("huddle-drawer-diag-close")
+                            .size(px(24.))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|el| el.bg(rgba(0xFFFFFF1A)))
+                            .child(Icon::new(IconName::X).size(px(13.)).text_color(muted))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.huddle_drawer = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .p_3p5()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_1p5()
+                            .rounded_xl()
+                            .bg(rgba(0xFFFFFF0A))
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .pb_1()
+                                    .child(div().size(px(8.)).rounded_full().bg(phase_color))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(white)
+                                            .child(phase_label),
+                                    ),
+                            )
+                            .child(stat_row("Audio codec", "Opus 48 kHz Stereo".to_owned()))
+                            .child(stat_row("Video codec", video_codec))
+                            .child(stat_row(
+                                "Outbound (TX)",
+                                format!("{} pkts ({tx_kb:.1} KB)", snap.packets_sent),
+                            ))
+                            .child(stat_row(
+                                "Inbound (RX)",
+                                format!("{} pkts ({rx_kb:.1} KB)", snap.packets_received),
+                            ))
+                            .child(stat_row(
+                                "Signaling keepalive",
+                                format!("{} pongs", snap.pongs_sent),
+                            ))
+                            .child(stat_row(
+                                "Screen audio",
+                                snap.screen_audio_device
+                                    .clone()
+                                    .unwrap_or_else(|| "None (install BlackHole 2ch)".to_owned()),
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_2()
+                            .rounded_xl()
+                            .bg(rgba(0xFFFFFF0A))
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(white)
+                                    .child("Sonora Audio Processing"),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(dsp_pill("AEC3", snap.aec))
+                                    .child(dsp_pill("Noise Supp", snap.ns))
+                                    .child(dsp_pill("Auto Gain", snap.agc)),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_2()
+                            .rounded_xl()
+                            .bg(rgba(0xFFFFFF0A))
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(white)
+                                                    .child("Audio-only mode"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child("Pause video to save bandwidth"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("huddle-diag-audio-only")
+                                            .cursor_pointer()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded_full()
+                                            .bg(if audio_only { amber } else { rgba(0xFFFFFF18) })
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(if audio_only {
+                                                rgb(0x14171C)
+                                            } else {
+                                                white
+                                            })
+                                            .child(if audio_only { "On" } else { "Off" })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let next = !audio_only;
+                                                (send_ao)(Command::SetHuddleAudioOnly(next));
+                                                if this.fixtures.sample {
+                                                    if let Some(dock) = this.huddle_dock_entity() {
+                                                        dock.update(cx, |d, cx| {
+                                                            d.set_audio_only_local(next, cx)
+                                                        });
+                                                    }
+                                                }
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_2()
+                            .rounded_xl()
+                            .bg(rgba(0xFFFFFF0A))
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(white)
+                                    .child("Audio self-test"),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(stat_row("Microphone level", format!("{rms_pct}%")))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .h(px(6.))
+                                            .rounded_full()
+                                            .bg(rgba(0xFFFFFF18))
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .w(px((2.8 * rms_pct as f32).clamp(4., 280.)))
+                                                    .rounded_full()
+                                                    .bg(emerald),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .pt_1()
+                                    .child(
+                                        div()
+                                            .id("huddle-diag-test-tone")
+                                            .flex_1()
+                                            .cursor_pointer()
+                                            .py_1p5()
+                                            .rounded_lg()
+                                            .bg(rgba(0xFFFFFF14))
+                                            .hover(|el| el.bg(rgba(0xFFFFFF24)))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(white)
+                                            .child("Test speaker")
+                                            .on_click(move |_, _, _| {
+                                                let _ = play_speaker_test_tone(test_out.as_deref());
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("huddle-diag-test-chime")
+                                            .flex_1()
+                                            .cursor_pointer()
+                                            .py_1p5()
+                                            .rounded_lg()
+                                            .bg(rgba(0xFFFFFF14))
+                                            .hover(|el| el.bg(rgba(0xFFFFFF24)))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(white)
+                                            .child("Test chime")
+                                            .on_click(move |_, _, _| {
+                                                let _ = play_huddle_chime(
+                                                    HuddleChime::Join,
+                                                    chime_out.as_deref(),
+                                                );
+                                            }),
+                                    ),
+                            ),
+                    ),
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1160,8 +1980,6 @@ impl PopoutWindow {
         status_color: Rgba,
         status_text: String,
         bar_bg: Rgba,
-        on_jump: JumpHandler,
-        on_open_canvas: CanvasOpenHandler,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         use gpui_kit::component::Icon;
@@ -1179,73 +1997,42 @@ impl PopoutWindow {
             format!("https://app.slack.com/huddle/{team}/{channel}")
         });
         let send_copy = self.send.clone();
-        let send_notes = self.send.clone();
         let copy_ch = channel.clone();
-        let notes_ch = channel.clone();
-        let thread_ch = channel.clone();
-        let thread_ts = snap.thread_root_ts.clone();
-        let canvas_id = snap.canvas_file_id.clone();
+        let notes_open = self.huddle_drawer == Some(HuddleDrawer::Notes);
+        let thread_open = self.huddle_drawer == Some(HuddleDrawer::Thread);
+        let diag_open = self.huddle_drawer == Some(HuddleDrawer::Diagnostics);
 
-        let notes_pill = if let Some(fid) = canvas_id {
-            h_flex()
-                .id("popout-huddle-canvas")
-                .h(px(28.))
-                .px_2p5()
-                .gap_1p5()
-                .items_center()
-                .rounded_lg()
-                .bg(rgba(0xFFFFFF12))
-                .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                .cursor_pointer()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(white)
-                .child(
-                    Icon::new(IconName::FileText)
-                        .size(px(13.))
-                        .text_color(white),
-                )
-                .child("Notes")
-                .on_click(move |_, _, cx| on_open_canvas(fid.clone(), cx))
-        } else {
-            let topic_title = snap
-                .topic
-                .clone()
-                .map(|t| format!("Huddle notes: {t}"))
-                .unwrap_or_else(|| "Huddle notes".to_owned());
-            h_flex()
-                .id("popout-huddle-canvas-new")
-                .h(px(28.))
-                .px_2p5()
-                .gap_1p5()
-                .items_center()
-                .rounded_lg()
-                .bg(rgba(0xFFFFFF12))
-                .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                .cursor_pointer()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(white)
-                .child(
-                    Icon::new(IconName::FileText)
-                        .size(px(13.))
-                        .text_color(white),
-                )
-                .child("Notes")
-                .on_click(move |_, window, cx| {
-                    (send_notes)(Command::CreateCanvas {
-                        title: topic_title.clone(),
-                        markdown: "# Huddle notes\n\n- ".to_owned(),
-                        channel: Some(notes_ch.clone()),
-                    });
-                    actions::notify(
-                        "Creating huddle notes",
-                        "Opening a shared canvas for this huddle.",
-                        window,
-                        cx,
-                    );
-                })
-        };
+        let notes_pill = h_flex()
+            .id("popout-huddle-canvas")
+            .h(px(28.))
+            .px_2p5()
+            .gap_1p5()
+            .items_center()
+            .rounded_lg()
+            .bg(if notes_open {
+                rgba(0xFFFFFF2A)
+            } else {
+                rgba(0xFFFFFF12)
+            })
+            .hover(|el| el.bg(rgba(0xFFFFFF22)))
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(white)
+            .child(
+                Icon::new(IconName::FileText)
+                    .size(px(13.))
+                    .text_color(white),
+            )
+            .child("Notes")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.huddle_drawer = if this.huddle_drawer == Some(HuddleDrawer::Notes) {
+                    None
+                } else {
+                    Some(HuddleDrawer::Notes)
+                };
+                cx.notify();
+            }));
 
         TitleBar::new()
             .h(px(44.))
@@ -1339,7 +2126,11 @@ impl PopoutWindow {
                                     .gap_1p5()
                                     .items_center()
                                     .rounded_lg()
-                                    .bg(rgba(0xFFFFFF12))
+                                    .bg(if thread_open {
+                                        rgba(0xFFFFFF2A)
+                                    } else {
+                                        rgba(0xFFFFFF12)
+                                    })
                                     .hover(|el| el.bg(rgba(0xFFFFFF22)))
                                     .cursor_pointer()
                                     .text_xs()
@@ -1351,14 +2142,46 @@ impl PopoutWindow {
                                             .text_color(white),
                                     )
                                     .child("Thread")
-                                    .on_click(move |_, _, cx| {
-                                        on_jump(
-                                            thread_ch.clone(),
-                                            thread_ts.clone(),
-                                            thread_ts.is_some(),
-                                            cx,
-                                        );
-                                    }),
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.huddle_drawer =
+                                            if this.huddle_drawer == Some(HuddleDrawer::Thread) {
+                                                None
+                                            } else {
+                                                Some(HuddleDrawer::Thread)
+                                            };
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("popout-huddle-diag")
+                                    .size(px(28.))
+                                    .rounded_lg()
+                                    .bg(if diag_open {
+                                        rgba(0xFFFFFF2A)
+                                    } else {
+                                        rgba(0xFFFFFF12)
+                                    })
+                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(IconName::Activity)
+                                            .size(px(13.))
+                                            .text_color(status_color),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.huddle_drawer = if this.huddle_drawer
+                                            == Some(HuddleDrawer::Diagnostics)
+                                        {
+                                            None
+                                        } else {
+                                            Some(HuddleDrawer::Diagnostics)
+                                        };
+                                        cx.notify();
+                                    })),
                             )
                             .child(
                                 div()
@@ -2336,6 +3159,7 @@ impl PopoutWindow {
             rgb(0xE01E5A),
         );
         let send = self.send.clone();
+        let loopback = slackless_core::huddle::detect_system_audio_loopback();
         v_flex()
             .max_w(px(560.))
             .p_3()
@@ -2346,6 +3170,23 @@ impl PopoutWindow {
             .bg(card_bg)
             .shadow_2xl()
             .text_color(white)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgba(0xFFFFFF0A))
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(if loopback.is_some() { emerald } else { muted })
+                    .child(if let Some(dev) = loopback {
+                        format!("System audio capture ready via {dev}")
+                    } else {
+                        "System audio: install BlackHole 2ch (or virtual loopback) to share app audio"
+                            .to_owned()
+                    }),
+            )
             .child(
                 h_flex()
                     .items_center()

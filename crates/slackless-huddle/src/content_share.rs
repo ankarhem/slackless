@@ -7,10 +7,13 @@
 //! `receive_stream_ids = [0]`), so webcam video and screen sharing run simultaneously and appear
 //! as a native screen share on official Slack desktop/web clients.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use cpal::SampleFormat;
+use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
@@ -25,12 +28,39 @@ use crate::signaling::{
 use crate::video::VideoFrame;
 use crate::{HuddleCredentials, HuddleError, Result};
 
+/// Detect an installed virtual system-audio loopback input device (`BlackHole`, `Loopback`,
+/// `Soundflower`, `VB-Cable`, PulseAudio/PipeWire `Monitor of ...`) for screen-share audio
+/// capture (`F-COLLAB-022`).
+pub fn detect_system_audio_loopback() -> Option<String> {
+    let host = cpal::default_host();
+    let inputs = host.input_devices().ok()?;
+    for dev in inputs {
+        let Ok(name) = dev.name() else { continue };
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("blackhole")
+            || lower.contains("loopback")
+            || lower.contains("soundflower")
+            || lower.contains("vb-cable")
+            || lower.contains("cable output")
+            || lower.contains("monitor of")
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Running `#content` screen-share session handle.
 pub struct ContentShareSession {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    loopback_device: Option<String>,
 }
 
 impl ContentShareSession {
+    /// Name of the system audio loopback device feeding `#content` audio, if detected.
+    pub fn loopback_device(&self) -> Option<&str> {
+        self.loopback_device.as_deref()
+    }
     /// Start a native `#content` attendee sharing `source_id`, forwarding local preview frames
     /// onto `preview_tx`.
     pub async fn start(
@@ -101,20 +131,110 @@ impl ContentShareSession {
         let running = Arc::new(AtomicBool::new(true));
         let running_audio = Arc::clone(&running);
         let rtc_audio = Arc::clone(&rtc);
-        // Keep the audio m-line alive with 20ms stereo Opus silence (matching official Chime SDK).
+        let loopback_device = detect_system_audio_loopback();
+        let loopback_pcm: Arc<Mutex<VecDeque<i16>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(48_000 * 2)));
+        let loopback_capture_running = Arc::clone(&running);
+        let loopback_pcm_tx = Arc::clone(&loopback_pcm);
+        if let Some(dev_name) = loopback_device.clone() {
+            let _ = std::thread::Builder::new()
+                .name("slackless-screen-audio".to_owned())
+                .spawn(move || {
+                    let host = cpal::default_host();
+                    let Some(dev) = host.input_devices().ok().and_then(|mut it| {
+                        it.find(|d| d.name().ok().as_deref() == Some(dev_name.as_str()))
+                    }) else {
+                        return;
+                    };
+                    let Ok(supported) = dev.default_input_config() else {
+                        return;
+                    };
+                    let fmt = supported.sample_format();
+                    let ch = supported.channels() as usize;
+                    let cfg: cpal::StreamConfig = supported.into();
+                    let push = move |stereo: Vec<i16>| {
+                        if let Ok(mut q) = loopback_pcm_tx.lock() {
+                            if q.len() > 48_000 * 4 {
+                                q.drain(..48_000);
+                            }
+                            q.extend(stereo);
+                        }
+                    };
+                    let stream = match fmt {
+                        SampleFormat::F32 => dev
+                            .build_input_stream(
+                                &cfg,
+                                move |data: &[f32], _| {
+                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
+                                    for frame in data.chunks(ch.max(1)) {
+                                        let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
+                                        let r = (frame
+                                            .get(1)
+                                            .copied()
+                                            .unwrap_or(frame[0])
+                                            .clamp(-1.0, 1.0)
+                                            * 32767.0)
+                                            as i16;
+                                        out.push(l);
+                                        out.push(r);
+                                    }
+                                    push(out);
+                                },
+                                |_| {},
+                                None,
+                            )
+                            .ok(),
+                        SampleFormat::I16 => dev
+                            .build_input_stream(
+                                &cfg,
+                                move |data: &[i16], _| {
+                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
+                                    for frame in data.chunks(ch.max(1)) {
+                                        out.push(frame[0]);
+                                        out.push(*frame.get(1).unwrap_or(&frame[0]));
+                                    }
+                                    push(out);
+                                },
+                                |_| {},
+                                None,
+                            )
+                            .ok(),
+                        _ => None,
+                    };
+                    let Some(stream) = stream else { return };
+                    let _ = stream.play();
+                    while loopback_capture_running.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+        }
+        // Feed live system loopback audio (when available, `F-COLLAB-022`) or 20ms stereo Opus
+        // silence (matching official Chime SDK) on the `#content` audio m-line.
         tokio::spawn(async move {
             let Ok(mut enc) =
-                opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+                opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
             else {
                 return;
             };
-            let pcm = vec![0i16; 960 * 2];
+            let silence = vec![0i16; 960 * 2];
+            let mut pcm = vec![0i16; 960 * 2];
             let mut out = vec![0u8; 4000];
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             while running_audio.load(Ordering::Relaxed) {
                 tick.tick().await;
-                if let Ok(n) = enc.encode(&pcm, &mut out) {
+                let has_audio = loopback_pcm.lock().ok().is_some_and(|mut q| {
+                    if q.len() >= 960 * 2 {
+                        for dst in &mut pcm {
+                            *dst = q.pop_front().unwrap_or(0);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let frame = if has_audio { &pcm } else { &silence };
+                if let Ok(n) = enc.encode(frame, &mut out) {
                     let _ = rtc_audio.write_opus_frame(out[..n].to_vec()).await;
                 }
             }
@@ -175,6 +295,7 @@ impl ContentShareSession {
 
         Ok(Self {
             stop_tx: Some(stop_tx),
+            loopback_device,
         })
     }
 

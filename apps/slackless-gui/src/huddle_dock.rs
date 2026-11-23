@@ -515,6 +515,17 @@ impl HuddleDock {
         }
     }
 
+    pub fn set_audio_only_local(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.session.audio_only != enabled {
+            self.session.audio_only = enabled;
+            if enabled {
+                self.session.video = false;
+                self.video_frames.clear();
+            }
+            cx.notify();
+        }
+    }
+
     pub fn session(&self) -> &HuddleSessionSnapshot {
         &self.session
     }

@@ -615,6 +615,8 @@ pub enum Command {
     SetHuddleBackground(String),
     /// Enable or disable live AWS Transcribe captions (`rooms.startTranscription` / `rooms.stopTranscription`).
     SetHuddleCaptions(bool),
+    /// Toggle low-bandwidth audio-only huddle mode (`F-COLLAB-075`).
+    SetHuddleAudioOnly(bool),
     /// Decline an incoming direct-message huddle invite (`rooms.inviteResponse`).
     DeclineHuddleInvite {
         channel: ChannelId,
