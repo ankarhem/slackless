@@ -556,6 +556,20 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `conversations.convertToPrivate`: convert a public channel or group DM into a private
+    /// channel (`F-CORE-049`, `F-CORE-072`).
+    pub async fn conversations_convert_to_private(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Conversation> {
+        let params = vec![("channel", channel.to_string())];
+        Ok(self
+            .call::<ChannelWire>(method::CONVERSATIONS_CONVERT_TO_PRIVATE, params)
+            .await?
+            .data
+            .channel)
+    }
+
     /// `conversations.invite`: invite one or more users into `channel`.
     pub async fn conversations_invite(
         &self,
@@ -1066,6 +1080,60 @@ impl SlackApi {
             .await?
             .data
             .usergroups)
+    }
+
+    /// `usergroups.create`: create a workspace `@handle` user group (`F-COLLAB-1161`, `1162`).
+    pub async fn usergroups_create(
+        &self,
+        name: &str,
+        handle: &str,
+        description: &str,
+    ) -> Result<Usergroup> {
+        #[derive(Deserialize)]
+        struct Wire {
+            usergroup: Usergroup,
+        }
+        let mut params = vec![("name", name.to_owned())];
+        if !handle.trim().is_empty() {
+            params.push(("handle", handle.trim().trim_start_matches('@').to_owned()));
+        }
+        if !description.trim().is_empty() {
+            params.push(("description", description.trim().to_owned()));
+        }
+        Ok(self
+            .call::<Wire>(method::USERGROUPS_CREATE, params)
+            .await?
+            .data
+            .usergroup)
+    }
+
+    /// `usergroups.update`: update an existing `@handle` user group's name/handle/description.
+    pub async fn usergroups_update(
+        &self,
+        usergroup: &str,
+        name: &str,
+        handle: &str,
+        description: &str,
+    ) -> Result<Usergroup> {
+        #[derive(Deserialize)]
+        struct Wire {
+            usergroup: Usergroup,
+        }
+        let mut params = vec![
+            ("usergroup", usergroup.to_owned()),
+            ("name", name.to_owned()),
+        ];
+        if !handle.trim().is_empty() {
+            params.push(("handle", handle.trim().trim_start_matches('@').to_owned()));
+        }
+        if !description.trim().is_empty() {
+            params.push(("description", description.trim().to_owned()));
+        }
+        Ok(self
+            .call::<Wire>(method::USERGROUPS_UPDATE, params)
+            .await?
+            .data
+            .usergroup)
     }
 
     /// Every page of `users.channelSections.list`: the user's sidebar sections, in the order

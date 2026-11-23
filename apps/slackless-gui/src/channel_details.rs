@@ -50,6 +50,8 @@ pub enum ChannelDetailsEvent {
     Archive(ChannelId),
     /// Unarchive an archived channel (`conversations.unarchive`).
     Unarchive(ChannelId),
+    /// Convert a public channel or group DM into a private channel (`conversations.convertToPrivate`).
+    ConvertToPrivate(ChannelId),
     /// Open the "Add people" picker for this channel or DM.
     AddPeople(ChannelId),
     /// A topic save: the root posts it to the core (`conversations.setTopic`).
@@ -885,6 +887,38 @@ impl ChannelDetails {
                     cx.emit(ChannelDetailsEvent::Leave(channel.clone()))
                 })),
         );
+
+        // Convert public channel or group DM to private channel (`F-CORE-049`, `F-CORE-072`).
+        if (!conversation.is_private && !conversation.is_general && !conversation.is_im)
+            || conversation.is_mpim
+        {
+            let conv_channel = self.channel.clone();
+            let conv_label = if conversation.is_mpim {
+                "Convert group DM to a private channel"
+            } else {
+                "Change to a private channel"
+            };
+            cards = cards.child(
+                h_flex()
+                    .id("details-convert-private")
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(link_color)
+                    .hover(move |row| row.bg(accent_color))
+                    .child(Icon::new(IconName::Lock).size(px(16.)))
+                    .child(conv_label)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(ChannelDetailsEvent::ConvertToPrivate(conv_channel.clone()));
+                    })),
+            );
+        }
 
         // Archive / Unarchive channel (on non-general channels).
         if can_manage {

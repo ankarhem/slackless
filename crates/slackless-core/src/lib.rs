@@ -261,6 +261,22 @@ pub enum Command {
     /// Unarchive `channel` (`conversations.unarchive`), update the stored record and announce
     /// [`Event::Conversations`].
     UnarchiveChannel(ChannelId),
+    /// Convert a public channel or group DM to a private channel (`conversations.convertToPrivate`,
+    /// `F-CORE-049`, `F-CORE-072`).
+    ConvertChannelToPrivate(ChannelId),
+    /// Create a workspace `@handle` user group (`usergroups.create`, `F-COLLAB-1161`, `1162`).
+    CreateUsergroup {
+        name: String,
+        handle: String,
+        description: String,
+    },
+    /// Update an existing workspace `@handle` user group (`usergroups.update`).
+    UpdateUsergroup {
+        usergroup: String,
+        name: String,
+        handle: String,
+        description: String,
+    },
     /// Invite `users` into `channel` (`conversations.invite`), then refresh channel members.
     InviteToChannel {
         channel: ChannelId,

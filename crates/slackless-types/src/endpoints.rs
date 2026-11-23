@@ -279,7 +279,9 @@ pub mod method {
     pub const SUBSCRIPTIONS_THREAD_REMOVE: &str = "subscriptions.thread.remove";
     pub const TEAM_INFO: &str = "team.info";
     pub const TEAM_PROFILE_GET: &str = "team.profile.get";
+    pub const USERGROUPS_CREATE: &str = "usergroups.create";
     pub const USERGROUPS_LIST: &str = "usergroups.list";
+    pub const USERGROUPS_UPDATE: &str = "usergroups.update";
     pub const USERGROUPS_USERS_LIST: &str = "usergroups.users.list";
     pub const USERS_CHANNEL_SECTIONS_CHANNELS_BULK_UPDATE: &str =
         "users.channelSections.channels.bulkUpdate";

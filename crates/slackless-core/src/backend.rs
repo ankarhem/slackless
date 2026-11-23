@@ -316,6 +316,32 @@ pub trait Backend: Clone + Send + Sync + 'static {
         channel: ChannelId,
         scheduled_message_id: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
+    /// Convert a public channel or group DM into a private channel (`conversations.convertToPrivate`).
+    fn convert_channel_to_private(
+        &self,
+        _channel: ChannelId,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send {
+        async { Err(api::ApiError::Slack("unsupported".to_owned())) }
+    }
+    /// Create a `@handle` user group (`usergroups.create`).
+    fn create_usergroup(
+        &self,
+        _name: String,
+        _handle: String,
+        _description: String,
+    ) -> impl Future<Output = api::Result<Usergroup>> + Send {
+        async { Err(api::ApiError::Slack("unsupported".to_owned())) }
+    }
+    /// Update a `@handle` user group (`usergroups.update`).
+    fn update_usergroup(
+        &self,
+        _usergroup: String,
+        _name: String,
+        _handle: String,
+        _description: String,
+    ) -> impl Future<Output = api::Result<Usergroup>> + Send {
+        async { Err(api::ApiError::Slack("unsupported".to_owned())) }
+    }
     /// Active `@handle` user groups (`usergroups.list`).
     fn usergroups(&self) -> impl Future<Output = api::Result<Vec<Usergroup>>> + Send {
         async { Ok(Vec::new()) }
@@ -1246,6 +1272,30 @@ impl Backend for SlackApi {
         scheduled_message_id: String,
     ) -> api::Result<()> {
         self.chat_delete_scheduled_message(&channel, &scheduled_message_id)
+            .await
+    }
+
+    async fn convert_channel_to_private(&self, channel: ChannelId) -> api::Result<Conversation> {
+        self.conversations_convert_to_private(&channel).await
+    }
+
+    async fn create_usergroup(
+        &self,
+        name: String,
+        handle: String,
+        description: String,
+    ) -> api::Result<Usergroup> {
+        self.usergroups_create(&name, &handle, &description).await
+    }
+
+    async fn update_usergroup(
+        &self,
+        usergroup: String,
+        name: String,
+        handle: String,
+        description: String,
+    ) -> api::Result<Usergroup> {
+        self.usergroups_update(&usergroup, &name, &handle, &description)
             .await
     }
 

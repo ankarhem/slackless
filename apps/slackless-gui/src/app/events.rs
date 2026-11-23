@@ -628,6 +628,10 @@ impl App {
                 };
                 let tag = format!("bg:{ws_index}:{channel}:{}", message.ts);
                 self.system_notification_kind(&tag, &title, &body, dm || mentioned, cx);
+                if sender_is_vip {
+                    let vip_sound = self.preferences.read(cx).settings().vip_sound;
+                    self.play_sound(vip_sound, cx);
+                }
             }
             Event::HuddleUpdated {
                 channel,

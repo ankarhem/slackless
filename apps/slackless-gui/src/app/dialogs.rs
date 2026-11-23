@@ -111,9 +111,14 @@ impl App {
             compact: settings.sidebar_compact,
             show_muted: settings.show_muted_channels,
         };
+        let vip_users = settings.vip_users.clone();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.set_nav_prefs(nav_prefs, cx);
             sidebar.set_home_prefs(home_prefs, cx);
+            sidebar.set_vip_users(vip_users.clone(), cx);
+        });
+        self.activity.update(cx, |activity, cx| {
+            activity.set_vip_users(vip_users, cx);
         });
         if let Some(prev) = self.saved_settings.as_ref() {
             if *prev != settings {
@@ -1381,8 +1386,10 @@ impl App {
         let status = self.self_state.status.clone();
         let workspace = SharedString::from(self.fixtures.workspaces[self.workspace].name.clone());
         let presets = self.fixtures.status_presets.clone();
+        let scheduled = self.self_state.scheduled_statuses.clone();
         self.status_picker.update(cx, |picker, cx| {
             picker.set_presets(presets, cx);
+            picker.set_scheduled(scheduled, cx);
             picker.edit(status.as_ref(), workspace, window, cx)
         });
         let picker = self.status_picker.clone();
@@ -1882,6 +1889,63 @@ impl App {
                 window.close_dialog(cx);
                 self.bridge.send(Command::UnarchiveChannel(channel.clone()));
                 actions::notify("Channel unarchived", self.label(channel), window, cx);
+            }
+            ChannelDetailsEvent::ConvertToPrivate(channel) => {
+                window.close_dialog(cx);
+                let this = cx.weak_entity();
+                let ch = channel.clone();
+                let label = self.label(&ch);
+                window.open_dialog(cx, move |dialog, _, cx| {
+                    let muted = cx.theme().muted_foreground;
+                    let (this, ch) = (this.clone(), ch.clone());
+                    dialog
+                        .title(format!("Convert {label} to private?"))
+                        .w(px(420.))
+                        .child(
+                            v_flex()
+                                .gap_3()
+                                .p_4()
+                                .child(div().text_sm().text_color(muted).child(
+                                    "Members stay in the conversation, and only invited people will be able to find or view it going forward.",
+                                ))
+                                .child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("convert-priv-cancel")
+                                                .outline()
+                                                .with_size(Size::Small)
+                                                .label("Cancel")
+                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                                        )
+                                        .child(
+                                            Button::new("convert-priv-confirm")
+                                                .primary()
+                                                .with_size(Size::Small)
+                                                .label("Convert to private")
+                                                .on_click(move |_, window, cx| {
+                                                    window.close_dialog(cx);
+                                                    let _ = this.update(cx, |app, cx| {
+                                                        if !app.fixtures.sample {
+                                                            app.bridge.send(
+                                                                Command::ConvertChannelToPrivate(
+                                                                    ch.clone(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        actions::notify(
+                                                            "Converted to private",
+                                                            app.label(&ch),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    });
+                                                }),
+                                        ),
+                                ),
+                        )
+                });
             }
             ChannelDetailsEvent::AddPeople(channel) => {
                 window.close_dialog(cx);

@@ -1596,6 +1596,44 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::ConvertChannelToPrivate(channel) => {
+                self.spawn("conversations.convertToPrivate", async move {
+                    let updated = backend.convert_channel_to_private(channel.clone()).await?;
+                    with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
+                    events.emit(Event::Conversations(vec![channel]));
+                    events.emit(Event::SidebarChanged);
+                    Ok(())
+                });
+            }
+            Command::CreateUsergroup {
+                name,
+                handle,
+                description,
+            } => {
+                self.spawn("usergroups.create", async move {
+                    let _ = backend.create_usergroup(name, handle, description).await?;
+                    if let Ok(groups) = backend.usergroups().await {
+                        events.emit(Event::Usergroups(groups));
+                    }
+                    Ok(())
+                });
+            }
+            Command::UpdateUsergroup {
+                usergroup,
+                name,
+                handle,
+                description,
+            } => {
+                self.spawn("usergroups.update", async move {
+                    let _ = backend
+                        .update_usergroup(usergroup, name, handle, description)
+                        .await?;
+                    if let Ok(groups) = backend.usergroups().await {
+                        events.emit(Event::Usergroups(groups));
+                    }
+                    Ok(())
+                });
+            }
             Command::InviteToChannel { channel, users } => {
                 if !users.is_empty() {
                     self.spawn("conversations.invite", async move {

@@ -387,6 +387,47 @@ impl Sidebar {
             }
         };
         let mut list = Vec::new();
+        // Dedicated VIPs section at top of Home when VIP colleagues are configured (`F-SHELL-058`).
+        if !self.vip_users.trim().is_empty() {
+            let vip_settings = crate::preferences::Settings {
+                vip_users: self.vip_users.clone(),
+                ..Default::default()
+            };
+            let vip_dms: Vec<Conversation> = self
+                .fixtures
+                .dms
+                .iter()
+                .filter(|conv| {
+                    conv.user.as_ref().is_some_and(|uid| {
+                        let u = self.fixtures.user(uid);
+                        let handle = u.map(|x| x.name.as_str()).unwrap_or("");
+                        let display = u.map(|x| x.display_name()).unwrap_or("");
+                        vip_settings.is_vip(uid.as_str(), handle, display)
+                    })
+                })
+                .cloned()
+                .collect();
+            if !vip_dms.is_empty() {
+                list.extend(
+                    self.section(
+                        "home-vip-section".into(),
+                        (
+                            "VIPs",
+                            Some(
+                                Icon::new(IconName::Star)
+                                    .size(px(14.))
+                                    .text_color(cx.theme().warning)
+                                    .into_any_element(),
+                            ),
+                        ),
+                        &vip_dms,
+                        watermark,
+                        None,
+                        cx,
+                    ),
+                );
+            }
+        }
         if self.home_prefs.unreads_section {
             let unread_all: Vec<Conversation> = channels
                 .iter()

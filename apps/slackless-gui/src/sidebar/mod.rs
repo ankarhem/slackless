@@ -412,6 +412,8 @@ pub struct Sidebar {
     pub(super) nav_prefs: NavPrefs,
     /// Home sidebar filter, sort, photo, and row-density preferences from Preferences -> Home.
     pub(super) home_prefs: HomePrefs,
+    /// Comma-separated VIP handles/names/IDs from Preferences -> Notifications (`F-SHELL-058`).
+    pub(super) vip_users: String,
     /// The signed-in user's status and presence, for the rail avatar.
     pub(super) self_state: SelfState,
     /// The pointer is over the focus button / the focus card.
@@ -525,6 +527,7 @@ impl Sidebar {
                 workspace_badges: Vec::new(),
                 nav_prefs: NavPrefs::default(),
                 home_prefs: HomePrefs::default(),
+                vip_users: String::new(),
                 self_state: SelfState::default(),
                 focus_hover: (false, false),
                 _subscriptions: subscriptions,
@@ -547,6 +550,14 @@ impl Sidebar {
         self.fresh_latest.clear();
         self.fixtures = fixtures;
         cx.notify();
+    }
+
+    /// Update the configured VIP list driving the top-level VIPs sidebar section (`F-SHELL-058`).
+    pub fn set_vip_users(&mut self, vip_users: String, cx: &mut Context<Self>) {
+        if self.vip_users != vip_users {
+            self.vip_users = vip_users;
+            cx.notify();
+        }
     }
 
     /// Live mode: Slack's thread counts (unread replies in followed threads, mentions among

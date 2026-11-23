@@ -1392,6 +1392,18 @@ impl App {
                                     cx,
                                 );
                             }
+                            StatusEvent::RemoveScheduled(ix) => {
+                                if *ix < this.self_state.scheduled_statuses.len() {
+                                    this.self_state.scheduled_statuses.remove(*ix);
+                                    notify(
+                                        "Scheduled status removed",
+                                        "Cancelled upcoming scheduled status.",
+                                        window,
+                                        cx,
+                                    );
+                                }
+                                return;
+                            }
                             StatusEvent::Cancel => {}
                         }
                         window.close_dialog(cx);

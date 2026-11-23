@@ -65,16 +65,18 @@ pub(crate) enum Filter {
     Threads,
     Reactions,
     Apps,
+    Vips,
 }
 
 impl Filter {
-    const ALL: [Filter; 6] = [
+    const ALL: [Filter; 7] = [
         Filter::All,
         Filter::Dms,
         Filter::Mentions,
         Filter::Threads,
         Filter::Reactions,
         Filter::Apps,
+        Filter::Vips,
     ];
 
     fn label(self) -> &'static str {
@@ -85,6 +87,7 @@ impl Filter {
             Filter::Threads => "Threads",
             Filter::Reactions => "Reactions",
             Filter::Apps => "Apps",
+            Filter::Vips => "VIPs",
         }
     }
 
@@ -92,7 +95,7 @@ impl Filter {
     fn admits(self, kind: ActivityKind) -> bool {
         matches!(
             (self, kind),
-            (Filter::All, _)
+            (Filter::All | Filter::Vips, _)
                 | (Filter::Dms, ActivityKind::Dm | ActivityKind::App)
                 | (Filter::Mentions, ActivityKind::Mention)
                 | (Filter::Threads, ActivityKind::Thread)
@@ -168,6 +171,7 @@ pub struct ActivityFeed {
     items: Vec<Item>,
     filter: Filter,
     unreads_only: bool,
+    vip_users: String,
     load: Load,
     /// Keyboard-selected visible row index (`Up` / `Down` / `Enter` in Activity).
     selected: Option<usize>,
@@ -188,9 +192,18 @@ impl ActivityFeed {
             fixtures,
             filter: Filter::All,
             unreads_only: false,
+            vip_users: String::new(),
             load: Load::Idle,
             selected: None,
         })
+    }
+
+    /// Update the configured VIP list used by the `VIPs` filter tab (`F-SHELL-061`).
+    pub fn set_vip_users(&mut self, vip_users: String, cx: &mut Context<Self>) {
+        if self.vip_users != vip_users {
+            self.vip_users = vip_users;
+            cx.notify();
+        }
     }
 
     /// Snapshot of currently visible items for a popped-out Activity window (`F-SHELL-149`).
@@ -299,7 +312,30 @@ impl ActivityFeed {
 
     /// The rows the current tab and Unreads toggle show, in `items` order.
     fn visible(&self) -> Vec<usize> {
-        visible(&self.items, self.filter, self.unreads_only)
+        let base = visible(&self.items, self.filter, self.unreads_only);
+        if self.filter != Filter::Vips {
+            return base;
+        }
+        let vip_settings = crate::preferences::Settings {
+            vip_users: self.vip_users.clone(),
+            ..Default::default()
+        };
+        base.into_iter()
+            .filter(|&ix| {
+                let item = &self.items[ix];
+                let uid = item
+                    .message
+                    .as_ref()
+                    .and_then(|m| m.user.as_ref())
+                    .or(item.actor.as_ref());
+                uid.is_some_and(|u| {
+                    let user_obj = self.fixtures.user(u);
+                    let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");
+                    let display = user_obj.map(|x| x.display_name()).unwrap_or("");
+                    vip_settings.is_vip(u.as_str(), handle, display)
+                })
+            })
+            .collect()
     }
 
     fn toggle_read(&mut self, ix: usize, cx: &mut Context<Self>) {

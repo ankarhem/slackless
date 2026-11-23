@@ -278,6 +278,8 @@ pub struct Settings {
     pub keywords: String,
     /// Comma-separated VIP handles, display names, or user IDs that break through DND/Focus (`F-SHELL-056`, `F-SHELL-057`).
     pub vip_users: String,
+    /// Dedicated notification sound for VIP messages (`F-SHELL-059`).
+    pub vip_sound: usize,
     /// Allow urgent direct messages to break through Do Not Disturb & Focus mode (`F-SHELL-038`).
     pub urgent_dm_override: bool,
     /// Automatically set `"In focus mode"` status while Focus mode is active (`F-SHELL-039`).
@@ -565,6 +567,7 @@ impl Default for Settings {
             notify_reminders: true,
             keywords: "deploy, incident".to_owned(),
             vip_users: String::new(),
+            vip_sound: 1,
             urgent_dm_override: true,
             focus_auto_status: true,
             sound: 0,
@@ -1568,6 +1571,7 @@ impl Preferences {
             |s| &mut s.urgent_dm_override,
             cx,
         );
+        let vip_sound_sel = self.select("notify-vip-sound", &SOUNDS, |s| &mut s.vip_sound, cx);
         let focus_status = self.checkbox(
             "notify-focus-auto-status",
             "Automatically set 'In focus mode' status during Focus mode",
@@ -1598,6 +1602,7 @@ impl Preferences {
                 v_flex()
                     .gap_2()
                     .child(vip_box)
+                    .child(self.labeled("Notification sound (VIPs)", vip_sound_sel))
                     .child(urgent_override)
                     .child(focus_status),
                 cx,

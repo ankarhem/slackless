@@ -381,6 +381,8 @@ pub enum StatusEvent {
     Save(Option<UserStatus>),
     /// Schedule a status to activate automatically at a future time (`F-SHELL-018`).
     Schedule(ScheduledStatus),
+    /// Remove a pending scheduled status by index (`F-SHELL-019`).
+    RemoveScheduled(usize),
     Cancel,
 }
 
@@ -401,6 +403,8 @@ pub struct StatusPicker {
     presets: Vec<(String, String, usize)>,
     /// Recently saved custom statuses in this session (newest first, max 3).
     recent: Vec<(String, String, usize)>,
+    /// Upcoming scheduled statuses shown for management (`F-SHELL-019`).
+    scheduled: Vec<ScheduledStatus>,
     emoji_open: bool,
     clear_open: bool,
     _subscriptions: Vec<Subscription>,
@@ -438,6 +442,7 @@ impl StatusPicker {
                 workspace: SharedString::default(),
                 presets: Vec::new(),
                 recent: Vec::new(),
+                scheduled: Vec::new(),
                 emoji_open: false,
                 clear_open: false,
                 _subscriptions: subscriptions,
@@ -448,6 +453,12 @@ impl StatusPicker {
     /// Install workspace-configured suggested statuses (`team.prefs.custom_status_default_suggestions`).
     pub fn set_presets(&mut self, presets: Vec<(String, String, usize)>, cx: &mut Context<Self>) {
         self.presets = presets;
+        cx.notify();
+    }
+
+    /// Sync upcoming scheduled statuses so the picker can display and cancel them (`F-SHELL-019`).
+    pub fn set_scheduled(&mut self, scheduled: Vec<ScheduledStatus>, cx: &mut Context<Self>) {
+        self.scheduled = scheduled;
         cx.notify();
     }
 
@@ -908,6 +919,64 @@ impl Render for StatusPicker {
                 .child(schedule_row)
         });
 
+        let upcoming = (!self.scheduled.is_empty()).then(|| {
+            v_flex()
+                .gap_1()
+                .pt_1()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(muted)
+                        .child("Scheduled statuses"),
+                )
+                .children(self.scheduled.iter().enumerate().map(|(ix, sched)| {
+                    let glyph = emoji_glyph(&sched.emoji).unwrap_or("\u{1F4AC}");
+                    let when = clock(sched.starts_at, None);
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(hover.opacity(0.45))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .min_w_0()
+                                .child(glyph)
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .truncate()
+                                        .child(sched.text.clone()),
+                                )
+                                .child(
+                                    div().text_xs().text_color(muted).child(format!("· {when}")),
+                                ),
+                        )
+                        .child(
+                            Button::new(("status-sched-remove", ix))
+                                .ghost()
+                                .with_size(gpui_kit::component::Size::XSmall)
+                                .icon(IconName::X)
+                                .tooltip("Cancel scheduled status")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if ix < this.scheduled.len() {
+                                        this.scheduled.remove(ix);
+                                    }
+                                    cx.emit(StatusEvent::RemoveScheduled(ix));
+                                    cx.notify();
+                                })),
+                        )
+                }))
+        });
+
         v_flex()
             .w_full()
             .gap_3()
@@ -915,6 +984,7 @@ impl Render for StatusPicker {
             .children(emoji_grid)
             .children(suggestions)
             .children(details)
+            .children(upcoming)
             .child(footer)
     }
 }
