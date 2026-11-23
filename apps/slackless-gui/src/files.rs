@@ -770,8 +770,18 @@ fn video_card(file: &File, cx: &App) -> Div {
 }
 
 const SNIPPET_COLLAPSED_LINES: usize = 5;
-const SNIPPET_EXPANDED_MAX_H: f32 = 460.;
-const SNIPPET_SCROLL_THRESHOLD: usize = 20;
+/// Maximum lines rendered inline when a snippet is expanded: high enough to show full files like
+/// Slack does inline (e.g. 252-line configs) while keeping multi-thousand-line files responsive.
+const SNIPPET_MAX_EXPANDED_LINES: usize = 1_000;
+
+/// `(visible_count, omitted_lines_when_expanded)` for a snippet card.
+fn snippet_visible_and_omitted(total_loaded: usize, expanded: bool) -> (usize, usize) {
+    if !expanded {
+        return (total_loaded.min(SNIPPET_COLLAPSED_LINES), 0);
+    }
+    let visible = total_loaded.min(SNIPPET_MAX_EXPANDED_LINES);
+    (visible, total_loaded.saturating_sub(visible))
+}
 
 fn extra_usize(file: &File, key: &str) -> Option<usize> {
     let val = file.extra.get(key)?;
@@ -888,11 +898,7 @@ impl RenderOnce for SnippetCard {
         };
         let hidden_lines = snippet_hidden_lines(&file, lines.len(), has_full_text);
         let can_expand = lines.len() > SNIPPET_COLLAPSED_LINES || hidden_lines > 0 || is_truncated;
-        let visible_count = if expanded {
-            lines.len()
-        } else {
-            lines.len().min(SNIPPET_COLLAPSED_LINES)
-        };
+        let (visible_count, omitted_lines) = snippet_visible_and_omitted(lines.len(), expanded);
         let gutter_digits = visible_count.max(1).to_string().len().max(2);
         let title = file
             .title
@@ -1103,20 +1109,51 @@ impl RenderOnce for SnippetCard {
                     .child("Loading full snippet\u{2026}"),
             );
         } else if expanded {
-            if let Some(err) = error {
-                code_body = code_body.child(div().pt_1().text_xs().text_color(muted).child(err));
+            if let Some(err) = error.as_ref() {
+                code_body =
+                    code_body.child(div().pt_1().text_xs().text_color(muted).child(err.clone()));
             }
         }
-        let code_area: AnyElement = if expanded && visible_count > SNIPPET_SCROLL_THRESHOLD {
-            div()
-                .id(SharedString::from(format!("snippet-body-{id_str}")))
-                .w_full()
-                .max_h(px(SNIPPET_EXPANDED_MAX_H))
-                .overflow_y_scroll()
-                .child(code_body)
-                .into_any_element()
+        let truncation_notice = if expanded && !loading && omitted_lines > 0 {
+            Some(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(secondary.opacity(0.5))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(Icon::new(IconName::Info).size(px(12.)).text_color(muted))
+                    .child(format!(
+                        "Showing first {visible_count} of {} lines ({omitted_lines} more not shown) \u{2014} copy or download for the full file.",
+                        lines.len()
+                    )),
+            )
+        } else if expanded && !loading && is_truncated && !has_full_text && error.is_none() {
+            let total = lines.len() + hidden_lines;
+            Some(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1p5()
+                    .border_t_1()
+                    .border_color(border)
+                    .bg(secondary.opacity(0.5))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(Icon::new(IconName::Info).size(px(12.)).text_color(muted))
+                    .child(format!(
+                        "Showing preview ({visible_count} of {total} lines) \u{2014} download for the full file."
+                    )),
+            )
         } else {
-            code_body.into_any_element()
+            None
         };
 
         let toggle_row = can_expand.then(|| {
@@ -1237,7 +1274,8 @@ impl RenderOnce for SnippetCard {
             .bg(code_bg)
             .overflow_hidden()
             .child(header)
-            .child(code_area)
+            .child(code_body)
+            .children(truncation_notice)
             .children(toggle_row)
     }
 }
@@ -1461,6 +1499,15 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_snippet(&canvas));
+
+        // Expanding a 252-line file shows the entire file inline; files beyond the inline cap
+        // report the exact omitted line count so the UI tells the user it was truncated.
+        assert_eq!(snippet_visible_and_omitted(252, false), (5, 0));
+        assert_eq!(snippet_visible_and_omitted(252, true), (252, 0));
+        assert_eq!(
+            snippet_visible_and_omitted(SNIPPET_MAX_EXPANDED_LINES + 500, true),
+            (SNIPPET_MAX_EXPANDED_LINES, 500)
+        );
     }
 
     #[gpui::test]
@@ -1518,19 +1565,31 @@ mod tests {
             ..Default::default()
         };
 
+        let huge_text: String = (1..=SNIPPET_MAX_EXPANDED_LINES + 50)
+            .map(|n| format!("line {n}\n"))
+            .collect();
+        let huge = File {
+            id: FileId::from("F0HUGE"),
+            name: Some("dump.log".into()),
+            title: Some("dump.log".into()),
+            mode: Some(FileMode::Snippet),
+            pretty_type: Some("Plain Text".into()),
+            preview: Some(huge_text),
+            ..Default::default()
+        };
+
         let (view, cx) = cx.add_window_view(|_, _| Host {
             visible: true,
-            files: vec![truncated, untruncated],
+            files: vec![truncated, untruncated, huge],
         });
         cx.update(|window, cx| {
-            // Simulate expanding `F0TRUNC` with fetched full text cached in `SnippetStore`.
-            let entry = cx
-                .default_global::<SnippetStore>()
-                .entries
-                .entry(FileId::from("F0TRUNC"))
-                .or_default();
+            // Simulate expanding `F0TRUNC` with fetched full text cached in `SnippetStore`,
+            // and expanding `F0HUGE` (> 1,000 lines) to exercise the truncation notice banner.
+            let entries = &mut cx.default_global::<SnippetStore>().entries;
+            let entry = entries.entry(FileId::from("F0TRUNC")).or_default();
             entry.expanded = true;
             entry.full_text = Some("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n".into());
+            entries.entry(FileId::from("F0HUGE")).or_default().expanded = true;
             let _ = window.draw(cx);
         });
 
