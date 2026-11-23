@@ -441,19 +441,118 @@ impl App {
                         .extend(users.iter().map(|u| (u.clone(), presence.clone())));
                 }
             }
+            Event::ReadMarker { channel, ts } => {
+                let apply = |counts: &mut HashMap<ChannelId, ConversationCounts>| {
+                    let entry =
+                        counts
+                            .entry(channel.clone())
+                            .or_insert_with(|| ConversationCounts {
+                                id: channel.clone(),
+                                ..Default::default()
+                            });
+                    entry.last_read = Some(ts.clone());
+                    let caught_up = entry.latest.as_ref().is_none_or(|latest| *ts >= *latest);
+                    if caught_up {
+                        entry.clear_unreads();
+                    } else {
+                        entry.has_unreads = true;
+                    }
+                };
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
+                    apply(&mut parked.state.counts);
+                    if parked
+                        .state
+                        .counts
+                        .get(channel)
+                        .is_some_and(|c| !c.is_unread())
+                    {
+                        parked
+                            .views
+                            .sidebar
+                            .update(cx, |s, cx| s.mark_read(channel.clone(), cx));
+                    } else {
+                        parked
+                            .views
+                            .sidebar
+                            .update(cx, |s, cx| s.mark_unread(channel, cx));
+                    }
+                }
+                if let Some(slot) = self.bg_counts.get_mut(ws_index) {
+                    apply(slot);
+                }
+                cx.notify();
+            }
             Event::MessagePosted { channel, message } => {
                 let settings = self.preferences.read(cx).settings().clone();
+                let snap = self
+                    .parked_bridges
+                    .get(ws_index)
+                    .and_then(Option::as_ref)
+                    .and_then(|b| b.snapshot(&HashMap::new()));
+                let reply = message
+                    .thread_ts
+                    .as_ref()
+                    .is_some_and(|ts| *ts != message.ts);
+                let broadcast =
+                    message.subtype == Some(slackless_core::types::MessageSubtype::ThreadBroadcast);
+                let counts_in_channel =
+                    !message.hidden && !message.is_ephemeral && (!reply || broadcast);
+                if counts_in_channel {
+                    let from_self = snap
+                        .as_ref()
+                        .is_some_and(|s| message.user.as_ref() == Some(&s.self_user));
+                    if !from_self {
+                        let is_dm = snap
+                            .as_ref()
+                            .and_then(|s| s.conversation(channel))
+                            .is_some_and(|c| {
+                                matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim)
+                            });
+                        let is_im = snap
+                            .as_ref()
+                            .and_then(|s| s.conversation(channel))
+                            .is_some_and(|c| c.kind() == ConversationKind::Im);
+                        let mentioned = snap.as_ref().is_some_and(|s| {
+                            mentions_me(&message.text, &s.self_user, &settings.keywords)
+                        });
+                        let bump = |counts: &mut HashMap<ChannelId, ConversationCounts>| {
+                            let entry = counts.entry(channel.clone()).or_insert_with(|| {
+                                ConversationCounts {
+                                    id: channel.clone(),
+                                    ..Default::default()
+                                }
+                            });
+                            if entry.latest.as_ref().is_none_or(|l| message.ts > *l) {
+                                entry.latest = Some(message.ts.clone());
+                            }
+                            entry.has_unreads = true;
+                            if is_dm || mentioned {
+                                entry.mention_count = entry.mention_count.saturating_add(1);
+                            }
+                            if is_im {
+                                entry.dm_count = entry.dm_count.saturating_add(1);
+                            }
+                        };
+                        if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut)
+                        {
+                            bump(&mut parked.state.counts);
+                            parked
+                                .views
+                                .sidebar
+                                .update(cx, |s, cx| s.mark_unread(channel, cx));
+                        }
+                        if let Some(slot) = self.bg_counts.get_mut(ws_index) {
+                            bump(slot);
+                        }
+                        cx.notify();
+                    }
+                }
                 if !settings.desktop_notifications
                     || self.self_state.paused()
                     || !settings.notifications_allowed_now()
                 {
                     return;
                 }
-                let snap = self
-                    .parked_bridges
-                    .get(ws_index)
-                    .and_then(Option::as_ref)
-                    .and_then(|b| b.snapshot(&HashMap::new()));
                 let Some(snap) = snap else {
                     return;
                 };
@@ -550,11 +649,43 @@ impl App {
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.set_thread_counts(has_unreads, mentions, cx)
                 });
-                self.ws.counts = [&counts.channels, &counts.ims, &counts.mpims]
-                    .into_iter()
-                    .flatten()
-                    .map(|entry| (entry.id.clone(), entry.clone()))
-                    .collect();
+                let mut next_counts: HashMap<ChannelId, ConversationCounts> =
+                    [&counts.channels, &counts.ims, &counts.mpims]
+                        .into_iter()
+                        .flatten()
+                        .map(|entry| (entry.id.clone(), entry.clone()))
+                        .collect();
+                let mut newly_unread: Vec<ChannelId> = Vec::new();
+                for (id, entry) in &mut next_counts {
+                    if let Some(marked) = self.ws.marked_read.get(id).cloned() {
+                        let server_has_newer =
+                            entry.latest.as_ref().is_some_and(|latest| *latest > marked);
+                        if !server_has_newer {
+                            // Keep local read state when an in-flight `client.counts` predates our
+                            // `conversations.mark`.
+                            entry.clear_unreads();
+                            if entry.last_read.as_ref().is_none_or(|r| marked > *r) {
+                                entry.last_read = Some(marked);
+                            }
+                        } else {
+                            // Genuinely newer messages landed since we last marked this read.
+                            self.ws.marked_read.remove(id);
+                            if entry.is_unread() {
+                                newly_unread.push(id.clone());
+                            }
+                        }
+                    } else if entry.is_unread() {
+                        newly_unread.push(id.clone());
+                    }
+                }
+                if !newly_unread.is_empty() {
+                    self.sidebar.update(cx, |sidebar, cx| {
+                        for id in &newly_unread {
+                            sidebar.mark_unread(id, cx);
+                        }
+                    });
+                }
+                self.ws.counts = next_counts;
                 // Fast path: when every conversation in `counts` is already known in memory,
                 // update counts + `last_read` in-place without re-reading the whole SQLite store.
                 let all_known = !self.fixtures.sample
@@ -570,6 +701,19 @@ impl App {
                 } else {
                     self.reload_live(window, cx);
                 }
+                // Cold launch can open a DM before `client.counts` arrives: once counts report it
+                // unread, mark the visible open conversation read right away.
+                if self
+                    .ws
+                    .counts
+                    .get(&self.channel)
+                    .is_some_and(ConversationCounts::is_unread)
+                {
+                    self.maybe_mark_open_read(cx);
+                }
+            }
+            Event::ReadMarker { channel, ts } => {
+                self.apply_read_marker(channel, ts, cx);
             }
             Event::StoreChanged { channel } => {
                 if *channel == self.channel {
@@ -1094,6 +1238,84 @@ impl App {
         .detach();
     }
 
+    /// Fast in-memory update pushing `self.ws.counts` (and updated per-conversation `last_read`
+    /// cursors) into `self.fixtures` and the views that read unread state, without touching SQLite
+    /// or requiring `&mut Window`.
+    pub(super) fn sync_counts_to_views(&mut self, cx: &mut Context<Self>) {
+        if self.fixtures.sample {
+            return;
+        }
+        let fixtures = Arc::new(self.fixtures.with_counts(self.ws.counts.clone()));
+        self.sidebar
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.messages
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.unreads
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.switcher
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.search_menu
+            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
+        self.thread
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.threads
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.details
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.fixtures = fixtures;
+        if self.unreads_open {
+            self.refresh_unreads(cx);
+        }
+        cx.notify();
+    }
+
+    /// Fold an RTM `*_marked` (`im_marked`, `mpim_marked`, `channel_marked`, `group_marked`) event
+    /// into local counts, `fixtures`, sidebar, and badge state.
+    pub(super) fn apply_read_marker(
+        &mut self,
+        channel: &ChannelId,
+        ts: &Ts,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self
+            .ws
+            .counts
+            .entry(channel.clone())
+            .or_insert_with(|| ConversationCounts {
+                id: channel.clone(),
+                ..Default::default()
+            });
+        entry.last_read = Some(ts.clone());
+        let caught_up = entry.latest.as_ref().is_none_or(|latest| *ts >= *latest);
+        if caught_up {
+            entry.clear_unreads();
+            let advance = self
+                .ws
+                .marked_read
+                .get(channel)
+                .is_none_or(|prev| *ts > *prev);
+            if advance {
+                self.ws.marked_read.insert(channel.clone(), ts.clone());
+            }
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.mark_read(channel.clone(), cx));
+        } else {
+            entry.has_unreads = true;
+            if self
+                .fixtures
+                .conversation(channel)
+                .is_some_and(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim))
+                && entry.effective_mentions() == 0
+            {
+                entry.mention_count = 1;
+            }
+            self.ws.marked_read.remove(channel);
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.mark_unread(channel, cx));
+        }
+        self.sync_counts_to_views(cx);
+    }
+
     /// Push a freshly built (or in-memory counts-updated) `Arc<Fixtures>` snapshot to all views.
     pub(super) fn apply_snapshot(
         &mut self,
@@ -1197,7 +1419,16 @@ impl App {
             this.update(cx, |app, cx| {
                 if app.history_generation == generation && app.channel == channel {
                     app.resolve_named_users(&history);
-                    let newest = history.last().map(|message| message.ts.clone());
+                    let newest = history
+                        .last()
+                        .map(|message| message.ts.clone())
+                        .or_else(|| {
+                            app.ws
+                                .counts
+                                .get(&channel)
+                                .filter(|c| c.is_unread())
+                                .and_then(|c| c.latest.clone())
+                        });
                     let settings = app.preferences.read(cx).settings().clone();
                     let mark_read_mode = settings.mark_read;
                     app.messages.update(cx, |list, cx| {
@@ -1206,8 +1437,9 @@ impl App {
                             list.scroll_to_unread_once(cx);
                         }
                     });
-                    let allow_mark =
-                        mark_read_mode != 2 && (!settings.no_bg_mark_read || app.window_active);
+                    let allow_mark = app.transcript_visible(cx)
+                        && mark_read_mode != 2
+                        && (!settings.no_bg_mark_read || app.window_active);
                     if allow_mark {
                         if let Some(newest) = newest {
                             app.mark_read(&channel, newest, cx);
@@ -1469,6 +1701,64 @@ impl App {
                 typists.retain(|(typist, _)| typist != author);
             }
             self.expire_typing(cx);
+        }
+        let reply = message
+            .thread_ts
+            .as_ref()
+            .is_some_and(|ts| *ts != message.ts);
+        let broadcast =
+            message.subtype == Some(slackless_core::types::MessageSubtype::ThreadBroadcast);
+        let counts_in_channel = !message.hidden && !message.is_ephemeral && (!reply || broadcast);
+        if !self.fixtures.sample && counts_in_channel {
+            let from_self = message.user.as_ref() == Some(&self.fixtures.self_user);
+            let settings = self.preferences.read(cx).settings().clone();
+            let allow_mark =
+                settings.mark_read != 2 && (!settings.no_bg_mark_read || self.window_active);
+            let viewing = *channel == self.channel && self.transcript_visible(cx);
+            let entry =
+                self.ws
+                    .counts
+                    .entry(channel.clone())
+                    .or_insert_with(|| ConversationCounts {
+                        id: channel.clone(),
+                        ..Default::default()
+                    });
+            if entry.latest.as_ref().is_none_or(|l| message.ts > *l) {
+                entry.latest = Some(message.ts.clone());
+            }
+            if from_self {
+                if entry.last_read.as_ref().is_none_or(|r| message.ts > *r) {
+                    entry.last_read = Some(message.ts.clone());
+                }
+            } else if !viewing || !allow_mark {
+                let is_dm = self.fixtures.conversation(channel).is_some_and(|c| {
+                    matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim)
+                });
+                let is_im = self
+                    .fixtures
+                    .conversation(channel)
+                    .is_some_and(|c| c.kind() == ConversationKind::Im);
+                let mentioned =
+                    mentions_me(&message.text, &self.fixtures.self_user, &settings.keywords);
+                entry.has_unreads = true;
+                if is_dm || mentioned {
+                    entry.mention_count = entry.mention_count.saturating_add(1);
+                }
+                if is_im {
+                    entry.dm_count = entry.dm_count.saturating_add(1);
+                }
+                if self
+                    .ws
+                    .marked_read
+                    .get(channel)
+                    .is_some_and(|marked| message.ts > *marked)
+                {
+                    self.ws.marked_read.remove(channel);
+                }
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.mark_unread(channel, cx));
+                self.sync_counts_to_views(cx);
+            }
         }
         if !self.should_notify(channel, message, window, cx) {
             return;

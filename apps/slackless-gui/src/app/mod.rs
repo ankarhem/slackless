@@ -431,6 +431,9 @@ struct WorkspaceViews {
 pub(super) struct WorkspaceState {
     /// Live mode: Slack's latest read and unread state (`client.counts`).
     pub(super) counts: HashMap<ChannelId, ConversationCounts>,
+    /// Highest message ts marked read locally per conversation in this session, so a stale
+    /// in-flight `client.counts` snapshot cannot resurrect unreads on a conversation already viewed.
+    pub(super) marked_read: HashMap<ChannelId, Ts>,
     /// Live mode: last known presence per DM peer (`users.getPresence`, `presence_change`);
     /// injected into every live fixtures snapshot so sidebar rows and headers render dots.
     pub(super) presence: fixtures::PresenceMap,
@@ -1021,10 +1024,7 @@ impl App {
                             if this.threads_open {
                                 this.auto_mark_threads_view_read(cx);
                             } else {
-                                let ch = this.channel.clone();
-                                if let Some(newest) = this.messages.read(cx).newest_ts() {
-                                    this.mark_read(&ch, newest, cx);
-                                }
+                                this.maybe_mark_open_read(cx);
                             }
                         }
                     }
@@ -3382,7 +3382,12 @@ fn subscribe_workspace(
                     this.open_thread(channel.clone(), thread_ts.clone(), cx);
                 }
                 MessageListEvent::Later(request) => this.save_for_later(request, cx),
-                MessageListEvent::Changed { channel, change } => this.post_change(channel, change),
+                MessageListEvent::Changed { channel, change } => {
+                    this.post_change(channel, change);
+                    if let MessageChange::MarkUnread { ts } = change {
+                        this.apply_local_mark_unread(channel, ts.clone(), cx);
+                    }
+                }
                 MessageListEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                 MessageListEvent::OpenLink(target) => this.open_link(target.clone(), window, cx),
                 MessageListEvent::OpenImage {

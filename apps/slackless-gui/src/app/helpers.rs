@@ -84,8 +84,8 @@ pub(super) fn workspace_badge_from_counts(
     let mut mentions = activity_unread;
     let mut has_unreads = activity_unread > 0;
     for entry in counts.values() {
-        mentions = mentions.saturating_add(entry.mention_count);
-        if entry.has_unreads || entry.mention_count > 0 {
+        mentions = mentions.saturating_add(entry.effective_mentions());
+        if entry.is_unread() {
             has_unreads = true;
         }
     }

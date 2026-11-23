@@ -237,7 +237,11 @@ impl Sidebar {
                     .child(div().line_clamp(2).text_color(preview_fg).children(preview)),
             )
             .when(unread.count > 0, |row| {
-                row.child(count_pill(unread.count, unread.mentions > 0, cx))
+                row.child(count_pill(
+                    unread.mentions.max(unread.count),
+                    unread.mentions > 0,
+                    cx,
+                ))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.select_row(id.clone(), cx)))
     }

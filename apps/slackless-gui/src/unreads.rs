@@ -106,12 +106,12 @@ pub fn local_groups(fixtures: &Fixtures, order: &[ChannelId]) -> Vec<UnreadGroup
                     .filter(|message| mentions_user(message, &fixtures.self_user))
                     .count() as u32
             },
-            |counts| counts.mention_count,
+            |counts| counts.effective_mentions(),
         );
         if fixtures.notify_levels.get(channel) == Some(&NotifyLevel::Muted) && mention_count == 0 {
             continue;
         }
-        let counted = counts.is_some_and(|c| c.has_unreads || c.mention_count > 0);
+        let counted = counts.is_some_and(slackless_core::api::ConversationCounts::is_unread);
         let Some(newest_ts) = messages
             .last()
             .map(|message| message.ts.clone())
@@ -1162,6 +1162,7 @@ mod tests {
             last_read: last_read.map(Ts::from),
             latest: latest.map(Ts::from),
             mention_count: mentions,
+            dm_count: 0,
             has_unreads: unreads,
             extra: Default::default(),
         }

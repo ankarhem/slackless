@@ -300,10 +300,31 @@ pub struct ConversationCounts {
     pub latest: Option<Ts>,
     #[serde(default, deserialize_with = "lenient_u32")]
     pub mention_count: u32,
+    #[serde(default, deserialize_with = "lenient_u32")]
+    pub dm_count: u32,
     #[serde(default, deserialize_with = "lenient_bool")]
     pub has_unreads: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl ConversationCounts {
+    /// Mention or DM unread count (`client.counts` `ims` entries may report `dm_count`).
+    pub fn effective_mentions(&self) -> u32 {
+        self.mention_count.max(self.dm_count)
+    }
+
+    /// Whether this conversation currently has any unread messages.
+    pub fn is_unread(&self) -> bool {
+        self.has_unreads || self.mention_count > 0 || self.dm_count > 0
+    }
+
+    /// Clear all unread flags and mention/DM counters.
+    pub fn clear_unreads(&mut self) {
+        self.has_unreads = false;
+        self.mention_count = 0;
+        self.dm_count = 0;
+    }
 }
 
 /// `client.counts` `threads`.

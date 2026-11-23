@@ -269,6 +269,28 @@ fn messages_list_bodies_parse_by_channel() {
     assert!(bodies[&ChannelId::from("D0PEER")].is_empty());
 }
 
+#[test]
+fn client_counts_parses_dm_count_and_clears_cleanly() {
+    let mut counts: ClientCounts = serde_json::from_str(
+        r#"{
+            "ims": [{
+                "id": "D0PEER",
+                "last_read": "1700000100.000100",
+                "latest": "1700000200.000100",
+                "dm_count": 3
+            }]
+        }"#,
+    )
+    .unwrap();
+    let dm = &mut counts.ims[0];
+    assert_eq!(dm.dm_count, 3);
+    assert_eq!(dm.effective_mentions(), 3);
+    assert!(dm.is_unread());
+    dm.clear_unreads();
+    assert!(!dm.is_unread());
+    assert_eq!(dm.effective_mentions(), 0);
+}
+
 /// A one-off probe of the live `activity.feed` answer, printed as raw JSON so the
 /// parser is built against the real shape (values carry personal data; the shipped
 /// fixture replaces them). Run manually with the signed-in session in the app's store;

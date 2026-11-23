@@ -288,23 +288,120 @@ impl App {
     }
 
     /// Like Slack, viewing a conversation with unreads marks it read up to its newest message:
-    /// Slack is told (`conversations.mark`) and the sidebar un-bolds it at once. Without a
-    /// counts entry (the bundled sample workspace) the sidebar's own read state moves.
+    /// Slack is told (`conversations.mark`), the sidebar un-bolds it at once, and `self.fixtures`
+    /// advances `last_read` so re-opening the conversation (or opening All Unreads) does not keep
+    /// showing it as new/unread.
     pub(super) fn mark_read(&mut self, channel: &ChannelId, newest: Ts, cx: &mut Context<Self>) {
-        if let Some(counts) = self.ws.counts.get_mut(channel) {
-            if !counts.has_unreads && counts.mention_count == 0 {
-                return;
+        let mut target_ts = newest;
+        if !self.fixtures.sample {
+            if let Some(counts) = self.ws.counts.get_mut(channel) {
+                // If local SQLite history lags behind `client.counts.latest`, mark up to `latest`
+                // so a cached pre-fetch read never sends a stale cursor and leaves the DM unread.
+                if let Some(latest) = counts.latest.as_ref() {
+                    if *latest > target_ts {
+                        target_ts = latest.clone();
+                    }
+                }
+                let advances_cursor = counts
+                    .last_read
+                    .as_ref()
+                    .is_none_or(|read| target_ts > *read);
+                if !counts.is_unread() && !advances_cursor {
+                    return;
+                }
+                counts.clear_unreads();
+                counts.last_read = Some(target_ts.clone());
+                if counts.latest.as_ref().is_none_or(|l| target_ts > *l) {
+                    counts.latest = Some(target_ts.clone());
+                }
+            } else {
+                self.ws.counts.insert(
+                    channel.clone(),
+                    ConversationCounts {
+                        id: channel.clone(),
+                        last_read: Some(target_ts.clone()),
+                        latest: Some(target_ts.clone()),
+                        ..Default::default()
+                    },
+                );
             }
-            counts.has_unreads = false;
-            counts.mention_count = 0;
-            counts.last_read = Some(newest.clone());
+            let record = self
+                .ws
+                .marked_read
+                .get(channel)
+                .is_none_or(|prev| target_ts > *prev);
+            if record {
+                self.ws
+                    .marked_read
+                    .insert(channel.clone(), target_ts.clone());
+            }
         }
         self.bridge.send(Command::MarkRead {
             channel: channel.clone(),
-            ts: newest,
+            ts: target_ts,
         });
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.mark_read(channel.clone(), cx));
+        self.sync_counts_to_views(cx);
+    }
+
+    /// Mark the open conversation read if the transcript is visible and the user's preferences
+    /// allow auto-marking read (`mark_read != 2`, and window focused when `no_bg_mark_read` is on).
+    pub(super) fn maybe_mark_open_read(&mut self, cx: &mut Context<Self>) {
+        if !self.transcript_visible(cx) {
+            return;
+        }
+        let settings = self.preferences.read(cx).settings().clone();
+        let allow_mark =
+            settings.mark_read != 2 && (!settings.no_bg_mark_read || self.window_active);
+        if !allow_mark {
+            return;
+        }
+        let channel = self.channel.clone();
+        let newest = self
+            .messages
+            .read(cx)
+            .newest_ts()
+            .into_iter()
+            .chain(self.ws.counts.get(&channel).and_then(|c| c.latest.clone()))
+            .max();
+        if let Some(newest) = newest {
+            self.mark_read(&channel, newest, cx);
+        }
+    }
+
+    /// Mirror a user-initiated "Mark as Unread" (`conversations.mark` backward to `ts`) into local
+    /// counts, `fixtures`, and sidebar state so the conversation immediately shows unread again.
+    pub(super) fn apply_local_mark_unread(
+        &mut self,
+        channel: &ChannelId,
+        ts: Ts,
+        cx: &mut Context<Self>,
+    ) {
+        self.ws.marked_read.remove(channel);
+        if !self.fixtures.sample {
+            let entry =
+                self.ws
+                    .counts
+                    .entry(channel.clone())
+                    .or_insert_with(|| ConversationCounts {
+                        id: channel.clone(),
+                        ..Default::default()
+                    });
+            entry.last_read = Some(ts);
+            entry.has_unreads = true;
+            if self
+                .fixtures
+                .conversation(channel)
+                .is_some_and(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim))
+                && entry.effective_mentions() == 0
+            {
+                entry.mention_count = 1;
+            }
+        }
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.mark_unread(channel, cx));
+        self.sync_counts_to_views(cx);
     }
 
     /// Advance a single thread's read cursor to `ts` (`subscriptions.thread.mark`), clear its
@@ -426,8 +523,17 @@ impl App {
             return;
         }
         let channel = self.channel.clone();
-        if let Some(newest) = self.messages.read(cx).newest_ts() {
-            self.mark_read(&channel, newest, cx);
+        let newest = self
+            .messages
+            .read(cx)
+            .newest_ts()
+            .into_iter()
+            .chain(self.ws.counts.get(&channel).and_then(|c| c.latest.clone()))
+            .max();
+        if let Some(newest) = newest {
+            self.mark_read(&channel, newest.clone(), cx);
+            self.messages
+                .update(cx, |list, cx| list.set_last_read(Some(newest), cx));
         }
     }
 
@@ -435,9 +541,12 @@ impl App {
     /// sidebar un-bolds at once and the core's fresh counts follow.
     pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
         self.bridge.send(Command::MarkAllRead);
-        for counts in self.ws.counts.values_mut() {
-            counts.has_unreads = false;
-            counts.mention_count = 0;
+        for (id, counts) in &mut self.ws.counts {
+            counts.clear_unreads();
+            if let Some(latest) = counts.latest.clone() {
+                counts.last_read = Some(latest.clone());
+                self.ws.marked_read.insert(id.clone(), latest);
+            }
         }
         let unread = self.sidebar.read(cx).unread_ids();
         self.sidebar.update(cx, |sidebar, cx| {
@@ -449,6 +558,7 @@ impl App {
         self.threads.update(cx, |threads, cx| {
             threads.clear_all_unreads(true, cx);
         });
+        self.sync_counts_to_views(cx);
         if self.unreads_open {
             self.refresh_unreads(cx);
         }
@@ -1055,7 +1165,8 @@ impl App {
                 }
             }
             MessageAction::MarkUnread => {
-                self.post_change(&channel, &MessageChange::MarkUnread { ts });
+                self.post_change(&channel, &MessageChange::MarkUnread { ts: ts.clone() });
+                self.apply_local_mark_unread(&channel, ts, cx);
                 notify("Marked unread", String::new(), window, cx);
             }
             MessageAction::Edit => {

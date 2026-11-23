@@ -890,14 +890,33 @@ impl App {
         self.navigate(channel, cx);
     }
 
+    /// Whether the main column is currently showing `self.channel`'s transcript (as opposed to
+    /// a full-column overlay such as Unreads, Threads, Activity, Search, Drafts, Later, or Files).
+    pub(super) fn transcript_visible(&self, cx: &gpui::App) -> bool {
+        !self.searching
+            && !self.drafts_open
+            && !self.later_open
+            && !self.threads_open
+            && !self.unreads_open
+            && !self.huddles_open
+            && !self.directory_open
+            && !self.compose_open
+            && !self.activity_open
+            && self.sidebar.read(cx).active_nav() != crate::sidebar::NavItem::Files
+    }
+
     /// Show `channel` as the user's choice, leaving any full-column view (search, drafts,
     /// later). History is the caller's: [`App::select`] records it, back/forward replay it.
     pub(super) fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        let was_covered = !self.transcript_visible(cx);
         self.ws.chosen = true;
         self.activity_open = false;
         self.close_full_column_views(cx);
         self.close_hover_card(cx);
         cx.notify();
+        if channel == self.channel && was_covered {
+            self.maybe_mark_open_read(cx);
+        }
         self.show_conversation(channel, cx);
     }
 

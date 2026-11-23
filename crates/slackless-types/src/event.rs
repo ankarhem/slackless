@@ -273,6 +273,8 @@ pub struct MarkedEvent {
     #[serde(default)]
     pub mention_count: Option<u32>,
     #[serde(default)]
+    pub dm_count: Option<u32>,
+    #[serde(default)]
     pub event_ts: Option<Ts>,
 }
 

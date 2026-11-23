@@ -623,6 +623,13 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Allow `channel` to display as unread again (e.g. a new message arrived or it was marked unread).
+    pub fn mark_unread(&mut self, channel: &ChannelId, cx: &mut Context<Self>) {
+        if self.read.remove(channel) {
+            cx.notify();
+        }
+    }
+
     /// The signed-in user's status and presence shown on the rail avatar.
     pub fn set_self_state(&mut self, state: SelfState, cx: &mut Context<Self>) {
         self.self_state = state;
@@ -1380,8 +1387,8 @@ impl Sidebar {
                 return Unread::default();
             }
             return Unread {
-                count: u32::from(counts.has_unreads || counts.mention_count > 0),
-                mentions: counts.mention_count,
+                count: u32::from(counts.is_unread()),
+                mentions: counts.effective_mentions(),
             };
         }
         let messages = self.unread_messages(conversation, watermark);

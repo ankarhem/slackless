@@ -33,10 +33,21 @@ fn apply(store: &mut Store, ws: &TeamId, event: SlackEvent) -> store::Result<Opt
         SlackEvent::ChannelMarked(m)
         | SlackEvent::ImMarked(m)
         | SlackEvent::GroupMarked(m)
-        | SlackEvent::MpimMarked(m) => Some(Event::ReadMarker {
-            channel: m.channel,
-            ts: m.ts,
-        }),
+        | SlackEvent::MpimMarked(m) => {
+            if let Some(mut conv) = store.conversation(ws, &m.channel)? {
+                conv.last_read = Some(m.ts.clone());
+                if let Some(unread) = m.unread_count_display {
+                    conv.unread_count_display = Some(unread);
+                } else if m.dm_count == Some(0) {
+                    conv.unread_count_display = Some(0);
+                }
+                store.upsert_conversation(ws, &conv)?;
+            }
+            Some(Event::ReadMarker {
+                channel: m.channel,
+                ts: m.ts,
+            })
+        }
         SlackEvent::ThreadMarked(m) => Some(Event::ThreadReadMarker {
             channel: m.subscription.channel,
             thread_ts: m.subscription.thread_ts,
@@ -295,5 +306,36 @@ mod tests {
             apply_event(&mut store, &ws(), event(r#"{"type":"hello"}"#)),
             None
         );
+    }
+
+    #[test]
+    fn im_marked_persists_last_read_and_unread_count() {
+        let mut store = Store::open_in_memory().unwrap();
+        let dm = crate::types::Conversation {
+            id: ChannelId::from("D1"),
+            is_im: true,
+            last_read: Some(Ts::from("1.0")),
+            unread_count_display: Some(3),
+            ..Default::default()
+        };
+        store.upsert_conversation(&ws(), &dm).unwrap();
+        let ev = apply_event(
+            &mut store,
+            &ws(),
+            event(r#"{"type":"im_marked","channel":"D1","ts":"1.5","dm_count":0}"#),
+        );
+        assert_eq!(
+            ev,
+            Some(Event::ReadMarker {
+                channel: ChannelId::from("D1"),
+                ts: Ts::from("1.5"),
+            })
+        );
+        let stored = store
+            .conversation(&ws(), &ChannelId::from("D1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.last_read, Some(Ts::from("1.5")));
+        assert_eq!(stored.unread_count_display, Some(0));
     }
 }

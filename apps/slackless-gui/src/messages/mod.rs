@@ -462,6 +462,21 @@ impl MessageList {
         self.sync(cx);
     }
 
+    /// Move the visible transcript's `"New"` divider cursor (e.g. pressing Esc clears it).
+    pub fn set_last_read(&mut self, last_read: Option<Ts>, cx: &mut Context<Self>) {
+        let changed = self.data.update(cx, |data, _| {
+            if data.last_read != last_read {
+                data.last_read = last_read;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            self.refresh(cx);
+        }
+    }
+
     /// Append a message to `channel`'s history (live event or optimistic local send). Appends
     /// to the visible conversation also advance the virtual list by one row, tail-anchored.
     pub fn append(&mut self, channel: ChannelId, message: Message, cx: &mut Context<Self>) {
@@ -621,9 +636,12 @@ impl MessageList {
             .and_then(|conversation| conversation.last_read.clone());
         let count = history.len();
         self.data.update(cx, |data, _| {
+            let switching = data.channel != self.channel;
             data.channel = self.channel.clone();
             data.messages = history;
-            data.last_read = last_read;
+            if switching || data.last_read.is_none() {
+                data.last_read = last_read;
+            }
             data.editing = None;
             data.active = None;
         });

@@ -885,7 +885,16 @@ impl<B: Backend> Core<B> {
                 Ok(())
             }),
             Command::MarkRead { channel, ts } => self.spawn("conversations.mark", async move {
-                Ok(backend.mark_read(channel, ts).await?)
+                backend.mark_read(channel.clone(), ts.clone()).await?;
+                let _ = with_store(&store, move |s| {
+                    if let Some(mut conv) = s.conversation(&ws, &channel)? {
+                        conv.last_read = Some(ts);
+                        s.upsert_conversation(&ws, &conv)?;
+                    }
+                    Ok::<_, StoreError>(())
+                })
+                .await;
+                Ok(())
             }),
             Command::MarkThreadRead {
                 channel,

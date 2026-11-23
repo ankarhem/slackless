@@ -719,3 +719,174 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
         let _ = window.draw(cx);
     });
 }
+
+#[gpui::test]
+fn dm_unread_clears_when_viewed_and_stays_read(cx: &mut gpui::TestAppContext) {
+    use gpui_kit::component::Root;
+    use slackless_core::api::ClientCounts;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let fx = fixtures::load();
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(Arc::new(fx), CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    // Switch fixtures to live-like mode (`sample = false`) with an unread DM carrying `dm_count`.
+    let (general_id, dm_id) = cx.update(|window, cx| {
+        let mut general_id = ChannelId::from("C0GENERAL");
+        let mut dm_id = ChannelId::default();
+        app.update(cx, |app, cx| {
+            let mut live_like = (*app.fixtures).with_counts(HashMap::new());
+            live_like.sample = false;
+            live_like.messages.clear();
+            general_id = live_like.channels[0].id.clone();
+            dm_id = live_like.dms[0].id.clone();
+            app.apply_snapshot(Arc::new(live_like), window, cx);
+            app.sidebar
+                .update(cx, |sidebar, cx| sidebar.set_activity_unread(0, cx));
+            app.select(general_id.clone(), cx);
+
+            // 1. Server `client.counts` reports unread DM via `dm_count` (even if `has_unreads` is false).
+            let counts = ClientCounts {
+                ims: vec![ConversationCounts {
+                    id: dm_id.clone(),
+                    last_read: Some(Ts::from("1700000100.000100")),
+                    latest: Some(Ts::from("1700000200.000100")),
+                    mention_count: 0,
+                    dm_count: 2,
+                    has_unreads: false,
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            };
+            app.on_core_event(&Event::Counts(Box::new(counts)), window, cx);
+            assert!(
+                app.sidebar.read(cx).unread_ids().contains(&dm_id),
+                "DM with dm_count > 0 must show unread in sidebar"
+            );
+            assert_eq!(app.sidebar.read(cx).badge_count(), 1);
+            assert!(
+                crate::unreads::local_groups(&app.fixtures, std::slice::from_ref(&dm_id))
+                    .iter()
+                    .any(|g| g.channel == dm_id),
+                "unread DM must appear in All Unreads"
+            );
+
+            // 2. Open the DM and simulate stale SQLite history (`newest = 100`, behind `latest = 200`):
+            //    `mark_read` must advance cursor to `latest = 200` and sync `fixtures` + sidebar.
+            app.select(dm_id.clone(), cx);
+            app.mark_read(&dm_id, Ts::from("1700000100.000100"), cx);
+            assert_eq!(
+                app.ws
+                    .counts
+                    .get(&dm_id)
+                    .and_then(|c| c.last_read.as_ref())
+                    .map(Ts::as_str),
+                Some("1700000200.000100")
+            );
+            assert!(
+                !app.ws.counts.get(&dm_id).unwrap().is_unread(),
+                "ws.counts must clear unread state on viewed DM"
+            );
+            assert_eq!(
+                app.fixtures
+                    .conversation(&dm_id)
+                    .and_then(|c| c.last_read.as_ref())
+                    .map(Ts::as_str),
+                Some("1700000200.000100"),
+                "fixtures.conversation.last_read must advance so re-entering clears New divider"
+            );
+
+            // 3. Switch away from the DM: it must STAY read in sidebar, badge, and All Unreads.
+            app.select(general_id.clone(), cx);
+            assert!(
+                !app.sidebar.read(cx).unread_ids().contains(&dm_id),
+                "viewed DM must not become unread again after switching away"
+            );
+            assert_eq!(app.sidebar.read(cx).badge_count(), 0);
+            assert!(
+                crate::unreads::local_groups(&app.fixtures, std::slice::from_ref(&dm_id))
+                    .is_empty(),
+                "viewed DM must disappear from All Unreads"
+            );
+
+            // 4. Stale in-flight `client.counts` (same `latest = 200`) must NOT resurrect unreads.
+            let stale_counts = ClientCounts {
+                ims: vec![ConversationCounts {
+                    id: dm_id.clone(),
+                    last_read: Some(Ts::from("1700000100.000100")),
+                    latest: Some(Ts::from("1700000200.000100")),
+                    mention_count: 2,
+                    dm_count: 2,
+                    has_unreads: true,
+                    extra: Default::default(),
+                }],
+                ..Default::default()
+            };
+            app.on_core_event(&Event::Counts(Box::new(stale_counts)), window, cx);
+            assert!(
+                !app.sidebar.read(cx).unread_ids().contains(&dm_id),
+                "stale in-flight client.counts must not resurrect unread on already-viewed DM"
+            );
+
+            // 5. A new live DM arrives via RTM (`ts = 300`) while viewing `#general`:
+            //    it must light up as unread again (clearing `sidebar.read`), and then viewing
+            //    it must mark `300` read cleanly.
+            let incoming = slackless_core::types::Message {
+                ts: Ts::from("1700000300.000100"),
+                user: Some(UserId::from("U0OTHER")),
+                text: "hey there".to_owned(),
+                ..Default::default()
+            };
+            app.on_core_event(
+                &Event::MessagePosted {
+                    channel: dm_id.clone(),
+                    message: Box::new(incoming),
+                },
+                window,
+                cx,
+            );
+            assert!(
+                app.sidebar.read(cx).unread_ids().contains(&dm_id),
+                "live incoming DM must show unread even after earlier mark_read"
+            );
+            assert_eq!(app.sidebar.read(cx).badge_count(), 1);
+
+            // 6. An `im_marked` read marker from another device clears the unread DM cleanly.
+            app.on_core_event(
+                &Event::ReadMarker {
+                    channel: dm_id.clone(),
+                    ts: Ts::from("1700000300.000100"),
+                },
+                window,
+                cx,
+            );
+            assert!(
+                !app.sidebar.read(cx).unread_ids().contains(&dm_id),
+                "Event::ReadMarker (im_marked) must clear unread DM"
+            );
+            assert_eq!(app.sidebar.read(cx).badge_count(), 0);
+            assert_eq!(
+                app.fixtures
+                    .conversation(&dm_id)
+                    .and_then(|c| c.last_read.as_ref())
+                    .map(Ts::as_str),
+                Some("1700000300.000100")
+            );
+        });
+        let _ = window.draw(cx);
+        (general_id, dm_id)
+    });
+    assert_ne!(general_id, dm_id);
+}
