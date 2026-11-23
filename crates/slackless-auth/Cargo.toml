@@ -25,3 +25,6 @@ tempfile = "3"
 # The embedded WebKit sign-in window (`embedded_sign_in`). Front-ends that open it enable this;
 # the core and its tests do not need a windowing stack.
 webview = ["dep:wry", "dep:tao"]
+
+[lints]
+workspace = true

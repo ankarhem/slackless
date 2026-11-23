@@ -134,48 +134,67 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<PostedMessage>> + Send;
     fn update_message(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-        content: MessageContent,
-    ) -> impl Future<Output = api::Result<PostedMessage>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+        _content: MessageContent,
+    ) -> impl Future<Output = api::Result<PostedMessage>> + Send {
+        async { Ok(PostedMessage::default()) }
+    }
     fn delete_message(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     fn add_reaction(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-        name: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+        _name: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     fn remove_reaction(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-        name: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+        _name: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Run a slash command Slack handles (`chat.command`) in `channel`, or in the thread at
     /// `thread_ts`; `team` is the signed-in workspace.
     fn run_command(
         &self,
-        channel: ChannelId,
-        command: String,
-        args: String,
-        thread_ts: Option<Ts>,
-        team: TeamId,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _command: String,
+        _args: String,
+        _thread_ts: Option<Ts>,
+        _team: TeamId,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Dispatch a Block Kit interaction to the app that posted the message (`blocks.actions`).
     fn block_action(
         &self,
-        bot: BotId,
-        app_id: String,
-        team: TeamId,
-        action: serde_json::Value,
-        container: ActionContainer,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _bot: BotId,
+        _app_id: String,
+        _team: TeamId,
+        _action: serde_json::Value,
+        _container: ActionContainer,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// A bot's profile (`bots.info`), for messages that carry only its id.
-    fn bot_info(&self, bot: BotId) -> impl Future<Output = api::Result<BotProfile>> + Send;
+    fn bot_info(&self, bot: BotId) -> impl Future<Output = api::Result<BotProfile>> + Send {
+        async move {
+            Ok(BotProfile {
+                id: bot,
+                ..Default::default()
+            })
+        }
+    }
     /// The followed threads of the Threads view (`subscriptions.thread.getView`), page one.
     fn threads_view(&self) -> impl Future<Output = api::Result<ThreadsView>> + Send;
     /// The Activity view's feed (`activity.feed`), page one; row bodies hydrate separately
@@ -291,7 +310,9 @@ pub trait Backend: Clone + Send + Sync + 'static {
         scheduled_message_id: String,
     ) -> impl Future<Output = api::Result<()>> + Send;
     /// Active `@handle` user groups (`usergroups.list`).
-    fn usergroups(&self) -> impl Future<Output = api::Result<Vec<Usergroup>>> + Send;
+    fn usergroups(&self) -> impl Future<Output = api::Result<Vec<Usergroup>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Upload files into `channel` via external upload v2 (`files.getUploadURLExternal` +
     /// raw upload POST + `files.completeUploadExternal`).
     fn upload_files(
@@ -304,71 +325,107 @@ pub trait Backend: Clone + Send + Sync + 'static {
     /// Featured/trending GIFs for the composer picker (`gif.featured`).
     fn gif_featured(
         &self,
-        limit: u32,
-    ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send;
+        _limit: u32,
+    ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Search GIFs for the composer picker (`gif.search`).
     fn gif_search(
         &self,
-        query: String,
-        limit: u32,
-    ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send;
+        _query: String,
+        _limit: u32,
+    ) -> impl Future<Output = api::Result<Vec<api::GifItem>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Saved-for-Later items (`saved.list`) under `filter` (`"saved"`, `"completed"`, `"archived"`).
     fn saved_list(
         &self,
-        filter: &'static str,
-    ) -> impl Future<Output = api::Result<Vec<api::SavedItem>>> + Send;
+        _filter: &'static str,
+    ) -> impl Future<Output = api::Result<Vec<api::SavedItem>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Save a message for Later (`saved.add`), optionally with a reminder (`date_due`).
     fn saved_add(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-        date_due: Option<u64>,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+        _date_due: Option<u64>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Update a saved item's state (`mark`) and/or reminder (`date_due`).
     fn saved_update(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-        mark: Option<api::SavedMark>,
-        date_due: Option<Option<u64>>,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+        _mark: Option<api::SavedMark>,
+        _date_due: Option<Option<u64>>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Remove a message from Later (`saved.delete`).
     fn saved_delete(
         &self,
-        channel: ChannelId,
-        ts: Ts,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _ts: Ts,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Clear all completed Later items (`saved.clearCompleted`).
-    fn saved_clear_completed(&self) -> impl Future<Output = api::Result<()>> + Send;
+    fn saved_clear_completed(&self) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Workspace slash command catalog (`client.appCommands`).
-    fn app_commands(&self) -> impl Future<Output = api::Result<Vec<api::AppCommand>>> + Send;
+    fn app_commands(&self) -> impl Future<Output = api::Result<Vec<api::AppCommand>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Fast remote typeahead (`edgeapi` `users/search` + `channels/search`) for Cmd+K.
     fn edge_search(
         &self,
-        team_id: TeamId,
-        query: String,
-    ) -> impl Future<Output = api::Result<api::EdgeSearchResults>> + Send;
+        _team_id: TeamId,
+        _query: String,
+    ) -> impl Future<Output = api::Result<api::EdgeSearchResults>> + Send {
+        async { Ok(api::EdgeSearchResults::default()) }
+    }
     /// Opt-in remote Slack message search (`search.modules.messages`).
     fn search_remote_messages(
         &self,
-        query: String,
-        sort: api::SearchSort,
+        _query: String,
+        _sort: api::SearchSort,
         page: usize,
-    ) -> impl Future<Output = api::Result<api::RemoteMessagePage>> + Send;
+    ) -> impl Future<Output = api::Result<api::RemoteMessagePage>> + Send {
+        async move {
+            Ok(api::RemoteMessagePage {
+                page,
+                ..Default::default()
+            })
+        }
+    }
     /// Opt-in remote Slack file search (`search.modules.files`).
     fn search_remote_files(
         &self,
-        query: String,
-        sort: api::SearchSort,
+        _query: String,
+        _sort: api::SearchSort,
         page: usize,
-    ) -> impl Future<Output = api::Result<api::RemoteFilePage>> + Send;
+    ) -> impl Future<Output = api::Result<api::RemoteFilePage>> + Send {
+        async move {
+            Ok(api::RemoteFilePage {
+                page,
+                ..Default::default()
+            })
+        }
+    }
     /// Update the signed-in user's profile or custom status (`users.profile.set`).
     fn update_profile(
         &self,
-        update: api::ProfileUpdate,
-    ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send;
+        _update: api::ProfileUpdate,
+    ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send {
+        async { Ok(slackless_types::Profile::default()) }
+    }
     /// Manually set presence active or away (`presence.set`).
-    fn set_presence(&self, away: bool) -> impl Future<Output = api::Result<()>> + Send;
+    fn set_presence(&self, _away: bool) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Create a new public or private channel (`conversations.create`).
     fn create_channel(
         &self,
@@ -380,124 +437,183 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         channel: ChannelId,
         name: String,
-    ) -> impl Future<Output = api::Result<Conversation>> + Send;
+    ) -> impl Future<Output = api::Result<Conversation>> + Send {
+        async move {
+            Ok(Conversation {
+                id: channel,
+                name: Some(name),
+                ..Default::default()
+            })
+        }
+    }
     /// Archive a channel (`conversations.archive`).
-    fn archive_channel(&self, channel: ChannelId) -> impl Future<Output = api::Result<()>> + Send;
+    fn archive_channel(&self, _channel: ChannelId) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Unarchive a channel (`conversations.unarchive`).
-    fn unarchive_channel(&self, channel: ChannelId)
-    -> impl Future<Output = api::Result<()>> + Send;
+    fn unarchive_channel(
+        &self,
+        _channel: ChannelId,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Invite users to a channel (`conversations.invite`).
     fn invite_to_channel(
         &self,
         channel: ChannelId,
-        users: Vec<UserId>,
-    ) -> impl Future<Output = api::Result<Conversation>> + Send;
+        _users: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<Conversation>> + Send {
+        async move {
+            Ok(Conversation {
+                id: channel,
+                ..Default::default()
+            })
+        }
+    }
     /// Write a single user preference back to Slack (`users.prefs.set`).
     fn set_user_pref(
         &self,
-        name: String,
-        value: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _name: String,
+        _value: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Fetch a user's full profile including custom `fields` and `pronouns` (`users.profile.get`).
     fn user_profile(
         &self,
-        user: UserId,
-    ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send;
+        _user: UserId,
+    ) -> impl Future<Output = api::Result<slackless_types::Profile>> + Send {
+        async { Ok(slackless_types::Profile::default()) }
+    }
     /// Fetch workspace custom profile field definitions (`team.profile.get`).
     fn team_profile_fields(
         &self,
-    ) -> impl Future<Output = api::Result<HashMap<String, String>>> + Send;
+    ) -> impl Future<Output = api::Result<HashMap<String, String>>> + Send {
+        async { Ok(HashMap::new()) }
+    }
     /// Submit a Block Kit modal view (`views.submit`).
     fn views_submit(
         &self,
-        view_id: String,
-        hash: Option<String>,
-        state_values: serde_json::Value,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _view_id: String,
+        _hash: Option<String>,
+        _state_values: serde_json::Value,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Close a Block Kit modal view (`views.close`).
     fn views_close(
         &self,
-        view_id: String,
-        hash: Option<String>,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _view_id: String,
+        _hash: Option<String>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Add a link bookmark inside a folder (`bookmarks.add` with `parent_id`).
     fn add_bookmark_in_folder(
         &self,
-        channel: ChannelId,
-        title: String,
-        url: String,
-        parent_id: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _title: String,
+        _url: String,
+        _parent_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Remove a bookmark (`bookmarks.remove`).
     fn remove_bookmark(
         &self,
-        channel: ChannelId,
-        bookmark_id: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _bookmark_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Fetch cloud-synced drafts (`drafts.list`).
-    fn drafts_list(&self) -> impl Future<Output = api::Result<Vec<api::CloudDraft>>> + Send;
+    fn drafts_list(&self) -> impl Future<Output = api::Result<Vec<api::CloudDraft>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Create a cloud draft (`drafts.create`).
     fn drafts_create(
         &self,
-        channel: ChannelId,
-        text: String,
-    ) -> impl Future<Output = api::Result<Option<String>>> + Send;
+        _channel: ChannelId,
+        _text: String,
+    ) -> impl Future<Output = api::Result<Option<String>>> + Send {
+        async { Ok(None) }
+    }
     /// Update an existing cloud draft (`drafts.update`).
     fn drafts_update(
         &self,
-        draft_id: String,
-        channel: ChannelId,
-        text: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _draft_id: String,
+        _channel: ChannelId,
+        _text: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Delete a cloud draft (`drafts.delete`).
-    fn drafts_delete(&self, draft_id: String) -> impl Future<Output = api::Result<()>> + Send;
+    fn drafts_delete(&self, _draft_id: String) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Fetch dynamic `external_select` options (`blocks.suggestions`).
     #[allow(clippy::too_many_arguments)]
     fn block_suggestions(
         &self,
-        bot: BotId,
-        app_id: String,
-        team: TeamId,
-        action_id: String,
-        block_id: String,
-        value: String,
-        container: ActionContainer,
-    ) -> impl Future<Output = api::Result<Vec<(String, String)>>> + Send;
+        _bot: BotId,
+        _app_id: String,
+        _team: TeamId,
+        _action_id: String,
+        _block_id: String,
+        _value: String,
+        _container: ActionContainer,
+    ) -> impl Future<Output = api::Result<Vec<(String, String)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
     /// Revoke the workspace token server-side (`auth.revoke`, `F-CORE-009`).
-    fn auth_revoke(&self) -> impl Future<Output = api::Result<()>> + Send;
+    fn auth_revoke(&self) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Add a conversation tab (`conversations.addTab`, `F-CORE-061`).
     fn add_conversation_tab(
         &self,
-        channel: ChannelId,
-        tab_type: String,
-        label: Option<String>,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _tab_type: String,
+        _label: Option<String>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Remove a conversation tab (`conversations.removeTab`, `F-CORE-061`).
     fn remove_conversation_tab(
         &self,
-        channel: ChannelId,
-        tab_id: String,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _tab_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Move a conversation tab (`conversations.moveTab`, `F-CORE-061`).
     fn move_conversation_tab(
         &self,
-        channel: ChannelId,
-        tab_id: String,
-        after: Option<String>,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _channel: ChannelId,
+        _tab_id: String,
+        _after: Option<String>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Save a file for Later (`saved.add` with `item_type=file`, `F-CORE-157`).
     fn save_file(
         &self,
-        file_id: String,
-        date_due: Option<u64>,
-    ) -> impl Future<Output = api::Result<()>> + Send;
+        _file_id: String,
+        _date_due: Option<u64>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Permanently delete a user-owned file/clip (`files.delete`, `F-CORE-130`).
-    fn delete_file(&self, file_id: String) -> impl Future<Output = api::Result<()>> + Send;
+    fn delete_file(&self, _file_id: String) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Fetch a live Slack canvas's read-only HTML export (`files.info` + `url_private`, `F-COLLAB-125`).
     fn fetch_canvas_html(
         &self,
-        file_id: String,
-    ) -> impl Future<Output = api::Result<(String, String)>> + Send;
+        _file_id: String,
+    ) -> impl Future<Output = api::Result<(String, String)>> + Send {
+        async { Ok((String::new(), String::new())) }
+    }
 }
 
 impl Backend for SlackApi {

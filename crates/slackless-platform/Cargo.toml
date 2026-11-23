@@ -20,3 +20,6 @@ objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSBundle", "NSDa
 dispatch2 = "0.3.1"
 # Keychain generic passwords.
 security-framework = "3.7.0"
+
+[lints]
+workspace = true

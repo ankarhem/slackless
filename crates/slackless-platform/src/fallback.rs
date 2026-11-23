@@ -7,7 +7,7 @@
 //! pure parser in [`crate::deep_link`]; nothing can be registered with an OS.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use crate::deep_link::{self, DeepLink};
 use crate::{
@@ -72,7 +72,7 @@ impl SecretStore for FallbackPlatform {
     fn store_secret(&self, service: &str, name: &str, secret: &[u8]) -> Result<()> {
         self.secrets
             .lock()
-            .expect("secrets mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert((service.to_string(), name.to_string()), secret.to_vec());
         Ok(())
     }
@@ -80,7 +80,7 @@ impl SecretStore for FallbackPlatform {
     fn load_secret(&self, service: &str, name: &str) -> Result<Vec<u8>> {
         self.secrets
             .lock()
-            .expect("secrets mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&(service.to_string(), name.to_string()))
             .cloned()
             .ok_or_else(|| PlatformError::SecretNotFound {
@@ -92,7 +92,7 @@ impl SecretStore for FallbackPlatform {
     fn delete_secret(&self, service: &str, name: &str) -> Result<()> {
         self.secrets
             .lock()
-            .expect("secrets mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(&(service.to_string(), name.to_string()));
         Ok(())
     }
@@ -109,14 +109,14 @@ impl DeepLinkHandler for FallbackPlatform {
         *self
             .pending_link
             .lock()
-            .expect("pending link mutex poisoned") = Some(link.clone());
+            .unwrap_or_else(PoisonError::into_inner) = Some(link.clone());
         Ok(link)
     }
 
     fn take_link(&self) -> Option<DeepLink> {
         self.pending_link
             .lock()
-            .expect("pending link mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
 }

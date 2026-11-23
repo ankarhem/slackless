@@ -25,3 +25,6 @@ serde.workspace = true
 # engine's test-support only (the kit's would also resolve its optional gpui-fast backend,
 # which needs a proptest this environment's registry lacks).
 gpui = { version = "=0.3.12", package = "gpui-pre", features = ["test-support"] }
+
+[lints]
+workspace = true

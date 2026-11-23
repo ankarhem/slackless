@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
@@ -215,14 +215,14 @@ impl DeepLinkHandler for MacPlatform {
         *self
             .pending_link
             .lock()
-            .expect("pending link mutex poisoned") = Some(link.clone());
+            .unwrap_or_else(PoisonError::into_inner) = Some(link.clone());
         Ok(link)
     }
 
     fn take_link(&self) -> Option<DeepLink> {
         self.pending_link
             .lock()
-            .expect("pending link mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
 }
@@ -278,7 +278,7 @@ define_class!(
         fn show_window(&self, _sender: Option<&AnyObject>) {
             STATUS_ACTIONS
                 .lock()
-                .expect("status actions mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .push_back(StatusBarAction::ShowWindow);
             if let Some(mtm) = MainThreadMarker::new() {
                 let app = NSApplication::sharedApplication(mtm);
@@ -294,7 +294,7 @@ define_class!(
             if tag >= 0 {
                 STATUS_ACTIONS
                     .lock()
-                    .expect("status actions mutex poisoned")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .push_back(StatusBarAction::SwitchWorkspace(tag as usize));
             }
             if let Some(mtm) = MainThreadMarker::new() {
@@ -309,7 +309,7 @@ define_class!(
         fn toggle_dnd(&self, _sender: Option<&AnyObject>) {
             STATUS_ACTIONS
                 .lock()
-                .expect("status actions mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .push_back(StatusBarAction::ToggleDnd);
         }
 
@@ -317,7 +317,7 @@ define_class!(
         fn quit_app(&self, _sender: Option<&AnyObject>) {
             STATUS_ACTIONS
                 .lock()
-                .expect("status actions mutex poisoned")
+                .unwrap_or_else(PoisonError::into_inner)
                 .push_back(StatusBarAction::Quit);
         }
     }
@@ -356,7 +356,7 @@ impl StatusBarItem for MacPlatform {
     fn take_status_bar_action(&self) -> Option<StatusBarAction> {
         STATUS_ACTIONS
             .lock()
-            .expect("status actions mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .pop_front()
     }
 }
