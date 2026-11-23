@@ -1350,32 +1350,47 @@ impl App {
                     &status_picker,
                     window,
                     |this: &mut App, _, event: &StatusEvent, window, cx| {
-                        if let StatusEvent::Save(status) = event {
-                            this.self_state.set_status(status.clone());
-                            this.send_status_to_slack(this.self_state.status.as_ref());
-                            if this
-                                .preferences
-                                .read(cx)
-                                .settings()
-                                .status_pauses_notifications
-                            {
-                                if let Some(st) = status {
-                                    let now = crate::messages::now_secs();
-                                    let mins = st
-                                        .expiration
-                                        .map(|until| {
-                                            ((until.saturating_sub(now) + 59) / 60).clamp(1, 1440)
-                                                as u32
-                                        })
-                                        .unwrap_or(60);
-                                    this.self_state.paused_until = Some(now + i64::from(mins) * 60);
-                                    this.bridge.send(Command::SetDndSnooze { minutes: mins });
-                                } else if this.self_state.paused() {
-                                    this.self_state.paused_until = None;
-                                    this.bridge.send(Command::EndDndSnooze);
+                        match event {
+                            StatusEvent::Save(status) => {
+                                this.self_state.set_status(status.clone());
+                                this.send_status_to_slack(this.self_state.status.as_ref());
+                                if this
+                                    .preferences
+                                    .read(cx)
+                                    .settings()
+                                    .status_pauses_notifications
+                                {
+                                    if let Some(st) = status {
+                                        let now = crate::messages::now_secs();
+                                        let mins = st
+                                            .expiration
+                                            .map(|until| {
+                                                ((until.saturating_sub(now) + 59) / 60)
+                                                    .clamp(1, 1440)
+                                                    as u32
+                                            })
+                                            .unwrap_or(60);
+                                        this.self_state.paused_until =
+                                            Some(now + i64::from(mins) * 60);
+                                        this.bridge.send(Command::SetDndSnooze { minutes: mins });
+                                    } else if this.self_state.paused() {
+                                        this.self_state.paused_until = None;
+                                        this.bridge.send(Command::EndDndSnooze);
+                                    }
                                 }
+                                this.push_self_state(cx);
                             }
-                            this.push_self_state(cx);
+                            StatusEvent::Schedule(sched) => {
+                                this.self_state.scheduled_statuses.push(sched.clone());
+                                let when = crate::messages::clock(sched.starts_at, None);
+                                notify(
+                                    "Status scheduled",
+                                    format!("Will set \"{}\" at {when}.", sched.text),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            StatusEvent::Cancel => {}
                         }
                         window.close_dialog(cx);
                     },
@@ -3462,7 +3477,20 @@ fn subscribe_workspace(
                 }
                 SidebarEvent::ToggleFocus => this.toggle_focus(window, cx),
                 SidebarEvent::FocusDuration(preset) => {
-                    this.self_state.start_focus(*preset);
+                    let auto_status = this.preferences.read(cx).settings().focus_auto_status;
+                    this.self_state
+                        .start_focus_with_status(*preset, auto_status);
+                    if !this.fixtures.sample {
+                        let minutes = crate::status::FOCUS_DURATIONS
+                            .get(*preset)
+                            .and_then(|(_, secs)| *secs)
+                            .map(|secs| ((secs + 59) / 60).clamp(1, 1440) as u32)
+                            .unwrap_or(480);
+                        this.bridge.send(Command::SetDndSnooze { minutes });
+                        if auto_status {
+                            this.send_status_to_slack(this.self_state.status.as_ref());
+                        }
+                    }
                     this.apply_preferences(window, cx);
                 }
                 SidebarEvent::OpenUserMenu => {

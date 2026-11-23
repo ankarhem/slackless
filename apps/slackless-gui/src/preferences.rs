@@ -276,6 +276,12 @@ pub struct Settings {
     pub notify_huddle_invites: bool,
     pub notify_reminders: bool,
     pub keywords: String,
+    /// Comma-separated VIP handles, display names, or user IDs that break through DND/Focus (`F-SHELL-056`, `F-SHELL-057`).
+    pub vip_users: String,
+    /// Allow urgent direct messages to break through Do Not Disturb & Focus mode (`F-SHELL-038`).
+    pub urgent_dm_override: bool,
+    /// Automatically set `"In focus mode"` status while Focus mode is active (`F-SHELL-039`).
+    pub focus_auto_status: bool,
     pub sound: usize,
     pub dm_sound: usize,
     pub show_preview: bool,
@@ -514,6 +520,34 @@ impl Settings {
         };
         on_day && in_hours
     }
+    /// Returns true if `user_id`, `name`, or `display_name` matches any configured VIP entry (`F-SHELL-056`).
+    pub fn is_vip(&self, user_id: &str, name: &str, display_name: &str) -> bool {
+        if self.vip_users.trim().is_empty() {
+            return false;
+        }
+        self.vip_users
+            .split([',', '\n'])
+            .map(|entry| entry.trim().trim_start_matches('@'))
+            .filter(|entry| !entry.is_empty())
+            .any(|vip| {
+                vip.eq_ignore_ascii_case(user_id)
+                    || (!name.is_empty() && vip.eq_ignore_ascii_case(name))
+                    || (!display_name.is_empty() && vip.eq_ignore_ascii_case(display_name))
+            })
+    }
+
+    /// Returns true if an incoming DM should break through DND/Focus as urgent (`F-SHELL-038`).
+    pub fn is_urgent_dm_breakthrough(&self, is_dm: bool, text: &str) -> bool {
+        if !self.urgent_dm_override || !is_dm {
+            return false;
+        }
+        let lower = text.to_ascii_lowercase();
+        lower.contains("[urgent]")
+            || lower.contains("urgent:")
+            || lower.starts_with("urgent ")
+            || text.contains('\u{1F6A8}')
+            || lower.contains(":rotating_light:")
+    }
 }
 
 impl Default for Settings {
@@ -530,6 +564,9 @@ impl Default for Settings {
             notify_huddle_invites: true,
             notify_reminders: true,
             keywords: "deploy, incident".to_owned(),
+            vip_users: String::new(),
+            urgent_dm_override: true,
+            focus_auto_status: true,
             sound: 0,
             dm_sound: 0,
             show_preview: true,
@@ -696,6 +733,7 @@ pub struct Preferences {
     /// The select whose option list is expanded, by id.
     open_select: Option<&'static str>,
     keywords: Entity<TextareaState>,
+    vip_input: Entity<TextareaState>,
     excluded_channels: Entity<TextareaState>,
     proxy_input: Entity<TextareaState>,
     custom_sidebar_hex: Entity<TextareaState>,
@@ -726,6 +764,13 @@ impl Preferences {
                     .placeholder("Add keywords, separated by commas")
                     .auto_grow(1, 3);
                 state.set_value(settings.keywords.clone(), window, cx);
+                state
+            });
+            let vip_input = cx.new(|cx| {
+                let mut state = TextareaState::new(window, cx)
+                    .placeholder("Add VIP names, @handles, or user IDs (comma-separated)")
+                    .auto_grow(1, 2);
+                state.set_value(settings.vip_users.clone(), window, cx);
                 state
             });
             let excluded_channels = cx.new(|cx| {
@@ -773,6 +818,16 @@ impl Preferences {
                     },
                 ),
                 cx.subscribe_in(
+                    &vip_input,
+                    window,
+                    |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            this.settings.vip_users = field.read(cx).value().to_string();
+                            cx.emit(PreferencesEvent::Changed);
+                        }
+                    },
+                ),
+                cx.subscribe_in(
                     &excluded_channels,
                     window,
                     |this: &mut Preferences, field, event: &InputEvent, _, cx| {
@@ -798,6 +853,7 @@ impl Preferences {
                 settings,
                 open_select: None,
                 keywords,
+                vip_input,
                 excluded_channels,
                 proxy_input,
                 custom_sidebar_hex,
@@ -837,6 +893,7 @@ impl Preferences {
         cx: &mut Context<Self>,
     ) {
         let keywords = settings.keywords.clone();
+        let vip_users = settings.vip_users.clone();
         let excluded = settings.excluded_channels.clone();
         let proxy = settings.proxy_url.clone();
         slackless_core::api::set_proxy_url(Some(proxy.clone()));
@@ -845,6 +902,8 @@ impl Preferences {
         self.settings = settings;
         self.keywords
             .update(cx, |state, cx| state.set_value(keywords, window, cx));
+        self.vip_input
+            .update(cx, |state, cx| state.set_value(vip_users, window, cx));
         self.excluded_channels
             .update(cx, |state, cx| state.set_value(excluded, window, cx));
         self.proxy_input
@@ -1490,6 +1549,31 @@ impl Preferences {
             |s| &mut s.bounce_dock,
             cx,
         );
+        let vip_box = div()
+            .w(px(420.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .text_sm()
+            .child(
+                Textarea::new(&self.vip_input)
+                    .appearance(false)
+                    .bordered(false),
+            );
+        let urgent_override = self.checkbox(
+            "notify-urgent-dm-override",
+            "Allow urgent direct messages to break through Do Not Disturb & Focus mode",
+            |s| &mut s.urgent_dm_override,
+            cx,
+        );
+        let focus_status = self.checkbox(
+            "notify-focus-auto-status",
+            "Automatically set 'In focus mode' status during Focus mode",
+            |s| &mut s.focus_auto_status,
+            cx,
+        );
         v_flex()
             .child(self.group(
                 "Notify me about\u{2026}",
@@ -1506,6 +1590,16 @@ impl Preferences {
                     .child(ch_mentions)
                     .child(huddle_invites)
                     .child(reminders),
+                cx,
+            ))
+            .child(self.group(
+                "VIPs & Focus overrides",
+                Some("Messages from VIP colleagues always notify you even during Do Not Disturb or Focus mode."),
+                v_flex()
+                    .gap_2()
+                    .child(vip_box)
+                    .child(urgent_override)
+                    .child(focus_status),
                 cx,
             ))
             .child(self.group(
@@ -3071,5 +3165,16 @@ mod tests {
         s.schedule_days = 2;
         s.schedule_custom_days = [false; 7];
         assert!(!s.notifications_allowed_now());
+
+        s.vip_users = "@ada, U999, Grace Hopper".to_owned();
+        assert!(s.is_vip("U111", "ada", "Ada Lovelace"));
+        assert!(s.is_vip("U999", "bob", "Bob"));
+        assert!(s.is_vip("U222", "grace", "Grace Hopper"));
+        assert!(!s.is_vip("U333", "carol", "Carol"));
+        assert!(s.is_urgent_dm_breakthrough(true, "[URGENT] prod DB down"));
+        assert!(s.is_urgent_dm_breakthrough(true, "\u{1F6A8} page on-call"));
+        assert!(!s.is_urgent_dm_breakthrough(false, "[URGENT] channel chatter"));
+        s.urgent_dm_override = false;
+        assert!(!s.is_urgent_dm_breakthrough(true, "[URGENT] prod DB down"));
     }
 }

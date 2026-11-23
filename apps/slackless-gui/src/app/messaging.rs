@@ -788,6 +788,33 @@ impl App {
                 notify("/status", "Your status was cleared.", window, cx);
             }
             SlashKind::Status => self.open_status_picker(window, cx),
+            SlashKind::Dnd => match parse_dnd_minutes(&invocation.args) {
+                Some(None) => {
+                    self.self_state.paused_until = None;
+                    if !self.fixtures.sample {
+                        self.bridge.send(Command::EndDndSnooze);
+                    }
+                    self.push_self_state(cx);
+                    notify("/dnd", "Notifications resumed.", window, cx);
+                }
+                Some(Some(minutes)) => {
+                    let until = crate::messages::now_secs() + i64::from(minutes) * 60;
+                    self.self_state.paused_until = Some(until);
+                    if !self.fixtures.sample {
+                        self.bridge.send(Command::SetDndSnooze { minutes });
+                    }
+                    self.push_self_state(cx);
+                    notify(
+                        "/dnd",
+                        format!("Notifications paused for {minutes} minutes."),
+                        window,
+                        cx,
+                    );
+                }
+                None => {
+                    notify("/dnd", "Usage: /dnd [30m | 2h | 1h30m | off]", window, cx);
+                }
+            },
             kind => {
                 eprintln!(
                     "slackless: slash command {kind:?} /{} args={:?} in {} (fixture mode: not run)",
@@ -1603,5 +1630,68 @@ impl App {
                     ),
             )
         });
+    }
+}
+
+/// Parse `/dnd` slash-command arguments into `Some(None)` (end DND), `Some(Some(minutes))`,
+/// or `None` for invalid input (`F-SHELL-032`).
+pub(crate) fn parse_dnd_minutes(args: &str) -> Option<Option<u32>> {
+    let trimmed = args.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Some(Some(60));
+    }
+    if matches!(
+        trimmed.as_str(),
+        "off" | "end" | "resume" | "cancel" | "stop" | "0"
+    ) {
+        return Some(None);
+    }
+    if let Ok(mins) = trimmed.parse::<u32>() {
+        return (mins > 0).then(|| Some(mins.clamp(1, 1440)));
+    }
+    let mut total: u32 = 0;
+    let mut num: u32 = 0;
+    let mut saw_digit = false;
+    let mut saw_unit = false;
+    for ch in trimmed.chars() {
+        if let Some(d) = ch.to_digit(10) {
+            num = num.saturating_mul(10).saturating_add(d);
+            saw_digit = true;
+        } else if ch == 'h' && saw_digit {
+            total = total.saturating_add(num.saturating_mul(60));
+            num = 0;
+            saw_digit = false;
+            saw_unit = true;
+        } else if ch == 'm' && saw_digit {
+            total = total.saturating_add(num);
+            num = 0;
+            saw_digit = false;
+            saw_unit = true;
+        } else if ch.is_whitespace() {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    if saw_digit && saw_unit {
+        total = total.saturating_add(num);
+    }
+    (saw_unit && total > 0).then(|| Some(total.clamp(1, 1440)))
+}
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::parse_dnd_minutes;
+
+    #[test]
+    fn parses_dnd_slash_command_durations() {
+        assert_eq!(parse_dnd_minutes(""), Some(Some(60)));
+        assert_eq!(parse_dnd_minutes("off"), Some(None));
+        assert_eq!(parse_dnd_minutes("RESUME"), Some(None));
+        assert_eq!(parse_dnd_minutes("30"), Some(Some(30)));
+        assert_eq!(parse_dnd_minutes("45m"), Some(Some(45)));
+        assert_eq!(parse_dnd_minutes("2h"), Some(Some(120)));
+        assert_eq!(parse_dnd_minutes("1h30m"), Some(Some(90)));
+        assert_eq!(parse_dnd_minutes("banana"), None);
     }
 }

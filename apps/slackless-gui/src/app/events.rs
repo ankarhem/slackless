@@ -131,6 +131,7 @@ impl App {
                     state,
                     due: item.date_due,
                     fired: false,
+                    is_todo: false,
                 }
             })
             .collect();
@@ -547,10 +548,7 @@ impl App {
                         cx.notify();
                     }
                 }
-                if !settings.desktop_notifications
-                    || self.self_state.paused()
-                    || !settings.notifications_allowed_now()
-                {
+                if !settings.desktop_notifications {
                     return;
                 }
                 let Some(snap) = snap else {
@@ -567,6 +565,21 @@ impl App {
                     return;
                 };
                 let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
+                let sender_is_vip = message.user.as_ref().is_some_and(|u| {
+                    let user_obj = snap.user(u);
+                    let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");
+                    let display = user_obj.map(|x| x.display_name()).unwrap_or("");
+                    settings.is_vip(u.as_str(), handle, display)
+                });
+                let breakthrough =
+                    sender_is_vip || settings.is_urgent_dm_breakthrough(dm, &message.text);
+                if !breakthrough
+                    && (self.self_state.paused()
+                        || self.self_state.focused()
+                        || !settings.notifications_allowed_now())
+                {
+                    return;
+                }
                 let mentioned = mentions_me(&message.text, &snap.self_user, &settings.keywords);
                 let wanted = match (level, settings.notify_level) {
                     (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,
@@ -1986,10 +1999,29 @@ impl App {
     ) -> bool {
         let me = &self.fixtures.self_user;
         let settings = self.preferences.read(cx).settings();
-        if !settings.desktop_notifications
-            || message.user.as_ref() == Some(me)
-            || self.self_state.paused()
-            || !settings.notifications_allowed_now()
+        if !settings.desktop_notifications || message.user.as_ref() == Some(me) {
+            return false;
+        }
+        let dm = self
+            .fixtures
+            .conversation(channel)
+            .is_some_and(|conversation| {
+                matches!(
+                    conversation.kind(),
+                    ConversationKind::Im | ConversationKind::Mpim
+                )
+            });
+        let sender_is_vip = message.user.as_ref().is_some_and(|u| {
+            let user_obj = self.fixtures.user(u);
+            let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");
+            let display = user_obj.map(|x| x.display_name()).unwrap_or("");
+            settings.is_vip(u.as_str(), handle, display)
+        });
+        let breakthrough = sender_is_vip || settings.is_urgent_dm_breakthrough(dm, &message.text);
+        if !breakthrough
+            && (self.self_state.paused()
+                || self.self_state.focused()
+                || !settings.notifications_allowed_now())
         {
             return false;
         }
@@ -2013,18 +2045,12 @@ impl App {
             return false;
         }
         let level = self.fixtures.notify_levels.get(channel).copied();
-        if level == Some(NotifyLevel::Muted) {
+        if level == Some(NotifyLevel::Muted) && !breakthrough {
             return false;
         }
-        let dm = self
-            .fixtures
-            .conversation(channel)
-            .is_some_and(|conversation| {
-                matches!(
-                    conversation.kind(),
-                    ConversationKind::Im | ConversationKind::Mpim
-                )
-            });
+        if breakthrough {
+            return true;
+        }
         let mentioned = mentions_me(&message.text, me, &settings.keywords);
         let wanted = match (level, settings.notify_level) {
             (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,

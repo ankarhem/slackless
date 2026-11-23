@@ -503,6 +503,7 @@ impl App {
     /// Slack's focus mode (the rail's moon): on with Slack's default "Don't turn off", or off.
     /// Syncs DND snooze & automatic focus status with Slack in live mode (`F-SHELL-036`).
     pub(super) fn toggle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let auto_status = self.preferences.read(cx).settings().focus_auto_status;
         if self.self_state.focused() {
             self.self_state.end_focus();
             if !self.fixtures.sample {
@@ -510,18 +511,21 @@ impl App {
                 self.send_status_to_slack(self.self_state.status.as_ref());
             }
         } else {
-            self.self_state.start_focus(FOCUS_UNTIL_OFF);
+            self.self_state
+                .start_focus_with_status(FOCUS_UNTIL_OFF, auto_status);
             if !self.fixtures.sample {
                 // Default 8-hour DND snooze for indefinite focus mode.
                 self.bridge.send(Command::SetDndSnooze { minutes: 480 });
-                self.send_status_to_slack(self.self_state.status.as_ref());
+                if auto_status {
+                    self.send_status_to_slack(self.self_state.status.as_ref());
+                }
             }
         }
         self.apply_preferences(window, cx);
     }
 
-    /// End a timed focus mode or expired custom status once its Duration ran out (checked on
-    /// the reminder poll).
+    /// End a timed focus mode or expired custom status once its Duration ran out, and activate
+    /// any scheduled statuses whose start time has arrived (checked on the reminder poll).
     pub(super) fn expire_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.self_state.focus_until.is_some() && !self.self_state.focused() {
             self.self_state.end_focus();
@@ -529,6 +533,18 @@ impl App {
         }
         if self.self_state.expire_status() {
             self.push_self_state(cx);
+        }
+        if let Some(activated) = self.self_state.activate_due_scheduled() {
+            if !self.fixtures.sample {
+                self.send_status_to_slack(Some(&activated));
+            }
+            self.push_self_state(cx);
+            notify(
+                "Scheduled status active",
+                format!("{} {}", activated.glyph(), activated.text),
+                window,
+                cx,
+            );
         }
     }
 

@@ -226,13 +226,21 @@ pub enum LaterState {
     Completed,
 }
 
-/// One saved message.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum LaterFilter {
+    #[default]
+    All,
+    Saved,
+    Todos,
+}
+
+/// One saved message or standalone personal to-do (`F-CORE-161`..`166`).
 #[derive(Clone)]
 pub struct LaterItem {
     pub workspace: usize,
     pub channel: ChannelId,
     pub ts: Ts,
-    /// Conversation label (`# name` / peer names).
+    /// Conversation label (`# name` / peer names / `"To-dos"`).
     pub label: String,
     pub author: String,
     pub text: String,
@@ -241,6 +249,8 @@ pub struct LaterItem {
     pub due: Option<u64>,
     /// The reminder already fired (overdue items stay listed, flagged red).
     pub fired: bool,
+    /// `true` when this item is a personal To-do or moved from Saved to To-dos (`F-CORE-162`, `165`).
+    pub is_todo: bool,
 }
 
 impl LaterItem {
@@ -284,6 +294,9 @@ pub enum LaterEvent {
 pub struct LaterView {
     workspace: usize,
     tab: LaterState,
+    filter: LaterFilter,
+    creating_todo: bool,
+    todo_input: Option<Entity<TextareaState>>,
     items: Vec<LaterItem>,
     /// Workspaces already seeded from fixtures.
     seeded: HashSet<usize>,
@@ -296,9 +309,48 @@ impl LaterView {
         cx.new(|_| LaterView {
             workspace: 0,
             tab: LaterState::InProgress,
+            filter: LaterFilter::All,
+            creating_todo: false,
+            todo_input: None,
             items: Vec::new(),
             seeded: HashSet::new(),
         })
+    }
+
+    /// Create a standalone personal to-do item in the current workspace (`F-CORE-162`).
+    pub fn add_todo(&mut self, text: String, cx: &mut Context<Self>) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let ts = Ts::from(format!("{}.{:06}", now_secs(), self.items.len()));
+        self.items.insert(
+            0,
+            LaterItem {
+                workspace: self.workspace,
+                channel: ChannelId::from("TODO"),
+                ts,
+                label: "To-dos".to_owned(),
+                author: "Personal to-do".to_owned(),
+                text: trimmed.to_owned(),
+                state: LaterState::InProgress,
+                due: None,
+                fired: false,
+                is_todo: true,
+            },
+        );
+        self.tab = LaterState::InProgress;
+        cx.emit(LaterEvent::Changed);
+        cx.notify();
+    }
+
+    /// Toggle whether item `ix` lives in To-dos or Saved (`F-CORE-165`).
+    pub fn toggle_todo(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(item) = self.items.get_mut(ix) {
+            item.is_todo = !item.is_todo;
+            cx.emit(LaterEvent::Changed);
+            cx.notify();
+        }
     }
 
     pub fn set_workspace(&mut self, workspace: usize, cx: &mut Context<Self>) {
@@ -379,6 +431,7 @@ impl LaterView {
                 due,
                 // A seeded overdue reminder shows as overdue without notifying at startup.
                 fired: due.is_some_and(|due| due <= now),
+                is_todo: false,
             });
         }
         cx.emit(LaterEvent::Changed);
@@ -422,6 +475,7 @@ impl LaterView {
                     state: LaterState::InProgress,
                     due: request.due,
                     fired: false,
+                    is_todo: false,
                 },
             ),
         }
@@ -658,13 +712,44 @@ impl Render for LaterView {
                     .on_click(cx.listener(move |this, _, _, cx| this.show(tab, cx)))
             }));
 
+        let filter = self.filter;
+        let filter_pills = h_flex().ml_auto().items_center().gap_1().children(
+            [
+                (LaterFilter::All, "All"),
+                (LaterFilter::Saved, "Saved"),
+                (LaterFilter::Todos, "To-dos"),
+            ]
+            .into_iter()
+            .map(|(f, label)| {
+                let on = f == filter;
+                Button::new(SharedString::from(format!("later-filter-{label}")))
+                    .when(on, |b| b.primary())
+                    .when(!on, |b| b.ghost())
+                    .with_size(Size::XSmall)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.filter = f;
+                        cx.notify();
+                    }))
+            }),
+        );
+        let tab_row = tab_row.child(filter_pills);
+
         let tab = self.tab;
         let ws = self.workspace;
         let shown: Vec<(usize, LaterItem)> = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.workspace == ws && item.state == tab)
+            .filter(|(_, item)| {
+                item.workspace == ws
+                    && item.state == tab
+                    && match filter {
+                        LaterFilter::All => true,
+                        LaterFilter::Saved => !item.is_todo,
+                        LaterFilter::Todos => item.is_todo,
+                    }
+            })
             .map(|(ix, item)| (ix, item.clone()))
             .collect();
         let rows: Vec<_> = shown
@@ -733,14 +818,32 @@ impl Render for LaterView {
                         );
                     }
                 }
-                actions = actions.child(
-                    Button::new(("later-remove", ix))
-                        .ghost()
-                        .with_size(Size::Small)
-                        .icon(IconName::Trash)
-                        .tooltip("Remove from Later")
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove(ix, cx))),
-                );
+                let is_todo_item = item.is_todo;
+                actions = actions
+                    .child(
+                        Button::new(("later-toggle-todo", ix))
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(if is_todo_item {
+                                IconName::Bookmark
+                            } else {
+                                IconName::ListChecks
+                            })
+                            .tooltip(if is_todo_item {
+                                "Move to Saved"
+                            } else {
+                                "Move to To-dos"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_todo(ix, cx))),
+                    )
+                    .child(
+                        Button::new(("later-remove", ix))
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::Trash)
+                            .tooltip("Remove from Later")
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove(ix, cx))),
+                    );
                 let (workspace, channel) = (item.workspace, item.channel.clone());
                 let completed = item.state == LaterState::Completed;
                 h_flex()
@@ -841,6 +944,58 @@ impl Render for LaterView {
                 })
         });
 
+        let todo_composer = (self.creating_todo)
+            .then(|| self.todo_input.clone())
+            .flatten()
+            .map(|input| {
+                let input_add = input.clone();
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(Textarea::new(&input).appearance(false).bordered(false)),
+                    )
+                    .child(
+                        Button::new("later-todo-add")
+                            .primary()
+                            .with_size(Size::Small)
+                            .label("Add")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let text = input_add.read(cx).value().to_string();
+                                if !text.trim().is_empty() {
+                                    this.add_todo(text, cx);
+                                    input_add.update(cx, |st, cx| {
+                                        st.set_value(String::new(), window, cx);
+                                    });
+                                    this.creating_todo = false;
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("later-todo-cancel")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.creating_todo = false;
+                                cx.notify();
+                            })),
+                    )
+            });
+
         v_flex()
             .size_full()
             .child(
@@ -856,13 +1011,33 @@ impl Render for LaterView {
                             .gap_2()
                             .text_lg()
                             .font_weight(FontWeight::BOLD)
-                            // Slack's sidebar row and page are both "Saved".
-                            .child("Saved"),
+                            // Slack's sidebar row and page cover Saved & To-dos.
+                            .child("Saved & To-dos"),
                     )
                     .child(
                         h_flex()
                             .items_center()
                             .gap_2()
+                            .child(
+                                Button::new("later-new-todo")
+                                    .primary()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Plus)
+                                    .label("New to-do")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.creating_todo = !this.creating_todo;
+                                        if this.creating_todo && this.todo_input.is_none() {
+                                            let input = cx.new(|cx| {
+                                                TextareaState::new(window, cx)
+                                                    .placeholder("What do you need to get done?")
+                                                    .auto_grow(1, 2)
+                                            });
+                                            input.read(cx).focus_handle(cx).focus(window, cx);
+                                            this.todo_input = Some(input);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
                             .when(
                                 tab == LaterState::Completed
                                     && self.count(LaterState::Completed) > 0,
@@ -901,6 +1076,7 @@ impl Render for LaterView {
                     ),
             )
             .child(tab_row)
+            .children(todo_composer)
             .child(
                 v_flex()
                     .id("later-list")
@@ -1005,6 +1181,7 @@ mod tests {
                     state: LaterState::InProgress,
                     due: Some(u64::MAX),
                     fired: false,
+                    is_todo: false,
                 }],
                 cx,
             );

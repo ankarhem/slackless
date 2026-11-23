@@ -877,9 +877,108 @@ impl App {
                 tz_in.clone(),
                 loaded_fields.clone(),
             );
+            let this_photo = this.clone();
             dialog.title("Edit your profile").w(px(460.)).child(
                 v_flex()
                     .gap_3()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Profile photo"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child("PNG, JPG, GIF or WebP up to 10 MB"),
+                                    ),
+                            )
+                            .child(
+                                Button::new("profile-upload-photo")
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Image)
+                                    .label("Upload photo\u{2026}")
+                                    .on_click(move |_, window, cx| {
+                                        let this_u = this_photo.clone();
+                                        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                            files: true,
+                                            directories: false,
+                                            multiple: false,
+                                            prompt: Some("Choose profile photo".into()),
+                                        });
+                                        window
+                                            .spawn(cx, async move |cx| {
+                                                let Ok(Ok(Some(paths))) = rx.await else {
+                                                    return;
+                                                };
+                                                let Some(path) = paths.into_iter().next() else {
+                                                    return;
+                                                };
+                                                let filename = path
+                                                    .file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_else(|| "avatar.png".to_owned());
+                                                let bytes = match std::fs::read(&path) {
+                                                    Ok(b) if b.len() <= 10 * 1024 * 1024 => b,
+                                                    Ok(_) => {
+                                                        let _ = cx.update(|window, cx| {
+                                                            notify(
+                                                                "Photo too large",
+                                                                "Choose an image smaller than 10 MB.",
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                        return;
+                                                    }
+                                                    Err(err) => {
+                                                        let _ = cx.update(|window, cx| {
+                                                            notify(
+                                                                "Could not read photo",
+                                                                err.to_string(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                        return;
+                                                    }
+                                                };
+                                                let _ = cx.update(|window, cx| {
+                                                    let _ = this_u.update(cx, |app, _| {
+                                                        if !app.fixtures.sample {
+                                                            app.bridge.send(
+                                                                Command::SetUserPhoto {
+                                                                    filename: filename.clone(),
+                                                                    bytes,
+                                                                },
+                                                            );
+                                                        }
+                                                    });
+                                                    notify(
+                                                        "Profile photo",
+                                                        format!("Uploading {filename}\u{2026}"),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            })
+                                            .detach();
+                                    }),
+                            ),
+                    )
                     .child(field("Display name", &display_in))
                     .child(field("Title", &title_in))
                     .child(field("Phone", &phone_in))

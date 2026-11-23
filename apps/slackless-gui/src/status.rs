@@ -23,7 +23,7 @@ use gpui_kit::base::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _,
@@ -172,6 +172,16 @@ impl UserStatus {
     }
 }
 
+/// A future status scheduled to activate automatically at `starts_at` (`F-SHELL-018`, `F-SHELL-019`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ScheduledStatus {
+    pub emoji: String,
+    pub text: String,
+    pub starts_at: i64,
+    pub clear_after: usize,
+    pub pause: bool,
+}
+
 /// The signed-in user's status, presence and notification pause.
 #[derive(Clone, Default)]
 pub struct SelfState {
@@ -184,6 +194,8 @@ pub struct SelfState {
     pub focus_until: Option<i64>,
     /// The focus Duration in effect, an index into [`FOCUS_DURATIONS`].
     pub focus_preset: usize,
+    /// Pending scheduled statuses that activate automatically when `starts_at <= now` (`F-SHELL-018`).
+    pub scheduled_statuses: Vec<ScheduledStatus>,
 }
 
 /// Focus mode's Duration choices: label and length in seconds (`None`: "Don't turn off").
@@ -220,13 +232,40 @@ impl SelfState {
 
     /// Turn focus mode on with the Duration [`FOCUS_DURATIONS`]`[preset]`, or re-time it. Like
     /// Slack it sets the telescope's "In focus mode" status unless a status is already set.
+    #[allow(dead_code)]
     pub fn start_focus(&mut self, preset: usize) {
+        self.start_focus_with_status(preset, true);
+    }
+
+    /// Turn focus mode on with `preset`, optionally setting the automatic `"In focus mode"`
+    /// status when `auto_status` is true (`F-SHELL-037`, `F-SHELL-039`).
+    pub fn start_focus_with_status(&mut self, preset: usize, auto_status: bool) {
         let duration = FOCUS_DURATIONS[preset].1;
         self.focus_preset = preset;
         self.focus_until = Some(duration.map_or(i64::MAX, |secs| now_secs() + secs));
-        if self.status.is_none() {
+        if auto_status && self.status.is_none() {
             self.status = Some(focus_status());
         }
+    }
+
+    /// Pop and activate the earliest due scheduled status whose `starts_at <= now`, if any (`F-SHELL-018`).
+    pub fn activate_due_scheduled(&mut self) -> Option<UserStatus> {
+        let now = now_secs();
+        let ix = self
+            .scheduled_statuses
+            .iter()
+            .position(|s| s.starts_at <= now)?;
+        let sched = self.scheduled_statuses.remove(ix);
+        let mut status = UserStatus {
+            emoji: sched.emoji,
+            text: sched.text,
+            clear_after: sched.clear_after,
+            pause: sched.pause,
+            expiration: None,
+        };
+        status.expiration = status.clears_at();
+        self.set_status(Some(status.clone()));
+        Some(status)
     }
 
     /// Turn focus mode off, clearing its automatic status (a status the user set stays).
@@ -340,6 +379,8 @@ pub fn self_avatar(fixtures: &Fixtures, state: &SelfState, size: f32, ring: Hsla
 pub enum StatusEvent {
     /// The status to set; `None` clears it.
     Save(Option<UserStatus>),
+    /// Schedule a status to activate automatically at a future time (`F-SHELL-018`).
+    Schedule(ScheduledStatus),
     Cancel,
 }
 
@@ -791,9 +832,81 @@ impl Render for StatusPicker {
                     .disabled(!self.has_text)
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             );
-        let details = self
-            .has_text
-            .then(|| v_flex().gap_4().child(clear_select).child(pause));
+        let schedule_row = v_flex()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child("Or schedule for later"),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .child(
+                        Button::new("status-sched-1h")
+                            .outline()
+                            .with_size(gpui_kit::component::Size::XSmall)
+                            .label("In 1 hour")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let text = this.text.read(cx).value().trim().to_owned();
+                                if !text.is_empty() {
+                                    cx.emit(StatusEvent::Schedule(ScheduledStatus {
+                                        emoji: this.emoji.clone(),
+                                        text,
+                                        starts_at: PauseLength::Seconds(3_600).until(),
+                                        clear_after: this.clear_after,
+                                        pause: this.pause,
+                                    }));
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("status-sched-tomorrow")
+                            .outline()
+                            .with_size(gpui_kit::component::Size::XSmall)
+                            .label("Tomorrow 9:00 AM")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let text = this.text.read(cx).value().trim().to_owned();
+                                if !text.is_empty() {
+                                    cx.emit(StatusEvent::Schedule(ScheduledStatus {
+                                        emoji: this.emoji.clone(),
+                                        text,
+                                        starts_at: PauseLength::Days(1).until(),
+                                        clear_after: this.clear_after,
+                                        pause: this.pause,
+                                    }));
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("status-sched-next-week")
+                            .outline()
+                            .with_size(gpui_kit::component::Size::XSmall)
+                            .label("Next week 9:00 AM")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let text = this.text.read(cx).value().trim().to_owned();
+                                if !text.is_empty() {
+                                    cx.emit(StatusEvent::Schedule(ScheduledStatus {
+                                        emoji: this.emoji.clone(),
+                                        text,
+                                        starts_at: PauseLength::Days(7).until(),
+                                        clear_after: this.clear_after,
+                                        pause: this.pause,
+                                    }));
+                                }
+                            })),
+                    ),
+            );
+        let details = self.has_text.then(|| {
+            v_flex()
+                .gap_3()
+                .child(clear_select)
+                .child(pause)
+                .child(schedule_row)
+        });
 
         v_flex()
             .w_full()
@@ -1453,7 +1566,32 @@ fn parse_until_time(text: &str, now: i64, offset: i64) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_until_time;
+    use super::{ScheduledStatus, SelfState, parse_until_time};
+
+    #[test]
+    fn activates_due_scheduled_statuses_in_order() {
+        let mut state = SelfState::default();
+        state.scheduled_statuses.push(ScheduledStatus {
+            emoji: "palm_tree".to_owned(),
+            text: "Future PTO".to_owned(),
+            starts_at: i64::MAX - 10,
+            clear_after: 0,
+            pause: true,
+        });
+        state.scheduled_statuses.push(ScheduledStatus {
+            emoji: "spiral_calendar_pad".to_owned(),
+            text: "Standup".to_owned(),
+            starts_at: 1,
+            clear_after: 1,
+            pause: false,
+        });
+        let active = state
+            .activate_due_scheduled()
+            .expect("past scheduled status should activate");
+        assert_eq!(active.text, "Standup");
+        assert_eq!(state.scheduled_statuses.len(), 1);
+        assert!(state.activate_due_scheduled().is_none());
+    }
 
     /// 2024-03-07 10:00:00 UTC (`offset` 0 in the calls below).
     const NOW: i64 = 1_709_805_600;
