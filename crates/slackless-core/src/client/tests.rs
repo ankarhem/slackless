@@ -56,6 +56,8 @@ struct FakeState {
     recent_calls: Vec<(ChannelId, u32)>,
     /// `conversations.mark` asks, in order.
     mark_calls: Vec<(ChannelId, Ts)>,
+    /// `subscriptions.thread.mark` asks, in order.
+    thread_mark_calls: Vec<(ChannelId, Ts, Ts)>,
     /// `chat.postMessage` asks, in order.
     posted_messages: Vec<(ChannelId, String)>,
     /// When true, `post_message` fails with a Slack error (for offline retry tests).
@@ -850,6 +852,15 @@ impl Backend for FakeBackend {
         Err(ApiError::AuthExpired("invalid_auth".into()))
     }
 
+    async fn mark_thread_read(&self, channel: ChannelId, thread_ts: Ts, ts: Ts) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .thread_mark_calls
+            .push((channel, thread_ts, ts));
+        Ok(())
+    }
+
     async fn mark_all_read(&self) -> api::Result<()> {
         Err(ApiError::AuthExpired("invalid_auth".into()))
     }
@@ -1418,6 +1429,27 @@ async fn following_a_thread_tells_slack_then_rereads_the_thread() {
         vec![(Ts::from("5.0"), Ts::from("5.0.1"), true)]
     );
     assert_eq!(fake.reply_calls(), vec![(Ts::from("5.0"), None)]);
+}
+
+#[tokio::test]
+async fn mark_thread_read_posts_thread_cursor() {
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    core.handle(Command::MarkThreadRead {
+        channel: c1(),
+        thread_ts: Ts::from("5.0"),
+        ts: Ts::from("5.0.3"),
+    });
+    // Flush the spawned task by following with a synchronous-event command.
+    core.handle(Command::FetchChannelManagers { channel: c1() });
+    let _ = next(&mut rx).await;
+
+    assert_eq!(
+        fake.state.lock().unwrap().thread_mark_calls,
+        vec![(c1(), Ts::from("5.0"), Ts::from("5.0.3"))]
+    );
 }
 
 #[tokio::test]

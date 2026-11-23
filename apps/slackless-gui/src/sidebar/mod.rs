@@ -532,6 +532,14 @@ impl Sidebar {
         cx.notify();
     }
 
+    pub fn has_thread_unreads(&self) -> bool {
+        self.threads_unread.0 || self.threads_unread.1 > 0
+    }
+
+    pub fn thread_mentions(&self) -> u32 {
+        self.threads_unread.1
+    }
+
     /// Live mode: `channel`'s newest message as just re-read from the store, so the DM list's
     /// preview, stamp and order follow it before the next snapshot.
     pub fn set_latest(

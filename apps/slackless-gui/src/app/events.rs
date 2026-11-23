@@ -644,9 +644,36 @@ impl App {
                 cx.notify();
             }
             Event::ThreadsView(view) => {
+                let total_unread = view.total_unread_replies;
                 self.threads
                     .update(cx, |threads, cx| threads.set_remote((**view).clone(), cx));
+                if total_unread == 0 {
+                    self.sidebar
+                        .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+                } else if self.threads_open {
+                    let settings = self.preferences.read(cx).settings().clone();
+                    let allow_mark = settings.mark_read != 2
+                        && (!settings.no_bg_mark_read || self.window_active);
+                    if allow_mark {
+                        self.auto_mark_threads_view_read(cx);
+                    }
+                }
                 cx.notify();
+            }
+            Event::ThreadReadMarker {
+                channel,
+                thread_ts,
+                last_read,
+            } => {
+                if let Some(cursor) = last_read {
+                    self.ws
+                        .marked_threads
+                        .insert((channel.clone(), thread_ts.clone()), cursor.clone());
+                }
+                self.threads.update(cx, |threads, cx| {
+                    threads.mark_thread_read(channel, thread_ts, last_read.as_ref(), false, cx);
+                });
+                self.sync_thread_sidebar_counts(cx);
             }
             Event::ActivityView { feed } => match feed.as_deref() {
                 Ok(feed) => {
@@ -1213,9 +1240,34 @@ impl App {
             this.update(cx, |app, cx| {
                 if app.thread_generation == generation {
                     app.resolve_named_users(&messages);
+                    let newest = (messages.len() > 1)
+                        .then(|| messages.last().map(|m| m.ts.clone()))
+                        .flatten();
+                    let root_has_unread =
+                        messages
+                            .first()
+                            .zip(newest.as_ref())
+                            .is_some_and(|(root, last)| {
+                                root.last_read.as_ref().is_some_and(|lr| last > lr)
+                            });
                     app.thread.update(cx, |panel, cx| {
-                        panel.set_thread(channel, thread_ts, messages, cx)
+                        panel.set_thread(channel.clone(), thread_ts.clone(), messages, cx)
                     });
+                    if app.thread_open {
+                        let settings = app.preferences.read(cx).settings().clone();
+                        let allow_mark = settings.mark_read != 2
+                            && (!settings.no_bg_mark_read || app.window_active);
+                        if allow_mark {
+                            if let Some(newest) = newest {
+                                let should_mark = root_has_unread
+                                    || app.threads.read(cx).is_thread_unread(&channel, &thread_ts)
+                                    || app.sidebar.read(cx).has_thread_unreads();
+                                if should_mark {
+                                    app.mark_thread_read(channel, thread_ts, newest, false, cx);
+                                }
+                            }
+                        }
+                    }
                 }
             })
         })

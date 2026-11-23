@@ -382,6 +382,25 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `subscriptions.thread.mark`: update the read cursor of a single thread (`read=1` marks
+    /// replies up to and including `ts` as read; moving `ts` earlier marks newer replies unread).
+    pub async fn subscriptions_thread_mark(
+        &self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        ts: &Ts,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("thread_ts", thread_ts.to_string()),
+            ("ts", ts.to_string()),
+            ("read", "1".to_owned()),
+        ];
+        self.call::<Empty>(method::SUBSCRIPTIONS_THREAD_MARK, params)
+            .await?;
+        Ok(())
+    }
+
     /// `conversations.open`: opens (or finds) the DM with `users`, a comma-separated id list.
     /// `return_im` makes a single-user call answer one `channel` object.
     pub async fn conversations_open(&self, users: &str) -> Result<Conversation> {

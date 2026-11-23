@@ -887,6 +887,13 @@ impl<B: Backend> Core<B> {
             Command::MarkRead { channel, ts } => self.spawn("conversations.mark", async move {
                 Ok(backend.mark_read(channel, ts).await?)
             }),
+            Command::MarkThreadRead {
+                channel,
+                thread_ts,
+                ts,
+            } => self.spawn("subscriptions.thread.mark", async move {
+                Ok(backend.mark_thread_read(channel, thread_ts, ts).await?)
+            }),
             Command::MarkAllRead => self.spawn("users.markAllRead", async move {
                 backend.mark_all_read().await?;
                 events.emit(Event::Counts(Box::new(backend.counts().await?)));

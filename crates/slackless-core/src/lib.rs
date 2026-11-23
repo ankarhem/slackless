@@ -162,6 +162,12 @@ pub enum Command {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Move the read cursor of a thread to `ts` (`subscriptions.thread.mark`).
+    MarkThreadRead {
+        channel: ChannelId,
+        thread_ts: Ts,
+        ts: Ts,
+    },
     /// Mark every conversation and thread read (`users.markAllRead`, Slack's Shift+Esc),
     /// then re-read the unread counts.
     MarkAllRead,
@@ -527,6 +533,12 @@ pub enum Event {
     Counts(Box<api::ClientCounts>),
     /// The read cursor of `channel` moved to `ts` (possibly from another client).
     ReadMarker { channel: ChannelId, ts: Ts },
+    /// The read cursor of a thread moved (`thread_marked`, possibly from another client).
+    ThreadReadMarker {
+        channel: ChannelId,
+        thread_ts: Ts,
+        last_read: Option<Ts>,
+    },
     /// A message was just posted (live, over the websocket; not history or edits), after
     /// [`Event::StoreChanged`] for its channel: what notifications are decided from.
     MessagePosted {

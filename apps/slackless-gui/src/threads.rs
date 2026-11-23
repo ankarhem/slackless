@@ -76,6 +76,12 @@ pub enum ThreadPanelEvent {
         last_read: Ts,
         subscribed: bool,
     },
+    /// User marked a message inside the thread unread; move the thread's read cursor back to `ts`.
+    MarkThreadRead {
+        channel: ChannelId,
+        thread_ts: Ts,
+        ts: Ts,
+    },
     /// The user reacted to, edited or deleted a message of the open thread (already shown
     /// here); the root posts the change to Slack.
     Changed {
@@ -824,7 +830,22 @@ impl ThreadPanel {
     }
 
     fn mark_unread(&mut self, ts: Ts, cx: &mut Context<Self>) {
+        let cursor = self
+            .root
+            .iter()
+            .chain(&self.replies)
+            .take_while(|m| m.ts < ts)
+            .last()
+            .map(|m| m.ts.clone())
+            .unwrap_or_else(|| crate::threads_cards::ts_just_before(&ts));
         self.unread_after = Some(ts);
+        if let Some((channel, thread_ts)) = self.thread.clone() {
+            cx.emit(ThreadPanelEvent::MarkThreadRead {
+                channel,
+                thread_ts,
+                ts: cursor,
+            });
+        }
         cx.notify();
     }
 

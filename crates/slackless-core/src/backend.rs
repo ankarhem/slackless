@@ -243,6 +243,13 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn search(&self, query: String) -> impl Future<Output = api::Result<SearchMessages>> + Send;
     fn mark_read(&self, channel: ChannelId, ts: Ts)
     -> impl Future<Output = api::Result<()>> + Send;
+    /// Move the read cursor of a thread (`subscriptions.thread.mark`).
+    fn mark_thread_read(
+        &self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        ts: Ts,
+    ) -> impl Future<Output = api::Result<()>> + Send;
     /// Mark every conversation and thread read (`users.markAllRead`).
     fn mark_all_read(&self) -> impl Future<Output = api::Result<()>> + Send;
     /// Follow or unfollow a thread (`subscriptions.thread.add` / `.remove`); `last_read` is
@@ -951,6 +958,11 @@ impl Backend for SlackApi {
 
     async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
         self.conversations_mark(&channel, &ts).await
+    }
+
+    async fn mark_thread_read(&self, channel: ChannelId, thread_ts: Ts, ts: Ts) -> api::Result<()> {
+        self.subscriptions_thread_mark(&channel, &thread_ts, &ts)
+            .await
     }
 
     async fn mark_all_read(&self) -> api::Result<()> {

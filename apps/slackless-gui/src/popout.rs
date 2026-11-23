@@ -636,7 +636,25 @@ impl PopoutWindow {
                 }
             }
             MessageAction::MarkUnread => {
-                (self.send)(Command::MarkRead { channel, ts });
+                match &self.kind {
+                    PopoutKind::Thread { thread_ts, .. } => {
+                        let cursor = self
+                            .messages
+                            .iter()
+                            .take_while(|m| m.ts < ts)
+                            .last()
+                            .map(|m| m.ts.clone())
+                            .unwrap_or_else(|| crate::threads_cards::ts_just_before(&ts));
+                        (self.send)(Command::MarkThreadRead {
+                            channel,
+                            thread_ts: thread_ts.clone(),
+                            ts: cursor,
+                        });
+                    }
+                    _ => {
+                        (self.send)(Command::MarkRead { channel, ts });
+                    }
+                }
                 actions::notify("Marked unread", String::new(), window, cx);
             }
             MessageAction::Edit => {

@@ -482,6 +482,8 @@ pub(super) struct WorkspaceState {
     pub(super) active_list: Option<String>,
     /// Live mode: per app DM channel, its App Home metadata and Block Kit view (`F-COLLAB-480`).
     pub(super) app_homes: HashMap<ChannelId, Result<slackless_core::api::AppHomeResponse, String>>,
+    /// Deduplicates `subscriptions.thread.mark` calls: last cursor sent per `(channel, thread_ts)`.
+    pub(super) marked_threads: HashMap<(ChannelId, Ts), Ts>,
 }
 
 /// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,
@@ -1012,11 +1014,15 @@ impl App {
                 cx.observe_window_activation(window, |this, window, cx| {
                     this.window_active = window.is_window_active();
                     if this.window_active {
-                        let settings = this.preferences.read(cx).settings();
+                        let settings = this.preferences.read(cx).settings().clone();
                         if settings.no_bg_mark_read && settings.mark_read != 2 {
-                            let ch = this.channel.clone();
-                            if let Some(newest) = this.messages.read(cx).newest_ts() {
-                                this.mark_read(&ch, newest, cx);
+                            if this.threads_open {
+                                this.auto_mark_threads_view_read(cx);
+                            } else {
+                                let ch = this.channel.clone();
+                                if let Some(newest) = this.messages.read(cx).newest_ts() {
+                                    this.mark_read(&ch, newest, cx);
+                                }
                             }
                         }
                     }
@@ -1481,6 +1487,7 @@ impl App {
                                 thread_ts: Some(thread_ts.clone()),
                                 broadcast: *broadcast,
                             });
+                            this.sync_thread_sidebar_counts(cx);
                         }
                         ThreadsEvent::ReplyWithFiles {
                             channel,
@@ -1524,6 +1531,32 @@ impl App {
                                     content: content.clone(),
                                 },
                             );
+                        }
+                        ThreadsEvent::MarkRead {
+                            channel,
+                            thread_ts,
+                            ts,
+                        } => {
+                            this.mark_thread_read(
+                                channel.clone(),
+                                thread_ts.clone(),
+                                ts.clone(),
+                                true,
+                                cx,
+                            );
+                        }
+                        ThreadsEvent::MarkAllRead(targets) => {
+                            for (channel, thread_ts, ts) in targets {
+                                this.mark_thread_read(
+                                    channel.clone(),
+                                    thread_ts.clone(),
+                                    ts.clone(),
+                                    true,
+                                    cx,
+                                );
+                            }
+                            this.sidebar
+                                .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
                         }
                         ThreadsEvent::PickEmoji(position) => {
                             this.open_picker(PickerTarget::ThreadsComposer, *position, window, cx);
@@ -3354,6 +3387,13 @@ fn subscribe_workspace(
                     last_read: last_read.clone(),
                     subscribed: *subscribed,
                 }),
+                ThreadPanelEvent::MarkThreadRead {
+                    channel,
+                    thread_ts,
+                    ts,
+                } => {
+                    this.mark_thread_unread(channel.clone(), thread_ts.clone(), ts.clone(), cx);
+                }
             },
         ),
         cx.subscribe_in(

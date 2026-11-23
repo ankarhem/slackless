@@ -50,6 +50,8 @@ pub struct ThreadCard {
     pub replies: Vec<Message>,
     pub reply_total: u32,
     pub unread: u32,
+    /// Pre-mark read cursor used to draw a subtle `"New"` divider above unread replies.
+    pub last_read: Option<Ts>,
 }
 
 impl ThreadCard {
@@ -63,10 +65,55 @@ impl ThreadCard {
                 .unwrap_or_else(|| self.thread_ts.clone()),
         )
     }
+
+    /// The newest message timestamp in this thread (the cursor sent to `subscriptions.thread.mark`
+    /// when marking the thread fully read).
+    pub fn newest_ts(&self) -> Ts {
+        let latest_reply = self.replies.last().map(|m| m.ts.clone());
+        let root_latest = self.root.latest_reply.clone();
+        match (latest_reply, root_latest) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => self.root.ts.clone(),
+        }
+    }
+
+    /// The cursor immediately before `ts` in this thread (so `subscriptions.thread.mark` moves
+    /// the read marker back and makes `ts` and everything after it unread).
+    pub fn cursor_before(&self, ts: &Ts) -> Ts {
+        let mut prev: Option<&Ts> = None;
+        for msg in std::iter::once(&self.root).chain(&self.replies) {
+            if msg.ts < *ts {
+                prev = Some(&msg.ts);
+            } else {
+                break;
+            }
+        }
+        prev.cloned().unwrap_or_else(|| ts_just_before(ts))
+    }
+}
+
+/// One microsecond before `ts`, matching Slack's `DDDDDDDDDD.MMMMMM` timestamp format.
+pub(crate) fn ts_just_before(ts: &Ts) -> Ts {
+    let raw = ts.as_str();
+    if let Some((secs, frac)) = raw.split_once('.') {
+        if let (Ok(s), Ok(f)) = (secs.parse::<u64>(), frac.parse::<u64>()) {
+            return if f > 0 {
+                Ts::from(format!("{s}.{:06}", f - 1))
+            } else if s > 0 {
+                Ts::from(format!("{}.999999", s - 1))
+            } else {
+                Ts::from("0.000000")
+            };
+        }
+    }
+    Ts::from("0.000000")
 }
 
 /// A card from a root and its full reply list.
 fn card(channel: ChannelId, root: Message, replies: &[Message]) -> ThreadCard {
+    let last_read = root.last_read.clone();
     ThreadCard {
         thread_ts: root.ts.clone(),
         reply_total: root
@@ -74,6 +121,7 @@ fn card(channel: ChannelId, root: Message, replies: &[Message]) -> ThreadCard {
             .unwrap_or_else(|| u32::try_from(replies.len()).unwrap_or(u32::MAX)),
         replies: replies.to_vec(),
         unread: 0,
+        last_read,
         channel,
         root,
     }
@@ -139,7 +187,8 @@ pub fn store_cards(store: &Store, team: &TeamId, me: &UserId) -> Vec<ThreadCard>
 }
 
 /// Slack's own followed threads (`subscriptions.thread.getView`): the view's threads become
-/// cards, unread first, then latest activity.
+/// cards, unread first, then latest activity. Merges `latest_replies` and `unread_replies`
+/// (deduped by `ts`, sorted oldest first) so unread replies are never hidden.
 pub fn remote_cards(view: SlackThreads) -> Vec<ThreadCard> {
     let mut cards: Vec<ThreadCard> = view
         .threads
@@ -150,11 +199,35 @@ pub fn remote_cards(view: SlackThreads) -> Vec<ThreadCard> {
             if root.ts.as_str().is_empty() {
                 return None;
             }
+            let unread_count = u32::try_from(thread.unread_replies.len()).unwrap_or(u32::MAX);
+            let first_unread_ts = thread.unread_replies.iter().map(|m| &m.ts).min().cloned();
+            let mut seen_ts: HashSet<Ts> = HashSet::new();
+            let mut replies: Vec<Message> =
+                Vec::with_capacity(thread.latest_replies.len() + thread.unread_replies.len());
+            for msg in thread
+                .latest_replies
+                .into_iter()
+                .chain(thread.unread_replies)
+            {
+                if seen_ts.insert(msg.ts.clone()) {
+                    replies.push(msg);
+                }
+            }
+            replies.sort_by(|a, b| a.ts.cmp(&b.ts));
+            let last_read = root
+                .last_read
+                .clone()
+                .or_else(|| first_unread_ts.as_ref().map(ts_just_before));
+            let reply_total = root
+                .reply_count
+                .unwrap_or_default()
+                .max(u32::try_from(replies.len()).unwrap_or(u32::MAX));
             Some(ThreadCard {
                 thread_ts: root.thread_ts.clone().unwrap_or_else(|| root.ts.clone()),
-                replies: thread.latest_replies,
-                reply_total: root.reply_count.unwrap_or_default(),
-                unread: u32::try_from(thread.unread_replies.len()).unwrap_or(u32::MAX),
+                replies,
+                reply_total,
+                unread: unread_count,
+                last_read,
                 channel,
                 root,
             })
@@ -440,68 +513,108 @@ pub(super) fn card_view(
 
     let expand_key = (card.channel.clone(), card.thread_ts.clone());
     let mut prev_reply: Option<&Message> = None;
-    let reply_rows: Vec<AnyElement> = shown
-        .iter()
-        .enumerate()
-        .map(|(r_ix, reply)| {
-            let msg_group = SharedString::from(format!("thread-{ix}-reply-{r_ix}"));
-            let grouped = prev_reply
-                .filter(|prev| same_group(prev, reply))
-                .map(|_| msg_group.clone());
-            prev_reply = Some(reply);
-            render_thread_message(
-                fixtures,
-                card,
-                reply,
-                format!("thread-{ix}-reply-{}-{}", r_ix, reply.ts.as_str()),
-                msg_group,
-                grouped,
-                false,
-                saved_set,
-                editing,
-                &links,
-                cx,
-            )
-        })
-        .collect();
-
-    let header = v_flex()
-        .id(("thread-card-head", ix))
-        .gap_0p5()
-        .mb_2()
-        .cursor_pointer()
-        .on_click(cx.listener(move |_, _, _, cx| {
-            cx.emit(ThreadsEvent::Open {
-                channel: open.0.clone(),
-                thread_ts: open.1.clone(),
-            });
-        }))
-        .child(
-            h_flex()
-                .items_center()
-                .gap_1p5()
-                .child(badge)
-                .child(
-                    div()
-                        .text_size(px(15.))
-                        .font_weight(FontWeight::BOLD)
-                        .hover(|el| el.underline())
-                        .child(channel_name),
-                )
-                .when(card.unread > 0, |head| {
-                    head.child(
+    let mut drew_new_divider = false;
+    let mut reply_rows: Vec<AnyElement> = Vec::with_capacity(shown.len() + 1);
+    for (r_ix, reply) in shown.iter().enumerate() {
+        let is_unread = card.last_read.as_ref().is_some_and(|read| reply.ts > *read);
+        if is_unread && !drew_new_divider {
+            drew_new_divider = true;
+            prev_reply = None;
+            reply_rows.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_0p5()
+                    .child(div().flex_1().h(px(1.)).bg(danger.opacity(0.6)))
+                    .child(
                         div()
-                            .rounded_full()
-                            .bg(danger)
                             .text_xs()
-                            .px_1p5()
-                            .text_color(danger_foreground)
-                            .child(card.unread.to_string()),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(danger)
+                            .child("New"),
                     )
+                    .into_any_element(),
+            );
+        }
+        let msg_group = SharedString::from(format!("thread-{ix}-reply-{r_ix}"));
+        let grouped = prev_reply
+            .filter(|prev| same_group(prev, reply))
+            .map(|_| msg_group.clone());
+        prev_reply = Some(reply);
+        reply_rows.push(render_thread_message(
+            fixtures,
+            card,
+            reply,
+            format!("thread-{ix}-reply-{}-{}", r_ix, reply.ts.as_str()),
+            msg_group,
+            grouped,
+            false,
+            saved_set,
+            editing,
+            &links,
+            cx,
+        ));
+    }
+
+    let mark_key = (card.channel.clone(), card.thread_ts.clone());
+    let header = h_flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .mb_2()
+        .child(
+            v_flex()
+                .id(("thread-card-head", ix))
+                .min_w_0()
+                .flex_1()
+                .gap_0p5()
+                .cursor_pointer()
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.emit(ThreadsEvent::Open {
+                        channel: open.0.clone(),
+                        thread_ts: open.1.clone(),
+                    });
+                }))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(badge)
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::BOLD)
+                                .hover(|el| el.underline())
+                                .child(channel_name),
+                        )
+                        .when(card.unread > 0, |head| {
+                            head.child(
+                                div()
+                                    .rounded_full()
+                                    .bg(danger)
+                                    .text_xs()
+                                    .px_1p5()
+                                    .text_color(danger_foreground)
+                                    .child(card.unread.to_string()),
+                            )
+                        }),
+                )
+                .when(!participants.is_empty(), |head| {
+                    head.child(div().text_xs().text_color(muted).child(participants))
                 }),
         )
-        .when(!participants.is_empty(), |head| {
-            head.child(div().text_xs().text_color(muted).child(participants))
+        .when(card.unread > 0, |row| {
+            row.child(
+                Button::new(("thread-mark-read", ix))
+                    .outline()
+                    .with_size(Size::XSmall)
+                    .label("Mark as read")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mark_card_read(mark_key.0.clone(), mark_key.1.clone(), cx);
+                    })),
+            )
         });
 
     let reply_footer = if active {
@@ -607,6 +720,67 @@ mod tests {
         assert_eq!(
             format_name_list(&["A".into(), "B".into(), "C".into(), "D".into(), "E".into()]),
             "A, B, C, and 2 others"
+        );
+    }
+
+    #[test]
+    fn remote_cards_merges_unread_and_latest_replies_sorted() {
+        use slackless_core::api::ThreadSubscription;
+        let view = SlackThreads {
+            total_unread_replies: 2,
+            has_more: false,
+            threads: vec![ThreadSubscription {
+                root: Message {
+                    channel: Some(ChannelId::from("C1")),
+                    ts: Ts::from("1700000000.000100"),
+                    text: "root".into(),
+                    reply_count: Some(3),
+                    last_read: Some(Ts::from("1700000000.000200")),
+                    ..Default::default()
+                },
+                latest_replies: vec![
+                    Message {
+                        ts: Ts::from("1700000000.000200"),
+                        text: "read".into(),
+                        ..Default::default()
+                    },
+                    Message {
+                        ts: Ts::from("1700000000.000400"),
+                        text: "newest".into(),
+                        ..Default::default()
+                    },
+                ],
+                unread_replies: vec![
+                    Message {
+                        ts: Ts::from("1700000000.000300"),
+                        text: "unread-1".into(),
+                        ..Default::default()
+                    },
+                    Message {
+                        ts: Ts::from("1700000000.000400"),
+                        text: "newest".into(),
+                        ..Default::default()
+                    },
+                ],
+            }],
+        };
+        let cards = remote_cards(view);
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        let ts_list: Vec<&str> = card.replies.iter().map(|m| m.ts.as_str()).collect();
+        assert_eq!(
+            ts_list,
+            vec![
+                "1700000000.000200",
+                "1700000000.000300",
+                "1700000000.000400"
+            ]
+        );
+        assert_eq!(card.unread, 2);
+        assert_eq!(card.newest_ts(), Ts::from("1700000000.000400"));
+        assert_eq!(
+            card.cursor_before(&Ts::from("1700000000.000300")),
+            Ts::from("1700000000.000200")
         );
     }
 }

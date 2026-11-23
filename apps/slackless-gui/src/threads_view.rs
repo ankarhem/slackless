@@ -19,8 +19,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::TextareaState;
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, FontWeight,
@@ -79,6 +80,14 @@ pub enum ThreadsEvent {
         ts: Ts,
         content: MessageContent,
     },
+    /// User explicitly marked one thread card read up to `ts`.
+    MarkRead {
+        channel: ChannelId,
+        thread_ts: Ts,
+        ts: Ts,
+    },
+    /// User explicitly marked all unread thread cards read (`(channel, thread_ts, newest_ts)`).
+    MarkAllRead(Vec<(ChannelId, Ts, Ts)>),
     /// The reply composer's emoji button asked for the picker.
     PickEmoji(Point<Pixels>),
     PickGif(Point<Pixels>),
@@ -550,6 +559,8 @@ impl ThreadsView {
         message.attachments = content.attachments.clone();
         card.replies.push(message);
         card.reply_total += 1;
+        card.unread = 0;
+        card.last_read = None;
         cx.emit(ThreadsEvent::Reply {
             channel: card.channel.clone(),
             thread_ts: card.thread_ts.clone(),
@@ -589,6 +600,149 @@ impl ThreadsView {
         self.expanded.insert((channel.clone(), thread_ts.clone()));
         cx.emit(ThreadsEvent::ExpandThread { channel, thread_ts });
         cx.notify();
+    }
+
+    /// True once Slack's `subscriptions.thread.getView` list has been loaded for this workspace.
+    pub fn is_remote(&self) -> bool {
+        self.remote
+    }
+
+    /// True if any displayed thread card still has unread replies.
+    pub fn has_unreads(&self) -> bool {
+        self.cards.iter().any(|c| c.unread > 0)
+    }
+
+    /// True if the specific thread card currently shows unread replies.
+    pub fn is_thread_unread(&self, channel: &ChannelId, thread_ts: &Ts) -> bool {
+        self.cards
+            .iter()
+            .any(|c| c.channel == *channel && c.thread_ts == *thread_ts && c.unread > 0)
+    }
+
+    /// `(channel, thread_ts, newest_ts)` for every card currently carrying unread replies.
+    #[cfg(test)]
+    pub fn unread_targets(&self) -> Vec<(ChannelId, Ts, Ts)> {
+        self.cards
+            .iter()
+            .filter(|c| c.unread > 0)
+            .map(|c| (c.channel.clone(), c.thread_ts.clone(), c.newest_ts()))
+            .collect()
+    }
+
+    /// The read cursor immediately before `ts` inside `(channel, thread_ts)` (for "Mark unread").
+    pub fn cursor_before(&self, channel: &ChannelId, thread_ts: &Ts, ts: &Ts) -> Ts {
+        self.cards
+            .iter()
+            .find(|c| c.channel == *channel && c.thread_ts == *thread_ts)
+            .map(|c| c.cursor_before(ts))
+            .unwrap_or_else(|| crate::threads_cards::ts_just_before(ts))
+    }
+
+    /// Apply a thread read cursor (`last_read`) to `(channel, thread_ts)`: clears `unread` when
+    /// caught up to `newest_ts()`, or recounts unread replies when moved earlier (Mark unread).
+    pub fn mark_thread_read(
+        &mut self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        last_read: Option<&Ts>,
+        clear_divider: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|c| c.channel == *channel && c.thread_ts == *thread_ts)
+        else {
+            return false;
+        };
+        let newest = card.newest_ts();
+        let new_unread = match last_read {
+            None => 0,
+            Some(cursor) if *cursor >= newest => 0,
+            Some(cursor) => {
+                let count = card.replies.iter().filter(|m| m.ts > *cursor).count() as u32;
+                count.max(1)
+            }
+        };
+        let mut changed = card.unread != new_unread;
+        card.unread = new_unread;
+        if let Some(cursor) = last_read {
+            card.root.last_read = Some(cursor.clone());
+            if new_unread > 0 {
+                card.last_read = Some(cursor.clone());
+                changed = true;
+            } else if clear_divider && card.last_read.take().is_some() {
+                changed = true;
+            }
+        } else if clear_divider && card.last_read.take().is_some() {
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Clear local unread badges across all cards and return every `(channel, thread_ts, newest_ts)`
+    /// that was unread. When `clear_dividers` is false (auto-mark on opening Threads), each card
+    /// keeps its pre-mark `last_read` so the `"New"` divider stays visible during this visit.
+    pub fn clear_all_unreads(
+        &mut self,
+        clear_dividers: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<(ChannelId, Ts, Ts)> {
+        let mut targets = Vec::new();
+        let mut changed = false;
+        for card in &mut self.cards {
+            if card.unread > 0 {
+                let newest = card.newest_ts();
+                targets.push((card.channel.clone(), card.thread_ts.clone(), newest.clone()));
+                card.unread = 0;
+                card.root.last_read = Some(newest);
+                changed = true;
+            }
+            if clear_dividers && card.last_read.take().is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        targets
+    }
+
+    /// Explicit per-card "Mark as read" click.
+    pub(super) fn mark_card_read(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(card) = self
+            .cards
+            .iter_mut()
+            .find(|c| c.channel == channel && c.thread_ts == thread_ts)
+        else {
+            return;
+        };
+        let ts = card.newest_ts();
+        card.unread = 0;
+        card.last_read = None;
+        card.root.last_read = Some(ts.clone());
+        cx.emit(ThreadsEvent::MarkRead {
+            channel,
+            thread_ts,
+            ts,
+        });
+        cx.notify();
+    }
+
+    /// Explicit header "Mark all read" click.
+    pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
+        let targets = self.clear_all_unreads(true, cx);
+        if !targets.is_empty() {
+            cx.emit(ThreadsEvent::MarkAllRead(targets));
+        }
     }
 }
 
@@ -650,24 +804,39 @@ impl Render for ThreadsView {
                 h_flex()
                     .flex_none()
                     .items_center()
+                    .justify_between()
                     .px_5()
                     .h(px(49.))
                     .gap_2()
                     .border_b_1()
                     .border_color(border)
                     .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("Threads"),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("Threads"),
+                            )
+                            .when(unread > 0, |title| {
+                                title.child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(muted)
+                                        .child(format!("{unread} unread")),
+                                )
+                            }),
                     )
-                    .when(unread > 0, |title| {
-                        title.child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(muted)
-                                .child(format!("{unread} unread")),
+                    .when(unread > 0, |bar| {
+                        bar.child(
+                            Button::new("threads-mark-all-read")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label("Mark all read")
+                                .on_click(cx.listener(|this, _, _, cx| this.mark_all_read(cx))),
                         )
                     }),
             )
@@ -837,5 +1006,139 @@ mod tests {
             assert_eq!(view.read(cx).cards[0].replies.len(), before_replies - 1);
         });
         assert_eq!(*edited.lock().unwrap(), vec!["Edited reply text"]);
+    }
+
+    #[gpui::test]
+    fn threads_view_marks_individual_and_all_threads_read_and_unread(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let fixtures = Arc::new(crate::fixtures::load());
+        let view_cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let cell = view_cell.clone();
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let view = ThreadsView::new(fixtures.clone(), window, cx);
+            *cell.borrow_mut() = Some(view.clone());
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let view = view_cell.borrow_mut().take().unwrap();
+        let marked: Arc<std::sync::Mutex<Vec<(ChannelId, Ts, Ts)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let marked_cb = marked.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event, _| match event {
+                ThreadsEvent::MarkRead {
+                    channel,
+                    thread_ts,
+                    ts,
+                } => {
+                    marked_cb.lock().unwrap().push((
+                        channel.clone(),
+                        thread_ts.clone(),
+                        ts.clone(),
+                    ));
+                }
+                ThreadsEvent::MarkAllRead(targets) => {
+                    marked_cb.lock().unwrap().extend(targets.iter().cloned());
+                }
+                _ => {}
+            })
+            .detach();
+        });
+
+        let remote = SlackThreads {
+            threads: vec![
+                ThreadSubscription {
+                    root: Message {
+                        channel: Some(ChannelId::from("C0ENG")),
+                        ts: Ts::from("1760000001.000100"),
+                        text: "thread 1".into(),
+                        reply_count: Some(2),
+                        last_read: Some(Ts::from("1760000001.000200")),
+                        ..Default::default()
+                    },
+                    latest_replies: vec![Message {
+                        ts: Ts::from("1760000001.000200"),
+                        text: "older".into(),
+                        ..Default::default()
+                    }],
+                    unread_replies: vec![Message {
+                        ts: Ts::from("1760000001.000300"),
+                        text: "new reply".into(),
+                        ..Default::default()
+                    }],
+                },
+                ThreadSubscription {
+                    root: Message {
+                        channel: Some(ChannelId::from("C0GENERAL")),
+                        ts: Ts::from("1760000002.000100"),
+                        text: "thread 2".into(),
+                        reply_count: Some(1),
+                        ..Default::default()
+                    },
+                    latest_replies: vec![],
+                    unread_replies: vec![Message {
+                        ts: Ts::from("1760000002.000200"),
+                        text: "unread 2".into(),
+                        ..Default::default()
+                    }],
+                },
+            ],
+            has_more: false,
+            total_unread_replies: 2,
+        };
+
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| v.set_remote(remote, cx));
+            assert!(view.read(cx).has_unreads());
+            assert_eq!(view.read(cx).unread_targets().len(), 2);
+
+            // Explicit per-card mark read clears card 1 and emits MarkRead with newest reply ts.
+            view.update(cx, |v, cx| {
+                v.mark_card_read(ChannelId::from("C0ENG"), Ts::from("1760000001.000100"), cx);
+            });
+            assert!(
+                !view
+                    .read(cx)
+                    .is_thread_unread(&ChannelId::from("C0ENG"), &Ts::from("1760000001.000100"))
+            );
+            assert!(view.read(cx).has_unreads());
+
+            // Explicit Mark all read clears remaining unread cards.
+            view.update(cx, |v, cx| v.mark_all_read(cx));
+            assert!(!view.read(cx).has_unreads());
+
+            // Moving cursor backward (Mark unread) restores unread count.
+            view.update(cx, |v, cx| {
+                v.mark_thread_read(
+                    &ChannelId::from("C0ENG"),
+                    &Ts::from("1760000001.000100"),
+                    Some(&Ts::from("1760000001.000200")),
+                    false,
+                    cx,
+                );
+            });
+            assert!(
+                view.read(cx)
+                    .is_thread_unread(&ChannelId::from("C0ENG"), &Ts::from("1760000001.000100"))
+            );
+        });
+
+        assert_eq!(
+            *marked.lock().unwrap(),
+            vec![
+                (
+                    ChannelId::from("C0ENG"),
+                    Ts::from("1760000001.000100"),
+                    Ts::from("1760000001.000300"),
+                ),
+                (
+                    ChannelId::from("C0GENERAL"),
+                    Ts::from("1760000002.000100"),
+                    Ts::from("1760000002.000200"),
+                ),
+            ]
+        );
     }
 }

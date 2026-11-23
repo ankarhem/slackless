@@ -483,6 +483,29 @@ async fn thread_view_parses_roots_and_sends_web_client_params() {
 }
 
 #[tokio::test]
+async fn subscriptions_thread_mark_posts_channel_thread_ts_and_read() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/subscriptions.thread.mark"))
+        .and(body_string_contains("channel=C1"))
+        .and(body_string_contains("thread_ts=1700000300.000400"))
+        .and(body_string_contains("ts=1700000300.000600"))
+        .and(body_string_contains("read=1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    api.subscriptions_thread_mark(
+        &ChannelId::from("C1"),
+        &Ts::from("1700000300.000400"),
+        &Ts::from("1700000300.000600"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn conversations_open_parses_the_channel() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))

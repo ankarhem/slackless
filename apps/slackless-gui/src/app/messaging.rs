@@ -307,13 +307,122 @@ impl App {
             .update(cx, |sidebar, cx| sidebar.mark_read(channel.clone(), cx));
     }
 
-    /// Esc: mark the open conversation read up to its newest message - or, while the All
-    /// Unreads view is open, the group the keyboard focused.
+    /// Advance a single thread's read cursor to `ts` (`subscriptions.thread.mark`), clear its
+    /// unread badge in `ThreadsView`, and clear the sidebar's Threads indicator when caught up.
+    pub(super) fn mark_thread_read(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        ts: Ts,
+        clear_divider: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (channel.clone(), thread_ts.clone());
+        let already_marked = self
+            .ws
+            .marked_threads
+            .get(&key)
+            .is_some_and(|prev| *prev == ts);
+        if !already_marked {
+            self.ws.marked_threads.insert(key, ts.clone());
+            self.bridge.send(Command::MarkThreadRead {
+                channel: channel.clone(),
+                thread_ts: thread_ts.clone(),
+                ts: ts.clone(),
+            });
+        }
+        self.threads.update(cx, |threads, cx| {
+            threads.mark_thread_read(&channel, &thread_ts, Some(&ts), clear_divider, cx);
+        });
+        self.sync_thread_sidebar_counts(cx);
+    }
+
+    /// Move a thread's read cursor backward to `cursor` (marking messages after it unread).
+    pub(super) fn mark_thread_unread(
+        &mut self,
+        channel: ChannelId,
+        thread_ts: Ts,
+        cursor: Ts,
+        cx: &mut Context<Self>,
+    ) {
+        self.ws
+            .marked_threads
+            .insert((channel.clone(), thread_ts.clone()), cursor.clone());
+        self.bridge.send(Command::MarkThreadRead {
+            channel: channel.clone(),
+            thread_ts: thread_ts.clone(),
+            ts: cursor.clone(),
+        });
+        self.threads.update(cx, |threads, cx| {
+            threads.mark_thread_read(&channel, &thread_ts, Some(&cursor), false, cx);
+        });
+        let mentions = self.sidebar.read(cx).thread_mentions();
+        self.sidebar
+            .update(cx, |s, cx| s.set_thread_counts(true, mentions, cx));
+    }
+
+    /// Auto-mark every currently unread card in `ThreadsView` read on Slack when the view opens,
+    /// keeping the in-card `"New"` divider for the current visit while clearing badges immediately.
+    pub(super) fn auto_mark_threads_view_read(&mut self, cx: &mut Context<Self>) {
+        let targets = self
+            .threads
+            .update(cx, |threads, cx| threads.clear_all_unreads(false, cx));
+        for (channel, thread_ts, ts) in targets {
+            let key = (channel.clone(), thread_ts.clone());
+            if self.ws.marked_threads.get(&key) != Some(&ts) {
+                self.ws.marked_threads.insert(key, ts.clone());
+                self.bridge.send(Command::MarkThreadRead {
+                    channel,
+                    thread_ts,
+                    ts,
+                });
+            }
+        }
+        self.sidebar
+            .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+    }
+
+    /// Explicitly mark all unread threads read (`Esc` in Threads view or "Mark all read" button).
+    pub(super) fn mark_all_threads_read(&mut self, cx: &mut Context<Self>) {
+        let targets = self
+            .threads
+            .update(cx, |threads, cx| threads.clear_all_unreads(true, cx));
+        for (channel, thread_ts, ts) in targets {
+            let key = (channel.clone(), thread_ts.clone());
+            if self.ws.marked_threads.get(&key) != Some(&ts) {
+                self.ws.marked_threads.insert(key, ts.clone());
+                self.bridge.send(Command::MarkThreadRead {
+                    channel,
+                    thread_ts,
+                    ts,
+                });
+            }
+        }
+        self.sidebar
+            .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+    }
+
+    /// Clear the sidebar's Threads unread indicator when `ThreadsView` has the remote list and
+    /// no unread cards remain.
+    pub(super) fn sync_thread_sidebar_counts(&mut self, cx: &mut Context<Self>) {
+        let threads = self.threads.read(cx);
+        if threads.is_remote() && !threads.has_unreads() {
+            self.sidebar
+                .update(cx, |s, cx| s.set_thread_counts(false, 0, cx));
+        }
+    }
+
+    /// Esc: mark the open conversation read up to its newest message - or, while All Unreads or
+    /// Threads is open, mark its unreads read.
     pub(super) fn mark_open_read(&mut self, cx: &mut Context<Self>) {
         if self.unreads_open {
             self.unreads.update(cx, |view, cx| {
                 view.handle_key("escape", cx);
             });
+            return;
+        }
+        if self.threads_open {
+            self.mark_all_threads_read(cx);
             return;
         }
         let channel = self.channel.clone();
@@ -335,6 +444,10 @@ impl App {
             for channel in unread {
                 sidebar.mark_read(channel, cx);
             }
+            sidebar.set_thread_counts(false, 0, cx);
+        });
+        self.threads.update(cx, |threads, cx| {
+            threads.clear_all_unreads(true, cx);
         });
         if self.unreads_open {
             self.refresh_unreads(cx);
@@ -1162,7 +1275,11 @@ impl App {
                 }
             }
             MessageAction::MarkUnread => {
-                self.post_change(&channel, &MessageChange::MarkUnread { ts });
+                let cursor = self
+                    .threads
+                    .read(cx)
+                    .cursor_before(&channel, &thread_ts, &ts);
+                self.mark_thread_unread(channel, thread_ts, cursor, cx);
                 notify("Marked unread", String::new(), window, cx);
             }
             MessageAction::Edit => {

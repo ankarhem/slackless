@@ -37,6 +37,11 @@ fn apply(store: &mut Store, ws: &TeamId, event: SlackEvent) -> store::Result<Opt
             channel: m.channel,
             ts: m.ts,
         }),
+        SlackEvent::ThreadMarked(m) => Some(Event::ThreadReadMarker {
+            channel: m.subscription.channel,
+            thread_ts: m.subscription.thread_ts,
+            last_read: m.subscription.last_read,
+        }),
         SlackEvent::UserTyping(t) => Some(Event::Typing {
             channel: t.channel,
             user: t.user,
@@ -270,6 +275,20 @@ mod tests {
             Some(Event::ReadMarker {
                 channel: c1(),
                 ts: Ts::from("1.5")
+            })
+        );
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(
+                    r#"{"type":"thread_marked","subscription":{"channel":"C1","thread_ts":"1.0","last_read":"1.9","active":true}}"#
+                )
+            ),
+            Some(Event::ThreadReadMarker {
+                channel: c1(),
+                thread_ts: Ts::from("1.0"),
+                last_read: Some(Ts::from("1.9")),
             })
         );
         assert_eq!(
