@@ -1851,6 +1851,21 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::OpenAppHome { app_id, team_id } => {
+                self.spawn("apps.home.open", async move {
+                    if let Some(channel) = backend.open_app_home(app_id, team_id).await? {
+                        events.emit(Event::ConversationOpened(channel));
+                    }
+                    Ok(())
+                });
+            }
+            Command::TripWorkflowTrigger { url, context } => {
+                self.spawn("workflows.triggers.trip", async move {
+                    backend.trip_workflow_trigger(url.clone(), context).await?;
+                    events.emit(Event::WorkflowTripped { url });
+                    Ok(())
+                });
+            }
             Command::SetGlobalNotificationPref { name, value, sync } => {
                 self.spawn("users.prefs.setNotifications(global)", async move {
                     backend

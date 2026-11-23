@@ -224,6 +224,55 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `apps.home.open`: resolve an app's DM conversation id from `(app_id, team_id)` (`F-COLLAB-481`, `F-COLLAB-523`).
+    pub async fn apps_home_open(
+        &self,
+        app_id: &str,
+        app_installed_team_id: &str,
+    ) -> Result<Option<ChannelId>> {
+        let params = vec![
+            ("app_id", app_id.to_owned()),
+            ("app_installed_team_id", app_installed_team_id.to_owned()),
+            ("_x_reason", "app-home-open-api".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let data: Value = self.call(method::APPS_HOME_OPEN, params).await?.data;
+        let conv = data
+            .get("app_home")
+            .and_then(|v| v.get("conversation_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ChannelId::from);
+        Ok(conv)
+    }
+
+    /// `workflows.triggers.trip`: trigger a Slack Workflow Builder link trigger (`https://slack.com/shortcuts/Ft...`,
+    /// `F-COLLAB-319`, `F-COLLAB-376`). Any resulting modal arrives over the websocket as `view_opened`.
+    pub async fn workflows_triggers_trip(&self, url: &str, context: &Value) -> Result<()> {
+        if !url.starts_with("https://") {
+            return Err(crate::ApiError::UntrustedUrl(url.to_owned()));
+        }
+        let client_token = format!(
+            "web-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        );
+        let params = vec![
+            ("client_token", client_token),
+            ("url", url.to_owned()),
+            ("context", context.to_string()),
+            (
+                "_x_reason",
+                "trip-trigger-from-bk-workflow-button".to_owned(),
+            ),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::WORKFLOWS_TRIGGERS_TRIP, params)
+            .await?;
+        Ok(())
+    }
+
     /// One page of `conversations.list`.
     pub async fn conversations_list(
         &self,

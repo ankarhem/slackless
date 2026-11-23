@@ -76,6 +76,8 @@ pub struct BlockKitState {
     calendar_months: HashMap<String, (i32, u32)>,
     /// Live option suggestions fetched via `blocks.suggestions` for `external_select` (`F-COLLAB-786`).
     suggestions: HashMap<String, Vec<(String, String)>>,
+    /// Locally chosen file paths for `file_input` elements in modals (`F-COLLAB-751`).
+    files: HashMap<String, Vec<String>>,
 }
 
 impl BlockKitState {
@@ -207,12 +209,32 @@ fn control_key(
     format!("{}/{block_id}/{action_id}", ts.as_str())
 }
 
-const TEXT_INPUTS: [&str; 4] = [
+const TEXT_INPUTS: [&str; 5] = [
     "plain_text_input",
     "email_text_input",
     "url_text_input",
     "number_input",
+    "rich_text_input",
 ];
+
+fn extract_rich_text_plain(value: &Json) -> String {
+    if let Some(s) = value.as_str() {
+        return s.to_owned();
+    }
+    let mut out = String::new();
+    fn walk(node: &Json, out: &mut String) {
+        if let Some(t) = node["text"].as_str() {
+            out.push_str(t);
+        }
+        if let Some(arr) = node["elements"].as_array() {
+            for child in arr {
+                walk(child, out);
+            }
+        }
+    }
+    walk(value, &mut out);
+    out
+}
 
 /// Give each text input of `message` its textarea state (needs the window, so the transcript
 /// calls this from its row renderer before painting the row).
@@ -227,8 +249,8 @@ pub fn prepare_inputs(
             continue;
         };
         let element = &raw["element"];
-        if r#type != "input" || !TEXT_INPUTS.contains(&element["type"].as_str().unwrap_or_default())
-        {
+        let kind = element["type"].as_str().unwrap_or_default();
+        if r#type != "input" || !TEXT_INPUTS.contains(&kind) {
             continue;
         }
         let key = control_key(&message.ts, raw, ix, element, 0);
@@ -238,11 +260,15 @@ pub fn prepare_inputs(
         let placeholder = text_of(&element["placeholder"])
             .unwrap_or_default()
             .to_owned();
-        let initial = element["initial_value"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        let rows = if element["multiline"].as_bool().unwrap_or(false) {
+        let initial = if kind == "rich_text_input" {
+            extract_rich_text_plain(&element["initial_value"])
+        } else {
+            element["initial_value"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let rows = if kind == "rich_text_input" || element["multiline"].as_bool().unwrap_or(false) {
             3
         } else {
             1
@@ -1505,26 +1531,37 @@ fn input_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
         })
 }
 
-/// `(label, value)` of an element's `options` and `option_groups`.
+/// `(label, value)` of an element's `options` and `option_groups` (preserving group headings, `F-COLLAB-762`).
 fn options(element: &Json) -> Vec<(String, String)> {
-    let groups = element["option_groups"]
+    let mut out: Vec<(String, String)> = element["options"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|group| group["options"].as_array())
-        .flatten();
-    element["options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .chain(groups)
         .filter_map(|option| {
             Some((
                 text_of(&option["text"])?.to_owned(),
                 option["value"].as_str()?.to_owned(),
             ))
         })
-        .collect()
+        .collect();
+    if let Some(groups) = element["option_groups"].as_array() {
+        for group in groups {
+            let group_label = text_of(&group["label"]).unwrap_or_default().trim();
+            for option in group["options"].as_array().into_iter().flatten() {
+                if let (Some(text), Some(value)) =
+                    (text_of(&option["text"]), option["value"].as_str())
+                {
+                    let display = if group_label.is_empty() {
+                        text.to_owned()
+                    } else {
+                        format!("{group_label} · {text}")
+                    };
+                    out.push((display, value.to_owned()));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn choice(kcx: &KitCx, key: &str, cx: &App) -> Option<String> {
@@ -1742,19 +1779,36 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
         | "channels_select"
         | "multi_conversations_select"
         | "multi_channels_select" => {
-            let channels = kcx
-                .fixtures
-                .channels
-                .iter()
-                .map(|channel| {
-                    (
-                        kcx.fixtures.conversation_label(channel),
-                        channel.id.to_string(),
-                    )
-                })
-                .collect();
+            let channels = filtered_conversations(element, kind, kcx.fixtures);
             select(element, block, key, channels, kcx, cx)
         }
+        "feedback_buttons" => {
+            let mut row = h_flex().items_center().gap_1p5();
+            for (sub_ix, field) in ["positive_button", "negative_button"].iter().enumerate() {
+                if let Some(btn) = element.get(*field).filter(|v| v.is_object()) {
+                    let mut synthetic = btn.clone();
+                    synthetic["type"] = "button".into();
+                    if synthetic["action_id"].is_null() {
+                        synthetic["action_id"] = element["action_id"].clone();
+                    }
+                    row = row.child(button(&synthetic, block, format!("{key}-fb{sub_ix}"), kcx));
+                }
+            }
+            row.into_any_element()
+        }
+        "icon_button" => {
+            let mut synthetic = element.clone();
+            synthetic["type"] = "button".into();
+            if synthetic["text"].is_null() {
+                let lbl = element["accessibility_label"]
+                    .as_str()
+                    .or_else(|| element["icon"].as_str())
+                    .unwrap_or("Action");
+                synthetic["text"] = serde_json::json!({ "type": "plain_text", "text": lbl });
+            }
+            button(&synthetic, block, key, kcx).into_any_element()
+        }
+        "file_input" => file_input_element(element, &key, kcx, cx),
         "overflow" => overflow(element, block, key, kcx).into_any_element(),
         "datepicker" => datepicker(element, block, key, kcx, cx),
         "datetimepicker" => datetimepicker(element, block, key, kcx, cx),
@@ -1783,7 +1837,7 @@ fn block_element(element: &Json, block: &Json, key: String, kcx: &KitCx, cx: &Ap
         "image" => image_element(element, kcx, 20., cx),
         "tag" => tag_element(element, cx).into_any_element(),
         "citation" => citation_element(element, 0, kcx, cx),
-        kind if TEXT_INPUTS.contains(&kind) => text_input(element, &key, kcx, cx),
+        kind if TEXT_INPUTS.contains(&kind) => text_input(element, block, &key, kcx, cx),
         other => div()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
@@ -2788,8 +2842,162 @@ fn validate_text_input(element: &Json, value: &str) -> Option<String> {
     }
 }
 
+/// Filter workspace conversations according to Slack's `conversations_select` / `channels_select`
+/// `filter` object (`include`, `exclude_external_shared_channels`, `exclude_bot_users`, `F-COLLAB-763`).
+fn filtered_conversations(
+    element: &Json,
+    kind: &str,
+    fixtures: &Fixtures,
+) -> Vec<(String, String)> {
+    let public_only = matches!(kind, "channels_select" | "multi_channels_select");
+    let filter = element.get("filter").filter(|v| v.is_object());
+    let include: Option<Vec<&str>> = filter
+        .and_then(|f| f["include"].as_array())
+        .map(|arr| arr.iter().filter_map(Json::as_str).collect());
+    let exclude_ext = filter
+        .and_then(|f| f["exclude_external_shared_channels"].as_bool())
+        .unwrap_or(false);
+    let exclude_bots = filter
+        .and_then(|f| f["exclude_bot_users"].as_bool())
+        .unwrap_or(false);
+
+    fixtures
+        .channels
+        .iter()
+        .filter(|ch| {
+            if public_only && (!ch.is_channel || ch.is_private || ch.is_im || ch.is_mpim) {
+                return false;
+            }
+            if exclude_ext && (ch.is_ext_shared || ch.is_shared) {
+                return false;
+            }
+            if exclude_bots && ch.is_im {
+                if let Some(uid) = ch.user.as_ref() {
+                    if fixtures
+                        .user(uid)
+                        .is_some_and(|u| u.is_bot || u.is_app_user)
+                    {
+                        return false;
+                    }
+                }
+            }
+            if let Some(inc) = &include {
+                if !inc.is_empty() {
+                    let tag = if ch.is_im {
+                        "im"
+                    } else if ch.is_mpim {
+                        "mpim"
+                    } else if ch.is_private || ch.is_group {
+                        "private"
+                    } else {
+                        "public"
+                    };
+                    if !inc.contains(&tag) {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .map(|channel| (fixtures.conversation_label(channel), channel.id.to_string()))
+        .collect()
+}
+
+/// Slack `file_input` element (`F-COLLAB-751`): native file chooser storing selected filenames
+/// in `BlockKitState::files` for `views.submit`.
+fn file_input_element(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let max_files = element["max_files"].as_u64().unwrap_or(10) as usize;
+    let chosen = kcx
+        .kit
+        .and_then(|kit| kit.read(cx).files.get(key).cloned())
+        .unwrap_or_default();
+    let kit_pick = kcx.kit.cloned();
+    let key_pick = key.to_owned();
+    let kit_clear = kcx.kit.cloned();
+    let key_clear = key.to_owned();
+    let multiple = max_files > 1;
+
+    v_flex()
+        .gap_1p5()
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new(SharedString::from(format!("bk-file-{key}")))
+                        .outline()
+                        .with_size(Size::Small)
+                        .icon(IconName::Paperclip)
+                        .label(if chosen.is_empty() {
+                            "Choose files\u{2026}".to_owned()
+                        } else {
+                            format!("{} selected", chosen.len())
+                        })
+                        .on_click(move |_, _, cx| {
+                            let rx = cx.prompt_for_paths(gpui_kit::gpui::PathPromptOptions {
+                                files: true,
+                                directories: false,
+                                multiple,
+                                prompt: Some("Select files".into()),
+                            });
+                            let kit = kit_pick.clone();
+                            let key = key_pick.clone();
+                            cx.spawn(async move |cx| {
+                                if let Ok(Ok(Some(paths))) = rx.await {
+                                    let names: Vec<String> = paths
+                                        .into_iter()
+                                        .take(max_files)
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .collect();
+                                    if let Some(kit) = kit {
+                                        kit.update(cx, |state, cx| {
+                                            state.files.insert(key, names);
+                                            cx.notify();
+                                        });
+                                    }
+                                }
+                            })
+                            .detach();
+                        }),
+                )
+                .when(!chosen.is_empty(), |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!("bk-file-clear-{key}")))
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::X)
+                            .on_click(move |_, _, cx| {
+                                if let Some(kit) = &kit_clear {
+                                    kit.update(cx, |state, cx| {
+                                        state.files.remove(&key_clear);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                }),
+        )
+        .when(!chosen.is_empty(), |col| {
+            col.child(v_flex().gap_0p5().children(chosen.into_iter().map(|path| {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&path)
+                    .to_owned();
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(name)
+            })))
+        })
+        .into_any_element()
+}
+
 /// A text input's textarea when [`prepare_inputs`] created one, else a framed placeholder.
-fn text_input(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
+/// Supports `dispatch_action` / `dispatch_action_config` (`F-COLLAB-764`) by offering an inline
+/// Apply button that dispatches `blocks.actions` with the current value.
+fn text_input(element: &Json, block: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
     if let Some(input) = kcx
         .kit
         .and_then(|kit| kit.read(cx).inputs.get(key).cloned())
@@ -2797,16 +3005,61 @@ fn text_input(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
         let value = input.read(cx).value();
         let error = validate_text_input(element, &value);
         let danger = cx.theme().danger;
+        let dispatch_enabled = block["dispatch_action"].as_bool().unwrap_or(false)
+            || element["dispatch_action_config"]["trigger_actions_on"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty());
+        let apply_btn = dispatch_enabled.then(|| {
+            let input_c = input.clone();
+            let base = action_base(element, block);
+            let kind = element["type"]
+                .as_str()
+                .unwrap_or("plain_text_input")
+                .to_owned();
+            let on_action = kcx.on_action.clone();
+            let attachment = kcx.attachment;
+            let key_c = key.to_owned();
+            Button::new(SharedString::from(format!("bk-dispatch-{key}")))
+                .outline()
+                .with_size(Size::Small)
+                .label("Apply")
+                .on_click(move |_, window, cx| {
+                    let val = input_c.read(cx).value().to_string();
+                    let mut payload = base.clone();
+                    if kind == "rich_text_input" {
+                        payload["rich_text_value"] = rich_text_input_value(&val);
+                    } else {
+                        payload["value"] = val.clone().into();
+                    }
+                    dispatch_action(
+                        payload,
+                        on_action.as_ref(),
+                        attachment,
+                        &key_c,
+                        &format!("submitted \u{201C}{val}\u{201D}"),
+                        window,
+                        cx,
+                    );
+                })
+        });
         return v_flex()
             .w_full()
             .gap_1()
             .child(
-                div()
+                h_flex()
                     .w_full()
-                    .when(error.is_some(), |el| {
-                        el.rounded_md().border_1().border_color(danger)
-                    })
-                    .child(Textarea::new(&input)),
+                    .items_start()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .when(error.is_some(), |el| {
+                                el.rounded_md().border_1().border_color(danger)
+                            })
+                            .child(Textarea::new(&input)),
+                    )
+                    .children(apply_btn),
             )
             .when_some(error, |col, msg| {
                 col.child(div().text_xs().text_color(danger).child(msg))
@@ -2828,6 +3081,16 @@ fn text_input(element: &Json, key: &str, kcx: &KitCx, cx: &App) -> AnyElement {
                 .to_owned(),
         )
         .into_any_element()
+}
+
+fn rich_text_input_value(text: &str) -> Json {
+    serde_json::json!({
+        "type": "rich_text",
+        "elements": [{
+            "type": "rich_text_section",
+            "elements": [{ "type": "text", "text": text }]
+        }]
+    })
 }
 
 /// The image at `url`: a decoded fixture image, or live, the remote image loaded through the
@@ -3674,7 +3937,13 @@ pub fn collect_modal_state(
                 .inputs
                 .get(&key)
                 .map(|i| i.read(cx).value().to_string())
-                .or_else(|| element["initial_value"].as_str().map(str::to_owned))
+                .or_else(|| {
+                    if kind == "rich_text_input" {
+                        Some(extract_rich_text_plain(&element["initial_value"]))
+                    } else {
+                        element["initial_value"].as_str().map(str::to_owned)
+                    }
+                })
                 .unwrap_or_default();
             if !optional && val.trim().is_empty() {
                 return Err(format!("{label} is required."));
@@ -3682,7 +3951,24 @@ pub fn collect_modal_state(
             if let Some(err) = validate_text_input(element, &val) {
                 return Err(format!("{label}: {err}"));
             }
-            serde_json::json!({ "type": kind, "value": val })
+            if kind == "rich_text_input" {
+                serde_json::json!({
+                    "type": kind,
+                    "rich_text_value": rich_text_input_value(&val),
+                })
+            } else {
+                serde_json::json!({ "type": kind, "value": val })
+            }
+        } else if kind == "file_input" {
+            let files = state.files.get(&key).cloned().unwrap_or_default();
+            if !optional && files.is_empty() {
+                return Err(format!("{label} is required."));
+            }
+            let arr: Vec<Json> = files
+                .into_iter()
+                .map(|path| serde_json::json!({ "name": path }))
+                .collect();
+            serde_json::json!({ "type": kind, "files": arr })
         } else if kind == "datepicker" {
             let val = state
                 .choices
@@ -3974,5 +4260,88 @@ mod tests {
             let _ = window.draw(cx);
         });
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn filters_conversations_and_preserves_option_group_headings() {
+        let fixtures = crate::fixtures::load();
+        let pub_only = json!({
+            "type": "conversations_select",
+            "filter": { "include": ["public"], "exclude_external_shared_channels": true }
+        });
+        let filtered = filtered_conversations(&pub_only, "conversations_select", &fixtures);
+        assert!(!filtered.is_empty());
+        for (_, id) in &filtered {
+            let ch = fixtures
+                .conversation(&slackless_core::types::ChannelId::from(id.as_str()))
+                .unwrap();
+            assert!(!ch.is_im && !ch.is_mpim && !ch.is_private);
+            assert!(!ch.is_ext_shared && !ch.is_shared);
+        }
+
+        let grouped = json!({
+            "type": "static_select",
+            "option_groups": [
+                {
+                    "label": { "type": "plain_text", "text": "Priority" },
+                    "options": [
+                        { "text": { "type": "plain_text", "text": "High" }, "value": "p1" }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            options(&grouped),
+            vec![("Priority · High".to_owned(), "p1".to_owned())]
+        );
+    }
+
+    #[gpui::test]
+    fn collects_rich_text_input_and_file_input_modal_state(cx: &mut gpui::TestAppContext) {
+        let ts = Ts::from("modal-1");
+        let blocks = vec![
+            json!({
+                "type": "input",
+                "block_id": "rt_blk",
+                "label": { "type": "plain_text", "text": "Summary" },
+                "element": {
+                    "type": "rich_text_input",
+                    "action_id": "rt_act",
+                    "initial_value": {
+                        "type": "rich_text",
+                        "elements": [{
+                            "type": "rich_text_section",
+                            "elements": [{ "type": "text", "text": "Ship it" }]
+                        }]
+                    }
+                }
+            }),
+            json!({
+                "type": "input",
+                "block_id": "file_blk",
+                "optional": true,
+                "label": { "type": "plain_text", "text": "Attachment" },
+                "element": { "type": "file_input", "action_id": "file_act", "max_files": 3 }
+            }),
+        ];
+        let kit = cx.new(|_| {
+            let mut st = BlockKitState::default();
+            st.files.insert(
+                "modal-1/file_blk/file_act".to_owned(),
+                vec!["/tmp/spec.pdf".to_owned()],
+            );
+            st
+        });
+        cx.update(|cx| {
+            let state = collect_modal_state(&ts, &blocks, &kit, cx).expect("valid modal state");
+            assert_eq!(
+                state["rt_blk"]["rt_act"]["rich_text_value"]["elements"][0]["elements"][0]["text"],
+                "Ship it"
+            );
+            assert_eq!(
+                state["file_blk"]["file_act"]["files"][0]["name"],
+                "/tmp/spec.pdf"
+            );
+        });
     }
 }

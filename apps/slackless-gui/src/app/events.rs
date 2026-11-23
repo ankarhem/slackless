@@ -1020,6 +1020,14 @@ impl App {
                 }
                 cx.notify();
             }
+            Event::WorkflowTripped { .. } => {
+                notify(
+                    "Workflow started",
+                    "Workflow trigger dispatched.",
+                    window,
+                    cx,
+                );
+            }
             Event::FilesExtrasLoaded {
                 favorites,
                 collections,

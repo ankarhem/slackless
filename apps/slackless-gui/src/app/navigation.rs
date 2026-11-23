@@ -98,6 +98,25 @@ impl App {
                 if self.handle_deep_link(url.as_ref(), window, cx) {
                     return;
                 }
+                if is_workflow_trigger_url(url.as_ref()) {
+                    if self.fixtures.sample {
+                        notify(
+                            "Workflow trigger",
+                            format!("Triggered {}", url.as_ref()),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        self.bridge.send(Command::TripWorkflowTrigger {
+                            url: url.to_string(),
+                            context: crate::blockkit::serde_json::json!({
+                                "location": "link",
+                                "channel_id": self.channel.as_str(),
+                            }),
+                        });
+                    }
+                    return;
+                }
                 match parse_permalink(&url) {
                     Some(permalink) if self.fixtures.conversation(&permalink.channel).is_some() => {
                         self.select(permalink.channel.clone(), cx);
@@ -1831,4 +1850,16 @@ impl App {
             .is_some_and(|(channel, _)| *channel == self.channel)
             || self.ws.active_huddles.contains_key(&self.channel)
     }
+}
+
+/// Whether `url` is a Slack Workflow Builder link trigger (`https://slack.com/shortcuts/Ft...`,
+/// `F-COLLAB-319`, `F-COLLAB-376`).
+pub(super) fn is_workflow_trigger_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return false;
+    };
+    (host == "slack.com" || host.ends_with(".slack.com")) && path.starts_with("shortcuts/Ft")
 }

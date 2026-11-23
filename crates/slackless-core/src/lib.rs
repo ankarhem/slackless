@@ -400,6 +400,16 @@ pub enum Command {
     /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true` +
     /// `apps.home.dispatchOpenEvent`, `F-COLLAB-480`).
     LoadAppHome(ChannelId),
+    /// Resolve and open an app's DM/Home conversation (`apps.home.open`, `F-COLLAB-481`, `F-COLLAB-523`).
+    OpenAppHome {
+        app_id: String,
+        team_id: String,
+    },
+    /// Trigger a Workflow Builder link trigger natively (`workflows.triggers.trip`, `F-COLLAB-319`, `F-COLLAB-376`).
+    TripWorkflowTrigger {
+        url: String,
+        context: serde_json::Value,
+    },
     /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`; `F-CORE-147`, `F-CORE-155`).
     SetGlobalNotificationPref {
         name: String,
@@ -759,6 +769,8 @@ pub enum Event {
     },
     /// An app published a fresh Home tab view (`view_updated` with `type: "home"`, `F-COLLAB-480`).
     AppHomeUpdated(serde_json::Value),
+    /// A Workflow Builder link trigger was tripped via `workflows.triggers.trip` (`F-COLLAB-319`, `F-COLLAB-376`).
+    WorkflowTripped { url: String },
     /// Starred files, custom collections, and recently deleted items for the Files browser (`F-CORE-133`).
     FilesExtrasLoaded {
         favorites: Vec<String>,

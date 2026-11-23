@@ -715,6 +715,22 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<api::AppHomeResponse>> + Send {
         async { Ok(api::AppHomeResponse::default()) }
     }
+    /// Open an app's Home DM conversation (`apps.home.open`, `F-COLLAB-481`).
+    fn open_app_home(
+        &self,
+        _app_id: String,
+        _team_id: String,
+    ) -> impl Future<Output = api::Result<Option<ChannelId>>> + Send {
+        async { Ok(None) }
+    }
+    /// Trigger a Workflow Builder link trigger (`workflows.triggers.trip`, `F-COLLAB-319`, `F-COLLAB-376`).
+    fn trip_workflow_trigger(
+        &self,
+        _url: String,
+        _context: serde_json::Value,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
     /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`).
     fn set_global_notification_pref(
         &self,
@@ -1462,6 +1478,22 @@ impl Backend for SlackApi {
         let home = self.conversations_app_home(&channel).await?;
         let _ = self.apps_home_dispatch_open_event(&channel).await;
         Ok(home)
+    }
+
+    async fn open_app_home(
+        &self,
+        app_id: String,
+        team_id: String,
+    ) -> api::Result<Option<ChannelId>> {
+        self.apps_home_open(&app_id, &team_id).await
+    }
+
+    async fn trip_workflow_trigger(
+        &self,
+        url: String,
+        context: serde_json::Value,
+    ) -> api::Result<()> {
+        self.workflows_triggers_trip(&url, &context).await
     }
 
     async fn set_global_notification_pref(
