@@ -1041,19 +1041,21 @@ pub fn load() -> Fixtures {
         pretty_type: Some("Plain Text".into()),
         mode: Some(slackless_core::types::FileMode::Snippet),
         preview: Some(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-             <plist version=\"1.0\">\n\
-             <dict>\n\
-                 <key>ANSIBlackColor</key>\n\
-                 <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVy</data>\n\
-                 <key>ANSIRedColor</key>\n\
-                 <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVy</data>\n\
-                 <key>ANSIGreenColor</key>\n\
-                 <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVy</data>\n\
-             </dict>\n\
-             </plist>\n"
-                .into(),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+                "<plist version=\"1.0\">\n",
+                "<dict>\n",
+                "    <key>ANSIBlackColor</key>\n",
+                "    <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVy</data>\n",
+                "    <key>ANSIRedColor</key>\n",
+                "    <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVy</data>\n",
+                "    <key>ANSIGreenColor</key>\n",
+                "    <data>YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVy</data>\n",
+                "</dict>\n",
+                "</plist>\n",
+            )
+            .into(),
         ),
         ..Default::default()
     }];

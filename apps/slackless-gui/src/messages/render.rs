@@ -1741,6 +1741,38 @@ pub(super) fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div
     )
 }
 
+/// One selectable monospaced code line/block (used by [`crate::files::SnippetCard`]) that
+/// participates in the window's [`TextSelectionLayer`] with bounded double/triple-click and `Cmd+C`.
+pub(crate) fn selectable_code(
+    key: &str,
+    line_ix: usize,
+    text: String,
+    document_order: u64,
+    cx: &App,
+) -> AnyElement {
+    let theme = RunTheme::body(cx, SharedString::from(key.to_owned()), document_order, None);
+    let mut run = theme.run(
+        RunFlags {
+            code: true,
+            ..DEFAULT_FLAGS
+        },
+        Some(theme.foreground),
+        None,
+        text.len(),
+    );
+    run.font = theme.mono_font.clone();
+    SelectableParagraph::new(
+        paragraph_id(&theme.key, line_ix, 0, &text),
+        text,
+        vec![run],
+        Vec::new(),
+        document_order,
+        &theme,
+    )
+    .with_code_block()
+    .into_any_element()
+}
+
 /// Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground ring with 4px
 /// corners, 32px kept clear at the right for the copy button a hover shows there.
 pub(super) fn code_block(code: String, language: Option<String>, theme: &RunTheme) -> Div {

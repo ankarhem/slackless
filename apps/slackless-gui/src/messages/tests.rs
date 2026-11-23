@@ -624,3 +624,44 @@ fn triple_click_is_bounded_inside_inline_code_and_fenced_code_blocks(cx: &mut Te
         assert_eq!(selected_text(cx), "");
     });
 }
+
+#[gpui::test]
+fn snippet_card_lines_are_selectable_without_line_numbers(cx: &mut TestAppContext) {
+    let line1 = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+    let line3 = "<plist version=\"1.0\">";
+    let line5 = "    <key>ANSIBlackColor</key>";
+    with_transcript("C0DESIGN", cx, |harness, cx| {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+
+        // Drag across lines 1..3 of the Chalk_Custom.terminal snippet: code is selected cleanly
+        // with NO line numbers (`1`, `2`, `3`) mixed into the copied text.
+        press_at(line1, 0, 1, cx);
+        let end = drag_to(line3, line3.len(), cx);
+        release_at(end, 1, cx);
+        let dragged = selected_text(cx);
+        assert!(
+            dragged.starts_with(line1) && dragged.ends_with(line3),
+            "drag across snippet lines should select code text cleanly, got: {dragged:?}"
+        );
+        assert!(
+            !dragged.contains("\n2 ") && !dragged.contains("\n3 "),
+            "line numbers must not be included in selected snippet text: {dragged:?}"
+        );
+
+        // Double-click selects a single identifier inside the snippet.
+        let key_ix = line5.find("ANSIBlackColor").unwrap() + 3;
+        let at = press_at(line5, key_ix, 2, cx);
+        release_at(at, 2, cx);
+        assert_eq!(selected_text(cx), "ANSIBlackColor");
+
+        // Triple-click selects the entire snippet line.
+        let at = press_at(line1, 5, 3, cx);
+        release_at(at, 3, cx);
+        assert_eq!(selected_text(cx), line1);
+
+        drop(harness);
+    });
+}
