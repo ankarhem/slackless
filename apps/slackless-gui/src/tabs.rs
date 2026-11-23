@@ -47,8 +47,10 @@ pub enum ConversationTab {
 pub enum TabAction {
     /// Show this tab's body in the main column.
     Switch(ConversationTab),
-    /// Open the channel canvas (its file id) in Slack's web client.
+    /// Open the channel canvas (its file id) in the native reader.
     OpenCanvas(String),
+    /// Open a Slack List tab (its file id) in the native read-only Lists viewer.
+    OpenList(String),
     /// Create the channel canvas, then open it like an existing one.
     AddCanvas,
 }
@@ -211,9 +213,30 @@ pub fn derive(conversation: &Conversation, sample: bool) -> Vec<TabSpec> {
                     }),
                 ));
             }
-            // The canvas slot is handled above; List tabs and unknown types are left out.
+            Some(ConversationTabKind::List) => {
+                let list_id = tab
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.file_id.as_deref().or(data.list_id.as_deref()))
+                    .filter(|id| !id.is_empty());
+                let Some(list_id) = list_id else {
+                    continue;
+                };
+                let label = tab
+                    .label
+                    .as_deref()
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or("List");
+                row.push(spec_with_id(
+                    "tab-list",
+                    tab.id.clone(),
+                    label,
+                    IconName::ListChecks,
+                    TabAction::OpenList(list_id.to_owned()),
+                ));
+            }
+            // The canvas slot is handled above; unknown types are left out.
             Some(ConversationTabKind::ChannelCanvas)
-            | Some(ConversationTabKind::List)
             | Some(ConversationTabKind::Other(_))
             | None => {}
         }
@@ -355,6 +378,27 @@ mod tests {
         assert_eq!(
             row(&conversation(tabs, None), false),
             ["Messages -> Switch(Messages)", "Add canvas -> AddCanvas"]
+        );
+    }
+
+    #[test]
+    fn derives_live_list_tabs_when_file_id_is_present() {
+        let list_tab = ConversationTabSpec {
+            kind: Some(ConversationTabKind::List),
+            label: Some("Launch tasks".into()),
+            data: Some(TabData {
+                file_id: Some("F09LIST".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            row(&conversation(vec![list_tab], None), false),
+            [
+                "Messages -> Switch(Messages)",
+                "Add canvas -> AddCanvas",
+                "Launch tasks -> OpenList(\"F09LIST\")",
+            ]
         );
     }
 

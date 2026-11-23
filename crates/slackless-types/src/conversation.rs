@@ -225,6 +225,12 @@ pub struct TabData {
     /// The folder bookmark whose entries a `folder` tab lists.
     #[serde(default)]
     pub folder_bookmark_id: Option<String>,
+    /// File id (`F…`) backing a `list` or `canvas` tab.
+    #[serde(default)]
+    pub file_id: Option<String>,
+    /// Alternate list id key observed on some `list` tabs.
+    #[serde(default)]
+    pub list_id: Option<String>,
     /// Fields this crate does not model, preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,

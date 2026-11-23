@@ -171,6 +171,16 @@ pub const NOTIFY_LEVELS: [&str; 3] = [
     "Direct messages, mentions & keywords",
     "Nothing",
 ];
+/// Mobile push handoff delay choices (`push_idle_wait`, `F-CORE-155`).
+pub const MOBILE_HANDOFF: [&str; 7] = [
+    "As soon as I'm inactive",
+    "After 1 minute",
+    "After 2 minutes",
+    "After 5 minutes",
+    "After 10 minutes",
+    "After 15 minutes",
+    "After 30 minutes",
+];
 const SOUNDS: [&str; 6] = ["Knock Brush", "Ding", "Plink", "Hummus", "Boing", "None"];
 /// Where [`SOUNDS`] play from, in the same order: Slack's own notification sounds on its CDN
 /// (its web client's `knock_brush`, `b2`, `confirm_delivery`, `hummus` and `animal_stick`
@@ -245,6 +255,10 @@ pub struct Settings {
     pub desktop_notifications: bool,
     pub notify_level: usize,
     pub mobile_different: bool,
+    /// Mobile handoff idle wait index into [`MOBILE_HANDOFF`] (`push_idle_wait`, `F-CORE-155`).
+    pub mobile_handoff: usize,
+    /// Automatically pause notifications while a custom status is active (`F-SHELL-017`).
+    pub status_pauses_notifications: bool,
     pub thread_replies: bool,
     pub keywords: String,
     pub sound: usize,
@@ -424,6 +438,8 @@ impl Default for Settings {
             desktop_notifications: true,
             notify_level: 1,
             mobile_different: false,
+            mobile_handoff: 0,
+            status_pauses_notifications: false,
             thread_replies: true,
             keywords: "deploy, incident".to_owned(),
             sound: 0,
@@ -511,6 +527,30 @@ impl Settings {
         }
         const OFFSETS: [i64; 5] = [3_600, 0, -18_000, -28_800, 32_400];
         Some(OFFSETS.get(self.timezone).copied().unwrap_or(0))
+    }
+
+    /// Slack's `push_idle_wait` value in seconds for [`Self::mobile_handoff`] (`F-CORE-155`).
+    pub fn mobile_handoff_secs(&self) -> u32 {
+        const SECS: [u32; 7] = [0, 60, 120, 300, 600, 900, 1_800];
+        SECS.get(self.mobile_handoff).copied().unwrap_or(0)
+    }
+
+    /// Slack's `global_desktop` notification level key for [`Self::notify_level`] (`F-CORE-147`).
+    pub fn notify_level_wire(&self) -> &'static str {
+        match self.notify_level {
+            0 => "everything",
+            2 => "nothing",
+            _ => "mentions_dms",
+        }
+    }
+
+    /// Slack's `dnd_days` wire value for [`Self::schedule_days`].
+    pub fn schedule_days_wire(&self) -> &'static str {
+        match self.schedule_days {
+            0 => "every_day",
+            2 => "custom",
+            _ => "weekdays",
+        }
     }
 
     /// `Weekdays, 9:00 AM – 6:00 PM`, or `Off` without a schedule.
@@ -963,6 +1003,22 @@ impl Preferences {
             |s| &mut s.mobile_different,
             cx,
         );
+        let mobile_handoff_select = self.select(
+            "notify-mobile-handoff",
+            &MOBILE_HANDOFF,
+            |s| &mut s.mobile_handoff,
+            cx,
+        );
+        let mobile_handoff = self.labeled(
+            "When I'm not active on desktop, send notifications to my mobile devices:",
+            mobile_handoff_select,
+        );
+        let status_pause = self.checkbox(
+            "notify-status-pause",
+            "Pause notifications automatically while a custom status is set",
+            |s| &mut s.status_pauses_notifications,
+            cx,
+        );
         let threads = self.checkbox(
             "notify-threads",
             "Notify me about replies to threads I'm following",
@@ -1038,6 +1094,8 @@ impl Preferences {
                     .child(desktop)
                     .child(level)
                     .child(mobile)
+                    .child(mobile_handoff)
+                    .child(status_pause)
                     .child(threads),
                 cx,
             ))
@@ -2013,5 +2071,19 @@ mod tests {
         s.schedule_enabled = false;
         assert!(s.notifications_allowed_now());
         assert_eq!(s.schedule_summary(), "Off");
+
+        s.notify_level = 0;
+        assert_eq!(s.notify_level_wire(), "everything");
+        s.notify_level = 1;
+        assert_eq!(s.notify_level_wire(), "mentions_dms");
+        s.notify_level = 2;
+        assert_eq!(s.notify_level_wire(), "nothing");
+
+        s.mobile_handoff = 3;
+        assert_eq!(s.mobile_handoff_secs(), 300);
+        s.schedule_days = 0;
+        assert_eq!(s.schedule_days_wire(), "every_day");
+        s.schedule_days = 1;
+        assert_eq!(s.schedule_days_wire(), "weekdays");
     }
 }

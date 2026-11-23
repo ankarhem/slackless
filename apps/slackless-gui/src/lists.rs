@@ -1,18 +1,28 @@
-//! Read-only Slack List view: the conversation's List tab renders a fixture list (typed
-//! columns over rows; text, person, select, date and checkbox fields) as a table
-//! (docs/research/api-canvases-lists.md). Editing is deferred: cells are rendered, never
-//! mutated, and the header says so.
+//! Read-only Slack List view: renders both the sample workspace's fixture list and live Slack
+//! Lists fetched via `files.info` + `lists.records.list` / `slackLists.items.list` as a
+//! searchable, sortable table with typed columns (text, person, select, date, checkbox,
+//! number, link) (`docs/research/api-canvases-lists.md`).
+
+use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::button::Button;
+use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Div, FontWeight, Hsla, InteractiveElement as _, ParentElement as _, Stateful,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    App, Div, Entity, FontWeight, Hsla, InteractiveElement as _, ParentElement as _, Stateful,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
 };
+use slackless_core::api::{SlackListCellValue, SlackListColumn, SlackListData, SlackListRow};
 
-use crate::canvas::read_only_badge;
+use crate::canvas::{OpenBrowserFn, read_only_badge};
+use crate::fixtures::Fixtures;
 use crate::sidebar::team_initials;
 use crate::theme;
+
+/// Callback invoked when the user clicks a live list column header to sort by `col_idx`.
+pub type SortColumnFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// A column's field type; drives its header icon and how its cells render.
 #[derive(Clone, Copy)]
@@ -249,5 +259,583 @@ fn cell(field: &Field, cx: &App) -> Div {
             };
             div().child(Icon::new(icon).text_color(color).size(px(16.)))
         }
+    }
+}
+
+/// Native live read-only Slack Lists viewer: shows loading, error with browser fallback, or a
+/// searchable, column-sortable table of typed Slack List records.
+#[allow(clippy::too_many_arguments)]
+pub fn live_list_view(
+    loaded: Option<&Result<SlackListData, String>>,
+    fixtures: &Fixtures,
+    query: &str,
+    search: Option<&Entity<TextareaState>>,
+    sort: Option<(usize, bool)>,
+    on_sort: Option<SortColumnFn>,
+    open_browser: Option<OpenBrowserFn>,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    match loaded {
+        None => v_flex()
+            .id("list-loading")
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child("Loading list…")
+            .when_some(open_browser, |col, open| {
+                col.child(
+                    Button::new("list-loading-browser")
+                        .outline()
+                        .with_size(Size::Small)
+                        .icon(IconName::ExternalLink)
+                        .label("Open in browser")
+                        .on_click(move |_, window, cx| open(window, cx)),
+                )
+            }),
+        Some(Err(err)) => v_flex()
+            .id("list-error")
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_8()
+            .text_sm()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Could not load list"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(err.clone()),
+            )
+            .when_some(open_browser, |col, open| {
+                col.child(
+                    Button::new("list-err-browser")
+                        .outline()
+                        .with_size(Size::Small)
+                        .icon(IconName::ExternalLink)
+                        .label("Open in browser")
+                        .on_click(move |_, window, cx| open(window, cx)),
+                )
+            }),
+        Some(Ok(data)) => render_live_list(
+            data,
+            fixtures,
+            query,
+            search,
+            sort,
+            on_sort,
+            open_browser,
+            cx,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_live_list(
+    data: &SlackListData,
+    fixtures: &Fixtures,
+    query: &str,
+    search: Option<&Entity<TextareaState>>,
+    sort: Option<(usize, bool)>,
+    on_sort: Option<SortColumnFn>,
+    open_browser: Option<OpenBrowserFn>,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let visible_indices = filter_and_sort_rows(data, fixtures, query, sort);
+
+    let header_row = data.columns.iter().enumerate().fold(
+        h_flex()
+            .bg(theme.muted)
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD),
+        |row, (ix, column)| {
+            let width = live_column_width(column);
+            let active_sort = sort.filter(|(c, _)| *c == ix).map(|(_, asc)| asc);
+            let on_sort_cb = on_sort.clone();
+            let hover = theme.accent;
+            let cell = h_flex()
+                .id(("list-col-hdr", ix))
+                .w(px(width))
+                .flex_none()
+                .items_center()
+                .gap_1p5()
+                .px_3()
+                .py_2()
+                .text_color(theme.muted_foreground)
+                .when(on_sort_cb.is_some(), |el| {
+                    el.cursor_pointer().hover(move |h| h.bg(hover))
+                })
+                .when_some(on_sort_cb, |el, cb| {
+                    el.on_click(move |_, window, cx| cb(ix, window, cx))
+                })
+                .child(
+                    Icon::new(live_column_icon(&column.kind))
+                        .text_color(theme.muted_foreground)
+                        .size(px(14.)),
+                )
+                .child(div().truncate().child(column.name.clone()))
+                .when_some(active_sort, |el, asc| {
+                    el.child(div().text_xs().text_color(theme.foreground).child(if asc {
+                        "\u{2191}"
+                    } else {
+                        "\u{2193}"
+                    }))
+                });
+            row.child(cell)
+        },
+    );
+
+    let rows_ui = visible_indices.iter().map(|&row_ix| {
+        let rec = &data.rows[row_ix];
+        data.columns.iter().fold(
+            h_flex().border_t_1().border_color(theme.border).text_sm(),
+            |row, column| {
+                let width = live_column_width(column);
+                let val = row_cell(rec, column);
+                row.child(
+                    h_flex()
+                        .w(px(width))
+                        .flex_none()
+                        .items_center()
+                        .px_3()
+                        .py_2()
+                        .child(live_cell(val, column, fixtures, cx)),
+                )
+            },
+        )
+    });
+
+    let body = if data.columns.is_empty() {
+        div()
+            .py_8()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child("This list has no columns.")
+    } else if visible_indices.is_empty() {
+        v_flex()
+            .flex_none()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(header_row)
+            .child(
+                div()
+                    .px_4()
+                    .py_6()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(if query.trim().is_empty() {
+                        "This list has no items yet."
+                    } else {
+                        "No matching items."
+                    }),
+            )
+    } else {
+        v_flex()
+            .flex_none()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .child(header_row)
+            .children(rows_ui)
+    };
+
+    let find_bar = search.map(|input| {
+        h_flex()
+            .w(px(320.))
+            .h(px(30.))
+            .px_2p5()
+            .gap_2()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                Icon::new(IconName::Search)
+                    .size(px(14.))
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Textarea::new(input).appearance(false).bordered(false)),
+            )
+    });
+
+    div().id("list-scroll").size_full().overflow_scroll().child(
+        v_flex()
+            .px_6()
+            .py_5()
+            .gap_4()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::ListChecks)
+                            .text_color(theme.success)
+                            .size(px(18.)),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(data.title.clone()),
+                                    )
+                                    .child(
+                                        div().text_xs().text_color(theme.muted_foreground).child(
+                                            format!(
+                                                "{} of {} items",
+                                                visible_indices.len(),
+                                                data.rows.len()
+                                            ),
+                                        ),
+                                    ),
+                            )
+                            .when(!data.description.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(data.description.clone()),
+                                )
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .children(find_bar)
+                    .child(read_only_badge(cx))
+                    .when_some(open_browser, |row, open| {
+                        row.child(
+                            Button::new("list-open-browser")
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::ExternalLink)
+                                .label("Open in browser")
+                                .on_click(move |_, window, cx| open(window, cx)),
+                        )
+                    }),
+            )
+            .child(body),
+    )
+}
+
+fn row_cell<'a>(row: &'a SlackListRow, column: &SlackListColumn) -> Option<&'a SlackListCellValue> {
+    row.cells
+        .get(&column.id)
+        .or_else(|| row.cells.get(&column.key))
+}
+
+fn live_column_icon(kind: &str) -> IconName {
+    match kind {
+        "user" | "todo_assignee" | "assignee" | "created_by" | "last_edited_by" | "vote" => {
+            IconName::User
+        }
+        "select" | "multi_select" => IconName::CircleDot,
+        "date" | "todo_due_date" | "due_date" | "created_time" | "last_edited_time" => {
+            IconName::Calendar
+        }
+        "checkbox" | "todo_completed" | "completed" => IconName::SquareCheck,
+        "link" => IconName::Link,
+        "number" | "rating" | "currency" => IconName::Hash,
+        _ => IconName::Type,
+    }
+}
+
+fn live_column_width(column: &SlackListColumn) -> f32 {
+    if column.is_primary {
+        return 260.;
+    }
+    match column.kind.as_str() {
+        "checkbox" | "todo_completed" | "completed" => 90.,
+        "date" | "todo_due_date" | "due_date" | "number" | "rating" => 120.,
+        "select" | "multi_select" => 150.,
+        "user" | "todo_assignee" | "assignee" => 180.,
+        _ => 210.,
+    }
+}
+
+fn slack_choice_color(name: &str, cx: &App) -> Hsla {
+    let theme = cx.theme();
+    match name {
+        "green" => theme.success,
+        "red" => theme.danger,
+        "blue" | "indigo" => theme.link,
+        "yellow" | "orange" => rgb(0xd97706).into(),
+        "purple" => rgb(0x7c3aed).into(),
+        "pink" => rgb(0xdb2777).into(),
+        "cyan" => rgb(0x0891b2).into(),
+        "brown" => rgb(0x92400e).into(),
+        _ => theme.muted_foreground,
+    }
+}
+
+fn cell_sort_key(
+    val: Option<&SlackListCellValue>,
+    col: &SlackListColumn,
+    fixtures: &Fixtures,
+) -> String {
+    match val {
+        None | Some(SlackListCellValue::Empty) => String::new(),
+        Some(SlackListCellValue::Text(s))
+        | Some(SlackListCellValue::Date(s))
+        | Some(SlackListCellValue::Number(s)) => s.to_lowercase(),
+        Some(SlackListCellValue::Link { label, .. }) => label.to_lowercase(),
+        Some(SlackListCellValue::Checkbox(b)) => if *b { "1" } else { "0" }.to_owned(),
+        Some(SlackListCellValue::Users(users)) => users
+            .iter()
+            .map(|u| fixtures.user_name(u).to_lowercase())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(SlackListCellValue::Select(opts)) => opts
+            .iter()
+            .map(|v| {
+                col.choices
+                    .iter()
+                    .find(|c| c.value == *v)
+                    .map(|c| c.label.to_lowercase())
+                    .unwrap_or_else(|| v.to_lowercase())
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+/// Filter live list rows by `query` across all columns and sort by optional `(col_idx, ascending)`.
+pub(crate) fn filter_and_sort_rows(
+    data: &SlackListData,
+    fixtures: &Fixtures,
+    query: &str,
+    sort: Option<(usize, bool)>,
+) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    let mut indices: Vec<usize> =
+        data.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                needle.is_empty()
+                    || data.columns.iter().any(|col| {
+                        cell_sort_key(row_cell(row, col), col, fixtures).contains(&needle)
+                    })
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+    if let Some((col_ix, asc)) = sort {
+        if let Some(col) = data.columns.get(col_ix) {
+            indices.sort_by(|&a, &b| {
+                let ka = cell_sort_key(row_cell(&data.rows[a], col), col, fixtures);
+                let kb = cell_sort_key(row_cell(&data.rows[b], col), col, fixtures);
+                if asc { ka.cmp(&kb) } else { kb.cmp(&ka) }
+            });
+        }
+    }
+    indices
+}
+
+fn live_cell(
+    val: Option<&SlackListCellValue>,
+    column: &SlackListColumn,
+    fixtures: &Fixtures,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    match val {
+        None | Some(SlackListCellValue::Empty) => {
+            div().text_color(theme.muted_foreground).child("—")
+        }
+        Some(SlackListCellValue::Text(t)) => div().truncate().child(t.clone()),
+        Some(SlackListCellValue::Date(d)) => {
+            div().text_color(theme.muted_foreground).child(d.clone())
+        }
+        Some(SlackListCellValue::Number(n)) => {
+            div().font_weight(FontWeight::MEDIUM).child(n.clone())
+        }
+        Some(SlackListCellValue::Checkbox(checked)) => {
+            let (icon, color) = if *checked {
+                (IconName::SquareCheck, theme.success)
+            } else {
+                (IconName::Square, theme.muted_foreground)
+            };
+            div().child(Icon::new(icon).text_color(color).size(px(16.)))
+        }
+        Some(SlackListCellValue::Link { label, url }) => {
+            let href = url.clone();
+            div().child(
+                div()
+                    .id(gpui_kit::gpui::SharedString::from(format!(
+                        "list-link-{href}"
+                    )))
+                    .truncate()
+                    .text_color(theme.link)
+                    .cursor_pointer()
+                    .hover(|el| el.underline())
+                    .child(label.clone())
+                    .on_click(move |_, _, cx| cx.open_url(&href)),
+            )
+        }
+        Some(SlackListCellValue::Users(users)) => {
+            let mut row = h_flex()
+                .gap_1p5()
+                .items_center()
+                .min_w_0()
+                .overflow_hidden();
+            for uid in users.iter().take(2) {
+                let name = fixtures.user_name(uid).to_owned();
+                row = row.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .size(px(20.))
+                                .flex_none()
+                                .rounded_sm()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .bg(theme::avatar_color(&name))
+                                .text_color(theme::avatar_foreground())
+                                .child(team_initials(&name)),
+                        )
+                        .child(div().truncate().child(name)),
+                );
+            }
+            if users.len() > 2 {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("+{}", users.len() - 2)),
+                );
+            }
+            row
+        }
+        Some(SlackListCellValue::Select(opts)) => {
+            let mut row = h_flex().gap_1().items_center().flex_wrap();
+            for opt in opts {
+                let choice = column.choices.iter().find(|c| c.value == *opt);
+                let label = choice.map(|c| c.label.as_str()).unwrap_or(opt.as_str());
+                let color = choice
+                    .map(|c| slack_choice_color(&c.color, cx))
+                    .unwrap_or(theme.muted_foreground);
+                row = row.child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .text_xs()
+                        .bg(color.opacity(0.18))
+                        .text_color(color)
+                        .child(label.to_owned()),
+                );
+            }
+            row
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slackless_core::api::SlackListChoice;
+    use std::collections::HashMap;
+
+    #[test]
+    fn filters_and_sorts_live_slack_list_rows() {
+        let fixtures = crate::fixtures::load();
+        let data = SlackListData {
+            file_id: "F1".into(),
+            title: "Tasks".into(),
+            description: String::new(),
+            columns: vec![
+                SlackListColumn {
+                    id: "C1".into(),
+                    key: "task".into(),
+                    name: "Task".into(),
+                    kind: "text".into(),
+                    is_primary: true,
+                    choices: Vec::new(),
+                },
+                SlackListColumn {
+                    id: "C2".into(),
+                    key: "status".into(),
+                    name: "Status".into(),
+                    kind: "select".into(),
+                    is_primary: false,
+                    choices: vec![
+                        SlackListChoice {
+                            value: "opt_done".into(),
+                            label: "Done".into(),
+                            color: "green".into(),
+                        },
+                        SlackListChoice {
+                            value: "opt_todo".into(),
+                            label: "To do".into(),
+                            color: "gray".into(),
+                        },
+                    ],
+                },
+            ],
+            rows: vec![
+                SlackListRow {
+                    id: "R1".into(),
+                    cells: HashMap::from([
+                        ("C1".into(), SlackListCellValue::Text("Zebra work".into())),
+                        (
+                            "C2".into(),
+                            SlackListCellValue::Select(vec!["opt_todo".into()]),
+                        ),
+                    ]),
+                },
+                SlackListRow {
+                    id: "R2".into(),
+                    cells: HashMap::from([
+                        ("C1".into(), SlackListCellValue::Text("Alpha launch".into())),
+                        (
+                            "C2".into(),
+                            SlackListCellValue::Select(vec!["opt_done".into()]),
+                        ),
+                    ]),
+                },
+            ],
+        };
+
+        assert_eq!(
+            filter_and_sort_rows(&data, &fixtures, "", Some((0, true))),
+            vec![1, 0]
+        );
+        assert_eq!(
+            filter_and_sort_rows(&data, &fixtures, "", Some((0, false))),
+            vec![0, 1]
+        );
+        // Query matches resolved select choice label ("done") as well as text.
+        assert_eq!(
+            filter_and_sort_rows(&data, &fixtures, "done", None),
+            vec![1]
+        );
+        assert_eq!(
+            filter_and_sort_rows(&data, &fixtures, "zebra", None),
+            vec![0]
+        );
     }
 }

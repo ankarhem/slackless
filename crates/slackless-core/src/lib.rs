@@ -339,6 +339,37 @@ pub enum Command {
     LoadCanvas {
         file_id: String,
     },
+    /// Fetch a live Slack List's schema and records (`files.info` + `lists.records.list`).
+    LoadList {
+        file_id: String,
+    },
+    /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`; `F-CORE-147`, `F-CORE-155`).
+    SetGlobalNotificationPref {
+        name: String,
+        value: String,
+        sync: bool,
+    },
+    /// Load starred files, custom file collections, and recently deleted canvases/lists (`F-CORE-133`).
+    LoadFilesExtras,
+    /// Star/unstar a file or add/remove it from a collection (`files.favorites.add`/`.remove`, `F-CORE-133`).
+    SetFileFavorite {
+        file_id: String,
+        collection_id: Option<String>,
+        starred: bool,
+    },
+    /// Create a custom Files sidebar collection (`files.collections.create`, `F-CORE-133`).
+    CreateFileCollection {
+        name: String,
+        emoji: Option<String>,
+    },
+    /// Delete a custom Files sidebar collection (`files.collections.delete`, `F-CORE-133`).
+    DeleteFileCollection {
+        collection_id: String,
+    },
+    /// Restore a recently deleted canvas or list (`files.undelete`, `F-CORE-133`).
+    RestoreDeletedFile {
+        file_id: String,
+    },
     /// Update a Later item's state (`mark`) and/or reminder due time (`date_due`, `Some(None)` clears).
     UpdateSavedItem {
         channel: ChannelId,
@@ -639,6 +670,19 @@ pub enum Event {
         title: String,
         html: Result<String, String>,
     },
+    /// A live Slack List finished loading (`files.info` + `lists.records.list`).
+    ListLoaded {
+        file_id: String,
+        list: Result<Box<api::SlackListData>, String>,
+    },
+    /// Starred files, custom collections, and recently deleted items for the Files browser (`F-CORE-133`).
+    FilesExtrasLoaded {
+        favorites: Vec<String>,
+        collections: Vec<api::FileCollection>,
+        deleted: Vec<api::DeletedFile>,
+    },
+    /// A recently deleted canvas/list was restored (`files.undelete`, `F-CORE-133`).
+    FileRestored { file_id: String },
     /// A user-owned file was deleted via `files.delete` (`F-CORE-130`).
     FileDeleted { file_id: String },
     /// A non-fatal failure worth surfacing.

@@ -207,6 +207,8 @@ pub struct Composer {
     spellcheck_lang: Option<&'static str>,
     misspellings: Vec<Range<usize>>,
     spell_guesses: Option<(Range<usize>, String, Vec<String>)>,
+    /// Byte offset at the end of a word actively being typed; suppressed until word end or caret move.
+    spell_typing_end: Option<usize>,
     /// A GIF selected from the GIFs picker, staged in the composer until send or removal.
     pending_gif: Option<GifItem>,
     /// Removed/replaced staged GIF URLs awaiting GPU texture eviction on the next render.
@@ -309,6 +311,7 @@ impl Composer {
                 spellcheck_lang: None,
                 misspellings: Vec::new(),
                 spell_guesses: None,
+                spell_typing_end: None,
                 pending_gif: None,
                 stale_gif_urls: Vec::new(),
                 next_paste_id: 1,

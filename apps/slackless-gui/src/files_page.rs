@@ -29,7 +29,7 @@ use gpui_kit::gpui::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::api::FilesFilter;
+use slackless_core::api::{DeletedFile, FileCollection, FilesFilter};
 use slackless_core::types::{File, UserId};
 
 use crate::files::file_icon;
@@ -50,10 +50,18 @@ pub enum FilesSection {
     All,
     Canvases,
     Lists,
+    Starred,
+    Deleted,
 }
 
 impl FilesSection {
-    pub const ALL: [FilesSection; 3] = [Self::All, Self::Canvases, Self::Lists];
+    pub const ALL: [FilesSection; 5] = [
+        Self::All,
+        Self::Canvases,
+        Self::Lists,
+        Self::Starred,
+        Self::Deleted,
+    ];
 
     /// The list-column row's label and the page's title.
     pub fn title(self) -> &'static str {
@@ -61,6 +69,8 @@ impl FilesSection {
             Self::All => "All files",
             Self::Canvases => "Canvases",
             Self::Lists => "Lists",
+            Self::Starred => "Starred",
+            Self::Deleted => "Recently deleted",
         }
     }
 
@@ -70,6 +80,8 @@ impl FilesSection {
             Self::All => IconName::FileStack,
             Self::Canvases => IconName::StickyNote,
             Self::Lists => IconName::Table2,
+            Self::Starred => IconName::Star,
+            Self::Deleted => IconName::Trash,
         }
     }
 
@@ -78,13 +90,15 @@ impl FilesSection {
             Self::All => "Search files",
             Self::Canvases => "Search canvases",
             Self::Lists => "Search lists",
+            Self::Starred => "Search starred files",
+            Self::Deleted => "Search deleted canvases & lists",
         }
     }
 
     /// Whether `file` belongs on this page: canvases are `quip` files, lists `list` files.
     fn holds(self, file: &File) -> bool {
         match self {
-            Self::All => true,
+            Self::All | Self::Starred | Self::Deleted => true,
             Self::Canvases => file.filetype.as_deref() == Some("quip"),
             Self::Lists => file.filetype.as_deref() == Some("list"),
         }
@@ -92,7 +106,7 @@ impl FilesSection {
 
     fn source(self) -> Source {
         match self {
-            Self::All | Self::Lists => Source::Workspace,
+            Self::All | Self::Lists | Self::Starred | Self::Deleted => Source::Workspace,
             Self::Canvases => Source::Canvases,
         }
     }
@@ -111,6 +125,14 @@ impl FilesSection {
             Self::Lists => (
                 "No lists yet",
                 "Lists you create or that are shared with you will be shown here.",
+            ),
+            Self::Starred => (
+                "No starred files yet",
+                "Click the star on any file, canvas, or list to keep it handy here.",
+            ),
+            Self::Deleted => (
+                "Nothing in trash",
+                "Canvases and lists deleted in the last 24 hours can be restored here.",
             ),
         }
     }
@@ -134,6 +156,8 @@ impl FilesChip {
             (Self::All, FilesSection::All) => "All",
             (Self::All, FilesSection::Canvases) => "All Canvases",
             (Self::All, FilesSection::Lists) => "All Lists",
+            (Self::All, FilesSection::Starred) => "All Starred",
+            (Self::All, FilesSection::Deleted) => "All Deleted",
             (Self::CreatedByYou, _) => "Created by you",
             (Self::SharedWithYou, _) => "Shared with you",
         }
@@ -190,12 +214,28 @@ enum Load {
 pub enum FilesPageEvent {
     /// Fetch a page's rows (`files.list`); the answer lands through [`FilesPage::land`].
     Load(FilesFilter),
+    /// Fetch starred file IDs, custom file collections, and recently deleted items (`F-CORE-133`).
+    LoadExtras,
     /// Save a file for Later (`saved.add` with `item_type=file`, `F-CORE-157`).
     SaveFile { file_id: String, name: String },
     /// Permanently delete a user-owned file/clip (`files.delete`, `F-CORE-130`).
     DeleteFile { file_id: String, name: String },
+    /// Star/unstar a file or add/remove it from a collection (`files.favorites.*`, `F-CORE-133`).
+    ToggleFavorite {
+        file_id: String,
+        collection_id: Option<String>,
+        starred: bool,
+    },
+    /// Create a new custom file collection (`files.collections.create`, `F-CORE-133`).
+    CreateCollection { name: String },
+    /// Delete a custom file collection (`files.collections.delete`, `F-CORE-133`).
+    DeleteCollection { collection_id: String },
+    /// Restore a recently deleted canvas or list (`files.undelete`, `F-CORE-133`).
+    RestoreFile { file_id: String, title: String },
     /// Preview a Slack canvas natively in the in-app Canvas reader (`F-COLLAB-125`).
     OpenCanvas { file_id: String },
+    /// Preview a Slack List natively in the in-app read-only Lists viewer.
+    OpenList { file_id: String },
 }
 
 /// Client-side sort order over the loaded files page (`F-CORE-133`).
@@ -233,6 +273,14 @@ pub struct FilesPage {
     /// Indices into the shown source's rows that the page lists, recomputed when the rows,
     /// the page, the chip or the search change.
     shown: Vec<usize>,
+    /// Starred file IDs (`files.favorites.list`, `F-CORE-133`).
+    favorites: HashSet<String>,
+    /// Custom file collections (`files.collections.list`, `F-CORE-133`).
+    collections: Vec<FileCollection>,
+    /// Active custom collection ID filter (`None` = all files in the section).
+    active_collection: Option<String>,
+    /// Recently deleted canvases & lists (`files.recentlyDeleted`, `F-CORE-133`).
+    deleted: Vec<DeletedFile>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -265,6 +313,10 @@ impl FilesPage {
                 query: String::new(),
                 rows: Default::default(),
                 shown: Vec::new(),
+                favorites: HashSet::new(),
+                collections: Vec::new(),
+                active_collection: None,
+                deleted: Vec::new(),
                 _subscriptions: subscriptions,
             };
             page.reload();
@@ -281,6 +333,49 @@ impl FilesPage {
             rows.fresh = false;
         }
         self.fetch(cx);
+        if !self.fixtures.sample {
+            cx.emit(FilesPageEvent::LoadExtras);
+        }
+        cx.notify();
+    }
+
+    /// Land starred IDs, custom file collections, and recently deleted canvases/lists (`F-CORE-133`).
+    pub fn set_extras(
+        &mut self,
+        favorites: Vec<String>,
+        collections: Vec<FileCollection>,
+        deleted: Vec<DeletedFile>,
+        cx: &mut Context<Self>,
+    ) {
+        self.favorites = favorites.into_iter().collect();
+        self.collections = collections;
+        if let Some(active) = &self.active_collection {
+            if !self.collections.iter().any(|c| &c.id == active) {
+                self.active_collection = None;
+            }
+        }
+        self.deleted = deleted;
+        self.refilter();
+        cx.notify();
+    }
+
+    /// Optimistically toggle a file's star state locally before `files.favorites.*` lands.
+    pub fn toggle_favorite_local(&mut self, file_id: &str, cx: &mut Context<Self>) -> bool {
+        let now_starred = if self.favorites.contains(file_id) {
+            self.favorites.remove(file_id);
+            false
+        } else {
+            self.favorites.insert(file_id.to_owned());
+            true
+        };
+        self.refilter();
+        cx.notify();
+        now_starred
+    }
+
+    /// Remove a restored file from the Deleted list immediately (`Event::FileRestored`).
+    pub fn mark_restored(&mut self, file_id: &str, cx: &mut Context<Self>) {
+        self.deleted.retain(|d| d.id != file_id);
         cx.notify();
     }
 
@@ -398,6 +493,13 @@ impl FilesPage {
 
     fn refilter(&mut self) {
         let rows = &self.rows[self.section.source().index()];
+        let collection_ids: Option<HashSet<&str>> =
+            self.active_collection.as_ref().and_then(|id| {
+                self.collections
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| c.file_ids.iter().map(String::as_str).collect())
+            });
         let mut shown = visible_files(
             &rows.files,
             self.section,
@@ -405,6 +507,12 @@ impl FilesPage {
             &self.fixtures.self_user,
             &self.query,
         );
+        if self.section == FilesSection::Starred {
+            shown.retain(|&ix| self.favorites.contains(rows.files[ix].id.as_str()));
+        }
+        if let Some(ids) = collection_ids {
+            shown.retain(|&ix| ids.contains(rows.files[ix].id.as_str()));
+        }
         sort_visible_files(&rows.files, &mut shown, self.sort);
         self.shown = shown;
     }
@@ -498,8 +606,16 @@ impl FilesPage {
 
 impl Render for FilesPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (fg, dim, border) = (theme.foreground, theme.muted_foreground, theme.border);
+        let (fg, dim, border, fill, hover) = {
+            let theme = cx.theme();
+            (
+                theme.foreground,
+                theme.muted_foreground,
+                theme.border,
+                theme.link,
+                theme.accent,
+            )
+        };
         let section = self.section;
         let header = v_flex()
             .gap_3()
@@ -543,17 +659,172 @@ impl Render for FilesPage {
             .gap_2()
             .child(chips)
             .child(sort_menu);
+        // Custom file collections strip (`files.collections.*`, `F-CORE-133`): lets users filter
+        // by collection, delete a collection, or create a new one.
+        let collections_bar = (section != FilesSection::Deleted
+            && (!self.collections.is_empty() || !self.fixtures.sample))
+            .then(|| {
+                let on_fill = crate::theme::avatar_foreground();
+                let active_col = self.active_collection.clone();
+                let this_new = cx.weak_entity();
+                h_flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().text_xs().text_color(dim).child("Collections:"))
+                    .children(self.collections.iter().enumerate().map(|(ix, col)| {
+                        let cid = col.id.clone();
+                        let cid_del = col.id.clone();
+                        let active = active_col.as_deref() == Some(col.id.as_str());
+                        let label = format!("{} ({})", col.name, col.file_ids.len());
+                        h_flex()
+                            .id(("files-collection", ix))
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(active, |c| {
+                                c.border_color(fill).bg(fill).text_color(on_fill)
+                            })
+                            .when(!active, |c| {
+                                c.border_color(border).hover(move |c| c.bg(hover))
+                            })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.active_collection =
+                                    if this.active_collection.as_deref() == Some(cid.as_str()) {
+                                        None
+                                    } else {
+                                        Some(cid.clone())
+                                    };
+                                this.refilter();
+                                cx.notify();
+                            }))
+                            .when(active, |pill| {
+                                pill.child(
+                                    div()
+                                        .id(("files-collection-del", ix))
+                                        .pl_1()
+                                        .cursor_pointer()
+                                        .child("\u{2715}")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.active_collection = None;
+                                            cx.emit(FilesPageEvent::DeleteCollection {
+                                                collection_id: cid_del.clone(),
+                                            });
+                                            this.refilter();
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                    }))
+                    .child(
+                        Button::new("files-collection-new")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Plus)
+                            .label("New collection")
+                            .on_click(move |_, window, cx| {
+                                open_new_collection_dialog(this_new.clone(), window, cx);
+                            }),
+                    )
+            });
         let rows = &self.rows[section.source().index()];
         let error = match &rows.load {
             Load::Failed(error) => Some(Self::error_row(error, cx)),
             _ => None,
         };
-        let body: AnyElement = if self.shown.is_empty() {
+        let body: AnyElement = if section == FilesSection::Deleted {
+            let matching_deleted: Vec<&DeletedFile> = self
+                .deleted
+                .iter()
+                .filter(|d| self.query.is_empty() || d.title.to_lowercase().contains(&self.query))
+                .collect();
+            if matching_deleted.is_empty() {
+                let (title, line) = section.empty_state();
+                state_block(Some(title), line, fg, dim).into_any_element()
+            } else {
+                let this = cx.weak_entity();
+                v_flex()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(border)
+                    .overflow_hidden()
+                    .children(matching_deleted.into_iter().enumerate().map(|(ix, item)| {
+                        let fid = item.id.clone();
+                        let title = item.title.clone();
+                        let page_restore = this.clone();
+                        let kind_label = match item.file_type.as_str() {
+                            "quip" => "Canvas",
+                            "list" => "List",
+                            other if !other.is_empty() => other,
+                            _ => "File",
+                        };
+                        let when = if item.date_delete > 0 {
+                            format!("{kind_label} · Deleted {}", file_day(item.date_delete))
+                        } else {
+                            kind_label.to_owned()
+                        };
+                        h_flex()
+                            .id(("files-deleted-row", ix))
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .when(ix > 0, |r| r.border_t_1().border_color(border))
+                            .child(
+                                Icon::new(if item.file_type == "list" {
+                                    IconName::Table2
+                                } else {
+                                    IconName::StickyNote
+                                })
+                                .size(px(18.))
+                                .text_color(dim),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(item.title.clone()),
+                                    )
+                                    .child(div().text_xs().text_color(dim).child(when)),
+                            )
+                            .child(
+                                Button::new(("files-restore", ix))
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::RotateCcw)
+                                    .label("Restore")
+                                    .on_click(move |_, _, cx| {
+                                        let _ = page_restore.update(cx, |_, cx| {
+                                            cx.emit(FilesPageEvent::RestoreFile {
+                                                file_id: fid.clone(),
+                                                title: title.clone(),
+                                            });
+                                        });
+                                    }),
+                            )
+                    }))
+                    .into_any_element()
+            }
+        } else if self.shown.is_empty() {
             match &rows.load {
                 Load::Loading => state_block(None, "Loading…", fg, dim).into_any_element(),
                 // The error row stands in for a page that never loaded.
                 Load::Failed(_) if rows.files.is_empty() => div().into_any_element(),
-                _ if self.chip != FilesChip::All || !self.query.is_empty() => {
+                _ if self.chip != FilesChip::All
+                    || !self.query.is_empty()
+                    || self.active_collection.is_some() =>
+                {
                     state_block(Some("No matches"), "Try another search or filter.", fg, dim)
                         .into_any_element()
                 }
@@ -565,17 +836,22 @@ impl Render for FilesPage {
         } else {
             let this = cx.weak_entity();
             let self_user = self.fixtures.self_user.clone();
+            let favorites = &self.favorites;
+            let collections = &self.collections;
             v_flex()
                 .rounded_lg()
                 .border_1()
                 .border_color(border)
                 .overflow_hidden()
                 .children(self.shown.iter().enumerate().map(|(position, &index)| {
+                    let file = &rows.files[index];
                     file_row(
-                        &rows.files[index],
+                        file,
                         &rows.meta[index],
                         position > 0,
                         &self_user,
+                        favorites.contains(file.id.as_str()),
+                        collections,
                         this.clone(),
                         cx,
                     )
@@ -598,7 +874,8 @@ impl Render for FilesPage {
                         v_flex()
                             .gap_3()
                             .pb_6()
-                            .child(toolbar)
+                            .when(section != FilesSection::Deleted, |col| col.child(toolbar))
+                            .children(collections_bar)
                             .children(error)
                             .child(body),
                     )),
@@ -629,14 +906,80 @@ fn state_block(title: Option<&'static str>, line: &'static str, fg: Hsla, dim: H
         .child(div().text_color(dim).child(line))
 }
 
-/// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens canvases in
-/// the native reader (other files in the browser), offers "Save for later" (`F-CORE-157`), and
-/// offers "Delete file" on files owned by `self_user` (`F-CORE-130`).
+/// Modal dialog to create a custom file collection (`files.collections.create`, `F-CORE-133`).
+fn open_new_collection_dialog(
+    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::gpui::Focusable as _;
+    let name_state = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder("Collection name (e.g. Design specs)")
+            .auto_grow(1, 1)
+    });
+    name_state.read(cx).focus_handle(cx).focus(window, cx);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (border, bg) = (theme.border, theme.background);
+        let name_c = name_state.clone();
+        let page_c = page.clone();
+        dialog.title("Create file collection").w(px(380.)).child(
+            v_flex()
+                .gap_3()
+                .p_4()
+                .child(
+                    div()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .child(Textarea::new(&name_state).appearance(false).bordered(false)),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("files-col-cancel")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("files-col-create")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Create")
+                                .on_click(move |_, window, cx| {
+                                    let name = name_c.read(cx).value().trim().to_owned();
+                                    if name.is_empty() {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    let _ = page_c.update(cx, |_, cx| {
+                                        cx.emit(FilesPageEvent::CreateCollection { name });
+                                    });
+                                }),
+                        ),
+                ),
+        )
+    });
+}
+
+/// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens canvases and
+/// lists in their native readers (other files in the browser), offers star/collection toggles
+/// (`F-CORE-133`), "Save for later" (`F-CORE-157`), and "Delete file" on user-owned files (`F-CORE-130`).
+#[allow(clippy::too_many_arguments)]
 fn file_row(
     file: &File,
     meta: &SharedString,
     divided: bool,
     self_user: &UserId,
+    starred: bool,
+    collections: &[FileCollection],
     page: gpui_kit::gpui::WeakEntity<FilesPage>,
     cx: &App,
 ) -> Stateful<Div> {
@@ -646,6 +989,68 @@ fn file_row(
     let file_title = display_name(file).to_owned();
     let is_own = file.user.as_ref() == Some(self_user);
     let is_canvas = file.filetype.as_deref() == Some("quip");
+    let is_list = file.filetype.as_deref() == Some("list");
+
+    let page_star = page.clone();
+    let fid_star = file_id.clone();
+    let star_btn = Button::new(SharedString::from(format!("files-star-{file_id}")))
+        .ghost()
+        .with_size(Size::XSmall)
+        .icon(IconName::Star)
+        .tooltip(if starred { "Unstar file" } else { "Star file" })
+        .when(starred, |b| b.text_color(gpui_kit::gpui::rgb(0xeab308)))
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let _ = page_star.update(cx, |p, cx| {
+                let now_starred = p.toggle_favorite_local(&fid_star, cx);
+                cx.emit(FilesPageEvent::ToggleFavorite {
+                    file_id: fid_star.clone(),
+                    collection_id: None,
+                    starred: now_starred,
+                });
+            });
+        });
+
+    let collection_btn = (!collections.is_empty()).then(|| {
+        let cols: Vec<(String, String, bool)> = collections
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    c.name.clone(),
+                    c.file_ids.iter().any(|id| id == &file_id),
+                )
+            })
+            .collect();
+        let page_col = page.clone();
+        let fid_col = file_id.clone();
+        Button::new(SharedString::from(format!("files-col-menu-{file_id}")))
+            .ghost()
+            .with_size(Size::XSmall)
+            .icon(IconName::FolderPlus)
+            .tooltip("Add to collection")
+            .dropdown_menu(move |mut menu, _, _| {
+                for (cid, name, in_col) in &cols {
+                    let page_col = page_col.clone();
+                    let fid_col = fid_col.clone();
+                    let cid = cid.clone();
+                    let in_col = *in_col;
+                    menu = menu.item(PopupMenuItem::new(name.clone()).checked(in_col).on_click(
+                        move |_, _, cx| {
+                            let _ = page_col.update(cx, |_, cx| {
+                                cx.emit(FilesPageEvent::ToggleFavorite {
+                                    file_id: fid_col.clone(),
+                                    collection_id: Some(cid.clone()),
+                                    starred: !in_col,
+                                });
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
+    });
+
     let page_save = page.clone();
     let fid_save = file_id.clone();
     let title_save = file_title.clone();
@@ -722,6 +1127,8 @@ fn file_row(
                         .child(meta.clone()),
                 ),
         )
+        .child(star_btn)
+        .children(collection_btn)
         .child(save_btn)
         .children(delete_btn);
     if is_canvas {
@@ -734,6 +1141,20 @@ fn file_row(
                 let _ = page.update(cx, |_, cx| {
                     cx.emit(FilesPageEvent::OpenCanvas {
                         file_id: fid_canvas.clone(),
+                    });
+                });
+            });
+    }
+    if is_list {
+        let hover = theme.accent;
+        let fid_list = file_id.clone();
+        return row
+            .cursor_pointer()
+            .hover(move |row| row.bg(hover))
+            .on_click(move |_, _, cx| {
+                let _ = page.update(cx, |_, cx| {
+                    cx.emit(FilesPageEvent::OpenList {
+                        file_id: fid_list.clone(),
                     });
                 });
             });

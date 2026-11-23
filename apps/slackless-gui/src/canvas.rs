@@ -12,7 +12,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, Div, Entity, FontWeight, InteractiveElement as _, ParentElement as _, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div, img, px,
 };
 
 /// One block of a canvas document, in reading order.
@@ -32,6 +32,11 @@ pub enum CanvasBlock {
     Table {
         header: Vec<String>,
         rows: Vec<Vec<String>>,
+    },
+    /// Embedded canvas image (`img[src]` with optional alt caption).
+    Image {
+        url: String,
+        alt: String,
     },
     Divider,
 }
@@ -53,6 +58,7 @@ impl CanvasBlock {
             Self::Table { header, rows } => {
                 header.iter().any(|s| has(s)) || rows.iter().any(|r| r.iter().any(|s| has(s)))
             }
+            Self::Image { alt, url } => has(alt) || has(url),
             Self::Divider => false,
         }
     }
@@ -75,6 +81,19 @@ impl CanvasDoc {
             meta: "Live canvas · read-only preview".to_owned(),
             blocks,
         }
+    }
+
+    /// Headings in document order (`(level, text)`) for the collapsible outline strip.
+    pub fn outline_headings(&self) -> Vec<(u8, &str)> {
+        self.blocks
+            .iter()
+            .filter_map(|b| match b {
+                CanvasBlock::Heading { level, text } if !text.is_empty() => {
+                    Some((*level, text.as_str()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -321,6 +340,54 @@ fn render_canvas_doc(
             }))
     });
 
+    let headings = canvas.outline_headings();
+    let outline_bar = (headings.len() >= 2).then(|| {
+        let search_handle = search.cloned();
+        h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1p5()
+            .px_2p5()
+            .py_1p5()
+            .rounded_md()
+            .bg(theme.secondary.opacity(0.35))
+            .border_1()
+            .border_color(theme.border)
+            .text_xs()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child("Outline:"),
+            )
+            .children(headings.into_iter().enumerate().map(|(ix, (level, text))| {
+                let label = text.to_owned();
+                let search_h = search_handle.clone();
+                let fg = theme.foreground;
+                let hover = theme.accent;
+                let muted = theme.muted_foreground;
+                let prefix = if level >= 3 { "· " } else { "" };
+                div()
+                    .id(("canvas-outline", ix))
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .text_color(if level == 1 { fg } else { muted })
+                    .when(level == 1, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .when_some(search_h, |d, input| {
+                        let jump = label.clone();
+                        d.cursor_pointer()
+                            .hover(move |el| el.bg(hover).text_color(fg))
+                            .on_click(move |_, window, cx| {
+                                input.update(cx, |state, cx| {
+                                    state.set_value(jump.clone(), window, cx);
+                                });
+                            })
+                    })
+                    .child(format!("{prefix}{label}"))
+            }))
+    });
+
     let document = if filtered.is_empty() {
         v_flex().py_8().items_center().child(
             div()
@@ -352,6 +419,7 @@ fn render_canvas_doc(
                 .gap_4()
                 .child(header)
                 .children(find_bar)
+                .children(outline_bar)
                 .child(document),
         )
 }
@@ -477,6 +545,24 @@ fn render_block(block: &CanvasBlock, cx: &App) -> Div {
                         .children(row.iter().map(|text| cell(text)))
                 }))
         }
+        CanvasBlock::Image { url, alt } => v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .overflow_hidden()
+                    .child(img(url.clone()).max_w(px(640.)).max_h(px(360.))),
+            )
+            .when(!alt.is_empty(), |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(alt.clone()),
+                )
+            }),
         CanvasBlock::Divider => div().h(px(1.)).w_full().bg(theme.border),
     }
 }
@@ -508,6 +594,18 @@ pub fn parse_canvas_html(html: &str) -> Vec<CanvasBlock> {
             .to_ascii_lowercase();
         if tag_name == "hr" {
             blocks.push(CanvasBlock::Divider);
+            continue;
+        }
+        if tag_name == "img" {
+            if let Some(src) = extract_attr(trimmed, "src") {
+                if src.starts_with("https://") || src.starts_with("http://") {
+                    let alt = extract_attr(trimmed, "alt").unwrap_or_default();
+                    blocks.push(CanvasBlock::Image {
+                        url: decode_entities(&src),
+                        alt: clean_text(&alt),
+                    });
+                }
+            }
             continue;
         }
         if matches!(tag_name.as_str(), "style" | "script" | "head") {
@@ -592,6 +690,25 @@ fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     haystack
         .to_ascii_lowercase()
         .find(&needle.to_ascii_lowercase())
+}
+
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let needle = format!("{attr}=");
+    let pos = lower.find(&needle)?;
+    let rest = tag[pos + needle.len()..].trim_start();
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        Some(quoted[..end].to_owned())
+    } else if let Some(quoted) = rest.strip_prefix('\'') {
+        let end = quoted.find('\'')?;
+        Some(quoted[..end].to_owned())
+    } else {
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(rest.len());
+        Some(rest[..end].to_owned())
+    }
 }
 
 fn extract_tag_inner<'a>(html: &'a str, tag: &str) -> Option<&'a str> {
@@ -754,5 +871,26 @@ mod tests {
         assert!(blocks[0].matches("architecture"));
         assert!(!blocks[0].matches("cargo"));
         assert!(blocks[3].matches("cargo"));
+    }
+
+    #[test]
+    fn parses_canvas_images_and_extracts_heading_outline() {
+        let html = r#"<html><body>
+            <h1>Launch Plan</h1>
+            <img src="https://files.slack.com/files-pri/T1-F1/arch.png" alt="Architecture diagram" />
+            <h2>Milestones</h2>
+            <h3>Risks</h3>
+        </body></html>"#;
+        let doc = CanvasDoc::from_html("Launch Plan".into(), html);
+        assert!(doc.blocks.iter().any(|b| matches!(
+            b,
+            CanvasBlock::Image { url, alt }
+                if url == "https://files.slack.com/files-pri/T1-F1/arch.png"
+                && alt == "Architecture diagram"
+        )));
+        assert_eq!(
+            doc.outline_headings(),
+            vec![(1, "Launch Plan"), (2, "Milestones"), (3, "Risks")]
+        );
     }
 }

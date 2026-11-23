@@ -156,11 +156,61 @@ impl App {
                             format!("skin-tone-{}", settings.skin_tone + 1),
                         );
                     }
+                    let sync_global_notif = |name: &str, value: String, sync: bool| {
+                        self.bridge.send(Command::SetGlobalNotificationPref {
+                            name: name.to_owned(),
+                            value,
+                            sync,
+                        });
+                    };
+                    if prev.notify_level != settings.notify_level
+                        || prev.mobile_different != settings.mobile_different
+                    {
+                        sync_global_notif(
+                            "global_desktop",
+                            settings.notify_level_wire().to_owned(),
+                            !settings.mobile_different,
+                        );
+                    }
+                    if prev.thread_replies != settings.thread_replies {
+                        sync_global_notif(
+                            "threads_everything",
+                            settings.thread_replies.to_string(),
+                            false,
+                        );
+                    }
+                    if prev.show_preview != settings.show_preview {
+                        sync_global_notif(
+                            "no_text_in_notifications",
+                            (!settings.show_preview).to_string(),
+                            false,
+                        );
+                    }
+                    if prev.mobile_handoff != settings.mobile_handoff {
+                        sync_global_notif(
+                            "push_idle_wait",
+                            settings.mobile_handoff_secs().to_string(),
+                            false,
+                        );
+                    }
                     if prev.keywords != settings.keywords {
                         sync_pref("highlight_words", settings.keywords.clone());
+                        sync_global_notif("global_keywords", settings.keywords.clone(), false);
+                    }
+                    if prev.mute_sounds != settings.mute_sounds {
+                        sync_pref("mute_sounds", settings.mute_sounds.to_string());
+                    }
+                    if prev.badge_on_unreads != settings.badge_on_unreads {
+                        sync_pref("mac_ssb_bullet", settings.badge_on_unreads.to_string());
+                    }
+                    if prev.bounce_dock != settings.bounce_dock {
+                        sync_pref("mac_ssb_bounce", settings.bounce_dock.to_string());
                     }
                     if prev.schedule_enabled != settings.schedule_enabled {
                         sync_pref("dnd_enabled", settings.schedule_enabled.to_string());
+                    }
+                    if prev.schedule_days != settings.schedule_days {
+                        sync_pref("dnd_days", settings.schedule_days_wire().to_owned());
                     }
                     if prev.schedule_start != settings.schedule_start {
                         sync_pref(

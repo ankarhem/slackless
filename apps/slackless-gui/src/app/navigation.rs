@@ -267,6 +267,7 @@ impl App {
         match action {
             TabAction::Switch(target) => self.select_tab(target, cx),
             TabAction::OpenCanvas(file) => self.open_live_canvas(file, cx),
+            TabAction::OpenList(file) => self.open_live_list(file, cx),
             TabAction::AddCanvas => {
                 self.bridge
                     .send(Command::CreateChannelCanvas(self.channel.clone()));
@@ -287,6 +288,24 @@ impl App {
         if needs_load && !self.fixtures.sample {
             self.ws.canvases.remove(&file_id);
             self.bridge.send(Command::LoadCanvas { file_id });
+        }
+        cx.notify();
+    }
+
+    /// Open `file_id` natively inside the read-only Slack Lists viewer, fetching its schema and
+    /// rows (`files.info` + `lists.records.list`) if not cached yet.
+    pub(super) fn open_live_list(&mut self, file_id: String, cx: &mut Context<Self>) {
+        self.close_full_column_views(cx);
+        self.ws.active_list = Some(file_id.clone());
+        self.list_sort = None;
+        self.tab = ConversationTab::List;
+        let needs_load = match self.ws.lists.get(&file_id) {
+            None | Some(Err(_)) => true,
+            Some(Ok(_)) => false,
+        };
+        if needs_load && !self.fixtures.sample {
+            self.ws.lists.remove(&file_id);
+            self.bridge.send(Command::LoadList { file_id });
         }
         cx.notify();
     }

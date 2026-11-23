@@ -130,27 +130,40 @@ impl Render for Composer {
                         })),
                 )
         });
-        let spell_bar =
+        // Render spelling suggestions as a floating popover above the composer so triggering
+        // spellcheck never changes the composer's layout height or jumps the transcript above.
+        let spell_overlay =
             self.spell_guesses
                 .clone()
                 .filter(|_| focused)
                 .map(|(range, word, guesses)| {
                     let theme = cx.theme();
-                    let (muted, border, hover, fg) = (
+                    let (muted, border, hover, fg, popover) = (
                         theme.muted_foreground,
                         theme.border,
                         theme.accent,
                         theme.foreground,
+                        theme.popover,
                     );
                     h_flex()
+                        .id("composer-spell")
+                        .occlude()
+                        .absolute()
+                        .left(if self.edit_mode { px(0.) } else { px(16.) })
+                        .right(if self.edit_mode { px(0.) } else { px(16.) })
+                        .bottom(relative(1.))
+                        .mb_1()
                         .px_3()
-                        .py_1()
+                        .py_1p5()
                         .items_center()
                         .flex_wrap()
                         .gap_1p5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(border)
+                        .bg(popover)
+                        .shadow_lg()
                         .text_xs()
-                        .border_t_1()
-                        .border_color(border.opacity(0.6))
                         .child(div().text_color(muted).child("Spelling:"))
                         .children(guesses.into_iter().enumerate().map(|(ix, guess)| {
                             let range_c = range.clone();
@@ -184,13 +197,16 @@ impl Render for Composer {
                                     this.learn_spelling_word(&word, cx);
                                 })),
                         )
+                        .into_any_element()
                 });
         let also_send = self.also_send_row(cx);
         let actions = self.action_row(cx);
-        let overlay = if self.link_open {
-            Some(self.link_panel(cx))
+        let overlay: Option<AnyElement> = if self.link_open {
+            Some(self.link_panel(cx).into_any_element())
+        } else if let Some(menu) = self.menu.as_ref() {
+            Some(self.menu_panel(menu, cx).into_any_element())
         } else {
-            self.menu.as_ref().map(|menu| self.menu_panel(menu, cx))
+            spell_overlay
         };
 
         let fixtures = self.fixtures.clone();
@@ -286,7 +302,6 @@ impl Render for Composer {
                     )
                     .children(attachments)
                     .children(upload_warning)
-                    .children(spell_bar)
                     .children(also_send)
                     .child(actions),
             )

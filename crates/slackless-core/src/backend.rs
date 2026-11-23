@@ -614,6 +614,66 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<(String, String)>> + Send {
         async { Ok((String::new(), String::new())) }
     }
+    /// Fetch a live Slack List's schema and rows (`files.info` + `lists.records.list`).
+    fn fetch_list(
+        &self,
+        _file_id: String,
+    ) -> impl Future<Output = api::Result<api::SlackListData>> + Send {
+        async { Ok(api::SlackListData::default()) }
+    }
+    /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`).
+    fn set_global_notification_pref(
+        &self,
+        _name: String,
+        _value: String,
+        _sync: bool,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Starred file IDs (`files.favorites.list`, `F-CORE-133`).
+    fn files_favorites_list(&self) -> impl Future<Output = api::Result<Vec<String>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Star/unstar a file or add/remove it from a collection (`files.favorites.add`/`.remove`).
+    fn files_favorites_set(
+        &self,
+        _file_id: String,
+        _collection_id: Option<String>,
+        _starred: bool,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Custom file collections (`files.collections.list`, `F-CORE-133`).
+    fn files_collections_list(
+        &self,
+    ) -> impl Future<Output = api::Result<Vec<api::FileCollection>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Create a custom file collection (`files.collections.create`, `F-CORE-133`).
+    fn files_collections_create(
+        &self,
+        _name: String,
+        _emoji: Option<String>,
+    ) -> impl Future<Output = api::Result<Vec<api::FileCollection>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Delete a custom file collection (`files.collections.delete`, `F-CORE-133`).
+    fn files_collections_delete(
+        &self,
+        _collection_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Recently deleted canvases & lists (`files.recentlyDeleted`, `F-CORE-133`).
+    fn files_recently_deleted(
+        &self,
+    ) -> impl Future<Output = api::Result<Vec<api::DeletedFile>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Restore a recently deleted canvas or list (`files.undelete`, `F-CORE-133`).
+    fn files_undelete(&self, _file_id: String) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
 }
 
 impl Backend for SlackApi {
@@ -1216,5 +1276,56 @@ impl Backend for SlackApi {
 
     async fn fetch_canvas_html(&self, file_id: String) -> api::Result<(String, String)> {
         SlackApi::fetch_canvas_html(self, &file_id).await
+    }
+
+    async fn fetch_list(&self, file_id: String) -> api::Result<api::SlackListData> {
+        SlackApi::fetch_list(self, &file_id).await
+    }
+
+    async fn set_global_notification_pref(
+        &self,
+        name: String,
+        value: String,
+        sync: bool,
+    ) -> api::Result<()> {
+        self.users_prefs_set_global_notification(&name, &value, sync)
+            .await
+    }
+
+    async fn files_favorites_list(&self) -> api::Result<Vec<String>> {
+        SlackApi::files_favorites_list(self).await
+    }
+
+    async fn files_favorites_set(
+        &self,
+        file_id: String,
+        collection_id: Option<String>,
+        starred: bool,
+    ) -> api::Result<()> {
+        SlackApi::files_favorites_set(self, &file_id, collection_id.as_deref(), starred).await
+    }
+
+    async fn files_collections_list(&self) -> api::Result<Vec<api::FileCollection>> {
+        SlackApi::files_collections_list(self).await
+    }
+
+    async fn files_collections_create(
+        &self,
+        name: String,
+        emoji: Option<String>,
+    ) -> api::Result<Vec<api::FileCollection>> {
+        SlackApi::files_collections_create(self, &name, emoji.as_deref()).await
+    }
+
+    async fn files_collections_delete(&self, collection_id: String) -> api::Result<()> {
+        SlackApi::files_collections_delete(self, &collection_id).await
+    }
+
+    async fn files_recently_deleted(&self) -> api::Result<Vec<api::DeletedFile>> {
+        SlackApi::files_recently_deleted(self).await
+    }
+
+    async fn files_undelete(&self, file_id: String) -> api::Result<()> {
+        SlackApi::files_undelete(self, &file_id).await
     }
 }

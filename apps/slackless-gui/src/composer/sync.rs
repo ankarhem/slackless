@@ -61,6 +61,16 @@ impl Composer {
         }
         let converted = (closed_colon && self.convert_typed_emoji())
             || (typed_backtick && self.auto_open_code_block());
+        // Suppress flagging the word currently being typed at the caret until the user hits
+        // whitespace/punctuation or moves the caret away.
+        let sel = self.editor.selection();
+        let after_text = self.editor.doc().text();
+        let typing_word = sel.is_empty()
+            && after_text
+                .get(..sel.end)
+                .and_then(|prefix| prefix.chars().next_back())
+                .is_some_and(|c| c.is_alphanumeric() || c == '\'');
+        self.spell_typing_end = typing_word.then_some(sel.end);
         if diverged || converted {
             self.push(window, cx);
         } else {
@@ -164,6 +174,7 @@ impl Composer {
         let shown = state.selected_range();
         let moved = self.editor.select(shown);
         if moved {
+            self.spell_typing_end = None;
             self.sync_presentation(cx);
             self.changed(cx);
         }
@@ -173,6 +184,7 @@ impl Composer {
     /// collapses cleanly on blur.
     pub(super) fn sync_focus(&mut self, focused: bool, cx: &mut Context<Self>) {
         self.was_focused = focused;
+        self.spell_typing_end = None;
         self.sync_presentation(cx);
     }
 
@@ -212,7 +224,8 @@ impl Composer {
             .map(|m| m.range)
             .filter(|r| {
                 let word = &text[r.clone()];
-                !word.contains("://")
+                self.spell_typing_end != Some(r.end)
+                    && !word.contains("://")
                     && !word.starts_with('@')
                     && !word.starts_with('#')
                     && !word.starts_with(':')
@@ -232,7 +245,7 @@ impl Composer {
         let hit = self
             .misspellings
             .iter()
-            .find(|r| caret >= r.start && caret <= r.end)
+            .find(|r| self.spell_typing_end != Some(r.end) && caret >= r.start && caret <= r.end)
             .cloned();
         self.spell_guesses = hit.and_then(|range| {
             let word = text.get(range.clone())?.to_owned();
@@ -251,6 +264,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         let end = range.start + replacement.len();
+        self.spell_typing_end = None;
         self.editor.user_edit(range, replacement, end..end);
         self.refresh_spellcheck();
         self.push(window, cx);
@@ -261,6 +275,7 @@ impl Composer {
     pub(super) fn learn_spelling_word(&mut self, word: &str, cx: &mut Context<Self>) {
         let checker = slackless_core::platform::current();
         checker.learn_word(word);
+        self.spell_typing_end = None;
         self.refresh_spellcheck();
         self.sync_presentation(cx);
         cx.notify();

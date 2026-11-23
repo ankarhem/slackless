@@ -859,6 +859,29 @@ impl App {
                 self.ws.canvases.insert(file_id.clone(), parsed);
                 cx.notify();
             }
+            Event::ListLoaded { file_id, list } => {
+                let value = match list {
+                    Ok(data) => Ok((**data).clone()),
+                    Err(err) => Err(err.clone()),
+                };
+                self.ws.lists.insert(file_id.clone(), value);
+                cx.notify();
+            }
+            Event::FilesExtrasLoaded {
+                favorites,
+                collections,
+                deleted,
+            } => {
+                self.files_page.update(cx, |page, cx| {
+                    page.set_extras(favorites.clone(), collections.clone(), deleted.clone(), cx);
+                });
+            }
+            Event::FileRestored { file_id } => {
+                self.files_page
+                    .update(cx, |page, cx| page.mark_restored(file_id, cx));
+                notify("Restored", "Restored item from trash.", window, cx);
+                cx.notify();
+            }
             Event::FileDeleted { file_id } => {
                 self.files_page
                     .update(cx, |page, cx| page.remove_file(file_id, cx));

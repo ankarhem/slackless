@@ -1783,4 +1783,205 @@ impl SlackApi {
         self.call::<Empty>("users.prefs.set", params).await?;
         Ok(())
     }
+
+    /// `users.prefs.setNotifications` (`global=true`): write one global notification pref
+    /// (`global_desktop`, `global_mobile`, `global_keywords`, `threads_everything`,
+    /// `no_text_in_notifications`, `push_idle_wait`, etc.; `F-CORE-147`, `F-CORE-155`).
+    pub async fn users_prefs_set_global_notification(
+        &self,
+        name: &str,
+        value: &str,
+        sync: bool,
+    ) -> Result<()> {
+        let params = vec![
+            ("global", "true".to_owned()),
+            ("name", name.to_owned()),
+            ("value", value.to_owned()),
+            ("sync", sync.to_string()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::USERS_PREFS_SET_NOTIFICATIONS, params)
+            .await?;
+        Ok(())
+    }
+
+    /// Load a live Slack List (`files.info` for schema + `lists.records.list`, with public
+    /// `slackLists.items.list` fallback) for read-only native table rendering.
+    pub async fn fetch_list(&self, list_id: &str) -> Result<SlackListData> {
+        let info_val: Value = self
+            .call(
+                method::FILES_INFO,
+                vec![("file", list_id.to_owned()), ("count", "0".to_owned())],
+            )
+            .await?
+            .data;
+        let file_obj = info_val.get("file").unwrap_or(&info_val);
+        let (mut title, mut description, mut columns) = parse_list_schema(file_obj);
+
+        let private_res = self
+            .call::<Value>(
+                method::LISTS_RECORDS_LIST,
+                vec![
+                    ("list_id", list_id.to_owned()),
+                    ("limit", "200".to_owned()),
+                    ("archived", "false".to_owned()),
+                ],
+            )
+            .await;
+
+        let records_val = match private_res {
+            Ok(resp) => resp.data,
+            Err(_) => {
+                self.call::<Value>(
+                    method::SLACK_LISTS_ITEMS_LIST,
+                    vec![
+                        ("list_id", list_id.to_owned()),
+                        ("limit", "200".to_owned()),
+                        ("include_list", "true".to_owned()),
+                    ],
+                )
+                .await?
+                .data
+            }
+        };
+
+        if columns.is_empty() {
+            if let Some(list_obj) = records_val.get("list") {
+                let (t, d, cols) = parse_list_schema(list_obj);
+                if !t.is_empty() {
+                    title = t;
+                }
+                if !d.is_empty() {
+                    description = d;
+                }
+                columns = cols;
+            }
+        }
+
+        let raw_records = records_val
+            .get("records")
+            .or_else(|| records_val.get("items"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let rows = parse_list_records(raw_records);
+
+        Ok(SlackListData {
+            file_id: list_id.to_owned(),
+            title,
+            description,
+            columns,
+            rows,
+        })
+    }
+
+    /// `files.favorites.list`: starred file IDs, newest star first (`F-CORE-133`).
+    pub async fn files_favorites_list(&self) -> Result<Vec<String>> {
+        let wire: FileFavoritesWire = self
+            .call(
+                method::FILES_FAVORITES_LIST,
+                vec![("type", "all".to_owned())],
+            )
+            .await?
+            .data;
+        let mut ids = wire.file_ids;
+        ids.reverse();
+        Ok(ids)
+    }
+
+    /// `files.favorites.add` / `.remove`: star/unstar a file or add/remove it from a collection.
+    pub async fn files_favorites_set(
+        &self,
+        file_id: &str,
+        collection_id: Option<&str>,
+        starred: bool,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("file_id", file_id.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(cid) = collection_id.filter(|s| !s.is_empty()) {
+            params.push(("collection_id", cid.to_owned()));
+        }
+        let endpoint = if starred {
+            method::FILES_FAVORITES_ADD
+        } else {
+            method::FILES_FAVORITES_REMOVE
+        };
+        self.call::<Empty>(endpoint, params).await?;
+        Ok(())
+    }
+
+    /// `files.collections.list`: custom Files sidebar sections (`F-CORE-133`).
+    pub async fn files_collections_list(&self) -> Result<Vec<FileCollection>> {
+        let wire: FileCollectionsListWire = self
+            .call(method::FILES_COLLECTIONS_LIST, Vec::new())
+            .await?
+            .data;
+        Ok(wire.collections.into_iter().map(Into::into).collect())
+    }
+
+    /// `files.collections.create`: create a custom Files sidebar section (`F-CORE-133`).
+    pub async fn files_collections_create(
+        &self,
+        name: &str,
+        emoji: Option<&str>,
+    ) -> Result<Vec<FileCollection>> {
+        let mut params = vec![
+            ("name", name.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(e) = emoji.filter(|s| !s.is_empty()) {
+            params.push(("emoji", e.to_owned()));
+        }
+        let wire: FileCollectionsListWire = self
+            .call(method::FILES_COLLECTIONS_CREATE, params)
+            .await?
+            .data;
+        Ok(wire.collections.into_iter().map(Into::into).collect())
+    }
+
+    /// `files.collections.delete`: delete a custom Files sidebar section (`F-CORE-133`).
+    pub async fn files_collections_delete(&self, collection_id: &str) -> Result<()> {
+        let params = vec![
+            ("collection", collection_id.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::FILES_COLLECTIONS_DELETE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `files.recentlyDeleted`: canvases & lists deleted in the last 24h (`F-CORE-133`).
+    pub async fn files_recently_deleted(&self) -> Result<Vec<DeletedFile>> {
+        let wire: RecentlyDeletedWire = self
+            .call(method::FILES_RECENTLY_DELETED, Vec::new())
+            .await?
+            .data;
+        Ok(wire
+            .files
+            .into_iter()
+            .filter(|f| !f.id.is_empty())
+            .map(|f| DeletedFile {
+                id: f.id,
+                title: if f.title.is_empty() {
+                    "Untitled".to_owned()
+                } else {
+                    f.title
+                },
+                date_delete: f.date_delete,
+                file_type: f.file_type,
+            })
+            .collect())
+    }
+
+    /// `files.undelete`: restore a recently deleted canvas or list (`F-CORE-133`).
+    pub async fn files_undelete(&self, file_id: &str) -> Result<()> {
+        let params = vec![
+            ("file_id", file_id.to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        self.call::<Empty>(method::FILES_UNDELETE, params).await?;
+        Ok(())
+    }
 }

@@ -473,6 +473,10 @@ pub(super) struct WorkspaceState {
     pub(super) canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
     /// File id of the live canvas currently displayed in `ConversationTab::Canvas`.
     pub(super) active_canvas: Option<String>,
+    /// Live mode: parsed read-only Slack Lists keyed by file id (`files.info` + `lists.records.list`).
+    pub(super) lists: HashMap<String, Result<slackless_core::api::SlackListData, String>>,
+    /// File id of the live Slack List currently displayed in `ConversationTab::List`.
+    pub(super) active_list: Option<String>,
 }
 
 /// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,
@@ -647,6 +651,12 @@ pub struct App {
     canvas_search: Entity<TextareaState>,
     /// Current in-canvas Find query.
     canvas_query: String,
+    /// In-list Filter field for the native Slack Lists viewer.
+    list_search: Entity<TextareaState>,
+    /// Current in-list filter query.
+    list_query: String,
+    /// Active `(column_index, ascending)` sort for the native Slack Lists viewer.
+    list_sort: Option<(usize, bool)>,
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).
@@ -860,6 +870,11 @@ impl App {
             let canvas_search = cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .placeholder("Find in canvas…")
+                    .auto_grow(1, 1)
+            });
+            let list_search = cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .placeholder("Filter list items…")
                     .auto_grow(1, 1)
             });
             if fixtures.sample {
@@ -1257,6 +1272,28 @@ impl App {
                         if let StatusEvent::Save(status) = event {
                             this.self_state.set_status(status.clone());
                             this.send_status_to_slack(this.self_state.status.as_ref());
+                            if this
+                                .preferences
+                                .read(cx)
+                                .settings()
+                                .status_pauses_notifications
+                            {
+                                if let Some(st) = status {
+                                    let now = crate::messages::now_secs();
+                                    let mins = st
+                                        .expiration
+                                        .map(|until| {
+                                            ((until.saturating_sub(now) + 59) / 60).clamp(1, 1440)
+                                                as u32
+                                        })
+                                        .unwrap_or(60);
+                                    this.self_state.paused_until = Some(now + i64::from(mins) * 60);
+                                    this.bridge.send(Command::SetDndSnooze { minutes: mins });
+                                } else if this.self_state.paused() {
+                                    this.self_state.paused_until = None;
+                                    this.bridge.send(Command::EndDndSnooze);
+                                }
+                            }
                             this.push_self_state(cx);
                         }
                         window.close_dialog(cx);
@@ -1491,6 +1528,9 @@ impl App {
                         FilesPageEvent::Load(filter) => {
                             this.bridge.send(Command::LoadFiles(filter.clone()));
                         }
+                        FilesPageEvent::LoadExtras => {
+                            this.bridge.send(Command::LoadFilesExtras);
+                        }
                         FilesPageEvent::SaveFile { file_id, name } => {
                             this.bridge.send(Command::SaveFile {
                                 file_id: file_id.clone(),
@@ -1501,8 +1541,41 @@ impl App {
                         FilesPageEvent::DeleteFile { file_id, name } => {
                             this.confirm_delete_file(file_id.clone(), name.clone(), window, cx);
                         }
+                        FilesPageEvent::ToggleFavorite {
+                            file_id,
+                            collection_id,
+                            starred,
+                        } => {
+                            this.bridge.send(Command::SetFileFavorite {
+                                file_id: file_id.clone(),
+                                collection_id: collection_id.clone(),
+                                starred: *starred,
+                            });
+                        }
+                        FilesPageEvent::CreateCollection { name } => {
+                            this.bridge.send(Command::CreateFileCollection {
+                                name: name.clone(),
+                                emoji: None,
+                            });
+                            notify("Collection created", name.clone(), window, cx);
+                        }
+                        FilesPageEvent::DeleteCollection { collection_id } => {
+                            this.bridge.send(Command::DeleteFileCollection {
+                                collection_id: collection_id.clone(),
+                            });
+                            notify("Collection deleted", "Removed file collection.", window, cx);
+                        }
+                        FilesPageEvent::RestoreFile { file_id, title } => {
+                            this.bridge.send(Command::RestoreDeletedFile {
+                                file_id: file_id.clone(),
+                            });
+                            notify("Restoring", title.clone(), window, cx);
+                        }
                         FilesPageEvent::OpenCanvas { file_id } => {
                             this.open_live_canvas(file_id.clone(), cx);
+                        }
+                        FilesPageEvent::OpenList { file_id } => {
+                            this.open_live_list(file_id.clone(), cx);
                         }
                     },
                 ),
@@ -1511,6 +1584,15 @@ impl App {
                     |this: &mut App, input, event: &InputEvent, cx| {
                         if let InputEvent::Change = event {
                             this.canvas_query = input.read(cx).value().to_string();
+                            cx.notify();
+                        }
+                    },
+                ),
+                cx.subscribe(
+                    &list_search,
+                    |this: &mut App, input, event: &InputEvent, cx| {
+                        if let InputEvent::Change = event {
+                            this.list_query = input.read(cx).value().to_string();
                             cx.notify();
                         }
                     },
@@ -1751,6 +1833,9 @@ impl App {
                 last_right_pane: None,
                 canvas_search,
                 canvas_query: String::new(),
+                list_search,
+                list_query: String::new(),
+                list_sort: None,
                 fixture_bookmarks: HashMap::new(),
                 os: Rc::new(platform::current()),
                 badge: None,
@@ -2031,7 +2116,41 @@ impl Render for App {
                     column.child(div().flex_1().min_h_0().child(view))
                 }
                 ConversationTab::List => {
-                    column.child(div().flex_1().min_h_0().child(list_view(cx)))
+                    let view = if self.fixtures.sample {
+                        list_view(cx)
+                    } else {
+                        let file_id = self.ws.active_list.clone();
+                        let loaded = file_id.as_deref().and_then(|id| self.ws.lists.get(id));
+                        let open_browser = file_id.map(|id| {
+                            let url = self.canvas_link(&id);
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                cx.open_url(&url);
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let this = cx.weak_entity();
+                        let on_sort: crate::lists::SortColumnFn =
+                            Rc::new(move |col_ix, _window, cx| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.list_sort = match app.list_sort {
+                                        Some((c, true)) if c == col_ix => Some((col_ix, false)),
+                                        Some((c, false)) if c == col_ix => None,
+                                        _ => Some((col_ix, true)),
+                                    };
+                                    cx.notify();
+                                });
+                            });
+                        crate::lists::live_list_view(
+                            loaded,
+                            &self.fixtures,
+                            &self.list_query,
+                            Some(&self.list_search),
+                            self.list_sort,
+                            Some(on_sort),
+                            open_browser,
+                            cx,
+                        )
+                    };
+                    column.child(div().flex_1().min_h_0().child(view))
                 }
                 ConversationTab::Files => {
                     // The sample workspace lists its messages' files, newest first.

@@ -543,3 +543,95 @@ fn parses_search_modules_messages_and_files_and_sparse_profile_update() {
         })
     );
 }
+
+#[test]
+fn parses_slack_list_schema_and_typed_records() {
+    let file_obj = serde_json::json!({
+        "title": "Launch tracker",
+        "list_metadata": {
+            "description": "Q4 tasks",
+            "schema": [
+                { "id": "Col1", "key": "name", "name": "Task", "type": "text", "is_primary_column": true },
+                { "id": "Col2", "key": "assignee", "name": "Owner", "type": "user" },
+                {
+                    "id": "Col3",
+                    "key": "status",
+                    "name": "Status",
+                    "type": "select",
+                    "options": {
+                        "choices": [
+                            { "value": "OptDone", "label": "Done", "color": "green" },
+                            { "value": "OptTodo", "label": "To do", "color": "gray" }
+                        ]
+                    }
+                },
+                { "id": "Col4", "key": "done", "name": "Shipped", "type": "checkbox" }
+            ]
+        }
+    });
+    let (title, desc, cols) = parse_list_schema(&file_obj);
+    assert_eq!(title, "Launch tracker");
+    assert_eq!(desc, "Q4 tasks");
+    assert_eq!(cols.len(), 4);
+    assert_eq!(cols[2].choices.len(), 2);
+    assert_eq!(cols[2].choices[0].label, "Done");
+
+    let records = serde_json::json!([
+        {
+            "id": "Rec1",
+            "archived": false,
+            "fields": [
+                { "column_id": "Col1", "key": "name", "text": "Sign macOS build" },
+                { "column_id": "Col2", "key": "assignee", "user": ["U1"] },
+                { "column_id": "Col3", "key": "status", "select": ["OptDone"] },
+                { "column_id": "Col4", "key": "done", "checkbox": true }
+            ]
+        },
+        {
+            "id": "RecArchived",
+            "archived": true,
+            "fields": []
+        }
+    ]);
+    let rows = parse_list_records(records.as_array().unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].cells.get("Col1"),
+        Some(&SlackListCellValue::Text("Sign macOS build".into()))
+    );
+    assert_eq!(
+        rows[0].cells.get("Col2"),
+        Some(&SlackListCellValue::Users(vec![UserId::from("U1")]))
+    );
+    assert_eq!(
+        rows[0].cells.get("Col3"),
+        Some(&SlackListCellValue::Select(vec!["OptDone".into()]))
+    );
+    assert_eq!(
+        rows[0].cells.get("Col4"),
+        Some(&SlackListCellValue::Checkbox(true))
+    );
+}
+
+#[test]
+fn parses_file_collections_and_recently_deleted_wire() {
+    let cols_wire: FileCollectionsListWire = serde_json::from_value(serde_json::json!({
+        "collections": [
+            { "id": "ColA", "name": "Specs", "emoji": ":page_facing_up:", "files": [{ "id": "F1" }, { "id": "F2" }] }
+        ]
+    }))
+    .unwrap();
+    let cols: Vec<FileCollection> = cols_wire.collections.into_iter().map(Into::into).collect();
+    assert_eq!(cols.len(), 1);
+    assert_eq!(cols[0].name, "Specs");
+    assert_eq!(cols[0].file_ids, vec!["F1", "F2"]);
+
+    let del_wire: RecentlyDeletedWire = serde_json::from_value(serde_json::json!({
+        "files": [
+            { "id": "F9", "title": "Old Canvas", "date_delete": 1763540000, "file_type": "quip" }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(del_wire.files.len(), 1);
+    assert_eq!(del_wire.files[0].id, "F9");
+}

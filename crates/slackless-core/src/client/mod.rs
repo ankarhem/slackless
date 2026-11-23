@@ -1662,6 +1662,111 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::LoadList { file_id } => {
+                self.spawn("lists.records.list", async move {
+                    let list = backend
+                        .fetch_list(file_id.clone())
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string());
+                    events.emit(Event::ListLoaded { file_id, list });
+                    Ok(())
+                });
+            }
+            Command::SetGlobalNotificationPref { name, value, sync } => {
+                self.spawn("users.prefs.setNotifications(global)", async move {
+                    backend
+                        .set_global_notification_pref(name, value, sync)
+                        .await?;
+                    Ok(())
+                });
+            }
+            Command::LoadFilesExtras => {
+                self.spawn("files.extras", async move {
+                    let (favorites, collections, deleted) = tokio::join!(
+                        backend.files_favorites_list(),
+                        backend.files_collections_list(),
+                        backend.files_recently_deleted(),
+                    );
+                    events.emit(Event::FilesExtrasLoaded {
+                        favorites: favorites.unwrap_or_default(),
+                        collections: collections.unwrap_or_default(),
+                        deleted: deleted.unwrap_or_default(),
+                    });
+                    Ok(())
+                });
+            }
+            Command::SetFileFavorite {
+                file_id,
+                collection_id,
+                starred,
+            } => {
+                self.spawn("files.favorites", async move {
+                    backend
+                        .files_favorites_set(file_id, collection_id, starred)
+                        .await?;
+                    let (favorites, collections, deleted) = tokio::join!(
+                        backend.files_favorites_list(),
+                        backend.files_collections_list(),
+                        backend.files_recently_deleted(),
+                    );
+                    events.emit(Event::FilesExtrasLoaded {
+                        favorites: favorites.unwrap_or_default(),
+                        collections: collections.unwrap_or_default(),
+                        deleted: deleted.unwrap_or_default(),
+                    });
+                    Ok(())
+                });
+            }
+            Command::CreateFileCollection { name, emoji } => {
+                self.spawn("files.collections.create", async move {
+                    let _ = backend.files_collections_create(name, emoji).await?;
+                    let (favorites, collections, deleted) = tokio::join!(
+                        backend.files_favorites_list(),
+                        backend.files_collections_list(),
+                        backend.files_recently_deleted(),
+                    );
+                    events.emit(Event::FilesExtrasLoaded {
+                        favorites: favorites.unwrap_or_default(),
+                        collections: collections.unwrap_or_default(),
+                        deleted: deleted.unwrap_or_default(),
+                    });
+                    Ok(())
+                });
+            }
+            Command::DeleteFileCollection { collection_id } => {
+                self.spawn("files.collections.delete", async move {
+                    backend.files_collections_delete(collection_id).await?;
+                    let (favorites, collections, deleted) = tokio::join!(
+                        backend.files_favorites_list(),
+                        backend.files_collections_list(),
+                        backend.files_recently_deleted(),
+                    );
+                    events.emit(Event::FilesExtrasLoaded {
+                        favorites: favorites.unwrap_or_default(),
+                        collections: collections.unwrap_or_default(),
+                        deleted: deleted.unwrap_or_default(),
+                    });
+                    Ok(())
+                });
+            }
+            Command::RestoreDeletedFile { file_id } => {
+                self.spawn("files.undelete", async move {
+                    backend.files_undelete(file_id.clone()).await?;
+                    events.emit(Event::FileRestored { file_id });
+                    let (favorites, collections, deleted) = tokio::join!(
+                        backend.files_favorites_list(),
+                        backend.files_collections_list(),
+                        backend.files_recently_deleted(),
+                    );
+                    events.emit(Event::FilesExtrasLoaded {
+                        favorites: favorites.unwrap_or_default(),
+                        collections: collections.unwrap_or_default(),
+                        deleted: deleted.unwrap_or_default(),
+                    });
+                    Ok(())
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
