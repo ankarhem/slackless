@@ -311,10 +311,22 @@ impl ChimeRtcPeer {
             Box::pin(async move {
                 match track.kind() {
                     RTPCodecType::Audio => {
+                        let mut last_seq: Option<u16> = None;
                         while let Ok((rtp, _)) = track.read_rtp().await {
                             if rtp.payload.is_empty() {
                                 continue;
                             }
+                            let seq = rtp.header.sequence_number;
+                            if let Some(prev) = last_seq {
+                                let gap = seq.wrapping_sub(prev).saturating_sub(1);
+                                // Conceal 1..=4 consecutive dropped 20ms Opus frames via Opus PLC.
+                                if (1..=4).contains(&gap) {
+                                    for _ in 0..gap {
+                                        let _ = audio_tx.send(Vec::new());
+                                    }
+                                }
+                            }
+                            last_seq = Some(seq);
                             rx_pkts.fetch_add(1, Ordering::Relaxed);
                             rx_total.fetch_add(1, Ordering::Relaxed);
                             let len = rtp.payload.len() as u64;

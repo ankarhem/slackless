@@ -1227,6 +1227,12 @@ impl App {
                 self.open_add_to_list_dialog(channel, ts, window, cx);
             }
             MessageAction::SendToChannel => {}
+            MessageAction::JoinHuddle => {
+                if self.channel != channel {
+                    self.select(channel, cx);
+                }
+                self.start_huddle(window, cx);
+            }
             MessageAction::BlockAction { action, attachment } => {
                 if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
                     &message,
@@ -1482,6 +1488,12 @@ impl App {
             MessageAction::DismissEphemeral => {
                 self.threads
                     .update(cx, |t, cx| t.remove_message(&channel, &ts, cx));
+            }
+            MessageAction::JoinHuddle => {
+                if self.channel != channel {
+                    self.select(channel, cx);
+                }
+                self.start_huddle(window, cx);
             }
         }
     }

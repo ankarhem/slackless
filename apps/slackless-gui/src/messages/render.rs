@@ -11,7 +11,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{
     GlobalState, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun,
 };
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, BorderStyle, Bounds, Corners, CursorStyle, DispatchPhase, Div, Edges, Element,
@@ -2044,7 +2045,7 @@ pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
     let edited = message.edited.is_some();
     let inline_edited = edited && body_ends_in_text(message);
     if message.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread) {
-        if let Some(card) = render_huddle_thread_card(message, kcx.fixtures, cx) {
+        if let Some(card) = render_huddle_thread_card(message, kcx, cx) {
             return column.child(card);
         }
     }
@@ -2107,7 +2108,8 @@ pub(crate) fn format_huddle_duration(secs: u64) -> String {
 }
 
 /// Render official Slack's rich `huddle_thread` card in the message transcript (`F-COLLAB-003`).
-fn render_huddle_thread_card(message: &Message, fixtures: &Fixtures, cx: &App) -> Option<Div> {
+fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App) -> Option<Div> {
+    let fixtures = kcx.fixtures;
     let room = message.extra.get("room")?;
     let theme = cx.theme();
     let has_ended = room
@@ -2223,6 +2225,45 @@ fn render_huddle_thread_card(message: &Message, fixtures: &Fixtures, cx: &App) -
                             .take(4)
                             .map(|uid| crate::avatars::user_chip(fixtures, uid, 22.)),
                     ),
+                )
+            })
+            .when_some(kcx.on_action.clone(), |row, handler| {
+                let ts_key = message.ts.as_str().to_owned();
+                let join_handler = handler.clone();
+                row.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .flex_none()
+                        .when(!has_ended, |btns| {
+                            let id = SharedString::from(format!("huddle-join-{ts_key}"));
+                            btns.child(
+                                Button::new(id)
+                                    .primary()
+                                    .with_size(Size::XSmall)
+                                    .label("Join")
+                                    .on_click(move |_, window, cx| {
+                                        join_handler(
+                                            crate::actions::MessageAction::JoinHuddle,
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                            )
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!("huddle-thread-{ts_key}")))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .label("Thread")
+                                .on_click(move |_, window, cx| {
+                                    handler(
+                                        crate::actions::MessageAction::ReplyInThread,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        ),
                 )
             }),
     )

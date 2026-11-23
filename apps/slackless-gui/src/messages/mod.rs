@@ -216,6 +216,8 @@ pub enum MessageListEvent {
     },
     /// Forward this message (its permalink): the root opens New message with it drafted.
     Forward(String),
+    /// Join the live huddle from an inline `huddle_thread` card (`F-COLLAB-003`).
+    JoinHuddle(ChannelId),
     /// Open the local SQLite revision history inspector for `(channel, ts)`.
     ViewHistory {
         channel: ChannelId,
@@ -849,6 +851,7 @@ impl MessageList {
                 ts: ts.clone(),
             }),
             MessageAction::SendToChannel => {}
+            MessageAction::JoinHuddle => cx.emit(MessageListEvent::JoinHuddle(channel)),
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
                 let dispatch = self

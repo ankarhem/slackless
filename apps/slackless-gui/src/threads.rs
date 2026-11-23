@@ -755,6 +755,7 @@ impl ThreadPanel {
                     }
                 }
             }
+            MessageAction::JoinHuddle => {}
             MessageAction::OpenImage(origin) => {
                 // The viewer pages through the thread's images, root first.
                 let Some((channel, _)) = self.thread.clone() else {

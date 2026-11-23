@@ -392,9 +392,11 @@ impl AudioEngine {
                             playback_ring,
                             outbound_opus_tx,
                             &mut inbound_opus_rx,
+                            in_name,
+                            out_name,
+                            in_stream,
+                            out_stream,
                         );
-                        drop(in_stream);
-                        drop(out_stream);
                     }
                     Err(err) => {
                         let _ = ready_tx.send(Err(err));
@@ -452,12 +454,44 @@ fn build_sonora(aec: bool, ns: bool, agc: bool) -> AudioProcessing {
         .build()
 }
 
+/// Decode a received Opus packet, or invoke Opus Packet Loss Concealment (PLC) when `pkt` is
+/// empty (a sentinel emitted by the RTP reader when 1..=4 consecutive frames were dropped).
+pub(crate) fn decode_opus_or_plc(
+    decoder: &mut Decoder,
+    pkt: &[u8],
+    out: &mut [f32],
+) -> std::result::Result<usize, opus::Error> {
+    if pkt.is_empty() {
+        let plc_len = FRAME_20MS.min(out.len());
+        decoder.decode_float(&[], &mut out[..plc_len], false)
+    } else {
+        decoder.decode_float(pkt, out, false)
+    }
+}
+
+fn current_default_input_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|d| d.name().ok())
+}
+
+fn current_default_output_name() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.name().ok())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_audio_dsp_loop(
     shared: AudioSharedState,
     capture_ring: Arc<Mutex<VecDeque<f32>>>,
     playback_ring: Arc<Mutex<VecDeque<f32>>>,
     outbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
     inbound_opus_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    configured_in: Option<String>,
+    configured_out: Option<String>,
+    mut in_stream: Stream,
+    mut out_stream: Stream,
 ) {
     let Ok(mut encoder) = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip) else {
         return;
@@ -476,7 +510,43 @@ fn run_audio_dsp_loop(
     let silence_pcm = vec![0.0f32; FRAME_20MS];
     let mut processed_capture = Vec::with_capacity(FRAME_20MS);
 
+    // Watch system default input/output devices (e.g. AirPods connect/disconnect mid-huddle)
+    // and seamlessly rebuild the affected cpal stream in place without dropping the Chime call.
+    let mut last_default_in = if configured_in.is_none() {
+        current_default_input_name()
+    } else {
+        None
+    };
+    let mut last_default_out = if configured_out.is_none() {
+        current_default_output_name()
+    } else {
+        None
+    };
+    let mut last_device_check = std::time::Instant::now();
+
     while shared.running.load(Ordering::Relaxed) {
+        if last_device_check.elapsed() >= Duration::from_millis(1500) {
+            last_device_check = std::time::Instant::now();
+            if configured_in.is_none() {
+                let now_in = current_default_input_name();
+                if now_in.is_some() && now_in != last_default_in {
+                    if let Ok(next_stream) = open_input_stream(None, Arc::clone(&capture_ring)) {
+                        in_stream = next_stream;
+                        last_default_in = now_in;
+                    }
+                }
+            }
+            if configured_out.is_none() {
+                let now_out = current_default_output_name();
+                if now_out.is_some() && now_out != last_default_out {
+                    if let Ok(next_stream) = open_output_stream(None, Arc::clone(&playback_ring)) {
+                        out_stream = next_stream;
+                        last_default_out = now_out;
+                    }
+                }
+            }
+        }
+
         // Reconfigure Sonora live if AEC/NS/AGC toggles changed.
         let next_aec = shared.aec.load(Ordering::Relaxed);
         let next_ns = shared.ns.load(Ordering::Relaxed);
@@ -486,9 +556,9 @@ fn run_audio_dsp_loop(
             apm = build_sonora(cur_aec, cur_ns, cur_agc);
         }
 
-        // 1. Drain inbound Opus packets -> decode -> feed AEC3 render reference -> playback ring.
+        // 1. Drain inbound Opus packets (or empty PLC sentinels) -> decode -> AEC3 ref -> playback.
         while let Ok(pkt) = inbound_opus_rx.try_recv() {
-            if let Ok(samples) = decoder.decode_float(&pkt, &mut decoded_pcm, false) {
+            if let Ok(samples) = decode_opus_or_plc(&mut decoder, &pkt, &mut decoded_pcm) {
                 let pcm = &decoded_pcm[..samples];
                 for chunk in pcm.chunks(FRAME_10MS) {
                     if chunk.len() == FRAME_10MS {
@@ -554,6 +624,8 @@ fn run_audio_dsp_loop(
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    drop(in_stream);
+    drop(out_stream);
 }
 
 fn select_input_device(name: Option<&str>) -> Result<cpal::Device> {
@@ -846,6 +918,32 @@ mod tests {
             .unwrap();
         assert_eq!(samples, FRAME_20MS);
         assert!(compute_rms_mono(&decoded) > 0.01);
+    }
+
+    #[test]
+    fn opus_plc_conceals_lost_packet_without_silence_click() {
+        let mut enc = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).unwrap();
+        let mut dec = Decoder::new(SAMPLE_RATE, Channels::Mono).unwrap();
+
+        let sine: Vec<f32> = (0..FRAME_20MS)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 330.0 * (i as f32 / SAMPLE_RATE as f32)).sin() * 0.3
+            })
+            .collect();
+        let mut encoded = vec![0u8; 4000];
+        let mut decoded = vec![0.0f32; FRAME_20MS * 2];
+
+        // Prime the decoder with two normal frames so PLC has history to extrapolate.
+        for _ in 0..2 {
+            let n = enc.encode_float(&sine, &mut encoded).unwrap();
+            let got = decode_opus_or_plc(&mut dec, &encoded[..n], &mut decoded).unwrap();
+            assert_eq!(got, FRAME_20MS);
+        }
+
+        // Empty slice invokes Opus PLC for a missing 20ms RTP frame.
+        let plc_samples = decode_opus_or_plc(&mut dec, &[], &mut decoded).unwrap();
+        assert_eq!(plc_samples, FRAME_20MS);
+        assert!(compute_rms_mono(&decoded[..plc_samples]) > 0.005);
     }
 
     #[test]

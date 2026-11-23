@@ -3676,6 +3676,12 @@ fn subscribe_workspace(
                     index,
                 } => this.open_image_viewer(channel.clone(), images.clone(), *index, window, cx),
                 MessageListEvent::Forward(link) => this.open_compose(link, window, cx),
+                MessageListEvent::JoinHuddle(channel) => {
+                    if this.channel != *channel {
+                        this.select(channel.clone(), cx);
+                    }
+                    this.start_huddle(window, cx);
+                }
                 MessageListEvent::ViewHistory { channel, ts } => {
                     this.open_revision_history(channel.clone(), ts.clone(), window, cx)
                 }

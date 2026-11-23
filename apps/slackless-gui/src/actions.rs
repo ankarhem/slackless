@@ -88,6 +88,8 @@ pub enum MessageAction {
     AddToList,
     /// Broadcast an existing thread reply back into the parent channel (`F-CORE-106`).
     SendToChannel,
+    /// Join the live huddle linked to a `huddle_thread` card (`F-COLLAB-003`).
+    JoinHuddle,
 }
 
 /// Which actions apply to one message.

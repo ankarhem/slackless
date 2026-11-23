@@ -823,6 +823,7 @@ impl PopoutWindow {
                 cx.notify();
             }
             MessageAction::AddToList => {}
+            MessageAction::JoinHuddle => {}
             MessageAction::SendToChannel => {
                 if let PopoutKind::Thread {
                     channel, thread_ts, ..
