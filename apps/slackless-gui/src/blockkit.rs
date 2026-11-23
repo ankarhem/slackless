@@ -369,7 +369,8 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
         }
         "markdown" => {
             let text = raw["text"].as_str()?;
-            messages::mrkdwn(text, kcx, false, false, cx).into_any_element()
+            let converted = standard_markdown_to_mrkdwn(text);
+            messages::mrkdwn(&converted, kcx, false, false, cx).into_any_element()
         }
         "video" => video_block(raw, ix, kcx, cx).into_any_element(),
         "call" => call_block(raw, ix, kcx, cx).into_any_element(),
@@ -387,6 +388,97 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             .into_any_element(),
     };
     Some(element)
+}
+
+/// Convert common standard Markdown constructs used by Slack's `markdown` block (`**bold**`,
+/// `[label](url)`, `# Heading`, `~~strike~~`) into Slack `mrkdwn` while leaving fenced and
+/// inline code spans untouched.
+fn standard_markdown_to_mrkdwn(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_fence = false;
+    for (line_ix, line) in input.split('\n').enumerate() {
+        if line_ix > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+            let heading = trimmed[hashes + 1..].trim();
+            out.push('*');
+            out.push_str(&convert_inline_markdown(heading));
+            out.push('*');
+        } else {
+            out.push_str(&convert_inline_markdown(line));
+        }
+    }
+    out
+}
+
+fn convert_inline_markdown(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_code = false;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            in_code = !in_code;
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        if in_code {
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        // `[label](url)` -> `<url|label>`
+        if bytes[i] == b'[' {
+            if let Some(close_bracket) = line[i + 1..].find("](") {
+                let label_end = i + 1 + close_bracket;
+                let url_start = label_end + 2;
+                if let Some(close_paren) = line[url_start..].find(')') {
+                    let label = &line[i + 1..label_end];
+                    let url = &line[url_start..url_start + close_paren];
+                    if !url.is_empty() && !url.contains(char::is_whitespace) {
+                        out.push('<');
+                        out.push_str(url);
+                        if !label.is_empty() {
+                            out.push('|');
+                            out.push_str(label);
+                        }
+                        out.push('>');
+                        i = url_start + close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // `**bold**` -> `*bold*`, `~~strike~~` -> `~strike~`
+        if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            out.push('*');
+            i += 2;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+            out.push('~');
+            i += 2;
+            continue;
+        }
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Slack's Block Kit `video` block: clickable title + thumbnail preview + description/provider.
@@ -2991,6 +3083,7 @@ pub fn collect_modal_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::gpui;
     use serde_json::json;
 
     #[test]
@@ -3014,5 +3107,116 @@ mod tests {
         assert!(validate_text_input(&plain, "hi").is_some());
         assert!(validate_text_input(&plain, "hey").is_none());
         assert!(validate_text_input(&plain, "toolong").is_some());
+    }
+
+    #[test]
+    fn converts_standard_markdown_to_mrkdwn_preserving_code() {
+        let md = "### Deploy Summary\n\
+                  Status: **green** — see [dashboard](https://grafana.example) and ~~old~~ `**keep** [a](b)`\n\
+                  ```\n\
+                  **verbatim** [link](https://example.com)\n\
+                  ```";
+        let out = standard_markdown_to_mrkdwn(md);
+        assert_eq!(
+            out,
+            "*Deploy Summary*\n\
+             Status: *green* — see <https://grafana.example|dashboard> and ~old~ `**keep** [a](b)`\n\
+             ```\n\
+             **verbatim** [link](https://example.com)\n\
+             ```"
+        );
+    }
+
+    #[gpui::test]
+    fn renders_all_modern_block_kit_blocks_without_panicking(cx: &mut gpui::TestAppContext) {
+        use gpui::{Render, Window};
+
+        struct BlockHost {
+            fixtures: std::sync::Arc<Fixtures>,
+            kit: Entity<BlockKitState>,
+            blocks: Vec<Json>,
+        }
+        impl Render for BlockHost {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let ts = Ts::from("1700000001.000100");
+                prepare_raw_inputs(&self.kit, &ts, &self.blocks, window, cx);
+                let kcx = KitCx::new(&self.fixtures, Some(&self.kit), &ts);
+                div()
+                    .size_full()
+                    .p_4()
+                    .child(render_raw_blocks(&self.blocks, &kcx, cx))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let blocks = vec![
+            json!({ "type": "markdown", "text": "## Summary\nAll **checks** passed on [CI](https://ci.example)." }),
+            json!({ "type": "alert", "style": "warning", "title": { "type": "plain_text", "text": "Heads up" }, "text": { "type": "mrkdwn", "text": "Deploy window opens at 14:00." } }),
+            json!({ "type": "callout", "severity": "danger", "text": "Incident active" }),
+            json!({
+                "type": "card",
+                "title": { "type": "plain_text", "text": "Service API" },
+                "subtitle": "Production",
+                "fields": [
+                    { "type": "mrkdwn", "text": "*Latency*\n12ms" },
+                    { "type": "mrkdwn", "text": "*Errors*\n0.01%" }
+                ],
+                "actions": [
+                    { "type": "button", "action_id": "open_runbook", "text": { "type": "plain_text", "text": "Runbook" }, "value": "rb" }
+                ]
+            }),
+            json!({
+                "type": "carousel",
+                "elements": [
+                    { "type": "card", "title": "Slide 1", "subtitle": "First" },
+                    { "type": "card", "title": "Slide 2", "subtitle": "Second" }
+                ]
+            }),
+            json!({
+                "type": "video",
+                "title": { "type": "plain_text", "text": "Release walkthrough" },
+                "title_url": "https://video.example/1",
+                "description": { "type": "plain_text", "text": "Demo of v2.4" },
+                "provider_name": "Loom"
+            }),
+            json!({
+                "type": "call",
+                "call": {
+                    "title": "Standup",
+                    "active_participants": [{ "slack_id": "U0ALICE" }],
+                    "join_url": "https://call.example/join"
+                }
+            }),
+            json!({ "type": "file", "external_id": "report-2026.csv" }),
+            json!({
+                "type": "rich_text",
+                "elements": [
+                    { "type": "rich_text_section", "elements": [{ "type": "text", "text": "Nested rich text" }] }
+                ]
+            }),
+            json!({
+                "type": "input",
+                "block_id": "notes_blk",
+                "label": { "type": "plain_text", "text": "Notes" },
+                "element": { "type": "plain_text_input", "action_id": "notes_act", "initial_value": "Ready" }
+            }),
+        ];
+        let (_view, cx) = cx.add_window_view(|_, cx| BlockHost {
+            fixtures: std::sync::Arc::new(crate::fixtures::load()),
+            kit: cx.new(|_| BlockKitState::default()),
+            blocks,
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
     }
 }

@@ -495,3 +495,162 @@ fn mouse_back_and_forward_navigate_across_channels_and_pages(cx: &mut gpui::Test
         );
     });
 }
+
+#[gpui::test]
+fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppContext) {
+    use crate::blockkit::serde_json::json;
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+
+    // Augment sample fixtures with a bot user + bot DM so App Home tab behavior is exercised live.
+    let mut fx = fixtures::load();
+    let bot_id = UserId::from("U0APPBOT");
+    let mut bot = User {
+        id: bot_id.clone(),
+        name: "deploybot".into(),
+        real_name: Some("DeployBot".into()),
+        is_bot: true,
+        ..Default::default()
+    };
+    bot.profile.title = Some("Release orchestrator".into());
+    fx.users.push(bot);
+    let bot_dm = ChannelId::from("D0APPBOT");
+    fx.dms.push(Conversation {
+        id: bot_dm.clone(),
+        is_im: true,
+        user: Some(bot_id),
+        ..Default::default()
+    });
+
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(Arc::new(fx), CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    // 1. Huddle bar thread toggle (`HuddleEvent::OpenThread` -> `toggle_huddle_thread`) on `#general`.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(ChannelId::from("C0GENERAL"), cx);
+            app.start_huddle(window, cx);
+            assert!(
+                app.huddle_open,
+                "fixture huddle bar should open on #general"
+            );
+            assert!(!app.thread_open);
+            app.toggle_huddle_thread(cx);
+            assert!(
+                app.thread_open,
+                "Huddle thread button should open the thread panel"
+            );
+        });
+        let _ = window.draw(cx);
+        app.update(cx, |app, cx| {
+            app.toggle_huddle_thread(cx);
+            assert!(
+                !app.thread_open,
+                "second click should toggle the huddle thread closed"
+            );
+            // Browsing another channel while the huddle bar is open must still open the huddle's own channel thread.
+            app.select(ChannelId::from("C0DESIGN"), cx);
+            app.toggle_huddle_thread(cx);
+            assert_eq!(
+                app.thread.read(cx).open_thread().map(|(ch, _)| ch),
+                Some(ChannelId::from("C0GENERAL")),
+                "Huddle thread must target the huddle's channel even when browsing another channel"
+            );
+            app.close_thread(cx);
+        });
+        let _ = window.draw(cx);
+    });
+
+    // 1b. Huddles page (`HuddlesView::show_local`) populates ts and renders cleanly.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.show_huddles(cx);
+            assert!(app.huddles_open);
+        });
+        let _ = window.draw(cx);
+        app.update(cx, |app, cx| {
+            let general_ts = app
+                .fixtures
+                .messages
+                .get(&ChannelId::from("C0GENERAL"))
+                .and_then(|msgs| msgs.last())
+                .map(|m| m.ts.clone())
+                .expect("general has fixture messages");
+            app.select(ChannelId::from("C0GENERAL"), cx);
+            app.open_thread(ChannelId::from("C0GENERAL"), general_ts, cx);
+            assert!(!app.huddles_open);
+            assert!(app.thread_open);
+            app.close_thread(cx);
+        });
+        let _ = window.draw(cx);
+    });
+
+    // 2. Lists tab (including CSV button) renders cleanly.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select_tab(ConversationTab::List, cx);
+        });
+        let _ = window.draw(cx);
+    });
+
+    // 3. App Home tab on bot DM: Ctrl+1 selects Home, Ctrl+2 selects Messages, BlockKitState inputs
+    //    are prepared, and switching away resets tab to Messages.
+    let home_dm = bot_dm.clone();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.select(home_dm.clone(), cx);
+            app.ws.app_homes.insert(
+                home_dm.clone(),
+                Ok(slackless_core::api::AppHomeResponse {
+                    home_tab_enabled: true,
+                    messages_tab_enabled: true,
+                    home_view: Some(json!({
+                        "id": "V0HOME",
+                        "app_id": "A0DEPLOY",
+                        "bot_id": "B0DEPLOY",
+                        "blocks": [
+                            { "type": "header", "text": { "type": "plain_text", "text": "Deploy Dashboard" } },
+                            { "type": "markdown", "text": "Release **v2.4** is live — see [notes](https://acme.example/v2.4)." },
+                            { "type": "alert", "style": "success", "text": { "type": "mrkdwn", "text": "All systems operational." } },
+                            {
+                                "type": "input",
+                                "block_id": "note_blk",
+                                "label": { "type": "plain_text", "text": "Release note" },
+                                "element": { "type": "plain_text_input", "action_id": "note_act", "initial_value": "Shipped" }
+                            }
+                        ]
+                    })),
+                }),
+            );
+            // Ctrl+1 on a bot DM must pick Home (index 0).
+            app.select_conversation_tab(0, cx);
+            assert_eq!(app.tab, ConversationTab::Home);
+        });
+        let _ = window.draw(cx);
+        let _ = window.draw(cx);
+        app.update(cx, |app, cx| {
+            // Ctrl+2 picks Messages (index 1).
+            app.select_conversation_tab(1, cx);
+            assert_eq!(app.tab, ConversationTab::Messages);
+            // Switch back to Home, then navigate to #general -> tab must reset to Messages.
+            app.select_conversation_tab(0, cx);
+            assert_eq!(app.tab, ConversationTab::Home);
+            app.select(ChannelId::from("C0GENERAL"), cx);
+            assert_eq!(app.tab, ConversationTab::Messages);
+        });
+        let _ = window.draw(cx);
+    });
+}

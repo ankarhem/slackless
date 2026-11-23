@@ -572,30 +572,54 @@ impl App {
         )
     }
 
-    /// Open or toggle the current conversation's huddle thread in the right-hand thread panel
-    /// (`F-COLLAB-014`, `F-COLLAB-015`). Uses the newest `huddle_thread` trail message in the
-    /// channel, falling back to the newest message in sample mode.
+    /// Open or toggle the active huddle's thread in the right-hand thread panel
+    /// (`F-COLLAB-014`, `F-COLLAB-015`). Targets the huddle's own channel (even when browsing
+    /// another channel while the huddle bar is open), using its newest `huddle_thread` trail
+    /// message (falling back to the newest message in sample mode).
     pub(super) fn toggle_huddle_thread(&mut self, cx: &mut Context<Self>) {
-        let huddle_ts = self
-            .messages
-            .read(cx)
-            .latest_huddle_thread_ts(self.fixtures.sample, cx);
+        let huddle_channel = self
+            .huddle
+            .as_ref()
+            .map(|(ch, _)| ch.clone())
+            .unwrap_or_else(|| self.channel.clone());
+        let huddle_ts = if huddle_channel == self.channel {
+            self.messages
+                .read(cx)
+                .latest_huddle_thread_ts(self.fixtures.sample, cx)
+        } else {
+            self.fixtures
+                .messages
+                .get(&huddle_channel)
+                .and_then(|msgs| {
+                    msgs.iter()
+                        .rev()
+                        .find(|m| {
+                            m.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread)
+                        })
+                        .or_else(|| self.fixtures.sample.then(|| msgs.last()).flatten())
+                        .map(|m| m.ts.clone())
+                })
+        };
         let Some(ts) = huddle_ts else {
             return;
         };
         if self.thread_open
-            && self.thread.read(cx).open_thread().as_ref().map(|(_, t)| t) == Some(&ts)
+            && self.thread.read(cx).open_thread() == Some((huddle_channel.clone(), ts.clone()))
         {
             self.close_thread(cx);
         } else {
-            self.open_thread(self.channel.clone(), ts, cx);
+            self.open_thread(huddle_channel, ts, cx);
         }
     }
 
     /// Render the active app DM's Home tab (`F-COLLAB-480`): displays published Block Kit
-    /// `home_view.blocks` with interactive `blocks.actions` (`container: {"type":"view",...}`)
-    /// and a Refresh button.
-    pub(super) fn app_home_view(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// `home_view.blocks` with interactive `blocks.actions` (`container: {"type":"view",...}`),
+    /// interactive `BlockKitState` inputs/selects, link routing, and a Refresh button.
+    pub(super) fn app_home_view(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let theme = cx.theme();
         let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
         let channel = self.channel.clone();
@@ -606,7 +630,7 @@ impl App {
             .map(|u| self.fixtures.user_name(u).to_owned())
             .unwrap_or_else(|| "App".to_owned());
 
-        if self.fixtures.sample {
+        if self.fixtures.sample && !self.ws.app_homes.contains_key(&channel) {
             return div()
                 .id("app-home-scroll")
                 .size_full()
@@ -704,14 +728,21 @@ impl App {
                         .into_any_element()
                 } else {
                     let ts = Ts::from(format!("home-{view_id}"));
-                    let this = cx.entity().downgrade();
+                    crate::blockkit::prepare_raw_inputs(
+                        &self.app_home_kit,
+                        &ts,
+                        &raw_blocks,
+                        window,
+                        cx,
+                    );
+                    let this_action = cx.entity().downgrade();
                     let ch_action = channel.clone();
                     let on_action: crate::actions::ActionHandler =
                         Rc::new(move |action, _window, cx| {
                             if let crate::actions::MessageAction::BlockAction { action, .. } =
                                 action
                             {
-                                let _ = this.update(cx, |app, _| {
+                                let _ = this_action.update(cx, |app, _| {
                                     app.bridge.send(Command::BlockAction {
                                         bot: bot_id.clone(),
                                         app_id: app_id.clone(),
@@ -728,8 +759,16 @@ impl App {
                                 });
                             }
                         });
-                    let kcx = crate::blockkit::KitCx::new(&self.fixtures, None, &ts)
-                        .dispatching_actions(on_action);
+                    let this_link = cx.entity().downgrade();
+                    let links: crate::messages::LinkHandler = Rc::new(move |target, window, cx| {
+                        let _ = this_link.update(cx, |app, cx| {
+                            app.open_link(target, window, cx);
+                        });
+                    });
+                    let kcx =
+                        crate::blockkit::KitCx::new(&self.fixtures, Some(&self.app_home_kit), &ts)
+                            .with_links(links)
+                            .dispatching_actions(on_action);
                     crate::blockkit::render_raw_blocks(&raw_blocks, &kcx, cx).into_any_element()
                 }
             }
@@ -1578,6 +1617,22 @@ impl App {
             )
     }
 
+    /// Effective tab specs for `conversation`, prepending the `Home` tab for app/bot DMs.
+    pub(super) fn conversation_tab_specs(&self, conversation: &Conversation) -> Vec<tabs::TabSpec> {
+        let is_app_dm = conversation.is_im
+            && conversation
+                .user
+                .as_ref()
+                .and_then(|u| self.fixtures.user(u))
+                .is_some_and(|u| u.is_bot);
+        let specs = tabs::derive(conversation, self.fixtures.sample);
+        if is_app_dm {
+            tabs::with_app_home(specs)
+        } else {
+            specs
+        }
+    }
+
     /// The tab row under the header, derived from the conversation's `properties.tabs` in
     /// live mode ([`tabs`] for the rules) or the sample workspace's fixed set, with the
     /// active tab underlined. The trailing "+" opens Slack's new-tab menu, restricted to
@@ -1592,16 +1647,7 @@ impl App {
             .fixtures
             .conversation(&self.channel)
             .unwrap_or(&fallback);
-        let is_app_dm = conversation.is_im
-            && conversation
-                .user
-                .as_ref()
-                .and_then(|u| self.fixtures.user(u))
-                .is_some_and(|u| u.is_bot);
-        let mut specs = tabs::derive(conversation, self.fixtures.sample);
-        if is_app_dm {
-            specs = tabs::with_app_home(specs);
-        }
+        let specs = self.conversation_tab_specs(conversation);
         let this = cx.entity().downgrade();
         let sample = self.fixtures.sample;
         let ch_for_add = self.channel.clone();

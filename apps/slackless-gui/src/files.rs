@@ -762,6 +762,22 @@ fn video_card(file: &File, cx: &App) -> Div {
 }
 
 const SNIPPET_COLLAPSED_LINES: usize = 5;
+const SNIPPET_EXPANDED_MAX_H: f32 = 460.;
+const SNIPPET_SCROLL_THRESHOLD: usize = 20;
+
+fn extra_usize(file: &File, key: &str) -> Option<usize> {
+    let val = file.extra.get(key)?;
+    val.as_u64()
+        .map(|n| n as usize)
+        .or_else(|| val.as_str().and_then(|s| s.parse::<usize>().ok()))
+}
+
+fn text_lines(text: &str) -> Vec<String> {
+    text.trim_end_matches(['\n', '\r'])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
 
 fn is_snippet(file: &File) -> bool {
     let has_preview = file
@@ -777,36 +793,49 @@ fn is_snippet(file: &File) -> bool {
 }
 
 fn snippet_lines(file: &File) -> Vec<String> {
-    file.preview
-        .as_deref()
-        .unwrap_or_default()
-        .trim_end_matches('\n')
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    text_lines(file.preview.as_deref().unwrap_or_default())
 }
 
-/// Extra lines beyond the collapsed 5-line preview: uses Slack's `lines` metadata when
-/// available so truncated previews still report the real line count (`Show more (247 lines)`).
-fn snippet_hidden_lines(file: &File, preview_len: usize) -> usize {
-    let server_total = file
+/// Whether Slack truncated `file.preview` on the server (typically to 5 lines), so expanding or
+/// copying needs to fetch the full file text from `url_private`.
+fn snippet_is_truncated(file: &File, preview_len: usize) -> bool {
+    let flagged = file
         .extra
-        .get("lines")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or(preview_len);
-    let total = server_total.max(preview_len);
-    total.saturating_sub(SNIPPET_COLLAPSED_LINES)
+        .get("preview_is_truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let lines_more = extra_usize(file, "lines_more").unwrap_or(0);
+    let server_total = extra_usize(file, "lines").unwrap_or(0);
+    flagged || lines_more > 0 || server_total > preview_len
+}
+
+/// Extra lines beyond the collapsed 5-line preview: uses Slack's `lines` / `lines_more` metadata
+/// when available so truncated previews report the real line count (`Show more (247 lines)`).
+fn snippet_hidden_lines(file: &File, loaded_len: usize, has_full_text: bool) -> usize {
+    let from_loaded = loaded_len.saturating_sub(SNIPPET_COLLAPSED_LINES);
+    if has_full_text {
+        return from_loaded;
+    }
+    let from_total = extra_usize(file, "lines")
+        .unwrap_or(0)
+        .saturating_sub(SNIPPET_COLLAPSED_LINES);
+    let from_more = extra_usize(file, "lines_more").unwrap_or(0);
+    from_loaded.max(from_total).max(from_more)
 }
 
 #[derive(Default)]
 struct SnippetCardState {
     expanded: bool,
     copied: bool,
+    loading: bool,
+    full_text: Option<String>,
+    error: Option<String>,
 }
 
 /// Slack's collapsible line-numbered code snippet card (`Chalk_Custom.terminal`, etc.):
 /// shows 5 lines collapsed with a centered `Show more (N lines)` toggle plus Copy & Download.
+/// For server-truncated Slack previews (`preview_is_truncated` / `lines_more > 0`), lazily fetches
+/// the full file text via [`crate::media::fetch`] on expand or Copy.
 #[derive(IntoElement)]
 struct SnippetCard {
     file: File,
@@ -821,20 +850,32 @@ impl RenderOnce for SnippetCard {
             cx,
             |_, _| SnippetCardState::default(),
         );
-        let (expanded, copied) = {
+        let (expanded, copied, loading, full_text, error) = {
             let s = state.read(cx);
-            (s.expanded, s.copied)
+            (
+                s.expanded,
+                s.copied,
+                s.loading,
+                s.full_text.clone(),
+                s.error.clone(),
+            )
         };
         let theme = cx.theme();
-        let lines = snippet_lines(&file);
-        let can_expand = lines.len() > SNIPPET_COLLAPSED_LINES;
-        let hidden_lines = snippet_hidden_lines(&file, lines.len());
+        let preview_lines = snippet_lines(&file);
+        let is_truncated = snippet_is_truncated(&file, preview_lines.len());
+        let has_full_text = full_text.is_some();
+        let lines = match &full_text {
+            Some(full) => text_lines(full),
+            None => preview_lines,
+        };
+        let hidden_lines = snippet_hidden_lines(&file, lines.len(), has_full_text);
+        let can_expand = lines.len() > SNIPPET_COLLAPSED_LINES || hidden_lines > 0 || is_truncated;
         let visible_count = if expanded {
             lines.len()
         } else {
             lines.len().min(SNIPPET_COLLAPSED_LINES)
         };
-        let gutter_digits = lines.len().max(1).to_string().len().max(2);
+        let gutter_digits = visible_count.max(1).to_string().len().max(2);
         let title = file
             .title
             .clone()
@@ -845,8 +886,12 @@ impl RenderOnce for SnippetCard {
             .clone()
             .or_else(|| file.filetype.as_ref().map(|t| t.to_uppercase()));
         let dl_url = download_url(&file);
+        let fetch_url = file.url_private.clone().or_else(|| dl_url.clone());
         let name = file_name(&file);
-        let copy_text = file.preview.clone().unwrap_or_default();
+        let fallback_copy = full_text
+            .clone()
+            .or_else(|| file.preview.clone())
+            .unwrap_or_default();
         let code_bg = crate::theme::code_block_background(cx);
         let border = theme.border;
         let fg = theme.foreground;
@@ -857,6 +902,8 @@ impl RenderOnce for SnippetCard {
         let success = theme.success;
 
         let copy_state = state.clone();
+        let copy_fetch_url = fetch_url.clone();
+        let needs_copy_fetch = is_truncated && !has_full_text;
         let copy_btn = h_flex()
             .id(SharedString::from(format!("snippet-copy-{id_str}")))
             .items_center()
@@ -878,8 +925,43 @@ impl RenderOnce for SnippetCard {
                 .text_color(if copied { success } else { muted }),
             )
             .child(if copied { "Copied" } else { "Copy" })
-            .on_click(move |_, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, window, cx| {
+                if needs_copy_fetch {
+                    if let Some(fut) = copy_fetch_url
+                        .clone()
+                        .and_then(|url| crate::media::fetch(url, cx))
+                    {
+                        let state = copy_state.clone();
+                        let fallback = fallback_copy.clone();
+                        window
+                            .spawn(cx, async move |cx| {
+                                let text = match fut.await {
+                                    Ok(bytes) => {
+                                        let decoded = String::from_utf8_lossy(&bytes).into_owned();
+                                        state.update(cx, |s, cx| {
+                                            s.full_text = Some(decoded.clone());
+                                            s.loading = false;
+                                            s.error = None;
+                                            cx.notify();
+                                        });
+                                        decoded
+                                    }
+                                    Err(_) => fallback,
+                                };
+                                let _ = cx.update(|_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    state.update(cx, |s, cx| {
+                                        s.copied = true;
+                                        cx.notify();
+                                    });
+                                });
+                            })
+                            .detach();
+                        return;
+                    }
+                }
+                cx.write_to_clipboard(ClipboardItem::new_string(fallback_copy.clone()));
                 copy_state.update(cx, |s, cx| {
                     s.copied = true;
                     cx.notify();
@@ -905,6 +987,7 @@ impl RenderOnce for SnippetCard {
                         .text_color(muted),
                 )
                 .child("Download")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| {
                     crate::media::download(url.clone(), name.clone(), window, cx);
                 })
@@ -979,16 +1062,43 @@ impl RenderOnce for SnippetCard {
                     ),
             );
         }
+        if expanded && loading {
+            code_body = code_body.child(
+                div()
+                    .pt_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Loading full snippet\u{2026}"),
+            );
+        } else if expanded {
+            if let Some(err) = error {
+                code_body = code_body.child(div().pt_1().text_xs().text_color(muted).child(err));
+            }
+        }
+        let code_area: AnyElement = if expanded && visible_count > SNIPPET_SCROLL_THRESHOLD {
+            div()
+                .id(SharedString::from(format!("snippet-body-{id_str}")))
+                .w_full()
+                .max_h(px(SNIPPET_EXPANDED_MAX_H))
+                .overflow_y_scroll()
+                .child(code_body)
+                .into_any_element()
+        } else {
+            code_body.into_any_element()
+        };
 
         let toggle_row = can_expand.then(|| {
             let toggle_state = state.clone();
+            let expand_fetch_url = fetch_url.clone();
             let label = if expanded {
                 "Show less".to_owned()
-            } else {
+            } else if hidden_lines > 0 {
                 format!(
                     "Show more ({hidden_lines} {})",
                     if hidden_lines == 1 { "line" } else { "lines" }
                 )
+            } else {
+                "Show more".to_owned()
             };
             h_flex()
                 .w_full()
@@ -1011,11 +1121,61 @@ impl RenderOnce for SnippetCard {
                         .cursor_pointer()
                         .hover(move |b| b.bg(secondary_hover))
                         .child(label)
-                        .on_click(move |_, _, cx| {
-                            toggle_state.update(cx, |s, cx| {
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(move |_, window, cx| {
+                            let should_fetch = toggle_state.update(cx, |s, cx| {
                                 s.expanded = !s.expanded;
+                                let fetch =
+                                    s.expanded && is_truncated && s.full_text.is_none() && !s.loading;
+                                if fetch {
+                                    s.error = None;
+                                }
                                 cx.notify();
+                                fetch
                             });
+                            if should_fetch {
+                                if let Some(fut) = expand_fetch_url
+                                    .clone()
+                                    .and_then(|url| crate::media::fetch(url, cx))
+                                {
+                                    toggle_state.update(cx, |s, cx| {
+                                        s.loading = true;
+                                        cx.notify();
+                                    });
+                                    let state = toggle_state.clone();
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            let res = fut.await;
+                                            state.update(cx, |s, cx| {
+                                                s.loading = false;
+                                                match res {
+                                                    Ok(bytes) => {
+                                                        s.full_text = Some(
+                                                            String::from_utf8_lossy(&bytes)
+                                                                .into_owned(),
+                                                        );
+                                                        s.error = None;
+                                                    }
+                                                    Err(err) => {
+                                                        s.error = Some(format!(
+                                                            "Could not load full snippet ({err})."
+                                                        ));
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        })
+                                        .detach();
+                                } else {
+                                    toggle_state.update(cx, |s, cx| {
+                                        s.error = Some(
+                                            "Full snippet requires a live Slack session (showing preview)."
+                                                .to_owned(),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                            }
                         }),
                 )
         });
@@ -1029,7 +1189,7 @@ impl RenderOnce for SnippetCard {
             .bg(code_bg)
             .overflow_hidden()
             .child(header)
-            .child(code_body)
+            .child(code_area)
             .children(toggle_row)
     }
 }
@@ -1180,11 +1340,13 @@ pub(crate) fn human_size(bytes: i64) -> String {
 mod tests {
     use super::*;
     use crate::blockkit::serde_json::json;
+    use gpui_kit::gpui::{self, Render, TestAppContext};
     use slackless_core::types::FileId;
 
     #[test]
-    fn snippet_detection_and_line_counts_match_slack() {
-        let mut snippet = File {
+    fn snippet_detection_truncation_and_line_counts_match_slack() {
+        // Untruncated 7-line preview.
+        let snippet = File {
             id: FileId::from("F0SNIP"),
             name: Some("Chalk_Custom.terminal".into()),
             mode: Some(FileMode::Snippet),
@@ -1195,11 +1357,53 @@ mod tests {
         assert!(is_snippet(&snippet));
         let lines = snippet_lines(&snippet);
         assert_eq!(lines.len(), 7);
-        assert_eq!(snippet_hidden_lines(&snippet, lines.len()), 2);
+        assert!(!snippet_is_truncated(&snippet, lines.len()));
+        assert_eq!(snippet_hidden_lines(&snippet, lines.len(), false), 2);
 
-        // Slack's `lines` metadata overrides truncated preview counts (e.g. 252 total -> 247 hidden).
-        snippet.extra.insert("lines".into(), json!(252));
-        assert_eq!(snippet_hidden_lines(&snippet, lines.len()), 247);
+        // Server-truncated Slack snippet: only 5 preview lines, `lines: 252`, `lines_more: 247`.
+        let mut truncated = File {
+            id: FileId::from("F0TRUNC"),
+            name: Some("Chalk.terminal".into()),
+            mode: Some(FileMode::Snippet),
+            filetype: Some("xml".into()),
+            preview: Some("line 1\nline 2\nline 3\nline 4\nline 5\n".into()),
+            ..Default::default()
+        };
+        truncated
+            .extra
+            .insert("preview_is_truncated".into(), json!(true));
+        truncated.extra.insert("lines".into(), json!(252));
+        truncated.extra.insert("lines_more".into(), json!(247));
+        let trunc_lines = snippet_lines(&truncated);
+        assert_eq!(trunc_lines.len(), 5);
+        assert!(snippet_is_truncated(&truncated, trunc_lines.len()));
+        assert_eq!(
+            snippet_hidden_lines(&truncated, trunc_lines.len(), false),
+            247
+        );
+        // Once full text is fetched (say 252 lines), hidden lines computes from loaded text.
+        assert_eq!(snippet_hidden_lines(&truncated, 252, true), 247);
+
+        // String-encoded `lines_more` without `lines` or `preview_is_truncated` still triggers expansion.
+        let mut string_meta = File {
+            id: FileId::from("F0STR"),
+            mode: Some(FileMode::Snippet),
+            preview: Some("a\nb\nc\nd\ne\n".into()),
+            ..Default::default()
+        };
+        string_meta.extra.insert("lines_more".into(), json!("19"));
+        assert!(snippet_is_truncated(&string_meta, 5));
+        assert_eq!(snippet_hidden_lines(&string_meta, 5, false), 19);
+
+        // Short 3-line snippet is NOT truncated and has 0 hidden lines.
+        let short = File {
+            id: FileId::from("F0SHORT"),
+            mode: Some(FileMode::Snippet),
+            preview: Some("a\nb\nc\n".into()),
+            ..Default::default()
+        };
+        assert!(!snippet_is_truncated(&short, 3));
+        assert_eq!(snippet_hidden_lines(&short, 3, false), 0);
 
         // Non-snippet canvas / PDF files must not render as code snippet cards.
         let canvas = File {
@@ -1209,5 +1413,68 @@ mod tests {
             ..Default::default()
         };
         assert!(!is_snippet(&canvas));
+    }
+
+    #[gpui::test]
+    fn snippet_card_renders_and_toggles_both_untruncated_and_truncated_files(
+        cx: &mut TestAppContext,
+    ) {
+        struct Host {
+            files: Vec<File>,
+        }
+        impl Render for Host {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                v_flex()
+                    .size_full()
+                    .gap_4()
+                    .p_4()
+                    .children(self.files.iter().cloned().map(|file| SnippetCard { file }))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+
+        let mut truncated = File {
+            id: FileId::from("F0TRUNC"),
+            name: Some("Chalk_Custom.terminal".into()),
+            title: Some("Chalk_Custom.terminal".into()),
+            mode: Some(FileMode::Snippet),
+            pretty_type: Some("Plain Text".into()),
+            preview: Some("line 1\nline 2\nline 3\nline 4\nline 5\n".into()),
+            ..Default::default()
+        };
+        truncated
+            .extra
+            .insert("preview_is_truncated".into(), json!(true));
+        truncated.extra.insert("lines".into(), json!(252));
+        truncated.extra.insert("lines_more".into(), json!(247));
+
+        let untruncated = File {
+            id: FileId::from("F0FULL"),
+            name: Some("deploy.sh".into()),
+            title: Some("deploy.sh".into()),
+            mode: Some(FileMode::Snippet),
+            pretty_type: Some("Shell".into()),
+            preview: Some("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n".into()),
+            ..Default::default()
+        };
+
+        let (_view, cx) = cx.add_window_view(|_, _| Host {
+            files: vec![truncated, untruncated],
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        // Both truncated (`F0TRUNC`) and untruncated (`F0FULL`) cards must render without panicking
+        // and lay out their toggle buttons and Copy controls cleanly.
+        cx.run_until_parked();
     }
 }

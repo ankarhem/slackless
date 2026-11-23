@@ -206,6 +206,19 @@ pub fn list_view(cx: &App) -> Stateful<Div> {
                             .child(format!("{} items", list.rows.len())),
                     )
                     .child(div().flex_1())
+                    .child({
+                        let csv = fixture_to_csv(&list);
+                        let suggested = format!("{}.csv", sanitize_filename(list.title));
+                        Button::new("list-export-csv-fixture")
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Download)
+                            .label("CSV")
+                            .tooltip("Download list as CSV")
+                            .on_click(move |_, window, cx| {
+                                export_csv(csv.clone(), suggested.clone(), window, cx);
+                            })
+                    })
                     .child(read_only_badge(cx)),
             )
             .child(table),
@@ -779,6 +792,36 @@ fn live_cell(
             row
         }
     }
+}
+
+fn fixture_to_csv(list: &SlackList) -> String {
+    let mut out = String::new();
+    for (ix, col) in list.columns.iter().enumerate() {
+        if ix > 0 {
+            out.push(',');
+        }
+        push_csv_field(&mut out, col.name);
+    }
+    out.push('\n');
+    for row in &list.rows {
+        for (ix, field) in row.iter().enumerate() {
+            if ix > 0 {
+                out.push(',');
+            }
+            let val = match field {
+                Field::Text(s) | Field::Person(s) | Field::Date(s) => *s,
+                Field::Select(Status::Todo) => "To do",
+                Field::Select(Status::InProgress) => "In progress",
+                Field::Select(Status::Blocked) => "Blocked",
+                Field::Select(Status::Done) => "Done",
+                Field::Checkbox(true) => "true",
+                Field::Checkbox(false) => "false",
+            };
+            push_csv_field(&mut out, val);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Serialize a live Slack List to RFC 4180 CSV (`F-COLLAB-217`), resolving user IDs and

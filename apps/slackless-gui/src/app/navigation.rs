@@ -670,7 +670,7 @@ impl App {
         let Some(conv) = self.fixtures.conversation(&self.channel) else {
             return;
         };
-        let specs = tabs::derive(conv, self.fixtures.sample);
+        let specs = self.conversation_tab_specs(conv);
         if let Some(spec) = specs.into_iter().nth(index) {
             self.activate_tab(spec.action, cx);
         }

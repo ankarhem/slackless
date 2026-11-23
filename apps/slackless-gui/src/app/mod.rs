@@ -677,6 +677,8 @@ pub struct App {
     list_query: String,
     /// Active `(column_index, ascending)` sort for the native Slack Lists viewer.
     list_sort: Option<(usize, bool)>,
+    /// Interactive Block Kit widget state (selects, checkboxes, inputs) for App Home tabs.
+    app_home_kit: Entity<crate::blockkit::BlockKitState>,
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).
@@ -897,6 +899,7 @@ impl App {
                     .placeholder("Filter list items…")
                     .auto_grow(1, 1)
             });
+            let app_home_kit = cx.new(|_| crate::blockkit::BlockKitState::default());
             if fixtures.sample {
                 later.update(cx, |later, cx| later.seed(0, &fixtures, cx));
             }
@@ -1890,6 +1893,7 @@ impl App {
                 list_search,
                 list_query: String::new(),
                 list_sort: None,
+                app_home_kit,
                 fixture_bookmarks: HashMap::new(),
                 os: Rc::new(platform::current()),
                 badge: None,
@@ -2163,7 +2167,7 @@ impl Render for App {
             let column = column.child(tabs).children(bookmark_bar);
             match &self.tab {
                 ConversationTab::Home => {
-                    let view = self.app_home_view(cx);
+                    let view = self.app_home_view(window, cx);
                     column.child(div().flex_1().min_h_0().child(view))
                 }
                 // The Pins tab keeps the transcript under it; its panel is the right column.

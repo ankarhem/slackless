@@ -89,11 +89,19 @@ impl HuddlesView {
     pub fn show_local(&mut self, fixtures: &Fixtures, cx: &mut Context<Self>) {
         self.loading = false;
         self.huddles = huddle::fixture(fixtures)
-            .map(|huddle| RecentHuddle {
-                channel: huddle.channel,
-                ts: Ts::default(),
-                participants: huddle.participants,
-                live: true,
+            .map(|huddle| {
+                let ts = fixtures
+                    .messages
+                    .get(&huddle.channel)
+                    .and_then(|msgs| msgs.last())
+                    .map(|m| m.ts.clone())
+                    .unwrap_or_default();
+                RecentHuddle {
+                    channel: huddle.channel,
+                    ts,
+                    participants: huddle.participants,
+                    live: true,
+                }
             })
             .into_iter()
             .collect();
@@ -126,16 +134,15 @@ impl HuddlesView {
             .iter()
             .map(|user| self.fixtures.user_name(user))
             .collect();
-        let meta = if names.is_empty() {
-            format!("{} · {}", state_word(huddle.live), list_stamp(&huddle.ts))
-        } else {
-            format!(
-                "{} · {} · {}",
-                state_word(huddle.live),
-                names.join(", "),
-                list_stamp(&huddle.ts)
-            )
-        };
+        let stamp = list_stamp(&huddle.ts);
+        let mut parts = vec![state_word(huddle.live).to_owned()];
+        if !names.is_empty() {
+            parts.push(names.join(", "));
+        }
+        if !stamp.is_empty() {
+            parts.push(stamp);
+        }
+        let meta = parts.join(" · ");
         let open = huddle.channel.clone();
         let thread_target =
             (!huddle.ts.as_str().is_empty()).then(|| (huddle.channel.clone(), huddle.ts.clone()));
