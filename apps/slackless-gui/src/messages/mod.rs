@@ -1611,41 +1611,28 @@ fn transcript_row(
         }
     }
 
-    let gutter = if prefs.compact && !editing {
-        div()
-            .w(px(52.))
-            .flex_none()
-            .flex()
-            .items_start()
-            .justify_end()
-            .pt_0p5()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(stamp),
-            )
-            .into_any_element()
+    let grouped_hover_stamp = (!prefs.compact && grouped && !editing).then(|| stamp.clone());
+    let static_gutter = if prefs.compact && !editing {
+        Some(
+            div()
+                .w(px(52.))
+                .flex_none()
+                .flex()
+                .items_start()
+                .justify_end()
+                .pt_0p5()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(stamp),
+                )
+                .into_any_element(),
+        )
     } else if grouped && !editing {
-        // Slack shows a small hover-only timestamp in place of the avatar on grouped rows.
-        div()
-            .w(px(AVATAR_SIZE))
-            .flex_none()
-            .flex()
-            .items_start()
-            .justify_center()
-            .pt_0p5()
-            .opacity(0.)
-            .group_hover("msg", |slot| slot.opacity(1.))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(stamp),
-            )
-            .into_any_element()
+        None
     } else {
-        avatar_gutter(
+        Some(avatar_gutter(
             fixtures,
             message,
             &author_key,
@@ -1653,7 +1640,7 @@ fn transcript_row(
             &key,
             Some(&handler),
             cx,
-        )
+        ))
     };
 
     let set = ActionSet {
@@ -1667,76 +1654,98 @@ fn transcript_row(
     let saved_bg = theme.warning.opacity(0.08);
     let thread_open = !saved && store.open_thread.as_ref() == Some(&message.ts);
     let highlighted = store.highlighted.as_ref() == Some(&message.ts);
+    let active_row = store.active.as_ref() == Some(&message.ts);
+    let is_ephemeral = message.is_ephemeral;
     let thread_bg = crate::theme::thread_root(cx);
     let editing_bg = crate::theme::editing_row(cx);
+    let quick = fixtures.quick_reactions.clone();
     let menu_handler = handler.clone();
-    let card = div()
-        .id(SharedString::from(key.clone()))
-        .group("msg")
-        .relative()
-        .min_w_0()
-        .ml(px(-GUTTER))
-        .mr(px(-GUTTER))
-        .px(px(GUTTER))
-        .when(editing, |card| card.py_2().bg(editing_bg))
-        .when(!editing, |card| {
-            card.py_0p5()
-                .when(saved, |card| {
-                    card.bg(saved_bg).child(actions::saved_banner(cx))
-                })
-                .when(message.is_ephemeral, |card| {
-                    card.child(actions::ephemeral_banner(&key, Some(&handler), cx))
-                })
-                .when(highlighted, |card| card.bg(editing_bg))
-                .when(!highlighted && thread_open, |card| card.bg(thread_bg))
-                .when(
-                    !highlighted && !thread_open && store.active.as_ref() == Some(&message.ts),
-                    |card| card.bg(hover_bg),
-                )
-                .when(!saved && !highlighted && !thread_open, |card| {
-                    card.hover(|card| card.bg(hover_bg))
-                })
-        })
-        .child(
-            h_flex()
+    let row_key = key.clone();
+    let card = actions::HoverOverlay::new(SharedString::from(key.clone()), move |hover, _, cx| {
+        let revealed = hover.revealed(cx);
+        let gutter = match static_gutter {
+            Some(gutter) => gutter,
+            None => div()
+                .w(px(AVATAR_SIZE))
+                .flex_none()
+                .flex()
                 .items_start()
-                .gap_3()
-                .min_w_0()
-                .child(gutter)
-                .child(body),
-        )
-        .when(!editing, |card| {
-            card.child(actions::hover_toolbar(
-                &key,
-                &fixtures.quick_reactions,
-                set,
-                &handler,
-                "msg".into(),
-                cx,
-            ))
-        })
-        .on_hover({
-            let (this, ts) = (this.clone(), message.ts.clone());
-            move |hovered: &bool, _, cx| {
-                this.update(cx, |list, cx| {
-                    if *hovered {
-                        list.set_focused(&ts, cx);
-                    } else {
-                        list.clear_focused(&ts, cx);
-                    }
-                });
-            }
-        })
-        .context_menu(move |menu, window, cx| {
-            actions::actions_menu(
-                menu,
-                set,
-                &menu_handler,
-                actions::MenuOrigin::Context,
-                window,
-                cx,
+                .justify_center()
+                .pt_0p5()
+                .opacity(if revealed { 1. } else { 0. })
+                .group_hover("msg", |slot| slot.opacity(1.))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(grouped_hover_stamp.unwrap_or_default()),
+                )
+                .into_any_element(),
+        };
+        div()
+            .id(SharedString::from(row_key.clone()))
+            .group("msg")
+            .relative()
+            .min_w_0()
+            .ml(px(-GUTTER))
+            .mr(px(-GUTTER))
+            .px(px(GUTTER))
+            .when(editing, |card| card.py_2().bg(editing_bg))
+            .when(!editing, |card| {
+                card.py_0p5()
+                    .when(saved, |card| {
+                        card.bg(saved_bg).child(actions::saved_banner(cx))
+                    })
+                    .when(is_ephemeral, |card| {
+                        card.child(actions::ephemeral_banner(&row_key, Some(&handler), cx))
+                    })
+                    .when(highlighted, |card| card.bg(editing_bg))
+                    .when(!highlighted && thread_open, |card| card.bg(thread_bg))
+                    .when(!highlighted && !thread_open && active_row, |card| {
+                        card.bg(hover_bg)
+                    })
+                    .when(!saved && !highlighted && !thread_open && revealed, |card| {
+                        card.bg(hover_bg)
+                    })
+            })
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_3()
+                    .min_w_0()
+                    .child(gutter)
+                    .child(body),
             )
-        });
+            .when(!editing && revealed, |card| {
+                card.child(actions::hover_toolbar(
+                    &row_key, &quick, set, &handler, &hover, cx,
+                ))
+            })
+            .on_hover(hover.host_on_hover())
+            .context_menu(move |menu, window, cx| {
+                actions::actions_menu(
+                    menu,
+                    set,
+                    &menu_handler,
+                    actions::MenuOrigin::Context,
+                    window,
+                    cx,
+                )
+            })
+            .into_any_element()
+    })
+    .on_revealed({
+        let (this, ts) = (this.clone(), message.ts.clone());
+        move |revealed, _, cx| {
+            this.update(cx, |list, cx| {
+                if revealed {
+                    list.set_focused(&ts, cx);
+                } else {
+                    list.clear_focused(&ts, cx);
+                }
+            });
+        }
+    });
     row.child(card)
 }
 

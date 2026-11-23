@@ -987,53 +987,23 @@ fn card_view(
             let reactions = std::mem::take(&mut display.reactions);
             let chips = actions::reaction_chips(&key, &reactions, fixtures, Some(&handler), cx)
                 .map(|c| c.pl(px(48.)));
-            let toolbar = actions::hover_toolbar(
-                &key,
-                &fixtures.quick_reactions,
-                set,
-                &handler,
-                msg_group.clone(),
+            let row_body = message_row_linked(
+                fixtures,
+                &display,
+                Some(&handler),
+                Some(&links),
+                grouped,
                 cx,
-            )
-            // Keep the first row's bar inside the row so the section header never clips it.
-            .when(m_ix == 0 && !date_break, |bar| bar.top(px(3.)));
-            let menu_handler = handler.clone();
-
-            let mut item = v_flex()
-                .id(SharedString::from(key))
-                .group(msg_group.clone())
-                .relative()
-                .px_5()
-                .py_0p5()
-                .when(is_saved, |row| {
-                    row.bg(saved_bg).child(actions::saved_banner(cx))
-                })
-                .when(is_open_thread, |row| row.bg(thread_bg))
-                .when(!is_saved && !is_open_thread, |row| {
-                    row.hover(move |r| r.bg(hover_bg))
-                })
-                .child(message_row_linked(
-                    fixtures,
-                    &display,
-                    Some(&handler),
-                    Some(&links),
-                    grouped,
-                    cx,
-                ))
-                .children(chips)
-                .child(toolbar)
-                .context_menu(move |menu, window, cx| {
-                    actions::actions_menu(menu, set, &menu_handler, MenuOrigin::Context, window, cx)
-                });
+            );
             let ch = group.channel.clone();
             let ts = message.ts.clone();
             let view_for_thread = view.clone();
             let reply_group = SharedString::from(format!("unreads-{ix}-reply-{m_ix}"));
-            if let Some(bar) = reply_bar(
+            let reply_bar_el = reply_bar(
                 fixtures,
                 message,
                 ("unreads-thread-chip", ix * 1000 + m_ix),
-                msg_group,
+                msg_group.clone(),
                 reply_group,
                 move |_, cx| {
                     view_for_thread.update(cx, |_, cx| {
@@ -1044,10 +1014,51 @@ fn card_view(
                     });
                 },
                 cx,
-            ) {
-                // Align flush with `message_row_linked`'s body (36px avatar + 12px gap).
-                item = item.child(div().pl(px(48.)).child(bar));
-            }
+            )
+            // Align flush with `message_row_linked`'s body (36px avatar + 12px gap).
+            .map(|bar| div().pl(px(48.)).child(bar));
+            let quick = fixtures.quick_reactions.clone();
+            let menu_handler = handler.clone();
+            let row_key = key.clone();
+            let keep_inside = m_ix == 0 && !date_break;
+            let item = actions::HoverOverlay::new(SharedString::from(key), move |hover, _, cx| {
+                let revealed = hover.revealed(cx);
+                v_flex()
+                    .id(SharedString::from(row_key.clone()))
+                    .group(msg_group)
+                    .relative()
+                    .px_5()
+                    .py_0p5()
+                    .when(is_saved, |row| {
+                        row.bg(saved_bg).child(actions::saved_banner(cx))
+                    })
+                    .when(is_open_thread, |row| row.bg(thread_bg))
+                    .when(!is_saved && !is_open_thread && revealed, |row| {
+                        row.bg(hover_bg)
+                    })
+                    .child(row_body)
+                    .children(chips)
+                    .children(reply_bar_el)
+                    .when(revealed, |row| {
+                        row.child(
+                            actions::hover_toolbar(&row_key, &quick, set, &handler, &hover, cx)
+                                // Keep the first row's bar inside the row so the section header never clips it.
+                                .when(keep_inside, |bar| bar.top(px(3.))),
+                        )
+                    })
+                    .on_hover(hover.host_on_hover())
+                    .context_menu(move |menu, window, cx| {
+                        actions::actions_menu(
+                            menu,
+                            set,
+                            &menu_handler,
+                            MenuOrigin::Context,
+                            window,
+                            cx,
+                        )
+                    })
+                    .into_any_element()
+            });
             rows.push(item.into_any_element());
             prev_day = Some(day);
             prev_msg = Some(message);

@@ -1003,41 +1003,44 @@ impl ThreadPanel {
 
         // Straddling the row's top edge would cut the root's bar off at the panel's top, so
         // Slack keeps it inside the row, 3pt down.
-        let toolbar = actions::hover_toolbar(
-            &key,
-            &self.fixtures.quick_reactions,
-            set,
-            &handler,
-            row_group.clone(),
-            cx,
-        )
-        .when(is_root, |bar| bar.top(px(3.)));
-        let menu_handler = handler;
-        div()
-            .id(SharedString::from(key))
-            .group(row_group)
-            .relative()
-            .w_full()
-            .min_w_0()
-            .px_2()
-            .when(!grouped, |row| row.pt_1())
-            .pb_1()
-            .rounded_md()
-            .hover(|row| row.bg(hover_bg))
-            .when(saved, |row| row.child(actions::saved_banner(cx)))
-            .child(v_flex().min_w_0().child(card).children(chips))
-            .child(toolbar)
-            .context_menu(move |menu, window, cx| {
-                actions::actions_menu(
-                    menu,
-                    set,
-                    &menu_handler,
-                    actions::MenuOrigin::Context,
-                    window,
-                    cx,
-                )
-            })
-            .into_any_element()
+        let quick = self.fixtures.quick_reactions.clone();
+        let menu_handler = handler.clone();
+        let row_key = key.clone();
+        actions::HoverOverlay::new(SharedString::from(key), move |hover, _, cx| {
+            let revealed = hover.revealed(cx);
+            div()
+                .id(SharedString::from(row_key.clone()))
+                .group(row_group)
+                .relative()
+                .w_full()
+                .min_w_0()
+                .px_2()
+                .when(!grouped, |row| row.pt_1())
+                .pb_1()
+                .rounded_md()
+                .when(revealed, |row| row.bg(hover_bg))
+                .when(saved, |row| row.child(actions::saved_banner(cx)))
+                .child(v_flex().min_w_0().child(card).children(chips))
+                .when(revealed, |row| {
+                    row.child(
+                        actions::hover_toolbar(&row_key, &quick, set, &handler, &hover, cx)
+                            .when(is_root, |bar| bar.top(px(3.))),
+                    )
+                })
+                .on_hover(hover.host_on_hover())
+                .context_menu(move |menu, window, cx| {
+                    actions::actions_menu(
+                        menu,
+                        set,
+                        &menu_handler,
+                        actions::MenuOrigin::Context,
+                        window,
+                        cx,
+                    )
+                })
+                .into_any_element()
+        })
+        .into_any_element()
     }
 }
 

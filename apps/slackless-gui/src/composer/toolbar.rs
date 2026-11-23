@@ -563,48 +563,56 @@ impl Composer {
             theme.popover_foreground,
         );
         let gif_card = self.pending_gif.as_ref().map(|gif| {
-            div()
-                .id("staged-gif-card")
-                .group("staged-gif")
-                .relative()
-                .flex_none()
-                .size(px(62.))
-                .child(
-                    div()
-                        .size_full()
-                        .rounded_lg()
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(foreground.opacity(0.12))
-                        .bg(secondary)
-                        .child(
-                            crate::media::Picture::new(gif.preview_url.clone())
-                                .fit(ObjectFit::Cover)
-                                .radius(px(8.)),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("staged-gif-rm")
-                        .absolute()
-                        .top(px(-6.))
-                        .right(px(-6.))
-                        .size(px(20.))
-                        .rounded_full()
-                        .bg(popover)
-                        .border_1()
-                        .border_color(foreground.opacity(0.22))
-                        .shadow_sm()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .invisible()
-                        .group_hover("staged-gif", |el| el.visible())
-                        .tooltip(|window, cx| tip_view("Remove GIF", &[], window, cx))
-                        .child(Icon::new(IconName::X).size(px(12.)).text_color(popover_fg))
-                        .on_click(cx.listener(|this, _, _, cx| this.remove_gif(cx))),
-                )
+            let preview_url = gif.preview_url.clone();
+            let on_remove = cx.listener(|this, _, _, cx| this.remove_gif(cx));
+            crate::actions::HoverOverlay::new("staged-gif-card", move |hover, _, cx| {
+                let revealed = hover.revealed(cx);
+                div()
+                    .id("staged-gif-card")
+                    .relative()
+                    .flex_none()
+                    .size(px(62.))
+                    .child(
+                        div()
+                            .size_full()
+                            .rounded_lg()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(foreground.opacity(0.12))
+                            .bg(secondary)
+                            .child(
+                                crate::media::Picture::new(preview_url)
+                                    .fit(ObjectFit::Cover)
+                                    .radius(px(8.)),
+                            ),
+                    )
+                    .when(revealed, |card| {
+                        card.child(
+                            div()
+                                .id("staged-gif-rm")
+                                .absolute()
+                                .top(px(-6.))
+                                .right(px(-6.))
+                                .size(px(20.))
+                                .rounded_full()
+                                .bg(popover)
+                                .border_1()
+                                .border_color(foreground.opacity(0.22))
+                                .shadow_sm()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .occlude()
+                                .on_hover(hover.overlay_on_hover())
+                                .tooltip(|window, cx| tip_view("Remove GIF", &[], window, cx))
+                                .child(Icon::new(IconName::X).size(px(12.)).text_color(popover_fg))
+                                .on_click(on_remove),
+                        )
+                    })
+                    .on_hover(hover.host_on_hover())
+                    .into_any_element()
+            })
         });
         Some(
             h_flex()
