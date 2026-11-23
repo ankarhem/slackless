@@ -922,8 +922,9 @@ pub async fn run_huddle_invite(
     }
 }
 
-/// `huddle join <channel> [--muted] [--duration N] [--input NAME] [--output NAME]`:
+/// `huddle join <channel> [--muted] [--duration N] [--input NAME] [--output NAME] [--react EMOJI]`:
 /// join a live native Chime audio huddle from the terminal and leave cleanly on Ctrl+C or timeout.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_huddle_join(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -932,6 +933,7 @@ pub async fn run_huddle_join(
     duration: Option<u64>,
     input: Option<String>,
     output_dev: Option<String>,
+    react: Option<String>,
 ) -> Result<ExitCode> {
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
@@ -980,6 +982,7 @@ pub async fn run_huddle_join(
     let deadline =
         duration.map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
     let mut exit_code = ExitCode::SUCCESS;
+    let mut sent_react = false;
 
     loop {
         let timer_fut = async {
@@ -1027,6 +1030,18 @@ pub async fn run_huddle_join(
                                     .unwrap_or_default()
                             ),
                         );
+                        if snap.phase == slackless_core::huddle::HuddlePhase::Connected
+                            && !sent_react
+                        {
+                            if let Some(emoji) = &react {
+                                sent_react = true;
+                                handle.send(slackless_core::huddle::HuddleControl::SendReaction {
+                                    emoji: emoji.clone(),
+                                    kind: slackless_core::huddle::HuddleReactionKind::Standard,
+                                    emoji_url: None,
+                                });
+                            }
+                        }
                         if snap.phase == slackless_core::huddle::HuddlePhase::Failed {
                             exit_code = ExitCode::FAILURE;
                             break;
@@ -1035,11 +1050,20 @@ pub async fn run_huddle_join(
                             break;
                         }
                     }
+                    Some(slackless_core::huddle::HuddleUpdate::DataEvent(ev)) => {
+                        output::emit(
+                            ctx.json,
+                            &serde_json::json!({
+                                "event": "data",
+                                "detail": format!("{ev:?}"),
+                            }),
+                            &format!("huddle {display}\tdata\t{ev:?}\n"),
+                        );
+                    }
                     Some(
                         slackless_core::huddle::HuddleUpdate::AudioLevels(_)
                         | slackless_core::huddle::HuddleUpdate::VideoFrame { .. }
-                        | slackless_core::huddle::HuddleUpdate::VideoTileClosed(_)
-                        | slackless_core::huddle::HuddleUpdate::DataEvent(_),
+                        | slackless_core::huddle::HuddleUpdate::VideoTileClosed(_),
                     ) => {}
                     None => break,
                 }

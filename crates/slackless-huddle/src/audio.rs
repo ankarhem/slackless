@@ -728,6 +728,93 @@ fn compute_rms_interleaved(samples: &[f32], channels: usize) -> f32 {
     compute_rms_mono(&mono)
 }
 
+/// Pure-Rust gentle ambient lo-fi chord player for huddle jukebox / "music when alone"
+/// (`F-COLLAB-036`, `F-COLLAB-058`). Runs on its own OS thread so `cpal::Stream` stays off UI.
+pub struct AmbientMusicPlayer {
+    running: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AmbientMusicPlayer {
+    pub fn start(output_device: Option<String>) -> Result<Self> {
+        let running = Arc::new(AtomicBool::new(true));
+        let run_flag = Arc::clone(&running);
+        let worker = std::thread::Builder::new()
+            .name("slackless-huddle-music".to_owned())
+            .spawn(move || {
+                let Ok(device) = select_output_device(output_device.as_deref()) else {
+                    return;
+                };
+                let Ok(supported) = device.default_output_config() else {
+                    return;
+                };
+                let rate = supported.sample_rate().0 as f32;
+                let channels = supported.channels() as usize;
+                let config: StreamConfig = supported.into();
+                // Warm lo-fi 4-chord progression (Cmaj7 -> Am7 -> Fmaj7 -> G6)
+                const CHORDS: [[f32; 4]; 4] = [
+                    [261.63, 329.63, 392.00, 493.88],
+                    [220.00, 261.63, 329.63, 392.00],
+                    [174.61, 220.00, 261.63, 329.63],
+                    [196.00, 246.94, 293.66, 329.63],
+                ];
+                let mut sample_idx: u64 = 0;
+                let chord_samples = (rate * 3.5) as u64;
+                let stream = device.build_output_stream(
+                    &config,
+                    move |out: &mut [f32], _| {
+                        for frame in out.chunks_mut(channels) {
+                            let chord_ix = ((sample_idx / chord_samples) % 4) as usize;
+                            let pos_in_chord =
+                                (sample_idx % chord_samples) as f32 / chord_samples as f32;
+                            let env = (pos_in_chord * 8.0).min(1.0)
+                                * ((1.0 - pos_in_chord) * 8.0).min(1.0);
+                            let t = sample_idx as f32 / rate;
+                            let mut s = 0.0f32;
+                            for &hz in &CHORDS[chord_ix] {
+                                s += (2.0 * std::f32::consts::PI * hz * t).sin();
+                            }
+                            let sample = (s * 0.018 * env).clamp(-0.12, 0.12);
+                            for slot in frame {
+                                *slot = sample;
+                            }
+                            sample_idx = sample_idx.wrapping_add(1);
+                        }
+                    },
+                    |_| {},
+                    None,
+                );
+                let Ok(stream) = stream else {
+                    return;
+                };
+                if stream.play().is_err() {
+                    return;
+                }
+                while run_flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(80));
+                }
+            })
+            .map_err(|e| HuddleError::Audio(e.to_string()))?;
+        Ok(Self {
+            running,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for AmbientMusicPlayer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

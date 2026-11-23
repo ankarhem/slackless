@@ -810,6 +810,45 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<String>> + Send {
         async move { Ok(format!("https://app.slack.com/huddle/{channel}")) }
     }
+    /// Set or clear the live huddle topic (`screenhero.rooms.rename`).
+    fn rooms_rename(
+        &self,
+        _room_id: String,
+        _name: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Start AWS Transcribe live captions for an active huddle (`rooms.startTranscription`).
+    fn rooms_start_transcription(
+        &self,
+        _call_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Stop AWS Transcribe live captions for an active huddle (`rooms.stopTranscription`).
+    fn rooms_stop_transcription(
+        &self,
+        _call_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Respond to an incoming huddle invite (`rooms.inviteResponse`, e.g. `"decline"`).
+    fn rooms_invite_response(
+        &self,
+        _channel: ChannelId,
+        _room_id: String,
+        _response: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Update the active huddle's theme/background (`huddles.update`).
+    fn huddles_update_background(
+        &self,
+        _huddle_id: String,
+        _background_id: String,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
 }
 
 impl Backend for SlackApi {
@@ -1581,5 +1620,34 @@ impl Backend for SlackApi {
         Ok(SlackApi::rooms_get_link(self, &channel)
             .await?
             .unwrap_or_else(|| format!("https://app.slack.com/huddle/{channel}")))
+    }
+
+    async fn rooms_rename(&self, room_id: String, name: String) -> api::Result<()> {
+        SlackApi::rooms_rename(self, &room_id, &name).await
+    }
+
+    async fn rooms_start_transcription(&self, call_id: String) -> api::Result<()> {
+        SlackApi::rooms_start_transcription(self, &call_id).await
+    }
+
+    async fn rooms_stop_transcription(&self, call_id: String) -> api::Result<()> {
+        SlackApi::rooms_stop_transcription(self, &call_id).await
+    }
+
+    async fn rooms_invite_response(
+        &self,
+        channel: ChannelId,
+        room_id: String,
+        response: String,
+    ) -> api::Result<()> {
+        SlackApi::rooms_invite_response(self, &channel, &room_id, &response).await
+    }
+
+    async fn huddles_update_background(
+        &self,
+        huddle_id: String,
+        background_id: String,
+    ) -> api::Result<()> {
+        SlackApi::huddles_update_background(self, &huddle_id, &background_id).await
     }
 }

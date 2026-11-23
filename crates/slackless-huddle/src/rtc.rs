@@ -6,14 +6,16 @@
 //! - Full non-trickle SDP offer gathering
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine};
+use webrtc::api::media_engine::{
+    MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
+};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -24,9 +26,13 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::{FirEntry, FullIntraRequest};
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp_transceiver::rtp_codec::{
-    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability, RTPCodecType,
 };
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::{RTCPFeedback, RTCRtpTransceiverInit};
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -54,7 +60,9 @@ pub fn chime_setting_engine() -> SettingEngine {
     setting
 }
 
-/// Build the Chime-compatible `MediaEngine` (Opus 48kHz without RED, plus VP8 recv placeholder).
+/// Build the Chime-compatible `MediaEngine` matching official Slack's exact codec order, payload
+/// types, RFC 4588 RTX streams, RTCP feedback, and `sdes:mid` RTP header extensions on BOTH audio
+/// and video (required for BUNDLEd SFU tracks whose SSRCs arrive dynamically).
 pub fn chime_media_engine() -> Result<MediaEngine> {
     let mut m = MediaEngine::default();
     m.register_codec(
@@ -64,7 +72,10 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
                 clock_rate: 48_000,
                 channels: 2,
                 sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
-                rtcp_feedback: Vec::new(),
+                rtcp_feedback: vec![RTCPFeedback {
+                    typ: "transport-cc".to_owned(),
+                    parameter: String::new(),
+                }],
             },
             payload_type: 111,
             ..Default::default()
@@ -73,39 +84,110 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
     )
     .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
-    m.register_codec(
-        RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_owned(),
-                rtcp_feedback: Vec::new(),
+    let video_fb = || {
+        vec![
+            RTCPFeedback {
+                typ: "goog-remb".to_owned(),
+                parameter: String::new(),
             },
-            payload_type: 102,
-            ..Default::default()
-        },
-        RTPCodecType::Video,
-    )
-    .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+            RTCPFeedback {
+                typ: "transport-cc".to_owned(),
+                parameter: String::new(),
+            },
+            RTCPFeedback {
+                typ: "ccm".to_owned(),
+                parameter: "fir".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: String::new(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            },
+        ]
+    };
 
-    m.register_codec(
-        RTCRtpCodecParameters {
-            capability: RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_VP8.to_owned(),
-                clock_rate: 90_000,
-                channels: 0,
-                sdp_fmtp_line: String::new(),
-                rtcp_feedback: Vec::new(),
+    for (mime, pt, fmtp) in [
+        (MIME_TYPE_AV1, 45u8, ""),
+        (
+            MIME_TYPE_H264,
+            108u8,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+        ),
+        (MIME_TYPE_VP8, 96u8, ""),
+        (MIME_TYPE_VP9, 98u8, "profile-id=0"),
+    ] {
+        m.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: mime.to_owned(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line: fmtp.to_owned(),
+                    rtcp_feedback: video_fb(),
+                },
+                payload_type: pt,
+                ..Default::default()
             },
-            payload_type: 96,
-            ..Default::default()
-        },
-        RTPCodecType::Video,
-    )
-    .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+            RTPCodecType::Video,
+        )
+        .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+    }
+
+    for (primary, rtx_pt) in [(45u8, 46u8), (108, 109), (96, 97), (98, 99)] {
+        m.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: "video/rtx".to_owned(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line: format!("apt={primary}"),
+                    rtcp_feedback: Vec::new(),
+                },
+                payload_type: rtx_pt,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )
+        .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+    }
+
+    for (uri, kind) in [
+        ("urn:ietf:params:rtp-hdrext:sdes:mid", RTPCodecType::Audio),
+        ("urn:ietf:params:rtp-hdrext:sdes:mid", RTPCodecType::Video),
+        (
+            "urn:ietf:params:rtp-hdrext:ssrc-audio-level",
+            RTPCodecType::Audio,
+        ),
+        (
+            "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
+            RTPCodecType::Audio,
+        ),
+        (
+            "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time",
+            RTPCodecType::Video,
+        ),
+        (
+            "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+            RTPCodecType::Audio,
+        ),
+        (
+            "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01",
+            RTPCodecType::Video,
+        ),
+    ] {
+        m.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: uri.to_owned(),
+            },
+            kind,
+            None,
+        )
+        .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+    }
+
     Ok(m)
 }
 
@@ -113,7 +195,10 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
 #[derive(Debug, Clone)]
 pub struct InboundVideoPacket {
     pub ssrc: u32,
+    pub mid: String,
     pub track_id: String,
+    pub mime_type: String,
+    pub seq: u16,
     pub payload: Vec<u8>,
     pub marker: bool,
 }
@@ -188,14 +273,14 @@ impl ChimeRtcPeer {
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
-        // Local H.264 video track (shared by camera / screen share; inactive until frames flow).
+        // Local H.264 video track on mid 1 (official Slack camera slot).
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_H264.to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
                 sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"
                         .to_owned(),
                 rtcp_feedback: Vec::new(),
             },
@@ -212,7 +297,7 @@ impl ChimeRtcPeer {
         let rx_pkts = Arc::clone(&packets_received);
         let rx_bytes = Arc::clone(&bytes_received);
         let rx_total = Arc::clone(&total_packets_received);
-        pc.on_track(Box::new(move |track, _, _| {
+        pc.on_track(Box::new(move |track, _, transceiver| {
             let audio_tx = inbound_opus_tx.clone();
             let video_tx = inbound_video_tx.clone();
             let rx_pkts = Arc::clone(&rx_pkts);
@@ -236,6 +321,8 @@ impl ChimeRtcPeer {
                     RTPCodecType::Video => {
                         let ssrc = track.ssrc();
                         let track_id = track.id();
+                        let mime_type = track.codec().capability.mime_type;
+                        let mid = transceiver.mid().unwrap_or_default();
                         while let Ok((rtp, _)) = track.read_rtp().await {
                             if rtp.payload.is_empty() {
                                 continue;
@@ -246,7 +333,10 @@ impl ChimeRtcPeer {
                             if video_tx
                                 .send(InboundVideoPacket {
                                     ssrc,
+                                    mid: mid.to_string(),
                                     track_id: track_id.clone(),
+                                    mime_type: mime_type.clone(),
+                                    seq: rtp.header.sequence_number,
                                     payload: rtp.payload.to_vec(),
                                     marker: rtp.header.marker,
                                 })
@@ -277,6 +367,83 @@ impl ChimeRtcPeer {
             total_packets_sent: Arc::new(AtomicU64::new(0)),
             total_packets_received,
         })
+    }
+
+    /// Create a `#content` sender PeerConnection (identical media engine & SRTP profile, audio on
+    /// mid 0 and H.264 content video on mid 1).
+    pub async fn new_content_sender(
+        turn: &SdkTurnCredentials,
+        inbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
+        inbound_video_tx: mpsc::UnboundedSender<InboundVideoPacket>,
+        state_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
+    ) -> Result<Self> {
+        Self::new(turn, inbound_opus_tx, inbound_video_tx, state_tx).await
+    }
+
+    /// Ensure at least `count` dedicated `Recvonly` video transceivers exist AFTER the mid-1
+    /// camera slot (matching official Slack / Chime SFU expectations for subscribing to remote
+    /// cameras and `#content` screen shares), then return the freshly gathered offer SDP and the
+    /// assigned `mid` strings for those receive transceivers.
+    pub async fn prepare_video_receive_offer(&self, count: usize) -> Result<(String, Vec<String>)> {
+        let existing_video = self
+            .pc
+            .get_transceivers()
+            .await
+            .into_iter()
+            .filter(|t| t.kind() == RTPCodecType::Video)
+            .count();
+        // Transceiver 0 of video is mid 1 (local camera); receive slots start at index 1 (mid 2+).
+        let needed_total = 1 + count;
+        for _ in existing_video..needed_total {
+            self.pc
+                .add_transceiver_from_kind(
+                    RTPCodecType::Video,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Recvonly,
+                        send_encodings: Vec::new(),
+                    }),
+                )
+                .await
+                .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+        }
+        let offer = self.create_gathered_offer().await?;
+        let mids: Vec<String> = self
+            .pc
+            .get_transceivers()
+            .await
+            .into_iter()
+            .filter(|t| t.kind() == RTPCodecType::Video)
+            .skip(1)
+            .take(count)
+            .enumerate()
+            .map(|(ix, t)| {
+                t.mid()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| (ix + 2).to_string())
+            })
+            .collect();
+        Ok((offer, mids))
+    }
+
+    /// Send RTCP PLI + FIR to request an immediate keyframe for `media_ssrc` (prevents frozen
+    /// screen shares or cameras after packet loss).
+    pub async fn request_keyframe(&self, media_ssrc: u32) {
+        static FIR_SEQ: AtomicU8 = AtomicU8::new(0);
+        let pli = PictureLossIndication {
+            sender_ssrc: 0,
+            media_ssrc,
+        };
+        let fir = FullIntraRequest {
+            sender_ssrc: 0,
+            media_ssrc,
+            fir: vec![FirEntry {
+                ssrc: media_ssrc,
+                sequence_number: FIR_SEQ.fetch_add(1, Ordering::Relaxed),
+            }],
+        };
+        let pkts: Vec<Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>> =
+            vec![Box::new(pli), Box::new(fir)];
+        let _ = self.pc.write_rtcp(&pkts).await;
     }
 
     /// Create and fully gather a non-trickle SDP offer containing the relay candidate.

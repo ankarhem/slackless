@@ -395,6 +395,8 @@ pub struct Settings {
     pub huddle_reaction_animations: bool,
     /// Automatically enable live captions overlay when joining a huddle (`F-COLLAB-054`).
     pub huddle_auto_captions: bool,
+    /// Play gentle ambient music when waiting alone in a huddle (`F-COLLAB-058`).
+    pub huddle_music_when_alone: bool,
 }
 
 /// Active rendering preferences cached as a GPUI global so every message list, thread panel,
@@ -584,6 +586,7 @@ impl Default for Settings {
             huddle_sounds: true,
             huddle_reaction_animations: true,
             huddle_auto_captions: false,
+            huddle_music_when_alone: false,
         }
     }
 }
@@ -2625,6 +2628,12 @@ impl Preferences {
                 "prefs-huddle-captions",
                 "Automatically enable live captions when joining",
                 |s| &mut s.huddle_auto_captions,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-music",
+                "Play ambient music while waiting alone in a huddle",
+                |s| &mut s.huddle_music_when_alone,
                 cx,
             ));
 

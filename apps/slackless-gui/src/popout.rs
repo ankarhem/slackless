@@ -5,8 +5,8 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
@@ -18,10 +18,11 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     Anchor, App, AppContext as _, Bounds, ClipboardItem, Context, DisplayId, Edges, Entity,
-    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
-    ParentElement as _, Pixels, Point, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions, anchored, deferred, div, point, px, size,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Point, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions, anchored, canvas, deferred,
+    div, hsla, point, px, size,
 };
 use gpui_kit::open_window;
 use slackless_core::api::MessageContent;
@@ -177,7 +178,14 @@ pub struct PopoutWindow {
     huddle_devices_open: bool,
     huddle_share_open: bool,
     huddle_reactions_open: bool,
+    huddle_theme_open: bool,
     huddle_stage_expanded: bool,
+    huddle_draw_mode: bool,
+    huddle_draw_hue: i32,
+    huddle_drawing_active: bool,
+    huddle_draw_last_pt: Option<(f64, f64)>,
+    huddle_stage_bounds: Arc<Mutex<Bounds<Pixels>>>,
+    huddle_focused_screen: Option<usize>,
     huddle_topic_editing: Option<Entity<TextareaState>>,
     huddle_devices: slackless_core::huddle::AudioDevices,
     huddle_screens: Vec<slackless_core::huddle::ScreenSource>,
@@ -382,7 +390,14 @@ impl PopoutWindow {
             huddle_devices_open: false,
             huddle_share_open: false,
             huddle_reactions_open: false,
+            huddle_theme_open: false,
             huddle_stage_expanded: false,
+            huddle_draw_mode: false,
+            huddle_draw_hue: 0,
+            huddle_drawing_active: false,
+            huddle_draw_last_pt: None,
+            huddle_stage_bounds: Arc::new(Mutex::new(Bounds::default())),
+            huddle_focused_screen: None,
             huddle_topic_editing: None,
             huddle_devices: slackless_core::huddle::AudioDevices::default(),
             huddle_screens: Vec::new(),
@@ -932,10 +947,48 @@ impl PopoutWindow {
         });
 
         let send_copy = self.send.clone();
+        let send_notes = self.send.clone();
         let copy_ch = channel.clone();
+        let notes_ch = channel.clone();
         let thread_ch = channel.clone();
         let thread_ts = snap.thread_root_ts.clone();
         let canvas_id = snap.canvas_file_id.clone();
+        let theme_tint = huddle_background_tint(snap.background_id.as_deref());
+
+        let notes_btn = if let Some(fid) = canvas_id {
+            Button::new("popout-huddle-canvas")
+                .outline()
+                .with_size(Size::Small)
+                .icon(IconName::FileText)
+                .label("Notes")
+                .on_click(move |_, _, cx| {
+                    on_open_canvas(fid.clone(), cx);
+                })
+        } else {
+            let topic_title = snap
+                .topic
+                .clone()
+                .map(|t| format!("Huddle notes: {t}"))
+                .unwrap_or_else(|| "Huddle notes".to_owned());
+            Button::new("popout-huddle-canvas-new")
+                .outline()
+                .with_size(Size::Small)
+                .icon(IconName::FileText)
+                .label("New notes")
+                .on_click(move |_, window, cx| {
+                    (send_notes)(Command::CreateCanvas {
+                        title: topic_title.clone(),
+                        markdown: "# Huddle notes\n\n- ".to_owned(),
+                        channel: Some(notes_ch.clone()),
+                    });
+                    actions::notify(
+                        "Creating huddle notes",
+                        "Opening a shared canvas for this huddle.",
+                        window,
+                        cx,
+                    );
+                })
+        };
 
         let mut body = v_flex()
             .id("popout-huddle-body")
@@ -980,18 +1033,7 @@ impl PopoutWindow {
                                 );
                             }),
                     )
-                    .when_some(canvas_id, |row, fid| {
-                        row.child(
-                            Button::new("popout-huddle-canvas")
-                                .outline()
-                                .with_size(Size::Small)
-                                .icon(IconName::FileText)
-                                .label("Notes")
-                                .on_click(move |_, _, cx| {
-                                    on_open_canvas(fid.clone(), cx);
-                                }),
-                        )
-                    })
+                    .child(notes_btn)
                     .child(
                         Button::new("popout-huddle-copy-link")
                             .ghost()
@@ -1047,7 +1089,10 @@ impl PopoutWindow {
             body = body.child(self.render_huddle_share_panel(snap.share_source_id.as_deref(), cx));
         }
         if self.huddle_reactions_open {
-            body = body.child(self.render_huddle_reactions_panel(cx));
+            body = body.child(self.render_huddle_reactions_panel(&snap, cx));
+        }
+        if self.huddle_theme_open {
+            body = body.child(self.render_huddle_theme_panel(snap.background_id.as_deref(), cx));
         }
         if self.huddle_invite_open {
             body = body.child(self.render_huddle_invite_panel(&channel, &people, cx));
@@ -1064,6 +1109,7 @@ impl PopoutWindow {
             .id("popout-huddle-root")
             .flex_1()
             .min_h_0()
+            .when_some(theme_tint, |el, tint| el.bg(tint))
             .child(body)
             .child(self.render_huddle_controls(&snap, cx))
     }
@@ -1165,25 +1211,34 @@ impl PopoutWindow {
         state: &crate::huddle_dock::HuddleViewState,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
-        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
-        use slackless_core::huddle::VideoTileKey;
+        use slackless_core::huddle::{HuddleDrawMessage, VideoTileKey};
 
-        let active_screen = state
-            .video_frames
-            .iter()
-            .find_map(|(k, v)| match k {
-                VideoTileKey::RemoteScreen(uid) => Some((
+        let mut screens: Vec<(String, String, Arc<gpui_kit::gpui::RenderImage>)> = Vec::new();
+        for (k, v) in &state.video_frames {
+            if let VideoTileKey::RemoteScreen(uid) = k {
+                screens.push((
+                    uid.to_string(),
                     format!("{} is sharing their screen", self.fixtures.user_name(uid)),
                     v.clone(),
-                )),
-                _ => None,
-            })
-            .or_else(|| {
-                state
-                    .video_frames
-                    .get(&VideoTileKey::LocalScreen)
-                    .map(|v| ("You are sharing your screen".to_owned(), v.clone()))
-            })?;
+                ));
+            }
+        }
+        screens.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(v) = state.video_frames.get(&VideoTileKey::LocalScreen) {
+            let local_item = if !state.session.attendee_id.is_empty() {
+                state.session.attendee_id.clone()
+            } else {
+                self.fixtures.self_user.to_string()
+            };
+            screens.push((
+                local_item,
+                "You are sharing your screen".to_owned(),
+                v.clone(),
+            ));
+        }
+        if screens.is_empty() {
+            return None;
+        }
 
         let theme = cx.theme();
         let (border, card_bg, muted) = (theme.border, theme.muted, theme.muted_foreground);
@@ -1192,6 +1247,135 @@ impl PopoutWindow {
         } else {
             px(270.)
         };
+        let focused = self.huddle_focused_screen.filter(|&i| i < screens.len());
+        let primary_item_id = screens
+            .get(focused.unwrap_or(0))
+            .map(|s| s.0.clone())
+            .unwrap_or_default();
+        let header_title = if let Some(ix) = focused {
+            screens[ix].1.clone()
+        } else if screens.len() > 1 {
+            format!("{} screens shared side-by-side", screens.len())
+        } else {
+            screens[0].1.clone()
+        };
+
+        const HUES: [(i32, &str); 6] = [
+            (0, "Red"),
+            (35, "Orange"),
+            (55, "Yellow"),
+            (135, "Green"),
+            (210, "Blue"),
+            (285, "Purple"),
+        ];
+
+        let draw_btn = {
+            let item = primary_item_id.clone();
+            let hue = self.huddle_draw_hue;
+            let b = Button::new("popout-huddle-stage-draw")
+                .with_size(Size::XSmall)
+                .icon(IconName::Pencil)
+                .label(if self.huddle_draw_mode {
+                    "Drawing"
+                } else {
+                    "Draw"
+                })
+                .tooltip("Draw on the shared screen (visible to all Slack participants)")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.huddle_draw_mode = !this.huddle_draw_mode;
+                    this.huddle_drawing_active = false;
+                    this.huddle_draw_last_pt = None;
+                    if this.huddle_draw_mode {
+                        let msg = HuddleDrawMessage::ChangeHue {
+                            item_id: item.clone(),
+                            hue,
+                        };
+                        (this.send)(Command::SendHuddleDraw(msg.clone()));
+                        this.apply_local_draw(msg, cx);
+                    }
+                    cx.notify();
+                }));
+            if self.huddle_draw_mode {
+                b.primary()
+            } else {
+                b.ghost()
+            }
+        };
+
+        let swatches = self.huddle_draw_mode.then(|| {
+            h_flex()
+                .items_center()
+                .gap_1()
+                .children(HUES.iter().enumerate().map(|(ix, &(hue, _label))| {
+                    let selected = self.huddle_draw_hue == hue;
+                    let item = primary_item_id.clone();
+                    div()
+                        .id(("popout-draw-hue", ix))
+                        .size(px(14.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(hsla(hue as f32 / 360.0, 0.88, 0.54, 1.0))
+                        .border_2()
+                        .border_color(if selected {
+                            gpui_kit::gpui::white()
+                        } else {
+                            border
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.huddle_draw_hue = hue;
+                            let msg = HuddleDrawMessage::ChangeHue {
+                                item_id: item.clone(),
+                                hue,
+                            };
+                            (this.send)(Command::SendHuddleDraw(msg.clone()));
+                            this.apply_local_draw(msg, cx);
+                            cx.notify();
+                        }))
+                }))
+        });
+
+        let screen_tabs = (screens.len() > 1).then(|| {
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new("popout-huddle-split-all")
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .label(if focused.is_none() {
+                            "✓ Split"
+                        } else {
+                            "Split"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.huddle_focused_screen = None;
+                            cx.notify();
+                        })),
+                )
+                .children(screens.iter().enumerate().map(|(ix, (_, lbl, _))| {
+                    let is_f = focused == Some(ix);
+                    let short = lbl
+                        .split(" is ")
+                        .next()
+                        .unwrap_or("Screen")
+                        .replace("You are sharing your screen", "You");
+                    Button::new(("popout-huddle-screen-tab", ix))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .label(if is_f { format!("✓ {short}") } else { short })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.huddle_focused_screen = Some(ix);
+                            cx.notify();
+                        }))
+                }))
+        });
+
+        let visible_screens: Vec<(String, String, Arc<gpui_kit::gpui::RenderImage>)> =
+            if let Some(ix) = focused {
+                vec![screens[ix].clone()]
+            } else {
+                screens
+            };
 
         Some(
             v_flex()
@@ -1205,14 +1389,19 @@ impl PopoutWindow {
                 .child(
                     h_flex()
                         .items_center()
-                        .justify_between()
+                        .flex_wrap()
+                        .gap_1p5()
                         .child(
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(muted)
-                                .child(active_screen.0),
+                                .child(header_title),
                         )
+                        .children(screen_tabs)
+                        .child(div().flex_1())
+                        .children(swatches)
+                        .child(draw_btn)
                         .child(
                             Button::new("popout-huddle-stage-expand")
                                 .ghost()
@@ -1228,21 +1417,221 @@ impl PopoutWindow {
                                 })),
                         ),
                 )
-                .child(
-                    div()
-                        .w_full()
-                        .h(stage_h)
-                        .rounded_lg()
-                        .overflow_hidden()
-                        .bg(gpui_kit::gpui::black())
-                        .child(
-                            img(active_screen.1)
-                                .w_full()
-                                .h_full()
-                                .object_fit(ObjectFit::Contain),
-                        ),
-                ),
+                .child(h_flex().w_full().gap_2().children(
+                    visible_screens.into_iter().enumerate().map(
+                        |(ix, (item_id, _lbl, img_frame))| {
+                            self.render_huddle_screen_pane(
+                                ix, item_id, img_frame, stage_h, state, cx,
+                            )
+                        },
+                    ),
+                )),
         )
+    }
+
+    fn apply_local_draw(
+        &self,
+        message: slackless_core::huddle::HuddleDrawMessage,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(dock) = self.huddle_dock_entity() {
+            let me = self.fixtures.self_user.clone();
+            dock.update(cx, |d, cx| {
+                d.apply_data_event(
+                    &slackless_core::huddle::HuddleDataEvent::Draw {
+                        user: me,
+                        message,
+                        at_ms: 0,
+                    },
+                    cx,
+                );
+            });
+        }
+    }
+
+    fn render_huddle_screen_pane(
+        &self,
+        pane_ix: usize,
+        item_id: String,
+        img_frame: Arc<gpui_kit::gpui::RenderImage>,
+        stage_h: Pixels,
+        state: &crate::huddle_dock::HuddleViewState,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
+        use slackless_core::huddle::HuddleDrawMessage;
+
+        let filter_id = item_id.clone();
+        let strokes: Vec<_> = state
+            .draw_strokes
+            .iter()
+            .filter(|s| s.item_id.is_empty() || s.item_id == filter_id || pane_ix == 0)
+            .cloned()
+            .collect();
+        let cursors: Vec<_> = state
+            .draw_cursors
+            .values()
+            .filter(|c| c.item_id.is_empty() || c.item_id == filter_id || pane_ix == 0)
+            .cloned()
+            .collect();
+        let bounds_cell = Arc::clone(&self.huddle_stage_bounds);
+        let draw_overlay = canvas(
+            move |bounds, _, _| {
+                if pane_ix == 0 {
+                    if let Ok(mut guard) = bounds_cell.lock() {
+                        *guard = bounds;
+                    }
+                }
+            },
+            move |bounds, _, window, _| {
+                let left: f32 = bounds.origin.x.into();
+                let top: f32 = bounds.origin.y.into();
+                let width: f32 = bounds.size.width.into();
+                let height: f32 = bounds.size.height.into();
+                if width <= 1.0 || height <= 1.0 {
+                    return;
+                }
+                let to_pt = |[nx, ny]: [f64; 2]| {
+                    point(px(left + nx as f32 * width), px(top + ny as f32 * height))
+                };
+                for stroke in &strokes {
+                    if stroke.segments.is_empty() {
+                        continue;
+                    }
+                    let color = hsla(
+                        (stroke.hue.rem_euclid(360)) as f32 / 360.0,
+                        0.88,
+                        0.56,
+                        0.92,
+                    );
+                    let mut path = PathBuilder::stroke(px(3.5));
+                    for (ix, seg) in stroke.segments.iter().enumerate() {
+                        if ix == 0 {
+                            path.move_to(to_pt(seg.a));
+                        }
+                        path.cubic_bezier_to(to_pt(seg.d), to_pt(seg.b), to_pt(seg.c));
+                    }
+                    if let Ok(built) = path.build() {
+                        window.paint_path(built, color);
+                    }
+                }
+                for cur in &cursors {
+                    let color = hsla((cur.hue.rem_euclid(360)) as f32 / 360.0, 0.9, 0.58, 0.95);
+                    let center = to_pt([cur.x, cur.y]);
+                    let r = px(6.);
+                    let mut dot = PathBuilder::fill();
+                    dot.move_to(point(center.x - r, center.y));
+                    dot.line_to(point(center.x, center.y - r));
+                    dot.line_to(point(center.x + r, center.y));
+                    dot.line_to(point(center.x, center.y + r));
+                    dot.close();
+                    if let Ok(built) = dot.build() {
+                        window.paint_path(built, color);
+                    }
+                }
+            },
+        )
+        .size_full();
+
+        let item_down = item_id.clone();
+        let item_move = item_id.clone();
+        let item_up = item_id;
+
+        let mut pane = div()
+            .id(("popout-huddle-stage-pane", pane_ix))
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h(stage_h)
+            .rounded_lg()
+            .overflow_hidden()
+            .bg(gpui_kit::gpui::black())
+            .child(
+                img(img_frame)
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Contain),
+            )
+            .child(div().absolute().inset_0().child(draw_overlay));
+
+        if self.huddle_draw_mode && pane_ix == 0 {
+            pane = pane
+                .cursor_crosshair()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        let Some(pt) = this.normalize_stage_point(ev.position) else {
+                            return;
+                        };
+                        this.huddle_drawing_active = true;
+                        this.huddle_draw_last_pt = Some(pt);
+                        let hue_msg = HuddleDrawMessage::ChangeHue {
+                            item_id: item_down.clone(),
+                            hue: this.huddle_draw_hue,
+                        };
+                        (this.send)(Command::SendHuddleDraw(hue_msg.clone()));
+                        this.apply_local_draw(hue_msg, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                    let Some(pt) = this.normalize_stage_point(ev.position) else {
+                        return;
+                    };
+                    if this.huddle_drawing_active {
+                        if let Some(prev) = this.huddle_draw_last_pt {
+                            let dx = pt.0 - prev.0;
+                            let dy = pt.1 - prev.1;
+                            if dx * dx + dy * dy > 0.00004 {
+                                let msg = HuddleDrawMessage::New {
+                                    item_id: item_move.clone(),
+                                    segment: make_linear_segment(prev, pt),
+                                };
+                                this.huddle_draw_last_pt = Some(pt);
+                                (this.send)(Command::SendHuddleDraw(msg.clone()));
+                                this.apply_local_draw(msg, cx);
+                            }
+                        }
+                    } else {
+                        let pos_msg = HuddleDrawMessage::Position {
+                            item_id: item_move.clone(),
+                            x: pt.0,
+                            y: pt.1,
+                        };
+                        (this.send)(Command::SendHuddleDraw(pos_msg.clone()));
+                        this.apply_local_draw(pos_msg, cx);
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &MouseUpEvent, _, cx| {
+                        if this.huddle_drawing_active {
+                            this.huddle_drawing_active = false;
+                            this.huddle_draw_last_pt = None;
+                            let end_msg = HuddleDrawMessage::End {
+                                item_id: item_up.clone(),
+                            };
+                            (this.send)(Command::SendHuddleDraw(end_msg.clone()));
+                            this.apply_local_draw(end_msg, cx);
+                        }
+                    }),
+                );
+        }
+        pane
+    }
+
+    fn normalize_stage_point(&self, pos: Point<Pixels>) -> Option<(f64, f64)> {
+        let bounds = *self.huddle_stage_bounds.lock().ok()?;
+        let w: f32 = bounds.size.width.into();
+        let h: f32 = bounds.size.height.into();
+        if w <= 1.0 || h <= 1.0 {
+            return None;
+        }
+        let x: f32 = (pos.x - bounds.origin.x).into();
+        let y: f32 = (pos.y - bounds.origin.y).into();
+        Some((
+            (x / w).clamp(0.0, 1.0) as f64,
+            (y / h).clamp(0.0, 1.0) as f64,
+        ))
     }
 
     fn render_huddle_tiles(
@@ -1284,7 +1673,11 @@ impl PopoutWindow {
                 } else {
                     state.levels.muted_peers.contains(uid)
                 };
-                let hand_up = state.raised_hands.contains(uid);
+                let badge_glyph = state
+                    .sticky_emojis
+                    .get(uid)
+                    .map(|s| sticky_emoji_glyph(s).to_owned())
+                    .or_else(|| state.raised_hands.contains(uid).then(|| "✋".to_owned()));
                 let video_frame = if is_self {
                     state.video_frames.get(&VideoTileKey::LocalCamera).cloned()
                 } else {
@@ -1318,7 +1711,7 @@ impl PopoutWindow {
                             .overflow_hidden()
                             .bg(gpui_kit::gpui::black())
                             .child(img(frame).w_full().h_full().object_fit(ObjectFit::Cover))
-                            .when(hand_up, |el| {
+                            .when_some(badge_glyph, |el, glyph| {
                                 el.child(
                                     div()
                                         .absolute()
@@ -1329,7 +1722,7 @@ impl PopoutWindow {
                                         .rounded_full()
                                         .bg(bg.opacity(0.9))
                                         .text_xs()
-                                        .child("✋"),
+                                        .child(glyph),
                                 )
                             })
                             .when(is_muted, |el| {
@@ -1355,7 +1748,7 @@ impl PopoutWindow {
                         div()
                             .relative()
                             .child(crate::avatars::user_chip(&self.fixtures, uid, 64.))
-                            .when(hand_up, |el| {
+                            .when_some(badge_glyph, |el, glyph| {
                                 el.child(
                                     div()
                                         .absolute()
@@ -1367,7 +1760,7 @@ impl PopoutWindow {
                                         .border_1()
                                         .border_color(border)
                                         .text_xs()
-                                        .child("✋"),
+                                        .child(glyph),
                                 )
                             })
                             .when(is_muted, |el| {
@@ -1413,21 +1806,66 @@ impl PopoutWindow {
         state: &crate::huddle_dock::HuddleViewState,
         cx: &Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
+        let has_effect = state.active_effect.is_some();
         let has_reactions = !state.reactions.is_empty();
         let show_captions = state.session.captions_enabled || !state.captions.is_empty();
-        if !has_reactions && !show_captions {
+        if !has_effect && !has_reactions && !show_captions {
             return None;
         }
         let theme = cx.theme();
-        let (border, card_bg, muted) = (theme.border, theme.muted, theme.muted_foreground);
+        let (border, card_bg, muted, accent) = (
+            theme.border,
+            theme.muted,
+            theme.muted_foreground,
+            theme.primary,
+        );
         let mut col = v_flex().gap_2();
+        if let Some((uid, effect_name, _)) = &state.active_effect {
+            let who = self.fixtures.user_name(uid).to_owned();
+            let (glyph, label) = effect_label(effect_name);
+            col = col.child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_center()
+                    .rounded_xl()
+                    .bg(accent.opacity(0.16))
+                    .border_1()
+                    .border_color(accent.opacity(0.5))
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!(
+                        "{glyph} {glyph} {who} triggered {label}! {glyph} {glyph}"
+                    )),
+            );
+        }
         if has_reactions {
+            // Stack identical emoji reactions with live count (`👍 ×3 · Alice, Bob`).
+            let mut stacked: Vec<(String, usize, Vec<String>)> = Vec::new();
+            for entry in &state.reactions {
+                let who = self.fixtures.user_name(&entry.user).to_owned();
+                if let Some(slot) = stacked.iter_mut().find(|(em, _, _)| *em == entry.emoji) {
+                    slot.1 += 1;
+                    if !slot.2.contains(&who) {
+                        slot.2.push(who);
+                    }
+                } else {
+                    stacked.push((entry.emoji.clone(), 1, vec![who]));
+                }
+            }
             col = col.child(
                 h_flex()
                     .flex_wrap()
                     .gap_1p5()
-                    .children(state.reactions.iter().map(|(uid, emoji, _)| {
-                        let who = self.fixtures.user_name(uid).to_owned();
+                    .children(stacked.into_iter().map(|(emoji, count, names)| {
+                        let glyph = sticky_emoji_glyph(&emoji);
+                        let label = if count > 1 {
+                            format!("{glyph} ×{count}")
+                        } else {
+                            glyph.to_owned()
+                        };
                         h_flex()
                             .px_2()
                             .py_0p5()
@@ -1437,8 +1875,8 @@ impl PopoutWindow {
                             .border_1()
                             .border_color(border)
                             .text_xs()
-                            .child(emoji.clone())
-                            .child(div().text_color(muted).child(who))
+                            .child(label)
+                            .child(div().text_color(muted).child(names.join(", ")))
                     })),
             );
         }
@@ -1461,12 +1899,17 @@ impl PopoutWindow {
                 cap_box.child(
                     div()
                         .text_color(muted)
-                        .child("Listening for peer caption transcripts…"),
+                        .child("Listening for live speech transcripts…"),
                 )
             } else {
-                cap_box.children(state.captions.iter().map(|(uid, text)| {
+                cap_box.children(state.captions.iter().map(|(uid, text, is_partial)| {
                     let who = self.fixtures.user_name(uid).to_owned();
-                    div().child(format!("{who}: {text}"))
+                    let row = div().child(format!("{who}: {text}"));
+                    if *is_partial {
+                        row.text_color(muted)
+                    } else {
+                        row
+                    }
                 }))
             };
             col = col.child(cap_box);
@@ -1562,45 +2005,226 @@ impl PopoutWindow {
             })
     }
 
-    fn render_huddle_reactions_panel(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
-        const QUICK: [&str; 8] = ["👍", "🎉", "❤️", "😂", "👏", "🔥", "👀", "🙌"];
+    fn render_huddle_reactions_panel(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use slackless_core::huddle::{HuddleDataEvent, HuddleReactionKind};
+
+        const QUICK: [(&str, &str); 8] = [
+            ("👍", "+1"),
+            ("🎉", "tada"),
+            ("❤️", "heart"),
+            ("😂", "joy"),
+            ("👏", "clap"),
+            ("🔥", "fire"),
+            ("👀", "eyes"),
+            ("🙌", "raised_hands"),
+        ];
+        const EFFECTS: [(&str, &str, &str); 6] = [
+            ("🎉", "Confetti", "confetti"),
+            ("💖", "Hearts", "hearts"),
+            ("👏", "Applause", "clap"),
+            ("✨", "Sparkles", "sparkles"),
+            ("🚀", "Rocket", "rocket"),
+            ("🏆", "Trophy", "trophy"),
+        ];
+        const STICKY: [(&str, &str, &str); 4] = [
+            ("✋", "Hand", "raised_hand"),
+            ("☕", "Coffee", "coffee"),
+            ("🎧", "BRB", "headphones"),
+            ("✅", "Ready", "white_check_mark"),
+        ];
+
         let theme = cx.theme();
-        let (border, card_bg) = (theme.border, theme.muted);
+        let (border, card_bg, muted) = (theme.border, theme.muted, theme.muted_foreground);
         let send = self.send.clone();
-        h_flex()
-            .p_2()
-            .gap_1p5()
+        let active_sticky = snap.sticky_emoji.clone();
+
+        v_flex()
+            .p_2p5()
+            .gap_2()
             .rounded_lg()
             .border_1()
             .border_color(border)
             .bg(card_bg)
-            .children(QUICK.iter().enumerate().map(|(ix, emoji)| {
-                let em = (*emoji).to_owned();
-                let send_em = send.clone();
-                Button::new(("popout-huddle-react", ix))
-                    .ghost()
-                    .with_size(Size::Small)
-                    .label(*emoji)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        (send_em)(Command::SendHuddleReaction(em.clone()));
-                        if this.fixtures.sample {
-                            if let Some(dock) = this.huddle_dock_entity() {
-                                let me = this.fixtures.self_user.clone();
-                                dock.update(cx, |d, cx| {
-                                    d.apply_data_event(
-                                        &slackless_core::huddle::HuddleDataEvent::Reaction {
-                                            user: me,
-                                            emoji: em.clone(),
-                                            at_ms: 0,
-                                        },
-                                        cx,
-                                    );
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .items_center()
+                    .child(div().text_xs().text_color(muted).mr_1().child("React"))
+                    .children(QUICK.iter().enumerate().map(|(ix, &(glyph, code))| {
+                        let em = code.to_owned();
+                        let send_em = send.clone();
+                        Button::new(("popout-huddle-react", ix))
+                            .ghost()
+                            .with_size(Size::Small)
+                            .label(glyph)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                (send_em)(Command::SendHuddleReaction {
+                                    emoji: em.clone(),
+                                    kind: HuddleReactionKind::Standard,
+                                    emoji_url: None,
                                 });
-                            }
+                                if this.fixtures.sample {
+                                    if let Some(dock) = this.huddle_dock_entity() {
+                                        let me = this.fixtures.self_user.clone();
+                                        dock.update(cx, |d, cx| {
+                                            d.apply_data_event(
+                                                &HuddleDataEvent::Reaction {
+                                                    user: me,
+                                                    emoji: em.clone(),
+                                                    kind: HuddleReactionKind::Standard,
+                                                    emoji_url: None,
+                                                    at_ms: 0,
+                                                },
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .items_center()
+                    .child(div().text_xs().text_color(muted).mr_1().child("Effects"))
+                    .children(
+                        EFFECTS
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, &(glyph, label, code))| {
+                                let em = code.to_owned();
+                                let send_ef = send.clone();
+                                Button::new(("popout-huddle-effect", ix))
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .label(format!("{glyph} {label}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        (send_ef)(Command::SendHuddleReaction {
+                                            emoji: em.clone(),
+                                            kind: HuddleReactionKind::Effect,
+                                            emoji_url: None,
+                                        });
+                                        if this.fixtures.sample {
+                                            if let Some(dock) = this.huddle_dock_entity() {
+                                                let me = this.fixtures.self_user.clone();
+                                                dock.update(cx, |d, cx| {
+                                                    d.apply_data_event(
+                                                        &HuddleDataEvent::Reaction {
+                                                            user: me,
+                                                            emoji: em.clone(),
+                                                            kind: HuddleReactionKind::Effect,
+                                                            emoji_url: None,
+                                                            at_ms: 0,
+                                                        },
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }
+                                        this.huddle_reactions_open = false;
+                                        cx.notify();
+                                    }))
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .items_center()
+                    .child(div().text_xs().text_color(muted).mr_1().child("Sticky"))
+                    .children(
+                        STICKY
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, &(glyph, label, code))| {
+                                let selected = active_sticky.as_deref() == Some(code);
+                                let next = (!selected).then(|| code.to_owned());
+                                let send_st = send.clone();
+                                let b = Button::new(("popout-huddle-sticky", ix))
+                                    .with_size(Size::XSmall)
+                                    .label(format!("{glyph} {label}"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        (send_st)(Command::SetHuddleStickyEmoji(next.clone()));
+                                        if this.fixtures.sample {
+                                            if let Some(dock) = this.huddle_dock_entity() {
+                                                let me = this.fixtures.self_user.clone();
+                                                dock.update(cx, |d, cx| {
+                                                    d.apply_data_event(
+                                                        &HuddleDataEvent::StickyEmoji {
+                                                            user: me,
+                                                            emoji: next.clone(),
+                                                        },
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }
+                                        cx.notify();
+                                    }));
+                                if selected { b.primary() } else { b.outline() }
+                            }),
+                    ),
+            )
+    }
+
+    fn render_huddle_theme_panel(
+        &self,
+        active_bg: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        const THEMES: [(&str, &str); 6] = [
+            ("default", "Default"),
+            ("midnight", "Midnight"),
+            ("sunset", "Sunset"),
+            ("forest", "Forest"),
+            ("ocean", "Ocean"),
+            ("plum", "Plum"),
+        ];
+        let theme = cx.theme();
+        let (border, card_bg, muted) = (theme.border, theme.muted, theme.muted_foreground);
+        let send = self.send.clone();
+        h_flex()
+            .p_2p5()
+            .flex_wrap()
+            .gap_1p5()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(card_bg)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .mr_1()
+                    .child("Theme"),
+            )
+            .children(THEMES.iter().enumerate().map(|(ix, &(id, label))| {
+                let selected = active_bg == Some(id) || (active_bg.is_none() && id == "default");
+                let bg_id = id.to_owned();
+                let send_bg = send.clone();
+                let b = Button::new(("popout-huddle-theme", ix))
+                    .with_size(Size::XSmall)
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        (send_bg)(Command::SetHuddleBackground(bg_id.clone()));
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_background_local(bg_id.clone(), cx));
                         }
-                        this.huddle_reactions_open = false;
+                        this.huddle_theme_open = false;
                         cx.notify();
-                    }))
+                    }));
+                if selected { b.primary() } else { b.outline() }
             }))
     }
 
@@ -1889,8 +2513,6 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        use slackless_core::huddle::list_audio_devices;
-
         let hand_now = snap.hand_raised;
         let captions_now = snap.captions_enabled;
 
@@ -1947,7 +2569,28 @@ impl PopoutWindow {
             }
         };
 
-        let send_leave = self.send.clone();
+        let send_music = self.send.clone();
+        let music_on = snap.jukebox_song.is_some();
+        let music_btn = {
+            let next_song = (!music_on).then(|| "lofi".to_owned());
+            let b = Button::new("popout-huddle-music")
+                .with_size(Size::Small)
+                .label("🎵")
+                .tooltip(if music_on {
+                    "Stop huddle music"
+                } else {
+                    "Play ambient huddle music"
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    (send_music)(Command::SetHuddleJukebox(next_song.clone()));
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
+                        }
+                    }
+                }));
+            if music_on { b.primary() } else { b.outline() }
+        };
 
         h_flex()
             .gap_1p5()
@@ -1958,16 +2601,43 @@ impl PopoutWindow {
                     .outline()
                     .with_size(Size::Small)
                     .label("😊")
-                    .tooltip("Send reaction")
+                    .tooltip("Reactions, effects & sticky status")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.huddle_reactions_open = !this.huddle_reactions_open;
                         this.huddle_share_open = false;
+                        this.huddle_theme_open = false;
                         this.huddle_invite_open = false;
                         this.huddle_devices_open = false;
                         cx.notify();
                     })),
             )
             .child(cc_btn)
+            .child(music_btn)
+            .child(self.render_huddle_utility_controls(cx))
+    }
+
+    fn render_huddle_utility_controls(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
+        use slackless_core::huddle::list_audio_devices;
+
+        let send_leave = self.send.clone();
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(
+                Button::new("popout-huddle-theme-btn")
+                    .outline()
+                    .with_size(Size::Small)
+                    .icon(IconName::Palette)
+                    .tooltip("Huddle theme & background")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.huddle_theme_open = !this.huddle_theme_open;
+                        this.huddle_reactions_open = false;
+                        this.huddle_share_open = false;
+                        this.huddle_invite_open = false;
+                        this.huddle_devices_open = false;
+                        cx.notify();
+                    })),
+            )
             .child(
                 Button::new("popout-huddle-invite-btn")
                     .outline()
@@ -1979,6 +2649,7 @@ impl PopoutWindow {
                         this.huddle_devices_open = false;
                         this.huddle_share_open = false;
                         this.huddle_reactions_open = false;
+                        this.huddle_theme_open = false;
                         cx.notify();
                     })),
             )
@@ -1993,6 +2664,7 @@ impl PopoutWindow {
                         this.huddle_invite_open = false;
                         this.huddle_share_open = false;
                         this.huddle_reactions_open = false;
+                        this.huddle_theme_open = false;
                         if this.huddle_devices_open {
                             cx.spawn(async move |win, cx| {
                                 let devices = cx
@@ -2040,6 +2712,69 @@ impl PopoutWindow {
             .border_color(border)
             .child(self.render_huddle_media_controls(snap, cx))
             .child(self.render_huddle_collab_controls(snap, cx))
+    }
+}
+
+fn make_linear_segment(
+    p0: (f64, f64),
+    p1: (f64, f64),
+) -> slackless_core::huddle::HuddleDrawSegment {
+    let lerp = |t: f64| [p0.0 + (p1.0 - p0.0) * t, p0.1 + (p1.1 - p0.1) * t];
+    slackless_core::huddle::HuddleDrawSegment {
+        a: [p0.0, p0.1],
+        b: lerp(1.0 / 3.0),
+        c: lerp(2.0 / 3.0),
+        d: [p1.0, p1.1],
+    }
+}
+
+fn sticky_emoji_glyph(code: &str) -> &str {
+    match code {
+        "raised_hand" => "✋",
+        "coffee" => "☕",
+        "headphones" => "🎧",
+        "white_check_mark" => "✅",
+        "+1" | "thumbsup" => "👍",
+        "tada" => "🎉",
+        "heart" => "❤️",
+        "joy" => "😂",
+        "clap" => "👏",
+        "fire" => "🔥",
+        "eyes" => "👀",
+        "raised_hands" => "🙌",
+        "confetti" => "🎉",
+        "hearts" => "💖",
+        "sparkles" => "✨",
+        "rocket" => "🚀",
+        "mic_drop" => "🎤",
+        "trophy" => "🏆",
+        "unicorn" => "🦄",
+        other => other,
+    }
+}
+
+fn effect_label(code: &str) -> (&'static str, &'static str) {
+    match code {
+        "confetti" => ("🎉", "Confetti"),
+        "hearts" => ("💖", "Hearts"),
+        "clap" => ("👏", "Applause"),
+        "sparkles" => ("✨", "Sparkles"),
+        "rocket" => ("🚀", "Rocket"),
+        "mic_drop" => ("🎤", "Mic Drop"),
+        "trophy" => ("🏆", "Trophy"),
+        "unicorn" => ("🦄", "Unicorn"),
+        _ => ("✨", "Effect"),
+    }
+}
+
+fn huddle_background_tint(bg_id: Option<&str>) -> Option<gpui_kit::gpui::Hsla> {
+    match bg_id? {
+        "midnight" => Some(hsla(230.0 / 360.0, 0.45, 0.16, 0.22)),
+        "sunset" => Some(hsla(18.0 / 360.0, 0.72, 0.46, 0.14)),
+        "forest" => Some(hsla(145.0 / 360.0, 0.48, 0.26, 0.16)),
+        "ocean" => Some(hsla(200.0 / 360.0, 0.65, 0.34, 0.16)),
+        "plum" => Some(hsla(285.0 / 360.0, 0.52, 0.30, 0.18)),
+        _ => None,
     }
 }
 

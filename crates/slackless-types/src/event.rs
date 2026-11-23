@@ -425,6 +425,8 @@ pub struct HuddleRoom {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
+    pub background_id: Option<String>,
+    #[serde(default)]
     pub created_by: Option<UserId>,
     #[serde(default)]
     pub date_start: Option<i64>,

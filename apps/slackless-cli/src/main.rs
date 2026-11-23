@@ -312,6 +312,9 @@ enum HuddleCommand {
         /// Preferred output speaker name (defaults to system default).
         #[arg(long, value_name = "NAME")]
         output: Option<String>,
+        /// Optional emoji reaction to broadcast once connected (tests official `PeerMessage` `data-channel`).
+        #[arg(long, value_name = "EMOJI")]
+        react: Option<String>,
     },
     /// Fetch the shareable huddle link for a channel (`rooms.getLink`).
     Link {
@@ -496,7 +499,11 @@ async fn dispatch(
                 duration,
                 input,
                 output,
-            } => live::run_huddle_join(ctx, flag, &channel, muted, duration, input, output).await,
+                react,
+            } => {
+                live::run_huddle_join(ctx, flag, &channel, muted, duration, input, output, react)
+                    .await
+            }
             HuddleCommand::Link { channel } => live::run_huddle_link(ctx, flag, &channel).await,
             HuddleCommand::Invite { channel, user } => {
                 live::run_huddle_invite(ctx, flag, &channel, &user).await

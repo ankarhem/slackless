@@ -985,7 +985,9 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
             app.on_core_event(
                 &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Reaction {
                     user: inviter.clone(),
-                    emoji: "🎉".to_owned(),
+                    emoji: "confetti".to_owned(),
+                    kind: slackless_core::huddle::HuddleReactionKind::Effect,
+                    emoji_url: None,
                     at_ms: 0,
                 }),
                 window,
@@ -995,6 +997,64 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::HandRaise {
                     user: inviter.clone(),
                     raised: true,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::StickyEmoji {
+                    user: inviter.clone(),
+                    emoji: Some("coffee".to_owned()),
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Draw {
+                    user: inviter.clone(),
+                    message: slackless_core::huddle::HuddleDrawMessage::ChangeHue {
+                        item_id: inviter.to_string(),
+                        hue: 135,
+                    },
+                    at_ms: 0,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Draw {
+                    user: inviter.clone(),
+                    message: slackless_core::huddle::HuddleDrawMessage::New {
+                        item_id: inviter.to_string(),
+                        segment: slackless_core::huddle::HuddleDrawSegment {
+                            a: [0.1, 0.2],
+                            b: [0.2, 0.3],
+                            c: [0.3, 0.4],
+                            d: [0.4, 0.5],
+                        },
+                    },
+                    at_ms: 0,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Draw {
+                    user: inviter.clone(),
+                    message: slackless_core::huddle::HuddleDrawMessage::Position {
+                        item_id: inviter.to_string(),
+                        x: 0.4,
+                        y: 0.5,
+                    },
+                    at_ms: 0,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Jukebox {
+                    user: inviter.clone(),
+                    song_key: Some("lofi".to_owned()),
                 }),
                 window,
                 cx,
@@ -1010,7 +1070,18 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
             app.on_core_event(
                 &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Caption {
                     user: inviter.clone(),
-                    text: "Shipping Phases 2 through 4 today".to_owned(),
+                    text: "Shipping full parity…".to_owned(),
+                    is_partial: true,
+                    at_ms: 0,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Caption {
+                    user: inviter.clone(),
+                    text: "Shipping full parity today!".to_owned(),
+                    is_partial: false,
                     at_ms: 0,
                 }),
                 window,
@@ -1019,9 +1090,21 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
             let vs = app.huddle_dock.as_ref().unwrap().read(cx).view_state();
             assert_eq!(vs.video_frames.len(), 2);
             assert!(vs.raised_hands.contains(&inviter));
+            assert_eq!(
+                vs.sticky_emojis.get(&inviter).map(String::as_str),
+                Some("coffee")
+            );
             assert_eq!(vs.reactions.len(), 1);
+            assert!(vs.active_effect.is_some());
+            assert_eq!(vs.draw_strokes.len(), 1);
+            assert_eq!(vs.draw_strokes[0].hue, 135);
+            assert!(vs.draw_cursors.contains_key(&inviter));
+            assert_eq!(vs.session.jukebox_song.as_deref(), Some("lofi"));
             assert_eq!(vs.session.topic.as_deref(), Some("Release readiness"));
+            // Partial caption updated in-place by final caption -> 1 row!
             assert_eq!(vs.captions.len(), 1);
+            assert_eq!(vs.captions[0].1, "Shipping full parity today!");
+            assert!(!vs.captions[0].2);
             app.on_core_event(
                 &Event::HuddleVideoTileClosed(slackless_core::huddle::VideoTileKey::LocalCamera),
                 window,

@@ -178,6 +178,7 @@ pub mod method {
     pub const GIF_FEATURED: &str = "gif.featured";
     pub const GIF_SEARCH: &str = "gif.search";
     pub const HUDDLES_INFO: &str = "huddles.info";
+    pub const HUDDLES_UPDATE: &str = "huddles.update";
     pub const IM_LIST: &str = "im.list";
     pub const LISTS_ADD_TO_LIST: &str = "lists.addToList";
     pub const LISTS_CELLS_UPDATE: &str = "lists.cells.update";
@@ -217,9 +218,12 @@ pub mod method {
     pub const REMINDERS_LIST: &str = "reminders.list";
     pub const ROOMS_CAN_JOIN_HUDDLE: &str = "rooms.canJoinHuddle";
     pub const ROOMS_GET_LINK: &str = "rooms.getLink";
+    pub const ROOMS_INVITE_RESPONSE: &str = "rooms.inviteResponse";
     pub const ROOMS_JOIN: &str = "rooms.join";
     pub const ROOMS_LEAVE: &str = "rooms.leave";
     pub const ROOMS_NOTIFY_MEMBER: &str = "rooms.notifyMember";
+    pub const ROOMS_START_TRANSCRIPTION: &str = "rooms.startTranscription";
+    pub const ROOMS_STOP_TRANSCRIPTION: &str = "rooms.stopTranscription";
     pub const RTM_CONNECT: &str = "rtm.connect";
     pub const RTM_START: &str = "rtm.start";
     pub const SAVED_ADD: &str = "saved.add";
@@ -230,6 +234,7 @@ pub mod method {
     pub const SCREENHERO_ROOMS: &str = "screenhero.rooms";
     pub const SCREENHERO_ROOMS_CREATE: &str = "screenhero.rooms.create";
     pub const SCREENHERO_ROOMS_INFO: &str = "screenhero.rooms.info";
+    pub const SCREENHERO_ROOMS_RENAME: &str = "screenhero.rooms.rename";
     pub const SEARCH_ALL: &str = "search.all";
     pub const SEARCH_AUTOCOMPLETE: &str = "search.autocomplete";
     pub const SEARCH_AUTOCOMPLETE_FILES: &str = "search.autocomplete.files";

@@ -610,6 +610,7 @@ impl App {
                 channel,
                 participants,
                 ended,
+                ..
             } => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     if *ended {
@@ -1018,6 +1019,8 @@ impl App {
                 channel,
                 participants,
                 ended,
+                topic,
+                background_id,
             } => {
                 if *ended {
                     self.ws.active_huddles.remove(channel);
@@ -1031,6 +1034,12 @@ impl App {
                     .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
                 if let Some(dock) = &self.huddle_dock {
                     if dock.read(cx).session().channel == *channel {
+                        let alone_music =
+                            self.preferences.read(cx).settings().huddle_music_when_alone;
+                        let playing_jukebox = dock.read(cx).session().jukebox_song.is_some();
+                        if !*ended && participants.len() > 1 && alone_music && playing_jukebox {
+                            self.bridge.send(Command::SetHuddleJukebox(None));
+                        }
                         dock.update(cx, |d, cx| {
                             d.set_participants(
                                 if *ended {
@@ -1039,7 +1048,8 @@ impl App {
                                     participants.clone()
                                 },
                                 cx,
-                            )
+                            );
+                            d.apply_room_meta(topic.clone(), background_id.clone(), cx);
                         });
                     }
                 }
@@ -1075,11 +1085,25 @@ impl App {
                     }
                     if newly_connected {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
-                        if self.preferences.read(cx).settings().huddle_auto_captions
+                        let settings = self.preferences.read(cx).settings().clone();
+                        if settings.huddle_auto_captions
                             && !snap.captions_enabled
                             && !self.fixtures.sample
                         {
                             self.bridge.send(Command::SetHuddleCaptions(true));
+                        }
+                        let peer_count = self
+                            .ws
+                            .active_huddles
+                            .get(&snap.channel)
+                            .map_or(0, Vec::len);
+                        if settings.huddle_music_when_alone
+                            && peer_count <= 1
+                            && snap.jukebox_song.is_none()
+                            && !self.fixtures.sample
+                        {
+                            self.bridge
+                                .send(Command::SetHuddleJukebox(Some("lofi".to_owned())));
                         }
                     }
                 }

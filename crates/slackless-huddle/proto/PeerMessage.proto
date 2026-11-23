@@ -1,0 +1,144 @@
+syntax = "proto2";
+
+package slack.huddle.peer;
+
+// Exact wire-compatible mirror of Slack's `calls/client/peer_message.proto`
+// exchanged over Amazon Chime `DATA_MESSAGE` on topic `"data-channel"`.
+message PeerMessage {
+  message Reacji {
+    enum Type {
+      UNKNOWN_REACTION_TYPE = 0;
+      EFFECT = 1;
+      STANDARD = 2;
+      GIF = 3;
+    }
+    optional string emoji = 1;
+    optional Type type = 2;
+    optional string emoji_url = 3;
+  }
+
+  message Point {
+    optional double x = 1;
+    optional double y = 2;
+  }
+
+  message Segment {
+    optional Point a = 1;
+    optional Point b = 2;
+    optional Point c = 3;
+    optional Point d = 4;
+  }
+
+  message Draw {
+    enum Type {
+      UNKNOWN_DRAW_TYPE = 0;
+      NEW = 1;
+      EDIT = 2;
+      END = 3;
+      CHANGE_HUE = 4;
+      POSITION = 5;
+    }
+    optional Type type = 1;
+    optional Segment segment = 2;
+    optional int32 hue = 3;
+    optional string item_id = 4;
+    optional double x = 5;
+    optional double y = 6;
+  }
+
+  message Capabilities {
+    optional bool is_draw_enabled = 1;
+  }
+
+  message ContentShareDetails {
+    optional string source_type = 1;
+    optional string item_id = 2;
+  }
+
+  message Background {
+    optional string url = 1;
+  }
+
+  message MuteRequest {
+    optional string peer_id = 1;
+  }
+
+  message JukeboxRequest {
+    optional string song_key = 1;
+    optional bool stop = 2;
+  }
+
+  message RecordingStartNotification {
+    enum Type {
+      UNKNOWN_TYPE = 0;
+      SUMMARY = 1;
+    }
+    optional Type type = 1;
+    optional string recording_type = 2;
+  }
+
+  message KickNotification {
+    optional string kicked_user_id = 1;
+  }
+
+  message TranscriptLine {
+    optional string user_id = 1;
+    optional string content = 2;
+    optional uint64 start_time_ms = 3;
+    optional uint64 end_time_ms = 4;
+  }
+
+  message TranscriptCatchUp {
+    enum Type {
+      SOLICIT = 0;
+      OFFER = 1;
+      REQUEST_FROM = 2;
+      RESPONSE = 3;
+      RESPONSE_CHUNK = 4;
+    }
+    optional Type type = 1;
+    repeated TranscriptLine lines = 2;
+    optional uint32 chunk_index = 3;
+    optional uint32 total_chunks = 4;
+    optional string request_id = 5;
+    optional uint64 earliest_transcript_timestamp_ms = 6;
+  }
+
+  message AwarenessPayload {
+    optional string field_name = 1;
+    optional string field_value = 2;
+    optional int64 field_timestamp_ms = 3;
+  }
+
+  message AwarenessBroadcast {
+    optional string channel = 1;
+    optional string user = 2;
+    repeated AwarenessPayload awareness_state = 3;
+  }
+
+  message AwarenessQuery {
+    optional string channel = 1;
+    optional string user = 2;
+  }
+
+  message AwarenessClose {
+    optional string channel = 1;
+    optional string user = 2;
+  }
+
+  optional Reacji reacji = 1;
+  optional Draw draw = 2;
+  optional uint64 from_peer_id = 3;
+  optional string from_peer_id_string = 4;
+  optional Capabilities capabilities = 5;
+  optional Background background = 6;
+  optional MuteRequest mute_request = 10;
+  optional AwarenessBroadcast awareness_broadcast = 11;
+  optional AwarenessQuery awareness_query = 12;
+  optional AwarenessClose awareness_close = 13;
+  optional JukeboxRequest jukebox_request = 14;
+  optional ContentShareDetails content_share_details = 15;
+  optional RecordingStartNotification recording_start_notification = 16;
+  optional TranscriptCatchUp transcript_catch_up = 17;
+  optional KickNotification kick_notification = 18;
+}

@@ -21,6 +21,7 @@ opus = "0.4"
 sonora = "0.3"
 url = "2.5"
 openh264 = "0.9"
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 xcap = "0.9"
 nokhwa = { version = "0.10", features = ["input-native"] }
 image = { version = "0.25", default-features = false }

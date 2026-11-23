@@ -3,6 +3,9 @@
 //! screen sharing (`xcap` + `openh264`), and Chime `DATA_MESSAGE` extras for Slack Huddles.
 
 pub mod audio;
+pub mod av1;
+pub mod content_share;
+pub mod peer_message;
 pub mod rtc;
 pub mod screen;
 pub mod session;
@@ -14,13 +17,18 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/chime.signal.rs"));
 }
 
+/// Generated prost types for official Slack Huddle `PeerMessage` frames (`proto/PeerMessage.proto`).
+pub mod peer_proto {
+    include!(concat!(env!("OUT_DIR"), "/slack.huddle.peer.rs"));
+}
+
 use slackless_types::{ChannelId, Ts, UserId};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 pub use audio::{
-    AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe, list_audio_devices,
-    play_huddle_chime, play_speaker_test_tone,
+    AmbientMusicPlayer, AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe,
+    list_audio_devices, play_huddle_chime, play_speaker_test_tone,
 };
 pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;
@@ -111,14 +119,18 @@ pub struct HuddleSessionSnapshot {
     pub phase: HuddlePhase,
     pub channel: ChannelId,
     pub call_id: String,
+    pub attendee_id: String,
     pub muted: bool,
     pub video: bool,
     pub blur_background: bool,
     pub sharing: bool,
     pub share_source_id: Option<String>,
     pub hand_raised: bool,
+    pub sticky_emoji: Option<String>,
     pub captions_enabled: bool,
     pub topic: Option<String>,
+    pub background_id: Option<String>,
+    pub jukebox_song: Option<String>,
     pub started_at_secs: u64,
     pub thread_root_ts: Option<Ts>,
     pub canvas_file_id: Option<String>,
@@ -143,17 +155,68 @@ pub struct HuddleAudioLevels {
     pub muted_peers: Vec<UserId>,
 }
 
-/// Interactive Chime `DATA_MESSAGE` event (reactions, hand raises, topic updates, captions).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Reaction kind matching Slack's `PeerMessage.Reacji.Type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HuddleReactionKind {
+    #[default]
+    Standard,
+    Effect,
+    Gif,
+}
+
+/// Normalized cubic Bezier segment (`0.0..=1.0` screen-share coordinates) matching Slack's
+/// `PeerMessage.Segment` for drawing on shared screens (`F-COLLAB-025`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HuddleDrawSegment {
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub c: [f64; 2],
+    pub d: [f64; 2],
+}
+
+/// Screen-share drawing / live cursor message matching Slack's `PeerMessage.Draw`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HuddleDrawMessage {
+    New {
+        item_id: String,
+        segment: HuddleDrawSegment,
+    },
+    Edit {
+        item_id: String,
+        segment: HuddleDrawSegment,
+    },
+    End {
+        item_id: String,
+    },
+    ChangeHue {
+        item_id: String,
+        hue: i32,
+    },
+    Position {
+        item_id: String,
+        x: f64,
+        y: f64,
+    },
+}
+
+/// Interactive Chime `DATA_MESSAGE` event (`PeerMessage` on `"data-channel"` and AWS Transcribe
+/// `SdkTranscriptFrame` on `"aws:chime:transcription"`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum HuddleDataEvent {
     Reaction {
         user: UserId,
         emoji: String,
+        kind: HuddleReactionKind,
+        emoji_url: Option<String>,
         at_ms: u64,
     },
     HandRaise {
         user: UserId,
         raised: bool,
+    },
+    StickyEmoji {
+        user: UserId,
+        emoji: Option<String>,
     },
     Topic {
         user: UserId,
@@ -162,7 +225,20 @@ pub enum HuddleDataEvent {
     Caption {
         user: UserId,
         text: String,
+        is_partial: bool,
         at_ms: u64,
+    },
+    Draw {
+        user: UserId,
+        message: HuddleDrawMessage,
+        at_ms: u64,
+    },
+    Jukebox {
+        user: UserId,
+        song_key: Option<String>,
+    },
+    MutedByPeer {
+        actor: UserId,
     },
 }
 
@@ -201,9 +277,18 @@ pub enum HuddleControl {
     SetScreenShare {
         source_id: Option<String>,
     },
-    SendReaction(String),
+    SendReaction {
+        emoji: String,
+        kind: HuddleReactionKind,
+        emoji_url: Option<String>,
+    },
     SetHandRaised(bool),
+    SetStickyEmoji(Option<String>),
+    SendDraw(HuddleDrawMessage),
+    SetJukebox(Option<String>),
+    MutePeer(String),
     SetTopic(String),
+    SetBackground(Option<String>),
     SetCaptionsEnabled(bool),
     Leave,
 }

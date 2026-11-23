@@ -17,8 +17,9 @@ use gpui_kit::gpui::{
     Styled as _, Window, div, px,
 };
 use slackless_core::huddle::{
-    AudioDevices, HuddleAudioLevels, HuddleDataEvent, HuddlePhase, HuddleSessionSnapshot,
-    VideoFrame, VideoTileKey, list_audio_devices,
+    AudioDevices, HuddleAudioLevels, HuddleDataEvent, HuddleDrawMessage, HuddleDrawSegment,
+    HuddlePhase, HuddleReactionKind, HuddleSessionSnapshot, VideoFrame, VideoTileKey,
+    list_audio_devices,
 };
 use slackless_core::types::{ChannelId, UserId};
 
@@ -59,6 +60,34 @@ pub fn format_elapsed(secs: u64) -> String {
     }
 }
 
+/// Active fading drawing stroke on a shared screen (`PeerMessage.Draw`, `F-COLLAB-025`).
+#[derive(Clone, Debug)]
+pub struct DrawStrokeEntry {
+    pub user: UserId,
+    pub item_id: String,
+    pub hue: i32,
+    pub segments: Vec<HuddleDrawSegment>,
+    pub updated_at_ms: u64,
+}
+
+/// Live colored pointer cursor on a shared screen (`PeerMessage.Draw` `POSITION`).
+#[derive(Clone, Debug)]
+pub struct DrawCursorEntry {
+    pub item_id: String,
+    pub hue: i32,
+    pub x: f64,
+    pub y: f64,
+    pub updated_at_ms: u64,
+}
+
+/// Ephemeral huddle reaction / effect entry (`PeerMessage.Reacji`).
+#[derive(Clone, Debug)]
+pub struct ReactionEntry {
+    pub user: UserId,
+    pub emoji: String,
+    pub at_ms: u64,
+}
+
 /// Snapshot consumed by `PopoutKind::Huddle` so the Pop-out Huddle Window stays in lock-step with
 /// the sidebar mini-dock.
 #[derive(Clone)]
@@ -69,8 +98,12 @@ pub struct HuddleViewState {
     pub elapsed_secs: u64,
     pub video_frames: HashMap<VideoTileKey, Arc<RenderImage>>,
     pub raised_hands: HashSet<UserId>,
-    pub reactions: Vec<(UserId, String, u64)>,
-    pub captions: Vec<(UserId, String)>,
+    pub sticky_emojis: HashMap<UserId, String>,
+    pub reactions: Vec<ReactionEntry>,
+    pub active_effect: Option<(UserId, String, u64)>,
+    pub draw_strokes: Vec<DrawStrokeEntry>,
+    pub draw_cursors: HashMap<UserId, DrawCursorEntry>,
+    pub captions: Vec<(UserId, String, bool)>,
 }
 
 pub enum HuddleDockEvent {
@@ -98,8 +131,13 @@ pub struct HuddleDock {
     elapsed_secs: u64,
     video_frames: HashMap<VideoTileKey, Arc<RenderImage>>,
     raised_hands: HashSet<UserId>,
-    reactions: Vec<(UserId, String, u64)>,
-    captions: Vec<(UserId, String)>,
+    sticky_emojis: HashMap<UserId, String>,
+    reactions: Vec<ReactionEntry>,
+    active_effect: Option<(UserId, String, u64)>,
+    draw_strokes: Vec<DrawStrokeEntry>,
+    draw_cursors: HashMap<UserId, DrawCursorEntry>,
+    user_hues: HashMap<UserId, i32>,
+    captions: Vec<(UserId, String, bool)>,
     menu_open: bool,
     devices: AudioDevices,
 }
@@ -131,10 +169,33 @@ impl HuddleDock {
                                     now_secs().saturating_sub(dock.session.started_at_secs);
                                 dirty = true;
                             }
-                            let cutoff = now_ms().saturating_sub(4_000);
+                            let now = now_ms();
+                            let react_cutoff = now.saturating_sub(4_500);
                             let before = dock.reactions.len();
-                            dock.reactions.retain(|(_, _, at)| *at >= cutoff);
+                            dock.reactions.retain(|r| r.at_ms >= react_cutoff);
                             if dock.reactions.len() != before {
+                                dirty = true;
+                            }
+                            if dock
+                                .active_effect
+                                .as_ref()
+                                .is_some_and(|(_, _, at)| *at < now.saturating_sub(3_500))
+                            {
+                                dock.active_effect = None;
+                                dirty = true;
+                            }
+                            let stroke_cutoff = now.saturating_sub(6_000);
+                            let strokes_before = dock.draw_strokes.len();
+                            dock.draw_strokes
+                                .retain(|s| s.updated_at_ms >= stroke_cutoff);
+                            if dock.draw_strokes.len() != strokes_before {
+                                dirty = true;
+                            }
+                            let cursor_cutoff = now.saturating_sub(3_000);
+                            let cursors_before = dock.draw_cursors.len();
+                            dock.draw_cursors
+                                .retain(|_, c| c.updated_at_ms >= cursor_cutoff);
+                            if dock.draw_cursors.len() != cursors_before {
                                 dirty = true;
                             }
                             if dirty {
@@ -162,7 +223,12 @@ impl HuddleDock {
                 },
                 video_frames: HashMap::new(),
                 raised_hands: HashSet::new(),
+                sticky_emojis: HashMap::new(),
                 reactions: Vec::new(),
+                active_effect: None,
+                draw_strokes: Vec::new(),
+                draw_cursors: HashMap::new(),
+                user_hues: HashMap::new(),
                 captions: Vec::new(),
                 menu_open: false,
                 devices: AudioDevices::default(),
@@ -222,13 +288,62 @@ impl HuddleDock {
         }
     }
 
+    pub fn apply_room_meta(
+        &mut self,
+        topic: Option<String>,
+        background_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut dirty = false;
+        if let Some(t) = topic {
+            let next = (!t.trim().is_empty()).then_some(t);
+            if self.session.topic != next {
+                self.session.topic = next;
+                dirty = true;
+            }
+        }
+        if let Some(bg) = background_id {
+            let next = (!bg.trim().is_empty()).then_some(bg);
+            if self.session.background_id != next {
+                self.session.background_id = next;
+                dirty = true;
+            }
+        }
+        if dirty {
+            cx.notify();
+        }
+    }
+
+    pub fn set_background_local(&mut self, bg: String, cx: &mut Context<Self>) {
+        self.session.background_id = (!bg.trim().is_empty()).then_some(bg);
+        cx.notify();
+    }
+
+    pub fn set_jukebox_local(&mut self, song: Option<String>, cx: &mut Context<Self>) {
+        self.session.jukebox_song = song;
+        cx.notify();
+    }
+
     pub fn apply_data_event(&mut self, event: &HuddleDataEvent, cx: &mut Context<Self>) {
         match event {
-            HuddleDataEvent::Reaction { user, emoji, at_ms } => {
+            HuddleDataEvent::Reaction {
+                user,
+                emoji,
+                kind,
+                at_ms,
+                ..
+            } => {
                 let ts = if *at_ms == 0 { now_ms() } else { *at_ms };
-                self.reactions.push((user.clone(), emoji.clone(), ts));
-                if self.reactions.len() > 16 {
-                    let excess = self.reactions.len() - 16;
+                if *kind == HuddleReactionKind::Effect {
+                    self.active_effect = Some((user.clone(), emoji.clone(), ts));
+                }
+                self.reactions.push(ReactionEntry {
+                    user: user.clone(),
+                    emoji: emoji.clone(),
+                    at_ms: ts,
+                });
+                if self.reactions.len() > 24 {
+                    let excess = self.reactions.len() - 24;
                     self.reactions.drain(0..excess);
                 }
             }
@@ -242,17 +357,118 @@ impl HuddleDock {
                     self.session.hand_raised = *raised;
                 }
             }
+            HuddleDataEvent::StickyEmoji { user, emoji } => {
+                match emoji {
+                    Some(em) if !em.is_empty() => {
+                        if em == "raised_hand" || em == "✋" {
+                            self.raised_hands.insert(user.clone());
+                        }
+                        self.sticky_emojis.insert(user.clone(), em.clone());
+                    }
+                    _ => {
+                        self.sticky_emojis.remove(user);
+                        self.raised_hands.remove(user);
+                    }
+                }
+                if *user == self.fixtures.self_user {
+                    self.session.sticky_emoji = emoji.clone();
+                    self.session.hand_raised =
+                        matches!(emoji.as_deref(), Some("raised_hand") | Some("✋"));
+                }
+            }
             HuddleDataEvent::Topic { topic, .. } => {
                 self.session.topic = (!topic.is_empty()).then(|| topic.clone());
             }
-            HuddleDataEvent::Caption { user, text, .. } => {
+            HuddleDataEvent::Caption {
+                user,
+                text,
+                is_partial,
+                ..
+            } => {
                 if !text.trim().is_empty() {
-                    self.captions.push((user.clone(), text.clone()));
-                    if self.captions.len() > 3 {
-                        let excess = self.captions.len() - 3;
+                    if let Some(last) = self.captions.last_mut() {
+                        if last.0 == *user && last.2 {
+                            last.1 = text.clone();
+                            last.2 = *is_partial;
+                            cx.notify();
+                            return;
+                        }
+                    }
+                    self.captions
+                        .push((user.clone(), text.clone(), *is_partial));
+                    if self.captions.len() > 4 {
+                        let excess = self.captions.len() - 4;
                         self.captions.drain(0..excess);
                     }
                 }
+            }
+            HuddleDataEvent::Draw { user, message, .. } => {
+                let ts = now_ms();
+                match message {
+                    HuddleDrawMessage::ChangeHue { hue, .. } => {
+                        self.user_hues.insert(user.clone(), *hue);
+                    }
+                    HuddleDrawMessage::New { item_id, segment } => {
+                        let hue = *self.user_hues.get(user).unwrap_or(&210);
+                        // Append to an active stroke from this user if fresh (<250ms), else start new.
+                        let append_to_last = self.draw_strokes.last().is_some_and(|s| {
+                            s.user == *user
+                                && s.item_id == *item_id
+                                && s.hue == hue
+                                && ts.saturating_sub(s.updated_at_ms) < 250
+                                && s.segments.len() < 120
+                        });
+                        if append_to_last {
+                            if let Some(last) = self.draw_strokes.last_mut() {
+                                last.segments.push(*segment);
+                                last.updated_at_ms = ts;
+                            }
+                        } else {
+                            self.draw_strokes.push(DrawStrokeEntry {
+                                user: user.clone(),
+                                item_id: item_id.clone(),
+                                hue,
+                                segments: vec![*segment],
+                                updated_at_ms: ts,
+                            });
+                            if self.draw_strokes.len() > 64 {
+                                let excess = self.draw_strokes.len() - 64;
+                                self.draw_strokes.drain(0..excess);
+                            }
+                        }
+                    }
+                    HuddleDrawMessage::Edit { item_id, segment } => {
+                        if let Some(stroke) = self
+                            .draw_strokes
+                            .iter_mut()
+                            .rev()
+                            .find(|s| s.user == *user && s.item_id == *item_id)
+                        {
+                            stroke.segments.push(*segment);
+                            stroke.updated_at_ms = ts;
+                        }
+                    }
+                    HuddleDrawMessage::End { .. } => {}
+                    HuddleDrawMessage::Position { item_id, x, y } => {
+                        let hue = *self.user_hues.get(user).unwrap_or(&210);
+                        self.draw_cursors.insert(
+                            user.clone(),
+                            DrawCursorEntry {
+                                item_id: item_id.clone(),
+                                hue,
+                                x: *x,
+                                y: *y,
+                                updated_at_ms: ts,
+                            },
+                        );
+                    }
+                }
+            }
+            HuddleDataEvent::Jukebox { song_key, .. } => {
+                self.session.jukebox_song = song_key.clone();
+            }
+            HuddleDataEvent::MutedByPeer { .. } => {
+                self.session.muted = true;
             }
         }
         cx.notify();
@@ -310,7 +526,11 @@ impl HuddleDock {
             elapsed_secs: self.elapsed_secs,
             video_frames: self.video_frames.clone(),
             raised_hands: self.raised_hands.clone(),
+            sticky_emojis: self.sticky_emojis.clone(),
             reactions: self.reactions.clone(),
+            active_effect: self.active_effect.clone(),
+            draw_strokes: self.draw_strokes.clone(),
+            draw_cursors: self.draw_cursors.clone(),
             captions: self.captions.clone(),
         }
     }

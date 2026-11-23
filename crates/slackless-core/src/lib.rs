@@ -592,14 +592,34 @@ pub enum Command {
     SetHuddleScreenShare {
         source_id: Option<String>,
     },
-    /// Broadcast a floating emoji reaction to huddle peers over Chime `DATA_MESSAGE` (Phase 4).
-    SendHuddleReaction(String),
-    /// Raise or lower the local participant's hand over Chime `DATA_MESSAGE` (Phase 4).
+    /// Broadcast a floating emoji reaction, burst effect, or GIF sticker over official Slack
+    /// `PeerMessage.Reacji` (`data-channel`).
+    SendHuddleReaction {
+        emoji: String,
+        kind: huddle::HuddleReactionKind,
+        emoji_url: Option<String>,
+    },
+    /// Raise or lower the local participant's hand (`PeerMessage.AwarenessBroadcast` `raised_hand`).
     SetHuddleHandRaised(bool),
-    /// Set or clear the editable huddle topic over Chime `DATA_MESSAGE` (`F-COLLAB-016`).
+    /// Set or clear a persistent sticky status emoji (`PeerMessage.AwarenessBroadcast`).
+    SetHuddleStickyEmoji(Option<String>),
+    /// Broadcast a screen-share drawing stroke or live cursor position (`PeerMessage.Draw`).
+    SendHuddleDraw(huddle::HuddleDrawMessage),
+    /// Start (`Some(song_key)`) or stop (`None`) ambient/jukebox huddle music (`PeerMessage.JukeboxRequest`).
+    SetHuddleJukebox(Option<String>),
+    /// Request a remote huddle peer to mute their microphone (`PeerMessage.MuteRequest`).
+    MuteHuddlePeer(String),
+    /// Set or clear the editable huddle topic (`screenhero.rooms.rename`, `F-COLLAB-016`).
     SetHuddleTopic(String),
-    /// Enable or disable live huddle captions overlay (Phase 4).
+    /// Update the active huddle's visual theme/background (`huddles.update` + `PeerMessage.Background`).
+    SetHuddleBackground(String),
+    /// Enable or disable live AWS Transcribe captions (`rooms.startTranscription` / `rooms.stopTranscription`).
     SetHuddleCaptions(bool),
+    /// Decline an incoming direct-message huddle invite (`rooms.inviteResponse`).
+    DeclineHuddleInvite {
+        channel: ChannelId,
+        call_id: String,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -770,6 +790,8 @@ pub enum Event {
         channel: ChannelId,
         participants: Vec<UserId>,
         ended: bool,
+        topic: Option<String>,
+        background_id: Option<String>,
     },
     /// Active native huddle session lifecycle snapshot (`Connecting`, `Connected`, `Reconnecting`, `Failed`, `Idle`).
     HuddleSessionChanged(Box<huddle::HuddleSessionSnapshot>),

@@ -351,6 +351,9 @@ pub(crate) struct Core<B: Backend> {
     offline_queue: VecDeque<(i64, QueuedMutation)>,
     /// Active native Chime audio huddle session handle (at most one per workspace).
     active_huddle: Arc<Mutex<Option<crate::huddle::HuddleHandle>>>,
+    /// Active Slack huddle `call_id` (`R0...`) for REST APIs (`screenhero.rooms.rename`,
+    /// `rooms.startTranscription` / `rooms.stopTranscription`, `huddles.update`).
+    active_huddle_call_id: Arc<Mutex<Option<String>>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -403,6 +406,7 @@ impl<B: Backend> Core<B> {
             is_offline: false,
             offline_queue: persisted,
             active_huddle: Arc::new(Mutex::new(None)),
+            active_huddle_call_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1983,9 +1987,13 @@ impl<B: Backend> Core<B> {
                     prev.leave();
                 }
                 let active_huddle = Arc::clone(&self.active_huddle);
+                let active_huddle_call_id = Arc::clone(&self.active_huddle_call_id);
                 let team_id = self.workspace.clone();
                 self.spawn("rooms.join", async move {
                     let joined = backend.rooms_join(channel.clone()).await?;
+                    *active_huddle_call_id
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = Some(joined.call_id.clone());
                     let creds = crate::huddle::HuddleCredentials {
                         channel: channel.clone(),
                         call_id: joined.call_id.clone(),
@@ -2011,6 +2019,7 @@ impl<B: Backend> Core<B> {
                     let handle = crate::huddle::spawn_huddle_session(creds, audio, upd_tx);
                     *active_huddle.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
                     let active_for_clear = Arc::clone(&active_huddle);
+                    let call_id_for_clear = Arc::clone(&active_huddle_call_id);
                     tokio::spawn(async move {
                         while let Some(upd) = upd_rx.recv().await {
                             match upd {
@@ -2023,6 +2032,10 @@ impl<B: Backend> Core<B> {
                                     events.emit(Event::HuddleSessionChanged(snap));
                                     if done {
                                         let _ = active_for_clear
+                                            .lock()
+                                            .unwrap_or_else(PoisonError::into_inner)
+                                            .take();
+                                        let _ = call_id_for_clear
                                             .lock()
                                             .unwrap_or_else(PoisonError::into_inner)
                                             .take();
@@ -2047,6 +2060,11 @@ impl<B: Backend> Core<B> {
                 });
             }
             Command::LeaveHuddle => {
+                let _ = self
+                    .active_huddle_call_id
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
                 if let Some(handle) = self
                     .active_huddle
                     .lock()
@@ -2149,14 +2167,22 @@ impl<B: Backend> Core<B> {
                     handle.send(crate::huddle::HuddleControl::SetScreenShare { source_id });
                 }
             }
-            Command::SendHuddleReaction(emoji) => {
+            Command::SendHuddleReaction {
+                emoji,
+                kind,
+                emoji_url,
+            } => {
                 if let Some(handle) = self
                     .active_huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .as_ref()
                 {
-                    handle.send(crate::huddle::HuddleControl::SendReaction(emoji));
+                    handle.send(crate::huddle::HuddleControl::SendReaction {
+                        emoji,
+                        kind,
+                        emoji_url,
+                    });
                 }
             }
             Command::SetHuddleHandRaised(raised) => {
@@ -2169,6 +2195,46 @@ impl<B: Backend> Core<B> {
                     handle.send(crate::huddle::HuddleControl::SetHandRaised(raised));
                 }
             }
+            Command::SetHuddleStickyEmoji(emoji) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetStickyEmoji(emoji));
+                }
+            }
+            Command::SendHuddleDraw(draw) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SendDraw(draw));
+                }
+            }
+            Command::SetHuddleJukebox(song) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetJukebox(song));
+                }
+            }
+            Command::MuteHuddlePeer(peer_id) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::MutePeer(peer_id));
+                }
+            }
             Command::SetHuddleTopic(topic) => {
                 if let Some(handle) = self
                     .active_huddle
@@ -2176,7 +2242,44 @@ impl<B: Backend> Core<B> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .as_ref()
                 {
-                    handle.send(crate::huddle::HuddleControl::SetTopic(topic));
+                    handle.send(crate::huddle::HuddleControl::SetTopic(topic.clone()));
+                }
+                if let Some(call_id) = self
+                    .active_huddle_call_id
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                {
+                    self.spawn("screenhero.rooms.rename", async move {
+                        backend.rooms_rename(call_id, topic).await?;
+                        Ok(())
+                    });
+                }
+            }
+            Command::SetHuddleBackground(background_id) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetBackground(
+                        (!background_id.is_empty() && background_id != "default")
+                            .then(|| background_id.clone()),
+                    ));
+                }
+                if let Some(call_id) = self
+                    .active_huddle_call_id
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                {
+                    self.spawn("huddles.update", async move {
+                        backend
+                            .huddles_update_background(call_id, background_id)
+                            .await?;
+                        Ok(())
+                    });
                 }
             }
             Command::SetHuddleCaptions(enabled) => {
@@ -2188,6 +2291,36 @@ impl<B: Backend> Core<B> {
                 {
                     handle.send(crate::huddle::HuddleControl::SetCaptionsEnabled(enabled));
                 }
+                if let Some(call_id) = self
+                    .active_huddle_call_id
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                {
+                    self.spawn(
+                        if enabled {
+                            "rooms.startTranscription"
+                        } else {
+                            "rooms.stopTranscription"
+                        },
+                        async move {
+                            if enabled {
+                                backend.rooms_start_transcription(call_id).await?;
+                            } else {
+                                backend.rooms_stop_transcription(call_id).await?;
+                            }
+                            Ok(())
+                        },
+                    );
+                }
+            }
+            Command::DeclineHuddleInvite { channel, call_id } => {
+                self.spawn("rooms.inviteResponse", async move {
+                    backend
+                        .rooms_invite_response(channel, call_id, "decline".to_owned())
+                        .await?;
+                    Ok(())
+                });
             }
             // Handled by the loop.
             Command::Shutdown => {}
@@ -2309,11 +2442,15 @@ impl<B: Backend> Core<B> {
                     | SlackEvent::ShRoomLeave(ev) => {
                         let ended = !ev.room.is_active();
                         let participants = ev.room.participants.clone();
+                        let topic = ev.room.name.clone();
+                        let background_id = ev.room.background_id.clone();
                         for channel in ev.target_channels() {
                             self.events.emit(Event::HuddleUpdated {
                                 channel,
                                 participants: participants.clone(),
                                 ended,
+                                topic: topic.clone(),
+                                background_id: background_id.clone(),
                             });
                         }
                     }

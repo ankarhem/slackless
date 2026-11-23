@@ -205,14 +205,18 @@ pub fn parse_index_sources(
 }
 
 /// Build a Chime `SUBSCRIBE` frame for audio-only (`send_video = false`) or full `DUPLEX`
-/// audio + H.264 video (`send_video = true` or non-empty `receive_sources`).
+/// audio + video (`send_video = true` or non-empty `receive_sources`).
+///
+/// `receive_sources` carries `(sdp_mid, RemoteVideoSource)` pairs assigned to mid 2+ receive
+/// transceivers; `receive_stream_ids` prepends `0` for the mid-1 send video slot when `send_video`
+/// is true so Chime's `fixUpSubscriptionOrder` lines up with every video m-section.
 pub fn build_subscribe_frame(
     creds: &HuddleCredentials,
     sdp_offer: &str,
     wants_compressed_sdp: bool,
     audio_muted: bool,
     send_video: bool,
-    receive_sources: &[RemoteVideoSource],
+    receive_sources: &[(String, RemoteVideoSource)],
 ) -> Result<SdkSignalFrame> {
     let (plain, compressed) = if wants_compressed_sdp {
         (None, Some(deflate_sdp(sdp_offer)?))
@@ -246,7 +250,12 @@ pub fn build_subscribe_frame(
             height: Some(360),
         });
     }
-    let receive_stream_ids: Vec<u32> = receive_sources.iter().map(|s| s.stream_id).collect();
+    let mut receive_stream_ids =
+        Vec::with_capacity(receive_sources.len() + usize::from(send_video));
+    if send_video {
+        receive_stream_ids.push(0);
+    }
+    receive_stream_ids.extend(receive_sources.iter().map(|(_, s)| s.stream_id));
     let video_subscription_configuration = build_video_subscriptions(receive_sources);
     let duplex = if send_video {
         SdkStreamServiceType::Duplex
@@ -271,6 +280,62 @@ pub fn build_subscribe_frame(
     })
 }
 
+/// Build the Chime `SUBSCRIBE` frame for a dedicated `#content` screen-share publisher attendee.
+pub fn build_content_subscribe_frame(
+    creds: &HuddleCredentials,
+    sdp_offer: &str,
+    wants_compressed_sdp: bool,
+) -> Result<SdkSignalFrame> {
+    let (plain, compressed) = if wants_compressed_sdp {
+        (None, Some(deflate_sdp(sdp_offer)?))
+    } else {
+        (Some(sdp_offer.to_owned()), None)
+    };
+    let send_streams = vec![
+        SdkStreamDescriptor {
+            stream_id: Some(1),
+            framerate: Some(15),
+            max_bitrate_kbps: Some(600),
+            track_label: Some("AmazonChimeExpressAudio".to_owned()),
+            group_id: Some(1),
+            avg_bitrate_bps: Some(400_000),
+            attendee_id: Some(creds.attendee_id.clone()),
+            media_type: Some(SdkStreamMediaType::Audio as i32),
+            external_user_id: Some(creds.external_user_id.clone()),
+            ..Default::default()
+        },
+        SdkStreamDescriptor {
+            stream_id: Some(2),
+            framerate: Some(15),
+            max_bitrate_kbps: Some(3000),
+            track_label: Some("AmazonChimeExpressVideo".to_owned()),
+            group_id: Some(2),
+            avg_bitrate_bps: Some(1_500_000),
+            attendee_id: Some(creds.attendee_id.clone()),
+            media_type: Some(SdkStreamMediaType::Video as i32),
+            external_user_id: Some(creds.external_user_id.clone()),
+            width: Some(1280),
+            height: Some(720),
+        },
+    ];
+    Ok(SdkSignalFrame {
+        timestamp_ms: Some(now_ms()),
+        r#type: Some(sdk_signal_frame::Type::Subscribe as i32),
+        sub: Some(SdkSubscribeFrame {
+            duplex: Some(SdkStreamServiceType::Duplex as i32),
+            send_streams,
+            receive_stream_ids: vec![0],
+            sdp_offer: plain,
+            compressed_sdp_offer: compressed,
+            audio_host: Some(creds.audio_host_url.clone()),
+            audio_checkin: Some(false),
+            audio_muted: Some(true),
+            video_subscription_configuration: Vec::new(),
+        }),
+        ..Default::default()
+    })
+}
+
 /// Build the audio-only Chime `SUBSCRIBE` frame (note: `duplex = RX` describes video direction
 /// even while sending audio, and `framerate = 15` is expected by Chime's SFU on audio too).
 pub fn build_audio_subscribe_frame(
@@ -289,25 +354,24 @@ pub fn build_audio_subscribe_frame(
     )
 }
 
-/// Convert [`RemoteVideoSource`]s into Chime `SdkVideoSubscriptionConfiguration` entries.
+/// Convert `(mid, RemoteVideoSource)` pairs into Chime `SdkVideoSubscriptionConfiguration` entries
+/// matching official Slack's exact wire parameters (`stream_id: None`, `group_id: Some(...)`,
+/// `priority: 4_294_967_285`, `quality_adaptation_preference: 1`).
 pub fn build_video_subscriptions(
-    sources: &[RemoteVideoSource],
+    sources: &[(String, RemoteVideoSource)],
 ) -> Vec<SdkVideoSubscriptionConfiguration> {
     sources
         .iter()
-        .enumerate()
-        .map(|(ix, src)| SdkVideoSubscriptionConfiguration {
-            mid: Some(format!("v{}", ix + 1)),
+        .map(|(mid, src)| SdkVideoSubscriptionConfiguration {
+            mid: Some(mid.clone()),
             attendee_id: Some(src.attendee_id.clone()),
-            stream_id: Some(src.stream_id),
-            priority: Some(if src.is_content { 1 } else { 2 }),
-            target_bitrate_kbps: Some(src.max_bitrate_kbps.clamp(150, 2000)),
+            stream_id: None,
+            priority: Some(4_294_967_285),
+            target_bitrate_kbps: Some(src.max_bitrate_kbps.clamp(350, 2500)),
             group_id: Some(src.group_id),
-            quality_adaptation_preference: Some(if src.is_content {
-                SdkVideoQualityAdaptationPreference::MaintainResolution as i32
-            } else {
-                SdkVideoQualityAdaptationPreference::Balanced as i32
-            }),
+            quality_adaptation_preference: Some(
+                SdkVideoQualityAdaptationPreference::MaintainResolution as i32,
+            ),
         })
         .collect()
 }
@@ -459,10 +523,24 @@ pub fn decode_sdp_answer(sdp_answer: Option<&str>, compressed: Option<&[u8]>) ->
     ))
 }
 
-/// Extract a Slack `UserId` from Chime's `ExternalUserId` (`<team>-<call_id>-<user_id>` or
-/// `<team>-<call_id>-<user_id>#content`).
+/// Extract a Slack `UserId` from Chime's `ExternalUserId`.
+///
+/// Slack formats `ExternalUserId` as `<team>-<call_id>-<user_id>-<nonce>` (for example
+/// `T02HD8VA1-R0CLDM5DTPE-UGKSG83K3-12688436843750`), optionally suffixed with `#content`.
+/// Prefer the segment starting with `'U'` or `'W'` (Slack workspace/enterprise user IDs) before
+/// falling back to the final hyphen-delimited segment.
 pub fn parse_external_user_id(external: &str) -> Option<UserId> {
-    let base = external.strip_suffix("#content").unwrap_or(external);
+    let base = external.strip_suffix("#content").unwrap_or(external).trim();
+    if base.is_empty() {
+        return None;
+    }
+    if let Some(uid) = base.split('-').find(|part| {
+        (part.starts_with('U') || part.starts_with('W'))
+            && part.len() >= 2
+            && part.bytes().all(|b| b.is_ascii_alphanumeric())
+    }) {
+        return Some(UserId::from(uid));
+    }
     let candidate = base.rsplit('-').next()?.trim();
     if candidate.is_empty() {
         None
@@ -511,6 +589,14 @@ mod tests {
         assert_eq!(
             parse_external_user_id("T0123-R0987654321-U0BOB#content"),
             Some(UserId::from("U0BOB"))
+        );
+        assert_eq!(
+            parse_external_user_id("T02HD8VA1-R0CLDM5DTPE-UGKSG83K3-12688436843750"),
+            Some(UserId::from("UGKSG83K3"))
+        );
+        assert_eq!(
+            parse_external_user_id("T02HD8VA1-R0CLDM5DTPE-W01234567-999#content"),
+            Some(UserId::from("W01234567"))
         );
     }
 

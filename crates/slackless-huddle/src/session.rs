@@ -1,22 +1,32 @@
 //! Full Amazon Chime huddle session orchestrator:
 //! - Resilient signaling + auto-reconnect supervisor (1s -> 2s -> 4s backoff on unexpected drop)
-//! - WebRTC DTLS-SRTP audio & H.264 video (camera + `#content` screen share)
-//! - Chime `INDEX` + `REMOTE_VIDEO_UPDATE` remote camera/screen-share subscription & decode
-//! - Chime `DATA_MESSAGE` interactive huddle extras (reactions, hand raise, topic, captions)
+//! - WebRTC DTLS-SRTP audio + multi-codec video (`AV1` via `rav1d` + `H.264` via `openh264`)
+//! - Official `#content` second Chime session for native screen sharing (simultaneous with camera!)
+//! - Official Chime `INDEX` + mid-2+ `Recvonly` transceivers + `SUBSCRIBE` + `REMOTE_VIDEO_UPDATE`
+//! - Official Slack `PeerMessage` (`calls/client/peer_message.proto`) on `"data-channel"`
+//!   (reactions, effects, GIFs, sticky emoji / hand raise, drawing on shared screens, jukebox, mute)
+//! - Official AWS Chime `SdkTranscriptFrame` live captions on `"aws:chime:transcription"`
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng as _;
 use slackless_types::UserId;
 use tokio::sync::mpsc;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
-use crate::audio::{AudioEngine, AudioSharedState};
+use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
+use crate::av1::{Av1Decoder, Av1Frames};
+use crate::content_share::ContentShareSession;
+use crate::peer_message::{
+    CHIME_TRANSCRIPTION_TOPIC, SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message,
+    build_content_share_details_message, build_draw_message, build_jukebox_message,
+    build_mute_request_message, build_reacji_message, build_sticky_emoji_awareness,
+    decode_chime_transcript_frame, decode_slack_peer_message,
+};
 use crate::proto::sdk_signal_frame;
 use crate::rtc::{ChimeRtcPeer, InboundVideoPacket};
-use crate::screen::ScreenCapture;
 use crate::signaling::{
     ChimeSignalClient, RemoteVideoSource, build_audio_control_frame, build_client_metric_frame,
     build_data_message_frame, build_join_frame, build_leave_frame, build_pong_frame,
@@ -37,10 +47,6 @@ fn now_secs() -> u64 {
 }
 
 /// Start a native audio/video/screen-share huddle session on the current tokio runtime.
-///
-/// Emits [`HuddleUpdate`] events into `updates` and returns a [`HuddleHandle`] for live mute,
-/// camera, background blur, screen sharing, device switch, reactions/hand raise, and clean Chime
-/// `LEAVE` teardown.
 pub fn spawn_huddle_session(
     creds: HuddleCredentials,
     config: HuddleAudioConfig,
@@ -57,6 +63,42 @@ enum LoopExit {
     Fatal(HuddleError),
 }
 
+enum RemoteVideoDecoder {
+    Av1 { frames: Av1Frames, dec: Av1Decoder },
+    H264(H264VideoDecoder),
+}
+
+impl RemoteVideoDecoder {
+    fn for_mime(mime: &str) -> Option<Self> {
+        if mime.eq_ignore_ascii_case("video/AV1") {
+            Av1Decoder::new().ok().map(|dec| Self::Av1 {
+                frames: Av1Frames::default(),
+                dec,
+            })
+        } else if mime.eq_ignore_ascii_case("video/H264") {
+            H264VideoDecoder::new().ok().map(Self::H264)
+        } else {
+            None
+        }
+    }
+
+    fn push(&mut self, pkt: &InboundVideoPacket) -> (Option<VideoFrame>, bool) {
+        match self {
+            Self::Av1 { frames, dec } => {
+                if let Some(unit) = frames.push(pkt.seq, pkt.marker, &pkt.payload) {
+                    match dec.decode(&unit) {
+                        Ok(frame) => (frame, false),
+                        Err(_) => (None, true),
+                    }
+                } else {
+                    (None, false)
+                }
+            }
+            Self::H264(dec) => (dec.push_rtp_payload(&pkt.payload, pkt.marker), false),
+        }
+    }
+}
+
 async fn run_session(
     creds: HuddleCredentials,
     mut config: HuddleAudioConfig,
@@ -67,14 +109,18 @@ async fn run_session(
         phase: HuddlePhase::Connecting,
         channel: creds.channel.clone(),
         call_id: creds.call_id.clone(),
+        attendee_id: creds.attendee_id.clone(),
         muted: config.muted,
         video: false,
         blur_background: config.blur_background,
         sharing: false,
         share_source_id: None,
         hand_raised: false,
+        sticky_emoji: None,
         captions_enabled: false,
         topic: None,
+        background_id: None,
+        jukebox_song: None,
         started_at_secs: now_secs(),
         thread_root_ts: creds.thread_root_ts.clone(),
         canvas_file_id: creds.canvas_file_id.clone(),
@@ -126,6 +172,7 @@ async fn run_session(
             snap.phase = HuddlePhase::Idle;
             snap.video = false;
             snap.sharing = false;
+            snap.jukebox_song = None;
             snap.error = None;
             let _ = updates.send(HuddleUpdate::State(Box::new(snap)));
         }
@@ -133,6 +180,7 @@ async fn run_session(
             snap.phase = HuddlePhase::Failed;
             snap.video = false;
             snap.sharing = false;
+            snap.jukebox_song = None;
             snap.udp_blocked = matches!(err, HuddleError::UdpBlocked);
             snap.error = Some(err.to_string());
             let _ = updates.send(HuddleUpdate::State(Box::new(snap)));
@@ -215,7 +263,7 @@ async fn run_connected_loop(
         &sdp_offer,
         wants_compressed,
         config.muted,
-        snap.video || snap.sharing,
+        snap.video,
         &[],
     ) {
         Ok(f) => f,
@@ -281,9 +329,11 @@ async fn run_connected_loop(
     };
 
     let mut camera_capture: Option<CameraCapture> = None;
-    let mut screen_capture: Option<ScreenCapture> = None;
-    let mut remote_sources: Vec<RemoteVideoSource> = Vec::new();
-    let mut remote_decoders: HashMap<u32, H264VideoDecoder> = HashMap::new();
+    let mut content_share: Option<ContentShareSession> = None;
+    let mut music_player: Option<AmbientMusicPlayer> = None;
+    let mut remote_sources: Vec<(String, RemoteVideoSource)> = Vec::new();
+    let mut remote_decoders: HashMap<u32, RemoteVideoDecoder> = HashMap::new();
+    let mut last_keyframe_req: HashMap<u32, Instant> = HashMap::new();
     let mut active_remote_tiles: HashSet<VideoTileKey> = HashSet::new();
 
     let mut ever_connected = peer.connection_state() == RTCPeerConnectionState::Connected;
@@ -302,6 +352,7 @@ async fn run_connected_loop(
 
     let self_user =
         parse_external_user_id(&creds.external_user_id).unwrap_or_else(|| UserId::from("U0SELF"));
+    let self_content_attendee = format!("{}#content", creds.attendee_id);
 
     let mut exit_reason: Option<LoopExit> = None;
 
@@ -321,12 +372,7 @@ async fn run_connected_loop(
                 let _ = peer.write_opus_frame(opus_pkt).await;
             }
             Some(h264_frame) = outbound_h264_rx.recv() => {
-                let dur = if screen_capture.is_some() {
-                    Duration::from_millis(125)
-                } else {
-                    Duration::from_millis(66)
-                };
-                let _ = peer.write_h264_frame(h264_frame, dur).await;
+                let _ = peer.write_h264_frame(h264_frame, Duration::from_millis(66)).await;
             }
             Some(frame) = local_cam_rx.recv() => {
                 let _ = updates.send(HuddleUpdate::VideoFrame {
@@ -341,17 +387,34 @@ async fn run_connected_loop(
                 });
             }
             Some(pkt) = inbound_video_rx.recv() => {
-                let decoder = remote_decoders
-                    .entry(pkt.ssrc)
-                    .or_insert_with(|| H264VideoDecoder::new().expect("openh264 decoder"));
-                if let Some(frame) = decoder.push_rtp_payload(&pkt.payload, pkt.marker) {
-                    let tile = resolve_remote_video_tile(
-                        pkt.ssrc,
-                        &ssrc_to_stream_id,
-                        &remote_sources,
-                    );
-                    if let Some(tile) = tile {
-                        let _ = updates.send(HuddleUpdate::VideoFrame { tile, frame });
+                let is_new = !remote_decoders.contains_key(&pkt.ssrc);
+                if is_new {
+                    if let Some(dec) = RemoteVideoDecoder::for_mime(&pkt.mime_type) {
+                        remote_decoders.insert(pkt.ssrc, dec);
+                        last_keyframe_req.insert(pkt.ssrc, Instant::now());
+                        peer.request_keyframe(pkt.ssrc).await;
+                    }
+                }
+                if let Some(decoder) = remote_decoders.get_mut(&pkt.ssrc) {
+                    let (frame_opt, needs_keyframe) = decoder.push(&pkt);
+                    if needs_keyframe {
+                        let should_req = last_keyframe_req
+                            .get(&pkt.ssrc)
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                        if should_req {
+                            last_keyframe_req.insert(pkt.ssrc, Instant::now());
+                            peer.request_keyframe(pkt.ssrc).await;
+                        }
+                    }
+                    if let Some(frame) = frame_opt {
+                        if let Some(tile) = resolve_remote_video_tile(
+                            pkt.ssrc,
+                            &pkt.mid,
+                            &ssrc_to_stream_id,
+                            &remote_sources,
+                        ) {
+                            let _ = updates.send(HuddleUpdate::VideoFrame { tile, frame });
+                        }
                     }
                 }
             }
@@ -394,8 +457,13 @@ async fn run_connected_loop(
                             }
                         }
                         if let Some(index) = frame.index {
-                            let next_sources = parse_index_sources(&index, &creds.attendee_id);
-                            let next_tiles: HashSet<VideoTileKey> = next_sources
+                            // Ignore our own camera and our own `#content` screen share.
+                            let next_raw: Vec<RemoteVideoSource> =
+                                parse_index_sources(&index, &creds.attendee_id)
+                                    .into_iter()
+                                    .filter(|s| s.attendee_id != self_content_attendee)
+                                    .collect();
+                            let next_tiles: HashSet<VideoTileKey> = next_raw
                                 .iter()
                                 .map(|s| {
                                     if s.is_content {
@@ -408,11 +476,42 @@ async fn run_connected_loop(
                             for removed in active_remote_tiles.difference(&next_tiles) {
                                 let _ = updates.send(HuddleUpdate::VideoTileClosed(removed.clone()));
                             }
-                            if next_sources != remote_sources {
-                                let subs = build_video_subscriptions(&next_sources);
-                                let upd_frame = build_remote_video_update_frame(subs, Vec::new());
-                                let _ = signal.send_frame(&upd_frame).await;
-                                remote_sources = next_sources;
+                            let cur_raw: Vec<&RemoteVideoSource> =
+                                remote_sources.iter().map(|(_, s)| s).collect();
+                            let same_sources = cur_raw.len() == next_raw.len()
+                                && cur_raw.iter().zip(&next_raw).all(|(a, b)| *a == b);
+                            if !same_sources {
+                                if next_raw.is_empty() {
+                                    let removed_mids: Vec<String> =
+                                        remote_sources.iter().map(|(m, _)| m.clone()).collect();
+                                    if !removed_mids.is_empty() {
+                                        let upd = build_remote_video_update_frame(
+                                            Vec::new(),
+                                            removed_mids,
+                                        );
+                                        let _ = signal.send_frame(&upd).await;
+                                    }
+                                    remote_sources.clear();
+                                } else if let Ok((offer, mids)) =
+                                    peer.prepare_video_receive_offer(next_raw.len()).await
+                                {
+                                    let paired: Vec<(String, RemoteVideoSource)> =
+                                        mids.into_iter().zip(next_raw).collect();
+                                    if let Ok(sub_f) = build_subscribe_frame(
+                                        creds,
+                                        &offer,
+                                        wants_compressed,
+                                        config.muted,
+                                        snap.video,
+                                        &paired,
+                                    ) {
+                                        let _ = signal.send_frame(&sub_f).await;
+                                    }
+                                    let subs = build_video_subscriptions(&paired);
+                                    let upd = build_remote_video_update_frame(subs, Vec::new());
+                                    let _ = signal.send_frame(&upd).await;
+                                    remote_sources = paired;
+                                }
                             }
                             active_remote_tiles = next_tiles;
                         }
@@ -431,10 +530,27 @@ async fn run_connected_loop(
                         }
                         if let Some(dm) = frame.data_message {
                             for msg in dm.messages {
-                                if let Some(ev) = parse_data_message(&msg) {
-                                    if let HuddleDataEvent::Topic { topic, .. } = &ev {
-                                        snap.topic = Some(topic.clone());
-                                        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                                for ev in parse_incoming_data_message(
+                                    &msg,
+                                    &creds.attendee_id,
+                                ) {
+                                    match &ev {
+                                        HuddleDataEvent::Topic { topic, .. } => {
+                                            snap.topic = (!topic.is_empty()).then(|| topic.clone());
+                                            let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                                        }
+                                        HuddleDataEvent::MutedByPeer { .. } => {
+                                            config.muted = true;
+                                            shared.muted.store(true, Ordering::Relaxed);
+                                            snap.muted = true;
+                                            let _ = signal.send_frame(&build_audio_control_frame(true)).await;
+                                            let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                                        }
+                                        HuddleDataEvent::Jukebox { song_key, .. } => {
+                                            snap.jukebox_song = song_key.clone();
+                                            let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                                        }
+                                        _ => {}
                                     }
                                     let _ = updates.send(HuddleUpdate::DataEvent(ev));
                                 }
@@ -568,13 +684,6 @@ async fn run_connected_loop(
                         config.blur_background = blur;
                         snap.blur_background = blur;
                         if enabled {
-                            // Stop screen share if active so outbound video track carries camera cleanly.
-                            if let Some(mut sc) = screen_capture.take() {
-                                sc.stop();
-                                snap.sharing = false;
-                                snap.share_source_id = None;
-                                let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalScreen));
-                            }
                             if let Some(mut prev) = camera_capture.take() {
                                 prev.stop();
                             }
@@ -612,18 +721,16 @@ async fn run_connected_loop(
                             }
                             snap.video = false;
                             let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalCamera));
-                            if !snap.sharing {
-                                if let Ok(offer) = peer.create_gathered_offer().await {
-                                    if let Ok(f) = build_subscribe_frame(
-                                        creds,
-                                        &offer,
-                                        wants_compressed,
-                                        config.muted,
-                                        false,
-                                        &remote_sources,
-                                    ) {
-                                        let _ = signal.send_frame(&f).await;
-                                    }
+                            if let Ok(offer) = peer.create_gathered_offer().await {
+                                if let Ok(f) = build_subscribe_frame(
+                                    creds,
+                                    &offer,
+                                    wants_compressed,
+                                    config.muted,
+                                    false,
+                                    &remote_sources,
+                                ) {
+                                    let _ = signal.send_frame(&f).await;
                                 }
                             }
                         }
@@ -638,37 +745,49 @@ async fn run_connected_loop(
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
                     Some(HuddleControl::SetScreenShare { source_id }) => {
+                        if let Some(mut prev) = content_share.take() {
+                            prev.stop();
+                        }
                         if let Some(src_id) = source_id {
-                            if let Some(mut cam) = camera_capture.take() {
-                                cam.stop();
-                                snap.video = false;
-                                let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalCamera));
-                            }
-                            if let Some(mut prev) = screen_capture.take() {
-                                prev.stop();
-                            }
-                            match ScreenCapture::start(
+                            // Native `#content` second Chime session — runs simultaneously with camera!
+                            match ContentShareSession::start(
+                                creds.clone(),
                                 src_id.clone(),
-                                outbound_h264_tx.clone(),
                                 local_screen_tx.clone(),
-                            ) {
-                                Ok(cap) => {
-                                    screen_capture = Some(cap);
+                            )
+                            .await
+                            {
+                                Ok(cs) => {
+                                    content_share = Some(cs);
                                     snap.sharing = true;
-                                    snap.share_source_id = Some(src_id);
+                                    snap.share_source_id = Some(src_id.clone());
                                     snap.error = None;
-                                    if let Ok(offer) = peer.create_gathered_offer().await {
-                                        if let Ok(f) = build_subscribe_frame(
-                                            creds,
-                                            &offer,
-                                            wants_compressed,
-                                            config.muted,
-                                            true,
-                                            &remote_sources,
-                                        ) {
-                                            let _ = signal.send_frame(&f).await;
-                                        }
-                                    }
+                                    // Announce draw capability + content source details on official `"data-channel"`.
+                                    let cap_bytes =
+                                        build_capabilities_message(&creds.attendee_id, true);
+                                    let _ = signal
+                                        .send_frame(&build_data_message_frame(
+                                            SLACK_DATA_CHANNEL_TOPIC,
+                                            cap_bytes,
+                                            30_000,
+                                        ))
+                                        .await;
+                                    let src_kind = if src_id.starts_with("monitor:") {
+                                        "screen"
+                                    } else {
+                                        "window"
+                                    };
+                                    let det_bytes = build_content_share_details_message(
+                                        &creds.attendee_id,
+                                        src_kind,
+                                    );
+                                    let _ = signal
+                                        .send_frame(&build_data_message_frame(
+                                            SLACK_DATA_CHANNEL_TOPIC,
+                                            det_bytes,
+                                            30_000,
+                                        ))
+                                        .await;
                                 }
                                 Err(err) => {
                                     snap.sharing = false;
@@ -677,46 +796,46 @@ async fn run_connected_loop(
                                 }
                             }
                         } else {
-                            if let Some(mut sc) = screen_capture.take() {
-                                sc.stop();
-                            }
                             snap.sharing = false;
                             snap.share_source_id = None;
                             let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalScreen));
-                            if !snap.video {
-                                if let Ok(offer) = peer.create_gathered_offer().await {
-                                    if let Ok(f) = build_subscribe_frame(
-                                        creds,
-                                        &offer,
-                                        wants_compressed,
-                                        config.muted,
-                                        false,
-                                        &remote_sources,
-                                    ) {
-                                        let _ = signal.send_frame(&f).await;
-                                    }
-                                }
-                            }
                         }
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
-                    Some(HuddleControl::SendReaction(emoji)) => {
-                        let frame = build_data_message_frame(
-                            "huddle:reaction",
-                            emoji.as_bytes().to_vec(),
-                            4000,
+                    Some(HuddleControl::SendReaction {
+                        emoji,
+                        kind,
+                        emoji_url,
+                    }) => {
+                        let bytes = build_reacji_message(
+                            &creds.attendee_id,
+                            &emoji,
+                            kind,
+                            emoji_url.clone(),
                         );
+                        let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 4000);
                         let _ = signal.send_frame(&frame).await;
                         let _ = updates.send(HuddleUpdate::DataEvent(HuddleDataEvent::Reaction {
                             user: self_user.clone(),
                             emoji,
+                            kind,
+                            emoji_url,
                             at_ms: now_ms(),
                         }));
                     }
                     Some(HuddleControl::SetHandRaised(raised)) => {
                         snap.hand_raised = raised;
-                        let payload = if raised { b"1".to_vec() } else { b"0".to_vec() };
-                        let frame = build_data_message_frame("huddle:hand", payload, 30_000);
+                        let sticky = raised.then(|| "raised_hand".to_owned());
+                        snap.sticky_emoji = sticky.clone();
+                        let bytes = build_sticky_emoji_awareness(
+                            &creds.attendee_id,
+                            &creds.call_id,
+                            &self_user,
+                            sticky.as_deref(),
+                            now_ms() as i64,
+                        );
+                        let frame =
+                            build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 30_000);
                         let _ = signal.send_frame(&frame).await;
                         let _ = updates.send(HuddleUpdate::DataEvent(HuddleDataEvent::HandRaise {
                             user: self_user.clone(),
@@ -724,15 +843,65 @@ async fn run_connected_loop(
                         }));
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
+                    Some(HuddleControl::SetStickyEmoji(emoji)) => {
+                        snap.sticky_emoji = emoji.clone();
+                        snap.hand_raised = emoji.as_deref() == Some("raised_hand");
+                        let bytes = build_sticky_emoji_awareness(
+                            &creds.attendee_id,
+                            &creds.call_id,
+                            &self_user,
+                            emoji.as_deref(),
+                            now_ms() as i64,
+                        );
+                        let frame =
+                            build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 30_000);
+                        let _ = signal.send_frame(&frame).await;
+                        let _ = updates.send(HuddleUpdate::DataEvent(HuddleDataEvent::StickyEmoji {
+                            user: self_user.clone(),
+                            emoji,
+                        }));
+                        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                    }
+                    Some(HuddleControl::SendDraw(draw_msg)) => {
+                        let bytes = build_draw_message(&creds.attendee_id, &draw_msg);
+                        let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 5000);
+                        let _ = signal.send_frame(&frame).await;
+                        let _ = updates.send(HuddleUpdate::DataEvent(HuddleDataEvent::Draw {
+                            user: self_user.clone(),
+                            message: draw_msg,
+                            at_ms: now_ms(),
+                        }));
+                    }
+                    Some(HuddleControl::SetJukebox(song_key)) => {
+                        if let Some(mut prev) = music_player.take() {
+                            prev.stop();
+                        }
+                        if song_key.is_some() {
+                            music_player =
+                                AmbientMusicPlayer::start(config.output_device.clone()).ok();
+                        }
+                        snap.jukebox_song = song_key.clone();
+                        let bytes = build_jukebox_message(&creds.attendee_id, song_key.as_deref());
+                        let frame =
+                            build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 15_000);
+                        let _ = signal.send_frame(&frame).await;
+                        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                    }
+                    Some(HuddleControl::MutePeer(peer_id)) => {
+                        let bytes = build_mute_request_message(&creds.attendee_id, &peer_id);
+                        let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 5000);
+                        let _ = signal.send_frame(&frame).await;
+                    }
                     Some(HuddleControl::SetTopic(topic)) => {
                         snap.topic = (!topic.trim().is_empty()).then(|| topic.clone());
-                        let frame =
-                            build_data_message_frame("huddle:topic", topic.as_bytes().to_vec(), 60_000);
-                        let _ = signal.send_frame(&frame).await;
                         let _ = updates.send(HuddleUpdate::DataEvent(HuddleDataEvent::Topic {
                             user: self_user.clone(),
                             topic,
                         }));
+                        let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                    }
+                    Some(HuddleControl::SetBackground(bg_id)) => {
+                        snap.background_id = bg_id;
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
                     Some(HuddleControl::SetCaptionsEnabled(enabled)) => {
@@ -747,12 +916,15 @@ async fn run_connected_loop(
         }
     }
 
-    // 7. Clean teardown: stop captures, send Chime LEAVE, wait briefly for LEAVE_ACK, close peer & WS.
+    // 7. Clean teardown: stop captures, content share, music, send Chime LEAVE, close peer & WS.
     if let Some(mut cam) = camera_capture.take() {
         cam.stop();
     }
-    if let Some(mut sc) = screen_capture.take() {
-        sc.stop();
+    if let Some(mut cs) = content_share.take() {
+        cs.stop();
+    }
+    if let Some(mut mp) = music_player.take() {
+        mp.stop();
     }
     snap.packets_sent = peer.total_packets_sent();
     snap.packets_received = peer.total_packets_received();
@@ -769,11 +941,12 @@ async fn run_connected_loop(
 
 fn resolve_remote_video_tile(
     ssrc: u32,
+    mid: &str,
     ssrc_to_stream: &HashMap<u32, u32>,
-    sources: &[RemoteVideoSource],
+    sources: &[(String, RemoteVideoSource)],
 ) -> Option<VideoTileKey> {
-    if let Some(&sid) = ssrc_to_stream.get(&ssrc) {
-        if let Some(src) = sources.iter().find(|s| s.stream_id == sid) {
+    if !mid.is_empty() {
+        if let Some((_, src)) = sources.iter().find(|(m, _)| m == mid) {
             return Some(if src.is_content {
                 VideoTileKey::RemoteScreen(src.user_id.clone())
             } else {
@@ -781,8 +954,16 @@ fn resolve_remote_video_tile(
             });
         }
     }
-    // Fallback when Chime sends a single remote video stream before track-mapping updates.
-    sources.first().map(|src| {
+    if let Some(&sid) = ssrc_to_stream.get(&ssrc) {
+        if let Some((_, src)) = sources.iter().find(|(_, s)| s.stream_id == sid) {
+            return Some(if src.is_content {
+                VideoTileKey::RemoteScreen(src.user_id.clone())
+            } else {
+                VideoTileKey::RemoteCamera(src.user_id.clone())
+            });
+        }
+    }
+    sources.first().map(|(_, src)| {
         if src.is_content {
             VideoTileKey::RemoteScreen(src.user_id.clone())
         } else {
@@ -791,34 +972,31 @@ fn resolve_remote_video_tile(
     })
 }
 
-fn parse_data_message(msg: &crate::proto::SdkDataMessagePayload) -> Option<HuddleDataEvent> {
-    let topic = msg.topic.as_deref()?;
-    let data = msg.data.as_deref()?;
-    let text = std::str::from_utf8(data).ok()?.trim();
-    let user = msg
+fn parse_incoming_data_message(
+    msg: &crate::proto::SdkDataMessagePayload,
+    self_attendee_id: &str,
+) -> Vec<HuddleDataEvent> {
+    let topic = msg.topic.as_deref().unwrap_or("");
+    let data = msg.data.as_deref().unwrap_or(&[]);
+    let at_ms = msg
+        .ingest_time_ns
+        .map(|ns| (ns.max(0) as u64) / 1_000_000)
+        .unwrap_or_else(now_ms);
+
+    if topic == CHIME_TRANSCRIPTION_TOPIC {
+        return decode_chime_transcript_frame(data, at_ms);
+    }
+
+    let sender = msg
         .sender_external_user_id
         .as_deref()
         .and_then(parse_external_user_id)
-        .unwrap_or_else(|| UserId::from(msg.sender_attendee_id.as_deref().unwrap_or("U0PEER")));
-    match topic {
-        "huddle:reaction" if !text.is_empty() => Some(HuddleDataEvent::Reaction {
-            user,
-            emoji: text.to_owned(),
-            at_ms: now_ms(),
-        }),
-        "huddle:hand" => Some(HuddleDataEvent::HandRaise {
-            user,
-            raised: text == "1" || text.eq_ignore_ascii_case("true"),
-        }),
-        "huddle:topic" => Some(HuddleDataEvent::Topic {
-            user,
-            topic: text.to_owned(),
-        }),
-        "huddle:caption" if !text.is_empty() => Some(HuddleDataEvent::Caption {
-            user,
-            text: text.to_owned(),
-            at_ms: now_ms(),
-        }),
-        _ => None,
+        .unwrap_or_else(|| UserId::from("U0PEER"));
+    let sender_att = msg.sender_attendee_id.as_deref().unwrap_or("");
+
+    if topic == SLACK_DATA_CHANNEL_TOPIC {
+        return decode_slack_peer_message(&sender, sender_att, self_attendee_id, data, at_ms);
     }
+
+    Vec::new()
 }

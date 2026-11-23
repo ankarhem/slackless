@@ -2387,4 +2387,70 @@ impl SlackApi {
             .or(wire.url)
             .filter(|s| !s.is_empty()))
     }
+
+    /// `screenhero.rooms.rename`: set or clear the live huddle's topic (`F-COLLAB-016`).
+    pub async fn rooms_rename(&self, room_id: &str, room_name: &str) -> Result<()> {
+        let params = vec![
+            ("room", room_id.to_owned()),
+            ("room_name", room_name.to_owned()),
+        ];
+        self.call::<Empty>(method::SCREENHERO_ROOMS_RENAME, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `rooms.startTranscription`: enable server-side AWS Transcribe live captions (`F-COLLAB-037`).
+    pub async fn rooms_start_transcription(&self, call_id: &str) -> Result<()> {
+        let params = vec![
+            ("call_id", call_id.to_owned()),
+            ("reason", "start-event-log".to_owned()),
+        ];
+        self.call::<Empty>(method::ROOMS_START_TRANSCRIPTION, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `rooms.stopTranscription`: disable server-side AWS Transcribe live captions.
+    pub async fn rooms_stop_transcription(&self, call_id: &str) -> Result<()> {
+        let params = vec![
+            ("call_id", call_id.to_owned()),
+            ("reason", "stop-event-log".to_owned()),
+        ];
+        self.call::<Empty>(method::ROOMS_STOP_TRANSCRIPTION, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `rooms.inviteResponse`: decline or respond (`"decline"`, `"joining_soon"`) to a DM huddle invite.
+    pub async fn rooms_invite_response(
+        &self,
+        channel_id: &ChannelId,
+        room_id: &str,
+        response: &str,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel_id.to_string()),
+            ("room_id", room_id.to_owned()),
+            ("response", response.to_owned()),
+            ("reason", "respond-to-huddle-invite".to_owned()),
+        ];
+        self.call::<Empty>(method::ROOMS_INVITE_RESPONSE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `huddles.update`: update the huddle's theme/background id (`F-COLLAB-035`).
+    pub async fn huddles_update_background(
+        &self,
+        huddle_id: &str,
+        background_id: &str,
+    ) -> Result<()> {
+        let params = vec![
+            ("huddle_id", huddle_id.to_owned()),
+            ("background_id", background_id.to_owned()),
+            ("reason", "canvas-background-update".to_owned()),
+        ];
+        self.call::<Empty>(method::HUDDLES_UPDATE, params).await?;
+        Ok(())
+    }
 }

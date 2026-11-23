@@ -1421,10 +1421,16 @@ impl App {
         let channel = invite.channel.clone();
         let banner =
             crate::huddle_invite::HuddleInviteBanner::new(self.fixtures.clone(), invite, cx);
+        let decl_ch = channel.clone();
+        let decl_call = call_id.clone();
         let sub = cx.subscribe_in(
             &banner,
             window,
-            |this: &mut App, _, event: &crate::huddle_invite::HuddleInviteEvent, window, cx| {
+            move |this: &mut App,
+                  _,
+                  event: &crate::huddle_invite::HuddleInviteEvent,
+                  window,
+                  cx| {
                 match event {
                     crate::huddle_invite::HuddleInviteEvent::Accept(ch) => {
                         this.dismiss_huddle_invite(cx);
@@ -1433,6 +1439,12 @@ impl App {
                     }
                     crate::huddle_invite::HuddleInviteEvent::Decline => {
                         this.dismiss_huddle_invite(cx);
+                        if !this.fixtures.sample {
+                            this.bridge.send(Command::DeclineHuddleInvite {
+                                channel: decl_ch.clone(),
+                                call_id: decl_call.clone(),
+                            });
+                        }
                     }
                 }
             },
