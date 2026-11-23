@@ -1052,9 +1052,16 @@ impl App {
             }
             Event::HuddleSessionChanged(snap) => {
                 let snap = (**snap).clone();
+                let prev_phase = self.huddle_session.as_ref().map(|s| s.phase);
                 if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
+                    if prev_phase.is_some() {
+                        self.play_huddle_chime(slackless_core::huddle::HuddleChime::Leave, cx);
+                    }
                     self.clear_huddle_dock(cx);
                 } else {
+                    let newly_connected = snap.phase
+                        == slackless_core::huddle::HuddlePhase::Connected
+                        && prev_phase != Some(slackless_core::huddle::HuddlePhase::Connected);
                     self.huddle_session = Some(snap.clone());
                     if let Some(dock) = &self.huddle_dock {
                         dock.update(cx, |d, cx| d.update_session(snap.clone(), cx));
@@ -1066,6 +1073,15 @@ impl App {
                             bar.update(cx, |b, cx| b.update_session(Some(snap.clone()), cx));
                         }
                     }
+                    if newly_connected {
+                        self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
+                        if self.preferences.read(cx).settings().huddle_auto_captions
+                            && !snap.captions_enabled
+                            && !self.fixtures.sample
+                        {
+                            self.bridge.send(Command::SetHuddleCaptions(true));
+                        }
+                    }
                 }
                 cx.notify();
             }
@@ -1075,6 +1091,30 @@ impl App {
                 }
                 if let Some((_, bar)) = &self.huddle {
                     bar.update(cx, |b, cx| b.update_levels(levels.clone(), cx));
+                }
+            }
+            Event::HuddleVideoFrame { tile, frame } => {
+                if let Some(dock) = &self.huddle_dock {
+                    dock.update(cx, |d, cx| d.update_video_frame(tile.clone(), frame, cx));
+                }
+            }
+            Event::HuddleVideoTileClosed(tile) => {
+                if let Some(dock) = &self.huddle_dock {
+                    dock.update(cx, |d, cx| d.close_video_tile(tile, cx));
+                }
+            }
+            Event::HuddleDataEvent(ev) => {
+                if let Some(dock) = &self.huddle_dock {
+                    let show_reactions = self
+                        .preferences
+                        .read(cx)
+                        .settings()
+                        .huddle_reaction_animations;
+                    if show_reactions
+                        || !matches!(ev, slackless_core::huddle::HuddleDataEvent::Reaction { .. })
+                    {
+                        dock.update(cx, |d, cx| d.apply_data_event(ev, cx));
+                    }
                 }
             }
             Event::HuddleInvite {

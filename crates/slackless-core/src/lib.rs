@@ -580,6 +580,26 @@ pub enum Command {
     TestHuddleSpeaker {
         output_device: Option<String>,
     },
+    /// Enable or disable local webcam H.264 video in the active huddle (Phase 2).
+    SetHuddleCamera {
+        enabled: bool,
+        device_index: Option<usize>,
+        blur: bool,
+    },
+    /// Toggle software portrait background blur on the active local camera stream.
+    SetHuddleBlurBackground(bool),
+    /// Share a local monitor/window (`Some(source_id)`) or stop screen sharing (`None`) (Phase 3).
+    SetHuddleScreenShare {
+        source_id: Option<String>,
+    },
+    /// Broadcast a floating emoji reaction to huddle peers over Chime `DATA_MESSAGE` (Phase 4).
+    SendHuddleReaction(String),
+    /// Raise or lower the local participant's hand over Chime `DATA_MESSAGE` (Phase 4).
+    SetHuddleHandRaised(bool),
+    /// Set or clear the editable huddle topic over Chime `DATA_MESSAGE` (`F-COLLAB-016`).
+    SetHuddleTopic(String),
+    /// Enable or disable live huddle captions overlay (Phase 4).
+    SetHuddleCaptions(bool),
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -768,6 +788,15 @@ pub enum Event {
     },
     /// Shareable huddle join link fetched via `rooms.getLink` (`F-COLLAB-039`).
     HuddleLinkLoaded { channel: ChannelId, url: String },
+    /// Decoded BGRA8888 video frame for a local/remote camera or screen-share tile (Phases 2–3).
+    HuddleVideoFrame {
+        tile: huddle::VideoTileKey,
+        frame: huddle::VideoFrame,
+    },
+    /// A camera or screen-share video tile stopped publishing and should be removed.
+    HuddleVideoTileClosed(huddle::VideoTileKey),
+    /// Ephemeral collaboration event over Chime `DATA_MESSAGE` (reaction, hand raise, topic, caption).
+    HuddleDataEvent(huddle::HuddleDataEvent),
     /// Hydrated custom profile fields and pronouns for `user` (`users.profile.get` + `team.profile.get`).
     UserProfileLoaded {
         user: UserId,

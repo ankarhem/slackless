@@ -175,7 +175,12 @@ pub struct PopoutWindow {
     huddle_state: Option<crate::huddle_dock::HuddleViewState>,
     huddle_invite_open: bool,
     huddle_devices_open: bool,
+    huddle_share_open: bool,
+    huddle_reactions_open: bool,
+    huddle_stage_expanded: bool,
+    huddle_topic_editing: Option<Entity<TextareaState>>,
     huddle_devices: slackless_core::huddle::AudioDevices,
+    huddle_screens: Vec<slackless_core::huddle::ScreenSource>,
     composer: Entity<Composer>,
     emoji_picker: Entity<EmojiPicker>,
     picker: Option<(PopoutPickerTarget, Point<Pixels>)>,
@@ -375,7 +380,12 @@ impl PopoutWindow {
             huddle_state,
             huddle_invite_open: false,
             huddle_devices_open: false,
+            huddle_share_open: false,
+            huddle_reactions_open: false,
+            huddle_stage_expanded: false,
+            huddle_topic_editing: None,
             huddle_devices: slackless_core::huddle::AudioDevices::default(),
+            huddle_screens: Vec::new(),
             composer,
             emoji_picker,
             picker: None,
@@ -851,6 +861,13 @@ impl PopoutWindow {
         cx.notify();
     }
 
+    fn huddle_dock_entity(&self) -> Option<Entity<crate::huddle_dock::HuddleDock>> {
+        match &self.kind {
+            PopoutKind::Huddle { source, .. } => source.upgrade(),
+            _ => None,
+        }
+    }
+
     fn render_huddle_body(
         &self,
         on_jump: JumpHandler,
@@ -861,14 +878,11 @@ impl PopoutWindow {
         use slackless_core::huddle::HuddlePhase;
 
         let theme = cx.theme();
-        let (bg, border, muted, success, warning, danger, card_bg) = (
-            theme.background,
-            theme.border,
+        let (muted, success, warning, danger) = (
             theme.muted_foreground,
             theme.success,
             theme.warning,
             theme.danger,
-            theme.muted,
         );
 
         let Some(state) = self.huddle_state.clone() else {
@@ -886,9 +900,9 @@ impl PopoutWindow {
                 );
         };
 
-        let snap = state.session;
+        let snap = state.session.clone();
         let channel = snap.channel.clone();
-        let mut people = state.participants;
+        let mut people = state.participants.clone();
         if !people.contains(&self.fixtures.self_user) {
             people.push(self.fixtures.self_user.clone());
         }
@@ -917,76 +931,6 @@ impl PopoutWindow {
             format!("https://app.slack.com/huddle/{team}/{channel}")
         });
 
-        let tiles = h_flex()
-            .flex_wrap()
-            .gap_3()
-            .children(people.iter().map(|uid| {
-                let is_self = *uid == self.fixtures.self_user;
-                let speaking = if is_self {
-                    !snap.muted && state.levels.local_rms > 0.03
-                } else {
-                    state
-                        .levels
-                        .active_speakers
-                        .iter()
-                        .any(|(id, lvl)| id == uid && *lvl > 0.05)
-                };
-                let is_muted = if is_self {
-                    snap.muted
-                } else {
-                    state.levels.muted_peers.contains(uid)
-                };
-                let name = self.fixtures.user_name(uid).to_owned();
-                v_flex()
-                    .w(px(164.))
-                    .p_4()
-                    .gap_2()
-                    .items_center()
-                    .rounded_xl()
-                    .bg(card_bg)
-                    .border_2()
-                    .border_color(if speaking { success } else { border })
-                    .child(
-                        div()
-                            .relative()
-                            .child(crate::avatars::user_chip(&self.fixtures, uid, 64.))
-                            .when(is_muted, |el| {
-                                el.child(
-                                    div()
-                                        .absolute()
-                                        .right(px(-4.))
-                                        .bottom(px(-4.))
-                                        .size(px(22.))
-                                        .rounded_full()
-                                        .bg(bg)
-                                        .border_1()
-                                        .border_color(border)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Icon::new(IconName::MicOff)
-                                                .size(px(12.))
-                                                .text_color(danger),
-                                        ),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .text_center()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(if is_self {
-                                format!("{name} (You)")
-                            } else {
-                                name
-                            }),
-                    )
-            }));
-
         let send_copy = self.send.clone();
         let copy_ch = channel.clone();
         let thread_ch = channel.clone();
@@ -998,7 +942,7 @@ impl PopoutWindow {
             .flex_1()
             .min_h_0()
             .p_4()
-            .gap_4()
+            .gap_3()
             .overflow_y_scroll()
             .child(
                 h_flex()
@@ -1069,6 +1013,7 @@ impl PopoutWindow {
                             .on_click(move |_, _, cx| cx.open_url(&browser_url)),
                     ),
             )
+            .child(self.render_huddle_topic_bar(snap.topic.as_deref(), cx))
             .when_some(snap.error.clone(), |col, err| {
                 col.child(
                     h_flex()
@@ -1086,9 +1031,24 @@ impl PopoutWindow {
                         )
                         .child(err),
                 )
-            })
-            .child(tiles);
+            });
 
+        if let Some(stage) = self.render_huddle_stage(&state, cx) {
+            body = body.child(stage);
+        }
+
+        body = body.child(self.render_huddle_tiles(&state, &people, cx));
+
+        if let Some(overlays) = self.render_huddle_overlays(&state, cx) {
+            body = body.child(overlays);
+        }
+
+        if self.huddle_share_open {
+            body = body.child(self.render_huddle_share_panel(snap.share_source_id.as_deref(), cx));
+        }
+        if self.huddle_reactions_open {
+            body = body.child(self.render_huddle_reactions_panel(cx));
+        }
         if self.huddle_invite_open {
             body = body.child(self.render_huddle_invite_panel(&channel, &people, cx));
         }
@@ -1105,7 +1065,543 @@ impl PopoutWindow {
             .flex_1()
             .min_h_0()
             .child(body)
-            .child(self.render_huddle_controls(snap.muted, cx))
+            .child(self.render_huddle_controls(&snap, cx))
+    }
+
+    fn render_huddle_topic_bar(
+        &self,
+        topic: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let theme = cx.theme();
+        let (border, muted, card_bg) = (theme.border, theme.muted_foreground, theme.muted);
+        if let Some(input) = &self.huddle_topic_editing {
+            return h_flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Textarea::new(input).appearance(false).bordered(false)),
+                )
+                .child(
+                    Button::new("popout-huddle-topic-save")
+                        .primary()
+                        .with_size(Size::XSmall)
+                        .label("Save")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(inp) = this.huddle_topic_editing.take() {
+                                let text = inp.read(cx).value().trim().to_owned();
+                                (this.send)(Command::SetHuddleTopic(text.clone()));
+                                if this.fixtures.sample {
+                                    if let Some(dock) = this.huddle_dock_entity() {
+                                        let me = this.fixtures.self_user.clone();
+                                        dock.update(cx, |d, cx| {
+                                            d.apply_data_event(
+                                                &slackless_core::huddle::HuddleDataEvent::Topic {
+                                                    user: me,
+                                                    topic: text,
+                                                },
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("popout-huddle-topic-cancel")
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.huddle_topic_editing = None;
+                            cx.notify();
+                        })),
+                );
+        }
+        let initial = topic.unwrap_or_default().to_owned();
+        h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div().text_xs().text_color(muted).child(
+                    topic
+                        .map(|t| format!("Topic: {t}"))
+                        .unwrap_or_else(|| "No huddle topic set".to_owned()),
+                ),
+            )
+            .child(
+                Button::new("popout-huddle-topic-edit")
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::Pencil)
+                    .label(if topic.is_some() { "Edit" } else { "Set topic" })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let init = initial.clone();
+                        let input = cx.new(|cx| {
+                            let mut st = TextareaState::new(window, cx)
+                                .placeholder("What are you discussing?")
+                                .auto_grow(1, 2);
+                            st.set_value(init, window, cx);
+                            st
+                        });
+                        input.read(cx).focus_handle(cx).focus(window, cx);
+                        this.huddle_topic_editing = Some(input);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_huddle_stage(
+        &self,
+        state: &crate::huddle_dock::HuddleViewState,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::gpui::Div> {
+        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
+        use slackless_core::huddle::VideoTileKey;
+
+        let active_screen = state
+            .video_frames
+            .iter()
+            .find_map(|(k, v)| match k {
+                VideoTileKey::RemoteScreen(uid) => Some((
+                    format!("{} is sharing their screen", self.fixtures.user_name(uid)),
+                    v.clone(),
+                )),
+                _ => None,
+            })
+            .or_else(|| {
+                state
+                    .video_frames
+                    .get(&VideoTileKey::LocalScreen)
+                    .map(|v| ("You are sharing your screen".to_owned(), v.clone()))
+            })?;
+
+        let theme = cx.theme();
+        let (border, card_bg, muted) = (theme.border, theme.muted, theme.muted_foreground);
+        let stage_h = if self.huddle_stage_expanded {
+            px(440.)
+        } else {
+            px(270.)
+        };
+
+        Some(
+            v_flex()
+                .w_full()
+                .gap_1p5()
+                .p_2()
+                .rounded_xl()
+                .border_1()
+                .border_color(border)
+                .bg(card_bg)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(muted)
+                                .child(active_screen.0),
+                        )
+                        .child(
+                            Button::new("popout-huddle-stage-expand")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .label(if self.huddle_stage_expanded {
+                                    "Compact"
+                                } else {
+                                    "Expand"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.huddle_stage_expanded = !this.huddle_stage_expanded;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(stage_h)
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .bg(gpui_kit::gpui::black())
+                        .child(
+                            img(active_screen.1)
+                                .w_full()
+                                .h_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                ),
+        )
+    }
+
+    fn render_huddle_tiles(
+        &self,
+        state: &crate::huddle_dock::HuddleViewState,
+        people: &[slackless_core::types::UserId],
+        cx: &Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use gpui_kit::component::Icon;
+        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
+        use slackless_core::huddle::VideoTileKey;
+
+        let theme = cx.theme();
+        let (bg, border, success, danger, card_bg) = (
+            theme.background,
+            theme.border,
+            theme.success,
+            theme.danger,
+            theme.muted,
+        );
+        let snap = &state.session;
+
+        h_flex()
+            .flex_wrap()
+            .gap_3()
+            .children(people.iter().map(|uid| {
+                let is_self = *uid == self.fixtures.self_user;
+                let speaking = if is_self {
+                    !snap.muted && state.levels.local_rms > 0.03
+                } else {
+                    state
+                        .levels
+                        .active_speakers
+                        .iter()
+                        .any(|(id, lvl)| id == uid && *lvl > 0.05)
+                };
+                let is_muted = if is_self {
+                    snap.muted
+                } else {
+                    state.levels.muted_peers.contains(uid)
+                };
+                let hand_up = state.raised_hands.contains(uid);
+                let video_frame = if is_self {
+                    state.video_frames.get(&VideoTileKey::LocalCamera).cloned()
+                } else {
+                    state
+                        .video_frames
+                        .get(&VideoTileKey::RemoteCamera(uid.clone()))
+                        .cloned()
+                };
+                let name = self.fixtures.user_name(uid).to_owned();
+                let tile_w = if video_frame.is_some() {
+                    px(220.)
+                } else {
+                    px(164.)
+                };
+
+                v_flex()
+                    .w(tile_w)
+                    .p_3()
+                    .gap_2()
+                    .items_center()
+                    .rounded_xl()
+                    .bg(card_bg)
+                    .border_2()
+                    .border_color(if speaking { success } else { border })
+                    .child(if let Some(frame) = video_frame {
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(124.))
+                            .rounded_lg()
+                            .overflow_hidden()
+                            .bg(gpui_kit::gpui::black())
+                            .child(img(frame).w_full().h_full().object_fit(ObjectFit::Cover))
+                            .when(hand_up, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(6.))
+                                        .top(px(6.))
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_full()
+                                        .bg(bg.opacity(0.9))
+                                        .text_xs()
+                                        .child("✋"),
+                                )
+                            })
+                            .when(is_muted, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(6.))
+                                        .bottom(px(6.))
+                                        .size(px(22.))
+                                        .rounded_full()
+                                        .bg(bg.opacity(0.9))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::MicOff)
+                                                .size(px(12.))
+                                                .text_color(danger),
+                                        ),
+                                )
+                            })
+                    } else {
+                        div()
+                            .relative()
+                            .child(crate::avatars::user_chip(&self.fixtures, uid, 64.))
+                            .when(hand_up, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(-6.))
+                                        .top(px(-6.))
+                                        .px_1()
+                                        .rounded_full()
+                                        .bg(bg)
+                                        .border_1()
+                                        .border_color(border)
+                                        .text_xs()
+                                        .child("✋"),
+                                )
+                            })
+                            .when(is_muted, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-4.))
+                                        .bottom(px(-4.))
+                                        .size(px(22.))
+                                        .rounded_full()
+                                        .bg(bg)
+                                        .border_1()
+                                        .border_color(border)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::MicOff)
+                                                .size(px(12.))
+                                                .text_color(danger),
+                                        ),
+                                )
+                            })
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if is_self {
+                                format!("{name} (You)")
+                            } else {
+                                name
+                            }),
+                    )
+            }))
+    }
+
+    fn render_huddle_overlays(
+        &self,
+        state: &crate::huddle_dock::HuddleViewState,
+        cx: &Context<Self>,
+    ) -> Option<gpui_kit::gpui::Div> {
+        let has_reactions = !state.reactions.is_empty();
+        let show_captions = state.session.captions_enabled || !state.captions.is_empty();
+        if !has_reactions && !show_captions {
+            return None;
+        }
+        let theme = cx.theme();
+        let (border, card_bg, muted) = (theme.border, theme.muted, theme.muted_foreground);
+        let mut col = v_flex().gap_2();
+        if has_reactions {
+            col = col.child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(state.reactions.iter().map(|(uid, emoji, _)| {
+                        let who = self.fixtures.user_name(uid).to_owned();
+                        h_flex()
+                            .px_2()
+                            .py_0p5()
+                            .gap_1()
+                            .rounded_full()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border)
+                            .text_xs()
+                            .child(emoji.clone())
+                            .child(div().text_color(muted).child(who))
+                    })),
+            );
+        }
+        if show_captions {
+            let cap_box = v_flex()
+                .p_2p5()
+                .gap_1()
+                .rounded_lg()
+                .bg(card_bg)
+                .border_1()
+                .border_color(border)
+                .text_xs()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(muted)
+                        .child("Live captions (CC)"),
+                );
+            let cap_box = if state.captions.is_empty() {
+                cap_box.child(
+                    div()
+                        .text_color(muted)
+                        .child("Listening for peer caption transcripts…"),
+                )
+            } else {
+                cap_box.children(state.captions.iter().map(|(uid, text)| {
+                    let who = self.fixtures.user_name(uid).to_owned();
+                    div().child(format!("{who}: {text}"))
+                }))
+            };
+            col = col.child(cap_box);
+        }
+        Some(col)
+    }
+
+    fn render_huddle_share_panel(
+        &self,
+        active_source: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let theme = cx.theme();
+        let (border, muted, card_bg) = (theme.border, theme.muted_foreground, theme.muted);
+        let send = self.send.clone();
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(card_bg)
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(muted)
+                            .child("Share a screen or window"),
+                    )
+                    .when(active_source.is_some(), |row| {
+                        let send_stop = send.clone();
+                        row.child(
+                            Button::new("popout-huddle-share-stop")
+                                .danger()
+                                .with_size(Size::XSmall)
+                                .label("Stop sharing")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    (send_stop)(Command::SetHuddleScreenShare { source_id: None });
+                                    if this.fixtures.sample {
+                                        if let Some(dock) = this.huddle_dock_entity() {
+                                            dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
+                                        }
+                                    }
+                                    this.huddle_share_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(if self.huddle_screens.is_empty() {
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Scanning screens & windows… (grant Screen Recording permission in macOS System Settings if none appear)")
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(self.huddle_screens.iter().enumerate().map(|(ix, src)| {
+                        let selected = active_source == Some(src.id.as_str());
+                        let src_id = src.id.clone();
+                        let send_pick = send.clone();
+                        let prefix = if src.is_monitor { "🖥 " } else { "🪟 " };
+                        Button::new(("popout-huddle-src", ix))
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .label(if selected {
+                                format!("✓ {prefix}{}", src.name)
+                            } else {
+                                format!("{prefix}{}", src.name)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                (send_pick)(Command::SetHuddleScreenShare {
+                                    source_id: Some(src_id.clone()),
+                                });
+                                if this.fixtures.sample {
+                                    if let Some(dock) = this.huddle_dock_entity() {
+                                        dock.update(cx, |d, cx| {
+                                            d.set_sharing_local(Some(src_id.clone()), cx);
+                                        });
+                                    }
+                                }
+                                this.huddle_share_open = false;
+                                cx.notify();
+                            }))
+                    }))
+                    .into_any_element()
+            })
+    }
+
+    fn render_huddle_reactions_panel(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
+        const QUICK: [&str; 8] = ["👍", "🎉", "❤️", "😂", "👏", "🔥", "👀", "🙌"];
+        let theme = cx.theme();
+        let (border, card_bg) = (theme.border, theme.muted);
+        let send = self.send.clone();
+        h_flex()
+            .p_2()
+            .gap_1p5()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(card_bg)
+            .children(QUICK.iter().enumerate().map(|(ix, emoji)| {
+                let em = (*emoji).to_owned();
+                let send_em = send.clone();
+                Button::new(("popout-huddle-react", ix))
+                    .ghost()
+                    .with_size(Size::Small)
+                    .label(*emoji)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        (send_em)(Command::SendHuddleReaction(em.clone()));
+                        if this.fixtures.sample {
+                            if let Some(dock) = this.huddle_dock_entity() {
+                                let me = this.fixtures.self_user.clone();
+                                dock.update(cx, |d, cx| {
+                                    d.apply_data_event(
+                                        &slackless_core::huddle::HuddleDataEvent::Reaction {
+                                            user: me,
+                                            emoji: em.clone(),
+                                            at_ms: 0,
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }
+                        }
+                        this.huddle_reactions_open = false;
+                        cx.notify();
+                    }))
+            }))
     }
 
     fn render_huddle_invite_panel(
@@ -1263,77 +1759,240 @@ impl PopoutWindow {
             )
     }
 
-    fn render_huddle_controls(
+    fn render_huddle_media_controls(
         &self,
-        muted_now: bool,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        use slackless_core::huddle::list_audio_devices;
+        use slackless_core::huddle::list_screen_sources;
 
-        let border = cx.theme().border;
+        let (muted_now, video_now, blur_now, sharing_now) =
+            (snap.muted, snap.video, snap.blur_background, snap.sharing);
+
         let send_mute = self.send.clone();
         let next_muted = !muted_now;
         let mic_btn = {
             let b = Button::new("popout-huddle-mic")
-                .with_size(Size::Medium)
+                .with_size(Size::Small)
                 .icon(if muted_now {
                     IconName::MicOff
                 } else {
                     IconName::Mic
                 })
                 .label(if muted_now { "Unmute" } else { "Mute" })
-                .on_click(move |_, _, _| {
+                .on_click(cx.listener(move |this, _, _, cx| {
                     (send_mute)(Command::SetHuddleMuted(next_muted));
-                });
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_muted_local(next_muted, cx));
+                        }
+                    }
+                }));
             if muted_now { b.outline() } else { b.primary() }
         };
+
+        let send_cam = self.send.clone();
+        let next_cam = !video_now;
+        let cam_btn = {
+            let b = Button::new("popout-huddle-video")
+                .with_size(Size::Small)
+                .icon(if video_now {
+                    IconName::Video
+                } else {
+                    IconName::VideoOff
+                })
+                .tooltip(if video_now {
+                    "Turn camera off"
+                } else {
+                    "Turn camera on"
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    (send_cam)(Command::SetHuddleCamera {
+                        enabled: next_cam,
+                        device_index: None,
+                        blur: blur_now,
+                    });
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_camera_local(next_cam, cx));
+                        }
+                    }
+                }));
+            if video_now { b.primary() } else { b.outline() }
+        };
+
+        let send_blur = self.send.clone();
+        let next_blur = !blur_now;
+        let blur_btn = {
+            let b = Button::new("popout-huddle-blur")
+                .with_size(Size::Small)
+                .label(if blur_now { "Blur on" } else { "Blur" })
+                .tooltip("Toggle portrait background blur")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    (send_blur)(Command::SetHuddleBlurBackground(next_blur));
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
+                        }
+                    }
+                }));
+            if blur_now { b.primary() } else { b.ghost() }
+        };
+
+        let share_btn = {
+            let b = Button::new("popout-huddle-share")
+                .with_size(Size::Small)
+                .icon(IconName::ScreenShare)
+                .tooltip(if sharing_now {
+                    "Screen share options / Stop sharing"
+                } else {
+                    "Share screen or window"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.huddle_share_open = !this.huddle_share_open;
+                    this.huddle_invite_open = false;
+                    this.huddle_devices_open = false;
+                    this.huddle_reactions_open = false;
+                    if this.huddle_share_open {
+                        cx.spawn(async move |win, cx| {
+                            let screens = cx
+                                .background_executor()
+                                .spawn(async move { list_screen_sources() })
+                                .await;
+                            let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
+                                win.huddle_screens = screens;
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                    cx.notify();
+                }));
+            if sharing_now {
+                b.primary()
+            } else {
+                b.outline()
+            }
+        };
+
+        h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(mic_btn)
+            .child(cam_btn)
+            .when(video_now, |bar| bar.child(blur_btn))
+            .child(share_btn)
+    }
+
+    fn render_huddle_collab_controls(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use slackless_core::huddle::list_audio_devices;
+
+        let hand_now = snap.hand_raised;
+        let captions_now = snap.captions_enabled;
+
+        let send_hand = self.send.clone();
+        let next_hand = !hand_now;
+        let hand_btn = {
+            let b = Button::new("popout-huddle-hand")
+                .with_size(Size::Small)
+                .label("✋")
+                .tooltip(if hand_now { "Lower hand" } else { "Raise hand" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    (send_hand)(Command::SetHuddleHandRaised(next_hand));
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            let me = this.fixtures.self_user.clone();
+                            dock.update(cx, |d, cx| {
+                                d.apply_data_event(
+                                    &slackless_core::huddle::HuddleDataEvent::HandRaise {
+                                        user: me,
+                                        raised: next_hand,
+                                    },
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                }));
+            if hand_now { b.primary() } else { b.outline() }
+        };
+
+        let send_cc = self.send.clone();
+        let next_cc = !captions_now;
+        let cc_btn = {
+            let b = Button::new("popout-huddle-cc")
+                .with_size(Size::Small)
+                .label("CC")
+                .tooltip(if captions_now {
+                    "Hide live captions"
+                } else {
+                    "Show live captions"
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    (send_cc)(Command::SetHuddleCaptions(next_cc));
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_captions_local(next_cc, cx));
+                        }
+                    }
+                }));
+            if captions_now {
+                b.primary()
+            } else {
+                b.outline()
+            }
+        };
+
         let send_leave = self.send.clone();
 
         h_flex()
-            .flex_none()
-            .px_4()
-            .py_3()
-            .gap_2()
+            .gap_1p5()
             .items_center()
-            .justify_center()
-            .border_t_1()
-            .border_color(border)
-            .child(mic_btn)
+            .child(hand_btn)
             .child(
-                Button::new("popout-huddle-video")
-                    .ghost()
-                    .with_size(Size::Medium)
-                    .icon(IconName::VideoOff)
-                    .tooltip("Video coming in Phase 2 — use Browser for camera"),
+                Button::new("popout-huddle-react-btn")
+                    .outline()
+                    .with_size(Size::Small)
+                    .label("😊")
+                    .tooltip("Send reaction")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.huddle_reactions_open = !this.huddle_reactions_open;
+                        this.huddle_share_open = false;
+                        this.huddle_invite_open = false;
+                        this.huddle_devices_open = false;
+                        cx.notify();
+                    })),
             )
-            .child(
-                Button::new("popout-huddle-share")
-                    .ghost()
-                    .with_size(Size::Medium)
-                    .icon(IconName::ScreenShare)
-                    .tooltip("Screen sharing coming in Phase 3 — use Browser"),
-            )
+            .child(cc_btn)
             .child(
                 Button::new("popout-huddle-invite-btn")
                     .outline()
-                    .with_size(Size::Medium)
+                    .with_size(Size::Small)
                     .icon(IconName::UserPlus)
-                    .label("Invite")
+                    .tooltip("Invite people")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.huddle_invite_open = !this.huddle_invite_open;
                         this.huddle_devices_open = false;
+                        this.huddle_share_open = false;
+                        this.huddle_reactions_open = false;
                         cx.notify();
                     })),
             )
             .child(
                 Button::new("popout-huddle-devices-btn")
                     .outline()
-                    .with_size(Size::Medium)
+                    .with_size(Size::Small)
                     .icon(IconName::SlidersHorizontal)
-                    .label("Audio")
+                    .tooltip("Audio devices")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.huddle_devices_open = !this.huddle_devices_open;
                         this.huddle_invite_open = false;
+                        this.huddle_share_open = false;
+                        this.huddle_reactions_open = false;
                         if this.huddle_devices_open {
                             cx.spawn(async move |win, cx| {
                                 let devices = cx
@@ -1353,7 +2012,7 @@ impl PopoutWindow {
             .child(
                 Button::new("popout-huddle-leave")
                     .danger()
-                    .with_size(Size::Medium)
+                    .with_size(Size::Small)
                     .icon(IconName::PhoneOff)
                     .label("Leave")
                     .on_click(move |_, window, _| {
@@ -1361,6 +2020,26 @@ impl PopoutWindow {
                         window.remove_window();
                     }),
             )
+    }
+
+    fn render_huddle_controls(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let border = cx.theme().border;
+        h_flex()
+            .flex_none()
+            .flex_wrap()
+            .px_4()
+            .py_3()
+            .gap_1p5()
+            .items_center()
+            .justify_center()
+            .border_t_1()
+            .border_color(border)
+            .child(self.render_huddle_media_controls(snap, cx))
+            .child(self.render_huddle_collab_controls(snap, cx))
     }
 }
 

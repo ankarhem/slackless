@@ -17,6 +17,7 @@ emojis = "0.9"
 # The zoom platform wrapper (zoom.rs) names these types from GPUI's platform traits.
 raw-window-handle = "0.6"
 smallvec = "1"
+image = { version = "0.25", default-features = false }
 futures.workspace = true
 serde.workspace = true
 

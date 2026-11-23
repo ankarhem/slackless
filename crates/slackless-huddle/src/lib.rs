@@ -1,10 +1,13 @@
-//! Native Amazon Chime SDK (`free_willy`) signaling, WebRTC DTLS-SRTP media, and pure-Rust
-//! audio processing (`cpal` + `opus` + `sonora` AEC3/NS/AGC) for Slack Huddles.
+//! Native Amazon Chime SDK (`free_willy`) signaling, WebRTC DTLS-SRTP media, pure-Rust audio
+//! processing (`cpal` + `opus` + `sonora` AEC3/NS/AGC), H.264 camera video (`nokhwa` + `openh264`),
+//! screen sharing (`xcap` + `openh264`), and Chime `DATA_MESSAGE` extras for Slack Huddles.
 
 pub mod audio;
 pub mod rtc;
+pub mod screen;
 pub mod session;
 pub mod signaling;
+pub mod video;
 
 /// Generated prost types for Amazon Chime SDK signaling frames (`proto/SignalingProtocol.proto`).
 pub mod proto {
@@ -16,9 +19,12 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 pub use audio::{
-    AudioDeviceInfo, AudioDevices, MicLevelProbe, list_audio_devices, play_speaker_test_tone,
+    AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe, list_audio_devices,
+    play_huddle_chime, play_speaker_test_tone,
 };
+pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;
+pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};
 
 /// Errors returned by the native huddle engine.
 #[derive(Debug, Error)]
@@ -33,6 +39,8 @@ pub enum HuddleError {
     UdpBlocked,
     #[error("audio device error: {0}")]
     Audio(String),
+    #[error("video/capture error: {0}")]
+    Video(String),
     #[error("codec error: {0}")]
     Codec(String),
 }
@@ -56,12 +64,14 @@ pub struct HuddleCredentials {
     pub huddle_link: Option<String>,
 }
 
-/// User-selected audio settings for joining or running a huddle.
+/// User-selected audio & video settings for joining or running a huddle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HuddleAudioConfig {
     pub muted: bool,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    pub camera_device: Option<usize>,
+    pub blur_background: bool,
     pub aec: bool,
     pub ns: bool,
     pub agc: bool,
@@ -73,6 +83,8 @@ impl Default for HuddleAudioConfig {
             muted: false,
             input_device: None,
             output_device: None,
+            camera_device: None,
+            blur_background: false,
             aec: true,
             ns: true,
             agc: true,
@@ -101,7 +113,12 @@ pub struct HuddleSessionSnapshot {
     pub call_id: String,
     pub muted: bool,
     pub video: bool,
+    pub blur_background: bool,
     pub sharing: bool,
+    pub share_source_id: Option<String>,
+    pub hand_raised: bool,
+    pub captions_enabled: bool,
+    pub topic: Option<String>,
     pub started_at_secs: u64,
     pub thread_root_ts: Option<Ts>,
     pub canvas_file_id: Option<String>,
@@ -126,11 +143,40 @@ pub struct HuddleAudioLevels {
     pub muted_peers: Vec<UserId>,
 }
 
+/// Interactive Chime `DATA_MESSAGE` event (reactions, hand raises, topic updates, captions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HuddleDataEvent {
+    Reaction {
+        user: UserId,
+        emoji: String,
+        at_ms: u64,
+    },
+    HandRaise {
+        user: UserId,
+        raised: bool,
+    },
+    Topic {
+        user: UserId,
+        topic: String,
+    },
+    Caption {
+        user: UserId,
+        text: String,
+        at_ms: u64,
+    },
+}
+
 /// Events emitted by a running huddle session back to `slackless-core`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HuddleUpdate {
-    State(HuddleSessionSnapshot),
+    State(Box<HuddleSessionSnapshot>),
     AudioLevels(HuddleAudioLevels),
+    VideoFrame {
+        tile: VideoTileKey,
+        frame: VideoFrame,
+    },
+    VideoTileClosed(VideoTileKey),
+    DataEvent(HuddleDataEvent),
 }
 
 /// Live control commands accepted by an active huddle session.
@@ -146,6 +192,19 @@ pub enum HuddleControl {
         ns: bool,
         agc: bool,
     },
+    SetCamera {
+        enabled: bool,
+        device_index: Option<usize>,
+        blur: bool,
+    },
+    SetBlurBackground(bool),
+    SetScreenShare {
+        source_id: Option<String>,
+    },
+    SendReaction(String),
+    SetHandRaised(bool),
+    SetTopic(String),
+    SetCaptionsEnabled(bool),
     Leave,
 }
 

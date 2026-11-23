@@ -68,6 +68,96 @@ pub fn list_audio_devices() -> AudioDevices {
     AudioDevices { inputs, outputs }
 }
 
+/// Distinct acoustic chimes for huddle lifecycle events (`F-COLLAB-060`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HuddleChime {
+    /// Warm ascending triad when joining a huddle.
+    Join,
+    /// Gentle descending two-tone when leaving a huddle.
+    Leave,
+    /// Two-pulse ring chime for an incoming DM huddle invite.
+    InviteRing,
+}
+
+/// Play a short synthesized huddle chime on `output_device` (or the default speaker) without
+/// blocking the caller.
+pub fn play_huddle_chime(chime: HuddleChime, output_device: Option<&str>) -> Result<()> {
+    let device_name = output_device.map(ToOwned::to_owned);
+    std::thread::Builder::new()
+        .name("slackless-huddle-chime".to_owned())
+        .spawn(move || {
+            let Ok(device) = select_output_device(device_name.as_deref()) else {
+                return;
+            };
+            let Ok(supported) = device.default_output_config() else {
+                return;
+            };
+            let rate = supported.sample_rate().0 as f32;
+            let channels = supported.channels() as usize;
+            let duration_secs: f32 = match chime {
+                HuddleChime::Join => 0.34,
+                HuddleChime::Leave => 0.28,
+                HuddleChime::InviteRing => 0.44,
+            };
+            let total_frames = (rate * duration_secs) as usize;
+            let frame_ix = Arc::new(AtomicU32::new(0));
+            let ix_cb = Arc::clone(&frame_ix);
+
+            let config: StreamConfig = supported.into();
+            let Ok(stream) = device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _| {
+                    let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
+                    for frame in data.chunks_mut(channels) {
+                        let sample = if ix < total_frames {
+                            let t = ix as f32 / rate;
+                            let (freq, gain) = match chime {
+                                HuddleChime::Join => {
+                                    let f = if t < 0.11 {
+                                        523.25 // C5
+                                    } else if t < 0.22 {
+                                        659.25 // E5
+                                    } else {
+                                        783.99 // G5
+                                    };
+                                    (f, 0.18)
+                                }
+                                HuddleChime::Leave => {
+                                    let f = if t < 0.13 { 587.33 } else { 440.0 }; // D5 -> A4
+                                    (f, 0.16)
+                                }
+                                HuddleChime::InviteRing => {
+                                    let pulse = (t < 0.18) || (t > 0.24 && t < 0.42);
+                                    let f = if t < 0.18 { 783.99 } else { 987.77 }; // G5 -> B5
+                                    (f, if pulse { 0.20 } else { 0.0 })
+                                }
+                            };
+                            let env = (1.0 - (t / duration_secs)).clamp(0.0, 1.0) * gain;
+                            (2.0 * std::f32::consts::PI * freq * t).sin() * env
+                        } else {
+                            0.0
+                        };
+                        for ch in frame.iter_mut() {
+                            *ch = sample;
+                        }
+                        ix += 1;
+                    }
+                    ix_cb.store(ix as u32, Ordering::Relaxed);
+                },
+                |_| {},
+                None,
+            ) else {
+                return;
+            };
+            if stream.play().is_ok() {
+                std::thread::sleep(Duration::from_millis((duration_secs * 1000.0) as u64 + 80));
+            }
+            drop(stream);
+        })
+        .map_err(|e| HuddleError::Audio(e.to_string()))?;
+    Ok(())
+}
+
 /// Play a short two-note harmonic chime on `output_device` (or the default speaker) for `F-COLLAB-040`.
 pub fn play_speaker_test_tone(output_device: Option<&str>) -> Result<()> {
     let device_name = output_device.map(ToOwned::to_owned);

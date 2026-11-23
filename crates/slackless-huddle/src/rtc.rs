@@ -13,7 +13,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine};
+use webrtc::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
 use webrtc::ice_transport::ice_server::RTCIceServer;
@@ -24,11 +24,9 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
-use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -78,6 +76,24 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
     m.register_codec(
         RTCRtpCodecParameters {
             capability: RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                clock_rate: 90_000,
+                channels: 0,
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                        .to_owned(),
+                rtcp_feedback: Vec::new(),
+            },
+            payload_type: 102,
+            ..Default::default()
+        },
+        RTPCodecType::Video,
+    )
+    .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+
+    m.register_codec(
+        RTCRtpCodecParameters {
+            capability: RTCRtpCodecCapability {
                 mime_type: MIME_TYPE_VP8.to_owned(),
                 clock_rate: 90_000,
                 channels: 0,
@@ -93,10 +109,20 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
     Ok(m)
 }
 
+/// One inbound RTP video packet read from a remote Chime video/content track.
+#[derive(Debug, Clone)]
+pub struct InboundVideoPacket {
+    pub ssrc: u32,
+    pub track_id: String,
+    pub payload: Vec<u8>,
+    pub marker: bool,
+}
+
 /// Active `webrtc-rs` connection wired to Chime's TURN SFU.
 pub struct ChimeRtcPeer {
     pc: Arc<RTCPeerConnection>,
     audio_track: Arc<TrackLocalStaticSample>,
+    video_track: Arc<TrackLocalStaticSample>,
     packets_sent: Arc<AtomicU64>,
     bytes_sent: Arc<AtomicU64>,
     packets_received: Arc<AtomicU64>,
@@ -110,6 +136,7 @@ impl ChimeRtcPeer {
     pub async fn new(
         turn: &SdkTurnCredentials,
         inbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
+        inbound_video_tx: mpsc::UnboundedSender<InboundVideoPacket>,
         state_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
     ) -> Result<Self> {
         let udp_uris = filter_udp_turn_uris(&turn.uris);
@@ -161,16 +188,23 @@ impl ChimeRtcPeer {
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
-        // Chime's official client sends a BUNDLEd video m-line even for audio-only sessions.
-        pc.add_transceiver_from_kind(
-            RTPCodecType::Video,
-            Some(RTCRtpTransceiverInit {
-                direction: RTCRtpTransceiverDirection::Recvonly,
-                send_encodings: Vec::new(),
-            }),
-        )
-        .await
-        .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+        // Local H.264 video track (shared by camera / screen share; inactive until frames flow).
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: MIME_TYPE_H264.to_owned(),
+                clock_rate: 90_000,
+                channels: 0,
+                sdp_fmtp_line:
+                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                        .to_owned(),
+                rtcp_feedback: Vec::new(),
+            },
+            "AmazonChimeExpressVideo".to_owned(),
+            "AmazonChimeExpressVideo".to_owned(),
+        ));
+        pc.add_track(Arc::clone(&video_track) as Arc<dyn TrackLocal + Send + Sync>)
+            .await
+            .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
         let packets_received = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
@@ -179,24 +213,50 @@ impl ChimeRtcPeer {
         let rx_bytes = Arc::clone(&bytes_received);
         let rx_total = Arc::clone(&total_packets_received);
         pc.on_track(Box::new(move |track, _, _| {
-            let tx = inbound_opus_tx.clone();
+            let audio_tx = inbound_opus_tx.clone();
+            let video_tx = inbound_video_tx.clone();
             let rx_pkts = Arc::clone(&rx_pkts);
             let rx_bytes = Arc::clone(&rx_bytes);
             let rx_total = Arc::clone(&rx_total);
             Box::pin(async move {
-                if track.kind() != RTPCodecType::Audio {
-                    return;
-                }
-                while let Ok((rtp, _)) = track.read_rtp().await {
-                    if rtp.payload.is_empty() {
-                        continue;
+                match track.kind() {
+                    RTPCodecType::Audio => {
+                        while let Ok((rtp, _)) = track.read_rtp().await {
+                            if rtp.payload.is_empty() {
+                                continue;
+                            }
+                            rx_pkts.fetch_add(1, Ordering::Relaxed);
+                            rx_total.fetch_add(1, Ordering::Relaxed);
+                            rx_bytes.fetch_add(rtp.payload.len() as u64, Ordering::Relaxed);
+                            if audio_tx.send(rtp.payload.to_vec()).is_err() {
+                                break;
+                            }
+                        }
                     }
-                    rx_pkts.fetch_add(1, Ordering::Relaxed);
-                    rx_total.fetch_add(1, Ordering::Relaxed);
-                    rx_bytes.fetch_add(rtp.payload.len() as u64, Ordering::Relaxed);
-                    if tx.send(rtp.payload.to_vec()).is_err() {
-                        break;
+                    RTPCodecType::Video => {
+                        let ssrc = track.ssrc();
+                        let track_id = track.id();
+                        while let Ok((rtp, _)) = track.read_rtp().await {
+                            if rtp.payload.is_empty() {
+                                continue;
+                            }
+                            rx_pkts.fetch_add(1, Ordering::Relaxed);
+                            rx_total.fetch_add(1, Ordering::Relaxed);
+                            rx_bytes.fetch_add(rtp.payload.len() as u64, Ordering::Relaxed);
+                            if video_tx
+                                .send(InboundVideoPacket {
+                                    ssrc,
+                                    track_id: track_id.clone(),
+                                    payload: rtp.payload.to_vec(),
+                                    marker: rtp.header.marker,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
+                    _ => {}
                 }
             })
         }));
@@ -209,6 +269,7 @@ impl ChimeRtcPeer {
         Ok(Self {
             pc,
             audio_track,
+            video_track,
             packets_sent: Arc::new(AtomicU64::new(0)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             packets_received,
@@ -261,6 +322,23 @@ impl ChimeRtcPeer {
             .write_sample(&Sample {
                 data: Bytes::from(opus_bytes),
                 duration: Duration::from_millis(20),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Write one Annex-B H.264 video frame onto the local video track.
+    pub async fn write_h264_frame(&self, annex_b: Vec<u8>, duration: Duration) -> Result<()> {
+        let len = annex_b.len() as u64;
+        self.video_track
+            .write_sample(&Sample {
+                data: Bytes::from(annex_b),
+                duration,
                 ..Default::default()
             })
             .await

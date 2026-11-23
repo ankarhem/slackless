@@ -385,6 +385,16 @@ pub struct Settings {
     pub huddle_leave_on_lock: bool,
     /// Automatically pop out the dedicated Huddle Window when joining a huddle.
     pub huddle_auto_open_window: bool,
+    /// Preferred camera device index (`None` = system default camera 0, `F-COLLAB-046`).
+    pub huddle_camera_device: Option<usize>,
+    /// Enable software portrait background blur by default when turning on camera (`F-COLLAB-038`).
+    pub huddle_blur_background: bool,
+    /// Play synthesized join, leave, and incoming-invite ring chimes (`F-COLLAB-060`).
+    pub huddle_sounds: bool,
+    /// Show floating emoji reaction pills in the Huddle Window (`F-COLLAB-057`).
+    pub huddle_reaction_animations: bool,
+    /// Automatically enable live captions overlay when joining a huddle (`F-COLLAB-054`).
+    pub huddle_auto_captions: bool,
 }
 
 /// Active rendering preferences cached as a GPUI global so every message list, thread panel,
@@ -569,6 +579,11 @@ impl Default for Settings {
             huddle_join_muted: false,
             huddle_leave_on_lock: true,
             huddle_auto_open_window: false,
+            huddle_camera_device: None,
+            huddle_blur_background: false,
+            huddle_sounds: true,
+            huddle_reaction_animations: true,
+            huddle_auto_captions: false,
         }
     }
 }
@@ -656,10 +671,15 @@ pub struct Preferences {
     slack_theme_import: Entity<TextareaState>,
     storage_stats: Option<StorageInfo>,
     audio_devices: slackless_core::huddle::AudioDevices,
+    cameras: Vec<slackless_core::huddle::CameraDeviceInfo>,
     audio_loading: bool,
     audio_probe_gen: u64,
     mic_probe: Option<slackless_core::huddle::MicLevelProbe>,
     mic_level: f32,
+    camera_preview_on: bool,
+    camera_probe_gen: u64,
+    camera_probe: Option<slackless_core::huddle::CameraPreviewProbe>,
+    camera_frame: Option<std::sync::Arc<gpui_kit::gpui::RenderImage>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -753,10 +773,15 @@ impl Preferences {
                 slack_theme_import,
                 storage_stats: None,
                 audio_devices: slackless_core::huddle::AudioDevices::default(),
+                cameras: Vec::new(),
                 audio_loading: false,
                 audio_probe_gen: 0,
                 mic_probe: None,
                 mic_level: 0.0,
+                camera_preview_on: false,
+                camera_probe_gen: 0,
+                camera_probe: None,
+                camera_frame: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -823,8 +848,8 @@ impl Preferences {
         }
     }
 
-    /// Release the live microphone level meter probe off the UI thread (called when leaving Audio
-    /// & video or closing Preferences so CoreAudio teardown never stalls the main thread).
+    /// Release the live microphone & camera preview probes off the UI thread (called when leaving
+    /// Audio & video or closing Preferences so hardware teardown never stalls the main thread).
     pub fn stop_mic_probe(&mut self) {
         self.audio_probe_gen = self.audio_probe_gen.wrapping_add(1);
         self.audio_loading = false;
@@ -832,6 +857,84 @@ impl Preferences {
             std::thread::spawn(move || drop(old));
         }
         self.mic_level = 0.0;
+        self.stop_camera_preview();
+    }
+
+    fn stop_camera_preview(&mut self) {
+        self.camera_probe_gen = self.camera_probe_gen.wrapping_add(1);
+        self.camera_preview_on = false;
+        if let Some(old) = self.camera_probe.take() {
+            std::thread::spawn(move || drop(old));
+        }
+        self.camera_frame = None;
+    }
+
+    fn start_camera_preview(&mut self, cx: &mut Context<Self>) {
+        self.stop_camera_preview();
+        self.camera_preview_on = true;
+        let probe_gen = self.camera_probe_gen;
+        let device_index = self.settings.huddle_camera_device;
+        let blur = self.settings.huddle_blur_background;
+        cx.spawn(async move |this, cx| {
+            let probe = cx
+                .background_executor()
+                .spawn(async move {
+                    slackless_core::huddle::CameraPreviewProbe::start(device_index, blur).ok()
+                })
+                .await;
+
+            let started = this
+                .update(cx, |prefs, cx| {
+                    if prefs.camera_probe_gen != probe_gen || prefs.section != Section::AudioVideo {
+                        if let Some(stale) = probe {
+                            std::thread::spawn(move || drop(stale));
+                        }
+                        return false;
+                    }
+                    prefs.camera_probe = probe;
+                    if prefs.camera_probe.is_none() {
+                        prefs.camera_preview_on = false;
+                    }
+                    cx.notify();
+                    prefs.camera_probe.is_some()
+                })
+                .unwrap_or(false);
+
+            if !started {
+                return;
+            }
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(80))
+                    .await;
+                let keep = this
+                    .update(cx, |prefs, cx| {
+                        if prefs.camera_probe_gen != probe_gen {
+                            return false;
+                        }
+                        if let Some(probe) = &prefs.camera_probe {
+                            probe.set_blur(prefs.settings.huddle_blur_background);
+                            if let Some(frame) = probe.latest_frame() {
+                                if let Some(img) = crate::huddle_dock::frame_to_render_image(&frame)
+                                {
+                                    if let Some(old) = prefs.camera_frame.replace(img) {
+                                        cx.drop_image(old, None);
+                                    }
+                                    cx.notify();
+                                }
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn refresh_audio_devices_and_probe(&mut self, cx: &mut Context<Self>) {
@@ -843,13 +946,14 @@ impl Preferences {
         }
         let wanted = self.settings.huddle_input_device.clone();
         cx.spawn(async move |this, cx| {
-            let (devices, probe) = cx
+            let (devices, cameras, probe) = cx
                 .background_executor()
                 .spawn(async move {
                     let devices = slackless_core::huddle::list_audio_devices();
+                    let cameras = slackless_core::huddle::list_cameras();
                     let probe =
                         slackless_core::huddle::MicLevelProbe::start(wanted.as_deref()).ok();
-                    (devices, probe)
+                    (devices, cameras, probe)
                 })
                 .await;
 
@@ -862,6 +966,7 @@ impl Preferences {
                         return false;
                     }
                     prefs.audio_devices = devices;
+                    prefs.cameras = cameras;
                     prefs.audio_loading = false;
                     prefs.mic_probe = probe;
                     cx.notify();
@@ -2503,9 +2608,30 @@ impl Preferences {
                 "Automatically open the Huddle window when joining",
                 |s| &mut s.huddle_auto_open_window,
                 cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-sounds",
+                "Play join, leave, and incoming huddle ring chimes",
+                |s| &mut s.huddle_sounds,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-reactions",
+                "Show floating emoji reaction animations in huddles",
+                |s| &mut s.huddle_reaction_animations,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-captions",
+                "Automatically enable live captions when joining",
+                |s| &mut s.huddle_auto_captions,
+                cx,
             ));
 
+        let camera_group = self.audio_video_camera(cx);
+
         v_flex()
+            .child(camera_group)
             .child(self.group(
                 "Microphone",
                 Some("Choose which microphone slackless uses for native huddles."),
@@ -2525,6 +2651,121 @@ impl Preferences {
                 cx,
             ))
             .child(self.group("When joining a huddle", None, behavior, cx))
+    }
+
+    fn audio_video_camera(&mut self, cx: &mut Context<Self>) -> Div {
+        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
+
+        let theme = cx.theme();
+        let (border, muted, card_bg) = (theme.border, theme.muted_foreground, theme.muted);
+        let active_cam = self.settings.huddle_camera_device;
+        let preview_on = self.camera_preview_on;
+
+        let picker = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .child({
+                        let is_def = active_cam.is_none();
+                        Button::new("prefs-cam-default")
+                            .outline()
+                            .with_size(Size::Small)
+                            .label(if is_def {
+                                "✓ System default"
+                            } else {
+                                "System default"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings.huddle_camera_device = None;
+                                if this.camera_preview_on {
+                                    this.start_camera_preview(cx);
+                                }
+                                this.changed(cx);
+                            }))
+                    })
+                    .children(self.cameras.iter().enumerate().map(|(ix, cam)| {
+                        let selected = active_cam == Some(cam.index);
+                        let cam_idx = cam.index;
+                        Button::new(("prefs-cam", ix))
+                            .outline()
+                            .with_size(Size::Small)
+                            .label(if selected {
+                                format!("✓ {}", cam.name)
+                            } else {
+                                cam.name.clone()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.settings.huddle_camera_device = Some(cam_idx);
+                                if this.camera_preview_on {
+                                    this.start_camera_preview(cx);
+                                }
+                                this.changed(cx);
+                            }))
+                    })),
+            )
+            .child(self.checkbox(
+                "prefs-huddle-blur",
+                "Blur my background by default when turning on camera",
+                |s| &mut s.huddle_blur_background,
+                cx,
+            ))
+            .child(
+                h_flex().gap_2().child(
+                    Button::new("prefs-cam-preview-toggle")
+                        .outline()
+                        .with_size(Size::Small)
+                        .icon(if preview_on {
+                            IconName::VideoOff
+                        } else {
+                            IconName::Video
+                        })
+                        .label(if preview_on {
+                            "Stop camera preview"
+                        } else {
+                            "Preview camera"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.camera_preview_on {
+                                this.stop_camera_preview();
+                                cx.notify();
+                            } else {
+                                this.start_camera_preview(cx);
+                            }
+                        })),
+                ),
+            )
+            .when(preview_on, |el| {
+                let preview = div()
+                    .w(px(280.))
+                    .h(px(158.))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(border)
+                    .flex()
+                    .items_center()
+                    .justify_center();
+                el.child(if let Some(frame) = self.camera_frame.clone() {
+                    preview.child(img(frame).w_full().h_full().object_fit(ObjectFit::Cover))
+                } else {
+                    preview.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Starting camera preview…"),
+                    )
+                })
+            });
+
+        self.group(
+            "Camera",
+            Some("Choose your webcam and optional portrait background blur for native huddles."),
+            picker,
+            cx,
+        )
     }
 
     fn render_body(&mut self, cx: &mut Context<Self>) -> Div {

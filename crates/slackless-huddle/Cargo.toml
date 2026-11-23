@@ -20,6 +20,10 @@ cpal = "0.16"
 opus = "0.4"
 sonora = "0.3"
 url = "2.5"
+openh264 = "0.9"
+xcap = "0.9"
+nokhwa = { version = "0.10", features = ["input-native"] }
+image = { version = "0.25", default-features = false }
 
 [build-dependencies]
 prost-build = "0.14"

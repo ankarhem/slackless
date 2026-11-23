@@ -818,6 +818,50 @@ pub fn run_huddle_devices(ctx: &Ctx) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `huddle cameras` (offline): list available local cameras.
+pub fn run_huddle_cameras(ctx: &Ctx) -> Result<ExitCode> {
+    let cameras = slackless_core::huddle::list_cameras();
+    let mut human = String::new();
+    for c in &cameras {
+        human.push_str(&format!("{}\t{}\n", c.index, c.name));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "cameras": cameras.iter().map(|c| serde_json::json!({"index": c.index, "name": c.name})).collect::<Vec<_>>(),
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `huddle screens` (offline): list monitors and windows available for screen sharing.
+pub fn run_huddle_screens(ctx: &Ctx) -> Result<ExitCode> {
+    let sources = slackless_core::huddle::list_screen_sources();
+    let mut human = String::new();
+    for s in &sources {
+        let kind = if s.is_monitor { "monitor" } else { "window" };
+        human.push_str(&format!(
+            "{}\t{kind}\t{}x{}\t{}\n",
+            s.id, s.width, s.height, s.name
+        ));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "sources": sources.iter().map(|s| serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "monitor": s.is_monitor,
+                "width": s.width,
+                "height": s.height,
+            })).collect::<Vec<_>>(),
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `huddle link <channel>`: fetch the shareable huddle join URL (`rooms.getLink`).
 pub async fn run_huddle_link(ctx: &Ctx, flag: Option<&str>, channel_arg: &str) -> Result<ExitCode> {
     let (api, workspace) = match api_for(ctx, flag) {
@@ -991,7 +1035,12 @@ pub async fn run_huddle_join(
                             break;
                         }
                     }
-                    Some(slackless_core::huddle::HuddleUpdate::AudioLevels(_)) => {}
+                    Some(
+                        slackless_core::huddle::HuddleUpdate::AudioLevels(_)
+                        | slackless_core::huddle::HuddleUpdate::VideoFrame { .. }
+                        | slackless_core::huddle::HuddleUpdate::VideoTileClosed(_)
+                        | slackless_core::huddle::HuddleUpdate::DataEvent(_),
+                    ) => {}
                     None => break,
                 }
             }

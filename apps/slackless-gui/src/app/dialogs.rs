@@ -304,6 +304,11 @@ impl App {
                             agc: settings.huddle_agc,
                         });
                     }
+                    if prev.huddle_blur_background != settings.huddle_blur_background {
+                        self.bridge.send(Command::SetHuddleBlurBackground(
+                            settings.huddle_blur_background,
+                        ));
+                    }
                 }
                 self.saved_settings = Some(settings.clone());
                 if let Some(write) = self.bridge.remember_settings(&settings) {

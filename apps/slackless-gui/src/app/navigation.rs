@@ -1119,6 +1119,8 @@ impl App {
             muted: settings.huddle_join_muted,
             input_device: settings.huddle_input_device.clone(),
             output_device: settings.huddle_output_device.clone(),
+            camera_device: settings.huddle_camera_device,
+            blur_background: settings.huddle_blur_background,
             aec: settings.huddle_aec,
             ns: settings.huddle_ns,
             agc: settings.huddle_agc,
@@ -1131,13 +1133,17 @@ impl App {
             },
             channel: channel.clone(),
             muted: audio.muted,
+            blur_background: audio.blur_background,
+            captions_enabled: settings.huddle_auto_captions,
             started_at_secs: crate::drafts::now_secs(),
             input_device: audio.input_device.clone(),
             output_device: audio.output_device.clone(),
             ..Default::default()
         };
         self.mount_huddle_dock(initial, window, cx);
-        if !self.fixtures.sample {
+        if self.fixtures.sample {
+            self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
+        } else {
             self.bridge.send(Command::JoinHuddle {
                 channel: channel.clone(),
                 audio,
@@ -1185,6 +1191,10 @@ impl App {
             |this: &mut App, _, event: &crate::huddle_dock::HuddleDockEvent, window, cx| match event
             {
                 crate::huddle_dock::HuddleDockEvent::ToggleMute => this.toggle_huddle_mute(cx),
+                crate::huddle_dock::HuddleDockEvent::ToggleCamera => this.toggle_huddle_camera(cx),
+                crate::huddle_dock::HuddleDockEvent::ToggleScreenShare => {
+                    this.toggle_huddle_screen_share(window, cx);
+                }
                 crate::huddle_dock::HuddleDockEvent::Leave => this.leave_huddle(cx),
                 crate::huddle_dock::HuddleDockEvent::PopOut => this.pop_out_huddle(window, cx),
                 crate::huddle_dock::HuddleDockEvent::JumpToChannel(ch) => {
@@ -1235,7 +1245,25 @@ impl App {
         }
     }
 
+    pub(super) fn play_huddle_chime(
+        &self,
+        chime: slackless_core::huddle::HuddleChime,
+        cx: &gpui_kit::gpui::App,
+    ) {
+        let settings = self.preferences.read(cx).settings();
+        if settings.mute_sounds || !settings.huddle_sounds {
+            return;
+        }
+        let output = settings.huddle_output_device.clone();
+        std::thread::spawn(move || {
+            let _ = slackless_core::huddle::play_huddle_chime(chime, output.as_deref());
+        });
+    }
+
     pub(super) fn clear_huddle_dock(&mut self, cx: &mut Context<Self>) {
+        if let Some(dock) = &self.huddle_dock {
+            dock.update(cx, |d, cx| d.clear_video_frames(cx));
+        }
         self.huddle_session = None;
         self.huddle_dock = None;
         self._huddle_dock_sub = None;
@@ -1245,8 +1273,12 @@ impl App {
     }
 
     pub(super) fn leave_huddle(&mut self, cx: &mut Context<Self>) {
+        let was_active = self.huddle_session.is_some() || self.huddle_open;
         self.huddle_open = false;
         self.clear_huddle_dock(cx);
+        if was_active {
+            self.play_huddle_chime(slackless_core::huddle::HuddleChime::Leave, cx);
+        }
         if !self.fixtures.sample {
             self.bridge.send(Command::LeaveHuddle);
         }
@@ -1272,6 +1304,58 @@ impl App {
             self.bridge.send(Command::SetHuddleMuted(next));
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_huddle_camera(&mut self, cx: &mut Context<Self>) {
+        let settings = self.preferences.read(cx).settings().clone();
+        let Some(snap) = self.huddle_session.as_mut() else {
+            return;
+        };
+        let next = !snap.video;
+        snap.video = next;
+        snap.blur_background = settings.huddle_blur_background;
+        if let Some(dock) = &self.huddle_dock {
+            dock.update(cx, |d, cx| d.set_camera_local(next, cx));
+        }
+        if let Some((ch, bar)) = &self.huddle {
+            if *ch == snap.channel {
+                let s = snap.clone();
+                bar.update(cx, |b, cx| b.update_session(Some(s), cx));
+            }
+        }
+        if !self.fixtures.sample {
+            self.bridge.send(Command::SetHuddleCamera {
+                enabled: next,
+                device_index: settings.huddle_camera_device,
+                blur: settings.huddle_blur_background,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_huddle_screen_share(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_sharing = self.huddle_session.as_ref().is_some_and(|s| s.sharing);
+        if is_sharing {
+            if let Some(snap) = self.huddle_session.as_mut() {
+                snap.sharing = false;
+                snap.share_source_id = None;
+            }
+            if let Some(dock) = &self.huddle_dock {
+                dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
+            }
+            if !self.fixtures.sample {
+                self.bridge
+                    .send(Command::SetHuddleScreenShare { source_id: None });
+            }
+            cx.notify();
+        } else {
+            // Open the full Huddle Window so the user can pick a monitor or window to share.
+            self.pop_out_huddle(window, cx);
+        }
     }
 
     pub(super) fn copy_huddle_link(
@@ -1355,6 +1439,34 @@ impl App {
         );
         self.huddle_invite = Some(banner);
         self._huddle_invite_sub = Some(sub);
+        // Play initial ringtone + repeat every 3 seconds until accepted, declined, or expired.
+        self.play_huddle_chime(slackless_core::huddle::HuddleChime::InviteRing, cx);
+        let ring_ch = channel.clone();
+        let ring_call = call_id.clone();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..14 {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let still_ringing = this
+                    .update(cx, |app, cx| {
+                        let same = app.huddle_invite.as_ref().is_some_and(|b| {
+                            let inv = b.read(cx).invite();
+                            inv.channel == ring_ch && inv.call_id == ring_call
+                        });
+                        if same {
+                            app.play_huddle_chime(
+                                slackless_core::huddle::HuddleChime::InviteRing,
+                                cx,
+                            );
+                        }
+                        same
+                    })
+                    .unwrap_or(false);
+                if !still_ringing {
+                    break;
+                }
+            }
+        })
+        .detach();
         // Auto-dismiss unanswered invite after 45 seconds.
         cx.spawn(async move |this, cx| {
             cx.background_executor()

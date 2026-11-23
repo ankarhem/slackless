@@ -959,6 +959,85 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 cx,
             );
 
+            // 4b. Phase 2–4: video frames (camera & screen share) and DATA_MESSAGE events
+            // (reactions, hand raise, topic, captions) flow into HuddleDock -> HuddleViewState.
+            let frame = slackless_core::huddle::VideoFrame {
+                width: 4,
+                height: 4,
+                bgra: std::sync::Arc::new(vec![180u8; 4 * 4 * 4]),
+            };
+            app.on_core_event(
+                &Event::HuddleVideoFrame {
+                    tile: slackless_core::huddle::VideoTileKey::LocalCamera,
+                    frame: frame.clone(),
+                },
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleVideoFrame {
+                    tile: slackless_core::huddle::VideoTileKey::RemoteScreen(inviter.clone()),
+                    frame,
+                },
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Reaction {
+                    user: inviter.clone(),
+                    emoji: "🎉".to_owned(),
+                    at_ms: 0,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::HandRaise {
+                    user: inviter.clone(),
+                    raised: true,
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Topic {
+                    user: inviter.clone(),
+                    topic: "Release readiness".to_owned(),
+                }),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Caption {
+                    user: inviter.clone(),
+                    text: "Shipping Phases 2 through 4 today".to_owned(),
+                    at_ms: 0,
+                }),
+                window,
+                cx,
+            );
+            let vs = app.huddle_dock.as_ref().unwrap().read(cx).view_state();
+            assert_eq!(vs.video_frames.len(), 2);
+            assert!(vs.raised_hands.contains(&inviter));
+            assert_eq!(vs.reactions.len(), 1);
+            assert_eq!(vs.session.topic.as_deref(), Some("Release readiness"));
+            assert_eq!(vs.captions.len(), 1);
+            app.on_core_event(
+                &Event::HuddleVideoTileClosed(slackless_core::huddle::VideoTileKey::LocalCamera),
+                window,
+                cx,
+            );
+            assert_eq!(
+                app.huddle_dock
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .view_state()
+                    .video_frames
+                    .len(),
+                1
+            );
+
             // 5. Incoming DM huddle invite banner mounts and cancels cleanly.
             app.on_core_event(
                 &Event::HuddleInvite {

@@ -2020,7 +2020,7 @@ impl<B: Backend> Core<B> {
                                         crate::huddle::HuddlePhase::Idle
                                             | crate::huddle::HuddlePhase::Failed
                                     );
-                                    events.emit(Event::HuddleSessionChanged(Box::new(snap)));
+                                    events.emit(Event::HuddleSessionChanged(snap));
                                     if done {
                                         let _ = active_for_clear
                                             .lock()
@@ -2030,6 +2030,15 @@ impl<B: Backend> Core<B> {
                                 }
                                 crate::huddle::HuddleUpdate::AudioLevels(levels) => {
                                     events.emit(Event::HuddleAudioLevels(levels));
+                                }
+                                crate::huddle::HuddleUpdate::VideoFrame { tile, frame } => {
+                                    events.emit(Event::HuddleVideoFrame { tile, frame });
+                                }
+                                crate::huddle::HuddleUpdate::VideoTileClosed(tile) => {
+                                    events.emit(Event::HuddleVideoTileClosed(tile));
+                                }
+                                crate::huddle::HuddleUpdate::DataEvent(ev) => {
+                                    events.emit(Event::HuddleDataEvent(ev));
                                 }
                             }
                         }
@@ -2101,6 +2110,84 @@ impl<B: Backend> Core<B> {
                         events.emit(Event::Error(format!("speaker test: {err}")));
                     }
                 });
+            }
+            Command::SetHuddleCamera {
+                enabled,
+                device_index,
+                blur,
+            } => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetCamera {
+                        enabled,
+                        device_index,
+                        blur,
+                    });
+                }
+            }
+            Command::SetHuddleBlurBackground(blur) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetBlurBackground(blur));
+                }
+            }
+            Command::SetHuddleScreenShare { source_id } => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetScreenShare { source_id });
+                }
+            }
+            Command::SendHuddleReaction(emoji) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SendReaction(emoji));
+                }
+            }
+            Command::SetHuddleHandRaised(raised) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetHandRaised(raised));
+                }
+            }
+            Command::SetHuddleTopic(topic) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetTopic(topic));
+                }
+            }
+            Command::SetHuddleCaptions(enabled) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetCaptionsEnabled(enabled));
+                }
             }
             // Handled by the loop.
             Command::Shutdown => {}

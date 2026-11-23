@@ -3,6 +3,7 @@
 //! Pinned at the bottom of the sidebar column so the user can switch channels, threads, DMs, or
 //! Unreads without ever losing audio controls, active-speaker visibility, or one-click pop-out.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,11 +13,12 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
-    div, px,
+    IntoElement, ParentElement as _, Render, RenderImage, StatefulInteractiveElement as _,
+    Styled as _, Window, div, px,
 };
 use slackless_core::huddle::{
-    AudioDevices, HuddleAudioLevels, HuddlePhase, HuddleSessionSnapshot, list_audio_devices,
+    AudioDevices, HuddleAudioLevels, HuddleDataEvent, HuddlePhase, HuddleSessionSnapshot,
+    VideoFrame, VideoTileKey, list_audio_devices,
 };
 use slackless_core::types::{ChannelId, UserId};
 
@@ -28,6 +30,21 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Convert a BGRA8888 [`VideoFrame`] into a GPU-ready GPUI [`RenderImage`].
+pub fn frame_to_render_image(frame: &VideoFrame) -> Option<Arc<RenderImage>> {
+    let rgba = image::RgbaImage::from_raw(frame.width, frame.height, (*frame.bgra).clone())?;
+    Some(Arc::new(RenderImage::new(smallvec::smallvec![
+        image::Frame::new(rgba)
+    ])))
 }
 
 /// Format an elapsed duration in seconds as `MM:SS` or `H:MM:SS`.
@@ -50,10 +67,16 @@ pub struct HuddleViewState {
     pub participants: Vec<UserId>,
     pub levels: HuddleAudioLevels,
     pub elapsed_secs: u64,
+    pub video_frames: HashMap<VideoTileKey, Arc<RenderImage>>,
+    pub raised_hands: HashSet<UserId>,
+    pub reactions: Vec<(UserId, String, u64)>,
+    pub captions: Vec<(UserId, String)>,
 }
 
 pub enum HuddleDockEvent {
     ToggleMute,
+    ToggleCamera,
+    ToggleScreenShare,
     Leave,
     PopOut,
     JumpToChannel(ChannelId),
@@ -73,6 +96,10 @@ pub struct HuddleDock {
     participants: Vec<UserId>,
     levels: HuddleAudioLevels,
     elapsed_secs: u64,
+    video_frames: HashMap<VideoTileKey, Arc<RenderImage>>,
+    raised_hands: HashSet<UserId>,
+    reactions: Vec<(UserId, String, u64)>,
+    captions: Vec<(UserId, String)>,
     menu_open: bool,
     devices: AudioDevices,
 }
@@ -87,12 +114,13 @@ impl HuddleDock {
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
-            // 1-second timer to advance the elapsed duration clock while the huddle stays live.
+            // 1-second timer to advance the elapsed duration clock & expire floating reactions.
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
                     let keep = this
                         .update(cx, |dock: &mut HuddleDock, cx| {
+                            let mut dirty = false;
                             if dock.session.started_at_secs > 0
                                 && matches!(
                                     dock.session.phase,
@@ -101,6 +129,15 @@ impl HuddleDock {
                             {
                                 dock.elapsed_secs =
                                     now_secs().saturating_sub(dock.session.started_at_secs);
+                                dirty = true;
+                            }
+                            let cutoff = now_ms().saturating_sub(4_000);
+                            let before = dock.reactions.len();
+                            dock.reactions.retain(|(_, _, at)| *at >= cutoff);
+                            if dock.reactions.len() != before {
+                                dirty = true;
+                            }
+                            if dirty {
                                 cx.notify();
                             }
                         })
@@ -123,6 +160,10 @@ impl HuddleDock {
                 } else {
                     0
                 },
+                video_frames: HashMap::new(),
+                raised_hands: HashSet::new(),
+                reactions: Vec::new(),
+                captions: Vec::new(),
                 menu_open: false,
                 devices: AudioDevices::default(),
             }
@@ -132,6 +173,11 @@ impl HuddleDock {
     pub fn update_session(&mut self, session: HuddleSessionSnapshot, cx: &mut Context<Self>) {
         if session.started_at_secs > 0 {
             self.elapsed_secs = now_secs().saturating_sub(session.started_at_secs);
+        }
+        if session.hand_raised {
+            self.raised_hands.insert(self.fixtures.self_user.clone());
+        } else {
+            self.raised_hands.remove(&self.fixtures.self_user);
         }
         self.session = session;
         cx.notify();
@@ -149,9 +195,105 @@ impl HuddleDock {
         cx.notify();
     }
 
+    pub fn update_video_frame(
+        &mut self,
+        tile: VideoTileKey,
+        frame: &VideoFrame,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(img) = frame_to_render_image(frame) {
+            if let Some(old) = self.video_frames.insert(tile, img) {
+                cx.drop_image(old, None);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn close_video_tile(&mut self, tile: &VideoTileKey, cx: &mut Context<Self>) {
+        if let Some(old) = self.video_frames.remove(tile) {
+            cx.drop_image(old, None);
+            cx.notify();
+        }
+    }
+
+    pub fn clear_video_frames(&mut self, cx: &mut Context<Self>) {
+        for (_, old) in self.video_frames.drain() {
+            cx.drop_image(old, None);
+        }
+    }
+
+    pub fn apply_data_event(&mut self, event: &HuddleDataEvent, cx: &mut Context<Self>) {
+        match event {
+            HuddleDataEvent::Reaction { user, emoji, at_ms } => {
+                let ts = if *at_ms == 0 { now_ms() } else { *at_ms };
+                self.reactions.push((user.clone(), emoji.clone(), ts));
+                if self.reactions.len() > 16 {
+                    let excess = self.reactions.len() - 16;
+                    self.reactions.drain(0..excess);
+                }
+            }
+            HuddleDataEvent::HandRaise { user, raised } => {
+                if *raised {
+                    self.raised_hands.insert(user.clone());
+                } else {
+                    self.raised_hands.remove(user);
+                }
+                if *user == self.fixtures.self_user {
+                    self.session.hand_raised = *raised;
+                }
+            }
+            HuddleDataEvent::Topic { topic, .. } => {
+                self.session.topic = (!topic.is_empty()).then(|| topic.clone());
+            }
+            HuddleDataEvent::Caption { user, text, .. } => {
+                if !text.trim().is_empty() {
+                    self.captions.push((user.clone(), text.clone()));
+                    if self.captions.len() > 3 {
+                        let excess = self.captions.len() - 3;
+                        self.captions.drain(0..excess);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
     pub fn set_muted_local(&mut self, muted: bool, cx: &mut Context<Self>) {
         if self.session.muted != muted {
             self.session.muted = muted;
+            cx.notify();
+        }
+    }
+
+    pub fn set_camera_local(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.session.video != on {
+            self.session.video = on;
+            if !on {
+                self.close_video_tile(&VideoTileKey::LocalCamera, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn set_blur_local(&mut self, blur: bool, cx: &mut Context<Self>) {
+        if self.session.blur_background != blur {
+            self.session.blur_background = blur;
+            cx.notify();
+        }
+    }
+
+    pub fn set_sharing_local(&mut self, source_id: Option<String>, cx: &mut Context<Self>) {
+        self.session.sharing = source_id.is_some();
+        self.session.share_source_id = source_id;
+        if !self.session.sharing {
+            self.close_video_tile(&VideoTileKey::LocalScreen, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn set_captions_local(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.session.captions_enabled != enabled {
+            self.session.captions_enabled = enabled;
             cx.notify();
         }
     }
@@ -166,6 +308,10 @@ impl HuddleDock {
             participants: self.participants.clone(),
             levels: self.levels.clone(),
             elapsed_secs: self.elapsed_secs,
+            video_frames: self.video_frames.clone(),
+            raised_hands: self.raised_hands.clone(),
+            reactions: self.reactions.clone(),
+            captions: self.captions.clone(),
         }
     }
 
@@ -342,6 +488,119 @@ impl HuddleDock {
                     })),
             )
     }
+    fn render_action_bar(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
+        let mic_button = {
+            let btn = Button::new("huddle-dock-mic")
+                .with_size(Size::Small)
+                .icon(if self.session.muted {
+                    IconName::MicOff
+                } else {
+                    IconName::Mic
+                })
+                .tooltip(if self.session.muted {
+                    "Unmute microphone (⌘⇧Space)"
+                } else {
+                    "Mute microphone (⌘⇧Space)"
+                })
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleMute)));
+            if self.session.muted {
+                btn.ghost()
+            } else {
+                btn.primary()
+            }
+        };
+        let video_button = {
+            let btn = Button::new("huddle-dock-video")
+                .with_size(Size::Small)
+                .icon(if self.session.video {
+                    IconName::Video
+                } else {
+                    IconName::VideoOff
+                })
+                .tooltip(if self.session.video {
+                    "Turn camera off"
+                } else {
+                    "Turn camera on"
+                })
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.emit(HuddleDockEvent::ToggleCamera);
+                }));
+            if self.session.video {
+                btn.primary()
+            } else {
+                btn.ghost()
+            }
+        };
+        let share_button = {
+            let btn = Button::new("huddle-dock-share")
+                .with_size(Size::Small)
+                .icon(IconName::ScreenShare)
+                .tooltip(if self.session.sharing {
+                    "Stop screen sharing"
+                } else {
+                    "Share screen"
+                })
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.emit(HuddleDockEvent::ToggleScreenShare);
+                }));
+            if self.session.sharing {
+                btn.primary()
+            } else {
+                btn.ghost()
+            }
+        };
+        h_flex()
+            .items_center()
+            .gap_1()
+            .child(mic_button)
+            .child(video_button)
+            .child(share_button)
+            .child(
+                Button::new("huddle-dock-thread")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .icon(IconName::MessageSquare)
+                    .tooltip("Huddle thread")
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(HuddleDockEvent::OpenThread);
+                    })),
+            )
+            .child(
+                Button::new("huddle-dock-more")
+                    .ghost()
+                    .with_size(Size::Small)
+                    .icon(IconName::Ellipsis)
+                    .tooltip("Audio devices & huddle options")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.menu_open = !this.menu_open;
+                        if this.menu_open {
+                            cx.spawn(async move |dock, cx| {
+                                let devices = cx
+                                    .background_executor()
+                                    .spawn(async move { list_audio_devices() })
+                                    .await;
+                                let _ = dock.update(cx, |dock: &mut HuddleDock, cx| {
+                                    dock.devices = devices;
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("huddle-dock-leave")
+                    .danger()
+                    .with_size(Size::Small)
+                    .icon(IconName::PhoneOff)
+                    .tooltip("Leave huddle")
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(HuddleDockEvent::Leave);
+                    })),
+            )
+    }
 }
 
 impl Render for HuddleDock {
@@ -425,26 +684,7 @@ impl Render for HuddleDock {
                 )
             });
 
-        let mic_button = {
-            let btn = Button::new("huddle-dock-mic")
-                .with_size(Size::Small)
-                .icon(if self.session.muted {
-                    IconName::MicOff
-                } else {
-                    IconName::Mic
-                })
-                .tooltip(if self.session.muted {
-                    "Unmute microphone (⌘⇧Space)"
-                } else {
-                    "Mute microphone (⌘⇧Space)"
-                })
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleMute)));
-            if self.session.muted {
-                btn.ghost()
-            } else {
-                btn.primary()
-            }
-        };
+        let action_bar = self.render_action_bar(cx);
 
         let mut card = v_flex()
             .id("huddle-sidebar-dock")
@@ -583,59 +823,17 @@ impl Render for HuddleDock {
                                 ),
                         )
                     })
-                    // Action control bar: Mute, Thread, More/Devices, Leave
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(mic_button)
-                            .child(
-                                Button::new("huddle-dock-thread")
-                                    .ghost()
-                                    .with_size(Size::Small)
-                                    .icon(IconName::MessageSquare)
-                                    .tooltip("Huddle thread")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(HuddleDockEvent::OpenThread);
-                                    })),
-                            )
-                            .child(
-                                Button::new("huddle-dock-more")
-                                    .ghost()
-                                    .with_size(Size::Small)
-                                    .icon(IconName::Ellipsis)
-                                    .tooltip("Audio devices & huddle options")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.menu_open = !this.menu_open;
-                                        if this.menu_open {
-                                            cx.spawn(async move |dock, cx| {
-                                                let devices = cx
-                                                    .background_executor()
-                                                    .spawn(async move { list_audio_devices() })
-                                                    .await;
-                                                let _ =
-                                                    dock.update(cx, |dock: &mut HuddleDock, cx| {
-                                                        dock.devices = devices;
-                                                        cx.notify();
-                                                    });
-                                            })
-                                            .detach();
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("huddle-dock-leave")
-                                    .danger()
-                                    .with_size(Size::Small)
-                                    .icon(IconName::PhoneOff)
-                                    .label("Leave")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(HuddleDockEvent::Leave);
-                                    })),
-                            ),
-                    ),
+                    // Action control bar: Mute, Camera, Share, Thread, More/Devices, Leave
+                    .when_some(self.session.topic.clone(), |box_el, topic| {
+                        box_el.child(
+                            div()
+                                .text_xs()
+                                .truncate()
+                                .text_color(muted_fg)
+                                .child(format!("Topic: {topic}")),
+                        )
+                    })
+                    .child(action_bar),
             );
 
         if self.menu_open {

@@ -3728,6 +3728,12 @@ fn subscribe_workspace(
                 HuddleEvent::ToggleMute => {
                     this.toggle_huddle_mute(cx);
                 }
+                HuddleEvent::ToggleVideo => {
+                    this.toggle_huddle_camera(cx);
+                }
+                HuddleEvent::ToggleShare => {
+                    this.toggle_huddle_screen_share(window, cx);
+                }
                 HuddleEvent::PopOut => {
                     this.pop_out_huddle(window, cx);
                 }

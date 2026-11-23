@@ -16,10 +16,12 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::proto::{
-    SdkAudioControlFrame, SdkClientDetails, SdkClientMetricFrame, SdkJoinFlags, SdkJoinFrame,
-    SdkLeaveFrame, SdkMetric, SdkPingPongFrame, SdkPingPongType, SdkSignalFrame,
+    SdkAudioControlFrame, SdkClientDetails, SdkClientMetricFrame, SdkDataMessageFrame,
+    SdkDataMessagePayload, SdkIndexFrame, SdkJoinFlags, SdkJoinFrame, SdkLeaveFrame, SdkMetric,
+    SdkPingPongFrame, SdkPingPongType, SdkRemoteVideoUpdateFrame, SdkSignalFrame,
     SdkStreamDescriptor, SdkStreamMediaType, SdkStreamMetricFrame, SdkStreamServiceType,
-    SdkSubscribeFrame, sdk_metric, sdk_signal_frame,
+    SdkSubscribeFrame, SdkVideoQualityAdaptationPreference, SdkVideoSubscriptionConfiguration,
+    sdk_metric, sdk_signal_frame,
 };
 use crate::{HuddleCredentials, HuddleError, Result};
 
@@ -158,6 +160,117 @@ pub fn build_join_frame(audio_session_id: u64) -> SdkSignalFrame {
     }
 }
 
+/// One remote video or `#content` screen-share stream advertised by Chime's `INDEX` frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteVideoSource {
+    pub stream_id: u32,
+    pub group_id: u32,
+    pub attendee_id: String,
+    pub user_id: UserId,
+    pub is_content: bool,
+    pub max_bitrate_kbps: u32,
+}
+
+/// Extract remote camera and `#content` screen-share sources from an `SdkIndexFrame`.
+pub fn parse_index_sources(
+    index: &SdkIndexFrame,
+    self_attendee_id: &str,
+) -> Vec<RemoteVideoSource> {
+    let mut out = Vec::new();
+    for src in &index.sources {
+        let Some(stream_id) = src.stream_id else {
+            continue;
+        };
+        let attendee_id = src.attendee_id.clone().unwrap_or_default();
+        if attendee_id.is_empty() || attendee_id == self_attendee_id {
+            continue;
+        }
+        let external = src.external_user_id.as_deref().unwrap_or("");
+        let is_content = external.ends_with("#content") || attendee_id.ends_with("#content");
+        let Some(user_id) = parse_external_user_id(external) else {
+            continue;
+        };
+        out.push(RemoteVideoSource {
+            stream_id,
+            group_id: src.group_id.unwrap_or(1),
+            attendee_id,
+            user_id,
+            is_content,
+            max_bitrate_kbps: src
+                .max_bitrate_kbps
+                .unwrap_or(if is_content { 1500 } else { 350 }),
+        });
+    }
+    out
+}
+
+/// Build a Chime `SUBSCRIBE` frame for audio-only (`send_video = false`) or full `DUPLEX`
+/// audio + H.264 video (`send_video = true` or non-empty `receive_sources`).
+pub fn build_subscribe_frame(
+    creds: &HuddleCredentials,
+    sdp_offer: &str,
+    wants_compressed_sdp: bool,
+    audio_muted: bool,
+    send_video: bool,
+    receive_sources: &[RemoteVideoSource],
+) -> Result<SdkSignalFrame> {
+    let (plain, compressed) = if wants_compressed_sdp {
+        (None, Some(deflate_sdp(sdp_offer)?))
+    } else {
+        (Some(sdp_offer.to_owned()), None)
+    };
+    let mut send_streams = vec![SdkStreamDescriptor {
+        stream_id: Some(1),
+        framerate: Some(15),
+        max_bitrate_kbps: Some(600),
+        track_label: Some("AmazonChimeExpressAudio".to_owned()),
+        group_id: Some(1),
+        avg_bitrate_bps: Some(400_000),
+        attendee_id: Some(creds.attendee_id.clone()),
+        media_type: Some(SdkStreamMediaType::Audio as i32),
+        external_user_id: Some(creds.external_user_id.clone()),
+        ..Default::default()
+    }];
+    if send_video {
+        send_streams.push(SdkStreamDescriptor {
+            stream_id: Some(2),
+            framerate: Some(15),
+            max_bitrate_kbps: Some(1500),
+            track_label: Some("AmazonChimeExpressVideo".to_owned()),
+            group_id: Some(2),
+            avg_bitrate_bps: Some(800_000),
+            attendee_id: Some(creds.attendee_id.clone()),
+            media_type: Some(SdkStreamMediaType::Video as i32),
+            external_user_id: Some(creds.external_user_id.clone()),
+            width: Some(640),
+            height: Some(360),
+        });
+    }
+    let receive_stream_ids: Vec<u32> = receive_sources.iter().map(|s| s.stream_id).collect();
+    let video_subscription_configuration = build_video_subscriptions(receive_sources);
+    let duplex = if send_video {
+        SdkStreamServiceType::Duplex
+    } else {
+        SdkStreamServiceType::Rx
+    };
+    Ok(SdkSignalFrame {
+        timestamp_ms: Some(now_ms()),
+        r#type: Some(sdk_signal_frame::Type::Subscribe as i32),
+        sub: Some(SdkSubscribeFrame {
+            duplex: Some(duplex as i32),
+            send_streams,
+            receive_stream_ids,
+            sdp_offer: plain,
+            compressed_sdp_offer: compressed,
+            audio_host: Some(creds.audio_host_url.clone()),
+            audio_checkin: Some(false),
+            audio_muted: Some(audio_muted),
+            video_subscription_configuration,
+        }),
+        ..Default::default()
+    })
+}
+
 /// Build the audio-only Chime `SUBSCRIBE` frame (note: `duplex = RX` describes video direction
 /// even while sending audio, and `framerate = 15` is expected by Chime's SFU on audio too).
 pub fn build_audio_subscribe_frame(
@@ -166,38 +279,70 @@ pub fn build_audio_subscribe_frame(
     wants_compressed_sdp: bool,
     audio_muted: bool,
 ) -> Result<SdkSignalFrame> {
-    let (plain, compressed) = if wants_compressed_sdp {
-        (None, Some(deflate_sdp(sdp_offer)?))
-    } else {
-        (Some(sdp_offer.to_owned()), None)
-    };
-    Ok(SdkSignalFrame {
+    build_subscribe_frame(
+        creds,
+        sdp_offer,
+        wants_compressed_sdp,
+        audio_muted,
+        false,
+        &[],
+    )
+}
+
+/// Convert [`RemoteVideoSource`]s into Chime `SdkVideoSubscriptionConfiguration` entries.
+pub fn build_video_subscriptions(
+    sources: &[RemoteVideoSource],
+) -> Vec<SdkVideoSubscriptionConfiguration> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(ix, src)| SdkVideoSubscriptionConfiguration {
+            mid: Some(format!("v{}", ix + 1)),
+            attendee_id: Some(src.attendee_id.clone()),
+            stream_id: Some(src.stream_id),
+            priority: Some(if src.is_content { 1 } else { 2 }),
+            target_bitrate_kbps: Some(src.max_bitrate_kbps.clamp(150, 2000)),
+            group_id: Some(src.group_id),
+            quality_adaptation_preference: Some(if src.is_content {
+                SdkVideoQualityAdaptationPreference::MaintainResolution as i32
+            } else {
+                SdkVideoQualityAdaptationPreference::Balanced as i32
+            }),
+        })
+        .collect()
+}
+
+/// Build a Chime `REMOTE_VIDEO_UPDATE` frame to subscribe/unsubscribe remote video & screen streams.
+pub fn build_remote_video_update_frame(
+    added: Vec<SdkVideoSubscriptionConfiguration>,
+    removed_mids: Vec<String>,
+) -> SdkSignalFrame {
+    SdkSignalFrame {
         timestamp_ms: Some(now_ms()),
-        r#type: Some(sdk_signal_frame::Type::Subscribe as i32),
-        sub: Some(SdkSubscribeFrame {
-            duplex: Some(SdkStreamServiceType::Rx as i32),
-            send_streams: vec![SdkStreamDescriptor {
-                stream_id: Some(1),
-                framerate: Some(15),
-                max_bitrate_kbps: Some(600),
-                track_label: Some("AmazonChimeExpressAudio".to_owned()),
-                group_id: Some(1),
-                avg_bitrate_bps: Some(400_000),
-                attendee_id: Some(creds.attendee_id.clone()),
-                media_type: Some(SdkStreamMediaType::Audio as i32),
-                external_user_id: Some(creds.external_user_id.clone()),
-                ..Default::default()
-            }],
-            receive_stream_ids: Vec::new(),
-            sdp_offer: plain,
-            compressed_sdp_offer: compressed,
-            audio_host: Some(creds.audio_host_url.clone()),
-            audio_checkin: Some(false),
-            audio_muted: Some(audio_muted),
-            video_subscription_configuration: Vec::new(),
+        r#type: Some(sdk_signal_frame::Type::RemoteVideoUpdate as i32),
+        remote_video_update: Some(SdkRemoteVideoUpdateFrame {
+            added_or_updated_video_subscriptions: added,
+            removed_video_subscription_mids: removed_mids,
         }),
         ..Default::default()
-    })
+    }
+}
+
+/// Build a Chime `DATA_MESSAGE` frame for huddle reactions, hand raise, topic, or captions.
+pub fn build_data_message_frame(topic: &str, data: Vec<u8>, lifetime_ms: u32) -> SdkSignalFrame {
+    SdkSignalFrame {
+        timestamp_ms: Some(now_ms()),
+        r#type: Some(sdk_signal_frame::Type::DataMessage as i32),
+        data_message: Some(SdkDataMessageFrame {
+            messages: vec![SdkDataMessagePayload {
+                topic: Some(topic.to_owned()),
+                data: Some(data),
+                lifetime_ms: Some(lifetime_ms),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    }
 }
 
 /// Build a Chime `AUDIO_CONTROL` mute/unmute frame.

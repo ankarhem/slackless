@@ -292,6 +292,10 @@ enum ExportFormat {
 enum HuddleCommand {
     /// List available local microphones and speakers (offline).
     Devices,
+    /// List available local webcam cameras (offline).
+    Cameras,
+    /// List available monitors and application windows for screen sharing (offline).
+    Screens,
     /// Join or start a live native audio huddle in a channel (Ctrl+C or `--duration` leaves cleanly).
     Join {
         /// Channel id, #name, or @handle.
@@ -484,6 +488,8 @@ async fn dispatch(
         }
         Commands::Huddle { command } => match command {
             HuddleCommand::Devices => live::run_huddle_devices(ctx),
+            HuddleCommand::Cameras => live::run_huddle_cameras(ctx),
+            HuddleCommand::Screens => live::run_huddle_screens(ctx),
             HuddleCommand::Join {
                 channel,
                 muted,

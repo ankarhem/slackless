@@ -442,3 +442,16 @@ With no stored session, each of these fails the same way:
 - Treat `ts` values as opaque identifiers and copy them verbatim into `reply` and `react`.
 - Empty local results with exit 0 usually mean the archive has not synced yet; check `auth status` for `archive_exists` and `messages`.
 - A `session_rejected` error is fixed by the user signing in again (`slackless auth login`), not by retrying.
+
+### huddle
+
+```sh
+slackless huddle devices --json
+slackless huddle cameras --json
+slackless huddle screens --json
+slackless huddle join "#eng" --muted --duration 15 --json
+slackless huddle link "#eng" --json
+slackless huddle invite "#eng" U0123ABC --json
+```
+
+Native Amazon Chime huddles from the terminal: `devices`, `cameras`, and `screens` run offline to enumerate local microphones/speakers, cameras, and screen-share monitors/windows; `join` connects to Slack's `rooms.join` + Chime DTLS-SRTP media stack until Ctrl+C or `--duration N`; `link` fetches the shareable huddle URL; `invite` rings a member (`rooms.notifyMember`).

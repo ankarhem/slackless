@@ -54,6 +54,10 @@ pub enum HuddleEvent {
     OpenThread,
     /// Toggle local microphone mute (`Command::SetHuddleMuted`).
     ToggleMute,
+    /// Toggle local webcam H.264 video (`Command::SetHuddleCamera`).
+    ToggleVideo,
+    /// Toggle screen sharing (opens Pop-out Huddle Window source picker, or stops active share).
+    ToggleShare,
     /// Open the full Pop-out Huddle Window (`PopoutKind::Huddle`).
     PopOut,
     /// Copy shareable huddle link (`Command::CopyHuddleLink`).
@@ -105,6 +109,8 @@ impl HuddleBar {
     ) {
         if let Some(snap) = &session {
             self.muted = snap.muted;
+            self.video = snap.video;
+            self.sharing = snap.sharing;
         }
         self.session = session;
         cx.notify();
@@ -268,10 +274,15 @@ impl Render for HuddleBar {
                     self.video,
                     IconName::Video,
                     IconName::VideoOff,
-                    "Video (Phase 2 — use Open in browser for video)",
+                    if self.video {
+                        "Turn camera off"
+                    } else {
+                        "Turn camera on"
+                    },
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.video = !this.video;
+                    cx.emit(HuddleEvent::ToggleVideo);
                     cx.notify();
                 })),
             )
@@ -281,10 +292,15 @@ impl Render for HuddleBar {
                     self.sharing,
                     IconName::ScreenShare,
                     IconName::ScreenShare,
-                    "Share screen (Phase 3 — use Open in browser for screen share)",
+                    if self.sharing {
+                        "Stop screen sharing"
+                    } else {
+                        "Share screen"
+                    },
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.sharing = !this.sharing;
+                    cx.emit(HuddleEvent::ToggleShare);
                     cx.notify();
                 })),
             )
@@ -411,13 +427,5 @@ impl Render for HuddleBar {
                     )
                 },
             )
-            .when(self.sharing || self.video, |bar| {
-                bar.child(
-                    div()
-                        .text_xs()
-                        .text_color(muted_foreground)
-                        .child("Native audio is active; video and screen sharing are coming in Phases 2–3 (use Browser to share video/screen)."),
-                )
-            })
     }
 }

@@ -1561,12 +1561,26 @@ impl App {
                     .items_center()
                     .gap_1()
                     .when(can_huddle, |actions| {
-                        let live_count = self
-                            .ws
-                            .active_huddles
-                            .get(&self.channel)
-                            .map(Vec::len)
-                            .unwrap_or(0);
+                        let live_people = self.ws.active_huddles.get(&self.channel);
+                        let live_count = live_people.map(Vec::len).unwrap_or(0);
+                        let tooltip_text: SharedString = match live_people {
+                            Some(users) if !users.is_empty() => {
+                                let names: Vec<_> = users
+                                    .iter()
+                                    .take(5)
+                                    .map(|u| self.fixtures.user_name(u))
+                                    .collect();
+                                let extra = users.len().saturating_sub(names.len());
+                                if extra > 0 {
+                                    format!("Join huddle: {} +{extra} more", names.join(", "))
+                                        .into()
+                                } else {
+                                    format!("Join huddle: {}", names.join(", ")).into()
+                                }
+                            }
+                            _ if huddle_here => "Open huddle window".into(),
+                            _ => "Start a huddle".into(),
+                        };
                         actions
                             .child(if live_count > 0 {
                                 h_flex()
@@ -1579,6 +1593,12 @@ impl App {
                                     .bg(success.opacity(0.16))
                                     .cursor_pointer()
                                     .hover(|el| el.bg(success.opacity(0.24)))
+                                    .tooltip(move |window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            tooltip_text.clone(),
+                                        )
+                                        .build(window, cx)
+                                    })
                                     .child(
                                         Icon::new(IconName::Headphones)
                                             .text_color(success)
@@ -1606,6 +1626,10 @@ impl App {
                                     },
                                     accent,
                                 )
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(tooltip_text.clone())
+                                        .build(window, cx)
+                                })
                                 .on_click(
                                     cx.listener(|this, _, window, cx| {
                                         this.start_huddle(window, cx)
