@@ -271,9 +271,9 @@ impl App {
                     has_unreads,
                 }
             } else if let Some(parked) = self.parked.get(ix).and_then(Option::as_ref) {
-                if !parked.counts.is_empty() {
+                if !parked.state.counts.is_empty() {
                     let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
-                    workspace_badge_from_counts(&parked.counts, activity)
+                    workspace_badge_from_counts(&parked.state.counts, activity)
                 } else {
                     let sidebar = parked.views.sidebar.read(cx);
                     WorkspaceBadge {
@@ -360,7 +360,7 @@ impl App {
                         .map(|entry| (entry.id.clone(), entry.clone()))
                         .collect();
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    parked.counts = map.clone();
+                    parked.state.counts = map.clone();
                 }
                 if let Some(slot) = self.bg_counts.get_mut(ws_index) {
                     *slot = map;
@@ -397,34 +397,40 @@ impl App {
             }
             Event::Usergroups(groups) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    parked.usergroups = groups.clone();
+                    parked.state.usergroups = groups.clone();
                 }
             }
             Event::AppCommands(commands) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    parked.app_commands = commands.clone();
+                    parked.state.app_commands = commands.clone();
                 }
             }
             Event::Connection(state) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    parked.connection = Some(state.clone());
+                    parked.state.connection = Some(state.clone());
                 }
             }
             Event::OfflineQueueChanged(count) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    parked.offline_queued = *count;
+                    parked.state.offline_queued = *count;
                 }
             }
             Event::OfflineMutationFailed(failed) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    if !parked.failed_mutations.iter().any(|m| m.id == failed.id) {
-                        parked.failed_mutations.push(failed.clone());
+                    if !parked
+                        .state
+                        .failed_mutations
+                        .iter()
+                        .any(|m| m.id == failed.id)
+                    {
+                        parked.state.failed_mutations.push(failed.clone());
                     }
                 }
             }
             Event::Presence { users, presence } => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     parked
+                        .state
                         .presence
                         .write()
                         .unwrap_or_else(PoisonError::into_inner)
@@ -504,13 +510,15 @@ impl App {
             } => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     if *ended {
-                        parked.active_huddles.remove(channel);
+                        parked.state.active_huddles.remove(channel);
                     } else {
                         parked
+                            .state
                             .active_huddles
                             .insert(channel.clone(), participants.clone());
                     }
-                    let keys: HashSet<ChannelId> = parked.active_huddles.keys().cloned().collect();
+                    let keys: HashSet<ChannelId> =
+                        parked.state.active_huddles.keys().cloned().collect();
                     parked
                         .views
                         .sidebar
@@ -538,7 +546,7 @@ impl App {
                 self.sidebar.update(cx, |sidebar, cx| {
                     sidebar.set_thread_counts(has_unreads, mentions, cx)
                 });
-                self.counts = [&counts.channels, &counts.ims, &counts.mpims]
+                self.ws.counts = [&counts.channels, &counts.ims, &counts.mpims]
                     .into_iter()
                     .flatten()
                     .map(|entry| (entry.id.clone(), entry.clone()))
@@ -591,14 +599,15 @@ impl App {
             Event::Presence { users, presence } => {
                 // Every snapshot shares this map: update it in place and repaint, with no
                 // store reload however often presence changes.
-                self.presence
+                self.ws
+                    .presence
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .extend(users.iter().map(|user| (user.clone(), presence.clone())));
                 window.refresh();
             }
             Event::DndPaused { user, paused } => {
-                self.peer_dnd_paused.insert(user.clone(), *paused);
+                self.ws.peer_dnd_paused.insert(user.clone(), *paused);
                 cx.notify();
             }
             Event::ThreadsView(view) => {
@@ -635,10 +644,10 @@ impl App {
                 members,
             } => {
                 if let Some(count) = num_members {
-                    self.member_counts.insert(channel.clone(), *count);
+                    self.ws.member_counts.insert(channel.clone(), *count);
                 }
                 if let Some(apps) = num_apps {
-                    self.app_counts.insert(channel.clone(), *apps);
+                    self.ws.app_counts.insert(channel.clone(), *apps);
                 }
                 // A late answer for a channel left since is moot: the open one's follows.
                 if *channel == self.channel {
@@ -669,11 +678,11 @@ impl App {
                 if let Ok(messages) = &messages {
                     self.resolve_named_users(messages);
                 }
-                self.pins.insert(channel.clone(), messages);
+                self.ws.pins.insert(channel.clone(), messages);
                 cx.notify();
             }
             Event::BookmarksLoaded { channel, bookmarks } => {
-                self.bookmarks.insert(channel.clone(), bookmarks.clone());
+                self.ws.bookmarks.insert(channel.clone(), bookmarks.clone());
                 cx.notify();
             }
             Event::FilesLoaded { filter, files } => {
@@ -682,7 +691,7 @@ impl App {
                 }
                 match &filter.channel {
                     Some(channel) => {
-                        self.files.insert(channel.clone(), files.clone());
+                        self.ws.files.insert(channel.clone(), files.clone());
                     }
                     // A workspace-wide list answers the Files view.
                     None => self
@@ -692,16 +701,16 @@ impl App {
                 cx.notify();
             }
             Event::Connection(state) => {
-                self.connection = Some(state.clone());
+                self.ws.connection = Some(state.clone());
                 cx.notify();
             }
             Event::OfflineQueueChanged(count) => {
-                self.offline_queued = *count;
+                self.ws.offline_queued = *count;
                 cx.notify();
             }
             Event::OfflineMutationFailed(failed) => {
-                if !self.failed_mutations.iter().any(|m| m.id == failed.id) {
-                    self.failed_mutations.push(failed.clone());
+                if !self.ws.failed_mutations.iter().any(|m| m.id == failed.id) {
+                    self.ws.failed_mutations.push(failed.clone());
                     cx.notify();
                 }
             }
@@ -733,11 +742,11 @@ impl App {
                 cx.open_url(&self.canvas_link(canvas_id));
             }
             Event::Usergroups(groups) => {
-                self.usergroups = groups.clone();
+                self.ws.usergroups = groups.clone();
                 self.reload_live(window, cx);
             }
             Event::AppCommands(commands) => {
-                self.app_commands = commands.clone();
+                self.ws.app_commands = commands.clone();
                 self.reload_live(window, cx);
             }
             Event::QuickSwitchResults { query, results } => {
@@ -782,12 +791,13 @@ impl App {
                 ended,
             } => {
                 if *ended {
-                    self.active_huddles.remove(channel);
+                    self.ws.active_huddles.remove(channel);
                 } else {
-                    self.active_huddles
+                    self.ws
+                        .active_huddles
                         .insert(channel.clone(), participants.clone());
                 }
-                let keys: HashSet<ChannelId> = self.active_huddles.keys().cloned().collect();
+                let keys: HashSet<ChannelId> = self.ws.active_huddles.keys().cloned().collect();
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
                 cx.notify();
@@ -846,13 +856,13 @@ impl App {
                     Ok(raw) => Ok(crate::canvas::CanvasDoc::from_html(title.clone(), raw)),
                     Err(err) => Err(err.clone()),
                 };
-                self.canvases.insert(file_id.clone(), parsed);
+                self.ws.canvases.insert(file_id.clone(), parsed);
                 cx.notify();
             }
             Event::FileDeleted { file_id } => {
                 self.files_page
                     .update(cx, |page, cx| page.remove_file(file_id, cx));
-                for list in self.files.values_mut().flatten() {
+                for list in self.ws.files.values_mut().flatten() {
                     list.retain(|f| f.id.as_str() != file_id);
                 }
                 notify("File deleted", "Removed file from Slack.", window, cx);
@@ -865,7 +875,7 @@ impl App {
     /// Live mode: rebuild the workspace views from a fresh store snapshot after its
     /// conversations or people changed, staying on the open conversation while it exists.
     pub(super) fn reload_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut snapshot) = self.bridge.snapshot(&self.counts) else {
+        let Some(mut snapshot) = self.bridge.snapshot(&self.ws.counts) else {
             return;
         };
         // Keep the full multi-workspace rail intact while updating this workspace's team info.
@@ -878,9 +888,9 @@ impl App {
             snapshot.workspaces = self.live_teams.clone();
         }
         // Presence, usergroups, and app_commands are transient (never stored), so they ride along.
-        snapshot.presence = self.presence.clone();
-        snapshot.usergroups = self.usergroups.clone();
-        snapshot.app_commands = self.app_commands.clone();
+        snapshot.presence = self.ws.presence.clone();
+        snapshot.usergroups = self.ws.usergroups.clone();
+        snapshot.app_commands = self.ws.app_commands.clone();
         let fixtures = Arc::new(snapshot);
         // Refresh the views in place, as Slack does: a status change or a new channel keeps
         // every scroll position, collapsed section and open panel.
@@ -916,7 +926,7 @@ impl App {
             .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
         self.files_page
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
-        let keep = self.chosen && fixtures.conversation(&self.channel).is_some();
+        let keep = self.ws.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
         // Hydrate custom status from Slack's live self profile (preserving active focus mode).
         if !self.self_state.focused() {
@@ -1005,7 +1015,7 @@ impl App {
     /// dropped (the reload's `set_history` forgets the request, so the top re-asks); an empty
     /// page marks the channel fully loaded.
     pub(super) fn load_older(&mut self, channel: &ChannelId, before: Ts, cx: &mut Context<Self>) {
-        if self.history_complete.contains(channel) {
+        if self.ws.history_complete.contains(channel) {
             return;
         }
         let Some(read) = self.bridge.history(channel.clone(), Some(before)) else {
@@ -1020,7 +1030,7 @@ impl App {
                     return;
                 }
                 if older.is_empty() {
-                    app.history_complete.insert(channel);
+                    app.ws.history_complete.insert(channel);
                     return;
                 }
                 app.resolve_named_users(&older);
@@ -1045,7 +1055,7 @@ impl App {
                 let read = this.update(cx, |app, cx| {
                     if app.history_generation != generation
                         || app.channel != channel
-                        || app.history_complete.contains(&channel)
+                        || app.ws.history_complete.contains(&channel)
                     {
                         return None;
                     }
@@ -1065,7 +1075,7 @@ impl App {
                         return false;
                     }
                     if older.is_empty() {
-                        app.history_complete.insert(channel.clone());
+                        app.ws.history_complete.insert(channel.clone());
                     } else {
                         app.messages.update(cx, |list, cx| {
                             list.prepend_history(channel.clone(), older, cx)

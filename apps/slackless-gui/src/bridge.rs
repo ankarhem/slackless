@@ -695,3 +695,46 @@ fn default_store_path(team_id: &TeamId) -> Option<PathBuf> {
     path.push(format!("{team_id}.sqlite"));
     Some(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sidebar_menu::{SectionFilter, SectionSort};
+
+    #[test]
+    fn saved_draft_and_section_prefs_json_round_trip() {
+        let draft = SavedDraft {
+            channel: ChannelId::from("C123"),
+            label: "# general".into(),
+            text: "Hello *world*".into(),
+            at: 1_760_000_000,
+        };
+        let encoded = serde_json::to_string(&draft).unwrap();
+        let decoded: SavedDraft = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, draft);
+
+        let mut prefs = SectionPrefs::default();
+        prefs
+            .filters
+            .insert("channels".into(), SectionFilter::Unreads);
+        prefs.sorts.insert("channels".into(), SectionSort::Priority);
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let decoded: SectionPrefs = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, prefs);
+
+        let empty: SectionPrefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, SectionPrefs::default());
+    }
+
+    #[test]
+    fn offline_bridge_is_a_safe_noop() {
+        let bridge = CoreBridge::offline();
+        assert!(bridge.store().is_none());
+        assert!(bridge.snapshot(&HashMap::new()).is_none());
+        assert!(bridge.history(ChannelId::from("C1"), None).is_none());
+        assert!(bridge.settings().is_none());
+        assert!(bridge.drafts().is_none());
+        assert!(bridge.section_prefs().is_none());
+        bridge.send(Command::MarkAllRead);
+    }
+}

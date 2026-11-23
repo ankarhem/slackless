@@ -278,14 +278,14 @@ impl App {
     /// read-only HTML export (`files.info` -> `url_private`) if not cached yet.
     pub(super) fn open_live_canvas(&mut self, file_id: String, cx: &mut Context<Self>) {
         self.close_full_column_views(cx);
-        self.active_canvas = Some(file_id.clone());
+        self.ws.active_canvas = Some(file_id.clone());
         self.tab = ConversationTab::Canvas;
-        let needs_load = match self.canvases.get(&file_id) {
+        let needs_load = match self.ws.canvases.get(&file_id) {
             None | Some(Err(_)) => true,
             Some(Ok(_)) => false,
         };
         if needs_load && !self.fixtures.sample {
-            self.canvases.remove(&file_id);
+            self.ws.canvases.remove(&file_id);
             self.bridge.send(Command::LoadCanvas { file_id });
         }
         cx.notify();
@@ -319,15 +319,15 @@ impl App {
         let channel = self.channel.clone();
         let command = match tab {
             ConversationTab::Pins => {
-                forget_failure(&mut self.pins, &channel);
+                forget_failure(&mut self.ws.pins, &channel);
                 Command::LoadPins(channel)
             }
             ConversationTab::Files => {
-                forget_failure(&mut self.files, &channel);
+                forget_failure(&mut self.ws.files, &channel);
                 Command::LoadFiles(FilesFilter::channel(channel))
             }
             ConversationTab::Folder { .. } => {
-                forget_failure(&mut self.bookmarks, &channel);
+                forget_failure(&mut self.ws.bookmarks, &channel);
                 Command::LoadBookmarks(channel)
             }
             ConversationTab::Messages | ConversationTab::Canvas | ConversationTab::List => {
@@ -341,7 +341,7 @@ impl App {
     /// open their tab; entries without a target are left out. Empty until the channel's
     /// `bookmarks.list` has been fetched (lazy).
     pub(super) fn live_bookmarks(&self) -> Vec<bookmarks::Bookmark> {
-        let Some(Ok(list)) = self.bookmarks.get(&self.channel) else {
+        let Some(Ok(list)) = self.ws.bookmarks.get(&self.channel) else {
             return Vec::new();
         };
         list.iter()
@@ -376,7 +376,7 @@ impl App {
                     })
             });
         let title = || {
-            let list = self.bookmarks.get(&self.channel)?.as_ref().ok()?;
+            let list = self.ws.bookmarks.get(&self.channel)?.as_ref().ok()?;
             let folder = list.iter().find(|bookmark| bookmark.id == folder_id)?;
             Some(SharedString::from(folder.title.clone()))
         };
@@ -507,7 +507,7 @@ impl App {
                 }
                 _ => {
                     self.pins_open = true;
-                    if !self.fixtures.sample && !self.pins.contains_key(&self.channel) {
+                    if !self.fixtures.sample && !self.ws.pins.contains_key(&self.channel) {
                         self.bridge.send(Command::LoadPins(self.channel.clone()));
                     }
                 }
@@ -726,7 +726,7 @@ impl App {
     /// Show `channel` as the user's choice, leaving any full-column view (search, drafts,
     /// later). History is the caller's: [`App::select`] records it, back/forward replay it.
     pub(super) fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
-        self.chosen = true;
+        self.ws.chosen = true;
         self.close_full_column_views(cx);
         self.close_hover_card(cx);
         cx.notify();
@@ -818,6 +818,7 @@ impl App {
             return;
         }
         let member_count = self
+            .ws
             .member_counts
             .get(&self.channel)
             .copied()
@@ -1033,7 +1034,7 @@ impl App {
     ) {
         self.bridge
             .send(Command::LeaveConversation(channel.clone()));
-        self.counts.remove(&channel);
+        self.ws.counts.remove(&channel);
         self.back.retain(|c| *c != channel);
         self.forward.retain(|c| *c != channel);
         self.recent.retain(|c| *c != channel);
@@ -1067,7 +1068,7 @@ impl App {
         self.recent.retain(|c| *c != left && *c != channel);
         self.recent.insert(0, left);
         self.recent.truncate(RECENT_MAX);
-        *self.visits.entry(channel.clone()).or_default() += 1;
+        *self.ws.visits.entry(channel.clone()).or_default() += 1;
         if let Some(write) = self.bridge.remember_recent_places(&self.recent) {
             cx.background_executor().spawn(write).detach();
         }
@@ -1219,20 +1220,11 @@ impl App {
                     channel,
                     views,
                     subscriptions,
-                    counts: bg_counts,
-                    presence: fixtures::PresenceMap::default(),
-                    peer_dnd_paused: HashMap::new(),
-                    usergroups: Vec::new(),
-                    app_commands: Vec::new(),
-                    visits: HashMap::new(),
-                    active_huddles: HashMap::new(),
-                    connection: None,
-                    offline_queued: 0,
-                    failed_mutations: Vec::new(),
-                    member_counts: HashMap::new(),
-                    app_counts: HashMap::new(),
-                    history_complete: HashSet::new(),
-                    chosen,
+                    state: WorkspaceState {
+                        counts: bg_counts,
+                        chosen,
+                        ..Default::default()
+                    },
                 }
             }
         };
@@ -1241,20 +1233,7 @@ impl App {
             channel: mem::replace(&mut self.channel, incoming.channel),
             views: self.swap_views(incoming.views),
             subscriptions: mem::replace(&mut self.workspace_subscriptions, incoming.subscriptions),
-            counts: mem::replace(&mut self.counts, incoming.counts),
-            presence: mem::replace(&mut self.presence, incoming.presence),
-            peer_dnd_paused: mem::replace(&mut self.peer_dnd_paused, incoming.peer_dnd_paused),
-            usergroups: mem::replace(&mut self.usergroups, incoming.usergroups),
-            app_commands: mem::replace(&mut self.app_commands, incoming.app_commands),
-            visits: mem::replace(&mut self.visits, incoming.visits),
-            active_huddles: mem::replace(&mut self.active_huddles, incoming.active_huddles),
-            connection: mem::replace(&mut self.connection, incoming.connection),
-            offline_queued: mem::replace(&mut self.offline_queued, incoming.offline_queued),
-            failed_mutations: mem::replace(&mut self.failed_mutations, incoming.failed_mutations),
-            member_counts: mem::replace(&mut self.member_counts, incoming.member_counts),
-            app_counts: mem::replace(&mut self.app_counts, incoming.app_counts),
-            history_complete: mem::replace(&mut self.history_complete, incoming.history_complete),
-            chosen: mem::replace(&mut self.chosen, incoming.chosen),
+            state: mem::replace(&mut self.ws, incoming.state),
         };
         self.parked[self.workspace] = Some(outgoing);
         self.workspace = index;
@@ -1605,6 +1584,6 @@ impl App {
         self.huddle
             .as_ref()
             .is_some_and(|(channel, _)| *channel == self.channel)
-            || self.active_huddles.contains_key(&self.channel)
+            || self.ws.active_huddles.contains_key(&self.channel)
     }
 }

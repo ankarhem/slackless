@@ -428,7 +428,7 @@ impl App {
     /// that will automatically flush on reconnect. Hidden once connected and drained.
     pub(super) fn connection_banner(&self, cx: &Context<Self>) -> Option<Div> {
         use slackless_core::rtm::ConnectionState;
-        let queued = self.offline_queued;
+        let queued = self.ws.offline_queued;
         let queue_suffix = if queued == 1 {
             " (1 queued change will send when reconnected)".to_owned()
         } else if queued > 1 {
@@ -436,7 +436,7 @@ impl App {
         } else {
             String::new()
         };
-        let text = match self.connection.as_ref() {
+        let text = match self.ws.connection.as_ref() {
             Some(ConnectionState::Reconnecting { attempt, delay, .. }) => {
                 let secs = delay.as_secs();
                 if secs > 0 {
@@ -482,13 +482,14 @@ impl App {
     /// Clickable Retry / Discard bar shown when one or more persisted offline mutations failed
     /// while flushing after reconnect.
     pub(super) fn failed_mutations_banner(&self, cx: &Context<Self>) -> Option<Div> {
-        if self.failed_mutations.is_empty() {
+        if self.ws.failed_mutations.is_empty() {
             return None;
         }
         let theme = cx.theme();
         let (danger, fg, muted) = (theme.danger, theme.foreground, theme.muted_foreground);
         let rows: Vec<_> =
-            self.failed_mutations
+            self.ws
+                .failed_mutations
                 .iter()
                 .map(|item| {
                     let retry_id = item.id;
@@ -536,7 +537,7 @@ impl App {
                                     .with_size(Size::XSmall)
                                     .label("Retry")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.failed_mutations.retain(|m| m.id != retry_id);
+                                        this.ws.failed_mutations.retain(|m| m.id != retry_id);
                                         this.bridge.send(Command::RetryOfflineMutation(retry_id));
                                         cx.notify();
                                     })),
@@ -549,7 +550,7 @@ impl App {
                                     .with_size(Size::XSmall)
                                     .label("Discard")
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.failed_mutations.retain(|m| m.id != discard_id);
+                                        this.ws.failed_mutations.retain(|m| m.id != discard_id);
                                         this.bridge
                                             .send(Command::DiscardOfflineMutation(discard_id));
                                         cx.notify();
@@ -685,7 +686,7 @@ impl App {
         let peer = conversation
             .filter(|c| c.kind() == ConversationKind::Im)
             .and_then(|c| c.user.as_ref())?;
-        if !self.peer_dnd_paused.get(peer).copied().unwrap_or(false) {
+        if !self.ws.peer_dnd_paused.get(peer).copied().unwrap_or(false) {
             return None;
         }
         let muted = cx.theme().muted;
@@ -1009,6 +1010,7 @@ impl App {
             .map(|user| self.fixtures.user_name(user))
             .collect();
         let humans = self
+            .ws
             .member_counts
             .get(&conversation.id)
             .copied()
@@ -1183,7 +1185,7 @@ impl App {
                     ConversationKind::PublicChannel | ConversationKind::PrivateChannel
                 )
             })
-            .and_then(|c| self.member_counts.get(&c.id).copied().or(c.num_members))
+            .and_then(|c| self.ws.member_counts.get(&c.id).copied().or(c.num_members))
             .map(|count| {
                 let popover_open = self.members_hover.0 || self.members_hover.1;
                 div()
@@ -1235,7 +1237,7 @@ impl App {
             });
         // Slack counts the channel's apps apart: "👤 13  ⊞ 4".
         let apps = conversation
-            .and_then(|c| self.app_counts.get(&c.id).copied())
+            .and_then(|c| self.ws.app_counts.get(&c.id).copied())
             .filter(|&apps| apps > 0)
             .map(|apps| {
                 h_flex()
@@ -1329,6 +1331,7 @@ impl App {
                     .gap_1()
                     .when(can_huddle, |actions| {
                         let live_count = self
+                            .ws
                             .active_huddles
                             .get(&self.channel)
                             .map(Vec::len)

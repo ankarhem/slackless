@@ -2079,3 +2079,145 @@ impl Render for Sidebar {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::gpui;
+
+    #[test]
+    fn nav_prefs_shows_respects_toggles() {
+        let prefs = NavPrefs {
+            show_home: false,
+            show_dms: true,
+            show_activity: false,
+            show_files: true,
+            show_later: false,
+            icons_only: true,
+        };
+        assert!(!prefs.shows(NavItem::Home));
+        assert!(prefs.shows(NavItem::Dms));
+        assert!(!prefs.shows(NavItem::Activity));
+        assert!(prefs.shows(NavItem::Files));
+        assert!(!prefs.shows(NavItem::Todos));
+        assert!(prefs.shows(NavItem::Admin));
+    }
+
+    #[test]
+    fn drop_target_and_dm_acceptance_follow_section_kinds() {
+        let dm_section = ChannelSection {
+            id: "S_DM".into(),
+            name: "Direct messages".into(),
+            kind: SectionKind::DirectMessages,
+            emoji: String::new(),
+            next_id: None,
+            channel_ids: Vec::new(),
+        };
+        let custom_section = ChannelSection {
+            id: "S_CUSTOM".into(),
+            name: "Priority".into(),
+            kind: SectionKind::Standard,
+            emoji: String::new(),
+            next_id: None,
+            channel_ids: Vec::new(),
+        };
+        let channels_key = SharedString::from("channels");
+        let dms_key = SharedString::from("dms");
+        let custom_key = SharedString::from("S_CUSTOM");
+
+        assert_eq!(drop_target(None, &channels_key), Some(None));
+        assert_eq!(drop_target(None, &dms_key), None);
+        assert_eq!(drop_target(Some(&dm_section), &dms_key), None);
+        assert_eq!(
+            drop_target(Some(&custom_section), &custom_key),
+            Some(Some("S_CUSTOM".into()))
+        );
+        assert!(accepts_dms(Some(&custom_section), &custom_key));
+        assert!(!accepts_dms(None, &channels_key));
+    }
+
+    #[gpui::test]
+    fn sidebar_unread_counts_stepping_and_section_jumps(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut fixtures = crate::fixtures::load();
+        fixtures.messages.clear();
+        let first = fixtures.channels[0].id.clone();
+        let second = fixtures.channels[1].id.clone();
+        let dm = fixtures.dms[0].id.clone();
+        fixtures.counts.insert(
+            second.clone(),
+            slackless_core::api::ConversationCounts {
+                id: second.clone(),
+                has_unreads: true,
+                mention_count: 2,
+                ..Default::default()
+            },
+        );
+        fixtures.counts.insert(
+            dm.clone(),
+            slackless_core::api::ConversationCounts {
+                id: dm.clone(),
+                has_unreads: true,
+                mention_count: 3,
+                ..Default::default()
+            },
+        );
+        let fixtures = Arc::new(fixtures);
+
+        let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = mounted.clone();
+        let init_fixtures = fixtures.clone();
+        let init_first = first.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let entity = Sidebar::new(init_fixtures.clone(), init_first.clone(), window, cx);
+            *slot.borrow_mut() = Some(entity.clone());
+            gpui_kit::component::Root::new(entity, window, cx)
+        });
+        let sidebar = mounted.borrow_mut().take().unwrap();
+
+        // Unread counts, badge_count, and mark_read.
+        sidebar.read_with(cx, |s, _| {
+            let second_conv = fixtures.conversation(&second).unwrap();
+            let unread = s.unread_in(second_conv, None);
+            assert_eq!(unread.count, 1);
+            assert_eq!(unread.mentions, 2);
+            assert!(s.unread_ids().contains(&second));
+            assert!(s.unread_ids().contains(&dm));
+            assert!(s.has_any_unreads());
+            // Dock badge = unread activity (0) + unread DMs (1).
+            assert_eq!(s.badge_count(), 1);
+        });
+
+        sidebar.update(cx, |s, cx| {
+            s.set_activity_unread(4, cx);
+            s.mark_read(second.clone(), cx);
+        });
+        sidebar.read_with(cx, |s, _| {
+            assert!(!s.unread_ids().contains(&second));
+            assert_eq!(s.badge_count(), 5);
+        });
+
+        // `step` and `step_section` walk the laid-out rows cleanly.
+        sidebar.read_with(cx, |s, _| {
+            *s.rows.borrow_mut() = vec![
+                (first.clone(), false),
+                (second.clone(), false),
+                (dm.clone(), true),
+            ];
+            assert_eq!(s.step(&first, true, false), Some(second.clone()));
+            assert_eq!(s.step(&first, true, true), Some(dm.clone()));
+            assert_eq!(s.step(&dm, false, false), Some(second.clone()));
+            assert_eq!(s.step(&first, false, false), None);
+
+            // Section jump moves between Channels head (`first`) and DMs head (`dm`) and wraps.
+            let next_head = s.step_section(&first, true);
+            assert!(next_head.is_some());
+            assert_ne!(next_head.as_ref(), Some(&first));
+            let prev_head = s.step_section(&dm, false);
+            assert!(prev_head.is_some());
+        });
+    }
+}

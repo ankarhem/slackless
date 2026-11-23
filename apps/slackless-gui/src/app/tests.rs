@@ -367,3 +367,26 @@ fn workspace_badge_aggregates_mentions_activity_and_unreads() {
         }
     );
 }
+
+#[test]
+fn workspace_state_defaults_cleanly_for_atomic_swap() {
+    let mut a = WorkspaceState::default();
+    let mut b = WorkspaceState::default();
+    a.chosen = true;
+    a.offline_queued = 3;
+    a.active_canvas = Some("F123".into());
+    a.pins.insert(ChannelId::from("C1"), Ok(Vec::new()));
+
+    let prev = mem::replace(&mut a, b);
+    b = prev;
+
+    assert!(!a.chosen);
+    assert_eq!(a.offline_queued, 0);
+    assert!(a.active_canvas.is_none());
+    assert!(a.pins.is_empty());
+
+    assert!(b.chosen);
+    assert_eq!(b.offline_queued, 3);
+    assert_eq!(b.active_canvas.as_deref(), Some("F123"));
+    assert!(b.pins.contains_key(&ChannelId::from("C1")));
+}

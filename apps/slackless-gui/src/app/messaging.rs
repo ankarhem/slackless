@@ -261,7 +261,7 @@ impl App {
     /// Slack is told (`conversations.mark`) and the sidebar un-bolds it at once. Without a
     /// counts entry (the bundled sample workspace) the sidebar's own read state moves.
     pub(super) fn mark_read(&mut self, channel: &ChannelId, newest: Ts, cx: &mut Context<Self>) {
-        if let Some(counts) = self.counts.get_mut(channel) {
+        if let Some(counts) = self.ws.counts.get_mut(channel) {
             if !counts.has_unreads && counts.mention_count == 0 {
                 return;
             }
@@ -296,7 +296,7 @@ impl App {
     /// sidebar un-bolds at once and the core's fresh counts follow.
     pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
         self.bridge.send(Command::MarkAllRead);
-        for counts in self.counts.values_mut() {
+        for counts in self.ws.counts.values_mut() {
             counts.has_unreads = false;
             counts.mention_count = 0;
         }
@@ -568,6 +568,7 @@ impl App {
                 )
             });
             let members = self
+                .ws
                 .member_counts
                 .get(&self.channel)
                 .map(|&n| n as usize)

@@ -546,3 +546,141 @@ impl Render for QuickSwitcher {
             ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::gpui;
+
+    #[gpui::test]
+    fn quick_switcher_ranks_by_match_tier_frecency_and_merges_remote(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let mut fixtures = crate::fixtures::load();
+        fixtures.channels = vec![
+            Conversation {
+                id: ChannelId::from("C_SUB"),
+                name: Some("my-eng-team".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+            Conversation {
+                id: ChannelId::from("C_PRE"),
+                name: Some("engineering".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+            Conversation {
+                id: ChannelId::from("C_EXACT"),
+                name: Some("eng".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+            Conversation {
+                id: ChannelId::from("C_MID"),
+                name: Some("strength".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+        ];
+        fixtures.dms.clear();
+        fixtures.directory.clear();
+        fixtures.users.clear();
+
+        let fixtures = Arc::new(fixtures);
+        let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = mounted.clone();
+        let (_root, cx) = cx.add_window_view(move |window, cx| {
+            let entity = QuickSwitcher::new(fixtures.clone(), window, cx);
+            *slot.borrow_mut() = Some(entity.clone());
+            gpui_kit::component::Root::new(entity, window, cx)
+        });
+        let switcher = mounted.borrow_mut().take().unwrap();
+
+        // Empty query orders purely by frecency (recency + visit count).
+        switcher.update(cx, |s, cx| {
+            s.set_frecency(
+                vec![ChannelId::from("C_MID"), ChannelId::from("C_SUB")],
+                HashMap::from([(ChannelId::from("C_SUB"), 20)]),
+                cx,
+            );
+        });
+        switcher.read_with(cx, |s, _| {
+            let ids: Vec<String> = s
+                .matches()
+                .into_iter()
+                .filter_map(|(t, _)| match t {
+                    Target::Channel(id) => Some(id.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids[0], "C_SUB"); // 95 + 80 = 175 > 100
+            assert_eq!(ids[1], "C_MID");
+        });
+
+        // Query "eng" ranks exact > prefix > word-prefix > substring.
+        switcher.update(cx, |s, _| {
+            s.query = "eng".into();
+        });
+        switcher.read_with(cx, |s, _| {
+            let ids: Vec<String> = s
+                .matches()
+                .into_iter()
+                .filter_map(|(t, _)| match t {
+                    Target::Channel(id) => Some(id.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids, vec!["C_EXACT", "C_PRE", "C_SUB", "C_MID"]);
+        });
+
+        // Merging remote results deduplicates known channels and ignores stale queries.
+        switcher.update(cx, |s, cx| {
+            s.set_remote_results(
+                "stale",
+                EdgeSearchResults {
+                    channels: vec![Conversation {
+                        id: ChannelId::from("C_STALE"),
+                        name: Some("eng-stale".into()),
+                        ..Default::default()
+                    }],
+                    users: Vec::new(),
+                },
+                cx,
+            );
+            s.set_remote_results(
+                "eng",
+                EdgeSearchResults {
+                    channels: vec![
+                        Conversation {
+                            id: ChannelId::from("C_EXACT"),
+                            name: Some("eng".into()),
+                            ..Default::default()
+                        },
+                        Conversation {
+                            id: ChannelId::from("C_REMOTE"),
+                            name: Some("eng-remote".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    users: Vec::new(),
+                },
+                cx,
+            );
+        });
+        switcher.read_with(cx, |s, _| {
+            let labels: Vec<String> = s.matches().into_iter().map(|(_, l)| l).collect();
+            assert!(labels.iter().any(|l| l == "# eng-remote"));
+            assert!(!labels.iter().any(|l| l == "# eng-stale"));
+            assert_eq!(labels.iter().filter(|l| *l == "# eng").count(), 1);
+        });
+    }
+}

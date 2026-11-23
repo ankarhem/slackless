@@ -912,3 +912,133 @@ impl Render for LaterView {
             )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::gpui;
+
+    #[test]
+    fn remind_presets_compute_expected_due_timestamps() {
+        let base = 10 * DAY + 14 * HOUR;
+        assert_eq!(Remind::InTwentyMinutes.at(base), base + 20 * MINUTE);
+        assert_eq!(Remind::InOneHour.at(base), base + HOUR);
+        assert_eq!(Remind::InThreeHours.at(base), base + 3 * HOUR);
+        assert_eq!(Remind::Tomorrow.at(base), 11 * DAY + 9 * HOUR);
+        assert_eq!(Remind::NextWeek.at(base), 17 * DAY + 9 * HOUR);
+    }
+
+    #[gpui::test]
+    fn later_view_save_due_state_transitions_and_live_refresh(cx: &mut gpui::TestAppContext) {
+        let view = cx.update(LaterView::new);
+        let ch = ChannelId::from("C1");
+        let ts1 = Ts::from("100.0");
+        let ts2 = Ts::from("200.0");
+
+        // Save two items in workspace 0 and one in workspace 1.
+        view.update(cx, |v, cx| {
+            v.save(
+                SaveRequest {
+                    channel: ch.clone(),
+                    ts: ts1.clone(),
+                    author: "Ada".into(),
+                    text: "Ship it".into(),
+                    saved: true,
+                    due: Some(1_000),
+                },
+                0,
+                "# general".into(),
+                cx,
+            );
+            v.save(
+                SaveRequest {
+                    channel: ch.clone(),
+                    ts: ts2.clone(),
+                    author: "Lin".into(),
+                    text: "Review PR".into(),
+                    saved: true,
+                    due: Some(2_000),
+                },
+                0,
+                "# general".into(),
+                cx,
+            );
+            v.save(
+                SaveRequest {
+                    channel: ch.clone(),
+                    ts: ts1.clone(),
+                    author: "Other".into(),
+                    text: "WS 1 item".into(),
+                    saved: true,
+                    due: None,
+                },
+                1,
+                "# ops".into(),
+                cx,
+            );
+        });
+
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.in_progress_count(), 2);
+            assert_eq!(v.saved_in(0).len(), 2);
+            assert_eq!(v.saved_in(1).len(), 1);
+        });
+
+        // `take_due` fires ts1 at t=1500 once and never double-fires it.
+        let due = view.update(cx, |v, cx| v.take_due(1_500, cx));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].ts, ts1);
+        let due_again = view.update(cx, |v, cx| v.take_due(1_500, cx));
+        assert!(due_again.is_empty());
+
+        // `replace_live` preserves `fired` for ts1 while replacing workspace 0 items.
+        view.update(cx, |v, cx| {
+            v.replace_live(
+                0,
+                vec![LaterItem {
+                    workspace: 0,
+                    channel: ch.clone(),
+                    ts: ts1.clone(),
+                    label: "# general".into(),
+                    author: "Ada".into(),
+                    text: "Ship it".into(),
+                    state: LaterState::InProgress,
+                    due: Some(u64::MAX),
+                    fired: false,
+                }],
+                cx,
+            );
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.in_progress_count(), 1);
+            assert_eq!(v.saved_in(1).len(), 1);
+            let item = v
+                .items
+                .iter()
+                .find(|i| i.workspace == 0 && i.ts == ts1)
+                .unwrap();
+            assert!(item.fired);
+        });
+
+        // Unsaving removes the item from workspace 0 only.
+        view.update(cx, |v, cx| {
+            v.save(
+                SaveRequest {
+                    channel: ch.clone(),
+                    ts: ts1.clone(),
+                    author: String::new(),
+                    text: String::new(),
+                    saved: false,
+                    due: None,
+                },
+                0,
+                String::new(),
+                cx,
+            );
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.in_progress_count(), 0);
+            assert_eq!(v.saved_in(1).len(), 1);
+        });
+    }
+}

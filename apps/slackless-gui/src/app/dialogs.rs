@@ -1178,7 +1178,7 @@ impl App {
             recent.push(self.channel.clone());
         }
         recent.extend(self.recent.iter().cloned());
-        let visits = self.visits.clone();
+        let visits = self.ws.visits.clone();
         self.switcher
             .update(cx, |switcher, cx| switcher.set_frecency(recent, visits, cx));
         let switcher = self.switcher.clone();

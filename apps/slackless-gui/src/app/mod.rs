@@ -426,27 +426,63 @@ struct WorkspaceViews {
     switcher: Entity<QuickSwitcher>,
 }
 
+/// Per-workspace live state swapped atomically when switching workspaces.
+#[derive(Default)]
+pub(super) struct WorkspaceState {
+    /// Live mode: Slack's latest read and unread state (`client.counts`).
+    pub(super) counts: HashMap<ChannelId, ConversationCounts>,
+    /// Live mode: last known presence per DM peer (`users.getPresence`, `presence_change`);
+    /// injected into every live fixtures snapshot so sidebar rows and headers render dots.
+    pub(super) presence: fixtures::PresenceMap,
+    /// Live mode: DM peers whose notifications are paused right now (`dnd.info`).
+    pub(super) peer_dnd_paused: HashMap<UserId, bool>,
+    /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.
+    pub(super) usergroups: Vec<Usergroup>,
+    /// Live mode: workspace slash commands from `client.appCommands`, injected into snapshots.
+    pub(super) app_commands: Vec<slackless_core::api::AppCommand>,
+    /// Per-conversation visit counts for Cmd+K Quick Switcher frecency ranking.
+    pub(super) visits: HashMap<ChannelId, u32>,
+    /// Live huddles currently running in this workspace (`sh_room_*` socket updates): channel -> participant user ids.
+    pub(super) active_huddles: HashMap<ChannelId, Vec<UserId>>,
+    /// Live mode: latest RTM websocket connection state (drives the offline/reconnecting banner).
+    pub(super) connection: Option<slackless_core::rtm::ConnectionState>,
+    /// Live mode: outgoing mutations buffered while offline, waiting to flush on reconnect.
+    pub(super) offline_queued: usize,
+    /// Live mode: offline mutations that failed to flush and await user Retry or Discard.
+    pub(super) failed_mutations: Vec<slackless_core::FailedMutation>,
+    /// Member counts from open-time `conversations.info`, newer than the snapshot's.
+    pub(super) member_counts: HashMap<ChannelId, u32>,
+    /// Apps among a channel's members, counted apart from people as Slack's header does.
+    pub(super) app_counts: HashMap<ChannelId, u32>,
+    /// Live mode: channels whose stored history has no older page left; the transcript
+    /// stops asking for them.
+    pub(super) history_complete: HashSet<ChannelId>,
+    /// The user opened a conversation themselves; until then live reloads open the one most
+    /// recently read in Slack.
+    pub(super) chosen: bool,
+    /// Live mode: per channel, its pinned messages (`pins.list`) or why they could not be
+    /// loaded; fetched each time a pins surface opens, never per channel.
+    pub(super) pins: HashMap<ChannelId, Loaded<Message>>,
+    /// Live mode: per channel, its bookmarks (`bookmarks.list`), fetched each time a
+    /// bookmarks surface opens.
+    pub(super) bookmarks: HashMap<ChannelId, Loaded<ChannelBookmark>>,
+    /// Live mode: per channel, its shared files (`files.list`), fetched each time Files &
+    /// links opens.
+    pub(super) files: HashMap<ChannelId, Loaded<File>>,
+    /// Live mode: parsed read-only canvases keyed by file id (`files.info` -> `url_private`, `F-COLLAB-125`).
+    pub(super) canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
+    /// File id of the live canvas currently displayed in `ConversationTab::Canvas`.
+    pub(super) active_canvas: Option<String>,
+}
+
 /// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,
-/// and per-workspace live state (counts, presence, usergroups, connection).
+/// and per-workspace live state.
 struct Parked {
     fixtures: Arc<Fixtures>,
     channel: ChannelId,
     views: WorkspaceViews,
     subscriptions: Vec<Subscription>,
-    counts: HashMap<ChannelId, ConversationCounts>,
-    presence: fixtures::PresenceMap,
-    peer_dnd_paused: HashMap<UserId, bool>,
-    usergroups: Vec<Usergroup>,
-    app_commands: Vec<slackless_core::api::AppCommand>,
-    visits: HashMap<ChannelId, u32>,
-    active_huddles: HashMap<ChannelId, Vec<UserId>>,
-    connection: Option<slackless_core::rtm::ConnectionState>,
-    offline_queued: usize,
-    failed_mutations: Vec<slackless_core::FailedMutation>,
-    member_counts: HashMap<ChannelId, u32>,
-    app_counts: HashMap<ChannelId, u32>,
-    history_complete: HashSet<ChannelId>,
-    chosen: bool,
+    state: WorkspaceState,
 }
 
 /// Where an emoji pick goes.
@@ -492,6 +528,8 @@ pub struct App {
     /// Per workspace index: the parked state of a workspace visited before (`None` for the
     /// shown one and never-visited ones).
     parked: Vec<Option<Parked>>,
+    /// Active workspace's per-workspace live state (swapped atomically with `Parked.state`).
+    ws: WorkspaceState,
     channel: ChannelId,
     sidebar: Entity<Sidebar>,
     messages: Entity<MessageList>,
@@ -512,8 +550,6 @@ pub struct App {
     /// The fixture huddle's bar and the channel it runs in; `None` without a huddle.
     huddle: Option<(ChannelId, Entity<HuddleBar>)>,
     huddle_open: bool,
-    /// Live huddles currently running in this workspace (`sh_room_*` socket updates): channel -> participant user ids.
-    active_huddles: HashMap<ChannelId, Vec<UserId>>,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
     /// Standalone native Preferences OS window handle (`F-CORE-011`) so Cmd+, focuses it if open.
@@ -607,19 +643,6 @@ pub struct App {
     /// The pinned-messages panel of the open conversation (right column, exclusive with the
     /// thread and profile panels).
     pins_open: bool,
-    /// Live mode: per channel, its pinned messages (`pins.list`) or why they could not be
-    /// loaded; fetched each time a pins surface opens, never per channel.
-    pins: HashMap<ChannelId, Loaded<Message>>,
-    /// Live mode: per channel, its bookmarks (`bookmarks.list`), fetched each time a
-    /// bookmarks surface opens.
-    bookmarks: HashMap<ChannelId, Loaded<ChannelBookmark>>,
-    /// Live mode: per channel, its shared files (`files.list`), fetched each time Files &
-    /// links opens.
-    files: HashMap<ChannelId, Loaded<File>>,
-    /// Live mode: parsed read-only canvases keyed by file id (`files.info` -> `url_private`, `F-COLLAB-125`).
-    canvases: HashMap<String, Result<crate::canvas::CanvasDoc, String>>,
-    /// File id of the live canvas currently displayed in `ConversationTab::Canvas`.
-    active_canvas: Option<String>,
     /// In-canvas Find field (`F-SHELL-266`).
     canvas_search: Entity<TextareaState>,
     /// Current in-canvas Find query.
@@ -642,34 +665,8 @@ pub struct App {
     window_state_save: gpui::Task<()>,
     /// Live mode: the newest history read started; an overtaken read is dropped.
     history_generation: u64,
-    /// Live mode: channels whose stored history has no older page left; the transcript
-    /// stops asking for them.
-    history_complete: HashSet<ChannelId>,
     /// Live mode: the newest thread read started; an overtaken read is dropped.
     thread_generation: u64,
-    /// Live mode: Slack's latest read and unread state (`client.counts`).
-    counts: HashMap<ChannelId, ConversationCounts>,
-    /// Live mode: last known presence per DM peer (`users.getPresence`, `presence_change`);
-    /// injected into every live fixtures snapshot so sidebar rows and headers render dots.
-    presence: fixtures::PresenceMap,
-    /// Live mode: DM peers whose notifications are paused right now (`dnd.info`).
-    peer_dnd_paused: HashMap<UserId, bool>,
-    /// Live mode: latest RTM websocket connection state (drives the offline/reconnecting banner).
-    connection: Option<slackless_core::rtm::ConnectionState>,
-    /// Live mode: outgoing mutations buffered while offline, waiting to flush on reconnect.
-    offline_queued: usize,
-    /// Live mode: offline mutations that failed to flush and await user Retry or Discard.
-    failed_mutations: Vec<slackless_core::FailedMutation>,
-    /// Live mode: active `@handle` user groups from `usergroups.list`, injected into snapshots.
-    usergroups: Vec<Usergroup>,
-    /// Live mode: workspace slash commands from `client.appCommands`, injected into snapshots.
-    app_commands: Vec<slackless_core::api::AppCommand>,
-    /// Per-conversation visit counts for Cmd+K Quick Switcher frecency ranking.
-    visits: HashMap<ChannelId, u32>,
-    /// Member counts from open-time `conversations.info`, newer than the snapshot's.
-    member_counts: HashMap<ChannelId, u32>,
-    /// Apps among a channel's members, counted apart from people as Slack's header does.
-    app_counts: HashMap<ChannelId, u32>,
     /// Conversations navigated away from, newest last (Slack's back arrow, Cmd+[).
     back: Vec<ChannelId>,
     /// Conversations stepped back from, newest last (the forward arrow, Cmd+]).
@@ -687,9 +684,6 @@ pub struct App {
     sound_fetch: gpui::Task<()>,
     /// The sound Preferences last applied: picking another plays it, as in Slack.
     sound_choice: Option<usize>,
-    /// The user opened a conversation themselves; until then live reloads open the one most
-    /// recently read in Slack.
-    chosen: bool,
     /// Root focus target, so Cmd+K / Cmd+, reach the root with nothing else focused.
     focus: FocusHandle,
     /// Subscriptions to the shown workspace's views (parked with them on a switch).
@@ -1696,6 +1690,10 @@ impl App {
                 bg_activity_unread,
                 workspace: 0,
                 parked,
+                ws: WorkspaceState {
+                    chosen,
+                    ..Default::default()
+                },
                 channel,
                 sidebar,
                 messages,
@@ -1711,7 +1709,6 @@ impl App {
                 tab: ConversationTab::Messages,
                 huddle,
                 huddle_open: false,
-                active_huddles: HashMap::new(),
                 preferences,
                 prefs_window: None,
                 applied_theme,
@@ -1752,11 +1749,6 @@ impl App {
                 pending_dm: None,
                 pins_open: false,
                 last_right_pane: None,
-                pins: HashMap::new(),
-                bookmarks: HashMap::new(),
-                files: HashMap::new(),
-                canvases: HashMap::new(),
-                active_canvas: None,
                 canvas_search,
                 canvas_query: String::new(),
                 fixture_bookmarks: HashMap::new(),
@@ -1768,19 +1760,7 @@ impl App {
                 window_title: String::new(),
                 window_state_save: gpui::Task::ready(()),
                 history_generation: 0,
-                history_complete: HashSet::new(),
                 thread_generation: 0,
-                counts: HashMap::new(),
-                presence: fixtures::PresenceMap::default(),
-                peer_dnd_paused: HashMap::new(),
-                connection: None,
-                offline_queued: 0,
-                failed_mutations: Vec::new(),
-                usergroups: Vec::new(),
-                app_commands: Vec::new(),
-                visits: HashMap::new(),
-                member_counts: HashMap::new(),
-                app_counts: HashMap::new(),
                 open_members: None,
                 members_hover: (false, false),
                 channel_people: None,
@@ -1794,7 +1774,6 @@ impl App {
                 sound: None,
                 sound_fetch: gpui::Task::ready(()),
                 sound_choice: None,
-                chosen,
                 focus,
                 workspace_subscriptions,
                 _subscriptions: subscriptions,
@@ -1969,6 +1948,7 @@ impl Render for App {
             } else {
                 // The pin count is unknown until the channel's pins have been fetched.
                 let pinned = self
+                    .ws
                     .pins
                     .get(&self.channel)
                     .and_then(|loaded| loaded.as_ref().ok());
@@ -2025,7 +2005,7 @@ impl Render for App {
                     let view = if self.fixtures.sample {
                         canvas_view(cx)
                     } else {
-                        let file_id = self.active_canvas.clone().or_else(|| {
+                        let file_id = self.ws.active_canvas.clone().or_else(|| {
                             conversation
                                 .as_ref()
                                 .and_then(|c| c.properties.as_ref())
@@ -2033,7 +2013,7 @@ impl Render for App {
                                 .and_then(|cv| cv.file_id.as_ref())
                                 .map(|f| f.to_string())
                         });
-                        let loaded = file_id.as_deref().and_then(|id| self.canvases.get(id));
+                        let loaded = file_id.as_deref().and_then(|id| self.ws.canvases.get(id));
                         let open_browser = file_id.map(|id| {
                             let url = self.canvas_link(&id);
                             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
@@ -2065,13 +2045,13 @@ impl Render for App {
                             .collect());
                         Some(&sample_files)
                     } else {
-                        self.files.get(&self.channel)
+                        self.ws.files.get(&self.channel)
                     };
                     let view = tab_views::files_view(&self.fixtures, files, cx);
                     column.child(div().flex_1().min_h_0().child(view))
                 }
                 ConversationTab::Folder { bookmark_id, .. } => {
-                    let bookmarks = self.bookmarks.get(&self.channel);
+                    let bookmarks = self.ws.bookmarks.get(&self.channel);
                     let (on_add, on_remove): (
                         Option<tab_views::BookmarkAddFn>,
                         Option<tab_views::BookmarkRemoveFn>,
@@ -2218,7 +2198,7 @@ impl Render for App {
                     .collect());
                 Some(&sample_pins)
             } else {
-                self.pins.get(&self.channel)
+                self.ws.pins.get(&self.channel)
             };
             let panel = pins::pins_panel(&self.fixtures, pinned, &title, close, cx);
             panels = panels.child(

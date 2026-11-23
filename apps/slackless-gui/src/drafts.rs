@@ -462,3 +462,102 @@ impl Render for DraftsView {
             )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::gpui;
+
+    #[test]
+    fn send_later_and_when_label_compute_schedule_times() {
+        // Day 0 = Thursday 1970-01-01; day 4 = Monday 1970-01-05.
+        let thursday = 10 * HOUR + 15 * 60;
+        assert_eq!(SendLater::InThirtyMinutes.at(thursday), thursday + 1_800);
+        assert_eq!(SendLater::InOneHour.at(thursday), thursday + 3_600);
+        assert_eq!(SendLater::TomorrowMorning.at(thursday), DAY + 9 * HOUR);
+        assert_eq!(SendLater::NextMonday.at(thursday), 4 * DAY + 9 * HOUR);
+
+        // On Monday itself, NextMonday schedules for the following Monday (+7 days).
+        let monday = 4 * DAY + 8 * HOUR;
+        assert_eq!(SendLater::NextMonday.at(monday), 11 * DAY + 9 * HOUR);
+
+        assert_eq!(when_label(thursday, thursday), "Today 10:15");
+        assert_eq!(when_label(DAY + 9 * HOUR, thursday), "Tomorrow 09:00");
+        assert_eq!(
+            when_label(3 * DAY + 8 * HOUR + 5 * 60, 4 * DAY + 12 * HOUR),
+            "Yesterday 08:05"
+        );
+        assert_eq!(when_label(4 * DAY + 9 * HOUR, thursday), "Mon 09:00");
+    }
+
+    #[gpui::test]
+    fn drafts_view_upserts_dedups_and_sorts_scheduled_and_sent(cx: &mut gpui::TestAppContext) {
+        let view = cx.update(DraftsView::new);
+        let c1 = ChannelId::from("C1");
+        let c2 = ChannelId::from("C2");
+        let entry = |ws, ch: &ChannelId, text: &str, at| Entry {
+            id: None,
+            workspace: ws,
+            channel: ch.clone(),
+            label: format!("# {}", ch.as_str()),
+            text: text.into(),
+            at,
+        };
+
+        // Upsert draft, replace existing draft for same (ws, channel), and delete on blank text.
+        view.update(cx, |v, cx| {
+            v.set_draft(entry(0, &c1, "first", 10), cx);
+            v.set_draft(entry(0, &c1, "updated", 20), cx);
+            v.set_draft(entry(1, &c1, "other ws", 30), cx);
+            v.set_draft(entry(0, &c2, "   ", 40), cx);
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.draft_count(), 2);
+            assert_eq!(v.draft(0, &c1).as_deref(), Some("updated"));
+            assert_eq!(v.draft(0, &c2), None);
+            assert_eq!(v.drafts_for(0).len(), 1);
+            assert_eq!(v.drafts_for(1).len(), 1);
+        });
+        view.update(cx, |v, cx| v.set_draft(entry(0, &c1, "", 50), cx));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.draft(0, &c1), None);
+            assert_eq!(v.draft_count(), 1);
+        });
+
+        // Scheduled entries stay ordered earliest-first across `schedule` and `set_remote_scheduled`.
+        view.update(cx, |v, cx| {
+            v.schedule(entry(0, &c1, "later", 500), cx);
+            v.schedule(entry(0, &c2, "sooner", 200), cx);
+            v.schedule(entry(1, &c1, "ws1", 300), cx);
+        });
+        view.read_with(cx, |v, _| {
+            let ats: Vec<u64> = v.scheduled.iter().map(|e| e.at).collect();
+            assert_eq!(ats, vec![200, 300, 500]);
+        });
+        view.update(cx, |v, cx| {
+            v.set_remote_scheduled(0, vec![entry(0, &c1, "remote", 100)], cx);
+        });
+        view.read_with(cx, |v, _| {
+            let ats: Vec<u64> = v.scheduled.iter().map(|e| e.at).collect();
+            assert_eq!(ats, vec![100, 300]);
+        });
+
+        // `set_stored_sent` deduplicates within 5 seconds and sorts newest-first.
+        view.update(cx, |v, cx| {
+            v.record_sent(entry(0, &c1, "hello", 1000), cx);
+            v.set_stored_sent(
+                0,
+                vec![
+                    entry(0, &c1, "hello", 1003),
+                    entry(0, &c1, "older", 900),
+                    entry(0, &c2, "newer", 1200),
+                ],
+                cx,
+            );
+        });
+        view.read_with(cx, |v, _| {
+            let texts: Vec<&str> = v.sent.iter().map(|e| e.text.as_str()).collect();
+            assert_eq!(texts, vec!["newer", "hello", "older"]);
+        });
+    }
+}
