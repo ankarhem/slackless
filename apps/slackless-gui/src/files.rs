@@ -1066,6 +1066,17 @@ impl RenderOnce for SnippetCard {
             );
 
         let line_key = format!("snippet-{id_str}");
+        let sample = lines
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lang = crate::syntax::Lang::detect(
+            file.filetype.as_deref(),
+            file.name.as_deref().or(file.title.as_deref()),
+            &sample,
+        );
         let mut code_body = v_flex()
             .w_full()
             .px_2p5()
@@ -1085,6 +1096,7 @@ impl RenderOnce for SnippetCard {
                         &line_key,
                         ix,
                         line.clone(),
+                        lang,
                         order_base + ix as u64,
                         cx,
                     ))

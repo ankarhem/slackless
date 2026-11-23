@@ -59,6 +59,7 @@ mod sign_in;
 mod slash;
 mod status;
 mod switcher;
+mod syntax;
 mod tab_views;
 mod tabs;
 mod theme;

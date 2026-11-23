@@ -91,6 +91,8 @@ pub(super) struct RunTheme {
     pub(super) underline_links: bool,
     /// Render emoji as plain `:shortcode:` text (Preferences > Messages & media).
     pub(super) emoji_text_mode: bool,
+    /// Active dark/light appearance mode (used for syntax-highlighted code runs).
+    pub(super) dark: bool,
     /// Paragraphs rendered with this theme so far: keeps each paragraph's element id unique
     /// within its message (GPUI keys interaction and accessibility state by the id path)
     /// and counts its selection document order.
@@ -133,6 +135,7 @@ impl RunTheme {
             links,
             underline_links: crate::preferences::display_prefs(cx).underline_links,
             emoji_text_mode: crate::preferences::display_prefs(cx).emoji_text_mode,
+            dark: theme.mode.is_dark(),
             base_font,
             paragraphs: Cell::new(0),
             key,
@@ -1741,30 +1744,45 @@ pub(super) fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div
     )
 }
 
+fn highlighted_code_runs(code: &str, lang: crate::syntax::Lang, theme: &RunTheme) -> Vec<TextRun> {
+    if code.is_empty() {
+        return Vec::new();
+    }
+    crate::syntax::highlight(lang, code)
+        .into_iter()
+        .map(|(len, kind)| {
+            let color = crate::syntax::token_color(kind, theme.dark, theme.foreground);
+            let mut run = theme.run(
+                RunFlags {
+                    code: true,
+                    ..DEFAULT_FLAGS
+                },
+                Some(color),
+                None,
+                len,
+            );
+            run.font = theme.mono_font.clone();
+            run
+        })
+        .collect()
+}
+
 /// One selectable monospaced code line/block (used by [`crate::files::SnippetCard`]) that
 /// participates in the window's [`TextSelectionLayer`] with bounded double/triple-click and `Cmd+C`.
 pub(crate) fn selectable_code(
     key: &str,
     line_ix: usize,
     text: String,
+    lang: crate::syntax::Lang,
     document_order: u64,
     cx: &App,
 ) -> AnyElement {
     let theme = RunTheme::body(cx, SharedString::from(key.to_owned()), document_order, None);
-    let mut run = theme.run(
-        RunFlags {
-            code: true,
-            ..DEFAULT_FLAGS
-        },
-        Some(theme.foreground),
-        None,
-        text.len(),
-    );
-    run.font = theme.mono_font.clone();
+    let runs = highlighted_code_runs(&text, lang, &theme);
     SelectableParagraph::new(
         paragraph_id(&theme.key, line_ix, 0, &text),
         text,
-        vec![run],
+        runs,
         Vec::new(),
         document_order,
         &theme,
@@ -1776,23 +1794,12 @@ pub(crate) fn selectable_code(
 /// Slack's pre block: 12px code on an 18px line, 8px in from a 13% foreground ring with 4px
 /// corners, 32px kept clear at the right for the copy button a hover shows there.
 pub(super) fn code_block(code: String, language: Option<String>, theme: &RunTheme) -> Div {
-    let run_len = code.len();
     // Code blocks select like the paragraphs around them: one participant, its own order.
     let paragraph = theme.paragraphs.get();
     theme.paragraphs.set(paragraph + 1);
     let order = theme.order.map(|base| base + paragraph as u64);
-    let mut run = theme.run(
-        RunFlags {
-            code: true,
-            ..DEFAULT_FLAGS
-        },
-        // Code blocks keep the body color; only inline code is tinted.
-        Some(theme.foreground),
-        None,
-        run_len,
-    );
-    // The block's own 12px sizes it; the smaller inline face is for body-size text.
-    run.font = theme.mono_font.clone();
+    let lang = crate::syntax::Lang::detect(language.as_deref(), None, &code);
+    let runs = highlighted_code_runs(&code, lang, theme);
     let group = SharedString::from(format!("code-{}-{paragraph}", theme.key));
     let copy = CopyCode {
         id: ElementId::Name(format!("copy-{}-{paragraph}", theme.key).into()),
@@ -1803,16 +1810,14 @@ pub(super) fn code_block(code: String, language: Option<String>, theme: &RunThem
         Some(order) => SelectableParagraph::new(
             paragraph_id(&theme.key, paragraph, 0, &code),
             code,
-            vec![run],
+            runs,
             Vec::new(),
             order,
             theme,
         )
         .with_code_block()
         .into_any_element(),
-        None => StyledText::new(code)
-            .with_runs(vec![run])
-            .into_any_element(),
+        None => StyledText::new(code).with_runs(runs).into_any_element(),
     };
     v_flex()
         .min_w_0()
