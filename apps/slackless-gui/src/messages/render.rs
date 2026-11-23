@@ -1,25 +1,27 @@
 //! Message body, rich-text / mrkdwn layout, selectable paragraphs, code blocks, and time/date
 //! formatting for the transcript.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{TextSelectionHandle, TextSelectionRegistration, TextSelectionRun};
+use gpui_kit::base::{
+    GlobalState, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun,
+};
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, BorderStyle, Bounds, Corners, CursorStyle, DispatchPhase, Div, Edges, Element,
     ElementId, Font, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
     ImageSource, InspectorElementId, InteractiveElement as _, InteractiveText, IntoElement,
-    LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement as _, Pixels,
-    Point, RenderOnce, ScrollEvent, SharedString, StatefulInteractiveElement as _,
-    StrikethroughStyle, Styled as _, StyledText, Subscription, TextLayout, TextRun,
-    TransformationMatrix, UnderlineStyle, Window, deferred, div, px, relative, rgb, size,
-    transparent_black,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    ParentElement as _, Pixels, Point, RenderOnce, ScrollEvent, SharedString,
+    StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, StyledText, Subscription,
+    TextLayout, TextRun, TransformationMatrix, UnderlineStyle, Window, deferred, div, px, relative,
+    rgb, size, transparent_black,
 };
 use slackless_core::types::rich_text::{
     ListStyle, RichTextContainer, RichTextElement, RichTextList, RichTextPreformatted,
@@ -673,6 +675,9 @@ pub(super) struct SelectableParagraph {
     /// matching Slack's `.c-mrkdwn__code` (kept out of `washes` so fill and border share exact
     /// geometry with no top/bottom overflow or side gap).
     pub(super) code: Vec<(Range<usize>, Hsla)>,
+    /// True when this paragraph is the body of a fenced code block (```` ```...``` ````), so
+    /// triple-clicking selects the entire code block across all lines.
+    pub(super) is_code_block: bool,
     /// Non-code run backgrounds (mentions, app chips), painted under the selection: as
     /// run backgrounds GPUI paints them with the text, over the highlight.
     pub(super) washes: Vec<(Range<usize>, Hsla)>,
@@ -682,10 +687,14 @@ pub(super) struct SelectableParagraph {
 }
 
 /// What one paragraph keeps between frames: its selection handle (and the subscription
-/// that redraws the window when a drag moves its selection), the link it hovers, the link a
-/// press started in, and its key for member-hover-card reports.
+/// that redraws the window when a drag moves its selection), any bounded local selection
+/// (multi-click inside inline code or a fenced code block), the cached projected text for
+/// window drags, the link it hovers, the link a press started in, and its key for
+/// member-hover-card reports.
 pub(super) struct ParagraphState {
     pub(super) handle: TextSelectionHandle,
+    pub(super) local_range: Rc<RefCell<Option<Range<usize>>>>,
+    pub(super) projected: Rc<RefCell<String>>,
     pub(super) hovered_link: Rc<Cell<Option<usize>>>,
     pub(super) mouse_down: Rc<Cell<Option<usize>>>,
     /// This paragraph's key in hover-card trigger reports (stable across frames).
@@ -731,6 +740,7 @@ impl SelectableParagraph {
         }
         Self {
             code,
+            is_code_block: false,
             washes,
             icons,
             code_border: theme.foreground.opacity(0.13),
@@ -743,6 +753,11 @@ impl SelectableParagraph {
             selection: theme.selection,
             link: theme.link,
         }
+    }
+
+    pub(super) fn with_code_block(mut self) -> Self {
+        self.is_code_block = true;
+        self
     }
 
     /// The line-box quads a range covers: one per wrapped line between its ends (gpui-base's
@@ -1069,6 +1084,161 @@ impl SelectableParagraph {
         };
         window.on_mouse_event(wheel);
     }
+
+    /// Bounded multi-click selection inside inline code pills (`.c-mrkdwn__code`) and fenced
+    /// code blocks (`.c-mrkdwn__pre`), matching Slack:
+    /// - Double-click inside inline code selects the word strictly clamped inside that pill.
+    /// - Triple-click (or 4+ clicks) inside inline code selects only that inline code span,
+    ///   never the surrounding paragraph.
+    /// - Triple-click (or 4+ clicks) inside a fenced code block selects the entire code block
+    ///   across all lines.
+    fn paint_code_clicks(
+        &self,
+        handle: &TextSelectionHandle,
+        local_range: Rc<RefCell<Option<Range<usize>>>>,
+        layout: &TextLayout,
+        hitbox: &Hitbox,
+        window: &mut Window,
+    ) {
+        let code_pills: Vec<(Range<usize>, Vec<Bounds<Pixels>>)> = self
+            .code
+            .iter()
+            .map(|(range, _)| {
+                let quads = self
+                    .range_quads(layout, range.clone())
+                    .into_iter()
+                    .map(|b| {
+                        Bounds::from_corners(
+                            Point::new(b.left() - px(2.), b.top() + px(1.)),
+                            Point::new(b.right() + px(2.), b.bottom() - px(1.)),
+                        )
+                    })
+                    .collect();
+                (range.clone(), quads)
+            })
+            .collect();
+        let is_code_block = self.is_code_block;
+        let text = self.text.clone();
+        let layout = layout.clone();
+        let hitbox = hitbox.clone();
+        let handle = handle.clone();
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || event.button != MouseButton::Left
+                || event.click_count < 2
+                || !hitbox.is_hovered(window)
+            {
+                return;
+            }
+            let selected = if is_code_block {
+                if event.click_count >= 3 && !text.is_empty() {
+                    Some(0..text.len())
+                } else {
+                    None
+                }
+            } else {
+                let hit = match layout.index_for_position(event.position) {
+                    Ok(ix) => code_pills
+                        .iter()
+                        .find(|(span, _)| span.contains(&ix))
+                        .map(|(span, _)| (span.clone(), ix))
+                        .or_else(|| {
+                            code_pills
+                                .iter()
+                                .find(|(_, quads)| {
+                                    quads.iter().any(|q| q.contains(&event.position))
+                                })
+                                .map(|(span, _)| {
+                                    let clamped = ix.clamp(
+                                        span.start,
+                                        span.end.saturating_sub(1).max(span.start),
+                                    );
+                                    (span.clone(), clamped)
+                                })
+                        }),
+                    Err(nearest) => code_pills
+                        .iter()
+                        .find(|(_, quads)| quads.iter().any(|q| q.contains(&event.position)))
+                        .map(|(span, _)| {
+                            let clamped = nearest
+                                .clamp(span.start, span.end.saturating_sub(1).max(span.start));
+                            (span.clone(), clamped)
+                        }),
+                };
+                hit.and_then(|(span, ix)| {
+                    if event.click_count >= 3 {
+                        (!span.is_empty()).then_some(span)
+                    } else {
+                        word_range_bounded(&text, span, ix)
+                    }
+                })
+            };
+            let Some(range) = selected else {
+                return;
+            };
+            GlobalState::suppress_text_selection(cx);
+            *local_range.borrow_mut() = Some(range);
+            handle.set_local_selection(true, cx);
+            window.refresh();
+        });
+    }
+}
+
+/// Word range around `offset`, strictly clamped to `bounds` so double-clicking inside an
+/// inline code span never bleeds into adjacent prose.
+fn word_range_bounded(text: &str, bounds: Range<usize>, offset: usize) -> Option<Range<usize>> {
+    if bounds.is_empty() || bounds.end > text.len() {
+        return None;
+    }
+    let slice = text.get(bounds.clone())?;
+    let mut rel = offset.saturating_sub(bounds.start).min(slice.len());
+    if rel == slice.len() {
+        rel = slice.char_indices().next_back().map_or(0, |(ix, _)| ix);
+    } else {
+        while rel > 0 && !slice.is_char_boundary(rel) {
+            rel -= 1;
+        }
+    }
+    let ch = slice[rel..].chars().next()?;
+    let classify = |c: char| -> u8 {
+        if c == '_'
+            || c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '\u{00C0}'..='\u{024F}'
+                    | '\u{0400}'..='\u{04FF}'
+                    | '\u{1E00}'..='\u{1EFF}'
+                    | '\u{0300}'..='\u{036F}'
+            )
+        {
+            1 // Word
+        } else if matches!(c, '\n' | '\r') {
+            2 // Newline
+        } else if c.is_whitespace() {
+            3 // Whitespace
+        } else {
+            4 // Other
+        }
+    };
+    let kind = classify(ch);
+    let connects = |next: char| matches!((kind, classify(next)), (1, 1) | (3, 3));
+    let mut start = rel;
+    for prev in slice[..rel].chars().rev().take(128) {
+        if connects(prev) {
+            start -= prev.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let mut end = rel + ch.len_utf8();
+    for next in slice[end..].chars().take(128) {
+        if connects(next) {
+            end += next.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some((bounds.start + start)..(bounds.start + end))
 }
 
 impl gpui_kit::gpui::IntoElement for SelectableParagraph {
@@ -1103,9 +1273,40 @@ impl Element for SelectableParagraph {
             |retained: Option<ParagraphState>, window| {
                 let retained = retained.unwrap_or_else(|| {
                     let handle = TextSelectionHandle::new(self.text.clone(), cx);
+                    let local_range: Rc<RefCell<Option<Range<usize>>>> =
+                        Rc::new(RefCell::new(None));
+                    let projected: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+                    {
+                        let local_for_copy = local_range.clone();
+                        let projected_for_copy = projected.clone();
+                        let text_for_copy = self.text.clone();
+                        handle.copy_with(
+                            move |_| {
+                                if let Some(range) = local_for_copy.borrow().as_ref() {
+                                    return text_for_copy
+                                        .get(range.clone())
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                }
+                                projected_for_copy.borrow().clone()
+                            },
+                            cx,
+                        );
+                    }
+                    {
+                        let local_for_clear = local_range.clone();
+                        handle.clear_with(
+                            move |_| {
+                                *local_for_clear.borrow_mut() = None;
+                            },
+                            cx,
+                        );
+                    }
                     let refresh = handle.refresh_window_on_change(window, cx);
                     ParagraphState {
                         handle,
+                        local_range,
+                        projected,
                         hovered_link: Rc::new(Cell::new(None)),
                         mouse_down: Rc::new(Cell::new(None)),
                         hover_key: format!("{:?}", self.id).into(),
@@ -1161,14 +1362,35 @@ impl Element for SelectableParagraph {
             ],
             cx,
         );
+        let (local_range, projected) = window.with_element_state::<ParagraphState, _>(
+            global_id.expect("SelectableParagraph must have a stable element id"),
+            |state, _| {
+                let state = state.expect("request_layout retained the paragraph state");
+                let cells = (state.local_range.clone(), state.projected.clone());
+                (cells, state)
+            },
+        );
+        {
+            let mut out = projected.borrow_mut();
+            out.clear();
+            for range in projection.ranges().iter().flatten() {
+                if let Some(slice) = self.text.get(range.clone()) {
+                    out.push_str(slice);
+                }
+            }
+        }
         for (range, wash) in &self.washes {
             self.paint_wash(&layout, range.clone(), *wash, window);
         }
         for (range, wash) in &self.code {
             self.paint_code_box(&layout, range.clone(), *wash, window);
         }
-        for range in projection.ranges().iter().flatten().cloned() {
+        if let Some(range) = local_range.borrow().clone() {
             self.paint_selection(&layout, range, window);
+        } else {
+            for range in projection.ranges().iter().flatten().cloned() {
+                self.paint_selection(&layout, range, window);
+            }
         }
         self.styled.paint(
             global_id,
@@ -1189,6 +1411,9 @@ impl Element for SelectableParagraph {
             .is_some_and(|ix| self.links.iter().any(|(range, _)| range.contains(&ix)));
         if !over_link {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        }
+        if self.is_code_block || !self.code.is_empty() {
+            self.paint_code_clicks(handle, local_range, &layout, hitbox, window);
         }
         if !self.links.is_empty() {
             self.paint_links(global_id, &layout, hitbox, window);
@@ -1551,6 +1776,7 @@ pub(super) fn code_block(code: String, language: Option<String>, theme: &RunThem
             order,
             theme,
         )
+        .with_code_block()
         .into_any_element(),
         None => StyledText::new(code)
             .with_runs(vec![run])

@@ -7,9 +7,10 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, BorderStyle, Bounds, ContentMask, Context, Corners, Div, Edges, ExternalPaths,
-    Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, PaintQuad,
-    ParentElement as _, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, StyledText, Window, canvas, div, point, px, relative, rems,
+    Focusable as _, FontWeight, HighlightStyle, InteractiveElement as _, IntoElement, MouseButton,
+    MouseDownEvent, PaintQuad, ParentElement as _, Pixels, Point, Render, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, StyledText, Window, canvas, div, point, px,
+    relative, rems,
 };
 
 use super::tokens::{self, Palette};
@@ -296,6 +297,11 @@ impl Render for Composer {
                             .min_w_0()
                             .px_2()
                             .py_1()
+                            .capture_any_mouse_down(cx.listener(Self::on_draft_mouse_down_capture))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::on_draft_mouse_down_bubble),
+                            )
                             .children(code_backdrop)
                             .child(draft)
                             .children(private_prompt),
@@ -310,6 +316,88 @@ impl Render for Composer {
 }
 
 impl Composer {
+    /// Capture phase before `Textarea::on_mouse_down`: remember if a triple-click landed
+    /// inside an inline-code pill before `Textarea::select_line` replaces the selection with
+    /// the whole line.
+    fn on_draft_mouse_down_capture(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_code_click = None;
+        if event.button != MouseButton::Left || event.click_count < 3 {
+            return;
+        }
+        let doc = self.editor.doc();
+        let state = self.input.read(cx);
+        if *state.text() != doc.text() {
+            return;
+        }
+        let hit = inline_code_inner_at_position(doc, state, event.position).or_else(|| {
+            // Fallback when the previous click's word selection already sat inside an inline
+            // code span on the clicked visual line.
+            let prev = state.selected_range();
+            if prev.is_empty() {
+                return None;
+            }
+            tokens::inline_code_constructs(doc)
+                .into_iter()
+                .find(|(outer, _)| prev.start >= outer.start && prev.end <= outer.end)
+                .filter(|(_, inner)| {
+                    state.range_to_bounds(inner).is_some_and(|b| {
+                        event.position.y >= b.top() - px(2.)
+                            && event.position.y <= b.bottom() + px(2.)
+                    })
+                })
+                .map(|(_, inner)| inner)
+        });
+        self.pending_code_click = hit;
+    }
+
+    /// Bubble phase immediately after `Textarea::on_mouse_down`: apply bounded selection for
+    /// inline code pills and fenced code blocks (triple-click selects the entire inline code
+    /// span or entire fenced code block body; double-click stays clamped inside inline code).
+    fn on_draft_mouse_down_bubble(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = self.pending_code_click.take();
+        if event.click_count < 2 {
+            return;
+        }
+        let doc = self.editor.doc();
+        let (matches_doc, sel, inline_hit) = {
+            let state = self.input.read(cx);
+            let matches_doc = *state.text() == doc.text();
+            let sel = state.selected_range();
+            let inline_hit = if matches_doc && event.click_count == 2 {
+                inline_code_inner_at_position(doc, state, event.position)
+            } else {
+                None
+            };
+            (matches_doc, sel, inline_hit)
+        };
+        if !matches_doc {
+            return;
+        }
+        let target = if event.click_count >= 3 {
+            pending.or_else(|| tokens::fenced_code_block_body_at(doc, sel.start))
+        } else {
+            inline_hit.and_then(|inner| tokens::clamp_selection_to_inner(sel, &inner))
+        };
+        if let Some(range) = target {
+            self.input.update(cx, |state, cx| {
+                state.set_selected_range(range.clone(), cx);
+            });
+            self.editor.select(range);
+            self.sync_presentation(cx);
+            self.changed(cx);
+        }
+    }
+
     /// Paint rounded Slack code-block containers and inline-code pills behind the transparent
     /// `Textarea`. Because GPUI runs `prepaint` across the whole tree before any `paint`, the
     /// sibling textarea has already stored this frame's `last_layout`/`last_bounds` by the time
@@ -525,4 +613,29 @@ fn inline_code_quads(
         quads.push(last);
     }
     quads
+}
+
+/// If `pos` falls inside any painted inline-code pill in `state`, return that construct's
+/// `inner` byte range (excluding backticks).
+fn inline_code_inner_at_position(
+    doc: &crate::editor::Doc,
+    state: &gpui_kit::component::input::TextareaState,
+    pos: Point<Pixels>,
+) -> Option<std::ops::Range<usize>> {
+    let text = doc.text();
+    for (outer, inner) in tokens::inline_code_constructs(doc) {
+        let hit_quads = |range: &std::ops::Range<usize>| {
+            inline_code_quads(state, text, range).into_iter().any(|q| {
+                let pill = Bounds::from_corners(
+                    point(q.left() - px(2.), q.top()),
+                    point(q.right() + px(2.), q.bottom()),
+                );
+                pill.contains(&pos)
+            })
+        };
+        if hit_quads(&outer) || hit_quads(&inner) {
+            return Some(inner);
+        }
+    }
+    None
 }

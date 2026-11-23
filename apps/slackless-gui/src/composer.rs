@@ -219,6 +219,8 @@ pub struct Composer {
     typing: Option<TypingNames>,
     /// When [`ComposerEvent::Typing`] last went out.
     typing_sent: Option<Instant>,
+    /// Bounded inline-code target captured on triple-click before `Textarea::select_line` runs.
+    pending_code_click: Option<Range<usize>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -317,6 +319,7 @@ impl Composer {
                 next_paste_id: 1,
                 typing: None,
                 typing_sent: None,
+                pending_code_click: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -909,5 +912,124 @@ pub(super) fn format_bytes(bytes: usize) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use gpui_kit::gpui::{
+        IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Render, TestAppContext,
+        VisualTestContext,
+    };
+
+    struct ComposerHarness {
+        composer: Entity<Composer>,
+    }
+
+    impl Render for ComposerHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.composer.clone())
+        }
+    }
+
+    fn click_offset(
+        composer: &Entity<Composer>,
+        offset: usize,
+        click_count: usize,
+        cx: &mut VisualTestContext,
+    ) {
+        let pos = composer.read_with(cx, |composer, cx| {
+            let b = composer
+                .input
+                .read(cx)
+                .range_to_bounds(&(offset..offset + 1))
+                .unwrap_or_else(|| panic!("no bounds for offset {offset}"));
+            b.center()
+        });
+        cx.simulate_event(MouseDownEvent {
+            position: pos,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: pos,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count,
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    fn selected_slice(composer: &Entity<Composer>, cx: &mut VisualTestContext) -> String {
+        composer.read_with(cx, |composer, cx| {
+            let state = composer.input.read(cx);
+            let range = state.selected_range();
+            state.text().slice(range).to_string()
+        })
+    }
+
+    #[gpui::test]
+    fn composer_multi_click_is_bounded_in_inline_code_and_code_blocks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let mrkdwn = "see `order.customerType: \"Org\"` ok\n```line 1\nline 2```";
+        let expected_text = "see `order.customerType: \"Org\"` ok\n```\nline 1\nline 2\n```";
+        let slot = Rc::new(RefCell::new(None));
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let fixtures = Arc::new(crate::fixtures::load());
+            let composer = Composer::new("Message".into(), fixtures, window, cx);
+            composer.update(cx, |composer, cx| {
+                composer.load_draft(mrkdwn, cx);
+            });
+            *slot.borrow_mut() = Some(composer.clone());
+            let view = cx.new(|_| ComposerHarness { composer });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let composer = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+
+        let text = composer.read_with(cx, |c, _| c.editor.doc().text().to_owned());
+        assert_eq!(text, expected_text);
+
+        // Single, double, and triple click inside inline code (`customerType`).
+        let word_ix = text.find("customerType").unwrap() + 2;
+        click_offset(&composer, word_ix, 1, cx);
+        click_offset(&composer, word_ix, 2, cx);
+        assert_eq!(selected_slice(&composer, cx), "customerType");
+        click_offset(&composer, word_ix, 3, cx);
+        assert_eq!(selected_slice(&composer, cx), "order.customerType: \"Org\"");
+
+        // Triple click on prose on the same line still selects the entire line.
+        let prose_ix = text.find("see").unwrap() + 1;
+        click_offset(&composer, prose_ix, 1, cx);
+        click_offset(&composer, prose_ix, 2, cx);
+        click_offset(&composer, prose_ix, 3, cx);
+        assert_eq!(
+            selected_slice(&composer, cx),
+            "see `order.customerType: \"Org\"` ok"
+        );
+
+        // Double and triple click inside a multi-line fenced code block.
+        let l2_ix = text.find("line 2").unwrap() + 1;
+        click_offset(&composer, l2_ix, 1, cx);
+        click_offset(&composer, l2_ix, 2, cx);
+        assert_eq!(selected_slice(&composer, cx), "line");
+        click_offset(&composer, l2_ix, 3, cx);
+        assert_eq!(selected_slice(&composer, cx), "line 1\nline 2");
+        drop(root);
     }
 }

@@ -560,3 +560,67 @@ fn recent_channel_history_cache_avoids_blank_flash_on_switch(cx: &mut TestAppCon
         });
     });
 }
+
+#[gpui::test]
+fn triple_click_is_bounded_inside_inline_code_and_fenced_code_blocks(cx: &mut TestAppContext) {
+    let inline_line = "Check order.customerType: \"Organization\" please";
+    let fenced_code = "fn main() {\n    println!(\"hello\");\n}";
+    let inline_msg = Message {
+        ts: Ts::from("1700000010.000100"),
+        user: Some(UserId::from("U0ALICE")),
+        text: "Check `order.customerType: \"Organization\"` please".into(),
+        ..Default::default()
+    };
+    let fenced_msg = Message {
+        ts: Ts::from("1700000011.000100"),
+        user: Some(UserId::from("U0ALICE")),
+        text: format!("```\n{fenced_code}\n```"),
+        ..Default::default()
+    };
+    with_transcript("C0ENG", cx, |harness, cx| {
+        harness.update(cx, |harness, cx| {
+            let channel = ChannelId::from("C0CODE_CLICK");
+            harness.list.update(cx, |list, cx| {
+                list.set_conversation(channel.clone(), cx);
+                list.set_history(channel, vec![inline_msg, fenced_msg], cx);
+            });
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+
+        // Double-click inside multi-word inline code selects only that word.
+        let word_ix = inline_line.find("customerType").unwrap() + 2;
+        let at = press_at(inline_line, word_ix, 2, cx);
+        release_at(at, 2, cx);
+        assert_eq!(selected_text(cx), "customerType");
+
+        // Triple-click inside inline code selects ONLY the inline code span, not the whole line.
+        let at = press_at(inline_line, word_ix, 3, cx);
+        release_at(at, 3, cx);
+        assert_eq!(selected_text(cx), "order.customerType: \"Organization\"");
+
+        // Triple-click on normal prose on the same line still selects the entire line.
+        let prose_ix = inline_line.find("please").unwrap() + 1;
+        let at = press_at(inline_line, prose_ix, 3, cx);
+        release_at(at, 3, cx);
+        assert_eq!(selected_text(cx), inline_line);
+
+        // Double-click inside a multi-line fenced code block selects that word.
+        let println_ix = fenced_code.find("println").unwrap() + 2;
+        let at = press_at(fenced_code, println_ix, 2, cx);
+        release_at(at, 2, cx);
+        assert_eq!(selected_text(cx), "println");
+
+        // Triple-click on any line of a multi-line fenced code block selects the ENTIRE block.
+        let at = press_at(fenced_code, println_ix, 3, cx);
+        release_at(at, 3, cx);
+        assert_eq!(selected_text(cx), fenced_code);
+
+        // Clicking elsewhere clears the bounded local selection cleanly.
+        let at = press_at(inline_line, 0, 1, cx);
+        release_at(at, 1, cx);
+        assert_eq!(selected_text(cx), "");
+    });
+}

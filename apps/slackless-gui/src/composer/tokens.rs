@@ -193,6 +193,65 @@ pub(super) fn inline_code_spans(
     spans
 }
 
+/// All inline code constructs (`outer`, `inner`) outside fenced code blocks, used for
+/// bounded double/triple-click selection inside the composer.
+pub(super) fn inline_code_constructs(doc: &Doc) -> Vec<(Range<usize>, Range<usize>)> {
+    let parsed = doc.parse();
+    let mut out = Vec::new();
+    for line in &parsed.lines {
+        if matches!(line.kind, Some(LineKind::Code | LineKind::Fence)) {
+            continue;
+        }
+        for c in &line.inlines {
+            if matches!(c.kind, crate::editor::InlineKind::Style(Style::CODE))
+                && !c.inner.is_empty()
+            {
+                out.push((c.outer.clone(), c.inner.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// If `offset` lies on a body line (`LineKind::Code`) of a fenced code block, return the
+/// full byte range of that block's contiguous body lines (excluding the ```` ``` ```` fences).
+pub(super) fn fenced_code_block_body_at(doc: &Doc, offset: usize) -> Option<Range<usize>> {
+    let parsed = doc.parse();
+    let ix = parsed
+        .lines
+        .partition_point(|line| line.end < offset)
+        .min(parsed.lines.len().saturating_sub(1));
+    if parsed.lines.get(ix)?.kind != Some(LineKind::Code) {
+        return None;
+    }
+    let mut first = ix;
+    while first > 0 && parsed.lines[first - 1].kind == Some(LineKind::Code) {
+        first -= 1;
+    }
+    let mut last = ix;
+    while last + 1 < parsed.lines.len() && parsed.lines[last + 1].kind == Some(LineKind::Code) {
+        last += 1;
+    }
+    let start = parsed.lines[first].start;
+    let end = parsed.lines[last].end;
+    (start < end).then_some(start..end)
+}
+
+/// Clamp a double-click selection strictly inside an inline code span's `inner` bounds when
+/// it overlaps `inner` and spilled across its delimiters.
+pub(super) fn clamp_selection_to_inner(
+    selection: Range<usize>,
+    inner: &Range<usize>,
+) -> Option<Range<usize>> {
+    if selection.start < inner.end && inner.start < selection.end {
+        let clamped = selection.start.max(inner.start)..selection.end.min(inner.end);
+        if clamped != selection && !clamped.is_empty() {
+            return Some(clamped);
+        }
+    }
+    None
+}
+
 /// The theme colors Live Preview draws with.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct Palette {
@@ -838,6 +897,48 @@ mod tests {
         assert_eq!(inline_code_spans(&doc, &(6..6), true), vec![4..9]);
         // Blurred with caret inside: backticks hidden, wraps `foo` (5..8).
         assert_eq!(inline_code_spans(&doc, &(6..6), false), vec![5..8]);
+    }
+
+    #[test]
+    fn bounded_code_helpers_cover_fenced_blocks_and_inline_spans() {
+        let doc =
+            Doc::from("before `order.customerType: \"Org\"` after\n```\nline 1\nline 2\n```\ntail");
+        // Inline code constructs yield exact (outer, inner) byte ranges.
+        let constructs = inline_code_constructs(&doc);
+        assert_eq!(constructs.len(), 1);
+        let (outer, inner) = &constructs[0];
+        assert_eq!(&doc.text()[outer.clone()], "`order.customerType: \"Org\"`");
+        assert_eq!(&doc.text()[inner.clone()], "order.customerType: \"Org\"");
+
+        // Clamping a word selection that spilled across a backtick bounds it to `inner`.
+        assert_eq!(
+            clamp_selection_to_inner((inner.start - 1)..(inner.start + 5), inner),
+            Some(inner.start..(inner.start + 5))
+        );
+        assert_eq!(
+            clamp_selection_to_inner(inner.start..(inner.start + 5), inner),
+            None
+        );
+
+        // Fenced code block body spans all contiguous code lines, excluding fence lines.
+        let l1 = doc.text().find("line 1").unwrap();
+        let l2 = doc.text().find("line 2").unwrap();
+        let expected = l1..(l2 + "line 2".len());
+        assert_eq!(
+            fenced_code_block_body_at(&doc, l1 + 2),
+            Some(expected.clone())
+        );
+        assert_eq!(fenced_code_block_body_at(&doc, l2 + 2), Some(expected));
+        // Prose lines and fence lines return None.
+        assert_eq!(fenced_code_block_body_at(&doc, 0), None);
+        assert_eq!(
+            fenced_code_block_body_at(&doc, doc.text().find("```").unwrap()),
+            None
+        );
+        assert_eq!(
+            fenced_code_block_body_at(&doc, doc.text().find("tail").unwrap()),
+            None
+        );
     }
 
     #[test]
