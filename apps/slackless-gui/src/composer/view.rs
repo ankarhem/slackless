@@ -262,6 +262,7 @@ impl Render for Composer {
             .capture_action(cx.listener(Self::on_escape))
             .capture_action(cx.listener(Self::on_undo))
             .capture_action(cx.listener(Self::on_redo))
+            .capture_action(cx.listener(Self::on_select_all))
             .capture_key_down(cx.listener(Self::on_key))
             .children(overlay)
             // The context bar sits on the box, outside its outline.

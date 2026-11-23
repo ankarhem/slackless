@@ -5,9 +5,12 @@
 //! binding's action before any key-down listener, so those are intercepted as actions in the
 //! capture phase. The formatting shortcuts have no binding and arrive as plain key-downs.
 
-use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Redo, Undo};
+use gpui_kit::component::input::{
+    Enter, Escape, IndentInline, MoveDown, MoveUp, Redo, SelectAll, Undo,
+};
 use gpui_kit::gpui::{ClipboardEntry, ClipboardItem, Context, KeyDownEvent, Window};
 
+use super::tokens;
 use super::{Composer, ComposerEvent};
 use crate::editor::{LineKind, Style};
 
@@ -238,6 +241,37 @@ impl Composer {
             self.push(window, cx);
             self.changed(cx);
         }
+        cx.stop_propagation();
+    }
+
+    /// Scoped `Cmd+A` / `Ctrl+A`: when the caret or selection sits inside a fenced code block
+    /// or inline code span (and does not already span that entire code region), first select
+    /// just the code body; pressing `Cmd+A` a second time falls through to select the whole
+    /// draft.
+    pub(super) fn on_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if self.link_open {
+            return;
+        }
+        let doc = self.editor.doc();
+        let (matches_doc, sel) = {
+            let state = self.input.read(cx);
+            (*state.text() == doc.text(), state.selected_range())
+        };
+        if !matches_doc {
+            return;
+        }
+        let scoped = tokens::fenced_code_block_body_at(doc, sel.start)
+            .filter(|block| sel.end <= block.end && *block != sel)
+            .or_else(|| tokens::inline_code_inner_at(doc, &sel).filter(|inner| *inner != sel));
+        let Some(range) = scoped else {
+            return;
+        };
+        self.input.update(cx, |state, cx| {
+            state.set_selected_range(range.clone(), cx);
+        });
+        self.editor.select(range);
+        self.sync_presentation(cx);
+        self.changed(cx);
         cx.stop_propagation();
     }
 

@@ -1030,6 +1030,25 @@ mod tests {
         assert_eq!(selected_slice(&composer, cx), "line");
         click_offset(&composer, l2_ix, 3, cx);
         assert_eq!(selected_slice(&composer, cx), "line 1\nline 2");
+
+        // Scoped SelectAll: first Cmd+A inside a fenced code block selects just the block,
+        // second Cmd+A selects the entire draft.
+        click_offset(&composer, l2_ix, 1, cx);
+        cx.dispatch_action(gpui_kit::component::input::SelectAll);
+        cx.run_until_parked();
+        assert_eq!(selected_slice(&composer, cx), "line 1\nline 2");
+        cx.dispatch_action(gpui_kit::component::input::SelectAll);
+        cx.run_until_parked();
+        assert_eq!(selected_slice(&composer, cx), expected_text);
+
+        // Scoped SelectAll inside inline code: first selects inner text, second selects all.
+        click_offset(&composer, word_ix, 1, cx);
+        cx.dispatch_action(gpui_kit::component::input::SelectAll);
+        cx.run_until_parked();
+        assert_eq!(selected_slice(&composer, cx), "order.customerType: \"Org\"");
+        cx.dispatch_action(gpui_kit::component::input::SelectAll);
+        cx.run_until_parked();
+        assert_eq!(selected_slice(&composer, cx), expected_text);
         drop(root);
     }
 }

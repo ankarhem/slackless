@@ -8,11 +8,11 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AnyElement, App, Div, ElementId, FontWeight, Hsla, ImageSource, InteractiveElement as _,
-    IntoElement, MouseButton, ObjectFit, ParentElement as _, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
+    AnyElement, App, ClipboardItem, Div, ElementId, FontWeight, Hsla, ImageSource,
+    InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement as _, RenderOnce,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px,
 };
-use slackless_core::types::{File, Message};
+use slackless_core::types::{File, FileMode, Message};
 
 use crate::fixtures::Fixtures;
 use crate::image_viewer::{ImageClick, ImageOrigin};
@@ -59,6 +59,8 @@ pub fn attachments(
             audio_card(file, cx)
         } else if is_video(file) {
             video_card(file, cx)
+        } else if is_snippet(file) {
+            div().child(SnippetCard { file: file.clone() })
         } else {
             match thumbnail(fixtures, file) {
                 Some(source) => image_attachment(file, ix, source, on_open, cx),
@@ -759,6 +761,279 @@ fn video_card(file: &File, cx: &App) -> Div {
         )
 }
 
+const SNIPPET_COLLAPSED_LINES: usize = 5;
+
+fn is_snippet(file: &File) -> bool {
+    let has_preview = file
+        .preview
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty());
+    has_preview
+        && (file.mode == Some(FileMode::Snippet)
+            || (!is_audio(file)
+                && !is_video(file)
+                && remote_thumbnail(file).is_none()
+                && !matches!(file.filetype.as_deref(), Some("quip" | "list" | "pdf"))))
+}
+
+fn snippet_lines(file: &File) -> Vec<String> {
+    file.preview
+        .as_deref()
+        .unwrap_or_default()
+        .trim_end_matches('\n')
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Extra lines beyond the collapsed 5-line preview: uses Slack's `lines` metadata when
+/// available so truncated previews still report the real line count (`Show more (247 lines)`).
+fn snippet_hidden_lines(file: &File, preview_len: usize) -> usize {
+    let server_total = file
+        .extra
+        .get("lines")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(preview_len);
+    let total = server_total.max(preview_len);
+    total.saturating_sub(SNIPPET_COLLAPSED_LINES)
+}
+
+#[derive(Default)]
+struct SnippetCardState {
+    expanded: bool,
+    copied: bool,
+}
+
+/// Slack's collapsible line-numbered code snippet card (`Chalk_Custom.terminal`, etc.):
+/// shows 5 lines collapsed with a centered `Show more (N lines)` toggle plus Copy & Download.
+#[derive(IntoElement)]
+struct SnippetCard {
+    file: File,
+}
+
+impl RenderOnce for SnippetCard {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let file = self.file;
+        let id_str = file.id.to_string();
+        let state = window.use_keyed_state(
+            ElementId::Name(SharedString::from(format!("snippet-state-{id_str}"))),
+            cx,
+            |_, _| SnippetCardState::default(),
+        );
+        let (expanded, copied) = {
+            let s = state.read(cx);
+            (s.expanded, s.copied)
+        };
+        let theme = cx.theme();
+        let lines = snippet_lines(&file);
+        let can_expand = lines.len() > SNIPPET_COLLAPSED_LINES;
+        let hidden_lines = snippet_hidden_lines(&file, lines.len());
+        let visible_count = if expanded {
+            lines.len()
+        } else {
+            lines.len().min(SNIPPET_COLLAPSED_LINES)
+        };
+        let gutter_digits = lines.len().max(1).to_string().len().max(2);
+        let title = file
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| file_name(&file));
+        let kind = file
+            .pretty_type
+            .clone()
+            .or_else(|| file.filetype.as_ref().map(|t| t.to_uppercase()));
+        let dl_url = download_url(&file);
+        let name = file_name(&file);
+        let copy_text = file.preview.clone().unwrap_or_default();
+        let code_bg = crate::theme::code_block_background(cx);
+        let border = theme.border;
+        let fg = theme.foreground;
+        let muted = theme.muted_foreground;
+        let mono = theme.mono_font_family.clone();
+        let secondary = theme.secondary;
+        let secondary_hover = theme.secondary_hover;
+        let success = theme.success;
+
+        let copy_state = state.clone();
+        let copy_btn = h_flex()
+            .id(SharedString::from(format!("snippet-copy-{id_str}")))
+            .items_center()
+            .gap_1()
+            .px_1p5()
+            .py(px(2.))
+            .rounded_sm()
+            .text_xs()
+            .text_color(if copied { success } else { muted })
+            .cursor_pointer()
+            .hover(move |b| b.bg(secondary_hover).text_color(fg))
+            .child(
+                Icon::new(if copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                })
+                .size(px(12.))
+                .text_color(if copied { success } else { muted }),
+            )
+            .child(if copied { "Copied" } else { "Copy" })
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                copy_state.update(cx, |s, cx| {
+                    s.copied = true;
+                    cx.notify();
+                });
+            });
+
+        let dl_btn = dl_url.map(|url| {
+            let name = name.clone();
+            h_flex()
+                .id(SharedString::from(format!("snippet-dl-{id_str}")))
+                .items_center()
+                .gap_1()
+                .px_1p5()
+                .py(px(2.))
+                .rounded_sm()
+                .text_xs()
+                .text_color(muted)
+                .cursor_pointer()
+                .hover(move |b| b.bg(secondary_hover).text_color(fg))
+                .child(
+                    Icon::new(IconName::Download)
+                        .size(px(12.))
+                        .text_color(muted),
+                )
+                .child("Download")
+                .on_click(move |_, window, cx| {
+                    crate::media::download(url.clone(), name.clone(), window, cx);
+                })
+        });
+
+        let header = h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::FileCode)
+                            .size(px(14.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(title),
+                    )
+                    .when_some(kind, |row, k| {
+                        row.child(div().text_xs().text_color(muted).child(k))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .child(copy_btn)
+                    .children(dl_btn),
+            );
+
+        let mut code_body = v_flex()
+            .w_full()
+            .px_2p5()
+            .py_2()
+            .font_family(mono)
+            .text_size(px(12.))
+            .line_height(px(18.));
+        for (ix, line) in lines.iter().take(visible_count).enumerate() {
+            let num = format!("{:>width$}", ix + 1, width = gutter_digits);
+            code_body = code_body.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap_3()
+                    .child(div().flex_none().text_color(muted.opacity(0.65)).child(num))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(fg)
+                            .child(if line.is_empty() {
+                                " ".to_owned()
+                            } else {
+                                line.clone()
+                            }),
+                    ),
+            );
+        }
+
+        let toggle_row = can_expand.then(|| {
+            let toggle_state = state.clone();
+            let label = if expanded {
+                "Show less".to_owned()
+            } else {
+                format!(
+                    "Show more ({hidden_lines} {})",
+                    if hidden_lines == 1 { "line" } else { "lines" }
+                )
+            };
+            h_flex()
+                .w_full()
+                .justify_center()
+                .py_1p5()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("snippet-toggle-{id_str}")))
+                        .px_2p5()
+                        .py(px(2.))
+                        .rounded(px(999.))
+                        .bg(secondary)
+                        .border_1()
+                        .border_color(border)
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(fg)
+                        .cursor_pointer()
+                        .hover(move |b| b.bg(secondary_hover))
+                        .child(label)
+                        .on_click(move |_, _, cx| {
+                            toggle_state.update(cx, |s, cx| {
+                                s.expanded = !s.expanded;
+                                cx.notify();
+                            });
+                        }),
+                )
+        });
+
+        v_flex()
+            .w_full()
+            .max_w(px(720.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(border)
+            .bg(code_bg)
+            .overflow_hidden()
+            .child(header)
+            .child(code_body)
+            .children(toggle_row)
+    }
+}
+
 fn file_card(file: &File, cx: &App) -> Div {
     let theme = cx.theme();
     let (icon, tile) = file_icon(file, cx);
@@ -898,5 +1173,41 @@ pub(crate) fn human_size(bytes: i64) -> String {
         format!("{:.0} KB", bytes / KB)
     } else {
         format!("{:.1} MB", bytes / (KB * KB))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockkit::serde_json::json;
+    use slackless_core::types::FileId;
+
+    #[test]
+    fn snippet_detection_and_line_counts_match_slack() {
+        let mut snippet = File {
+            id: FileId::from("F0SNIP"),
+            name: Some("Chalk_Custom.terminal".into()),
+            mode: Some(FileMode::Snippet),
+            filetype: Some("xml".into()),
+            preview: Some("line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n".into()),
+            ..Default::default()
+        };
+        assert!(is_snippet(&snippet));
+        let lines = snippet_lines(&snippet);
+        assert_eq!(lines.len(), 7);
+        assert_eq!(snippet_hidden_lines(&snippet, lines.len()), 2);
+
+        // Slack's `lines` metadata overrides truncated preview counts (e.g. 252 total -> 247 hidden).
+        snippet.extra.insert("lines".into(), json!(252));
+        assert_eq!(snippet_hidden_lines(&snippet, lines.len()), 247);
+
+        // Non-snippet canvas / PDF files must not render as code snippet cards.
+        let canvas = File {
+            id: FileId::from("F0CANV"),
+            filetype: Some("quip".into()),
+            preview: Some("hello".into()),
+            ..Default::default()
+        };
+        assert!(!is_snippet(&canvas));
     }
 }

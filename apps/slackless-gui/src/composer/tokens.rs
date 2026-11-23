@@ -237,6 +237,15 @@ pub(super) fn fenced_code_block_body_at(doc: &Doc, offset: usize) -> Option<Rang
     (start < end).then_some(start..end)
 }
 
+/// If `selection` lies within an inline code construct (including its backticks), return
+/// that construct's `inner` byte range so `Cmd+A` can scope to the inline code pill first.
+pub(super) fn inline_code_inner_at(doc: &Doc, selection: &Range<usize>) -> Option<Range<usize>> {
+    inline_code_constructs(doc)
+        .into_iter()
+        .find(|(outer, _)| selection.start >= outer.start && selection.end <= outer.end)
+        .map(|(_, inner)| inner)
+}
+
 /// Clamp a double-click selection strictly inside an inline code span's `inner` bounds when
 /// it overlaps `inner` and spilled across its delimiters.
 pub(super) fn clamp_selection_to_inner(
