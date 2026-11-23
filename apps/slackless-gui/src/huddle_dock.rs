@@ -13,8 +13,9 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, RenderImage, StatefulInteractiveElement as _,
-    Styled as _, Window, div, px,
+    IntoElement, ObjectFit, ParentElement as _, Render, RenderImage,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px, rgb,
+    rgba,
 };
 use slackless_core::huddle::{
     AudioDevices, HuddleAudioLevels, HuddleDataEvent, HuddleDrawMessage, HuddleDrawSegment,
@@ -591,8 +592,12 @@ impl HuddleDock {
         browser_url: String,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let theme = cx.theme();
-        let (card_bg, border, muted_fg) = (theme.background, theme.border, theme.muted_foreground);
+        let (card_bg, border, muted_fg, fg) = (
+            rgb(0x222529),
+            rgba(0xFFFFFF22),
+            rgb(0xABABAD),
+            rgb(0xFFFFFF),
+        );
         let copy_ch = channel.clone();
         let canvas_id = self.session.canvas_file_id.clone();
         let active_in = self.session.input_device.clone();
@@ -602,11 +607,13 @@ impl HuddleDock {
             .w_full()
             .p_2()
             .gap_1()
-            .rounded_lg()
+            .rounded_xl()
             .bg(card_bg)
             .border_1()
             .border_color(border)
+            .shadow_xl()
             .text_xs()
+            .text_color(fg)
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -617,10 +624,16 @@ impl HuddleDock {
                 let selected = active_in.as_deref() == Some(dev.name.as_str())
                     || (active_in.is_none() && dev.is_default);
                 let dev_name = dev.name.clone();
-                Button::new(("dock-in-dev", ix))
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .label(if selected {
+                div()
+                    .id(("dock-in-dev", ix))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .truncate()
+                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
+                    .child(if selected {
                         format!("✓ {}", dev.name)
                     } else {
                         dev.name.clone()
@@ -642,10 +655,16 @@ impl HuddleDock {
                 let selected = active_out.as_deref() == Some(dev.name.as_str())
                     || (active_out.is_none() && dev.is_default);
                 let dev_name = dev.name.clone();
-                Button::new(("dock-out-dev", ix))
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .label(if selected {
+                div()
+                    .id(("dock-out-dev", ix))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .truncate()
+                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
+                    .child(if selected {
                         format!("✓ {}", dev.name)
                     } else {
                         dev.name.clone()
@@ -658,11 +677,39 @@ impl HuddleDock {
             }))
             .child(div().h(px(1.)).my_1().bg(border))
             .child(
-                Button::new("dock-copy-link")
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .icon(IconName::Link)
-                    .label("Copy huddle link")
+                h_flex()
+                    .id("dock-open-thread")
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .child(
+                        Icon::new(IconName::MessageSquare)
+                            .size(px(12.))
+                            .text_color(muted_fg),
+                    )
+                    .child("Open huddle thread")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::OpenThread);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .id("dock-copy-link")
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .child(Icon::new(IconName::Link).size(px(12.)).text_color(muted_fg))
+                    .child("Copy huddle link")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu_open = false;
                         cx.emit(HuddleDockEvent::CopyLink(copy_ch.clone()));
@@ -671,11 +718,21 @@ impl HuddleDock {
             )
             .when_some(canvas_id, |m, fid| {
                 m.child(
-                    Button::new("dock-open-canvas")
-                        .ghost()
-                        .with_size(Size::XSmall)
-                        .icon(IconName::FileText)
-                        .label("Open huddle notes")
+                    h_flex()
+                        .id("dock-open-canvas")
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                        .child(
+                            Icon::new(IconName::FileText)
+                                .size(px(12.))
+                                .text_color(muted_fg),
+                        )
+                        .child("Open huddle notes")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.menu_open = false;
                             cx.emit(HuddleDockEvent::OpenCanvas(fid.clone()));
@@ -684,11 +741,21 @@ impl HuddleDock {
                 )
             })
             .child(
-                Button::new("dock-audio-settings")
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .icon(IconName::Settings)
-                    .label("Audio & video preferences…")
+                h_flex()
+                    .id("dock-audio-settings")
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .child(
+                        Icon::new(IconName::Settings)
+                            .size(px(12.))
+                            .text_color(muted_fg),
+                    )
+                    .child("Audio & video preferences…")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.menu_open = false;
                         cx.emit(HuddleDockEvent::OpenAudioSettings);
@@ -696,11 +763,21 @@ impl HuddleDock {
                     })),
             )
             .child(
-                Button::new("dock-open-browser")
-                    .ghost()
-                    .with_size(Size::XSmall)
-                    .icon(IconName::ExternalLink)
-                    .label("Open huddle in browser")
+                h_flex()
+                    .id("dock-open-browser")
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .child(
+                        Icon::new(IconName::ExternalLink)
+                            .size(px(12.))
+                            .text_color(muted_fg),
+                    )
+                    .child("Open in browser")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.menu_open = false;
                         cx.emit(HuddleDockEvent::OpenBrowser(browser_url.clone()));
@@ -708,147 +785,179 @@ impl HuddleDock {
                     })),
             )
     }
+
     fn render_action_bar(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
-        let mic_button = {
-            let btn = Button::new("huddle-dock-mic")
-                .with_size(Size::Small)
-                .icon(if self.session.muted {
+        let dark_btn = rgb(0x2E3136);
+        let dark_hover = rgb(0x3B3F46);
+        let white = rgb(0xFFFFFF);
+        let obsidian = rgb(0x1A1D21);
+        let crimson = rgb(0xE01E5A);
+        let emerald = rgb(0x007A5A);
+
+        let mic_btn = div()
+            .id("huddle-dock-mic")
+            .flex_1()
+            .h(px(30.))
+            .rounded_lg()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if self.session.muted {
+                crimson
+            } else {
+                dark_btn
+            })
+            .hover(|el| {
+                el.bg(if self.session.muted {
+                    rgb(0xC91A50)
+                } else {
+                    dark_hover
+                })
+            })
+            .child(
+                Icon::new(if self.session.muted {
                     IconName::MicOff
                 } else {
                     IconName::Mic
                 })
-                .tooltip(if self.session.muted {
-                    "Unmute microphone (⌘⇧Space)"
+                .size(px(14.))
+                .text_color(white),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleMute)));
+
+        let video_btn = div()
+            .id("huddle-dock-video")
+            .flex_1()
+            .h(px(30.))
+            .rounded_lg()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if self.session.video { white } else { dark_btn })
+            .hover(|el| {
+                el.bg(if self.session.video {
+                    rgb(0xE8E8E8)
                 } else {
-                    "Mute microphone (⌘⇧Space)"
+                    dark_hover
                 })
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleMute)));
-            if self.session.muted {
-                btn.ghost()
-            } else {
-                btn.primary()
-            }
-        };
-        let video_button = {
-            let btn = Button::new("huddle-dock-video")
-                .with_size(Size::Small)
-                .icon(if self.session.video {
+            })
+            .child(
+                Icon::new(if self.session.video {
                     IconName::Video
                 } else {
                     IconName::VideoOff
                 })
-                .tooltip(if self.session.video {
-                    "Turn camera off"
-                } else {
-                    "Turn camera on"
-                })
-                .on_click(cx.listener(|_, _, _, cx| {
-                    cx.emit(HuddleDockEvent::ToggleCamera);
-                }));
-            if self.session.video {
-                btn.primary()
+                .size(px(14.))
+                .text_color(if self.session.video { obsidian } else { white }),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleCamera)));
+
+        let share_btn = div()
+            .id("huddle-dock-share")
+            .flex_1()
+            .h(px(30.))
+            .rounded_lg()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if self.session.sharing {
+                emerald
             } else {
-                btn.ghost()
-            }
-        };
-        let share_button = {
-            let btn = Button::new("huddle-dock-share")
-                .with_size(Size::Small)
-                .icon(IconName::ScreenShare)
-                .tooltip(if self.session.sharing {
-                    "Stop screen sharing"
+                dark_btn
+            })
+            .hover(|el| {
+                el.bg(if self.session.sharing {
+                    rgb(0x2BAC76)
                 } else {
-                    "Share screen"
+                    dark_hover
                 })
-                .on_click(cx.listener(|_, _, _, cx| {
-                    cx.emit(HuddleDockEvent::ToggleScreenShare);
-                }));
-            if self.session.sharing {
-                btn.primary()
-            } else {
-                btn.ghost()
-            }
-        };
+            })
+            .child(
+                Icon::new(IconName::ScreenShare)
+                    .size(px(14.))
+                    .text_color(white),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleScreenShare)));
+
+        let more_btn = div()
+            .id("huddle-dock-more")
+            .flex_1()
+            .h(px(30.))
+            .rounded_lg()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(if self.menu_open { dark_hover } else { dark_btn })
+            .hover(|el| el.bg(dark_hover))
+            .child(
+                Icon::new(IconName::Ellipsis)
+                    .size(px(14.))
+                    .text_color(white),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.menu_open = !this.menu_open;
+                if this.menu_open {
+                    cx.spawn(async move |dock, cx| {
+                        let devices = cx
+                            .background_executor()
+                            .spawn(async move { list_audio_devices() })
+                            .await;
+                        let _ = dock.update(cx, |dock: &mut HuddleDock, cx| {
+                            dock.devices = devices;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                cx.notify();
+            }));
+
+        let leave_btn = div()
+            .id("huddle-dock-leave")
+            .flex_1()
+            .h(px(30.))
+            .rounded_lg()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(crimson)
+            .hover(|el| el.bg(rgb(0xC91A50)))
+            .child(
+                Icon::new(IconName::PhoneOff)
+                    .size(px(14.))
+                    .text_color(white),
+            )
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::Leave)));
+
         h_flex()
             .items_center()
             .gap_1()
-            .child(mic_button)
-            .child(video_button)
-            .child(share_button)
-            .child(
-                Button::new("huddle-dock-thread")
-                    .ghost()
-                    .with_size(Size::Small)
-                    .icon(IconName::MessageSquare)
-                    .tooltip("Huddle thread")
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        cx.emit(HuddleDockEvent::OpenThread);
-                    })),
-            )
-            .child(
-                Button::new("huddle-dock-more")
-                    .ghost()
-                    .with_size(Size::Small)
-                    .icon(IconName::Ellipsis)
-                    .tooltip("Audio devices & huddle options")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.menu_open = !this.menu_open;
-                        if this.menu_open {
-                            cx.spawn(async move |dock, cx| {
-                                let devices = cx
-                                    .background_executor()
-                                    .spawn(async move { list_audio_devices() })
-                                    .await;
-                                let _ = dock.update(cx, |dock: &mut HuddleDock, cx| {
-                                    dock.devices = devices;
-                                    cx.notify();
-                                });
-                            })
-                            .detach();
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("huddle-dock-leave")
-                    .danger()
-                    .with_size(Size::Small)
-                    .icon(IconName::PhoneOff)
-                    .tooltip("Leave huddle")
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        cx.emit(HuddleDockEvent::Leave);
-                    })),
-            )
+            .child(mic_btn)
+            .child(video_btn)
+            .child(share_btn)
+            .child(more_btn)
+            .child(leave_btn)
     }
-}
 
-impl Render for HuddleDock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let bg = theme.sidebar;
-        let card_bg = theme.background;
-        let border = theme.border;
-        let fg = theme.foreground;
-        let muted_fg = theme.muted_foreground;
-        let success = theme.success;
-        let warning = theme.warning;
-        let danger = theme.danger;
-
-        let (status_color, status_text) = match self.session.phase {
-            HuddlePhase::Joining | HuddlePhase::Connecting => (warning, "Connecting…".to_owned()),
-            HuddlePhase::Connected => (success, format_elapsed(self.elapsed_secs)),
-            HuddlePhase::Reconnecting => (warning, "Reconnecting…".to_owned()),
-            HuddlePhase::Leaving => (muted_fg, "Leaving…".to_owned()),
-            HuddlePhase::Failed => (danger, "Audio failed".to_owned()),
-            HuddlePhase::Idle => (muted_fg, "Ended".to_owned()),
-        };
-
-        let channel = self.session.channel.clone();
-        let channel_label = self.channel_label();
-        let browser_url = self.browser_url();
+    fn render_mini_stage(
+        &self,
+        channel: &ChannelId,
+        channel_label: String,
+        status_color: gpui_kit::gpui::Rgba,
+        status_text: String,
+        stage_bg: gpui_kit::gpui::Rgba,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let white = rgb(0xFFFFFF);
+        let emerald = rgb(0x2BAC76);
+        let crimson = rgb(0xE01E5A);
         let people = self.all_people();
-        let visible_people: Vec<UserId> = people.iter().take(4).cloned().collect();
+        let visible_people: Vec<UserId> = people.iter().take(3).cloned().collect();
         let overflow_count = people.len().saturating_sub(visible_people.len());
         let local_bar_pct = if self.session.muted {
             0.0
@@ -856,210 +965,315 @@ impl Render for HuddleDock {
             (self.levels.local_rms * 3.5).clamp(0.0, 1.0)
         };
 
-        let avatars = h_flex()
-            .items_center()
-            .gap_1p5()
-            .children(visible_people.into_iter().map(|uid| {
-                let speaking = self.is_speaking(&uid);
-                let user_muted = self.is_muted_user(&uid);
-                div()
-                    .relative()
-                    .p(px(1.5))
-                    .rounded_md()
-                    .border_2()
-                    .border_color(if speaking {
-                        success
-                    } else {
-                        border.opacity(0.4)
-                    })
-                    .child(user_chip(&self.fixtures, &uid, 24.))
-                    .when(user_muted, |el| {
-                        el.child(
+        // Prefer active screen share or camera frame in the mini visual stage, just like Slack!
+        let preview_frame = self
+            .video_frames
+            .iter()
+            .find_map(|(k, v)| matches!(k, VideoTileKey::RemoteScreen(_)).then(|| v.clone()))
+            .or_else(|| self.video_frames.get(&VideoTileKey::LocalScreen).cloned())
+            .or_else(|| {
+                self.video_frames.iter().find_map(|(k, v)| {
+                    matches!(k, VideoTileKey::RemoteCamera(_)).then(|| v.clone())
+                })
+            })
+            .or_else(|| self.video_frames.get(&VideoTileKey::LocalCamera).cloned());
+
+        let jump_ch = channel.clone();
+        div()
+            .relative()
+            .w_full()
+            .h(px(104.))
+            .rounded_lg()
+            .overflow_hidden()
+            .bg(stage_bg)
+            .border_1()
+            .border_color(rgba(0xFFFFFF14))
+            .child(if let Some(frame) = preview_frame {
+                img(frame)
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .size_full()
+                    .pt_6()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .children(visible_people.into_iter().map(|uid| {
+                        let speaking = self.is_speaking(&uid);
+                        let user_muted = self.is_muted_user(&uid);
+                        div()
+                            .relative()
+                            .p(px(2.))
+                            .rounded_xl()
+                            .border_2()
+                            .border_color(if speaking { emerald } else { rgba(0xFFFFFF18) })
+                            .child(user_chip(&self.fixtures, &uid, 38.))
+                            .when(user_muted, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-3.))
+                                        .bottom(px(-3.))
+                                        .size(px(15.))
+                                        .rounded_full()
+                                        .bg(rgb(0x1A1D21))
+                                        .border_1()
+                                        .border_color(rgba(0xFFFFFF22))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::MicOff)
+                                                .size(px(9.))
+                                                .text_color(crimson),
+                                        ),
+                                )
+                            })
+                    }))
+                    .when(overflow_count > 0, |row| {
+                        row.child(
                             div()
-                                .absolute()
-                                .right(px(-3.))
-                                .bottom(px(-3.))
-                                .size(px(13.))
-                                .rounded_full()
-                                .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(Icon::new(IconName::MicOff).size(px(8.)).text_color(danger)),
+                                .px_1p5()
+                                .py_1()
+                                .rounded_lg()
+                                .bg(rgba(0xFFFFFF18))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(white)
+                                .child(format!("+{overflow_count}")),
                         )
                     })
-            }))
-            .when(overflow_count > 0, |row| {
-                row.child(
+                    .into_any_element()
+            })
+            // Top-left frosted channel + live status chip
+            .child(
+                h_flex()
+                    .id("huddle-dock-jump")
+                    .absolute()
+                    .left(px(6.))
+                    .top(px(6.))
+                    .max_w(px(156.))
+                    .px_1p5()
+                    .py_0p5()
+                    .gap_1()
+                    .items_center()
+                    .rounded_md()
+                    .bg(rgba(0x0E1014CC))
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(IconName::Headphones)
+                            .size(px(11.))
+                            .text_color(status_color),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(white)
+                            .child(channel_label),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(status_color)
+                            .child(status_text),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(HuddleDockEvent::JumpToChannel(jump_ch.clone()));
+                    })),
+            )
+            // Top-right frosted pop-out expand icon button
+            .child(
+                div()
+                    .id("huddle-dock-popout")
+                    .absolute()
+                    .right(px(6.))
+                    .top(px(6.))
+                    .size(px(22.))
+                    .rounded_md()
+                    .bg(rgba(0x0E1014CC))
+                    .hover(|el| el.bg(rgba(0xFFFFFF2E)))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Maximize2)
+                            .size(px(11.))
+                            .text_color(white),
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(HuddleDockEvent::PopOut);
+                    })),
+            )
+            // Bottom hairline voice activity pulse
+            .when(self.session.phase == HuddlePhase::Connected, |stage| {
+                stage.child(
                     div()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded_md()
-                        .bg(border.opacity(0.35))
-                        .text_xs()
-                        .text_color(muted_fg)
-                        .child(format!("+{overflow_count}")),
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(2.5))
+                        .bg(rgba(0xFFFFFF10))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui_kit::gpui::relative(local_bar_pct))
+                                .bg(emerald),
+                        ),
                 )
-            });
+            })
+    }
+}
 
+fn dock_theme_colors(bg_id: Option<&str>) -> (gpui_kit::gpui::Rgba, gpui_kit::gpui::Rgba) {
+    match bg_id {
+        Some("midnight") => (rgb(0x10172A), rgb(0x1B2440)),
+        Some("sunset") => (rgb(0x2B1818), rgb(0x3B2222)),
+        Some("forest") => (rgb(0x11221B), rgb(0x1B3328)),
+        Some("ocean") => (rgb(0x0F212E), rgb(0x183244)),
+        Some("plum") => (rgb(0x24142B), rgb(0x351F3E)),
+        _ => (rgb(0x1A1D21), rgb(0x23262B)),
+    }
+}
+
+impl Render for HuddleDock {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let sidebar_bg = theme.sidebar;
+        let sidebar_border = theme.border;
+        let emerald = rgb(0x2BAC76);
+        let amber = rgb(0xECB22E);
+        let crimson = rgb(0xE01E5A);
+        let muted_fg = rgb(0xABABAD);
+        let white = rgb(0xFFFFFF);
+
+        let (card_bg, stage_bg) = dock_theme_colors(self.session.background_id.as_deref());
+        let (status_color, status_text) = match self.session.phase {
+            HuddlePhase::Joining | HuddlePhase::Connecting => (amber, "…".to_owned()),
+            HuddlePhase::Connected => (emerald, format_elapsed(self.elapsed_secs)),
+            HuddlePhase::Reconnecting => (amber, "…".to_owned()),
+            HuddlePhase::Leaving => (muted_fg, "Leaving".to_owned()),
+            HuddlePhase::Failed => (crimson, "Failed".to_owned()),
+            HuddlePhase::Idle => (muted_fg, "Ended".to_owned()),
+        };
+
+        let channel = self.session.channel.clone();
+        let channel_label = self.channel_label();
+        let browser_url = self.browser_url();
+        let mini_stage = self.render_mini_stage(
+            &channel,
+            channel_label,
+            status_color,
+            status_text,
+            stage_bg,
+            cx,
+        );
         let action_bar = self.render_action_bar(cx);
 
-        let mut card = v_flex()
+        let mut outer = v_flex()
             .id("huddle-sidebar-dock")
             .w_full()
             .p_2()
-            .gap_2()
-            .bg(bg)
+            .gap_1p5()
+            .bg(sidebar_bg)
             .border_t_1()
-            .border_color(border)
-            .child(
-                v_flex()
-                    .w_full()
-                    .p_2p5()
-                    .gap_2()
-                    .rounded_lg()
-                    .bg(card_bg)
-                    .border_1()
-                    .border_color(status_color.opacity(0.6))
-                    .text_color(fg)
-                    // Header row: status icon, clickable channel name, elapsed timer, pop-out
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                Icon::new(IconName::Headphones)
-                                    .size(px(14.))
-                                    .text_color(status_color),
-                            )
-                            .child(
-                                div()
-                                    .id("huddle-dock-jump")
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .cursor_pointer()
-                                    .child(channel_label)
-                                    .on_click(cx.listener({
-                                        let ch = channel.clone();
-                                        move |_, _, _, cx| {
-                                            cx.emit(HuddleDockEvent::JumpToChannel(ch.clone()));
-                                        }
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(status_color)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(status_text),
-                            )
-                            .child(
-                                Button::new("huddle-dock-popout")
-                                    .ghost()
-                                    .with_size(Size::XSmall)
-                                    .icon(IconName::ExternalLink)
-                                    .tooltip("Pop out huddle window")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(HuddleDockEvent::PopOut);
-                                    })),
-                            ),
-                    )
-                    // Participant avatars + live local RMS level strip
-                    .child(avatars)
-                    .when(self.session.phase == HuddlePhase::Connected, |box_el| {
-                        box_el.child(
-                            div()
-                                .w_full()
-                                .h(px(3.))
-                                .rounded_full()
-                                .bg(border.opacity(0.4))
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .w(gpui_kit::gpui::relative(local_bar_pct))
-                                        .rounded_full()
-                                        .bg(success),
-                                ),
-                        )
-                    })
-                    // Error / UDP blocked callout with Retry + Open in browser
-                    .when_some(self.session.error.clone(), |box_el, err_msg| {
-                        let retry_ch = channel.clone();
-                        let fallback_url = browser_url.clone();
-                        box_el.child(
-                            v_flex()
-                                .p_2()
-                                .gap_1p5()
-                                .rounded_md()
-                                .bg(danger.opacity(0.12))
-                                .border_1()
-                                .border_color(danger.opacity(0.4))
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_start()
-                                        .child(
-                                            Icon::new(IconName::TriangleAlert)
-                                                .size(px(12.))
-                                                .text_color(danger),
-                                        )
-                                        .child(
-                                            div().flex_1().text_xs().text_color(fg).child(err_msg),
-                                        ),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(
-                                            Button::new("huddle-dock-retry")
-                                                .outline()
-                                                .with_size(Size::XSmall)
-                                                .icon(IconName::RefreshCw)
-                                                .label("Retry")
-                                                .on_click(cx.listener(move |_, _, _, cx| {
-                                                    cx.emit(HuddleDockEvent::RetryJoin(
-                                                        retry_ch.clone(),
-                                                    ));
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("huddle-dock-browser-fallback")
-                                                .primary()
-                                                .with_size(Size::XSmall)
-                                                .icon(IconName::ExternalLink)
-                                                .label("Open in browser")
-                                                .on_click(cx.listener(move |_, _, _, cx| {
-                                                    cx.emit(HuddleDockEvent::OpenBrowser(
-                                                        fallback_url.clone(),
-                                                    ));
-                                                })),
-                                        ),
-                                ),
-                        )
-                    })
-                    // Action control bar: Mute, Camera, Share, Thread, More/Devices, Leave
-                    .when_some(self.session.topic.clone(), |box_el, topic| {
-                        box_el.child(
-                            div()
-                                .text_xs()
-                                .truncate()
-                                .text_color(muted_fg)
-                                .child(format!("Topic: {topic}")),
-                        )
-                    })
-                    .child(action_bar),
-            );
+            .border_color(sidebar_border);
 
+        // Render upward floating menu ABOVE the card when open!
         if self.menu_open {
-            card = card.child(self.render_menu(&channel, browser_url, cx));
+            outer = outer.child(self.render_menu(&channel, browser_url.clone(), cx));
         }
 
-        card
+        outer.child(
+            v_flex()
+                .w_full()
+                .p_2()
+                .gap_2()
+                .rounded_xl()
+                .bg(card_bg)
+                .border_1()
+                .border_color(if self.session.phase == HuddlePhase::Connected {
+                    emerald.opacity(0.45)
+                } else {
+                    rgba(0xFFFFFF1C)
+                })
+                .shadow_md()
+                .text_color(white)
+                .child(mini_stage)
+                .when_some(self.session.topic.clone(), |box_el, topic| {
+                    box_el.child(
+                        div()
+                            .px_1()
+                            .text_xs()
+                            .truncate()
+                            .text_color(muted_fg)
+                            .child(topic),
+                    )
+                })
+                .when_some(self.session.error.clone(), |box_el, err_msg| {
+                    let retry_ch = channel.clone();
+                    let fallback_url = browser_url.clone();
+                    box_el.child(
+                        v_flex()
+                            .p_2()
+                            .gap_1p5()
+                            .rounded_lg()
+                            .bg(crimson.opacity(0.16))
+                            .border_1()
+                            .border_color(crimson.opacity(0.45))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_start()
+                                    .child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .size(px(12.))
+                                            .text_color(crimson),
+                                    )
+                                    .child(
+                                        div().flex_1().text_xs().text_color(white).child(err_msg),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("huddle-dock-retry")
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::RefreshCw)
+                                            .label("Retry")
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.emit(HuddleDockEvent::RetryJoin(
+                                                    retry_ch.clone(),
+                                                ));
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("huddle-dock-browser-fallback")
+                                            .primary()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::ExternalLink)
+                                            .label("Browser")
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.emit(HuddleDockEvent::OpenBrowser(
+                                                    fallback_url.clone(),
+                                                ));
+                                            })),
+                                    ),
+                            ),
+                    )
+                })
+                .child(action_bar),
+        )
     }
 }

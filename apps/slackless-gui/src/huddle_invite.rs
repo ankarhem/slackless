@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement,
-    ParentElement as _, Render, Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px, rgb, rgba,
 };
 use slackless_core::types::{ChannelId, UserId};
 
@@ -46,33 +46,34 @@ impl HuddleInviteBanner {
 
 impl Render for HuddleInviteBanner {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let bg = theme.popover;
-        let fg = theme.foreground;
-        let muted = theme.muted_foreground;
-        let success = theme.success;
+        let _ = cx.theme();
+        let card_bg = rgb(0x1E2228);
+        let fg = rgb(0xFFFFFF);
+        let muted = rgb(0xABABAD);
+        let emerald = rgb(0x2BAC76);
+        let join_green = rgb(0x007A5A);
 
         let inviter_name = self.fixtures.user_name(&self.invite.inviter).to_owned();
         let channel = self.invite.channel.clone();
 
         h_flex()
-            .w(px(340.))
+            .w(px(356.))
             .p_3()
             .gap_3()
             .items_center()
-            .rounded_xl()
-            .bg(bg)
+            .rounded_2xl()
+            .bg(card_bg)
             .border_1()
-            .border_color(success.opacity(0.65))
-            .shadow_lg()
+            .border_color(emerald.opacity(0.75))
+            .shadow_2xl()
             .text_color(fg)
             .child(
                 div()
-                    .p(px(2.))
-                    .rounded_lg()
+                    .p(px(2.5))
+                    .rounded_xl()
                     .border_2()
-                    .border_color(success)
-                    .child(user_chip(&self.fixtures, &self.invite.inviter, 36.)),
+                    .border_color(emerald)
+                    .child(user_chip(&self.fixtures, &self.invite.inviter, 40.)),
             )
             .child(
                 v_flex()
@@ -82,17 +83,18 @@ impl Render for HuddleInviteBanner {
                     .child(
                         h_flex()
                             .items_center()
-                            .gap_1()
+                            .gap_1p5()
                             .child(
                                 Icon::new(IconName::Headphones)
                                     .size(px(13.))
-                                    .text_color(success),
+                                    .text_color(emerald),
                             )
                             .child(
                                 div()
                                     .truncate()
                                     .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(fg)
                                     .child(format!("{inviter_name} is huddling")),
                             ),
                     )
@@ -105,23 +107,41 @@ impl Render for HuddleInviteBanner {
             )
             .child(
                 h_flex()
+                    .items_center()
                     .gap_1p5()
                     .child(
-                        Button::new("huddle-invite-decline")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::X)
-                            .tooltip("Decline")
+                        div()
+                            .id("huddle-invite-decline")
+                            .size(px(32.))
+                            .rounded_full()
+                            .bg(rgba(0xFFFFFF16))
+                            .hover(|el| el.bg(rgba(0xFFFFFF26)))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::X).size(px(14.)).text_color(fg))
                             .on_click(cx.listener(|_, _, _, cx| {
                                 cx.emit(HuddleInviteEvent::Decline);
                             })),
                     )
                     .child(
-                        Button::new("huddle-invite-accept")
-                            .primary()
-                            .with_size(Size::Small)
-                            .icon(IconName::Headphones)
-                            .label("Join")
+                        h_flex()
+                            .id("huddle-invite-accept")
+                            .h(px(32.))
+                            .px_3()
+                            .gap_1p5()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(join_green)
+                            .hover(|el| el.bg(emerald))
+                            .cursor_pointer()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(Icon::new(IconName::Headphones).size(px(13.)).text_color(fg))
+                            .child("Join")
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.emit(HuddleInviteEvent::Accept(channel.clone()));
                             })),
