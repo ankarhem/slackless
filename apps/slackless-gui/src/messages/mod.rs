@@ -424,6 +424,18 @@ impl MessageList {
         }
     }
 
+    /// Return the newest `huddle_thread` message ts in the current conversation (falling back
+    /// to the newest message in sample mode) so the huddle bar can open its thread (`F-COLLAB-014`).
+    pub fn latest_huddle_thread_ts(&self, sample_fallback: bool, cx: &App) -> Option<Ts> {
+        let messages = &self.data.read(cx).messages;
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread))
+            .or_else(|| sample_fallback.then(|| messages.last()).flatten())
+            .map(|m| m.ts.clone())
+    }
+
     /// Look up an already-loaded message by timestamp (used to seed `ThreadPanel` on frame 0).
     pub fn message_by_ts(&self, channel: &ChannelId, ts: &Ts, cx: &App) -> Option<Message> {
         if *channel == self.channel {

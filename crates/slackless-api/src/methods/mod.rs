@@ -197,6 +197,33 @@ impl SlackApi {
         Ok(resp.data.channel)
     }
 
+    /// `conversations.info` with `return_app_home=true`: fetches an app DM's Home tab flags
+    /// and published Block Kit `home_view` (`F-COLLAB-480`, `docs/research/api-apps-blocks.md`).
+    pub async fn conversations_app_home(&self, channel: &ChannelId) -> Result<AppHomeResponse> {
+        let params = vec![
+            ("channel", channel.to_string()),
+            ("return_app_home", "true".to_owned()),
+            ("_x_reason", "app-home-open-api".to_owned()),
+        ];
+        let resp = self
+            .call::<AppHomeWire>(method::CONVERSATIONS_INFO, params)
+            .await?;
+        Ok(resp.data.into_response())
+    }
+
+    /// `apps.home.dispatchOpenEvent`: notifies an app that the user opened its Home tab so it
+    /// can publish or refresh `home_view` via `views.publish` (`F-COLLAB-480`).
+    pub async fn apps_home_dispatch_open_event(&self, channel: &ChannelId) -> Result<()> {
+        let params = vec![
+            ("id", channel.to_string()),
+            ("type", "home".to_owned()),
+            ("_x_reason", "app-home-logging".to_owned()),
+        ];
+        self.call::<Empty>(method::APPS_HOME_DISPATCH_OPEN_EVENT, params)
+            .await?;
+        Ok(())
+    }
+
     /// One page of `conversations.list`.
     pub async fn conversations_list(
         &self,

@@ -621,6 +621,14 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<api::SlackListData>> + Send {
         async { Ok(api::SlackListData::default()) }
     }
+    /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true`) and
+    /// dispatch `apps.home.dispatchOpenEvent` (`F-COLLAB-480`).
+    fn load_app_home(
+        &self,
+        _channel: ChannelId,
+    ) -> impl Future<Output = api::Result<api::AppHomeResponse>> + Send {
+        async { Ok(api::AppHomeResponse::default()) }
+    }
     /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`).
     fn set_global_notification_pref(
         &self,
@@ -1280,6 +1288,12 @@ impl Backend for SlackApi {
 
     async fn fetch_list(&self, file_id: String) -> api::Result<api::SlackListData> {
         SlackApi::fetch_list(self, &file_id).await
+    }
+
+    async fn load_app_home(&self, channel: ChannelId) -> api::Result<api::AppHomeResponse> {
+        let home = self.conversations_app_home(&channel).await?;
+        let _ = self.apps_home_dispatch_open_event(&channel).await;
+        Ok(home)
     }
 
     async fn set_global_notification_pref(

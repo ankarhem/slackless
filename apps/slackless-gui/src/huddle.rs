@@ -55,6 +55,8 @@ pub fn fixture(fixtures: &Fixtures) -> Option<Huddle> {
 
 pub enum HuddleEvent {
     Leave,
+    /// Open or toggle the active huddle's thread in the right-hand thread panel (`F-COLLAB-014`/`015`).
+    OpenThread,
 }
 
 pub struct HuddleBar {
@@ -205,6 +207,12 @@ impl Render for HuddleBar {
             );
 
         let url = self.browser_url();
+        let open_thread = Button::new("huddle-open-thread")
+            .outline()
+            .with_size(Size::Small)
+            .icon(IconName::MessageSquare)
+            .label("Huddle thread")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleEvent::OpenThread)));
         let open_in_browser = Button::new("huddle-open-browser")
             .primary()
             .icon(IconName::ExternalLink)
@@ -242,6 +250,7 @@ impl Render for HuddleBar {
                             .child(format!("{count} participants")),
                     )
                     .child(div().flex_1())
+                    .child(open_thread)
                     .child(open_in_browser),
             )
             .child(

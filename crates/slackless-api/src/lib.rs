@@ -22,11 +22,11 @@ pub use client::{MAX_RATE_LIMIT_RETRIES, SlackApi};
 pub use error::ApiError;
 pub use methods::{
     ActionContainer, ActivityEntry, ActivityFeed, ActivityItem, ActivityKind, ActivityReaction,
-    AppCommand, AuthTest, BookmarksList, CanvasCreated, ChannelBookmark, ClientCounts, CloudDraft,
-    ConversationCounts, ConversationView, DeletedFile, EdgeSearchResults, FileCollection,
-    FilesFilter, GifItem, HistoryOpts, ListOpts, MessageContent, PinnedItem, PinsList,
-    PostedMessage, ProfileUpdate, RemoteFilePage, RemoteMessageHit, RemoteMessagePage, SavedItem,
-    SavedItemState, SavedMark, ScheduledMessage, ScheduledMessageCreated, SearchChannel,
+    AppCommand, AppHomeResponse, AuthTest, BookmarksList, CanvasCreated, ChannelBookmark,
+    ClientCounts, CloudDraft, ConversationCounts, ConversationView, DeletedFile, EdgeSearchResults,
+    FileCollection, FilesFilter, GifItem, HistoryOpts, ListOpts, MessageContent, PinnedItem,
+    PinsList, PostedMessage, ProfileUpdate, RemoteFilePage, RemoteMessageHit, RemoteMessagePage,
+    SavedItem, SavedItemState, SavedMark, ScheduledMessage, ScheduledMessageCreated, SearchChannel,
     SearchMatch, SearchMessages, SearchOpts, SearchPagination, SearchSort, SectionCreated,
     SlackListCellValue, SlackListChoice, SlackListColumn, SlackListData, SlackListRow,
     ThreadCounts, ThreadSubscription, ThreadsView, UploadFile, UploadSlot, UserBoot,

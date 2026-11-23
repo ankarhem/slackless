@@ -343,6 +343,9 @@ pub enum Command {
     LoadList {
         file_id: String,
     },
+    /// Fetch an app DM's Home tab view (`conversations.info` `return_app_home=true` +
+    /// `apps.home.dispatchOpenEvent`, `F-COLLAB-480`).
+    LoadAppHome(ChannelId),
     /// Write a global notification preference (`users.prefs.setNotifications` with `global=true`; `F-CORE-147`, `F-CORE-155`).
     SetGlobalNotificationPref {
         name: String,
@@ -675,6 +678,13 @@ pub enum Event {
         file_id: String,
         list: Result<Box<api::SlackListData>, String>,
     },
+    /// An app DM's Home tab finished loading (`conversations.info` `return_app_home=true`, `F-COLLAB-480`).
+    AppHomeLoaded {
+        channel: ChannelId,
+        home: Result<Box<api::AppHomeResponse>, String>,
+    },
+    /// An app published a fresh Home tab view (`view_updated` with `type: "home"`, `F-COLLAB-480`).
+    AppHomeUpdated(serde_json::Value),
     /// Starred files, custom collections, and recently deleted items for the Files browser (`F-CORE-133`).
     FilesExtrasLoaded {
         favorites: Vec<String>,

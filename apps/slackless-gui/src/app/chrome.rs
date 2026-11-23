@@ -572,6 +572,184 @@ impl App {
         )
     }
 
+    /// Open or toggle the current conversation's huddle thread in the right-hand thread panel
+    /// (`F-COLLAB-014`, `F-COLLAB-015`). Uses the newest `huddle_thread` trail message in the
+    /// channel, falling back to the newest message in sample mode.
+    pub(super) fn toggle_huddle_thread(&mut self, cx: &mut Context<Self>) {
+        let huddle_ts = self
+            .messages
+            .read(cx)
+            .latest_huddle_thread_ts(self.fixtures.sample, cx);
+        let Some(ts) = huddle_ts else {
+            return;
+        };
+        if self.thread_open
+            && self.thread.read(cx).open_thread().as_ref().map(|(_, t)| t) == Some(&ts)
+        {
+            self.close_thread(cx);
+        } else {
+            self.open_thread(self.channel.clone(), ts, cx);
+        }
+    }
+
+    /// Render the active app DM's Home tab (`F-COLLAB-480`): displays published Block Kit
+    /// `home_view.blocks` with interactive `blocks.actions` (`container: {"type":"view",...}`)
+    /// and a Refresh button.
+    pub(super) fn app_home_view(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
+        let channel = self.channel.clone();
+        let app_name = self
+            .fixtures
+            .conversation(&channel)
+            .and_then(|c| c.user.as_ref())
+            .map(|u| self.fixtures.user_name(u).to_owned())
+            .unwrap_or_else(|| "App".to_owned());
+
+        if self.fixtures.sample {
+            return div()
+                .id("app-home-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                v_flex()
+                    .px_6()
+                    .py_5()
+                    .gap_3()
+                    .max_w(px(760.))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(fg)
+                            .child(format!("{app_name} Home")),
+                    )
+                    .child(div().text_sm().text_color(muted).child(
+                        "App Home tabs load live Block Kit dashboards published by workspace apps.",
+                    )),
+            );
+        }
+
+        let header = h_flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .pb_3()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::House).size(px(16.)).text_color(muted))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(format!("{app_name} Home")),
+                    ),
+            )
+            .child(
+                Button::new("app-home-refresh")
+                    .outline()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::RefreshCw)
+                    .label("Refresh")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ws.app_homes.remove(&this.channel);
+                        this.bridge.send(Command::LoadAppHome(this.channel.clone()));
+                        cx.notify();
+                    })),
+            );
+
+        let body: AnyElement = match self.ws.app_homes.get(&channel) {
+            None => div()
+                .py_8()
+                .text_sm()
+                .text_color(muted)
+                .child("Loading Home tab\u{2026}")
+                .into_any_element(),
+            Some(Err(err)) => div()
+                .py_8()
+                .text_sm()
+                .text_color(muted)
+                .child(format!("Could not load Home tab: {err}"))
+                .into_any_element(),
+            Some(Ok(home)) if !home.home_tab_enabled || home.home_view.is_none() => div()
+                .py_8()
+                .text_sm()
+                .text_color(muted)
+                .child(format!("{app_name} has not published a Home tab."))
+                .into_any_element(),
+            Some(Ok(home)) => {
+                let view = home.home_view.as_ref().expect("checked above");
+                let view_id = view["id"].as_str().unwrap_or_default().to_owned();
+                let app_id = view["app_id"].as_str().unwrap_or_default().to_owned();
+                let bot_id = view["bot_id"]
+                    .as_str()
+                    .map(slackless_core::types::BotId::from)
+                    .unwrap_or_else(|| slackless_core::types::BotId::from(app_id.as_str()));
+                let team = view["app_installed_team_id"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(slackless_core::types::TeamId::from);
+                let raw_blocks: Vec<crate::blockkit::Json> =
+                    view["blocks"].as_array().cloned().unwrap_or_default();
+                if raw_blocks.is_empty() {
+                    div()
+                        .py_8()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("This app's Home tab is currently empty.")
+                        .into_any_element()
+                } else {
+                    let ts = Ts::from(format!("home-{view_id}"));
+                    let this = cx.entity().downgrade();
+                    let ch_action = channel.clone();
+                    let on_action: crate::actions::ActionHandler =
+                        Rc::new(move |action, _window, cx| {
+                            if let crate::actions::MessageAction::BlockAction { action, .. } =
+                                action
+                            {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::BlockAction {
+                                        bot: bot_id.clone(),
+                                        app_id: app_id.clone(),
+                                        team: team.clone(),
+                                        action,
+                                        container: slackless_core::api::ActionContainer {
+                                            channel: ch_action.clone(),
+                                            message_ts: Ts::default(),
+                                            attachment_id: None,
+                                            is_ephemeral: false,
+                                            view_id: Some(view_id.clone()),
+                                        },
+                                    });
+                                });
+                            }
+                        });
+                    let kcx = crate::blockkit::KitCx::new(&self.fixtures, None, &ts)
+                        .dispatching_actions(on_action);
+                    crate::blockkit::render_raw_blocks(&raw_blocks, &kcx, cx).into_any_element()
+                }
+            }
+        };
+
+        div()
+            .id("app-home-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .px_6()
+                    .py_5()
+                    .gap_4()
+                    .max_w(px(860.))
+                    .child(header)
+                    .child(body),
+            )
+    }
+
     /// App DM info & quick-action strip rendered above the transcript when the active
     /// conversation is a direct message with an app / bot user (`F-COLLAB-482`).
     pub(super) fn app_dm_banner(
@@ -1410,12 +1588,20 @@ impl App {
         let muted_foreground = cx.theme().muted_foreground;
 
         let fallback = Conversation::default();
-        let specs = tabs::derive(
-            self.fixtures
-                .conversation(&self.channel)
-                .unwrap_or(&fallback),
-            self.fixtures.sample,
-        );
+        let conversation = self
+            .fixtures
+            .conversation(&self.channel)
+            .unwrap_or(&fallback);
+        let is_app_dm = conversation.is_im
+            && conversation
+                .user
+                .as_ref()
+                .and_then(|u| self.fixtures.user(u))
+                .is_some_and(|u| u.is_bot);
+        let mut specs = tabs::derive(conversation, self.fixtures.sample);
+        if is_app_dm {
+            specs = tabs::with_app_home(specs);
+        }
         let this = cx.entity().downgrade();
         let sample = self.fixtures.sample;
         let ch_for_add = self.channel.clone();

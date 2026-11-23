@@ -47,6 +47,8 @@ pub struct RecentHuddle {
 pub enum HuddlesEvent {
     /// Open the huddle's conversation.
     Open(ChannelId),
+    /// Open the huddle's dedicated thread (`F-COLLAB-014`).
+    OpenThread(ChannelId, Ts),
     Close,
 }
 
@@ -135,6 +137,8 @@ impl HuddlesView {
             )
         };
         let open = huddle.channel.clone();
+        let thread_target =
+            (!huddle.ts.as_str().is_empty()).then(|| (huddle.channel.clone(), huddle.ts.clone()));
         h_flex()
             .id(("huddle-row", ix))
             .items_center()
@@ -166,6 +170,19 @@ impl HuddlesView {
                     )
                     .child(div().truncate().text_xs().text_color(muted).child(meta)),
             )
+            .when_some(thread_target, |row, (ch, ts)| {
+                row.child(
+                    Button::new(("huddle-thread", ix))
+                        .outline()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::MessageSquare)
+                        .label("Thread")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(HuddlesEvent::OpenThread(ch.clone(), ts.clone()));
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex_none()

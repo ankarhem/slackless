@@ -26,6 +26,8 @@ use slackless_core::types::{Conversation, ConversationTabKind, ConversationTabSp
 /// The conversation tab whose body fills the main column.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConversationTab {
+    /// An app/bot DM's Home tab (`conversations.info` `return_app_home=true`, `F-COLLAB-480`).
+    Home,
     Messages,
     /// The read-only canvas fixture view (sample workspace).
     Canvas,
@@ -120,6 +122,20 @@ fn default_tabs() -> Vec<ConversationTabSpec> {
         kind: Some(ConversationTabKind::Files),
         ..Default::default()
     }]
+}
+
+/// Prepend the `Home` tab to `specs` for app/bot DMs (`F-COLLAB-480`).
+pub fn with_app_home(mut specs: Vec<TabSpec>) -> Vec<TabSpec> {
+    specs.insert(
+        0,
+        spec(
+            "tab-home",
+            "Home",
+            IconName::House,
+            TabAction::Switch(ConversationTab::Home),
+        ),
+    );
+    specs
 }
 
 /// The tab row of `conversation`: the sample workspace's fixed set, else the conversation's

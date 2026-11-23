@@ -535,6 +535,19 @@ fn render_live_list(
                     )
                     .child(div().flex_1())
                     .children(find_bar)
+                    .child({
+                        let csv = list_to_csv(data, fixtures);
+                        let suggested = format!("{}.csv", sanitize_filename(&data.title));
+                        Button::new("list-export-csv")
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Download)
+                            .label("CSV")
+                            .tooltip("Download list as CSV")
+                            .on_click(move |_, window, cx| {
+                                export_csv(csv.clone(), suggested.clone(), window, cx);
+                            })
+                    })
                     .child(read_only_badge(cx))
                     .when_some(open_browser, |row, open| {
                         row.child(
@@ -768,6 +781,119 @@ fn live_cell(
     }
 }
 
+/// Serialize a live Slack List to RFC 4180 CSV (`F-COLLAB-217`), resolving user IDs and
+/// select option labels cleanly.
+pub fn list_to_csv(data: &SlackListData, fixtures: &Fixtures) -> String {
+    let mut out = String::new();
+    for (ix, col) in data.columns.iter().enumerate() {
+        if ix > 0 {
+            out.push(',');
+        }
+        push_csv_field(&mut out, &col.name);
+    }
+    out.push('\n');
+    for row in &data.rows {
+        for (ix, col) in data.columns.iter().enumerate() {
+            if ix > 0 {
+                out.push(',');
+            }
+            let val = match row_cell(row, col) {
+                None | Some(SlackListCellValue::Empty) => String::new(),
+                Some(SlackListCellValue::Text(s)) | Some(SlackListCellValue::Date(s)) => s.clone(),
+                Some(SlackListCellValue::Link { url, label }) => {
+                    if label.is_empty() || label == url {
+                        url.clone()
+                    } else {
+                        format!("{label} ({url})")
+                    }
+                }
+                Some(SlackListCellValue::Number(n)) => n.to_string(),
+                Some(SlackListCellValue::Checkbox(checked)) => {
+                    if *checked { "true" } else { "false" }.to_owned()
+                }
+                Some(SlackListCellValue::Users(users)) => users
+                    .iter()
+                    .map(|u| fixtures.user_name(u))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                Some(SlackListCellValue::Select(opts)) => opts
+                    .iter()
+                    .map(|opt| {
+                        col.choices
+                            .iter()
+                            .find(|c| c.value == *opt)
+                            .map(|c| c.label.as_str())
+                            .unwrap_or(opt.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            };
+            push_csv_field(&mut out, &val);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn push_csv_field(out: &mut String, field: &str) {
+    if field.contains([',', '"', '\n', '\r']) {
+        out.push('"');
+        for ch in field.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    } else {
+        out.push_str(field);
+    }
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "slack-list".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn export_csv(csv: String, suggested: String, window: &mut Window, cx: &mut App) {
+    let dir = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let receiver = cx.prompt_for_new_path(&dir, Some(&suggested));
+    window
+        .spawn(cx, async move |cx| {
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return;
+            };
+            let result = std::fs::write(&path, csv);
+            let _ = cx.update(|window, cx| match result {
+                Ok(()) => crate::actions::notify(
+                    "List exported",
+                    format!("Saved CSV to {}", path.display()),
+                    window,
+                    cx,
+                ),
+                Err(err) => crate::actions::notify("Export failed", err.to_string(), window, cx),
+            });
+        })
+        .detach();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,6 +976,18 @@ mod tests {
         assert_eq!(
             filter_and_sort_rows(&data, &fixtures, "zebra", None),
             vec![0]
+        );
+
+        // RFC 4180 CSV export resolves select labels and preserves column order.
+        let mut csv_data = data.clone();
+        csv_data.rows[0].cells.insert(
+            "C1".into(),
+            SlackListCellValue::Text("Zebra, \"quoted\" work".into()),
+        );
+        let csv = list_to_csv(&csv_data, &fixtures);
+        assert_eq!(
+            csv,
+            "Task,Status\n\"Zebra, \"\"quoted\"\" work\",To do\nAlpha launch,Done\n"
         );
     }
 }

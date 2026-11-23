@@ -42,10 +42,18 @@ pub struct ActionContainer {
     /// The legacy attachment holding the block (Giphy's preview), by its `id`.
     pub attachment_id: Option<i64>,
     pub is_ephemeral: bool,
+    /// When set, the action belongs to an App Home or modal view (`{"type":"view","view_id":...}`).
+    pub view_id: Option<String>,
 }
 
 impl ActionContainer {
     pub(super) fn json(&self) -> Value {
+        if let Some(view_id) = &self.view_id {
+            return serde_json::json!({
+                "type": "view",
+                "view_id": view_id,
+            });
+        }
         let (channel, ts) = (self.channel.as_str(), self.message_ts.as_str());
         match self.attachment_id {
             Some(id) => serde_json::json!({
@@ -667,6 +675,45 @@ pub(super) struct MessagesWire {
 #[derive(Deserialize)]
 pub(super) struct ChannelWire {
     pub(super) channel: Conversation,
+}
+
+/// App Home metadata and Block Kit view returned by `conversations.info` with
+/// `return_app_home=true` (`F-COLLAB-480`, `docs/research/api-apps-blocks.md`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppHomeResponse {
+    pub home_tab_enabled: bool,
+    pub messages_tab_enabled: bool,
+    pub home_view: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct AppHomeFlagsWire {
+    #[serde(default)]
+    home_tab_enabled: bool,
+    #[serde(default)]
+    messages_tab_enabled: bool,
+    #[serde(default)]
+    view: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AppHomeWire {
+    #[serde(default)]
+    app_home: Option<AppHomeFlagsWire>,
+    #[serde(default)]
+    home_view: Option<serde_json::Value>,
+}
+
+impl AppHomeWire {
+    pub(super) fn into_response(self) -> AppHomeResponse {
+        let flags = self.app_home.unwrap_or_default();
+        let home_view = self.home_view.or(flags.view);
+        AppHomeResponse {
+            home_tab_enabled: flags.home_tab_enabled || home_view.is_some(),
+            messages_tab_enabled: flags.messages_tab_enabled,
+            home_view,
+        }
+    }
 }
 
 #[derive(Deserialize)]

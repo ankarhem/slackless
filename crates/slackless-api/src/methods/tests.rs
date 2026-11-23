@@ -635,3 +635,41 @@ fn parses_file_collections_and_recently_deleted_wire() {
     assert_eq!(del_wire.files.len(), 1);
     assert_eq!(del_wire.files[0].id, "F9");
 }
+
+#[test]
+fn parses_app_home_wire_and_view_action_container() {
+    let wire: AppHomeWire = serde_json::from_value(serde_json::json!({
+        "app_home": {
+            "home_tab_enabled": true,
+            "messages_tab_enabled": true
+        },
+        "home_view": {
+            "id": "V0HOME1",
+            "type": "home",
+            "app_id": "A0APP1",
+            "blocks": [
+                { "type": "header", "text": { "type": "plain_text", "text": "Dashboard" } }
+            ]
+        }
+    }))
+    .unwrap();
+    let home = wire.into_response();
+    assert!(home.home_tab_enabled);
+    assert!(home.messages_tab_enabled);
+    assert_eq!(
+        home.home_view.as_ref().and_then(|v| v["id"].as_str()),
+        Some("V0HOME1")
+    );
+
+    let container = ActionContainer {
+        channel: ChannelId::from("D0APP"),
+        message_ts: Ts::default(),
+        attachment_id: None,
+        is_ephemeral: false,
+        view_id: Some("V0HOME1".into()),
+    };
+    assert_eq!(
+        container.json(),
+        serde_json::json!({ "type": "view", "view_id": "V0HOME1" })
+    );
+}

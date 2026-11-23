@@ -356,6 +356,27 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             )
             .into_any_element(),
         "input" => input_block(raw, ix, kcx, cx).into_any_element(),
+        "rich_text" => {
+            if let Ok(parsed) = serde_json::from_value::<Block>(raw.clone()) {
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .children(messages::render_block(&parsed, 0, kcx, false, cx))
+                    .into_any_element()
+            } else {
+                return None;
+            }
+        }
+        "markdown" => {
+            let text = raw["text"].as_str()?;
+            messages::mrkdwn(text, kcx, false, false, cx).into_any_element()
+        }
+        "video" => video_block(raw, ix, kcx, cx).into_any_element(),
+        "call" => call_block(raw, ix, kcx, cx).into_any_element(),
+        "alert" | "callout" => alert_block(raw, ix, kcx, cx).into_any_element(),
+        "card" | "container" => card_block(raw, ix, kcx, cx).into_any_element(),
+        "carousel" => carousel_block(raw, ix, kcx, cx).into_any_element(),
+        "file" => file_block(raw, cx).into_any_element(),
         other => div()
             .text_xs()
             .italic()
@@ -366,6 +387,423 @@ pub fn block(kind: &str, raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Option
             .into_any_element(),
     };
     Some(element)
+}
+
+/// Slack's Block Kit `video` block: clickable title + thumbnail preview + description/provider.
+fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (border, muted, fg, bg) = (
+        theme.border,
+        theme.muted_foreground,
+        theme.foreground,
+        theme.muted,
+    );
+    let title = text_of(&raw["title"])
+        .or_else(|| raw["title"].as_str())
+        .unwrap_or("Video")
+        .to_owned();
+    let url = raw["title_url"]
+        .as_str()
+        .or_else(|| raw["video_url"].as_str())
+        .map(str::to_owned);
+    let description = text_of(&raw["description"])
+        .or_else(|| raw["description"].as_str())
+        .map(|s| plain_label(s, cx));
+    let provider = raw["provider_name"]
+        .as_str()
+        .or_else(|| raw["author_name"].as_str())
+        .map(str::to_owned);
+    let thumb_url = raw["thumbnail_url"].as_str().map(str::to_owned);
+
+    let title_el: AnyElement = match url.clone() {
+        Some(href) => routed_link(
+            format!("bk-video-{}-{ix}", kcx.ts.as_str()),
+            plain_label(&title, cx),
+            href,
+            kcx,
+            FontWeight::SEMIBOLD,
+            cx,
+        )
+        .into_any_element(),
+        None => div()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(fg)
+            .child(plain_label(&title, cx))
+            .into_any_element(),
+    };
+
+    let mut card = v_flex()
+        .w_full()
+        .max_w(px(440.))
+        .gap_1p5()
+        .p_2p5()
+        .rounded_lg()
+        .border_1()
+        .border_color(border)
+        .bg(bg);
+    if let Some(prov) = provider {
+        card = card.child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .text_color(muted)
+                .child(Icon::new(IconName::Video).size(px(12.)).text_color(muted))
+                .child(prov),
+        );
+    }
+    card = card.child(title_el);
+    if let Some(desc) = description {
+        card = card.child(div().text_xs().text_color(muted).child(desc));
+    }
+    if let Some(thumb) = thumb_url {
+        let thumb_box = div()
+            .relative()
+            .w_full()
+            .h(px(180.))
+            .rounded_md()
+            .overflow_hidden()
+            .bg(theme.secondary)
+            .child(
+                crate::media::Picture::new(ImageSource::from(SharedString::from(thumb)))
+                    .fit(ObjectFit::Cover)
+                    .radius(px(6.)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(36.))
+                            .rounded_full()
+                            .bg(gpui_kit::gpui::hsla(0., 0., 0., 0.65))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::Play)
+                                    .size(px(16.))
+                                    .text_color(gpui_kit::gpui::hsla(0., 0., 1., 0.95)),
+                            ),
+                    ),
+            );
+        if let Some(href) = url {
+            let target = LinkTarget::Url(href.into());
+            let links = kcx.links.clone();
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "bk-video-thumb-{}-{ix}",
+                        kcx.ts.as_str()
+                    )))
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        messages::route_link(links.as_ref(), target.clone(), window, cx)
+                    })
+                    .child(thumb_box),
+            );
+        } else {
+            card = card.child(thumb_box);
+        }
+    }
+    card
+}
+
+/// Slack's Block Kit `call` block (third-party / legacy calls): title, live status, Join link.
+fn call_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let call = raw.get("call").unwrap_or(raw);
+    let title = call["title"].as_str().unwrap_or("Call").to_owned();
+    let ended = call["date_end"].as_i64().is_some_and(|t| t > 0);
+    let participants = call["active_participants"].as_array().map_or(0, Vec::len);
+    let join_url = call["join_url"]
+        .as_str()
+        .or_else(|| call["desktop_app_join_url"].as_str())
+        .map(str::to_owned);
+    let status = if ended {
+        "Call ended".to_owned()
+    } else if participants > 0 {
+        format!(
+            "Live · {participants} {}",
+            if participants == 1 {
+                "participant"
+            } else {
+                "participants"
+            }
+        )
+    } else {
+        "Live call".to_owned()
+    };
+
+    let mut row = h_flex()
+        .w_full()
+        .max_w(px(440.))
+        .items_center()
+        .gap_3()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .child(
+            div()
+                .flex_none()
+                .size(px(34.))
+                .rounded_md()
+                .bg(if ended {
+                    theme.secondary
+                } else {
+                    theme.success.opacity(0.18)
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(IconName::Headphones)
+                        .size(px(16.))
+                        .text_color(if ended {
+                            theme.muted_foreground
+                        } else {
+                            theme.success
+                        }),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(plain_label(&title, cx)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(status),
+                ),
+        );
+    if !ended {
+        if let Some(href) = join_url {
+            let target = LinkTarget::Url(href.into());
+            let links = kcx.links.clone();
+            row = row.child(
+                Button::new(SharedString::from(format!(
+                    "bk-call-join-{}-{ix}",
+                    kcx.ts.as_str()
+                )))
+                .primary()
+                .with_size(Size::XSmall)
+                .label("Join")
+                .on_click(move |_, window, cx| {
+                    messages::route_link(links.as_ref(), target.clone(), window, cx)
+                }),
+            );
+        }
+    }
+    row
+}
+
+/// Modern Block Kit `alert` / `callout` block (`F-COLLAB-713`): tinted left-accent banner.
+fn alert_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let accent = match raw["style"]
+        .as_str()
+        .or_else(|| raw["severity"].as_str())
+        .or_else(|| raw["variant"].as_str())
+        .unwrap_or("info")
+    {
+        "danger" | "error" | "critical" => theme.danger,
+        "warning" | "warn" => theme.warning,
+        "success" | "positive" => theme.success,
+        _ => theme.link,
+    };
+    let mut body = v_flex().flex_1().min_w_0().gap_1();
+    if let Some(title) = text_of(&raw["title"]).or_else(|| raw["title"].as_str()) {
+        body = body.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(plain_label(title, cx)),
+        );
+    }
+    if let Some(el) = text_object(&raw["text"], kcx, false, cx)
+        .or_else(|| text_object(&raw["body"], kcx, false, cx))
+        .or_else(|| {
+            raw["message"]
+                .as_str()
+                .or_else(|| raw["text"].as_str())
+                .map(|s| messages::mrkdwn(s, kcx, false, false, cx).into_any_element())
+        })
+    {
+        body = body.child(el);
+    }
+    if let Some(nested) = raw["blocks"].as_array() {
+        for (n, child) in nested.iter().enumerate() {
+            let kind = child["type"].as_str().unwrap_or_default();
+            if let Some(el) = block(kind, child, ix * 31 + n, kcx, cx) {
+                body = body.child(el);
+            }
+        }
+    }
+    h_flex()
+        .w_full()
+        .max_w(px(640.))
+        .items_stretch()
+        .gap_2p5()
+        .p_2p5()
+        .rounded_md()
+        .border_1()
+        .border_color(accent.opacity(0.35))
+        .bg(accent.opacity(0.08))
+        .child(div().flex_none().w(px(3.)).rounded_full().bg(accent))
+        .child(body)
+}
+
+/// Modern Block Kit `card` / `container` block (`F-COLLAB-714`, `F-COLLAB-716`): bordered
+/// structured card with optional title, subtitle, fields, nested blocks, and actions.
+fn card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let theme = cx.theme();
+    let mut card = v_flex()
+        .w_full()
+        .max_w(px(560.))
+        .gap_2()
+        .p_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted);
+    if let Some(title) = text_of(&raw["title"]).or_else(|| raw["title"].as_str()) {
+        let title_el: AnyElement = match raw["title_url"].as_str().or_else(|| raw["url"].as_str()) {
+            Some(href) => routed_link(
+                format!("bk-card-title-{}-{ix}", kcx.ts.as_str()),
+                plain_label(title, cx),
+                href.to_owned(),
+                kcx,
+                FontWeight::SEMIBOLD,
+                cx,
+            )
+            .into_any_element(),
+            None => div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(plain_label(title, cx))
+                .into_any_element(),
+        };
+        card = card.child(title_el);
+    }
+    if let Some(sub) = text_of(&raw["subtitle"]).or_else(|| raw["subtitle"].as_str()) {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(plain_label(sub, cx)),
+        );
+    }
+    if let Some(el) = text_object(&raw["body"], kcx, false, cx)
+        .or_else(|| text_object(&raw["text"], kcx, false, cx))
+    {
+        card = card.child(el);
+    }
+    if let Some(fields) = raw["fields"].as_array() {
+        for pair in fields.chunks(2) {
+            card = card.child(
+                h_flex()
+                    .items_start()
+                    .gap_4()
+                    .children(pair.iter().map(|field| {
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .children(text_object(field, kcx, false, cx))
+                    })),
+            );
+        }
+    }
+    for key in ["blocks", "elements"] {
+        if let Some(children) = raw[key].as_array() {
+            for (n, child) in children.iter().enumerate() {
+                let kind = child["type"].as_str().unwrap_or_default();
+                if let Some(el) = block(kind, child, ix * 37 + n, kcx, cx) {
+                    card = card.child(el);
+                }
+            }
+        }
+    }
+    if let Some(actions) = raw["actions"].as_array() {
+        card = card.child(h_flex().flex_wrap().items_center().gap_2().children(
+            actions.iter().enumerate().map(|(n, element)| {
+                let key = control_key(kcx.ts, raw, ix, element, n);
+                block_element(element, raw, key, kcx, cx)
+            }),
+        ));
+    }
+    card
+}
+
+/// Modern Block Kit `carousel` block (`F-COLLAB-715`): horizontal scrollable strip of cards.
+fn carousel_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
+    let items = raw["elements"]
+        .as_array()
+        .or_else(|| raw["cards"].as_array())
+        .or_else(|| raw["blocks"].as_array());
+    let mut strip = h_flex().gap_3().items_stretch();
+    if let Some(items) = items {
+        for (n, item) in items.iter().enumerate() {
+            let kind = item["type"].as_str().unwrap_or("card");
+            if let Some(el) = block(kind, item, ix * 41 + n, kcx, cx) {
+                strip = strip.child(div().w(px(280.)).flex_none().child(el));
+            }
+        }
+    }
+    div().w_full().min_w_0().child(
+        div()
+            .id(SharedString::from(format!(
+                "bk-carousel-{}-{ix}",
+                kcx.ts.as_str()
+            )))
+            .w_full()
+            .overflow_x_scroll()
+            .pb_1()
+            .child(strip),
+    )
+}
+
+/// Slack's Block Kit `file` block: compact reference chip for an embedded remote file.
+fn file_block(raw: &Json, cx: &App) -> Div {
+    let theme = cx.theme();
+    let label = raw["external_id"]
+        .as_str()
+        .or_else(|| raw["file_id"].as_str())
+        .unwrap_or("Attached file");
+    h_flex()
+        .items_center()
+        .gap_2()
+        .px_2p5()
+        .py_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.muted)
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(
+            Icon::new(IconName::File)
+                .size(px(14.))
+                .text_color(theme.muted_foreground),
+        )
+        .child(label.to_owned())
 }
 
 /// Slack's Block Kit `table` block: first row tinted as a header, column alignment from
@@ -616,6 +1054,7 @@ impl BlockDispatch {
                 message_ts: message.ts.clone(),
                 attachment_id: attachment,
                 is_ephemeral: message.is_ephemeral,
+                view_id: None,
             },
         })
     }

@@ -480,6 +480,8 @@ pub(super) struct WorkspaceState {
     pub(super) lists: HashMap<String, Result<slackless_core::api::SlackListData, String>>,
     /// File id of the live Slack List currently displayed in `ConversationTab::List`.
     pub(super) active_list: Option<String>,
+    /// Live mode: per app DM channel, its App Home metadata and Block Kit view (`F-COLLAB-480`).
+    pub(super) app_homes: HashMap<ChannelId, Result<slackless_core::api::AppHomeResponse, String>>,
 }
 
 /// A workspace that is not shown: its fixtures, open conversation, views, subscriptions,
@@ -1653,6 +1655,12 @@ impl App {
                             this.huddle_open = this.huddle_here();
                             cx.notify();
                         }
+                        HuddlesEvent::OpenThread(channel, ts) => {
+                            this.huddles_open = false;
+                            this.select(channel.clone(), cx);
+                            this.open_thread(channel.clone(), ts.clone(), cx);
+                            cx.notify();
+                        }
                         HuddlesEvent::Close => {
                             this.huddles_open = false;
                             cx.notify();
@@ -2154,6 +2162,10 @@ impl Render for App {
             };
             let column = column.child(tabs).children(bookmark_bar);
             match &self.tab {
+                ConversationTab::Home => {
+                    let view = self.app_home_view(cx);
+                    column.child(div().flex_1().min_h_0().child(view))
+                }
                 // The Pins tab keeps the transcript under it; its panel is the right column.
                 ConversationTab::Messages | ConversationTab::Pins => {
                     let column = column
@@ -3357,11 +3369,18 @@ fn subscribe_workspace(
     ];
     if let Some((_, bar)) = &views.huddle {
         subscriptions.push(
-            cx.subscribe(bar, |this: &mut App, _, event: &HuddleEvent, cx| {
-                let HuddleEvent::Leave = event;
-                this.huddle_open = false;
-                cx.notify();
-            }),
+            cx.subscribe(
+                bar,
+                |this: &mut App, _, event: &HuddleEvent, cx| match event {
+                    HuddleEvent::Leave => {
+                        this.huddle_open = false;
+                        cx.notify();
+                    }
+                    HuddleEvent::OpenThread => {
+                        this.toggle_huddle_thread(cx);
+                    }
+                },
+            ),
         );
     }
     subscriptions

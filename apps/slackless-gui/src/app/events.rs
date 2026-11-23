@@ -901,6 +901,44 @@ impl App {
                 self.ws.lists.insert(file_id.clone(), value);
                 cx.notify();
             }
+            Event::AppHomeLoaded { channel, home } => {
+                let value = match home {
+                    Ok(data) => Ok((**data).clone()),
+                    Err(err) => Err(err.clone()),
+                };
+                self.ws.app_homes.insert(channel.clone(), value);
+                cx.notify();
+            }
+            Event::AppHomeUpdated(view) => {
+                let app_id = view.get("app_id").and_then(|v| v.as_str());
+                let mut updated = false;
+                if let Some(target_app) = app_id {
+                    for entry in self.ws.app_homes.values_mut().flatten() {
+                        if entry
+                            .home_view
+                            .as_ref()
+                            .and_then(|v| v.get("app_id"))
+                            .and_then(|v| v.as_str())
+                            == Some(target_app)
+                        {
+                            entry.home_tab_enabled = true;
+                            entry.home_view = Some(view.clone());
+                            updated = true;
+                        }
+                    }
+                }
+                if !updated && self.tab == ConversationTab::Home {
+                    self.ws.app_homes.insert(
+                        self.channel.clone(),
+                        Ok(slackless_core::api::AppHomeResponse {
+                            home_tab_enabled: true,
+                            messages_tab_enabled: true,
+                            home_view: Some(view.clone()),
+                        }),
+                    );
+                }
+                cx.notify();
+            }
             Event::FilesExtrasLoaded {
                 favorites,
                 collections,

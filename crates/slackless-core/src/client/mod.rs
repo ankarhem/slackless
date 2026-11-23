@@ -1673,6 +1673,17 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::LoadAppHome(channel) => {
+                self.spawn("conversations.info(app_home)", async move {
+                    let home = backend
+                        .load_app_home(channel.clone())
+                        .await
+                        .map(Box::new)
+                        .map_err(|e| e.to_string());
+                    events.emit(Event::AppHomeLoaded { channel, home });
+                    Ok(())
+                });
+            }
             Command::SetGlobalNotificationPref { name, value, sync } => {
                 self.spawn("users.prefs.setNotifications(global)", async move {
                     backend
@@ -1937,7 +1948,11 @@ impl<B: Backend> Core<B> {
                         "view_opened" | "view_open" | "view_updated" | "view_update"
                     ) {
                         let view = raw.get("view").cloned().unwrap_or_else(|| raw.clone());
-                        self.events.emit(Event::ModalOpened(view));
+                        if view.get("type").and_then(serde_json::Value::as_str) == Some("home") {
+                            self.events.emit(Event::AppHomeUpdated(view));
+                        } else {
+                            self.events.emit(Event::ModalOpened(view));
+                        }
                     } else if matches!(r#type.as_str(), "view_closed" | "view_close") {
                         let id = raw
                             .get("view")

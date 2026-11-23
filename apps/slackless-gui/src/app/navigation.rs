@@ -348,6 +348,12 @@ impl App {
         }
         let channel = self.channel.clone();
         let command = match tab {
+            ConversationTab::Home => {
+                if self.ws.app_homes.get(&channel).is_some_and(Result::is_err) {
+                    self.ws.app_homes.remove(&channel);
+                }
+                Command::LoadAppHome(channel)
+            }
             ConversationTab::Pins => {
                 forget_failure(&mut self.ws.pins, &channel);
                 Command::LoadPins(channel)
