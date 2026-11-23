@@ -2102,12 +2102,19 @@ impl App {
                             .map(|u| if u > 10_000_000_000 { u / 1000 } else { u })
                     });
                 let age_days = latest_ts.map(|ts| ((now - ts).max(0)) / 86_400);
-                (
-                    c.id.clone(),
-                    self.fixtures.conversation_label(c),
-                    c.is_private,
-                    age_days,
-                )
+                let name = c
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        self.fixtures
+                            .conversation_label(c)
+                            .trim_start_matches('#')
+                            .trim()
+                            .to_owned()
+                    });
+                (c.id.clone(), name, c.is_private, age_days)
             })
             .collect();
         // Sort oldest / most inactive first (channels with no recent history at the top).

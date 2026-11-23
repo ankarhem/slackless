@@ -17,7 +17,7 @@ use gpui_kit::gpui::{
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::types::{ChannelId, Conversation, Team, User, UserId};
+use slackless_core::types::{ChannelId, Conversation, Team, UserId};
 
 use crate::avatars::user_chip;
 use crate::fixtures::Fixtures;
@@ -76,29 +76,42 @@ impl ToolsPage {
         self.filter.read(cx).value().trim().to_ascii_lowercase()
     }
 
-    fn apps(&self, needle: &str) -> Vec<&User> {
-        let mut list: Vec<&User> = self
+    fn apps(&self, needle: &str) -> Vec<(Option<UserId>, String, String)> {
+        let mut list: Vec<(Option<UserId>, String, String)> = self
             .fixtures
             .users
             .iter()
             .filter(|u| u.is_bot && !u.deleted && u.id.as_str() != "USLACKBOT")
-            .filter(|u| {
-                needle.is_empty()
-                    || u.display_name().to_ascii_lowercase().contains(needle)
-                    || u.name.to_ascii_lowercase().contains(needle)
-                    || u.profile
-                        .title
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_ascii_lowercase()
-                        .contains(needle)
+            .map(|u| {
+                let title = u
+                    .profile
+                    .title
+                    .as_deref()
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("Workspace app")
+                    .to_owned();
+                (Some(u.id.clone()), u.display_name().to_owned(), title)
             })
             .collect();
-        list.sort_by(|a, b| {
-            a.display_name()
-                .to_ascii_lowercase()
-                .cmp(&b.display_name().to_ascii_lowercase())
+        if let Ok(bots) = self.fixtures.bots.read() {
+            for bot in bots.values() {
+                if bot.name.is_empty() || bot.deleted {
+                    continue;
+                }
+                let already = list
+                    .iter()
+                    .any(|(_, name, _)| name.eq_ignore_ascii_case(&bot.name));
+                if !already {
+                    list.push((None, bot.name.clone(), "Workspace bot".to_owned()));
+                }
+            }
+        }
+        list.retain(|(_, name, title)| {
+            needle.is_empty()
+                || name.to_ascii_lowercase().contains(needle)
+                || title.to_ascii_lowercase().contains(needle)
         });
+        list.sort_by_key(|a| a.1.to_ascii_lowercase());
         list
     }
 
@@ -189,16 +202,19 @@ impl Render for ToolsPage {
                             .child("No installed apps match your filter."),
                     );
                 } else {
-                    for (ix, bot) in apps.into_iter().take(60).enumerate() {
-                        let uid = bot.id.clone();
-                        let name = bot.display_name().to_owned();
-                        let title = bot
-                            .profile
-                            .title
-                            .as_deref()
-                            .filter(|t| !t.is_empty())
-                            .unwrap_or("Workspace app")
-                            .to_owned();
+                    for (ix, (uid_opt, name, title)) in apps.into_iter().take(60).enumerate() {
+                        let avatar = match &uid_opt {
+                            Some(uid) => user_chip(&self.fixtures, uid, 32.).into_any_element(),
+                            None => div()
+                                .size(px(32.))
+                                .rounded_md()
+                                .bg(theme.secondary)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::Bot).size(px(16.)).text_color(muted))
+                                .into_any_element(),
+                        };
                         col = col.child(
                             h_flex()
                                 .id(("tools-app-row", ix))
@@ -216,7 +232,7 @@ impl Render for ToolsPage {
                                         .items_center()
                                         .gap_3()
                                         .min_w_0()
-                                        .child(user_chip(&self.fixtures, &uid, 32.))
+                                        .child(avatar)
                                         .child(
                                             v_flex()
                                                 .min_w_0()
@@ -251,15 +267,17 @@ impl Render for ToolsPage {
                                                 ),
                                         ),
                                 )
-                                .child(
-                                    Button::new(("tools-app-open", ix))
-                                        .outline()
-                                        .with_size(Size::XSmall)
-                                        .label("Open")
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(ToolsPageEvent::OpenAppDm(uid.clone()));
-                                        })),
-                                ),
+                                .when_some(uid_opt, |row, uid| {
+                                    row.child(
+                                        Button::new(("tools-app-open", ix))
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .label("Open")
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.emit(ToolsPageEvent::OpenAppDm(uid.clone()));
+                                            })),
+                                    )
+                                }),
                         );
                     }
                 }
@@ -419,7 +437,18 @@ impl Render for ToolsPage {
                 } else {
                     for (ix, ch) in channels.into_iter().take(60).enumerate() {
                         let cid = ch.id.clone();
-                        let label = self.fixtures.conversation_label(ch);
+                        let label = ch
+                            .name
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                self.fixtures
+                                    .conversation_label(ch)
+                                    .trim_start_matches('#')
+                                    .trim()
+                                    .to_owned()
+                            });
                         let icon = if ch.is_private {
                             IconName::Lock
                         } else {
