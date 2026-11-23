@@ -21,7 +21,7 @@ impl Composer {
     /// Inline native clip recording bar shown inside the composer while recording or encoding
     /// an audio/video clip (`F-CORE-127`, `F-CORE-128`, `F-CORE-131`).
     fn clip_recording_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
-        if self.clip_recorder.is_none() && !self.clip_stopping {
+        if self.clip_recorder.is_none() && !self.clip_stopping && self.clip_review.is_none() {
             return None;
         }
         let theme = cx.theme();
@@ -34,6 +34,101 @@ impl Composer {
             theme.primary,
             theme.primary_foreground,
         );
+        if let Some(review) = &self.clip_review {
+            let secs = review.duration_ms / 1000;
+            let kb = (review.bytes.len() / 1024).max(1);
+            let sel = review.selected_thumb;
+            return Some(
+                h_flex()
+                    .mx_2()
+                    .mt_1p5()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(surface)
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child(format!(
+                                        "Pick clip thumbnail ({:02}:{:02} · {kb} KB)",
+                                        secs / 60,
+                                        secs % 60
+                                    )),
+                            )
+                            .child(h_flex().items_center().gap_1p5().children(
+                                review.thumbs.iter().enumerate().map(|(ix, frame)| {
+                                    let active = ix == sel;
+                                    div()
+                                        .id(("clip-thumb", ix))
+                                        .cursor_pointer()
+                                        .rounded(px(4.))
+                                        .overflow_hidden()
+                                        .border_2()
+                                        .border_color(if active { primary } else { border })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(rev) = this.clip_review.as_mut() {
+                                                rev.selected_thumb = ix;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child(
+                                            gpui_kit::gpui::img(frame.clone())
+                                                .w(px(56.))
+                                                .h(px(32.))
+                                                .object_fit(gpui_kit::gpui::ObjectFit::Cover),
+                                        )
+                                }),
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .id("clip-review-discard")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(5.))
+                                    .border_1()
+                                    .border_color(border)
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_clip_review(cx);
+                                    }))
+                                    .child("Discard"),
+                            )
+                            .child(
+                                div()
+                                    .id("clip-review-attach")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded(px(5.))
+                                    .bg(primary)
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(primary_fg)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_clip_review(cx);
+                                    }))
+                                    .child("Attach clip"),
+                            ),
+                    ),
+            );
+        }
         if self.clip_stopping {
             return Some(
                 h_flex()
@@ -84,7 +179,7 @@ impl Composer {
             ),
         };
         let secs = elapsed_ms / 1000;
-        let timer = format!("{:02}:{:02}", secs / 60, secs % 60);
+        let timer = format!("{:02}:{:02} / 05:00", secs / 60, secs % 60);
         Some(
             h_flex()
                 .mx_2()

@@ -803,39 +803,70 @@ impl Composer {
                             .p_0()
                             .tooltip("Record video clip")
                             .child(icon(IconName::Video))
-                            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
                                 let cam_this = this.clone();
                                 let scr_this = this.clone();
-                                menu.item(
-                                    PopupMenuItem::new("Record camera clip")
-                                        .icon(IconName::Video)
-                                        .on_click(move |_, _, cx| {
-                                            if let Some(c) = cam_this.upgrade() {
-                                                c.update(cx, |composer, cx| {
-                                                    composer.start_video_clip(
-                                                        slackless_core::huddle::ClipVideoSource::Camera(None),
-                                                        cx,
-                                                    );
-                                                });
-                                            }
-                                        }),
-                                )
-                                .item(
-                                    PopupMenuItem::new("Record screen clip")
-                                        .icon(IconName::Monitor)
-                                        .on_click(move |_, _, cx| {
-                                            if let Some(c) = scr_this.upgrade() {
-                                                c.update(cx, |composer, cx| {
-                                                    composer.start_video_clip(
-                                                        slackless_core::huddle::ClipVideoSource::Screen(
-                                                            "monitor:primary".to_owned(),
-                                                        ),
-                                                        cx,
-                                                    );
-                                                });
-                                            }
-                                        }),
-                                )
+                                menu = menu
+                                    .item(
+                                        PopupMenuItem::new("Record camera clip")
+                                            .icon(IconName::Video)
+                                            .on_click(move |_, _, cx| {
+                                                if let Some(c) = cam_this.upgrade() {
+                                                    c.update(cx, |composer, cx| {
+                                                        composer.start_video_clip(
+                                                            slackless_core::huddle::ClipVideoSource::Camera(None),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                    .item(
+                                        PopupMenuItem::new("Record screen clip (primary display)")
+                                            .icon(IconName::Monitor)
+                                            .on_click(move |_, _, cx| {
+                                                if let Some(c) = scr_this.upgrade() {
+                                                    c.update(cx, |composer, cx| {
+                                                        composer.start_video_clip(
+                                                            slackless_core::huddle::ClipVideoSource::Screen(
+                                                                "monitor:primary".to_owned(),
+                                                            ),
+                                                            cx,
+                                                        );
+                                                    });
+                                                }
+                                            }),
+                                    );
+                                let sources = slackless_core::huddle::list_screen_sources();
+                                if sources.len() > 1 {
+                                    menu = menu.separator().label("Record display or window");
+                                    for src in sources.into_iter().take(6) {
+                                        let src_this = this.clone();
+                                        let src_id = src.id;
+                                        let icon = if src.is_monitor {
+                                            IconName::Monitor
+                                        } else {
+                                            IconName::AppWindow
+                                        };
+                                        menu = menu.item(
+                                            PopupMenuItem::new(src.name).icon(icon).on_click(
+                                                move |_, _, cx| {
+                                                    if let Some(c) = src_this.upgrade() {
+                                                        c.update(cx, |composer, cx| {
+                                                            composer.start_video_clip(
+                                                                slackless_core::huddle::ClipVideoSource::Screen(
+                                                                    src_id.clone(),
+                                                                ),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }
+                                                },
+                                            ),
+                                        );
+                                    }
+                                }
+                                menu
                             })
                             .into_any_element()
                     }

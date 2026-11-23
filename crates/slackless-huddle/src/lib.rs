@@ -34,7 +34,8 @@ pub use audio::{
     list_audio_devices, play_huddle_chime, play_speaker_test_tone,
 };
 pub use clips::{
-    AudioClipRecorder, ClipVideoSource, RecordedClip, VideoClipRecorder, finish_audio_clip,
+    AudioClipRecorder, ClipVideoSource, MAX_CLIP_DURATION_MS, RecordedClip, VideoClipRecorder,
+    finish_audio_clip,
 };
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
 pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};

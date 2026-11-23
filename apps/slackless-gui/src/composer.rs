@@ -156,6 +156,15 @@ pub enum Placeholder {
     Private(SharedString),
 }
 
+/// Recorded video clip awaiting thumbnail selection and confirmation before attaching (`F-COLLAB-099`).
+pub(super) struct ClipReview {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+    pub duration_ms: u64,
+    pub thumbs: Vec<Arc<RenderImage>>,
+    pub selected_thumb: usize,
+}
+
 /// An active native audio or video clip recording session inside the composer (`F-CORE-127`, `128`, `131`).
 pub(super) enum ActiveClipRecorder {
     Audio(AudioClipRecorder),
@@ -239,6 +248,7 @@ pub struct Composer {
     /// Active native audio/video clip recorder (`F-CORE-127`, `F-CORE-128`, `F-CORE-131`).
     pub(super) clip_recorder: Option<ActiveClipRecorder>,
     pub(super) clip_preview: Option<Arc<RenderImage>>,
+    pub(super) clip_review: Option<ClipReview>,
     pub(super) clip_stopping: bool,
     clip_ticker: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -343,6 +353,7 @@ impl Composer {
                 pending_code_click: None,
                 clip_recorder: None,
                 clip_preview: None,
+                clip_review: None,
                 clip_stopping: false,
                 clip_ticker: None,
                 _subscriptions: subscriptions,
@@ -519,11 +530,38 @@ impl Composer {
                         composer.clip_stopping = false;
                         match res {
                             Ok(clip) => {
-                                composer.attachments.push(PendingAttachment {
-                                    filename: clip.filename,
-                                    bytes: clip.bytes,
-                                    preview: None,
-                                });
+                                let thumbs: Vec<Arc<RenderImage>> = clip
+                                    .thumbnail_frames
+                                    .iter()
+                                    .filter_map(|vf| {
+                                        let buf = image::ImageBuffer::<
+                                                    image::Rgba<u8>,
+                                                    Vec<u8>,
+                                                >::from_raw(
+                                                    vf.width,
+                                                    vf.height,
+                                                    (*vf.bgra).clone(),
+                                                )?;
+                                        Some(Arc::new(RenderImage::new(vec![image::Frame::new(
+                                            buf,
+                                        )])))
+                                    })
+                                    .collect();
+                                if thumbs.is_empty() {
+                                    composer.attachments.push(PendingAttachment {
+                                        filename: clip.filename,
+                                        bytes: clip.bytes,
+                                        preview: None,
+                                    });
+                                } else {
+                                    composer.clip_review = Some(ClipReview {
+                                        filename: clip.filename,
+                                        bytes: clip.bytes,
+                                        duration_ms: clip.duration_ms,
+                                        thumbs,
+                                        selected_thumb: 0,
+                                    });
+                                }
                             }
                             Err(err) => {
                                 composer.upload_warning =
@@ -538,6 +576,24 @@ impl Composer {
         }
     }
 
+    /// Confirm the reviewed video clip (keeping the chosen thumbnail) and attach it (`F-COLLAB-099`).
+    pub fn confirm_clip_review(&mut self, cx: &mut Context<Self>) {
+        if let Some(review) = self.clip_review.take() {
+            self.attachments.push(PendingAttachment {
+                filename: review.filename,
+                bytes: review.bytes,
+                preview: None,
+            });
+            cx.notify();
+        }
+    }
+
+    /// Discard the pending video clip review without attaching.
+    pub fn discard_clip_review(&mut self, cx: &mut Context<Self>) {
+        self.clip_review = None;
+        cx.notify();
+    }
+
     fn spawn_clip_ticker(&mut self, cx: &mut Context<Self>) {
         self.clip_ticker = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -549,6 +605,15 @@ impl Composer {
                         let Some(active) = composer.clip_recorder.as_ref() else {
                             return false;
                         };
+                        let elapsed = match active {
+                            ActiveClipRecorder::Audio(rec) => rec.elapsed_ms(),
+                            ActiveClipRecorder::Video { recorder, .. } => recorder.elapsed_ms(),
+                        };
+                        // Enforce Slack's 5-minute clip cap (`F-COLLAB-107`).
+                        if elapsed >= slackless_core::huddle::MAX_CLIP_DURATION_MS {
+                            composer.stop_and_attach_clip(cx);
+                            return false;
+                        }
                         if let ActiveClipRecorder::Video { recorder, .. } = active {
                             if let Some(vf) = recorder.latest_preview() {
                                 if let Some(buf) =

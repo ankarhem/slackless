@@ -26,10 +26,12 @@ use crate::video::{
 };
 use crate::{HuddleError, Result};
 
+/// Maximum clip length (5 minutes, matching Slack's clip duration cap `F-COLLAB-107`).
+pub const MAX_CLIP_DURATION_MS: u64 = 5 * 60 * 1_000;
 /// Maximum audio clip length: 5 minutes at 48 kHz mono.
 const MAX_AUDIO_SAMPLES: usize = (SAMPLE_RATE as usize) * 60 * 5;
-/// Maximum video clip frames (~3 minutes at 12 fps).
-const MAX_VIDEO_FRAMES: usize = 12 * 180;
+/// Maximum video clip frames (5 minutes at 12 fps, `F-COLLAB-107`).
+const MAX_VIDEO_FRAMES: usize = 12 * 300;
 const LIVE_BARS: usize = 24;
 const CLIP_FPS: u32 = 12;
 
@@ -42,6 +44,8 @@ pub struct RecordedClip {
     pub duration_ms: u64,
     pub waveform: Vec<f32>,
     pub preview_frame: Option<VideoFrame>,
+    /// Up to 4 candidate thumbnail keyframes sampled across the video clip (`F-COLLAB-099`).
+    pub thumbnail_frames: Vec<VideoFrame>,
 }
 
 /// Source for [`VideoClipRecorder`].
@@ -292,6 +296,7 @@ pub fn finish_audio_clip(pcm: Vec<i16>, elapsed_ms: u64) -> Result<RecordedClip>
             duration_ms,
             waveform,
             preview_frame: None,
+            thumbnail_frames: Vec::new(),
         });
     }
 
@@ -302,6 +307,7 @@ pub fn finish_audio_clip(pcm: Vec<i16>, elapsed_ms: u64) -> Result<RecordedClip>
         duration_ms,
         waveform,
         preview_frame: None,
+        thumbnail_frames: Vec::new(),
     })
 }
 
@@ -309,6 +315,7 @@ pub fn finish_audio_clip(pcm: Vec<i16>, elapsed_ms: u64) -> Result<RecordedClip>
 pub struct VideoClipRecorder {
     running: Arc<AtomicBool>,
     latest_preview: Arc<Mutex<Option<VideoFrame>>>,
+    thumbnails: Arc<Mutex<Vec<VideoFrame>>>,
     frames: Arc<Mutex<Vec<EncodedH264Frame>>>,
     audio_pcm: Arc<Mutex<Vec<i16>>>,
     dimensions: Arc<Mutex<(u32, u32)>>,
@@ -326,6 +333,7 @@ impl VideoClipRecorder {
     pub fn start(source: ClipVideoSource) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let latest_preview: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
+        let thumbnails: Arc<Mutex<Vec<VideoFrame>>> = Arc::new(Mutex::new(Vec::with_capacity(4)));
         let frames: Arc<Mutex<Vec<EncodedH264Frame>>> =
             Arc::new(Mutex::new(Vec::with_capacity(120)));
         let audio_pcm: Arc<Mutex<Vec<i16>>> =
@@ -334,6 +342,7 @@ impl VideoClipRecorder {
 
         let run_flag = Arc::clone(&running);
         let preview_cb = Arc::clone(&latest_preview);
+        let thumbs_cb = Arc::clone(&thumbnails);
         let frames_cb = Arc::clone(&frames);
         let dims_cb = Arc::clone(&dimensions);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
@@ -409,6 +418,7 @@ impl VideoClipRecorder {
                                             h,
                                             &dims_cb,
                                             &preview_cb,
+                                            &thumbs_cb,
                                             &frames_cb,
                                         );
                                     }
@@ -446,6 +456,7 @@ impl VideoClipRecorder {
                                         h,
                                         &dims_cb,
                                         &preview_cb,
+                                        &thumbs_cb,
                                         &frames_cb,
                                     );
                                 }
@@ -471,6 +482,7 @@ impl VideoClipRecorder {
         Ok(Self {
             running,
             latest_preview,
+            thumbnails,
             frames,
             audio_pcm,
             dimensions,
@@ -509,6 +521,18 @@ impl VideoClipRecorder {
             let _ = h.join();
         }
         let preview_frame = self.latest_preview();
+        let mut thumbnail_frames = self
+            .thumbnails
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if let Some(last) = preview_frame.clone() {
+            if thumbnail_frames.len() < 4 {
+                thumbnail_frames.push(last);
+            } else {
+                thumbnail_frames[3] = last;
+            }
+        }
         let (w, h) = self.dimensions.lock().map(|g| *g).unwrap_or((0, 0));
         let frames = self
             .frames
@@ -539,6 +563,7 @@ impl VideoClipRecorder {
                 downsample_waveform(&pcm, 32)
             },
             preview_frame,
+            thumbnail_frames,
         })
     }
 }
@@ -555,6 +580,7 @@ impl Drop for VideoClipRecorder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_encoded_frame(
     enc: &mut H264VideoEncoder,
     rgb: &[u8],
@@ -562,6 +588,7 @@ fn record_encoded_frame(
     h: u32,
     dims_cb: &Arc<Mutex<(u32, u32)>>,
     preview_cb: &Arc<Mutex<Option<VideoFrame>>>,
+    thumbs_cb: &Arc<Mutex<Vec<VideoFrame>>>,
     frames_cb: &Arc<Mutex<Vec<EncodedH264Frame>>>,
 ) {
     // Keep dimensions consistent across a clip (resize if the source window resized mid-clip).
@@ -580,13 +607,22 @@ fn record_encoded_frame(
     if ew != target_w || eh != target_h {
         return;
     }
-    let bgra = rgb_to_bgra(&enc_rgb);
+    let frame_idx = frames_cb.lock().map(|g| g.len()).unwrap_or(0);
+    let vf = VideoFrame {
+        width: ew,
+        height: eh,
+        bgra: Arc::new(rgb_to_bgra(&enc_rgb)),
+    };
     if let Ok(mut p) = preview_cb.lock() {
-        *p = Some(VideoFrame {
-            width: ew,
-            height: eh,
-            bgra: Arc::new(bgra),
-        });
+        *p = Some(vf.clone());
+    }
+    // Sample candidate thumbnail keyframes at frame 0, ~2s, ~5s, and ~10s (`F-COLLAB-099`).
+    if matches!(frame_idx, 0 | 24 | 60 | 120) {
+        if let Ok(mut t) = thumbs_cb.lock() {
+            if t.len() < 4 {
+                t.push(vf);
+            }
+        }
     }
     if let Ok(annex_b) = enc.encode_rgb(&enc_rgb, ew as usize, eh as usize) {
         if !annex_b.is_empty() {

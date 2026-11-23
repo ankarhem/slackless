@@ -2043,6 +2043,11 @@ pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
         });
     let edited = message.edited.is_some();
     let inline_edited = edited && body_ends_in_text(message);
+    if message.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread) {
+        if let Some(card) = render_huddle_thread_card(message, kcx.fixtures, cx) {
+            return column.child(card);
+        }
+    }
     let attachments = blockkit::attachments(message, kcx, cx);
     // Jumbomoji: when enabled (and not in plain-text emoji mode) and the message is 1..=5 emoji only, render them large (32px).
     let display = crate::preferences::display_prefs(cx);
@@ -2076,6 +2081,151 @@ pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
         column = column.child(div().text_xs().text_color(muted).child("(edited)"));
     }
     column.children(attachments)
+}
+
+/// Format huddle duration cleanly (`"16s"`, `"12m 4s"`, `"1h 5m"`).
+pub(crate) fn format_huddle_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        }
+    }
+}
+
+/// Render official Slack's rich `huddle_thread` card in the message transcript (`F-COLLAB-003`).
+fn render_huddle_thread_card(message: &Message, fixtures: &Fixtures, cx: &App) -> Option<Div> {
+    let room = message.extra.get("room")?;
+    let theme = cx.theme();
+    let has_ended = room
+        .get("has_ended")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let custom_name = room
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let title = custom_name.map(str::to_owned).unwrap_or_else(|| {
+        if has_ended {
+            "A huddle happened".to_owned()
+        } else {
+            "A huddle is happening".to_owned()
+        }
+    });
+    let date_start = room.get("date_start").and_then(|v| v.as_u64());
+    let date_end = room.get("date_end").and_then(|v| v.as_u64());
+    let duration_label = match (date_start, date_end) {
+        (Some(start), Some(end)) if end > start => Some(format_huddle_duration(end - start)),
+        _ => None,
+    };
+    let participant_ids: Vec<UserId> = room
+        .get(if has_ended {
+            "participant_history"
+        } else {
+            "participants"
+        })
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|u| u.as_str().map(UserId::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let joined_summary = match participant_ids.len() {
+        0 => None,
+        1 => Some(format!(
+            "{} joined",
+            fixtures.user_name(&participant_ids[0])
+        )),
+        n => Some(format!("{n} people joined")),
+    };
+    let accent = if has_ended { theme.link } else { theme.success };
+    let subtitle = match (joined_summary, duration_label) {
+        (Some(j), Some(d)) => format!("{j} · {d}"),
+        (Some(j), None) => j,
+        (None, Some(d)) => format!("Lasted {d}"),
+        (None, None) => {
+            if has_ended {
+                "Ended".to_owned()
+            } else {
+                "Live now".to_owned()
+            }
+        }
+    };
+    Some(
+        h_flex()
+            .max_w(px(460.))
+            .p_3()
+            .gap_3()
+            .items_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(if has_ended {
+                theme.border
+            } else {
+                accent.opacity(0.45)
+            })
+            .bg(theme.secondary.opacity(0.42))
+            .child(
+                div()
+                    .size(px(36.))
+                    .flex_none()
+                    .rounded_md()
+                    .bg(accent.opacity(0.16))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Headphones)
+                            .size(px(18.))
+                            .text_color(accent),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(subtitle),
+                    ),
+            )
+            .when(!participant_ids.is_empty(), |row| {
+                row.child(
+                    h_flex().items_center().gap_0p5().children(
+                        participant_ids
+                            .iter()
+                            .take(4)
+                            .map(|uid| crate::avatars::user_chip(fixtures, uid, 22.)),
+                    ),
+                )
+            }),
+    )
 }
 
 /// One block of a message (or attachment): `rich_text` here, everything else through
