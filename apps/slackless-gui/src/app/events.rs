@@ -174,6 +174,19 @@ impl App {
         is_direct_or_mention: bool,
         cx: &mut Context<Self>,
     ) {
+        // Duplicate-notification guard (`F-SHELL-181`): ignore identical notification tags
+        // arriving within 60 seconds (e.g. reconnect replay or dual socket/poll delivery).
+        let now = Instant::now();
+        self.recent_notified_tags
+            .retain(|(_, at)| now.duration_since(*at) < Duration::from_secs(60));
+        if self.recent_notified_tags.iter().any(|(t, _)| t == tag) {
+            return;
+        }
+        self.recent_notified_tags.push((tag.to_owned(), now));
+        if self.recent_notified_tags.len() > 128 {
+            let drop_n = self.recent_notified_tags.len() - 128;
+            self.recent_notified_tags.drain(..drop_n);
+        }
         cx.show_system_notification(SystemNotification {
             tag: tag.to_owned().into(),
             title: title.to_owned().into(),

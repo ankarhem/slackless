@@ -411,8 +411,8 @@ mod tests;
 use self::chrome::{corner_cap, joinable, shadow};
 use self::helpers::{
     broadcast_kind, civil_from_days, convert_emoticons, demo, first_conversation, forget_failure,
-    is_suspicious_url, mentions_me, parse_notification_tag, parse_permalink, sync_launch_at_login,
-    workspace_badge_from_counts,
+    is_suspicious_url, mentions_me, parse_notification_target, parse_permalink,
+    sync_launch_at_login, workspace_badge_from_counts,
 };
 pub(crate) use self::helpers::{default_custom_datetime, parse_local_schedule};
 
@@ -709,6 +709,8 @@ pub struct App {
     last_status_bar: Option<StatusBarState>,
     /// Whether the main window is currently active/focused (guards background mark-as-read).
     window_active: bool,
+    /// Recently dispatched desktop notification tags (`F-SHELL-181` duplicate-notification guard).
+    recent_notified_tags: Vec<(String, Instant)>,
     /// The window title last set, so it is only set on change.
     window_title: String,
     /// The pending, debounced save of the window frame (replacing it cancels the last one).
@@ -1844,7 +1846,7 @@ impl App {
                 cx.subscribe_in(
                     &directory,
                     window,
-                    |this: &mut App, _, event: &DirectoryEvent, _, cx| match event {
+                    |this: &mut App, _, event: &DirectoryEvent, window, cx| match event {
                         DirectoryEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                         DirectoryEvent::Join(channel) => {
                             if let Some(joined) = this.fixtures.conversation(channel).cloned() {
@@ -1853,6 +1855,29 @@ impl App {
                             }
                         }
                         DirectoryEvent::Open(channel) => this.select(channel.clone(), cx),
+                        DirectoryEvent::CreateUsergroup {
+                            name,
+                            handle,
+                            description,
+                        } => {
+                            if !this.fixtures.sample {
+                                this.bridge.send(Command::CreateUsergroup {
+                                    name: name.clone(),
+                                    handle: handle.clone(),
+                                    description: description.clone(),
+                                });
+                            }
+                            notify(
+                                "User group created",
+                                if handle.is_empty() {
+                                    name.clone()
+                                } else {
+                                    format!("{name} (@{handle})")
+                                },
+                                window,
+                                cx,
+                            );
+                        }
                         DirectoryEvent::Close => {
                             this.directory_open = false;
                             cx.notify();
@@ -2076,6 +2101,7 @@ impl App {
                 badge_label: None,
                 last_status_bar: None,
                 window_active: window.is_window_active(),
+                recent_notified_tags: Vec::new(),
                 window_title: String::new(),
                 window_state_save: gpui::Task::ready(()),
                 history_generation: 0,
@@ -2106,13 +2132,18 @@ impl App {
         let notif_app = app.downgrade();
         let notif_window = window.window_handle();
         cx.on_system_notification_response(move |response, cx| {
-            let Some((channel, ts)) = parse_notification_tag(&response.tag) else {
+            let Some((ws_opt, channel, ts)) = parse_notification_target(&response.tag) else {
                 return;
             };
             cx.activate(true);
             let _ = notif_window.update(cx, |_, window, cx| {
                 window.activate_window();
                 let _ = notif_app.update(cx, |app, cx| {
+                    if let Some(ws_ix) = ws_opt {
+                        if ws_ix != app.workspace {
+                            app.switch_workspace(ws_ix, window, cx);
+                        }
+                    }
                     app.select(channel, cx);
                     app.messages.update(cx, |list, cx| list.reveal(&ts, cx));
                 });

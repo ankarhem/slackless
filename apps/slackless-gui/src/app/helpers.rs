@@ -95,6 +95,20 @@ pub(super) fn workspace_badge_from_counts(
     }
 }
 
+/// Decode a system notification tag (`msg:<channel>:<ts>`, `later:<channel>:<ts>`, or
+/// `bg:<workspace_index>:<channel>:<ts>`) into `(optional_workspace_index, channel, ts)` (`F-SHELL-171`).
+pub(super) fn parse_notification_target(tag: &str) -> Option<(Option<usize>, ChannelId, Ts)> {
+    if let Some(rest) = tag.strip_prefix("bg:") {
+        let (ws_str, tail) = rest.split_once(':')?;
+        let ws: usize = ws_str.parse().ok()?;
+        let (channel, ts) = tail.split_once(':')?;
+        return (!channel.is_empty() && !ts.is_empty())
+            .then(|| (Some(ws), ChannelId::from(channel), Ts::from(ts)));
+    }
+    let (channel, ts) = parse_notification_tag(tag)?;
+    Some((None, channel, ts))
+}
+
 /// Decode a system notification tag (`msg:<channel>:<ts>` or `later:<channel>:<ts>`).
 pub(super) fn parse_notification_tag(tag: &str) -> Option<(ChannelId, Ts)> {
     let rest = tag

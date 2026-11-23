@@ -2058,6 +2058,83 @@ fn render_live_list(
                                         &state.hidden_cols,
                                     ))
                                 })
+                                .when_some(actions.on_create_item.clone(), |row, create_cb| {
+                                    let cols_meta: Vec<(String, String, String)> = data
+                                        .columns
+                                        .iter()
+                                        .map(|c| (c.id.clone(), c.name.clone(), c.kind.clone()))
+                                        .collect();
+                                    let primary_col_ix = primary_ix;
+                                    row.child(
+                                        Button::new("list-import-csv")
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::FileText)
+                                            .label("Import CSV")
+                                            .tooltip("Import rows from a local CSV file")
+                                            .on_click(move |_, window, cx| {
+                                                let cb = create_cb.clone();
+                                                let cols = cols_meta.clone();
+                                                let rx = cx.prompt_for_paths(
+                                                    gpui_kit::gpui::PathPromptOptions {
+                                                        files: true,
+                                                        directories: false,
+                                                        multiple: false,
+                                                        prompt: Some(
+                                                            "Choose CSV file to import".into(),
+                                                        ),
+                                                    },
+                                                );
+                                                window
+                                                    .spawn(cx, async move |cx| {
+                                                        let Ok(Ok(Some(paths))) = rx.await else {
+                                                            return;
+                                                        };
+                                                        let Some(path) = paths.into_iter().next()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let Ok(content) =
+                                                            std::fs::read_to_string(&path)
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let rows = parse_csv_rows(&content);
+                                                        if rows.len() < 2 || cols.is_empty() {
+                                                            return;
+                                                        }
+                                                        let headers = &rows[0];
+                                                        let mut imported = 0usize;
+                                                        let _ = cx.update(|window, cx| {
+                                                            for row_vals in
+                                                                rows.iter().skip(1).take(100)
+                                                            {
+                                                                let cells = map_csv_row_to_cells(
+                                                                    headers,
+                                                                    row_vals,
+                                                                    &cols,
+                                                                    primary_col_ix,
+                                                                );
+                                                                if !cells.is_empty() {
+                                                                    cb(cells, window, cx);
+                                                                    imported += 1;
+                                                                }
+                                                            }
+                                                            crate::actions::notify(
+                                                                "CSV imported",
+                                                                format!(
+                                                                    "Imported {imported} row{} into list.",
+                                                                    if imported == 1 { "" } else { "s" }
+                                                                ),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    })
+                                                    .detach();
+                                            }),
+                                    )
+                                })
                                 .child({
                                     let csv = list_to_csv(data, fixtures);
                                     let suggested =
@@ -2707,6 +2784,109 @@ fn render_record_comments_section(
     }
 
     section
+}
+
+/// Parse RFC 4180 CSV text into rows of unescaped fields (`F-COLLAB-216`).
+pub(crate) fn parse_csv_rows(input: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(ch);
+            }
+        } else {
+            match ch {
+                '"' if field.is_empty() => in_quotes = true,
+                ',' => {
+                    row.push(std::mem::take(&mut field));
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    row.push(std::mem::take(&mut field));
+                    if row.iter().any(|c| !c.trim().is_empty()) {
+                        rows.push(std::mem::take(&mut row));
+                    } else {
+                        row.clear();
+                    }
+                }
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    if row.iter().any(|c| !c.trim().is_empty()) {
+                        rows.push(std::mem::take(&mut row));
+                    } else {
+                        row.clear();
+                    }
+                }
+                other => field.push(other),
+            }
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        if row.iter().any(|c| !c.trim().is_empty()) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+fn map_csv_row_to_cells(
+    headers: &[String],
+    values: &[String],
+    cols: &[(String, String, String)],
+    primary_ix: usize,
+) -> Vec<ListCellInput> {
+    let mut cells = Vec::new();
+    for (idx, val) in values.iter().enumerate() {
+        let trimmed = val.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let header = headers.get(idx).map(|s| s.trim()).unwrap_or("");
+        let matched = cols
+            .iter()
+            .find(|(_, name, _)| !header.is_empty() && name.eq_ignore_ascii_case(header))
+            .or_else(|| (idx == 0).then(|| cols.get(primary_ix)).flatten());
+        let Some((col_id, _, kind)) = matched else {
+            continue;
+        };
+        let cell_val = match kind.as_str() {
+            "checkbox" | "todo_completed" | "completed" => ListCellInputValue::Checkbox(matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "x"
+            )),
+            "date" | "todo_due_date" | "due_date" => {
+                ListCellInputValue::Date(vec![trimmed.to_owned()])
+            }
+            "number" | "rating" | "currency" => trimmed
+                .parse::<f64>()
+                .map(|n| ListCellInputValue::Number(vec![n]))
+                .unwrap_or_else(|_| ListCellInputValue::Text(trimmed.to_owned())),
+            "link" => ListCellInputValue::Link {
+                url: trimmed.to_owned(),
+                display_name: None,
+            },
+            _ => ListCellInputValue::Text(trimmed.to_owned()),
+        };
+        cells.push(ListCellInput {
+            column_id: col_id.clone(),
+            value: cell_val,
+        });
+    }
+    cells
 }
 
 fn export_file(

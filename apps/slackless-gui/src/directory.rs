@@ -43,6 +43,12 @@ pub enum DirectoryEvent {
     Open(ChannelId),
     /// An unjoined channel's Join (already marked joined here).
     Join(ChannelId),
+    /// Create a new `@handle` user group (`usergroups.create`, `F-COLLAB-1161`, `1162`).
+    CreateUsergroup {
+        name: String,
+        handle: String,
+        description: String,
+    },
     Close,
 }
 
@@ -220,12 +226,32 @@ impl Render for DirectoryView {
                             .child("Directory"),
                     )
                     .child(
-                        Button::new("directory-close")
-                            .ghost()
-                            .with_size(Size::Small)
-                            .icon(IconName::X)
-                            .tooltip("Close")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DirectoryEvent::Close))),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .when(tab == DirectoryTab::UserGroups, |row| {
+                                let this_ug = cx.weak_entity();
+                                row.child(
+                                    Button::new("directory-new-usergroup")
+                                        .primary()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Plus)
+                                        .label("New user group")
+                                        .on_click(move |_, window, cx| {
+                                            open_new_usergroup_dialog(this_ug.clone(), window, cx);
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("directory-close")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::X)
+                                    .tooltip("Close")
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| cx.emit(DirectoryEvent::Close)),
+                                    ),
+                            ),
                     ),
             )
             .child(
@@ -286,4 +312,107 @@ impl Render for DirectoryView {
                     }),
             )
     }
+}
+
+fn open_new_usergroup_dialog(
+    view: gpui_kit::gpui::WeakEntity<DirectoryView>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::gpui::Focusable as _;
+    let name_in = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder("Group name (e.g. Checkout Engineers)")
+            .auto_grow(1, 1)
+    });
+    let handle_in = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder("Handle without @ (e.g. checkout-eng)")
+            .auto_grow(1, 1)
+    });
+    let desc_in = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .placeholder("Purpose / description (optional)")
+            .auto_grow(1, 2)
+    });
+    name_in.read(cx).focus_handle(cx).focus(window, cx);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (border, muted, bg) = (theme.border, theme.muted_foreground, theme.background);
+        let (n_c, h_c, d_c, v_c) = (
+            name_in.clone(),
+            handle_in.clone(),
+            desc_in.clone(),
+            view.clone(),
+        );
+        let field = |label: &'static str, st: &Entity<TextareaState>| {
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(muted)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(bg)
+                        .child(Textarea::new(st).appearance(false).bordered(false)),
+                )
+        };
+        dialog.title("Create user group").w(px(420.)).child(
+            v_flex()
+                .gap_3()
+                .p_4()
+                .child(field("Name", &name_in))
+                .child(field("Handle (@handle)", &handle_in))
+                .child(field("Description", &desc_in))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("ug-create-cancel")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("ug-create-submit")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Create group")
+                                .on_click(move |_, window, cx| {
+                                    let name = n_c.read(cx).value().trim().to_owned();
+                                    let handle = h_c
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .trim_start_matches('@')
+                                        .to_owned();
+                                    let description = d_c.read(cx).value().trim().to_owned();
+                                    if name.is_empty() {
+                                        return;
+                                    }
+                                    window.close_dialog(cx);
+                                    let _ = v_c.update(cx, |_, cx| {
+                                        cx.emit(DirectoryEvent::CreateUsergroup {
+                                            name,
+                                            handle,
+                                            description,
+                                        });
+                                    });
+                                }),
+                        ),
+                ),
+        )
+    });
 }
