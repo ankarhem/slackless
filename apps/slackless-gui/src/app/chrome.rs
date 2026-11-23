@@ -578,28 +578,36 @@ impl App {
     /// message (falling back to the newest message in sample mode).
     pub(super) fn toggle_huddle_thread(&mut self, cx: &mut Context<Self>) {
         let huddle_channel = self
-            .huddle
+            .huddle_session
             .as_ref()
-            .map(|(ch, _)| ch.clone())
+            .map(|s| s.channel.clone())
+            .or_else(|| self.huddle.as_ref().map(|(ch, _)| ch.clone()))
             .unwrap_or_else(|| self.channel.clone());
-        let huddle_ts = if huddle_channel == self.channel {
-            self.messages
-                .read(cx)
-                .latest_huddle_thread_ts(self.fixtures.sample, cx)
-        } else {
-            self.fixtures
-                .messages
-                .get(&huddle_channel)
-                .and_then(|msgs| {
-                    msgs.iter()
-                        .rev()
-                        .find(|m| {
-                            m.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread)
+        let huddle_ts = self
+            .huddle_session
+            .as_ref()
+            .and_then(|s| s.thread_root_ts.clone())
+            .or_else(|| {
+                if huddle_channel == self.channel {
+                    self.messages
+                        .read(cx)
+                        .latest_huddle_thread_ts(self.fixtures.sample, cx)
+                } else {
+                    self.fixtures
+                        .messages
+                        .get(&huddle_channel)
+                        .and_then(|msgs| {
+                            msgs.iter()
+                                .rev()
+                                .find(|m| {
+                                    m.subtype
+                                        == Some(slackless_core::types::MessageSubtype::HuddleThread)
+                                })
+                                .or_else(|| self.fixtures.sample.then(|| msgs.last()).flatten())
+                                .map(|m| m.ts.clone())
                         })
-                        .or_else(|| self.fixtures.sample.then(|| msgs.last()).flatten())
-                        .map(|m| m.ts.clone())
-                })
-        };
+                }
+            });
         let Some(ts) = huddle_ts else {
             return;
         };

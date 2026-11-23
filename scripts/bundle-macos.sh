@@ -109,6 +109,10 @@ cat >"$APP/Contents/Info.plist" <<EOF
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Slackless needs microphone access so you can speak in Slack Huddles.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Slackless needs camera access so you can share video in Slack Huddles.</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -125,8 +129,9 @@ cat >"$APP/Contents/Info.plist" <<EOF
 EOF
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
+SIGN_ID="${SLACKLESS_SIGN_IDENTITY:--}"
 if command -v codesign >/dev/null; then
-  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+  codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || true
 fi
 
 echo "Bundled $APP (version $VERSION)"

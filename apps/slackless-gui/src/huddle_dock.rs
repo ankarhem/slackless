@@ -1,0 +1,636 @@
+//! Persistent sidebar mini-dock for an active native Slack Huddle (`F-COLLAB-001..059`).
+//!
+//! Pinned at the bottom of the sidebar column so the user can switch channels, threads, DMs, or
+//! Unreads without ever losing audio controls, active-speaker visibility, or one-click pop-out.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
+use gpui_kit::gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px,
+};
+use slackless_core::huddle::{
+    AudioDevices, HuddleAudioLevels, HuddlePhase, HuddleSessionSnapshot, list_audio_devices,
+};
+use slackless_core::types::{ChannelId, UserId};
+
+use crate::avatars::user_chip;
+use crate::fixtures::Fixtures;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format an elapsed duration in seconds as `MM:SS` or `H:MM:SS`.
+pub fn format_elapsed(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// Snapshot consumed by `PopoutKind::Huddle` so the Pop-out Huddle Window stays in lock-step with
+/// the sidebar mini-dock.
+#[derive(Clone)]
+pub struct HuddleViewState {
+    pub session: HuddleSessionSnapshot,
+    pub participants: Vec<UserId>,
+    pub levels: HuddleAudioLevels,
+    pub elapsed_secs: u64,
+}
+
+pub enum HuddleDockEvent {
+    ToggleMute,
+    Leave,
+    PopOut,
+    JumpToChannel(ChannelId),
+    OpenThread,
+    OpenCanvas(String),
+    CopyLink(ChannelId),
+    OpenBrowser(String),
+    RetryJoin(ChannelId),
+    OpenAudioSettings,
+    SwitchInputDevice(Option<String>),
+    SwitchOutputDevice(Option<String>),
+}
+
+pub struct HuddleDock {
+    fixtures: Arc<Fixtures>,
+    session: HuddleSessionSnapshot,
+    participants: Vec<UserId>,
+    levels: HuddleAudioLevels,
+    elapsed_secs: u64,
+    menu_open: bool,
+    devices: AudioDevices,
+}
+
+impl EventEmitter<HuddleDockEvent> for HuddleDock {}
+
+impl HuddleDock {
+    pub fn new(
+        fixtures: Arc<Fixtures>,
+        session: HuddleSessionSnapshot,
+        participants: Vec<UserId>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            // 1-second timer to advance the elapsed duration clock while the huddle stays live.
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let keep = this
+                        .update(cx, |dock: &mut HuddleDock, cx| {
+                            if dock.session.started_at_secs > 0
+                                && matches!(
+                                    dock.session.phase,
+                                    HuddlePhase::Connected | HuddlePhase::Reconnecting
+                                )
+                            {
+                                dock.elapsed_secs =
+                                    now_secs().saturating_sub(dock.session.started_at_secs);
+                                cx.notify();
+                            }
+                        })
+                        .is_ok();
+                    if !keep {
+                        break;
+                    }
+                }
+            })
+            .detach();
+
+            let started = session.started_at_secs;
+            Self {
+                fixtures,
+                session,
+                participants,
+                levels: HuddleAudioLevels::default(),
+                elapsed_secs: if started > 0 {
+                    now_secs().saturating_sub(started)
+                } else {
+                    0
+                },
+                menu_open: false,
+                devices: AudioDevices::default(),
+            }
+        })
+    }
+
+    pub fn update_session(&mut self, session: HuddleSessionSnapshot, cx: &mut Context<Self>) {
+        if session.started_at_secs > 0 {
+            self.elapsed_secs = now_secs().saturating_sub(session.started_at_secs);
+        }
+        self.session = session;
+        cx.notify();
+    }
+
+    pub fn set_participants(&mut self, participants: Vec<UserId>, cx: &mut Context<Self>) {
+        if self.participants != participants {
+            self.participants = participants;
+            cx.notify();
+        }
+    }
+
+    pub fn update_levels(&mut self, levels: HuddleAudioLevels, cx: &mut Context<Self>) {
+        self.levels = levels;
+        cx.notify();
+    }
+
+    pub fn set_muted_local(&mut self, muted: bool, cx: &mut Context<Self>) {
+        if self.session.muted != muted {
+            self.session.muted = muted;
+            cx.notify();
+        }
+    }
+
+    pub fn session(&self) -> &HuddleSessionSnapshot {
+        &self.session
+    }
+
+    pub fn view_state(&self) -> HuddleViewState {
+        HuddleViewState {
+            session: self.session.clone(),
+            participants: self.participants.clone(),
+            levels: self.levels.clone(),
+            elapsed_secs: self.elapsed_secs,
+        }
+    }
+
+    fn channel_label(&self) -> String {
+        self.fixtures
+            .conversation(&self.session.channel)
+            .map(|c| self.fixtures.conversation_label(c))
+            .unwrap_or_else(|| self.session.channel.to_string())
+    }
+
+    fn browser_url(&self) -> String {
+        if let Some(link) = &self.session.huddle_link {
+            return link.clone();
+        }
+        let team = self
+            .fixtures
+            .workspaces
+            .first()
+            .map(|t| t.id.to_string())
+            .unwrap_or_default();
+        format!(
+            "https://app.slack.com/huddle/{team}/{}",
+            self.session.channel
+        )
+    }
+
+    fn all_people(&self) -> Vec<UserId> {
+        let mut people = self.participants.clone();
+        if !people.contains(&self.fixtures.self_user) {
+            people.push(self.fixtures.self_user.clone());
+        }
+        people
+    }
+
+    fn is_speaking(&self, user: &UserId) -> bool {
+        if *user == self.fixtures.self_user {
+            !self.session.muted && self.levels.local_rms > 0.03
+        } else {
+            self.levels
+                .active_speakers
+                .iter()
+                .any(|(uid, lvl)| uid == user && *lvl > 0.05)
+        }
+    }
+
+    fn is_muted_user(&self, user: &UserId) -> bool {
+        if *user == self.fixtures.self_user {
+            self.session.muted
+        } else {
+            self.levels.muted_peers.contains(user)
+        }
+    }
+
+    fn render_menu(
+        &self,
+        channel: &ChannelId,
+        browser_url: String,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let theme = cx.theme();
+        let (card_bg, border, muted_fg) = (theme.background, theme.border, theme.muted_foreground);
+        let copy_ch = channel.clone();
+        let canvas_id = self.session.canvas_file_id.clone();
+        let active_in = self.session.input_device.clone();
+        let active_out = self.session.output_device.clone();
+
+        v_flex()
+            .w_full()
+            .p_2()
+            .gap_1()
+            .rounded_lg()
+            .bg(card_bg)
+            .border_1()
+            .border_color(border)
+            .text_xs()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted_fg)
+                    .child("Microphone"),
+            )
+            .children(self.devices.inputs.iter().enumerate().map(|(ix, dev)| {
+                let selected = active_in.as_deref() == Some(dev.name.as_str())
+                    || (active_in.is_none() && dev.is_default);
+                let dev_name = dev.name.clone();
+                Button::new(("dock-in-dev", ix))
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .label(if selected {
+                        format!("✓ {}", dev.name)
+                    } else {
+                        dev.name.clone()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::SwitchInputDevice(Some(dev_name.clone())));
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                div()
+                    .mt_1()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted_fg)
+                    .child("Speaker"),
+            )
+            .children(self.devices.outputs.iter().enumerate().map(|(ix, dev)| {
+                let selected = active_out.as_deref() == Some(dev.name.as_str())
+                    || (active_out.is_none() && dev.is_default);
+                let dev_name = dev.name.clone();
+                Button::new(("dock-out-dev", ix))
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .label(if selected {
+                        format!("✓ {}", dev.name)
+                    } else {
+                        dev.name.clone()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::SwitchOutputDevice(Some(dev_name.clone())));
+                        cx.notify();
+                    }))
+            }))
+            .child(div().h(px(1.)).my_1().bg(border))
+            .child(
+                Button::new("dock-copy-link")
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::Link)
+                    .label("Copy huddle link")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::CopyLink(copy_ch.clone()));
+                        cx.notify();
+                    })),
+            )
+            .when_some(canvas_id, |m, fid| {
+                m.child(
+                    Button::new("dock-open-canvas")
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::FileText)
+                        .label("Open huddle notes")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.menu_open = false;
+                            cx.emit(HuddleDockEvent::OpenCanvas(fid.clone()));
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                Button::new("dock-audio-settings")
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::Settings)
+                    .label("Audio & video preferences…")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::OpenAudioSettings);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("dock-open-browser")
+                    .ghost()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::ExternalLink)
+                    .label("Open huddle in browser")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::OpenBrowser(browser_url.clone()));
+                        cx.notify();
+                    })),
+            )
+    }
+}
+
+impl Render for HuddleDock {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let bg = theme.sidebar;
+        let card_bg = theme.background;
+        let border = theme.border;
+        let fg = theme.foreground;
+        let muted_fg = theme.muted_foreground;
+        let success = theme.success;
+        let warning = theme.warning;
+        let danger = theme.danger;
+
+        let (status_color, status_text) = match self.session.phase {
+            HuddlePhase::Joining | HuddlePhase::Connecting => (warning, "Connecting…".to_owned()),
+            HuddlePhase::Connected => (success, format_elapsed(self.elapsed_secs)),
+            HuddlePhase::Reconnecting => (warning, "Reconnecting…".to_owned()),
+            HuddlePhase::Leaving => (muted_fg, "Leaving…".to_owned()),
+            HuddlePhase::Failed => (danger, "Audio failed".to_owned()),
+            HuddlePhase::Idle => (muted_fg, "Ended".to_owned()),
+        };
+
+        let channel = self.session.channel.clone();
+        let channel_label = self.channel_label();
+        let browser_url = self.browser_url();
+        let people = self.all_people();
+        let visible_people: Vec<UserId> = people.iter().take(4).cloned().collect();
+        let overflow_count = people.len().saturating_sub(visible_people.len());
+        let local_bar_pct = if self.session.muted {
+            0.0
+        } else {
+            (self.levels.local_rms * 3.5).clamp(0.0, 1.0)
+        };
+
+        let avatars = h_flex()
+            .items_center()
+            .gap_1p5()
+            .children(visible_people.into_iter().map(|uid| {
+                let speaking = self.is_speaking(&uid);
+                let user_muted = self.is_muted_user(&uid);
+                div()
+                    .relative()
+                    .p(px(1.5))
+                    .rounded_md()
+                    .border_2()
+                    .border_color(if speaking {
+                        success
+                    } else {
+                        border.opacity(0.4)
+                    })
+                    .child(user_chip(&self.fixtures, &uid, 24.))
+                    .when(user_muted, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .right(px(-3.))
+                                .bottom(px(-3.))
+                                .size(px(13.))
+                                .rounded_full()
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::MicOff).size(px(8.)).text_color(danger)),
+                        )
+                    })
+            }))
+            .when(overflow_count > 0, |row| {
+                row.child(
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(border.opacity(0.35))
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(format!("+{overflow_count}")),
+                )
+            });
+
+        let mic_button = {
+            let btn = Button::new("huddle-dock-mic")
+                .with_size(Size::Small)
+                .icon(if self.session.muted {
+                    IconName::MicOff
+                } else {
+                    IconName::Mic
+                })
+                .tooltip(if self.session.muted {
+                    "Unmute microphone (⌘⇧Space)"
+                } else {
+                    "Mute microphone (⌘⇧Space)"
+                })
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleMute)));
+            if self.session.muted {
+                btn.ghost()
+            } else {
+                btn.primary()
+            }
+        };
+
+        let mut card = v_flex()
+            .id("huddle-sidebar-dock")
+            .w_full()
+            .p_2()
+            .gap_2()
+            .bg(bg)
+            .border_t_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .w_full()
+                    .p_2p5()
+                    .gap_2()
+                    .rounded_lg()
+                    .bg(card_bg)
+                    .border_1()
+                    .border_color(status_color.opacity(0.6))
+                    .text_color(fg)
+                    // Header row: status icon, clickable channel name, elapsed timer, pop-out
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::Headphones)
+                                    .size(px(14.))
+                                    .text_color(status_color),
+                            )
+                            .child(
+                                div()
+                                    .id("huddle-dock-jump")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .cursor_pointer()
+                                    .child(channel_label)
+                                    .on_click(cx.listener({
+                                        let ch = channel.clone();
+                                        move |_, _, _, cx| {
+                                            cx.emit(HuddleDockEvent::JumpToChannel(ch.clone()));
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(status_color)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(status_text),
+                            )
+                            .child(
+                                Button::new("huddle-dock-popout")
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::ExternalLink)
+                                    .tooltip("Pop out huddle window")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(HuddleDockEvent::PopOut);
+                                    })),
+                            ),
+                    )
+                    // Participant avatars + live local RMS level strip
+                    .child(avatars)
+                    .when(self.session.phase == HuddlePhase::Connected, |box_el| {
+                        box_el.child(
+                            div()
+                                .w_full()
+                                .h(px(3.))
+                                .rounded_full()
+                                .bg(border.opacity(0.4))
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui_kit::gpui::relative(local_bar_pct))
+                                        .rounded_full()
+                                        .bg(success),
+                                ),
+                        )
+                    })
+                    // Error / UDP blocked callout with Retry + Open in browser
+                    .when_some(self.session.error.clone(), |box_el, err_msg| {
+                        let retry_ch = channel.clone();
+                        let fallback_url = browser_url.clone();
+                        box_el.child(
+                            v_flex()
+                                .p_2()
+                                .gap_1p5()
+                                .rounded_md()
+                                .bg(danger.opacity(0.12))
+                                .border_1()
+                                .border_color(danger.opacity(0.4))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_start()
+                                        .child(
+                                            Icon::new(IconName::TriangleAlert)
+                                                .size(px(12.))
+                                                .text_color(danger),
+                                        )
+                                        .child(
+                                            div().flex_1().text_xs().text_color(fg).child(err_msg),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("huddle-dock-retry")
+                                                .outline()
+                                                .with_size(Size::XSmall)
+                                                .icon(IconName::RefreshCw)
+                                                .label("Retry")
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    cx.emit(HuddleDockEvent::RetryJoin(
+                                                        retry_ch.clone(),
+                                                    ));
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("huddle-dock-browser-fallback")
+                                                .primary()
+                                                .with_size(Size::XSmall)
+                                                .icon(IconName::ExternalLink)
+                                                .label("Open in browser")
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    cx.emit(HuddleDockEvent::OpenBrowser(
+                                                        fallback_url.clone(),
+                                                    ));
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
+                    // Action control bar: Mute, Thread, More/Devices, Leave
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(mic_button)
+                            .child(
+                                Button::new("huddle-dock-thread")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::MessageSquare)
+                                    .tooltip("Huddle thread")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(HuddleDockEvent::OpenThread);
+                                    })),
+                            )
+                            .child(
+                                Button::new("huddle-dock-more")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip("Audio devices & huddle options")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.menu_open = !this.menu_open;
+                                        if this.menu_open {
+                                            this.devices = list_audio_devices();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("huddle-dock-leave")
+                                    .danger()
+                                    .with_size(Size::Small)
+                                    .icon(IconName::PhoneOff)
+                                    .label("Leave")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(HuddleDockEvent::Leave);
+                                    })),
+                            ),
+                    ),
+            );
+
+        if self.menu_open {
+            card = card.child(self.render_menu(&channel, browser_url, cx));
+        }
+
+        card
+    }
+}

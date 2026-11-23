@@ -784,6 +784,32 @@ pub trait Backend: Clone + Send + Sync + 'static {
     fn files_undelete(&self, _file_id: String) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
     }
+    /// Join or start a Slack huddle in `channel` (`rooms.join`, returns Chime `free_willy` credentials).
+    fn rooms_join(
+        &self,
+        _channel: ChannelId,
+    ) -> impl Future<Output = api::Result<api::RoomJoinResponse>> + Send {
+        async {
+            Err(api::ApiError::UnsupportedHuddleBackend(
+                "huddles are unavailable in this backend".to_owned(),
+            ))
+        }
+    }
+    /// Invite/ring a workspace member into the active huddle (`rooms.notifyMember`).
+    fn rooms_notify_member(
+        &self,
+        _channel: ChannelId,
+        _user: UserId,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Fetch a shareable huddle URL for `channel` (`rooms.getLink`).
+    fn rooms_get_link(
+        &self,
+        channel: ChannelId,
+    ) -> impl Future<Output = api::Result<String>> + Send {
+        async move { Ok(format!("https://app.slack.com/huddle/{channel}")) }
+    }
 }
 
 impl Backend for SlackApi {
@@ -1541,5 +1567,19 @@ impl Backend for SlackApi {
 
     async fn files_undelete(&self, file_id: String) -> api::Result<()> {
         SlackApi::files_undelete(self, &file_id).await
+    }
+
+    async fn rooms_join(&self, channel: ChannelId) -> api::Result<api::RoomJoinResponse> {
+        SlackApi::rooms_join(self, &channel, None, None).await
+    }
+
+    async fn rooms_notify_member(&self, channel: ChannelId, user: UserId) -> api::Result<()> {
+        SlackApi::rooms_notify_member(self, &channel, &user).await
+    }
+
+    async fn rooms_get_link(&self, channel: ChannelId) -> api::Result<String> {
+        Ok(SlackApi::rooms_get_link(self, &channel)
+            .await?
+            .unwrap_or_else(|| format!("https://app.slack.com/huddle/{channel}")))
     }
 }

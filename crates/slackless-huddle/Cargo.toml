@@ -1,0 +1,32 @@
+[package]
+name = "slackless-huddle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slackless-types.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+prost = "0.14"
+flate2 = "1.1"
+bytes = "1"
+rand = "0.9"
+webrtc = "0.17"
+cpal = "0.16"
+opus = "0.4"
+sonora = "0.3"
+url = "2.5"
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.10"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "test-util"] }
+
+[lints]
+workspace = true

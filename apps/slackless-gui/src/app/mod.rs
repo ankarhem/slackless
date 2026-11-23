@@ -270,6 +270,8 @@ use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
 use crate::hover_card;
 use crate::huddle::{self, HuddleBar, HuddleEvent};
+use crate::huddle_dock::HuddleDock;
+use crate::huddle_invite::HuddleInviteBanner;
 use crate::huddles::{self, HuddlesEvent, HuddlesView};
 use crate::image_viewer::{ImageViewer, ViewerEvent, ViewerImage};
 use crate::later::{LaterEvent, LaterView, Remind, SaveRequest};
@@ -351,6 +353,7 @@ actions!(
         ZoomIn,
         ZoomOut,
         ActualSize,
+        ToggleHuddleMute,
     ]
 );
 
@@ -579,6 +582,14 @@ pub struct App {
     /// The fixture huddle's bar and the channel it runs in; `None` without a huddle.
     huddle: Option<(ChannelId, Entity<HuddleBar>)>,
     huddle_open: bool,
+    /// Active native audio huddle session snapshot (Chime SFU).
+    huddle_session: Option<slackless_core::huddle::HuddleSessionSnapshot>,
+    /// Persistent sidebar mini-dock mounted at the bottom of the sidebar while in a huddle.
+    huddle_dock: Option<Entity<HuddleDock>>,
+    _huddle_dock_sub: Option<Subscription>,
+    /// Floating incoming DM huddle ring banner (`huddle_invite`).
+    huddle_invite: Option<Entity<HuddleInviteBanner>>,
+    _huddle_invite_sub: Option<Subscription>,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
     /// Standalone native Preferences OS window handle (`F-CORE-011`) so Cmd+, focuses it if open.
@@ -959,6 +970,7 @@ impl App {
                 // insertion, so an unscoped single-key binding would swallow those letters
                 // (and Backspace / Right / Escape) in the composer and every text field.
                 KeyBinding::new("shift-escape", MarkAllRead, None),
+                KeyBinding::new("cmd-shift-space", ToggleHuddleMute, None),
             ]);
             const OUTSIDE_INPUT: Option<&str> =
                 Some("App && !Input && !PopupMenu && !Dialog && !Popover && !Select");
@@ -1313,6 +1325,20 @@ impl App {
                                 Err(err) => {
                                     notify("Net log export failed", err.to_string(), window, cx)
                                 }
+                            }
+                        }
+                        PreferencesEvent::TestSpeaker(output_device) => {
+                            if this.fixtures.sample {
+                                let dev = output_device.clone();
+                                std::thread::spawn(move || {
+                                    let _ = slackless_core::huddle::play_speaker_test_tone(
+                                        dev.as_deref(),
+                                    );
+                                });
+                            } else {
+                                this.bridge.send(Command::TestHuddleSpeaker {
+                                    output_device: output_device.clone(),
+                                });
                             }
                         }
                     },
@@ -1964,6 +1990,11 @@ impl App {
                 tab: ConversationTab::Messages,
                 huddle,
                 huddle_open: false,
+                huddle_session: None,
+                huddle_dock: None,
+                _huddle_dock_sub: None,
+                huddle_invite: None,
+                _huddle_invite_sub: None,
                 preferences,
                 prefs_window: None,
                 applied_theme,
@@ -2091,6 +2122,27 @@ impl App {
                             MouseNavDirection::Back => app.go_back(window, cx),
                             MouseNavDirection::Forward => app.go_forward(window, cx),
                         });
+                    });
+                }
+            })
+            .detach();
+        }
+        // Auto-leave active native huddle when the macOS screen locks (`F-COLLAB-059`).
+        {
+            use futures::StreamExt as _;
+            let (lock_tx, mut lock_rx) = futures::channel::mpsc::unbounded::<()>();
+            platform::install_screen_lock_monitor(move || {
+                let _ = lock_tx.unbounded_send(());
+            });
+            let lock_app = app.downgrade();
+            cx.spawn(async move |cx| {
+                while lock_rx.next().await.is_some() {
+                    let _ = lock_app.update(cx, |app, cx| {
+                        if app.huddle_session.is_some()
+                            && app.preferences.read(cx).settings().huddle_leave_on_lock
+                        {
+                            app.leave_huddle(cx);
+                        }
                     });
                 }
             })
@@ -2560,12 +2612,16 @@ impl Render for App {
             },
         ));
         if nav != NavItem::Activity {
+            let sidebar_col = v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
+                .when_some(self.huddle_dock.clone(), |col, dock| col.child(dock));
             panels = panels.child(
                 resizable_panel()
                     .size(sidebar_width)
                     .size_range(px(288.)..px(728.))
                     .fixed()
-                    .child(self.sidebar.clone()),
+                    .child(sidebar_col),
             );
         }
         let mut panels = panels.child(
@@ -2878,6 +2934,9 @@ impl Render for App {
                     this.select(prev, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &ToggleHuddleMute, _, cx| {
+                this.toggle_huddle_mute(cx);
+            }))
             .relative()
             .size_full()
             .bg(chrome)
@@ -2952,6 +3011,35 @@ impl Render for App {
                                     .overflow_hidden()
                                     .when(dark, |panel| panel.border_1().border_color(outline))
                                     .child(panels)
+                                    .when_some(self.huddle_invite.clone(), |panel, banner| {
+                                        panel.child(
+                                            div()
+                                                .id("huddle-invite-float")
+                                                .occlude()
+                                                .absolute()
+                                                .top_4()
+                                                .right_4()
+                                                .child(banner),
+                                        )
+                                    })
+                                    .when(
+                                        nav == NavItem::Activity && self.huddle_dock.is_some(),
+                                        |panel| {
+                                            panel.child(
+                                                div()
+                                                    .id("huddle-dock-activity-float")
+                                                    .occlude()
+                                                    .absolute()
+                                                    .left_4()
+                                                    .bottom_4()
+                                                    .w(px(280.))
+                                                    .rounded_lg()
+                                                    .overflow_hidden()
+                                                    .shadow_lg()
+                                                    .children(self.huddle_dock.clone()),
+                                            )
+                                        },
+                                    )
                                     .when(side_panel, |panel| {
                                         let outline = dark.then_some(outline);
                                         panel
@@ -3627,20 +3715,36 @@ fn subscribe_workspace(
         ),
     ];
     if let Some((_, bar)) = &views.huddle {
-        subscriptions.push(
-            cx.subscribe(
-                bar,
-                |this: &mut App, _, event: &HuddleEvent, cx| match event {
-                    HuddleEvent::Leave => {
-                        this.huddle_open = false;
-                        cx.notify();
-                    }
-                    HuddleEvent::OpenThread => {
-                        this.toggle_huddle_thread(cx);
-                    }
-                },
-            ),
-        );
+        subscriptions.push(cx.subscribe_in(
+            bar,
+            window,
+            |this: &mut App, _, event: &HuddleEvent, window, cx| match event {
+                HuddleEvent::Leave => {
+                    this.leave_huddle(cx);
+                }
+                HuddleEvent::OpenThread => {
+                    this.toggle_huddle_thread(cx);
+                }
+                HuddleEvent::ToggleMute => {
+                    this.toggle_huddle_mute(cx);
+                }
+                HuddleEvent::PopOut => {
+                    this.pop_out_huddle(window, cx);
+                }
+                HuddleEvent::CopyLink => {
+                    let ch = this
+                        .huddle_session
+                        .as_ref()
+                        .map(|s| s.channel.clone())
+                        .or_else(|| this.huddle.as_ref().map(|(c, _)| c.clone()))
+                        .unwrap_or_else(|| this.channel.clone());
+                    this.copy_huddle_link(ch, window, cx);
+                }
+                HuddleEvent::OpenCanvas(fid) => {
+                    this.open_huddle_canvas(fid.clone(), cx);
+                }
+            },
+        ));
     }
     subscriptions
 }

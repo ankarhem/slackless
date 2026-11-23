@@ -13,7 +13,7 @@ Two kinds of commands exist.
 
 Offline archive commands (`search`, `read`, `channels`, `dms`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
 
-Live Slack commands (`send`, `reply`, `react`, `mark-thread`, `saved`, `files`, `canvas`, `list`, `watch`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`).
+Live Slack commands (`send`, `reply`, `react`, `mark-thread`, `saved`, `files`, `canvas`, `list`, `watch`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`.
 
 ## Setup and auth
 

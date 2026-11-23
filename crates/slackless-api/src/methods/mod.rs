@@ -22,7 +22,7 @@ use crate::types::{
     ApiResponse, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus,
     Empty, File, Message, RichTextBlock, Team, TeamId, Ts, User, UserId, UserPresence, Usergroup,
 };
-use crate::{Result, SlackApi};
+use crate::{ApiError, Result, SlackApi};
 
 // ---------------------------------------------------------------------------------------------
 // Methods
@@ -2307,5 +2307,84 @@ impl SlackApi {
             .unwrap_or_default()
             .to_owned();
         Ok(id)
+    }
+
+    /// `rooms.join`: create or join a huddle in `channel_id` and obtain Amazon Chime (`free_willy`)
+    /// signaling/media credentials (`docs/research/api-huddles.md`). Rejects legacy Screenhero
+    /// rooms with [`ApiError::UnsupportedHuddleBackend`].
+    pub async fn rooms_join(
+        &self,
+        channel_id: &ChannelId,
+        thread_ts: Option<&Ts>,
+        regions: Option<&str>,
+    ) -> Result<RoomJoinResponse> {
+        let mut params = vec![
+            ("channel_id", channel_id.to_string()),
+            ("multidevice", "true".to_owned()),
+        ];
+        if let Some(ts) = thread_ts {
+            params.push(("thread_ts", ts.to_string()));
+        }
+        if let Some(region) = regions.filter(|r| !r.is_empty()) {
+            params.push(("regions", region.to_owned()));
+        }
+        let wire: RoomsJoinWire = self.call(method::ROOMS_JOIN, params).await?.data;
+        let call = wire.call.ok_or_else(|| {
+            ApiError::UnsupportedHuddleBackend("rooms.join response missing call block".to_owned())
+        })?;
+        if let Some(ref backend) = call.huddle.media_backend_type {
+            if !backend.is_empty() && backend != "free_willy" {
+                return Err(ApiError::UnsupportedHuddleBackend(backend.clone()));
+            }
+        }
+        let chime = call.free_willy.ok_or_else(|| {
+            ApiError::UnsupportedHuddleBackend(
+                "legacy non-Chime huddle backend (missing free_willy credentials)".to_owned(),
+            )
+        })?;
+        if chime.meeting.media_placement.signaling_url.is_empty()
+            || chime.attendee.join_token.is_empty()
+        {
+            return Err(ApiError::UnsupportedHuddleBackend(
+                "incomplete Chime credentials (missing SignalingUrl or JoinToken)".to_owned(),
+            ));
+        }
+        let call_id = if !call.call_id.is_empty() {
+            call.call_id
+        } else {
+            call.huddle.id.clone()
+        };
+        Ok(RoomJoinResponse {
+            call_id,
+            chime,
+            huddle: call.huddle,
+            canvas: call.canvas,
+        })
+    }
+
+    /// `rooms.notifyMember`: invite `user_id` into the active huddle in `channel_id`.
+    pub async fn rooms_notify_member(
+        &self,
+        channel_id: &ChannelId,
+        user_id: &UserId,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel_id.to_string()),
+            ("user_id", user_id.to_string()),
+        ];
+        self.call::<Empty>(method::ROOMS_NOTIFY_MEMBER, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `rooms.getLink`: fetch a shareable huddle link (falling back to the canonical web URL).
+    pub async fn rooms_get_link(&self, channel_id: &ChannelId) -> Result<Option<String>> {
+        let params = vec![("channel_id", channel_id.to_string())];
+        let wire: RoomsGetLinkWire = self.call(method::ROOMS_GET_LINK, params).await?.data;
+        Ok(wire
+            .link
+            .or(wire.huddle_link)
+            .or(wire.url)
+            .filter(|s| !s.is_empty()))
     }
 }

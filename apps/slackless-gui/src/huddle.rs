@@ -1,15 +1,9 @@
-//! Huddle UI without media (docs/research/api-huddles.md): the bar shown under the conversation
-//! header while a huddle is open - participants, mic / video / screen-share / leave controls and
-//! a prominent "Open huddle in browser" fallback - plus the fixture that says which channel has
-//! a live huddle (the sidebar marks that row with a headphones indicator).
+//! Huddle bar shown under a conversation header while a huddle is open in the current channel
+//! (and fixture huddle helper for sample mode).
 //!
-//! DEFERRED: actual audio/video. Slack huddles run on Amazon Chime/WebRTC, which slackless does
-//! not implement, so the mic/video/screen-share controls only flip local UI state and no media
-//! is captured or played. Joining for real goes through the browser fallback, which opens the
-//! huddle in Slack's web client.
-//!
-//! `HuddleBar::new(Arc<Fixtures>, Huddle, &mut App) -> Entity<HuddleBar>`
-//! emits `HuddleEvent::Leave`.
+//! Live workspaces connect natively to Slack's Amazon Chime audio SFU (`slackless-huddle`) while
+//! keeping a one-click "Open in browser" fallback for video/screen sharing (Phases 2–3) or
+//! UDP-blocked corporate networks.
 
 use std::sync::Arc;
 
@@ -21,6 +15,7 @@ use gpui_kit::gpui::{
     AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement, ParentElement as _,
     Render, Styled as _, Window, div, px,
 };
+use slackless_core::huddle::{HuddleAudioLevels, HuddlePhase, HuddleSessionSnapshot};
 use slackless_core::types::{ChannelId, UserId};
 
 use crate::avatars::user_chip;
@@ -57,12 +52,21 @@ pub enum HuddleEvent {
     Leave,
     /// Open or toggle the active huddle's thread in the right-hand thread panel (`F-COLLAB-014`/`015`).
     OpenThread,
+    /// Toggle local microphone mute (`Command::SetHuddleMuted`).
+    ToggleMute,
+    /// Open the full Pop-out Huddle Window (`PopoutKind::Huddle`).
+    PopOut,
+    /// Copy shareable huddle link (`Command::CopyHuddleLink`).
+    CopyLink,
+    /// Open the huddle's notes canvas if attached.
+    OpenCanvas(String),
 }
 
 pub struct HuddleBar {
     fixtures: Arc<Fixtures>,
     huddle: Huddle,
-    // UI-only control state; no media device is touched (see module docs).
+    session: Option<HuddleSessionSnapshot>,
+    levels: HuddleAudioLevels,
     muted: bool,
     video: bool,
     sharing: bool,
@@ -79,14 +83,43 @@ impl HuddleBar {
         cx.new(|_| HuddleBar {
             fixtures,
             huddle,
-            muted: true,
+            session: None,
+            levels: HuddleAudioLevels::default(),
+            muted: false,
             video: false,
             sharing: false,
         })
     }
 
+    pub fn set_participants(&mut self, participants: Vec<UserId>, cx: &mut Context<Self>) {
+        if self.huddle.participants != participants {
+            self.huddle.participants = participants;
+            cx.notify();
+        }
+    }
+
+    pub fn update_session(
+        &mut self,
+        session: Option<HuddleSessionSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(snap) = &session {
+            self.muted = snap.muted;
+        }
+        self.session = session;
+        cx.notify();
+    }
+
+    pub fn update_levels(&mut self, levels: HuddleAudioLevels, cx: &mut Context<Self>) {
+        self.levels = levels;
+        cx.notify();
+    }
+
     /// Slack's web-client huddle link for this channel.
     fn browser_url(&self) -> String {
+        if let Some(link) = self.session.as_ref().and_then(|s| s.huddle_link.as_ref()) {
+            return link.clone();
+        }
         let team = self
             .fixtures
             .workspaces
@@ -98,6 +131,21 @@ impl HuddleBar {
             self.huddle.channel
         )
     }
+
+    fn is_speaking(&self, user: &UserId, ix: usize) -> bool {
+        if self.session.is_some() {
+            if *user == self.fixtures.self_user {
+                !self.muted && self.levels.local_rms > 0.03
+            } else {
+                self.levels
+                    .active_speakers
+                    .iter()
+                    .any(|(uid, lvl)| uid == user && *lvl > 0.05)
+            }
+        } else {
+            ix == 0
+        }
+    }
 }
 
 impl Render for HuddleBar {
@@ -107,9 +155,12 @@ impl Render for HuddleBar {
         let success = cx.theme().success;
         let muted_foreground = cx.theme().muted_foreground;
         let warning = cx.theme().warning;
+        let danger = cx.theme().danger;
 
         let mut people: Vec<&UserId> = self.huddle.participants.iter().collect();
-        people.push(&self.fixtures.self_user);
+        if !people.contains(&&self.fixtures.self_user) {
+            people.push(&self.fixtures.self_user);
+        }
         let count = people.len();
         let channel = self
             .fixtures
@@ -117,22 +168,57 @@ impl Render for HuddleBar {
             .map(|c| self.fixtures.conversation_label(c))
             .unwrap_or_else(|| self.huddle.channel.to_string());
 
+        let phase = self.session.as_ref().map(|s| s.phase);
+        let status_label = match phase {
+            Some(HuddlePhase::Joining | HuddlePhase::Connecting) => Some(("Connecting…", warning)),
+            Some(HuddlePhase::Connected) => Some(("Audio connected", success)),
+            Some(HuddlePhase::Reconnecting) => Some(("Reconnecting…", warning)),
+            Some(HuddlePhase::Failed) => Some(("Connection failed", danger)),
+            _ => None,
+        };
+
         let participants = h_flex()
             .gap_3()
             .children(people.into_iter().enumerate().map(|(ix, user)| {
-                // The first participant is shown as the active speaker.
-                let speaking = ix == 0;
+                let speaking = self.is_speaking(user, ix);
+                let user_muted = if *user == self.fixtures.self_user {
+                    self.muted
+                } else {
+                    self.levels.muted_peers.contains(user)
+                };
                 v_flex()
                     .items_center()
                     .gap_1()
                     .w(px(64.))
                     .child(
                         div()
+                            .relative()
                             .p_0p5()
                             .rounded_md()
                             .border_2()
                             .border_color(if speaking { success } else { border })
-                            .child(user_chip(&self.fixtures, user, 36.)),
+                            .child(user_chip(&self.fixtures, user, 36.))
+                            .when(user_muted, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-3.))
+                                        .bottom(px(-3.))
+                                        .size(px(14.))
+                                        .rounded_full()
+                                        .bg(muted_bg)
+                                        .border_1()
+                                        .border_color(border)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::MicOff)
+                                                .size(px(9.))
+                                                .text_color(danger),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -164,10 +250,15 @@ impl Render for HuddleBar {
                     !self.muted,
                     IconName::Mic,
                     IconName::MicOff,
-                    "Mute / unmute (UI only)",
+                    if self.muted {
+                        "Unmute microphone (⌘⇧Space)"
+                    } else {
+                        "Mute microphone (⌘⇧Space)"
+                    },
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.muted = !this.muted;
+                    cx.emit(HuddleEvent::ToggleMute);
                     cx.notify();
                 })),
             )
@@ -177,7 +268,7 @@ impl Render for HuddleBar {
                     self.video,
                     IconName::Video,
                     IconName::VideoOff,
-                    "Video (UI only)",
+                    "Video (Phase 2 — use Open in browser for video)",
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.video = !this.video;
@@ -190,7 +281,7 @@ impl Render for HuddleBar {
                     self.sharing,
                     IconName::ScreenShare,
                     IconName::ScreenShare,
-                    "Share screen (UI only)",
+                    "Share screen (Phase 3 — use Open in browser for screen share)",
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.sharing = !this.sharing;
@@ -207,16 +298,31 @@ impl Render for HuddleBar {
             );
 
         let url = self.browser_url();
+        let canvas_id = self.session.as_ref().and_then(|s| s.canvas_file_id.clone());
         let open_thread = Button::new("huddle-open-thread")
             .outline()
             .with_size(Size::Small)
             .icon(IconName::MessageSquare)
             .label("Huddle thread")
             .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleEvent::OpenThread)));
-        let open_in_browser = Button::new("huddle-open-browser")
-            .primary()
+        let copy_link = Button::new("huddle-copy-link")
+            .ghost()
+            .with_size(Size::Small)
+            .icon(IconName::Link)
+            .tooltip("Copy huddle link")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleEvent::CopyLink)));
+        let pop_out = Button::new("huddle-popout")
+            .outline()
+            .with_size(Size::Small)
             .icon(IconName::ExternalLink)
-            .label("Open huddle in browser")
+            .label("Pop out")
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleEvent::PopOut)));
+        let open_in_browser = Button::new("huddle-open-browser")
+            .ghost()
+            .with_size(Size::Small)
+            .icon(IconName::ExternalLink)
+            .label("Browser")
+            .tooltip("Open huddle in Slack web client")
             .on_click(move |_, _, cx| cx.open_url(&url));
 
         v_flex()
@@ -249,8 +355,34 @@ impl Render for HuddleBar {
                             .text_color(muted_foreground)
                             .child(format!("{count} participants")),
                     )
+                    .when_some(status_label, |row, (label, color)| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(color.opacity(0.15))
+                                .text_xs()
+                                .text_color(color)
+                                .child(label),
+                        )
+                    })
                     .child(div().flex_1())
+                    .child(copy_link)
+                    .when_some(canvas_id, |row, fid| {
+                        row.child(
+                            Button::new("huddle-open-canvas")
+                                .outline()
+                                .with_size(Size::Small)
+                                .icon(IconName::FileText)
+                                .label("Notes")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.emit(HuddleEvent::OpenCanvas(fid.clone()));
+                                })),
+                        )
+                    })
                     .child(open_thread)
+                    .child(pop_out)
                     .child(open_in_browser),
             )
             .child(
@@ -261,28 +393,30 @@ impl Render for HuddleBar {
                     .child(div().flex_1())
                     .child(controls),
             )
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .items_center()
-                    .text_xs()
-                    .text_color(warning)
-                    .child(
-                        Icon::new(IconName::TriangleAlert)
-                            .text_color(warning)
-                            .size(px(12.)),
+            .when_some(
+                self.session.as_ref().and_then(|s| s.error.clone()),
+                |bar, err| {
+                    bar.child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .text_xs()
+                            .text_color(danger)
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .text_color(danger)
+                                    .size(px(12.)),
+                            )
+                            .child(err),
                     )
-                    .child(
-                        "Audio, video and screen sharing are not available in slackless yet - \
-                         controls are display-only. Use \"Open huddle in browser\" to talk.",
-                    ),
+                },
             )
             .when(self.sharing || self.video, |bar| {
                 bar.child(
                     div()
                         .text_xs()
                         .text_color(muted_foreground)
-                        .child("Nothing is being captured: media is handled only in the browser."),
+                        .child("Native audio is active; video and screen sharing are coming in Phases 2–3 (use Browser to share video/screen)."),
                 )
             })
     }

@@ -54,6 +54,9 @@ pub struct PopoutActivityRow {
 /// activates the main window and navigates to `(channel, ts, is_thread)`.
 pub type JumpHandler = Rc<dyn Fn(ChannelId, Option<Ts>, bool, &mut App)>;
 
+/// Callback invoked when opening a huddle's attached notes canvas from a popped-out Huddle window.
+pub type CanvasOpenHandler = Rc<dyn Fn(String, &mut App)>;
+
 /// What this popped-out native window displays.
 #[derive(Clone)]
 pub enum PopoutKind {
@@ -87,6 +90,13 @@ pub enum PopoutKind {
     Files {
         source: WeakEntity<crate::files_page::FilesPage>,
         on_jump: JumpHandler,
+    },
+    /// Popped-out native Huddle window (`F-COLLAB-001..059`): live participant tiles, active
+    /// speaker rings, audio controls, device switcher, invite picker, thread & notes canvas links.
+    Huddle {
+        source: WeakEntity<crate::huddle_dock::HuddleDock>,
+        on_jump: JumpHandler,
+        on_open_canvas: CanvasOpenHandler,
     },
 }
 
@@ -162,6 +172,10 @@ pub struct PopoutWindow {
     activity_rows: Vec<PopoutActivityRow>,
     later_items: Vec<LaterItem>,
     files_items: Vec<(String, String, Option<String>)>,
+    huddle_state: Option<crate::huddle_dock::HuddleViewState>,
+    huddle_invite_open: bool,
+    huddle_devices_open: bool,
+    huddle_devices: slackless_core::huddle::AudioDevices,
     composer: Entity<Composer>,
     emoji_picker: Entity<EmojiPicker>,
     picker: Option<(PopoutPickerTarget, Point<Pixels>)>,
@@ -191,7 +205,8 @@ impl PopoutWindow {
             PopoutKind::Activity { .. }
             | PopoutKind::Later { .. }
             | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. } => String::new(),
+            | PopoutKind::Files { .. }
+            | PopoutKind::Huddle { .. } => String::new(),
         };
         let has_composer = matches!(
             &kind,
@@ -247,7 +262,8 @@ impl PopoutWindow {
             PopoutKind::Activity { .. }
             | PopoutKind::Later { .. }
             | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. } => None,
+            | PopoutKind::Files { .. }
+            | PopoutKind::Huddle { .. } => None,
         };
         if let (Some(ch), Some((weak_later, workspace))) = (active_channel.clone(), &later_sync) {
             if let Some(later) = weak_later.upgrade() {
@@ -274,6 +290,7 @@ impl PopoutWindow {
         let mut activity_rows = Vec::new();
         let mut later_items = Vec::new();
         let mut files_items = Vec::new();
+        let mut huddle_state = None;
         match &kind {
             PopoutKind::Conversation { source, .. } | PopoutKind::Thread { source, .. } => {
                 if let Some(list) = source.upgrade() {
@@ -305,6 +322,15 @@ impl PopoutWindow {
                     files_items = page.read(cx).snapshot_for_popout();
                     subscriptions.push(cx.observe(&page, |this, page, cx| {
                         this.files_items = page.read(cx).snapshot_for_popout();
+                        cx.notify();
+                    }));
+                }
+            }
+            PopoutKind::Huddle { source, .. } => {
+                if let Some(dock) = source.upgrade() {
+                    huddle_state = Some(dock.read(cx).view_state());
+                    subscriptions.push(cx.observe(&dock, |this, dock, cx| {
+                        this.huddle_state = Some(dock.read(cx).view_state());
                         cx.notify();
                     }));
                 }
@@ -346,6 +372,10 @@ impl PopoutWindow {
             activity_rows,
             later_items,
             files_items,
+            huddle_state,
+            huddle_invite_open: false,
+            huddle_devices_open: false,
+            huddle_devices: slackless_core::huddle::AudioDevices::default(),
             composer,
             emoji_picker,
             picker: None,
@@ -477,7 +507,8 @@ impl PopoutWindow {
             | PopoutKind::Activity { on_jump, .. }
             | PopoutKind::Later { on_jump, .. }
             | PopoutKind::Canvas { on_jump, .. }
-            | PopoutKind::Files { on_jump, .. } => on_jump.clone(),
+            | PopoutKind::Files { on_jump, .. }
+            | PopoutKind::Huddle { on_jump, .. } => on_jump.clone(),
         }
     }
 
@@ -767,6 +798,13 @@ impl PopoutWindow {
                 }
                 return;
             }
+            PopoutKind::Huddle { source, .. } => {
+                if let Some(dock) = source.upgrade() {
+                    self.huddle_state = Some(dock.read(cx).view_state());
+                    cx.notify();
+                }
+                return;
+            }
             PopoutKind::Canvas { .. } => return,
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {}
         }
@@ -794,7 +832,8 @@ impl PopoutWindow {
             PopoutKind::Activity { .. }
             | PopoutKind::Later { .. }
             | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. } => return,
+            | PopoutKind::Files { .. }
+            | PopoutKind::Huddle { .. } => return,
         };
         let mut local =
             self.fixtures
@@ -811,6 +850,508 @@ impl PopoutWindow {
         });
         cx.notify();
     }
+
+    fn render_huddle_body(
+        &self,
+        on_jump: JumpHandler,
+        on_open_canvas: CanvasOpenHandler,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        use gpui_kit::component::Icon;
+        use slackless_core::huddle::HuddlePhase;
+
+        let theme = cx.theme();
+        let (bg, border, muted, success, warning, danger, card_bg) = (
+            theme.background,
+            theme.border,
+            theme.muted_foreground,
+            theme.success,
+            theme.warning,
+            theme.danger,
+            theme.muted,
+        );
+
+        let Some(state) = self.huddle_state.clone() else {
+            return v_flex()
+                .id("popout-huddle-ended")
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("This huddle has ended."),
+                );
+        };
+
+        let snap = state.session;
+        let channel = snap.channel.clone();
+        let mut people = state.participants;
+        if !people.contains(&self.fixtures.self_user) {
+            people.push(self.fixtures.self_user.clone());
+        }
+        let (status_color, status_text) = match snap.phase {
+            HuddlePhase::Joining | HuddlePhase::Connecting => (warning, "Connecting…".to_owned()),
+            HuddlePhase::Connected => (
+                success,
+                format!(
+                    "Connected · {}",
+                    crate::huddle_dock::format_elapsed(state.elapsed_secs)
+                ),
+            ),
+            HuddlePhase::Reconnecting => (warning, "Reconnecting…".to_owned()),
+            HuddlePhase::Leaving => (muted, "Leaving…".to_owned()),
+            HuddlePhase::Failed => (danger, "Connection failed".to_owned()),
+            HuddlePhase::Idle => (muted, "Ended".to_owned()),
+        };
+
+        let browser_url = snap.huddle_link.clone().unwrap_or_else(|| {
+            let team = self
+                .fixtures
+                .workspaces
+                .first()
+                .map(|t| t.id.to_string())
+                .unwrap_or_default();
+            format!("https://app.slack.com/huddle/{team}/{channel}")
+        });
+
+        let tiles = h_flex()
+            .flex_wrap()
+            .gap_3()
+            .children(people.iter().map(|uid| {
+                let is_self = *uid == self.fixtures.self_user;
+                let speaking = if is_self {
+                    !snap.muted && state.levels.local_rms > 0.03
+                } else {
+                    state
+                        .levels
+                        .active_speakers
+                        .iter()
+                        .any(|(id, lvl)| id == uid && *lvl > 0.05)
+                };
+                let is_muted = if is_self {
+                    snap.muted
+                } else {
+                    state.levels.muted_peers.contains(uid)
+                };
+                let name = self.fixtures.user_name(uid).to_owned();
+                v_flex()
+                    .w(px(164.))
+                    .p_4()
+                    .gap_2()
+                    .items_center()
+                    .rounded_xl()
+                    .bg(card_bg)
+                    .border_2()
+                    .border_color(if speaking { success } else { border })
+                    .child(
+                        div()
+                            .relative()
+                            .child(crate::avatars::user_chip(&self.fixtures, uid, 64.))
+                            .when(is_muted, |el| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-4.))
+                                        .bottom(px(-4.))
+                                        .size(px(22.))
+                                        .rounded_full()
+                                        .bg(bg)
+                                        .border_1()
+                                        .border_color(border)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(IconName::MicOff)
+                                                .size(px(12.))
+                                                .text_color(danger),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if is_self {
+                                format!("{name} (You)")
+                            } else {
+                                name
+                            }),
+                    )
+            }));
+
+        let send_copy = self.send.clone();
+        let copy_ch = channel.clone();
+        let thread_ch = channel.clone();
+        let thread_ts = snap.thread_root_ts.clone();
+        let canvas_id = snap.canvas_file_id.clone();
+
+        let mut body = v_flex()
+            .id("popout-huddle-body")
+            .flex_1()
+            .min_h_0()
+            .p_4()
+            .gap_4()
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Headphones)
+                            .size(px(16.))
+                            .text_color(status_color),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_full()
+                            .bg(status_color.opacity(0.15))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(status_color)
+                            .child(status_text),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("popout-huddle-thread")
+                            .outline()
+                            .with_size(Size::Small)
+                            .icon(IconName::MessageSquare)
+                            .label("Thread")
+                            .on_click(move |_, _, cx| {
+                                on_jump(
+                                    thread_ch.clone(),
+                                    thread_ts.clone(),
+                                    thread_ts.is_some(),
+                                    cx,
+                                );
+                            }),
+                    )
+                    .when_some(canvas_id, |row, fid| {
+                        row.child(
+                            Button::new("popout-huddle-canvas")
+                                .outline()
+                                .with_size(Size::Small)
+                                .icon(IconName::FileText)
+                                .label("Notes")
+                                .on_click(move |_, _, cx| {
+                                    on_open_canvas(fid.clone(), cx);
+                                }),
+                        )
+                    })
+                    .child(
+                        Button::new("popout-huddle-copy-link")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::Link)
+                            .label("Copy link")
+                            .on_click(move |_, _, _| {
+                                (send_copy)(Command::CopyHuddleLink {
+                                    channel: copy_ch.clone(),
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("popout-huddle-browser")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::ExternalLink)
+                            .label("Browser")
+                            .on_click(move |_, _, cx| cx.open_url(&browser_url)),
+                    ),
+            )
+            .when_some(snap.error.clone(), |col, err| {
+                col.child(
+                    h_flex()
+                        .p_2p5()
+                        .gap_2()
+                        .rounded_md()
+                        .bg(danger.opacity(0.12))
+                        .border_1()
+                        .border_color(danger.opacity(0.4))
+                        .text_xs()
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .size(px(14.))
+                                .text_color(danger),
+                        )
+                        .child(err),
+                )
+            })
+            .child(tiles);
+
+        if self.huddle_invite_open {
+            body = body.child(self.render_huddle_invite_panel(&channel, &people, cx));
+        }
+        if self.huddle_devices_open {
+            body = body.child(self.render_huddle_devices_panel(
+                snap.input_device.clone(),
+                snap.output_device.clone(),
+                cx,
+            ));
+        }
+
+        v_flex()
+            .id("popout-huddle-root")
+            .flex_1()
+            .min_h_0()
+            .child(body)
+            .child(self.render_huddle_controls(snap.muted, cx))
+    }
+
+    fn render_huddle_invite_panel(
+        &self,
+        channel: &ChannelId,
+        people: &[slackless_core::types::UserId],
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let theme = cx.theme();
+        let (border, muted, card_bg) = (theme.border, theme.muted_foreground, theme.muted);
+        let candidates: Vec<_> = self
+            .fixtures
+            .users
+            .iter()
+            .filter(|u| !u.is_bot && !u.deleted && !people.contains(&u.id))
+            .take(12)
+            .cloned()
+            .collect();
+        let inv_ch = channel.clone();
+        let send_inv = self.send.clone();
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(card_bg)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child("Invite people to this huddle"),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(candidates.into_iter().enumerate().map(|(ix, u)| {
+                        let uid = u.id.clone();
+                        let ch = inv_ch.clone();
+                        let send = send_inv.clone();
+                        let label = self.fixtures.user_name(&uid).to_owned();
+                        Button::new(("popout-huddle-inv", ix))
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::UserPlus)
+                            .label(label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                (send)(Command::InviteToHuddle {
+                                    channel: ch.clone(),
+                                    users: vec![uid.clone()],
+                                });
+                                actions::notify(
+                                    "Invitation sent",
+                                    "Notified member to join this huddle.",
+                                    window,
+                                    cx,
+                                );
+                                this.huddle_invite_open = false;
+                                cx.notify();
+                            }))
+                    })),
+            )
+    }
+
+    fn render_huddle_devices_panel(
+        &self,
+        cur_in: Option<String>,
+        cur_out: Option<String>,
+        cx: &Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let theme = cx.theme();
+        let (border, muted, card_bg) = (theme.border, theme.muted_foreground, theme.muted);
+        let send_in = self.send.clone();
+        let send_out = self.send.clone();
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(border)
+            .bg(card_bg)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child("Microphone"),
+            )
+            .child(
+                h_flex().flex_wrap().gap_1().children(
+                    self.huddle_devices
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, d)| {
+                            let selected = cur_in.as_deref() == Some(d.name.as_str())
+                                || (cur_in.is_none() && d.is_default);
+                            let name = d.name.clone();
+                            let out = cur_out.clone();
+                            let send = send_in.clone();
+                            Button::new(("popout-in-dev", ix))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .label(if selected {
+                                    format!("✓ {}", d.name)
+                                } else {
+                                    d.name.clone()
+                                })
+                                .on_click(move |_, _, _| {
+                                    (send)(Command::SetHuddleAudioDevices {
+                                        input: Some(name.clone()),
+                                        output: out.clone(),
+                                    });
+                                })
+                        }),
+                ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(muted)
+                    .child("Speaker"),
+            )
+            .child(
+                h_flex().flex_wrap().gap_1().children(
+                    self.huddle_devices
+                        .outputs
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, d)| {
+                            let selected = cur_out.as_deref() == Some(d.name.as_str())
+                                || (cur_out.is_none() && d.is_default);
+                            let name = d.name.clone();
+                            let inp = cur_in.clone();
+                            let send = send_out.clone();
+                            Button::new(("popout-out-dev", ix))
+                                .outline()
+                                .with_size(Size::XSmall)
+                                .label(if selected {
+                                    format!("✓ {}", d.name)
+                                } else {
+                                    d.name.clone()
+                                })
+                                .on_click(move |_, _, _| {
+                                    (send)(Command::SetHuddleAudioDevices {
+                                        input: inp.clone(),
+                                        output: Some(name.clone()),
+                                    });
+                                })
+                        }),
+                ),
+            )
+    }
+
+    fn render_huddle_controls(
+        &self,
+        muted_now: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use slackless_core::huddle::list_audio_devices;
+
+        let border = cx.theme().border;
+        let send_mute = self.send.clone();
+        let next_muted = !muted_now;
+        let mic_btn = {
+            let b = Button::new("popout-huddle-mic")
+                .with_size(Size::Medium)
+                .icon(if muted_now {
+                    IconName::MicOff
+                } else {
+                    IconName::Mic
+                })
+                .label(if muted_now { "Unmute" } else { "Mute" })
+                .on_click(move |_, _, _| {
+                    (send_mute)(Command::SetHuddleMuted(next_muted));
+                });
+            if muted_now { b.outline() } else { b.primary() }
+        };
+        let send_leave = self.send.clone();
+
+        h_flex()
+            .flex_none()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .items_center()
+            .justify_center()
+            .border_t_1()
+            .border_color(border)
+            .child(mic_btn)
+            .child(
+                Button::new("popout-huddle-video")
+                    .ghost()
+                    .with_size(Size::Medium)
+                    .icon(IconName::VideoOff)
+                    .tooltip("Video coming in Phase 2 — use Browser for camera"),
+            )
+            .child(
+                Button::new("popout-huddle-share")
+                    .ghost()
+                    .with_size(Size::Medium)
+                    .icon(IconName::ScreenShare)
+                    .tooltip("Screen sharing coming in Phase 3 — use Browser"),
+            )
+            .child(
+                Button::new("popout-huddle-invite-btn")
+                    .outline()
+                    .with_size(Size::Medium)
+                    .icon(IconName::UserPlus)
+                    .label("Invite")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.huddle_invite_open = !this.huddle_invite_open;
+                        this.huddle_devices_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("popout-huddle-devices-btn")
+                    .outline()
+                    .with_size(Size::Medium)
+                    .icon(IconName::SlidersHorizontal)
+                    .label("Audio")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.huddle_devices_open = !this.huddle_devices_open;
+                        this.huddle_invite_open = false;
+                        if this.huddle_devices_open {
+                            this.huddle_devices = list_audio_devices();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("popout-huddle-leave")
+                    .danger()
+                    .with_size(Size::Medium)
+                    .icon(IconName::PhoneOff)
+                    .label("Leave")
+                    .on_click(move |_, window, _| {
+                        (send_leave)(Command::LeaveHuddle);
+                        window.remove_window();
+                    }),
+            )
+    }
 }
 
 fn load_messages(
@@ -825,6 +1366,7 @@ fn load_messages(
             | PopoutKind::Later { .. }
             | PopoutKind::Canvas { .. }
             | PopoutKind::Files { .. }
+            | PopoutKind::Huddle { .. }
     ) {
         return Vec::new();
     }
@@ -840,7 +1382,8 @@ fn load_messages(
                 PopoutKind::Activity { .. }
                 | PopoutKind::Later { .. }
                 | PopoutKind::Canvas { .. }
-                | PopoutKind::Files { .. } => Ok(Vec::new()),
+                | PopoutKind::Files { .. }
+                | PopoutKind::Huddle { .. } => Ok(Vec::new()),
             };
             if let Ok(rows) = rows {
                 return rows
@@ -865,7 +1408,8 @@ fn load_messages(
         PopoutKind::Activity { .. }
         | PopoutKind::Later { .. }
         | PopoutKind::Canvas { .. }
-        | PopoutKind::Files { .. } => Vec::new(),
+        | PopoutKind::Files { .. }
+        | PopoutKind::Huddle { .. } => Vec::new(),
     }
 }
 
@@ -897,6 +1441,7 @@ impl Render for PopoutWindow {
             PopoutKind::Later { .. } => "Later · Live",
             PopoutKind::Canvas { .. } => "Canvas",
             PopoutKind::Files { .. } => "Files · Live",
+            PopoutKind::Huddle { .. } => "Huddle · Live",
         };
         let has_composer = matches!(
             &self.kind,
@@ -1302,6 +1847,11 @@ impl Render for PopoutWindow {
                 }
                 list
             }
+            PopoutKind::Huddle {
+                on_jump,
+                on_open_canvas,
+                ..
+            } => self.render_huddle_body(on_jump.clone(), on_open_canvas.clone(), cx),
         };
 
         let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);

@@ -26,7 +26,9 @@ fn apply(store: &mut Store, ws: &TeamId, event: SlackEvent) -> store::Result<Opt
             store.upsert_conversation(ws, &e.channel)?;
             Some(Event::Conversations(vec![e.channel.id.clone()]))
         }
-        SlackEvent::UserChange(e) | SlackEvent::UserProfileChanged(e) => {
+        SlackEvent::UserChange(e)
+        | SlackEvent::UserProfileChanged(e)
+        | SlackEvent::UserHuddleChanged(e) => {
             store.upsert_user(ws, &e.user)?;
             Some(Event::UsersChanged(vec![e.user.id.clone()]))
         }

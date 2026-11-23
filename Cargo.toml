@@ -26,6 +26,7 @@ slackless-api = { path = "crates/slackless-api" }
 slackless-rtm = { path = "crates/slackless-rtm" }
 slackless-store = { path = "crates/slackless-store" }
 slackless-auth = { path = "crates/slackless-auth" }
+slackless-huddle = { path = "crates/slackless-huddle" }
 slackless-platform = { path = "crates/slackless-platform" }
 slackless-core = { path = "crates/slackless-core" }
 serde = { version = "1", features = ["derive"] }

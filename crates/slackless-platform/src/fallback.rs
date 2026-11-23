@@ -149,3 +149,5 @@ pub(crate) fn install_mouse_nav_monitor(
     _on_nav: impl Fn(crate::MouseNavDirection) + Send + Sync + 'static,
 ) {
 }
+
+pub(crate) fn install_screen_lock_monitor(_on_lock: impl Fn() + Send + Sync + 'static) {}

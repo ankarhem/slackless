@@ -127,6 +127,12 @@ pub struct Profile {
     pub team: Option<TeamId>,
     #[serde(default)]
     pub bot_id: Option<BotId>,
+    /// Huddle presence state (`"in_a_huddle"`, `"default_unset"`, etc.).
+    #[serde(default)]
+    pub huddle_state: Option<String>,
+    /// Unix seconds when `huddle_state` expires.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    pub huddle_state_expiration_ts: Option<i64>,
     /// Custom profile fields keyed by field id.
     #[serde(default)]
     pub fields: Option<Value>,

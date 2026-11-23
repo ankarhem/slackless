@@ -16,6 +16,7 @@
 
 pub use slackless_api as api;
 pub use slackless_auth as auth;
+pub use slackless_huddle as huddle;
 pub use slackless_platform as platform;
 pub use slackless_rtm as rtm;
 pub use slackless_store as store;
@@ -546,6 +547,39 @@ pub enum Command {
         tab_id: String,
         after: Option<String>,
     },
+    /// Start or join a native audio huddle in `channel` (`rooms.join` + Amazon Chime SFU).
+    JoinHuddle {
+        channel: ChannelId,
+        audio: huddle::HuddleAudioConfig,
+    },
+    /// Leave the currently active native huddle cleanly (sends Chime `LEAVE` and releases audio).
+    LeaveHuddle,
+    /// Toggle local microphone mute in the active huddle.
+    SetHuddleMuted(bool),
+    /// Switch microphone and/or speaker in the active huddle without dropping the call.
+    SetHuddleAudioDevices {
+        input: Option<String>,
+        output: Option<String>,
+    },
+    /// Toggle pure-Rust Sonora AEC3 / noise suppression / AGC2 live in the active huddle.
+    SetHuddleAudioProcessing {
+        aec: bool,
+        ns: bool,
+        agc: bool,
+    },
+    /// Ring/invite workspace members into the active huddle (`rooms.notifyMember`).
+    InviteToHuddle {
+        channel: ChannelId,
+        users: Vec<UserId>,
+    },
+    /// Fetch the shareable huddle link for `channel` (`rooms.getLink`).
+    CopyHuddleLink {
+        channel: ChannelId,
+    },
+    /// Play a short two-note speaker test chime on `output_device` (Preferences -> Audio & video).
+    TestHuddleSpeaker {
+        output_device: Option<String>,
+    },
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
 }
@@ -717,6 +751,23 @@ pub enum Event {
         participants: Vec<UserId>,
         ended: bool,
     },
+    /// Active native huddle session lifecycle snapshot (`Connecting`, `Connected`, `Reconnecting`, `Failed`, `Idle`).
+    HuddleSessionChanged(Box<huddle::HuddleSessionSnapshot>),
+    /// Live local RMS level and remote active-speaker / mute states from the active Chime session.
+    HuddleAudioLevels(huddle::HuddleAudioLevels),
+    /// Incoming direct-message huddle ring (`huddle_invite`, `F-COLLAB-031`).
+    HuddleInvite {
+        channel: ChannelId,
+        inviter: UserId,
+        call_id: String,
+    },
+    /// Incoming direct-message huddle invite was cancelled or timed out (`huddle_invite_cancel`).
+    HuddleInviteCancelled {
+        channel: Option<ChannelId>,
+        call_id: Option<String>,
+    },
+    /// Shareable huddle join link fetched via `rooms.getLink` (`F-COLLAB-039`).
+    HuddleLinkLoaded { channel: ChannelId, url: String },
     /// Hydrated custom profile fields and pronouns for `user` (`users.profile.get` + `team.profile.get`).
     UserProfileLoaded {
         user: UserId,

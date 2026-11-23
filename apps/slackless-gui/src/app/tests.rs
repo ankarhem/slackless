@@ -890,3 +890,115 @@ fn dm_unread_clears_when_viewed_and_stays_read(cx: &mut gpui::TestAppContext) {
     });
     assert_ne!(general_id, dm_id);
 }
+
+#[gpui::test]
+fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    cx.update(crate::theme::init);
+    cx.update(|cx| cx.set_global(crate::zoom::Zoom::default()));
+    let fixtures = Arc::new(fixtures::load());
+    let general = ChannelId::from("C0GENERAL");
+    let design = ChannelId::from("C0DESIGN");
+    let inviter = fixtures
+        .users
+        .iter()
+        .find(|u| u.id != fixtures.self_user)
+        .expect("other user in fixtures")
+        .id
+        .clone();
+
+    let mounted: Rc<std::cell::RefCell<Option<gpui::Entity<App>>>> =
+        Rc::new(std::cell::RefCell::new(None));
+    let slot = mounted.clone();
+    let win = cx.add_window(|window, cx| {
+        let app = App::new(fixtures.clone(), CoreBridge::offline(), window, cx);
+        *slot.borrow_mut() = Some(app.clone());
+        gpui_kit::component::Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    let mut cx = gpui::VisualTestContext::from_window(win.into(), cx);
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. Start huddle in #general -> persistent sidebar mini-dock mounts.
+            app.select(general.clone(), cx);
+            app.start_huddle(window, cx);
+            assert!(app.huddle_dock.is_some(), "sidebar mini-dock should mount");
+            assert_eq!(
+                app.huddle_session.as_ref().map(|s| &s.channel),
+                Some(&general)
+            );
+
+            // 2. Switching channels keeps the mini-dock pinned in the sidebar.
+            app.select(design.clone(), cx);
+            assert!(
+                app.huddle_dock.is_some(),
+                "sidebar mini-dock must persist across channel switches"
+            );
+
+            // 3. Mute toggle updates session + dock state.
+            let was_muted = app.huddle_session.as_ref().unwrap().muted;
+            app.toggle_huddle_mute(cx);
+            assert_eq!(app.huddle_session.as_ref().unwrap().muted, !was_muted);
+            assert_eq!(
+                app.huddle_dock.as_ref().unwrap().read(cx).session().muted,
+                !was_muted
+            );
+
+            // 4. Live speaking / RMS audio levels render without error.
+            app.on_core_event(
+                &Event::HuddleAudioLevels(slackless_core::huddle::HuddleAudioLevels {
+                    local_rms: 0.25,
+                    active_speakers: vec![(inviter.clone(), 0.72)],
+                    muted_peers: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+
+            // 5. Incoming DM huddle invite banner mounts and cancels cleanly.
+            app.on_core_event(
+                &Event::HuddleInvite {
+                    channel: design.clone(),
+                    inviter: inviter.clone(),
+                    call_id: "R0INVITE1".to_owned(),
+                },
+                window,
+                cx,
+            );
+            assert!(
+                app.huddle_invite.is_some(),
+                "incoming DM huddle invite should mount floating ring banner"
+            );
+            app.on_core_event(
+                &Event::HuddleInviteCancelled {
+                    channel: Some(design.clone()),
+                    call_id: None,
+                },
+                window,
+                cx,
+            );
+            assert!(
+                app.huddle_invite.is_none(),
+                "huddle_invite_cancel should dismiss floating ring banner"
+            );
+
+            // 6. Preferences -> Audio & video section renders and releases mic probe on exit.
+            app.preferences
+                .update(cx, |p, cx| p.show(Section::AudioVideo, cx));
+        });
+        let _ = window.draw(cx);
+        app.update(cx, |app, cx| {
+            app.preferences
+                .update(cx, |p, cx| p.show(Section::Notifications, cx));
+            // 7. Leaving clears session and unmounts sidebar mini-dock.
+            app.leave_huddle(cx);
+            assert!(app.huddle_dock.is_none());
+            assert!(app.huddle_session.is_none());
+        });
+        let _ = window.draw(cx);
+    });
+}

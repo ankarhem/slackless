@@ -45,6 +45,9 @@ pub enum ApiError {
     /// The body was not JSON, or `ok: true` but the payload did not match the expected shape.
     #[error("malformed slack response: {0}")]
     Decode(#[from] serde_json::Error),
+    /// The workspace returned a legacy non-Chime huddle backend (Screenhero) instead of `free_willy`.
+    #[error("unsupported huddle backend: {0}")]
+    UnsupportedHuddleBackend(String),
 }
 
 impl ApiError {

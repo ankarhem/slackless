@@ -38,6 +38,8 @@ mod files_page;
 mod fixtures;
 mod hover_card;
 mod huddle;
+mod huddle_dock;
+mod huddle_invite;
 mod huddles;
 mod image_viewer;
 mod later;

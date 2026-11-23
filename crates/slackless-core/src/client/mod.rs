@@ -349,6 +349,8 @@ pub(crate) struct Core<B: Backend> {
     is_offline: bool,
     /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
     offline_queue: VecDeque<(i64, QueuedMutation)>,
+    /// Active native Chime audio huddle session handle (at most one per workspace).
+    active_huddle: Arc<Mutex<Option<crate::huddle::HuddleHandle>>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -400,6 +402,7 @@ impl<B: Backend> Core<B> {
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
             offline_queue: persisted,
+            active_huddle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1969,6 +1972,136 @@ impl<B: Backend> Core<B> {
                     Ok(())
                 });
             }
+            Command::JoinHuddle { channel, audio } => {
+                // Leave any currently running huddle first so only one audio session runs.
+                if let Some(prev) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                {
+                    prev.leave();
+                }
+                let active_huddle = Arc::clone(&self.active_huddle);
+                let team_id = self.workspace.clone();
+                self.spawn("rooms.join", async move {
+                    let joined = backend.rooms_join(channel.clone()).await?;
+                    let creds = crate::huddle::HuddleCredentials {
+                        channel: channel.clone(),
+                        call_id: joined.call_id.clone(),
+                        meeting_id: joined.chime.meeting.meeting_id,
+                        attendee_id: joined.chime.attendee.attendee_id,
+                        external_user_id: joined.chime.attendee.external_user_id,
+                        join_token: joined.chime.attendee.join_token,
+                        signaling_url: joined.chime.meeting.media_placement.signaling_url,
+                        turn_control_url: joined.chime.meeting.media_placement.turn_control_url,
+                        audio_host_url: joined.chime.meeting.media_placement.audio_host_url,
+                        thread_root_ts: joined.huddle.thread_root_ts.or_else(|| {
+                            joined
+                                .canvas
+                                .as_ref()
+                                .and_then(|c| c.root_thread_ts.clone())
+                        }),
+                        canvas_file_id: joined.canvas.as_ref().and_then(|c| c.file_id.clone()),
+                        huddle_link: joined.huddle.huddle_link.or_else(|| {
+                            Some(format!("https://app.slack.com/huddle/{team_id}/{channel}"))
+                        }),
+                    };
+                    let (upd_tx, mut upd_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let handle = crate::huddle::spawn_huddle_session(creds, audio, upd_tx);
+                    *active_huddle.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
+                    let active_for_clear = Arc::clone(&active_huddle);
+                    tokio::spawn(async move {
+                        while let Some(upd) = upd_rx.recv().await {
+                            match upd {
+                                crate::huddle::HuddleUpdate::State(snap) => {
+                                    let done = matches!(
+                                        snap.phase,
+                                        crate::huddle::HuddlePhase::Idle
+                                            | crate::huddle::HuddlePhase::Failed
+                                    );
+                                    events.emit(Event::HuddleSessionChanged(Box::new(snap)));
+                                    if done {
+                                        let _ = active_for_clear
+                                            .lock()
+                                            .unwrap_or_else(PoisonError::into_inner)
+                                            .take();
+                                    }
+                                }
+                                crate::huddle::HuddleUpdate::AudioLevels(levels) => {
+                                    events.emit(Event::HuddleAudioLevels(levels));
+                                }
+                            }
+                        }
+                    });
+                    Ok(())
+                });
+            }
+            Command::LeaveHuddle => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                {
+                    handle.leave();
+                }
+            }
+            Command::SetHuddleMuted(muted) => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetMuted(muted));
+                }
+            }
+            Command::SetHuddleAudioDevices { input, output } => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetAudioDevices { input, output });
+                }
+            }
+            Command::SetHuddleAudioProcessing { aec, ns, agc } => {
+                if let Some(handle) = self
+                    .active_huddle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    handle.send(crate::huddle::HuddleControl::SetAudioProcessing { aec, ns, agc });
+                }
+            }
+            Command::InviteToHuddle { channel, users } => {
+                self.spawn("rooms.notifyMember", async move {
+                    for user in users {
+                        backend.rooms_notify_member(channel.clone(), user).await?;
+                    }
+                    Ok(())
+                });
+            }
+            Command::CopyHuddleLink { channel } => {
+                self.spawn("rooms.getLink", async move {
+                    let url = backend.rooms_get_link(channel.clone()).await?;
+                    events.emit(Event::HuddleLinkLoaded { channel, url });
+                    Ok(())
+                });
+            }
+            Command::TestHuddleSpeaker { output_device } => {
+                let events = self.events.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) =
+                        crate::huddle::play_speaker_test_tone(output_device.as_deref())
+                    {
+                        events.emit(Event::Error(format!("speaker test: {err}")));
+                    }
+                });
+            }
             // Handled by the loop.
             Command::Shutdown => {}
         }
@@ -2084,6 +2217,37 @@ impl<B: Backend> Core<B> {
                             });
                         }
                     }
+                    SlackEvent::ShRoomJoin(ev)
+                    | SlackEvent::ShRoomUpdate(ev)
+                    | SlackEvent::ShRoomLeave(ev) => {
+                        let ended = !ev.room.is_active();
+                        let participants = ev.room.participants.clone();
+                        for channel in ev.target_channels() {
+                            self.events.emit(Event::HuddleUpdated {
+                                channel,
+                                participants: participants.clone(),
+                                ended,
+                            });
+                        }
+                    }
+                    SlackEvent::HuddleInvite(inv) => {
+                        if !inv.channel_id.as_str().is_empty()
+                            && !inv.sender_user_id.as_str().is_empty()
+                        {
+                            self.events.emit(Event::HuddleInvite {
+                                channel: inv.channel_id.clone(),
+                                inviter: inv.sender_user_id.clone(),
+                                call_id: inv.call_id.clone(),
+                            });
+                        }
+                    }
+                    SlackEvent::HuddleInviteCancel(cancel) => {
+                        self.events.emit(Event::HuddleInviteCancelled {
+                            channel: (!cancel.channel_id.as_str().is_empty())
+                                .then(|| cancel.channel_id.clone()),
+                            call_id: None,
+                        });
+                    }
                     _ => {}
                 }
                 if matches!(&event, SlackEvent::EmojiChanged(_)) {
@@ -2153,55 +2317,6 @@ impl<B: Backend> Core<B> {
                             .unwrap_or_default()
                             .to_owned();
                         self.events.emit(Event::ModalClosed(id));
-                    } else if matches!(
-                        r#type.as_str(),
-                        "sh_room_join" | "sh_room_update" | "sh_room_leave"
-                    ) {
-                        if let Some(room) = raw.get("room") {
-                            let ended = room
-                                .get("has_ended")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false);
-                            let participants: Vec<UserId> = room
-                                .get("participants")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(UserId::from)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let mut channels: Vec<ChannelId> = room
-                                .get("channels")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(serde_json::Value::as_str)
-                                        .map(ChannelId::from)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            if channels.is_empty() {
-                                if let Some(cid) = raw
-                                    .get("huddle")
-                                    .and_then(|h| h.get("channel_id"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .or_else(|| {
-                                        raw.get("channel_id").and_then(serde_json::Value::as_str)
-                                    })
-                                {
-                                    channels.push(ChannelId::from(cid));
-                                }
-                            }
-                            for channel in channels {
-                                self.events.emit(Event::HuddleUpdated {
-                                    channel,
-                                    participants: participants.clone(),
-                                    ended: ended || participants.is_empty(),
-                                });
-                            }
-                        }
                     }
                 }
                 if let Some(channel) = refresh_target(&event) {
@@ -2519,6 +2634,14 @@ impl<B: Backend> Core<B> {
     }
 
     fn shutdown(&mut self) {
+        if let Some(handle) = self
+            .active_huddle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.leave();
+        }
         for (_, task) in self.backfills.drain() {
             task.abort();
         }

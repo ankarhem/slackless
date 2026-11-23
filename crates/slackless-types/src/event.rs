@@ -58,8 +58,15 @@ tagged_enum! {
         // Users, emoji, prefs.
         "user_change" => UserChange(UserChange),
         "user_profile_changed" => UserProfileChanged(UserChange),
+        "user_huddle_changed" => UserHuddleChanged(UserChange),
         "emoji_changed" => EmojiChanged(EmojiChanged),
         "pref_change" => PrefChange(PrefChange),
+        // Huddles & calls.
+        "sh_room_join" => ShRoomJoin(Box<HuddleRoomEvent>),
+        "sh_room_leave" => ShRoomLeave(Box<HuddleRoomEvent>),
+        "sh_room_update" => ShRoomUpdate(Box<HuddleRoomEvent>),
+        "huddle_invite" => HuddleInvite(Box<HuddleInviteEvent>),
+        "huddle_invite_cancel" => HuddleInviteCancel(HuddleInviteCancelEvent),
     }
 }
 
@@ -407,6 +414,133 @@ pub struct PrefChange {
     pub name: String,
     #[serde(default)]
     pub value: Value,
+}
+
+/// Complete Slack Huddle / Screenhero room snapshot carried by `sh_room_join`, `sh_room_leave`,
+/// `sh_room_update`, `rooms.join`, and `huddle_thread` messages. Always snapshot-replace.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HuddleRoom {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<UserId>,
+    #[serde(default)]
+    pub date_start: Option<i64>,
+    #[serde(default)]
+    pub date_end: Option<i64>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub participants: Vec<UserId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub participant_history: Vec<UserId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub participants_camera_on: Vec<UserId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub participants_camera_off: Vec<UserId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub participants_screenshare_on: Vec<UserId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub participants_screenshare_off: Vec<UserId>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub channels: Vec<ChannelId>,
+    #[serde(default)]
+    pub thread_root_ts: Option<Ts>,
+    #[serde(default)]
+    pub canvas_thread_ts: Option<Ts>,
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_dm_call: bool,
+    #[serde(default, deserialize_with = "null_default")]
+    pub has_ended: bool,
+    #[serde(default, deserialize_with = "null_default")]
+    pub is_prewarmed: bool,
+    #[serde(default)]
+    pub media_backend_type: Option<String>,
+    #[serde(default)]
+    pub external_unique_id: Option<String>,
+    #[serde(default)]
+    pub huddle_link: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl HuddleRoom {
+    /// Whether this room is actively running with at least one participant (prewarmed rooms
+    /// with `participants: []` and ended rooms are not active).
+    pub fn is_active(&self) -> bool {
+        !self.has_ended && !self.participants.is_empty()
+    }
+}
+
+/// Optional `huddle` wrapper inside `sh_room_*` events carrying the target channel id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HuddleRef {
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
+}
+
+/// `sh_room_join` / `sh_room_leave` / `sh_room_update`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HuddleRoomEvent {
+    #[serde(default)]
+    pub room: HuddleRoom,
+    #[serde(default)]
+    pub user: Option<UserId>,
+    #[serde(default)]
+    pub huddle: Option<HuddleRef>,
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
+    #[serde(default)]
+    pub event_ts: Option<Ts>,
+    #[serde(default)]
+    pub ts: Option<Ts>,
+}
+
+impl HuddleRoomEvent {
+    /// All channels associated with this room event (`room.channels`, falling back to
+    /// `huddle.channel_id` or top-level `channel_id`).
+    pub fn target_channels(&self) -> Vec<ChannelId> {
+        let mut out = self.room.channels.clone();
+        if out.is_empty() {
+            if let Some(ch) = self
+                .huddle
+                .as_ref()
+                .and_then(|h| h.channel_id.clone())
+                .or_else(|| self.channel_id.clone())
+            {
+                out.push(ch);
+            }
+        }
+        out
+    }
+}
+
+/// `huddle_invite`: direct two-party huddle invite (the only huddle event that should ring).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HuddleInviteEvent {
+    #[serde(default)]
+    pub call_id: String,
+    #[serde(default)]
+    pub channel_id: ChannelId,
+    #[serde(default)]
+    pub sender_user_id: UserId,
+    #[serde(default)]
+    pub team_id: Option<TeamId>,
+    #[serde(default)]
+    pub event_ts: Option<Ts>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+/// `huddle_invite_cancel`: caller hung up before the DM huddle invite was answered.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HuddleInviteCancelEvent {
+    #[serde(default)]
+    pub channel_id: ChannelId,
+    #[serde(default)]
+    pub team_id: Option<TeamId>,
+    #[serde(default)]
+    pub event_ts: Option<Ts>,
 }
 
 #[cfg(test)]

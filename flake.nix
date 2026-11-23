@@ -61,6 +61,8 @@
                 gdb
                 minicom
                 usbutils
+                cmake
+                pkg-config
               ]
               ++ config.pre-commit.settings.enabledPackages;
 

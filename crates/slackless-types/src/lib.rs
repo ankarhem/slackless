@@ -24,7 +24,10 @@ pub use conversation::{
     ChannelCanvas, Conversation, ConversationKind, ConversationProperties, ConversationTabKind,
     ConversationTabSpec, Latest, TabData, TopicPurpose,
 };
-pub use event::{MessageEvent, SlackEvent};
+pub use event::{
+    HuddleInviteCancelEvent, HuddleInviteEvent, HuddleRef, HuddleRoom, HuddleRoomEvent,
+    MessageEvent, SlackEvent,
+};
 pub use file::{File, FileMode};
 pub use ids::{BotId, ChannelId, FileId, TeamId, Ts, UserId, UsergroupId};
 pub use message::{Attachment, BotProfile, Edited, Message, MessageSubtype};

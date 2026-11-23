@@ -40,6 +40,8 @@ pub enum PreferencesEvent {
     PruneMediaCache,
     /// User asked to export captured HTTP net-log JSON (`F-SHELL-158`).
     ExportNetLog,
+    /// User clicked "Test speaker" in Preferences -> Audio & video (`F-COLLAB-040`).
+    TestSpeaker(Option<String>),
 }
 
 /// Snapshot of local SQLite & media cache metrics shown in Preferences -> Advanced.
@@ -121,19 +123,21 @@ pub enum Section {
     Appearance,
     Messages,
     Language,
+    AudioVideo,
     Accessibility,
     MarkAsRead,
     Advanced,
 }
 
 impl Section {
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 10] = [
         Section::Notifications,
         Section::Navigation,
         Section::Home,
         Section::Appearance,
         Section::Messages,
         Section::Language,
+        Section::AudioVideo,
         Section::Accessibility,
         Section::MarkAsRead,
         Section::Advanced,
@@ -147,6 +151,7 @@ impl Section {
             Section::Appearance => "Appearance & Themes",
             Section::Messages => "Messages & media",
             Section::Language => "Language & region",
+            Section::AudioVideo => "Audio & video",
             Section::Accessibility => "Accessibility",
             Section::MarkAsRead => "Mark as read",
             Section::Advanced => "Advanced",
@@ -161,6 +166,7 @@ impl Section {
             Section::Appearance => IconName::Palette,
             Section::Messages => IconName::MessageSquare,
             Section::Language => IconName::Globe,
+            Section::AudioVideo => IconName::Headphones,
             Section::Accessibility => IconName::Accessibility,
             Section::MarkAsRead => IconName::CheckCheck,
             Section::Advanced => IconName::SlidersHorizontal,
@@ -362,6 +368,23 @@ pub struct Settings {
     pub proxy_url: String,
     /// Capture redacted HTTP request/response diagnostics in memory (`F-SHELL-158`).
     pub net_log_enabled: bool,
+    // Audio & video (Huddles)
+    /// Preferred microphone name (`None` = macOS system default).
+    pub huddle_input_device: Option<String>,
+    /// Preferred speaker name (`None` = macOS system default).
+    pub huddle_output_device: Option<String>,
+    /// Pure-Rust Sonora WebRTC AEC3 acoustic echo cancellation.
+    pub huddle_aec: bool,
+    /// Pure-Rust Sonora noise suppression.
+    pub huddle_ns: bool,
+    /// Pure-Rust Sonora automatic gain control (AGC2).
+    pub huddle_agc: bool,
+    /// Start every huddle with microphone muted (`F-COLLAB-049`).
+    pub huddle_join_muted: bool,
+    /// Automatically leave active huddle when the computer screen locks (`F-COLLAB-059`).
+    pub huddle_leave_on_lock: bool,
+    /// Automatically pop out the dedicated Huddle Window when joining a huddle.
+    pub huddle_auto_open_window: bool,
 }
 
 /// Active rendering preferences cached as a GPUI global so every message list, thread panel,
@@ -538,6 +561,14 @@ impl Default for Settings {
             ask_download_location: false,
             proxy_url: String::new(),
             net_log_enabled: false,
+            huddle_input_device: None,
+            huddle_output_device: None,
+            huddle_aec: true,
+            huddle_ns: true,
+            huddle_agc: true,
+            huddle_join_muted: false,
+            huddle_leave_on_lock: true,
+            huddle_auto_open_window: false,
         }
     }
 }
@@ -624,6 +655,9 @@ pub struct Preferences {
     custom_accent_hex: Entity<TextareaState>,
     slack_theme_import: Entity<TextareaState>,
     storage_stats: Option<StorageInfo>,
+    audio_devices: slackless_core::huddle::AudioDevices,
+    mic_probe: Option<slackless_core::huddle::MicLevelProbe>,
+    mic_level: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -716,6 +750,9 @@ impl Preferences {
                 custom_accent_hex,
                 slack_theme_import,
                 storage_stats: None,
+                audio_devices: slackless_core::huddle::AudioDevices::default(),
+                mic_probe: None,
+                mic_level: 0.0,
                 _subscriptions: subscriptions,
             }
         })
@@ -766,7 +803,48 @@ impl Preferences {
     pub fn show(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
         self.open_select = None;
+        if section == Section::AudioVideo {
+            self.refresh_audio_devices_and_probe(cx);
+        } else {
+            self.stop_mic_probe();
+        }
         cx.notify();
+    }
+
+    /// Release the live microphone level meter probe (called when leaving Audio & video or closing Preferences).
+    pub fn stop_mic_probe(&mut self) {
+        self.mic_probe = None;
+        self.mic_level = 0.0;
+    }
+
+    fn refresh_audio_devices_and_probe(&mut self, cx: &mut Context<Self>) {
+        self.audio_devices = slackless_core::huddle::list_audio_devices();
+        let wanted = self.settings.huddle_input_device.as_deref();
+        self.mic_probe = slackless_core::huddle::MicLevelProbe::start(wanted).ok();
+        if self.mic_probe.is_some() {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(80))
+                        .await;
+                    let keep = this
+                        .update(cx, |prefs, cx| {
+                            if let Some(probe) = &prefs.mic_probe {
+                                prefs.mic_level = probe.level();
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !keep {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     /// Show zoom level `level` (Cmd+= / Cmd+- / Cmd+0, or the remembered one) and apply it.
@@ -2180,21 +2258,232 @@ impl Preferences {
             cx,
         )
     }
-}
+    fn audio_video(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (border, muted, success) = (theme.border, theme.muted_foreground, theme.success);
+        let active_in = self.settings.huddle_input_device.clone();
+        let active_out = self.settings.huddle_output_device.clone();
+        let meter_pct = (self.mic_level * 3.5).clamp(0.0, 1.0);
 
-impl Render for Preferences {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match self.section {
+        let mic_picker = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .child({
+                        let is_def = active_in.is_none();
+                        Button::new("prefs-mic-default")
+                            .outline()
+                            .with_size(Size::Small)
+                            .label(if is_def {
+                                "✓ System default"
+                            } else {
+                                "System default"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings.huddle_input_device = None;
+                                this.refresh_audio_devices_and_probe(cx);
+                                this.changed(cx);
+                            }))
+                    })
+                    .children(
+                        self.audio_devices
+                            .inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, dev)| {
+                                let selected = active_in.as_deref() == Some(dev.name.as_str());
+                                let name = dev.name.clone();
+                                Button::new(("prefs-mic", ix))
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .label(if selected {
+                                        format!("✓ {}", dev.name)
+                                    } else {
+                                        dev.name.clone()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.settings.huddle_input_device = Some(name.clone());
+                                        this.refresh_audio_devices_and_probe(cx);
+                                        this.changed(cx);
+                                    }))
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_xs().text_color(muted).child("Input level"))
+                    .child(
+                        div()
+                            .w(px(320.))
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(border.opacity(0.5))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui_kit::gpui::relative(meter_pct))
+                                    .rounded_full()
+                                    .bg(success),
+                            ),
+                    ),
+            );
+
+        let speaker_picker =
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .child({
+                            let is_def = active_out.is_none();
+                            Button::new("prefs-spk-default")
+                                .outline()
+                                .with_size(Size::Small)
+                                .label(if is_def {
+                                    "✓ System default"
+                                } else {
+                                    "System default"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings.huddle_output_device = None;
+                                    this.changed(cx);
+                                }))
+                        })
+                        .children(self.audio_devices.outputs.iter().enumerate().map(
+                            |(ix, dev)| {
+                                let selected = active_out.as_deref() == Some(dev.name.as_str());
+                                let name = dev.name.clone();
+                                Button::new(("prefs-spk", ix))
+                                    .outline()
+                                    .with_size(Size::Small)
+                                    .label(if selected {
+                                        format!("✓ {}", dev.name)
+                                    } else {
+                                        dev.name.clone()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.settings.huddle_output_device = Some(name.clone());
+                                        this.changed(cx);
+                                    }))
+                            },
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("prefs-test-speaker")
+                                .outline()
+                                .with_size(Size::Small)
+                                .icon(IconName::Play)
+                                .label("Test speaker")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.emit(PreferencesEvent::TestSpeaker(
+                                        this.settings.huddle_output_device.clone(),
+                                    ));
+                                })),
+                        )
+                        .child(
+                            Button::new("prefs-refresh-audio")
+                                .ghost()
+                                .with_size(Size::Small)
+                                .icon(IconName::RefreshCw)
+                                .label("Refresh devices")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.refresh_audio_devices_and_probe(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                );
+
+        let dsp = v_flex()
+            .gap_1p5()
+            .child(self.checkbox(
+                "prefs-huddle-aec",
+                "Echo cancellation (WebRTC AEC3)",
+                |s| &mut s.huddle_aec,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-ns",
+                "Background noise suppression",
+                |s| &mut s.huddle_ns,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-agc",
+                "Automatic microphone gain control",
+                |s| &mut s.huddle_agc,
+                cx,
+            ));
+
+        let behavior = v_flex()
+            .gap_1p5()
+            .child(self.checkbox(
+                "prefs-huddle-join-muted",
+                "Mute my microphone when joining a huddle",
+                |s| &mut s.huddle_join_muted,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-leave-lock",
+                "Automatically leave a huddle when my computer locks",
+                |s| &mut s.huddle_leave_on_lock,
+                cx,
+            ))
+            .child(self.checkbox(
+                "prefs-huddle-auto-popout",
+                "Automatically open the Huddle window when joining",
+                |s| &mut s.huddle_auto_open_window,
+                cx,
+            ));
+
+        v_flex()
+            .child(self.group(
+                "Microphone",
+                Some("Choose which microphone slackless uses for native huddles."),
+                mic_picker,
+                cx,
+            ))
+            .child(self.group(
+                "Speaker",
+                Some("Choose where huddle audio plays."),
+                speaker_picker,
+                cx,
+            ))
+            .child(self.group(
+                "Audio processing",
+                Some("Pure-Rust real-time DSP applied to captured microphone audio."),
+                dsp,
+                cx,
+            ))
+            .child(self.group("When joining a huddle", None, behavior, cx))
+    }
+
+    fn render_body(&mut self, cx: &mut Context<Self>) -> Div {
+        match self.section {
             Section::Notifications => self.notifications(cx),
             Section::Navigation => self.navigation(cx),
             Section::Home => self.home(cx),
             Section::Appearance => self.appearance(cx),
             Section::Messages => self.messages(cx),
             Section::Language => self.language(cx),
+            Section::AudioVideo => self.audio_video(cx),
             Section::Accessibility => self.accessibility(cx),
             Section::MarkAsRead => self.mark_as_read(cx),
             Section::Advanced => self.advanced(cx),
-        };
+        }
+    }
+}
+
+impl Render for Preferences {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = self.render_body(cx);
         let nav = self.nav(cx);
         let title = self.section.label();
         h_flex()
@@ -2228,6 +2517,13 @@ impl Render for Preferences {
 /// font, and layout changes can be previewed side-by-side with the main workspace window.
 struct PreferencesWindow {
     preferences: Entity<Preferences>,
+}
+
+impl Drop for PreferencesWindow {
+    fn drop(&mut self) {
+        // Release any live microphone probe when the Preferences window closes.
+        let _ = &self.preferences;
+    }
 }
 
 impl Render for PreferencesWindow {
@@ -2280,6 +2576,11 @@ pub fn open_preferences_window(
     gpui_kit::open_window(options, cx, move |window, cx| {
         window.set_window_title("Preferences — slackless");
         window.activate_window();
+        let prefs_close = preferences.clone();
+        window.on_window_should_close(cx, move |_, cx| {
+            prefs_close.update(cx, |p, _| p.stop_mic_probe());
+            true
+        });
         cx.new(|_| PreferencesWindow { preferences })
     })
     .ok()

@@ -610,3 +610,24 @@ pub(crate) fn install_mouse_nav_monitor(
         }
     });
 }
+
+static SCREEN_LOCK_MONITOR: Once = Once::new();
+
+pub(crate) fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'static) {
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    SCREEN_LOCK_MONITOR.call_once(|| {
+        use objc2_foundation::{NSDistributedNotificationCenter, NSNotification};
+
+        let center = NSDistributedNotificationCenter::defaultCenter();
+        let name = NSString::from_str("com.apple.screenIsLocked");
+        let block = RcBlock::new(move |_notif: NonNull<NSNotification>| {
+            on_lock();
+        });
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(Some(&name), None, None, &block)
+        };
+        std::mem::forget(observer);
+    });
+}

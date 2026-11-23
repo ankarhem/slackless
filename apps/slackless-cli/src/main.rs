@@ -179,6 +179,11 @@ enum Commands {
         #[arg(long, value_name = "N")]
         count: Option<usize>,
     },
+    /// Native Slack Huddles (audio join/smoke-test, shareable link, invite, local audio devices).
+    Huddle {
+        #[command(subcommand)]
+        command: HuddleCommand,
+    },
     /// Account and session management.
     Auth {
         #[command(subcommand)]
@@ -281,6 +286,41 @@ enum ListCommand {
 enum ExportFormat {
     Md,
     Json,
+}
+
+#[derive(Subcommand)]
+enum HuddleCommand {
+    /// List available local microphones and speakers (offline).
+    Devices,
+    /// Join or start a live native audio huddle in a channel (Ctrl+C or `--duration` leaves cleanly).
+    Join {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Start with microphone muted.
+        #[arg(long)]
+        muted: bool,
+        /// Automatically leave after N seconds (useful for headless smoke tests).
+        #[arg(long, value_name = "SECS")]
+        duration: Option<u64>,
+        /// Preferred input microphone name (defaults to system default).
+        #[arg(long, value_name = "NAME")]
+        input: Option<String>,
+        /// Preferred output speaker name (defaults to system default).
+        #[arg(long, value_name = "NAME")]
+        output: Option<String>,
+    },
+    /// Fetch the shareable huddle link for a channel (`rooms.getLink`).
+    Link {
+        /// Channel id, #name, or @handle.
+        channel: String,
+    },
+    /// Invite/ring a workspace member into a channel's active huddle (`rooms.notifyMember`).
+    Invite {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Member user id (e.g. `U0123ABC`).
+        user: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -442,6 +482,20 @@ async fn dispatch(
         Commands::Watch { channel, count } => {
             live::run_watch(ctx, flag, channel.as_deref(), count).await
         }
+        Commands::Huddle { command } => match command {
+            HuddleCommand::Devices => live::run_huddle_devices(ctx),
+            HuddleCommand::Join {
+                channel,
+                muted,
+                duration,
+                input,
+                output,
+            } => live::run_huddle_join(ctx, flag, &channel, muted, duration, input, output).await,
+            HuddleCommand::Link { channel } => live::run_huddle_link(ctx, flag, &channel).await,
+            HuddleCommand::Invite { channel, user } => {
+                live::run_huddle_invite(ctx, flag, &channel, &user).await
+            }
+        },
         Commands::Auth { command } => match command {
             AuthCommand::Status => cmd_auth_status(ctx),
             AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),

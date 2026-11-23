@@ -793,6 +793,219 @@ pub(crate) fn list_to_tsv(data: &SlackListData) -> String {
     out
 }
 
+/// `huddle devices` (offline): list host input microphones and output speakers.
+pub fn run_huddle_devices(ctx: &Ctx) -> Result<ExitCode> {
+    let devices = slackless_core::huddle::list_audio_devices();
+    let mut human = String::new();
+    human.push_str("INPUTS\n");
+    for d in &devices.inputs {
+        let mark = if d.is_default { "*" } else { " " };
+        human.push_str(&format!("{mark}\t{}\n", d.name));
+    }
+    human.push_str("OUTPUTS\n");
+    for d in &devices.outputs {
+        let mark = if d.is_default { "*" } else { " " };
+        human.push_str(&format!("{mark}\t{}\n", d.name));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "inputs": devices.inputs.iter().map(|d| serde_json::json!({"name": d.name, "default": d.is_default})).collect::<Vec<_>>(),
+            "outputs": devices.outputs.iter().map(|d| serde_json::json!({"name": d.name, "default": d.is_default})).collect::<Vec<_>>(),
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `huddle link <channel>`: fetch the shareable huddle join URL (`rooms.getLink`).
+pub async fn run_huddle_link(ctx: &Ctx, flag: Option<&str>, channel_arg: &str) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, _label) = resolve_channel(&workspace, channel_arg);
+    match api.rooms_get_link(&channel).await {
+        Ok(url_opt) => {
+            let url = url_opt
+                .unwrap_or_else(|| format!("https://app.slack.com/huddle/{workspace}/{channel}"));
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "url": url,
+                }),
+                &format!("{url}\n"),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `huddle invite <channel> <user>`: ring/notify a workspace member to join (`rooms.notifyMember`).
+pub async fn run_huddle_invite(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    user_arg: &str,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel(&workspace, channel_arg);
+    let user = slackless_core::types::UserId::from(user_arg.to_owned());
+    match api.rooms_notify_member(&channel, &user).await {
+        Ok(()) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "user": user.as_str(),
+                }),
+                &format!(
+                    "invited {} to huddle in {}\n",
+                    user,
+                    label.unwrap_or_else(|| channel.to_string())
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `huddle join <channel> [--muted] [--duration N] [--input NAME] [--output NAME]`:
+/// join a live native Chime audio huddle from the terminal and leave cleanly on Ctrl+C or timeout.
+pub async fn run_huddle_join(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    muted: bool,
+    duration: Option<u64>,
+    input: Option<String>,
+    output_dev: Option<String>,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel(&workspace, channel_arg);
+    let joined = match api.rooms_join(&channel, None, None).await {
+        Ok(resp) => resp,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+
+    let creds = slackless_core::huddle::HuddleCredentials {
+        channel: channel.clone(),
+        call_id: joined.call_id.clone(),
+        meeting_id: joined.chime.meeting.meeting_id,
+        attendee_id: joined.chime.attendee.attendee_id,
+        external_user_id: joined.chime.attendee.external_user_id,
+        join_token: joined.chime.attendee.join_token,
+        signaling_url: joined.chime.meeting.media_placement.signaling_url,
+        turn_control_url: joined.chime.meeting.media_placement.turn_control_url,
+        audio_host_url: joined.chime.meeting.media_placement.audio_host_url,
+        thread_root_ts: joined.huddle.thread_root_ts.or_else(|| {
+            joined
+                .canvas
+                .as_ref()
+                .and_then(|c| c.root_thread_ts.clone())
+        }),
+        canvas_file_id: joined.canvas.as_ref().and_then(|c| c.file_id.clone()),
+        huddle_link: joined.huddle.huddle_link.or_else(|| {
+            Some(format!(
+                "https://app.slack.com/huddle/{workspace}/{channel}"
+            ))
+        }),
+    };
+    let audio = slackless_core::huddle::HuddleAudioConfig {
+        muted,
+        input_device: input,
+        output_device: output_dev,
+        ..Default::default()
+    };
+
+    let (upd_tx, mut upd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = slackless_core::huddle::spawn_huddle_session(creds, audio, upd_tx);
+    let display = label.unwrap_or_else(|| channel.to_string());
+
+    let deadline =
+        duration.map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+    let mut exit_code = ExitCode::SUCCESS;
+
+    loop {
+        let timer_fut = async {
+            if let Some(at) = deadline {
+                tokio::time::sleep_until(at).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                handle.leave();
+                break;
+            }
+            _ = timer_fut => {
+                handle.leave();
+                break;
+            }
+            upd = upd_rx.recv() => {
+                match upd {
+                    Some(slackless_core::huddle::HuddleUpdate::State(snap)) => {
+                        let phase = format!("{:?}", snap.phase);
+                        output::emit(
+                            ctx.json,
+                            &serde_json::json!({
+                                "event": "state",
+                                "phase": phase,
+                                "channel": snap.channel.as_str(),
+                                "call_id": snap.call_id,
+                                "muted": snap.muted,
+                                "error": snap.error,
+                                "udp_blocked": snap.udp_blocked,
+                            }),
+                            &format!(
+                                "huddle {display}\t{phase}{}\n",
+                                snap.error.as_deref().map(|e| format!("\t{e}")).unwrap_or_default()
+                            ),
+                        );
+                        if snap.phase == slackless_core::huddle::HuddlePhase::Failed {
+                            exit_code = ExitCode::FAILURE;
+                            break;
+                        }
+                        if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
+                            break;
+                        }
+                    }
+                    Some(slackless_core::huddle::HuddleUpdate::AudioLevels(_)) => {}
+                    None => break,
+                }
+            }
+        }
+    }
+
+    // Drain briefly so Chime receives the LEAVE frame before process exit.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while let Some(upd) = upd_rx.recv().await {
+            if matches!(
+                upd,
+                slackless_core::huddle::HuddleUpdate::State(s)
+                    if s.phase == slackless_core::huddle::HuddlePhase::Idle
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+
+    Ok(exit_code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

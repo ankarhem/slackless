@@ -1029,7 +1029,91 @@ impl App {
                 let keys: HashSet<ChannelId> = self.ws.active_huddles.keys().cloned().collect();
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
+                if let Some(dock) = &self.huddle_dock {
+                    if dock.read(cx).session().channel == *channel {
+                        dock.update(cx, |d, cx| {
+                            d.set_participants(
+                                if *ended {
+                                    Vec::new()
+                                } else {
+                                    participants.clone()
+                                },
+                                cx,
+                            )
+                        });
+                    }
+                }
+                if let Some((bar_ch, bar)) = &self.huddle {
+                    if bar_ch == channel {
+                        bar.update(cx, |b, cx| b.set_participants(participants.clone(), cx));
+                    }
+                }
                 cx.notify();
+            }
+            Event::HuddleSessionChanged(snap) => {
+                let snap = (**snap).clone();
+                if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
+                    self.clear_huddle_dock(cx);
+                } else {
+                    self.huddle_session = Some(snap.clone());
+                    if let Some(dock) = &self.huddle_dock {
+                        dock.update(cx, |d, cx| d.update_session(snap.clone(), cx));
+                    } else {
+                        self.mount_huddle_dock(snap.clone(), window, cx);
+                    }
+                    if let Some((bar_ch, bar)) = &self.huddle {
+                        if *bar_ch == snap.channel {
+                            bar.update(cx, |b, cx| b.update_session(Some(snap.clone()), cx));
+                        }
+                    }
+                }
+                cx.notify();
+            }
+            Event::HuddleAudioLevels(levels) => {
+                if let Some(dock) = &self.huddle_dock {
+                    dock.update(cx, |d, cx| d.update_levels(levels.clone(), cx));
+                }
+                if let Some((_, bar)) = &self.huddle {
+                    bar.update(cx, |b, cx| b.update_levels(levels.clone(), cx));
+                }
+            }
+            Event::HuddleInvite {
+                channel,
+                inviter,
+                call_id,
+            } => {
+                if self.preferences.read(cx).settings().notify_huddle_invites {
+                    self.show_huddle_invite(
+                        crate::huddle_invite::PendingHuddleInvite {
+                            channel: channel.clone(),
+                            inviter: inviter.clone(),
+                            call_id: call_id.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                    let sender = self.fixtures.user_name(inviter).to_owned();
+                    let tag = format!("huddle-invite:{channel}:{call_id}");
+                    self.system_notification_kind(
+                        &tag,
+                        "Incoming huddle",
+                        &format!("{sender} invited you to a huddle"),
+                        true,
+                        cx,
+                    );
+                }
+            }
+            Event::HuddleInviteCancelled { channel, .. } => {
+                let should_dismiss = self.huddle_invite.as_ref().is_some_and(|b| {
+                    channel.is_none() || channel.as_ref() == Some(&b.read(cx).invite().channel)
+                });
+                if should_dismiss {
+                    self.dismiss_huddle_invite(cx);
+                }
+            }
+            Event::HuddleLinkLoaded { url, .. } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                notify("Huddle link copied", url.clone(), window, cx);
             }
             Event::UserProfileLoaded {
                 user,

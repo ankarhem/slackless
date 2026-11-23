@@ -10,6 +10,7 @@ slackless-api.workspace = true
 slackless-rtm.workspace = true
 slackless-store.workspace = true
 slackless-auth.workspace = true
+slackless-huddle.workspace = true
 slackless-platform.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

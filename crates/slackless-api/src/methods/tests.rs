@@ -291,6 +291,59 @@ fn client_counts_parses_dm_count_and_clears_cleanly() {
     assert_eq!(dm.effective_mentions(), 0);
 }
 
+#[test]
+fn rooms_join_wire_parses_chime_free_willy_credentials() {
+    let wire: RoomsJoinWire = serde_json::from_str(
+        r#"{
+            "call": {
+                "call_id": "R0123456789",
+                "free_willy": {
+                    "attendee": {
+                        "AttendeeId": "att-1",
+                        "ExternalUserId": "T1-R0123456789-U1",
+                        "JoinToken": "tok-abc",
+                        "Capabilities": { "Audio": "SendReceive", "Video": "SendReceive", "Content": "SendReceive" }
+                    },
+                    "meeting": {
+                        "MeetingId": "mtg-1",
+                        "ExternalMeetingId": "T1-R0123456789-U1",
+                        "MediaRegion": "eu-central-1",
+                        "MediaPlacement": {
+                            "SignalingUrl": "wss://signal.chime.aws/control/mtg-1",
+                            "AudioHostUrl": "host.chime.aws:3478",
+                            "TurnControlUrl": "https://turn.chime.aws/v2/turn_sessions"
+                        }
+                    }
+                },
+                "huddle": {
+                    "id": "R0123456789",
+                    "channels": ["C1"],
+                    "has_ended": false,
+                    "media_backend_type": "free_willy",
+                    "participants": ["U1"],
+                    "thread_root_ts": "1700000000.000100",
+                    "huddle_link": "https://app.slack.com/huddle/T1/C1"
+                },
+                "canvas": { "root_thread_ts": "1700000000.000100", "thread_channel_id": "C1" }
+            }
+        }"#,
+    )
+    .unwrap();
+    let call = wire.call.unwrap();
+    assert_eq!(call.call_id, "R0123456789");
+    let chime = call.free_willy.unwrap();
+    assert_eq!(chime.attendee.join_token, "tok-abc");
+    assert_eq!(
+        chime.meeting.media_placement.signaling_url,
+        "wss://signal.chime.aws/control/mtg-1"
+    );
+    assert!(call.huddle.is_active());
+    assert_eq!(
+        call.canvas.unwrap().thread_channel_id,
+        Some(ChannelId::from("C1"))
+    );
+}
+
 /// A one-off probe of the live `activity.feed` answer, printed as raw JSON so the
 /// parser is built against the real shape (values carry personal data; the shipped
 /// fixture replaces them). Run manually with the signed-in session in the app's store;

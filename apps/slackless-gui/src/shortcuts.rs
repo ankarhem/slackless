@@ -78,6 +78,11 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
             ),
             (&["Esc"], "Mark conversation as read", true),
             (&["\u{21e7}", "Esc"], "Mark all messages as read", true),
+            (
+                &["\u{2318}", "\u{21e7}", "Space"],
+                "Mute or unmute active huddle",
+                true,
+            ),
         ],
     ),
     (

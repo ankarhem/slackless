@@ -285,6 +285,26 @@ impl App {
                 if prev.net_log_enabled != settings.net_log_enabled {
                     slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
                 }
+                if self.huddle_session.is_some() {
+                    if prev.huddle_input_device != settings.huddle_input_device
+                        || prev.huddle_output_device != settings.huddle_output_device
+                    {
+                        self.bridge.send(Command::SetHuddleAudioDevices {
+                            input: settings.huddle_input_device.clone(),
+                            output: settings.huddle_output_device.clone(),
+                        });
+                    }
+                    if prev.huddle_aec != settings.huddle_aec
+                        || prev.huddle_ns != settings.huddle_ns
+                        || prev.huddle_agc != settings.huddle_agc
+                    {
+                        self.bridge.send(Command::SetHuddleAudioProcessing {
+                            aec: settings.huddle_aec,
+                            ns: settings.huddle_ns,
+                            agc: settings.huddle_agc,
+                        });
+                    }
+                }
                 self.saved_settings = Some(settings.clone());
                 if let Some(write) = self.bridge.remember_settings(&settings) {
                     cx.background_executor().spawn(write).detach();

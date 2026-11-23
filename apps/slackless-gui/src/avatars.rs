@@ -3,7 +3,8 @@
 //! initials chip in the user's identity color; Slack's presence dot (filled green when
 //! active, a hollow ring when away) and the stacked two-chip avatar of group DMs.
 
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{ActiveTheme as _, Icon};
 use gpui_kit::gpui::{
     App, Div, FontWeight, Hsla, ParentElement as _, SharedString, Styled as _, div, img, px,
 };
@@ -27,11 +28,46 @@ pub fn conversation_avatar(
         [] => div(),
         [peer] if !conversation.is_mpim => {
             let chip = user_chip(fixtures, peer, size);
-            with_presence(chip, fixtures.presence(peer), size, ring, cx)
+            let in_huddle = fixtures
+                .user(peer)
+                .and_then(|u| u.profile.huddle_state.as_deref())
+                == Some("in_a_huddle");
+            let avatar = with_presence(chip, fixtures.presence(peer), size, ring, cx);
+            if in_huddle {
+                with_huddle_badge(avatar, size, ring, cx)
+            } else {
+                avatar
+            }
         }
         [only] => user_chip(fixtures, only, size),
         [first, second, ..] => stacked(fixtures, first, second, size, ring),
     }
+}
+
+/// Overlay a compact green headphones badge on the top-right corner of an avatar when the user's
+/// Slack profile reports `huddle_state == "in_a_huddle"` (`F-COLLAB-001`).
+pub fn with_huddle_badge(avatar: Div, size: f32, ring: Hsla, cx: &App) -> Div {
+    let badge = (size * 0.45).clamp(11., 16.);
+    let icon_sz = (badge * 0.65).clamp(7., 10.);
+    div().relative().flex_none().child(avatar).child(
+        div()
+            .absolute()
+            .right(px(-3.))
+            .top(px(-3.))
+            .size(px(badge))
+            .rounded_full()
+            .bg(cx.theme().success)
+            .border_1()
+            .border_color(ring)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                Icon::new(IconName::Headphones)
+                    .size(px(icon_sz))
+                    .text_color(theme::avatar_foreground()),
+            ),
+    )
 }
 
 /// The user's profile photo, or an initials chip in their identity color without one.

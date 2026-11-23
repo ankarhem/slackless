@@ -45,6 +45,16 @@ pub fn install_mouse_nav_monitor(on_nav: impl Fn(MouseNavDirection) + Send + Syn
     fallback::install_mouse_nav_monitor(on_nav);
 }
 
+/// Install a macOS distributed notification observer for `com.apple.screenIsLocked`
+/// (`F-COLLAB-059`, auto-leave active huddle when the computer locks). Safe to call once at app
+/// startup; no-op on non-macOS platforms.
+pub fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'static) {
+    #[cfg(target_os = "macos")]
+    macos::install_screen_lock_monitor(on_lock);
+    #[cfg(not(target_os = "macos"))]
+    fallback::install_screen_lock_monitor(on_lock);
+}
+
 /// Error surfaced by the fallible platform capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlatformError {
