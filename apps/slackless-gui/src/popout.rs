@@ -1335,7 +1335,17 @@ impl PopoutWindow {
                         this.huddle_devices_open = !this.huddle_devices_open;
                         this.huddle_invite_open = false;
                         if this.huddle_devices_open {
-                            this.huddle_devices = list_audio_devices();
+                            cx.spawn(async move |win, cx| {
+                                let devices = cx
+                                    .background_executor()
+                                    .spawn(async move { list_audio_devices() })
+                                    .await;
+                                let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
+                                    win.huddle_devices = devices;
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
                         }
                         cx.notify();
                     })),

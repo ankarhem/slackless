@@ -656,6 +656,8 @@ pub struct Preferences {
     slack_theme_import: Entity<TextareaState>,
     storage_stats: Option<StorageInfo>,
     audio_devices: slackless_core::huddle::AudioDevices,
+    audio_loading: bool,
+    audio_probe_gen: u64,
     mic_probe: Option<slackless_core::huddle::MicLevelProbe>,
     mic_level: f32,
     _subscriptions: Vec<Subscription>,
@@ -751,6 +753,8 @@ impl Preferences {
                 slack_theme_import,
                 storage_stats: None,
                 audio_devices: slackless_core::huddle::AudioDevices::default(),
+                audio_loading: false,
+                audio_probe_gen: 0,
                 mic_probe: None,
                 mic_level: 0.0,
                 _subscriptions: subscriptions,
@@ -811,40 +815,87 @@ impl Preferences {
         cx.notify();
     }
 
-    /// Release the live microphone level meter probe (called when leaving Audio & video or closing Preferences).
+    /// Called when the Preferences window is re-opened on its remembered section: resumes the
+    /// background audio probe only if currently viewing Audio & video.
+    pub fn on_reopen(&mut self, cx: &mut Context<Self>) {
+        if self.section == Section::AudioVideo && self.mic_probe.is_none() && !self.audio_loading {
+            self.refresh_audio_devices_and_probe(cx);
+        }
+    }
+
+    /// Release the live microphone level meter probe off the UI thread (called when leaving Audio
+    /// & video or closing Preferences so CoreAudio teardown never stalls the main thread).
     pub fn stop_mic_probe(&mut self) {
-        self.mic_probe = None;
+        self.audio_probe_gen = self.audio_probe_gen.wrapping_add(1);
+        self.audio_loading = false;
+        if let Some(old) = self.mic_probe.take() {
+            std::thread::spawn(move || drop(old));
+        }
         self.mic_level = 0.0;
     }
 
     fn refresh_audio_devices_and_probe(&mut self, cx: &mut Context<Self>) {
-        self.audio_devices = slackless_core::huddle::list_audio_devices();
-        let wanted = self.settings.huddle_input_device.as_deref();
-        self.mic_probe = slackless_core::huddle::MicLevelProbe::start(wanted).ok();
-        if self.mic_probe.is_some() {
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(80))
-                        .await;
-                    let keep = this
-                        .update(cx, |prefs, cx| {
-                            if let Some(probe) = &prefs.mic_probe {
-                                prefs.mic_level = probe.level();
-                                cx.notify();
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if !keep {
-                        break;
-                    }
-                }
-            })
-            .detach();
+        self.audio_probe_gen = self.audio_probe_gen.wrapping_add(1);
+        let probe_gen = self.audio_probe_gen;
+        self.audio_loading = true;
+        if let Some(old) = self.mic_probe.take() {
+            std::thread::spawn(move || drop(old));
         }
+        let wanted = self.settings.huddle_input_device.clone();
+        cx.spawn(async move |this, cx| {
+            let (devices, probe) = cx
+                .background_executor()
+                .spawn(async move {
+                    let devices = slackless_core::huddle::list_audio_devices();
+                    let probe =
+                        slackless_core::huddle::MicLevelProbe::start(wanted.as_deref()).ok();
+                    (devices, probe)
+                })
+                .await;
+
+            let started = this
+                .update(cx, |prefs, cx| {
+                    if prefs.audio_probe_gen != probe_gen || prefs.section != Section::AudioVideo {
+                        if let Some(stale) = probe {
+                            std::thread::spawn(move || drop(stale));
+                        }
+                        return false;
+                    }
+                    prefs.audio_devices = devices;
+                    prefs.audio_loading = false;
+                    prefs.mic_probe = probe;
+                    cx.notify();
+                    prefs.mic_probe.is_some()
+                })
+                .unwrap_or(false);
+
+            if !started {
+                return;
+            }
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(80))
+                    .await;
+                let keep = this
+                    .update(cx, |prefs, cx| {
+                        if prefs.audio_probe_gen != probe_gen {
+                            return false;
+                        }
+                        if let Some(probe) = &prefs.mic_probe {
+                            prefs.mic_level = probe.level();
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Show zoom level `level` (Cmd+= / Cmd+- / Cmd+0, or the remembered one) and apply it.
@@ -2310,6 +2361,17 @@ impl Preferences {
                                     }))
                             }),
                     ),
+            )
+            .when(
+                self.audio_loading && self.audio_devices.inputs.is_empty(),
+                |el| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Detecting audio devices…"),
+                    )
+                },
             )
             .child(
                 v_flex()

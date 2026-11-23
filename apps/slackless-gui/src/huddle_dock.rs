@@ -608,7 +608,18 @@ impl Render for HuddleDock {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.menu_open = !this.menu_open;
                                         if this.menu_open {
-                                            this.devices = list_audio_devices();
+                                            cx.spawn(async move |dock, cx| {
+                                                let devices = cx
+                                                    .background_executor()
+                                                    .spawn(async move { list_audio_devices() })
+                                                    .await;
+                                                let _ =
+                                                    dock.update(cx, |dock: &mut HuddleDock, cx| {
+                                                        dock.devices = devices;
+                                                        cx.notify();
+                                                    });
+                                            })
+                                            .detach();
                                         }
                                         cx.notify();
                                     })),

@@ -1236,17 +1236,19 @@ impl App {
     }
 
     /// Open Preferences in its own standalone native OS window (`F-CORE-011`), focusing the
-    /// existing window if already open.
+    /// existing window if already open. All slow diagnostics (SQLite counts, media cache walk,
+    /// CoreAudio enumeration) run asynchronously off the UI thread so the window appears instantly.
     pub(super) fn open_preferences(
         &mut self,
         section: Option<Section>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refresh_storage_stats(cx);
         if let Some(section) = section {
             self.preferences
                 .update(cx, |prefs, cx| prefs.show(section, cx));
+        } else {
+            self.preferences.update(cx, |prefs, cx| prefs.on_reopen(cx));
         }
         if let Some(handle) = self.prefs_window {
             if handle
@@ -1255,6 +1257,7 @@ impl App {
                 })
                 .is_ok()
             {
+                self.refresh_storage_stats(cx);
                 return;
             }
             self.prefs_window = None;
@@ -1262,6 +1265,7 @@ impl App {
         let display_id = window.display(cx).map(|d| d.id());
         self.prefs_window =
             crate::preferences::open_preferences_window(self.preferences.clone(), display_id, cx);
+        self.refresh_storage_stats(cx);
     }
 
     pub(super) fn open_status_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1903,8 +1907,8 @@ impl App {
         });
     }
 
-    /// Gather SQLite & media cache metrics for the active workspace and push them into
-    /// `Preferences -> Advanced -> Local storage & maintenance`.
+    /// Gather SQLite & media cache metrics for the active workspace off the UI thread and push
+    /// them into `Preferences -> Advanced -> Local storage & maintenance`.
     pub(super) fn refresh_storage_stats(&self, cx: &mut Context<Self>) {
         fn dir_bytes(dir: &std::path::Path) -> u64 {
             std::fs::read_dir(dir)
@@ -1917,26 +1921,39 @@ impl App {
                 .map(|m| m.len())
                 .sum()
         }
-        let info = self
+        let Some((store, team)) = self
             .bridge
-            .store()
-            .zip(self.bridge.team_id())
-            .and_then(|(store, team)| {
-                let stats = store.lock().ok()?.stats(team).ok()?;
-                let media_cache_bytes = dir_bytes(&std::env::temp_dir().join("slackless-media"))
+            .read_store_clone()
+            .zip(self.bridge.team_id().cloned())
+        else {
+            self.preferences
+                .update(cx, |prefs, cx| prefs.set_storage_stats(None, cx));
+            return;
+        };
+        let prefs = self.preferences.downgrade();
+        cx.spawn(async move |_, cx| {
+            let info = cx
+                .background_executor()
+                .spawn(async move {
+                    let stats = store.lock().ok()?.stats(&team).ok()?;
+                    let media_cache_bytes = dir_bytes(
+                        &std::env::temp_dir().join("slackless-media"),
+                    )
                     .saturating_add(dir_bytes(&std::env::temp_dir().join("slackless-audio")));
-                Some(crate::preferences::StorageInfo {
-                    messages: stats.messages,
-                    revisions: stats.revisions,
-                    conversations: stats.conversations,
-                    users: stats.users,
-                    offline_queued: stats.offline_queued,
-                    db_bytes: stats.db_bytes(),
-                    media_cache_bytes,
+                    Some(crate::preferences::StorageInfo {
+                        messages: stats.messages,
+                        revisions: stats.revisions,
+                        conversations: stats.conversations,
+                        users: stats.users,
+                        offline_queued: stats.offline_queued,
+                        db_bytes: stats.db_bytes(),
+                        media_cache_bytes,
+                    })
                 })
-            });
-        self.preferences
-            .update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+                .await;
+            let _ = prefs.update(cx, |prefs, cx| prefs.set_storage_stats(info, cx));
+        })
+        .detach();
     }
 
     /// Run `PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA optimize;` on the active workspace store.

@@ -403,6 +403,12 @@ impl CoreBridge {
         self.store.as_ref()
     }
 
+    /// A clone of the dedicated read-only WAL store (falling back to the main store if needed) so
+    /// background UI queries never contend with the core writer mutex.
+    pub fn read_store_clone(&self) -> Option<SharedStore> {
+        self.read_store().cloned()
+    }
+
     pub fn team_id(&self) -> Option<&slackless_core::types::TeamId> {
         self.session.as_ref().map(|s| &s.team_id)
     }
