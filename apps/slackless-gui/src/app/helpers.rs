@@ -199,6 +199,9 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
             | "threads"
             | "huddles"
             | "directory"
+            | "tools"
+            | "cleanup"
+            | "self-profile"
             | "compose"
             | "details"
             | "wsmenu"
@@ -248,6 +251,12 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                     "threads" => app.open_threads(cx),
                     "huddles" => app.open_huddles(cx),
                     "directory" => app.open_directory(cx),
+                    "tools" => app.open_tools(cx),
+                    "cleanup" => app.open_inactive_channels_dialog(window, cx),
+                    "self-profile" => {
+                        let me = app.fixtures.self_user.clone();
+                        app.open_profile(me, cx);
+                    }
                     "compose" => app.open_compose("", window, cx),
                     "details" => {
                         // The Slack Connect channel: the dialog and banner together.

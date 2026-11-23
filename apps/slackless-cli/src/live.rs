@@ -1371,6 +1371,90 @@ pub async fn run_download(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `backfill <CHANNEL> [--pages N] [--page-size N]`
+/// Walks `conversations.history` pages politely (Tier-3 pacing + 429 retry) and upserts every
+/// fetched message into the local SQLite archive (`X-1`).
+pub async fn run_backfill(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    max_pages: usize,
+    page_size: u32,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel(&workspace, channel_arg);
+    let Some(path) = crate::archive::store_path(&workspace) else {
+        return Ok(fail(
+            ctx,
+            "no_store_path",
+            "could not resolve local archive path",
+        ));
+    };
+    let mut store = slackless_store::Store::open(&path)?;
+    let opts = slackless_core::api::HistoryOpts {
+        limit: Some(page_size.clamp(1, 200)),
+        ..Default::default()
+    };
+    let mut cursor: Option<String> = None;
+    let mut pages_fetched: usize = 0;
+    let mut messages_stored: usize = 0;
+    let mut reached_end = false;
+
+    loop {
+        if max_pages > 0 && pages_fetched >= max_pages {
+            break;
+        }
+        let page = loop {
+            match api
+                .conversations_history(&channel, &opts, cursor.clone())
+                .await
+            {
+                Ok(page) => break page,
+                Err(ApiError::RateLimited { retry_after }) => {
+                    tokio::time::sleep(retry_after.max(std::time::Duration::from_secs(1))).await;
+                }
+                Err(err) => return Ok(api_fail(ctx, &err)),
+            }
+        };
+        pages_fetched += 1;
+        for msg in &page.items {
+            store.upsert_message(&workspace, &channel, msg)?;
+            messages_stored += 1;
+        }
+        match page.next_cursor {
+            Some(next) if !next.is_empty() => {
+                cursor = Some(next);
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            }
+            _ => {
+                reached_end = true;
+                break;
+            }
+        }
+    }
+
+    let display = label.unwrap_or_else(|| channel.to_string());
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "ok": true,
+            "workspace": workspace.as_str(),
+            "channel": channel.as_str(),
+            "label": display,
+            "pages": pages_fetched,
+            "messages": messages_stored,
+            "reached_end": reached_end,
+        }),
+        &format!(
+            "backfilled {display}: {messages_stored} messages across {pages_fetched} page(s) (complete={reached_end})\n"
+        ),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

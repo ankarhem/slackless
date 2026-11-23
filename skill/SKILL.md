@@ -482,10 +482,11 @@ slackless download F0123ABC --out ./report.pdf --json
 
 Downloads any Slack file by ID via `files.info` and the authenticated session cookie.
 
-### watch / stats / vacuum / revisions / export
+### watch / backfill / stats / vacuum / revisions / export
 
 ```sh
 slackless watch --channel "#eng" --count 5 --json
+slackless backfill "#eng" --pages 10 --json
 slackless stats --breakdown --json
 slackless vacuum --json
 slackless revisions "#eng" "1739280000.000100" --json
@@ -493,6 +494,7 @@ slackless export "#eng" --format md --limit 200 --out eng.md
 ```
 
 - `watch` streams live RTM events over `wss-primary`.
+- `backfill` walks `conversations.history` cursors politely (Tier-3 paced, `--pages 0` walks all history) into the local SQLite archive.
 - `stats` and `vacuum` inspect and compact the local SQLite archive (compressing legacy message JSON rows and reclaiming unused pages).
 - `revisions` prints the append-only edit/deletion history of one message.
 - `export` writes archived messages to Markdown or JSON offline.

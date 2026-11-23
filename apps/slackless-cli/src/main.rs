@@ -199,6 +199,17 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         out: Option<std::path::PathBuf>,
     },
+    /// Backfill a conversation's historical messages into the local SQLite archive (needs a stored session).
+    Backfill {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Maximum number of history pages to walk (0 = walk all history to the beginning).
+        #[arg(long, value_name = "N", default_value_t = 10)]
+        pages: usize,
+        /// Messages per page (Slack max 200).
+        #[arg(long, value_name = "N", default_value_t = 200)]
+        page_size: u32,
+    },
     /// Account and session management.
     Auth {
         #[command(subcommand)]
@@ -556,6 +567,11 @@ async fn dispatch(
         Commands::Download { file_id, out } => {
             live::run_download(ctx, flag, &file_id, out.as_deref()).await
         }
+        Commands::Backfill {
+            channel,
+            pages,
+            page_size,
+        } => live::run_backfill(ctx, flag, &channel, pages, page_size).await,
         Commands::Auth { command } => match command {
             AuthCommand::Status => cmd_auth_status(ctx),
             AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),
