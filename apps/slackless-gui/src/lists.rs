@@ -3,16 +3,18 @@
 //! searchable, sortable table with typed columns (text, person, select, date, checkbox,
 //! number, link) (`docs/research/api-canvases-lists.md`).
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, Div, Entity, FontWeight, Hsla, InteractiveElement as _, ParentElement as _, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
+    App, Div, Entity, FontWeight, Global, Hsla, InteractiveElement as _, ParentElement as _,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
 };
 use slackless_core::api::{SlackListCellValue, SlackListColumn, SlackListData, SlackListRow};
 
@@ -20,6 +22,46 @@ use crate::canvas::{OpenBrowserFn, read_only_badge};
 use crate::fixtures::Fixtures;
 use crate::sidebar::team_initials;
 use crate::theme;
+
+/// Layout mode for a Slack List view (`F-COLLAB-236`, `F-COLLAB-237`, `F-COLLAB-239`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ListLayout {
+    #[default]
+    Table,
+    Board,
+}
+
+#[derive(Clone, Default)]
+struct ListPanelState {
+    layout: ListLayout,
+    hidden_cols: HashSet<String>,
+    selected_row: Option<usize>,
+}
+
+/// Persistent per-list UI state (layout mode, hidden columns, open item detail drawer).
+#[derive(Default)]
+struct ListUiStore {
+    panels: HashMap<String, ListPanelState>,
+}
+
+impl Global for ListUiStore {}
+
+fn panel_state(key: &str, cx: &App) -> ListPanelState {
+    cx.try_global::<ListUiStore>()
+        .and_then(|store| store.panels.get(key))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn mutate_panel(key: &str, f: impl FnOnce(&mut ListPanelState), window: &mut Window, cx: &mut App) {
+    let entry = cx
+        .default_global::<ListUiStore>()
+        .panels
+        .entry(key.to_owned())
+        .or_default();
+    f(entry);
+    window.refresh();
+}
 
 /// Callback invoked when the user clicks a live list column header to sort by `col_idx`.
 pub type SortColumnFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
@@ -47,12 +89,40 @@ impl FieldKind {
 }
 
 /// Select options, colored like Slack's option chips.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
     Todo,
     InProgress,
     Blocked,
     Done,
+}
+
+impl Status {
+    const ALL: [Status; 4] = [
+        Status::Todo,
+        Status::InProgress,
+        Status::Blocked,
+        Status::Done,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Status::Todo => "To do",
+            Status::InProgress => "In progress",
+            Status::Blocked => "Blocked",
+            Status::Done => "Done",
+        }
+    }
+
+    fn color(self, cx: &App) -> Hsla {
+        let theme = cx.theme();
+        match self {
+            Status::Todo => theme.muted_foreground,
+            Status::InProgress => theme.link,
+            Status::Blocked => theme.danger,
+            Status::Done => theme.success,
+        }
+    }
 }
 
 enum Field {
@@ -128,114 +198,438 @@ fn fixture() -> SlackList {
     }
 }
 
-/// The List tab body: title row plus a horizontally and vertically scrollable table.
-pub fn list_view(cx: &App) -> Stateful<Div> {
+fn layout_switcher(list_key: &str, active: ListLayout, cx: &App) -> Div {
     let theme = cx.theme();
-    let list = fixture();
-
-    let header_row = list.columns.iter().fold(
-        h_flex()
-            .bg(theme.muted)
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD),
-        |row, column| {
-            row.child(
-                h_flex()
-                    .w(px(column.width))
-                    .flex_none()
-                    .items_center()
-                    .gap_1p5()
-                    .px_3()
-                    .py_2()
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        Icon::new(column.kind.icon())
-                            .text_color(theme.muted_foreground)
-                            .size(px(14.)),
-                    )
-                    .child(column.name),
-            )
-        },
+    let (border, muted, active_bg, active_fg) = (
+        theme.border,
+        theme.muted_foreground,
+        theme.secondary,
+        theme.foreground,
     );
-
-    let rows = list.rows.iter().map(|fields| {
-        list.columns.iter().zip(fields).fold(
-            h_flex().border_t_1().border_color(theme.border).text_sm(),
-            |row, (column, field)| {
-                row.child(
-                    h_flex()
-                        .w(px(column.width))
-                        .flex_none()
-                        .items_center()
-                        .px_3()
-                        .py_2()
-                        .child(cell(field, cx)),
-                )
-            },
-        )
-    });
-
-    let table = v_flex()
-        .flex_none()
+    let mk = |layout: ListLayout, label: &'static str, icon: IconName| {
+        let is_active = active == layout;
+        let key = list_key.to_owned();
+        h_flex()
+            .id(SharedString::from(format!("list-layout-{key}-{label}")))
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py(px(3.))
+            .rounded_sm()
+            .text_xs()
+            .cursor_pointer()
+            .when(is_active, |b| {
+                b.bg(active_bg)
+                    .text_color(active_fg)
+                    .font_weight(FontWeight::SEMIBOLD)
+            })
+            .when(!is_active, |b| b.text_color(muted))
+            .child(Icon::new(icon).size(px(12.)).text_color(if is_active {
+                active_fg
+            } else {
+                muted
+            }))
+            .child(label)
+            .on_click(move |_, window, cx| {
+                mutate_panel(&key, |s| s.layout = layout, window, cx);
+            })
+    };
+    h_flex()
+        .items_center()
+        .p(px(2.))
+        .gap_0p5()
         .rounded_md()
         .border_1()
-        .border_color(theme.border)
-        .overflow_hidden()
-        .child(header_row)
-        .children(rows);
+        .border_color(border)
+        .child(mk(ListLayout::Table, "Table", IconName::Table2))
+        .child(mk(ListLayout::Board, "Board", IconName::LayoutGrid))
+}
 
-    div().id("list-scroll").size_full().overflow_scroll().child(
-        v_flex()
-            .px_6()
-            .py_5()
-            .gap_4()
-            .child(
+fn fields_menu(
+    list_key: &str,
+    columns: Vec<(String, String)>,
+    hidden: &HashSet<String>,
+) -> impl gpui_kit::gpui::IntoElement {
+    let key = list_key.to_owned();
+    let hidden = hidden.clone();
+    let hidden_count = hidden.len();
+    let label = if hidden_count == 0 {
+        "Fields".to_owned()
+    } else {
+        format!("Fields ({hidden_count} hidden)")
+    };
+    Button::new(SharedString::from(format!("list-fields-{key}")))
+        .outline()
+        .with_size(Size::XSmall)
+        .icon(IconName::SlidersHorizontal)
+        .label(label)
+        .tooltip("Show or hide list columns")
+        .dropdown_menu(move |mut menu, _, _| {
+            for (col_key, col_name) in &columns {
+                let list_key = key.clone();
+                let col_key = col_key.clone();
+                let visible = !hidden.contains(&col_key);
+                menu = menu.item(
+                    PopupMenuItem::new(col_name.clone())
+                        .checked(visible)
+                        .on_click(move |_, window, cx| {
+                            mutate_panel(
+                                &list_key,
+                                |state| {
+                                    if !state.hidden_cols.remove(&col_key) {
+                                        state.hidden_cols.insert(col_key.clone());
+                                    }
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                );
+            }
+            menu
+        })
+}
+
+/// The List tab body: Table or Board layout, hideable fields, CSV/JSON export, and click-to-open
+/// item detail drawer (`F-COLLAB-229`, `F-COLLAB-234..237`, `F-COLLAB-239`).
+pub fn list_view(cx: &App) -> Stateful<Div> {
+    const KEY: &str = "fixture";
+    let theme = cx.theme();
+    let list = fixture();
+    let state = panel_state(KEY, cx);
+    let visible_cols: Vec<usize> = list
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(ix, col)| *ix == 0 || !state.hidden_cols.contains(col.name))
+        .map(|(ix, _)| ix)
+        .collect();
+    let toggleable_cols: Vec<(String, String)> = list
+        .columns
+        .iter()
+        .skip(1)
+        .map(|c| (c.name.to_owned(), c.name.to_owned()))
+        .collect();
+
+    let body: Div = match state.layout {
+        ListLayout::Table => {
+            let header_row = visible_cols.iter().fold(
                 h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::ListChecks)
-                            .text_color(theme.success)
-                            .size(px(18.)),
-                    )
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(list.title))
-                    .child(
-                        div()
-                            .text_xs()
+                    .bg(theme.muted)
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD),
+                |row, &col_ix| {
+                    let column = &list.columns[col_ix];
+                    row.child(
+                        h_flex()
+                            .w(px(column.width))
+                            .flex_none()
+                            .items_center()
+                            .gap_1p5()
+                            .px_3()
+                            .py_2()
                             .text_color(theme.muted_foreground)
-                            .child(format!("{} items", list.rows.len())),
+                            .child(
+                                Icon::new(column.kind.icon())
+                                    .text_color(theme.muted_foreground)
+                                    .size(px(14.)),
+                            )
+                            .child(column.name),
                     )
-                    .child(div().flex_1())
-                    .child({
-                        let csv = fixture_to_csv(&list);
-                        let suggested = format!("{}.csv", sanitize_filename(list.title));
-                        Button::new("list-export-csv-fixture")
-                            .outline()
-                            .with_size(Size::XSmall)
-                            .icon(IconName::Download)
-                            .label("CSV")
-                            .tooltip("Download list as CSV")
-                            .on_click(move |_, window, cx| {
-                                export_file(csv.clone(), suggested.clone(), "CSV", window, cx);
-                            })
-                    })
-                    .child({
-                        let json = fixture_to_json(&list);
-                        let suggested = format!("{}.json", sanitize_filename(list.title));
-                        Button::new("list-export-json-fixture")
-                            .outline()
-                            .with_size(Size::XSmall)
-                            .icon(IconName::Download)
-                            .label("JSON")
-                            .tooltip("Download list as JSON")
-                            .on_click(move |_, window, cx| {
-                                export_file(json.clone(), suggested.clone(), "JSON", window, cx);
-                            })
-                    })
-                    .child(read_only_badge(cx)),
-            )
-            .child(table),
-    )
+                },
+            );
+
+            let hover_bg = theme.secondary.opacity(0.45);
+            let selected_bg = theme.accent.opacity(0.28);
+            let rows = list.rows.iter().enumerate().map(|(row_ix, fields)| {
+                let is_sel = state.selected_row == Some(row_ix);
+                visible_cols.iter().fold(
+                    h_flex()
+                        .id(("list-fix-row", row_ix))
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .text_sm()
+                        .cursor_pointer()
+                        .when(is_sel, |r| r.bg(selected_bg))
+                        .when(!is_sel, |r| r.hover(move |h| h.bg(hover_bg)))
+                        .on_click(move |_, window, cx| {
+                            mutate_panel(
+                                KEY,
+                                |s| {
+                                    s.selected_row = if s.selected_row == Some(row_ix) {
+                                        None
+                                    } else {
+                                        Some(row_ix)
+                                    };
+                                },
+                                window,
+                                cx,
+                            );
+                        }),
+                    |row, &col_ix| {
+                        let column = &list.columns[col_ix];
+                        row.child(
+                            h_flex()
+                                .w(px(column.width))
+                                .flex_none()
+                                .items_center()
+                                .px_3()
+                                .py_2()
+                                .child(cell(&fields[col_ix], cx)),
+                        )
+                    },
+                )
+            });
+
+            v_flex()
+                .flex_none()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .overflow_hidden()
+                .child(header_row)
+                .children(rows)
+        }
+        ListLayout::Board => {
+            let hover_bg = theme.secondary.opacity(0.6);
+            let ring = theme.ring;
+            h_flex()
+                .items_start()
+                .gap_3()
+                .children(Status::ALL.iter().map(|&status| {
+                    let color = status.color(cx);
+                    let cards: Vec<usize> = list
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, fields)| {
+                            matches!(fields.get(2), Some(Field::Select(s)) if *s == status)
+                        })
+                        .map(|(ix, _)| ix)
+                        .collect();
+                    v_flex()
+                        .w(px(250.))
+                        .flex_none()
+                        .gap_2()
+                        .p_2p5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.muted.opacity(0.6))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .bg(color.opacity(0.18))
+                                        .text_color(color)
+                                        .child(status.label()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(cards.len().to_string()),
+                                ),
+                        )
+                        .children(cards.into_iter().map(|row_ix| {
+                            let fields = &list.rows[row_ix];
+                            let is_sel = state.selected_row == Some(row_ix);
+                            let mut card = v_flex()
+                                .id(("list-fix-card", row_ix))
+                                .gap_1p5()
+                                .p_2p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if is_sel { ring } else { theme.border })
+                                .bg(theme.background)
+                                .cursor_pointer()
+                                .hover(move |c| c.bg(hover_bg))
+                                .on_click(move |_, window, cx| {
+                                    mutate_panel(
+                                        KEY,
+                                        |s| s.selected_row = Some(row_ix),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(cell(&fields[0], cx)),
+                                );
+                            for &col_ix in &visible_cols {
+                                if col_ix == 0 || col_ix == 2 {
+                                    continue;
+                                }
+                                card = card.child(
+                                    h_flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(theme.muted_foreground)
+                                                .child(list.columns[col_ix].name),
+                                        )
+                                        .child(cell(&fields[col_ix], cx)),
+                                );
+                            }
+                            card
+                        }))
+                }))
+        }
+    };
+
+    let detail_drawer = state
+        .selected_row
+        .and_then(|row_ix| list.rows.get(row_ix).map(|fields| (row_ix, fields)))
+        .map(|(_, fields)| {
+            let mut panel = v_flex()
+                .w(px(320.))
+                .flex_none()
+                .h_full()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .p_4()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pb_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .child("Item details"),
+                        )
+                        .child(
+                            Button::new("list-fix-detail-close")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::X)
+                                .on_click(|_, window, cx| {
+                                    mutate_panel(KEY, |s| s.selected_row = None, window, cx);
+                                }),
+                        ),
+                );
+            for (col, field) in list.columns.iter().zip(fields) {
+                panel = panel.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(
+                                    Icon::new(col.kind.icon())
+                                        .size(px(12.))
+                                        .text_color(theme.muted_foreground),
+                                )
+                                .child(col.name),
+                        )
+                        .child(div().text_sm().child(cell(field, cx))),
+                );
+            }
+            panel
+        });
+
+    h_flex()
+        .id("list-root")
+        .size_full()
+        .child(
+            div()
+                .id("list-scroll")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_scroll()
+                .child(
+                    v_flex()
+                        .px_6()
+                        .py_5()
+                        .gap_4()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::ListChecks)
+                                        .text_color(theme.success)
+                                        .size(px(18.)),
+                                )
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(list.title))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{} items", list.rows.len())),
+                                )
+                                .child(div().flex_1())
+                                .child(layout_switcher(KEY, state.layout, cx))
+                                .child(fields_menu(KEY, toggleable_cols, &state.hidden_cols))
+                                .child({
+                                    let csv = fixture_to_csv(&list);
+                                    let suggested =
+                                        format!("{}.csv", sanitize_filename(list.title));
+                                    Button::new("list-export-csv-fixture")
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Download)
+                                        .label("CSV")
+                                        .tooltip("Download list as CSV")
+                                        .on_click(move |_, window, cx| {
+                                            export_file(
+                                                csv.clone(),
+                                                suggested.clone(),
+                                                "CSV",
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                })
+                                .child({
+                                    let json = fixture_to_json(&list);
+                                    let suggested =
+                                        format!("{}.json", sanitize_filename(list.title));
+                                    Button::new("list-export-json-fixture")
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Download)
+                                        .label("JSON")
+                                        .tooltip("Download list as JSON")
+                                        .on_click(move |_, window, cx| {
+                                            export_file(
+                                                json.clone(),
+                                                suggested.clone(),
+                                                "JSON",
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                })
+                                .child(read_only_badge(cx)),
+                        )
+                        .child(body),
+                ),
+        )
+        .children(detail_drawer)
 }
 
 fn cell(field: &Field, cx: &App) -> Div {
@@ -364,6 +758,67 @@ pub fn live_list_view(
     }
 }
 
+/// Group live list row indices into named lanes by the first `select` / `multi_select` column
+/// (or a single `"All items"` lane when no select column exists) for Board layout (`F-COLLAB-235`, `F-COLLAB-237`).
+pub(crate) fn group_live_rows(
+    data: &SlackListData,
+    visible_indices: &[usize],
+) -> Vec<(String, String, Vec<usize>)> {
+    let Some(group_col) = data
+        .columns
+        .iter()
+        .find(|c| matches!(c.kind.as_str(), "select" | "multi_select"))
+    else {
+        return vec![(
+            "All items".to_owned(),
+            "gray".to_owned(),
+            visible_indices.to_vec(),
+        )];
+    };
+    let mut lanes: Vec<(String, String, String, Vec<usize>)> = group_col
+        .choices
+        .iter()
+        .map(|c| {
+            (
+                c.value.clone(),
+                c.label.clone(),
+                c.color.clone(),
+                Vec::new(),
+            )
+        })
+        .collect();
+    let mut uncategorized = Vec::new();
+    for &row_ix in visible_indices {
+        let val = row_cell(&data.rows[row_ix], group_col);
+        let first_opt = match val {
+            Some(SlackListCellValue::Select(opts)) => opts.first().map(String::as_str),
+            _ => None,
+        };
+        if let Some(opt) = first_opt {
+            if let Some(lane) = lanes.iter_mut().find(|(v, _, _, _)| v == opt) {
+                lane.3.push(row_ix);
+            } else {
+                lanes.push((
+                    opt.to_owned(),
+                    opt.to_owned(),
+                    "gray".to_owned(),
+                    vec![row_ix],
+                ));
+            }
+        } else {
+            uncategorized.push(row_ix);
+        }
+    }
+    let mut out: Vec<(String, String, Vec<usize>)> = lanes
+        .into_iter()
+        .map(|(_, label, color, rows)| (label, color, rows))
+        .collect();
+    if !uncategorized.is_empty() || out.is_empty() {
+        out.push(("Uncategorized".to_owned(), "gray".to_owned(), uncategorized));
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_live_list(
     data: &SlackListData,
@@ -376,14 +831,33 @@ fn render_live_list(
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
+    let list_key = data.file_id.clone();
+    let state = panel_state(&list_key, cx);
     let visible_indices = filter_and_sort_rows(data, fixtures, query, sort);
 
-    let header_row = data.columns.iter().enumerate().fold(
+    let primary_ix = data.columns.iter().position(|c| c.is_primary).unwrap_or(0);
+    let visible_cols: Vec<usize> = data
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(ix, col)| *ix == primary_ix || !state.hidden_cols.contains(&col.id))
+        .map(|(ix, _)| ix)
+        .collect();
+    let toggleable_cols: Vec<(String, String)> = data
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(ix, _)| *ix != primary_ix)
+        .map(|(_, c)| (c.id.clone(), c.name.clone()))
+        .collect();
+
+    let header_row = visible_cols.iter().fold(
         h_flex()
             .bg(theme.muted)
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD),
-        |row, (ix, column)| {
+        |row, &ix| {
+            let column = &data.columns[ix];
             let width = live_column_width(column);
             let active_sort = sort.filter(|(c, _)| *c == ix).map(|(_, asc)| asc);
             let on_sort_cb = on_sort.clone();
@@ -420,11 +894,37 @@ fn render_live_list(
         },
     );
 
+    let hover_bg = theme.secondary.opacity(0.45);
+    let selected_bg = theme.accent.opacity(0.28);
     let rows_ui = visible_indices.iter().map(|&row_ix| {
         let rec = &data.rows[row_ix];
-        data.columns.iter().fold(
-            h_flex().border_t_1().border_color(theme.border).text_sm(),
-            |row, column| {
+        let is_sel = state.selected_row == Some(row_ix);
+        let key_click = list_key.clone();
+        visible_cols.iter().fold(
+            h_flex()
+                .id(("list-live-row", row_ix))
+                .border_t_1()
+                .border_color(theme.border)
+                .text_sm()
+                .cursor_pointer()
+                .when(is_sel, |r| r.bg(selected_bg))
+                .when(!is_sel, |r| r.hover(move |h| h.bg(hover_bg)))
+                .on_click(move |_, window, cx| {
+                    mutate_panel(
+                        &key_click,
+                        |s| {
+                            s.selected_row = if s.selected_row == Some(row_ix) {
+                                None
+                            } else {
+                                Some(row_ix)
+                            };
+                        },
+                        window,
+                        cx,
+                    );
+                }),
+            |row, &col_ix| {
+                let column = &data.columns[col_ix];
                 let width = live_column_width(column);
                 let val = row_cell(rec, column);
                 row.child(
@@ -446,6 +946,114 @@ fn render_live_list(
             .text_sm()
             .text_color(theme.muted_foreground)
             .child("This list has no columns.")
+    } else if state.layout == ListLayout::Board {
+        let lanes = group_live_rows(data, &visible_indices);
+        let group_col_ix = data
+            .columns
+            .iter()
+            .position(|c| matches!(c.kind.as_str(), "select" | "multi_select"));
+        let card_hover = theme.secondary.opacity(0.6);
+        let ring = theme.ring;
+        h_flex()
+            .items_start()
+            .gap_3()
+            .children(
+                lanes
+                    .into_iter()
+                    .map(|(lane_label, color_name, lane_rows)| {
+                        let color = slack_choice_color(&color_name, cx);
+                        v_flex()
+                            .w(px(260.))
+                            .flex_none()
+                            .gap_2()
+                            .p_2p5()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.muted.opacity(0.6))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .bg(color.opacity(0.18))
+                                            .text_color(color)
+                                            .child(lane_label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(lane_rows.len().to_string()),
+                                    ),
+                            )
+                            .children(lane_rows.into_iter().map(|row_ix| {
+                                let rec = &data.rows[row_ix];
+                                let is_sel = state.selected_row == Some(row_ix);
+                                let key_click = list_key.clone();
+                                let primary_col = &data.columns[primary_ix];
+                                let mut card = v_flex()
+                                    .id(("list-live-card", row_ix))
+                                    .gap_1p5()
+                                    .p_2p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if is_sel { ring } else { theme.border })
+                                    .bg(theme.background)
+                                    .cursor_pointer()
+                                    .hover(move |c| c.bg(card_hover))
+                                    .on_click(move |_, window, cx| {
+                                        mutate_panel(
+                                            &key_click,
+                                            |s| s.selected_row = Some(row_ix),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .child(
+                                        div().text_sm().font_weight(FontWeight::SEMIBOLD).child(
+                                            live_cell(
+                                                row_cell(rec, primary_col),
+                                                primary_col,
+                                                fixtures,
+                                                cx,
+                                            ),
+                                        ),
+                                    );
+                                for &col_ix in &visible_cols {
+                                    if col_ix == primary_ix || Some(col_ix) == group_col_ix {
+                                        continue;
+                                    }
+                                    let col = &data.columns[col_ix];
+                                    let val = row_cell(rec, col);
+                                    if matches!(val, None | Some(SlackListCellValue::Empty)) {
+                                        continue;
+                                    }
+                                    card = card.child(
+                                        h_flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_2()
+                                            .text_xs()
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(col.name.clone()),
+                                            )
+                                            .child(live_cell(val, col, fixtures, cx)),
+                                    );
+                                }
+                                card
+                            }))
+                    }),
+            )
     } else if visible_indices.is_empty() {
         v_flex()
             .flex_none()
@@ -477,9 +1085,75 @@ fn render_live_list(
             .children(rows_ui)
     };
 
+    let detail_drawer = state
+        .selected_row
+        .and_then(|row_ix| data.rows.get(row_ix))
+        .map(|rec| {
+            let key_close = list_key.clone();
+            let mut panel = v_flex()
+                .w(px(340.))
+                .flex_none()
+                .h_full()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .p_4()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pb_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .child("Item details"),
+                        )
+                        .child(
+                            Button::new("list-live-detail-close")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::X)
+                                .on_click(move |_, window, cx| {
+                                    mutate_panel(&key_close, |s| s.selected_row = None, window, cx);
+                                }),
+                        ),
+                );
+            for col in &data.columns {
+                panel = panel.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(
+                                    Icon::new(live_column_icon(&col.kind))
+                                        .size(px(12.))
+                                        .text_color(theme.muted_foreground),
+                                )
+                                .child(col.name.clone()),
+                        )
+                        .child(div().text_sm().child(live_cell(
+                            row_cell(rec, col),
+                            col,
+                            fixtures,
+                            cx,
+                        ))),
+                );
+            }
+            panel
+        });
+
     let find_bar = search.map(|input| {
         h_flex()
-            .w(px(320.))
+            .w(px(280.))
             .h(px(30.))
             .px_2p5()
             .gap_2()
@@ -514,93 +1188,129 @@ fn render_live_list(
             })
     });
 
-    div().id("list-scroll").size_full().overflow_scroll().child(
-        v_flex()
-            .px_6()
-            .py_5()
-            .gap_4()
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Icon::new(IconName::ListChecks)
-                            .text_color(theme.success)
-                            .size(px(18.)),
-                    )
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(data.title.clone()),
-                                    )
-                                    .child(
-                                        div().text_xs().text_color(theme.muted_foreground).child(
-                                            format!(
-                                                "{} of {} items",
-                                                visible_indices.len(),
-                                                data.rows.len()
-                                            ),
-                                        ),
-                                    ),
-                            )
-                            .when(!data.description.is_empty(), |col| {
-                                col.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(data.description.clone()),
+    h_flex()
+        .id("list-live-root")
+        .size_full()
+        .child(
+            div()
+                .id("list-scroll")
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_scroll()
+                .child(
+                    v_flex()
+                        .px_6()
+                        .py_5()
+                        .gap_4()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::ListChecks)
+                                        .text_color(theme.success)
+                                        .size(px(18.)),
                                 )
-                            }),
-                    )
-                    .child(div().flex_1())
-                    .children(find_bar)
-                    .child({
-                        let csv = list_to_csv(data, fixtures);
-                        let suggested = format!("{}.csv", sanitize_filename(&data.title));
-                        Button::new("list-export-csv")
-                            .outline()
-                            .with_size(Size::XSmall)
-                            .icon(IconName::Download)
-                            .label("CSV")
-                            .tooltip("Download list as CSV")
-                            .on_click(move |_, window, cx| {
-                                export_file(csv.clone(), suggested.clone(), "CSV", window, cx);
-                            })
-                    })
-                    .child({
-                        let json = list_to_json(data, fixtures);
-                        let suggested = format!("{}.json", sanitize_filename(&data.title));
-                        Button::new("list-export-json")
-                            .outline()
-                            .with_size(Size::XSmall)
-                            .icon(IconName::Download)
-                            .label("JSON")
-                            .tooltip("Download list as JSON")
-                            .on_click(move |_, window, cx| {
-                                export_file(json.clone(), suggested.clone(), "JSON", window, cx);
-                            })
-                    })
-                    .child(read_only_badge(cx))
-                    .when_some(open_browser, |row, open| {
-                        row.child(
-                            Button::new("list-open-browser")
-                                .outline()
-                                .with_size(Size::XSmall)
-                                .icon(IconName::ExternalLink)
-                                .label("Open in browser")
-                                .on_click(move |_, window, cx| open(window, cx)),
+                                .child(
+                                    v_flex()
+                                        .min_w_0()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .child(data.title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child(format!(
+                                                            "{} of {} items",
+                                                            visible_indices.len(),
+                                                            data.rows.len()
+                                                        )),
+                                                ),
+                                        )
+                                        .when(!data.description.is_empty(), |col| {
+                                            col.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(data.description.clone()),
+                                            )
+                                        }),
+                                )
+                                .child(div().flex_1())
+                                .children(find_bar)
+                                .child(layout_switcher(&list_key, state.layout, cx))
+                                .when(!toggleable_cols.is_empty(), |row| {
+                                    row.child(fields_menu(
+                                        &list_key,
+                                        toggleable_cols,
+                                        &state.hidden_cols,
+                                    ))
+                                })
+                                .child({
+                                    let csv = list_to_csv(data, fixtures);
+                                    let suggested =
+                                        format!("{}.csv", sanitize_filename(&data.title));
+                                    Button::new("list-export-csv")
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Download)
+                                        .label("CSV")
+                                        .tooltip("Download list as CSV")
+                                        .on_click(move |_, window, cx| {
+                                            export_file(
+                                                csv.clone(),
+                                                suggested.clone(),
+                                                "CSV",
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                })
+                                .child({
+                                    let json = list_to_json(data, fixtures);
+                                    let suggested =
+                                        format!("{}.json", sanitize_filename(&data.title));
+                                    Button::new("list-export-json")
+                                        .outline()
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Download)
+                                        .label("JSON")
+                                        .tooltip("Download list as JSON")
+                                        .on_click(move |_, window, cx| {
+                                            export_file(
+                                                json.clone(),
+                                                suggested.clone(),
+                                                "JSON",
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                })
+                                .child(read_only_badge(cx))
+                                .when_some(open_browser, |row, open| {
+                                    row.child(
+                                        Button::new("list-open-browser")
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::ExternalLink)
+                                            .label("Open in browser")
+                                            .on_click(move |_, window, cx| open(window, cx)),
+                                    )
+                                }),
                         )
-                    }),
-            )
-            .child(body),
-    )
+                        .child(body),
+                ),
+        )
+        .children(detail_drawer)
 }
 
 fn row_cell<'a>(row: &'a SlackListRow, column: &SlackListColumn) -> Option<&'a SlackListCellValue> {
@@ -1166,5 +1876,13 @@ mod tests {
         assert_eq!(parsed["items"][0]["Task"], "Zebra work");
         assert_eq!(parsed["items"][0]["Status"][0], "To do");
         assert_eq!(parsed["items"][1]["Status"][0], "Done");
+
+        // Board lane grouping partitions rows by the first select column (`F-COLLAB-235`, `F-COLLAB-237`).
+        let lanes = group_live_rows(&data, &[0, 1]);
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].0, "Done");
+        assert_eq!(lanes[0].2, vec![1]);
+        assert_eq!(lanes[1].0, "To do");
+        assert_eq!(lanes[1].2, vec![0]);
     }
 }
