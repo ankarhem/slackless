@@ -165,6 +165,8 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
     if matches!(
         demo.as_str(),
         "prefs"
+            | "prefs:nav"
+            | "huddle:popout"
             | "profile"
             | "status"
             | "switcher"
@@ -195,6 +197,12 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
             if let Some(this) = this.upgrade() {
                 this.update(cx, |app, cx| match demo.as_str() {
                     "prefs" => app.open_preferences(Some(Section::Appearance), window, cx),
+                    "prefs:nav" => app.open_preferences(Some(Section::Navigation), window, cx),
+                    "huddle:popout" => {
+                        let ch = app.channel.clone();
+                        app.join_huddle_in(ch, window, cx);
+                        app.pop_out_huddle(window, cx);
+                    }
                     "profile" => {
                         if let Some(peer) = app.fixtures.dms.first().and_then(|c| c.user.clone()) {
                             app.open_profile(peer, cx);
