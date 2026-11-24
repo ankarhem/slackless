@@ -1268,7 +1268,11 @@ impl PopoutWindow {
                     .as_deref()
                     .filter(|b| !b.is_empty() && *b != "none")
                 {
-                    format!("video/H264 ({backend})")
+                    if backend.contains("(HW)") {
+                        "video/H264 (VideoToolbox HW)".to_owned()
+                    } else {
+                        "video/H264 (OpenH264 SW)".to_owned()
+                    }
                 } else if snap.video || snap.sharing {
                     "video/H264".to_owned()
                 } else {
@@ -1286,12 +1290,17 @@ impl PopoutWindow {
 
         let stat_row = |label: &'static str, value: String| {
             h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_3()
                 .justify_between()
                 .items_center()
                 .text_xs()
-                .child(div().text_color(pal.drawer_muted).child(label))
+                .child(div().flex_none().text_color(pal.drawer_muted).child(label))
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(pal.drawer_fg)
                         .child(value),
