@@ -2198,7 +2198,7 @@ impl PopoutWindow {
                     let _ = window.paint_image(
                         bounds,
                         image_bounds,
-                        Corners::default(),
+                        Corners::all(px(15.)),
                         Arc::clone(&img_frame),
                         0,
                         false,
@@ -2411,7 +2411,7 @@ impl PopoutWindow {
         full_bleed_avatar: bool,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
-        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
+        use gpui_kit::gpui::ObjectFit;
         use slackless_core::huddle::VideoTileKey;
 
         let snap = &state.session;
@@ -2477,10 +2477,25 @@ impl PopoutWindow {
                 pal.tile_border
             })
             .child(if let Some(frame) = video_frame {
-                img(frame)
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .into_any_element()
+                let inner_radius = px(if speaking { 13. } else { 14. });
+                let frame_layout = Arc::clone(&frame);
+                canvas(
+                    move |bounds, _, _| ObjectFit::Cover.get_bounds(bounds, frame_layout.size(0)),
+                    move |bounds, img_bounds, window, _| {
+                        if frame.frame_count() > 0 {
+                            let _ = window.paint_image(
+                                bounds,
+                                img_bounds,
+                                gpui_kit::gpui::Corners::all(inner_radius),
+                                Arc::clone(&frame),
+                                0,
+                                false,
+                            );
+                        }
+                    },
+                )
+                .size_full()
+                .into_any_element()
             } else if full_bleed_avatar {
                 div()
                     .size_full()
@@ -2914,8 +2929,10 @@ impl PopoutWindow {
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
+        use gpui_kit::component::Icon;
+
         let hover = pal.popover_hover;
-        let primary = pal.primary;
+        let link = pal.link;
         let border = pal.popover_border;
         let selected_idx = self
             .huddle_selected_camera
@@ -2925,7 +2942,8 @@ impl PopoutWindow {
 
         v_flex()
             .w(px(248.))
-            .py_1p5()
+            .p_2()
+            .gap_0p5()
             .rounded_xl()
             .border_1()
             .border_color(border)
@@ -2934,7 +2952,7 @@ impl PopoutWindow {
             .text_color(pal.popover_fg)
             .child(
                 div()
-                    .px_3()
+                    .px_2p5()
                     .py_1()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -2943,7 +2961,7 @@ impl PopoutWindow {
             )
             .child(if self.huddle_cameras.is_empty() {
                 div()
-                    .px_3()
+                    .px_2p5()
                     .py_1p5()
                     .text_xs()
                     .text_color(pal.popover_muted)
@@ -2951,28 +2969,35 @@ impl PopoutWindow {
                     .into_any_element()
             } else {
                 v_flex()
+                    .gap_0p5()
                     .children(self.huddle_cameras.iter().enumerate().map(|(ix, cam)| {
                         let is_selected = selected_idx == Some(cam.index);
                         let cam_idx = cam.index;
                         let send = send_cam.clone();
                         h_flex()
                             .id(("popout-huddle-cam-opt", ix))
-                            .px_3()
+                            .px_2p5()
                             .py_1p5()
                             .gap_2()
                             .items_center()
+                            .rounded_lg()
                             .cursor_pointer()
                             .hover(move |el| el.bg(hover))
-                            .text_sm()
-                            .text_color(if is_selected { primary } else { pal.popover_fg })
-                            .child(
-                                div()
-                                    .w(px(14.))
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(primary)
-                                    .child(if is_selected { "✓" } else { "" }),
-                            )
+                            .text_xs()
+                            .font_weight(if is_selected {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(if is_selected { link } else { pal.popover_fg })
+                            .child(if is_selected {
+                                Icon::new(IconName::Check)
+                                    .size(px(14.))
+                                    .text_color(link)
+                                    .into_any_element()
+                            } else {
+                                div().size(px(14.)).into_any_element()
+                            })
                             .child(div().flex_1().min_w_0().truncate().child(cam.name.clone()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.huddle_selected_camera = Some(cam_idx);
@@ -2993,22 +3018,31 @@ impl PopoutWindow {
             .child(
                 h_flex()
                     .id("popout-huddle-cam-blur")
-                    .px_3()
+                    .px_2p5()
                     .py_1p5()
                     .gap_2()
                     .items_center()
+                    .rounded_lg()
                     .cursor_pointer()
                     .hover(move |el| el.bg(hover))
-                    .text_sm()
-                    .text_color(pal.popover_fg)
-                    .child(
-                        div()
-                            .w(px(14.))
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(primary)
-                            .child(if blur_now { "✓" } else { "" }),
-                    )
+                    .text_xs()
+                    .font_weight(if blur_now {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if blur_now { link } else { pal.popover_fg })
+                    .child(if blur_now {
+                        Icon::new(IconName::Check)
+                            .size(px(14.))
+                            .text_color(link)
+                            .into_any_element()
+                    } else {
+                        Icon::new(IconName::Video)
+                            .size(px(14.))
+                            .text_color(pal.popover_muted)
+                            .into_any_element()
+                    })
                     .child("Blur background")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let next_blur = !blur_now;
@@ -3025,15 +3059,21 @@ impl PopoutWindow {
             .child(
                 h_flex()
                     .id("popout-huddle-cam-bg")
-                    .px_3()
+                    .px_2p5()
                     .py_1p5()
                     .gap_2()
                     .items_center()
+                    .rounded_lg()
                     .cursor_pointer()
                     .hover(move |el| el.bg(hover))
-                    .text_sm()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(pal.popover_fg)
-                    .child(div().w(px(14.)))
+                    .child(
+                        Icon::new(IconName::Sparkles)
+                            .size(px(14.))
+                            .text_color(pal.popover_muted),
+                    )
                     .child("Video background")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.close_huddle_popovers();
@@ -3045,15 +3085,21 @@ impl PopoutWindow {
             .child(
                 h_flex()
                     .id("popout-huddle-cam-prefs")
-                    .px_3()
+                    .px_2p5()
                     .py_1p5()
                     .gap_2()
                     .items_center()
+                    .rounded_lg()
                     .cursor_pointer()
                     .hover(move |el| el.bg(hover))
-                    .text_sm()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(pal.popover_fg)
-                    .child(div().w(px(14.)))
+                    .child(
+                        Icon::new(IconName::Settings)
+                            .size(px(14.))
+                            .text_color(pal.popover_muted),
+                    )
                     .child("Audio & video preferences")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_audio_video_preferences(cx);
@@ -3122,7 +3168,7 @@ impl PopoutWindow {
                                 let _ = window.paint_image(
                                     bounds,
                                     img_bounds,
-                                    Corners::default(),
+                                    Corners::all(px(7.)),
                                     Arc::clone(&frame),
                                     0,
                                     false,
@@ -4314,8 +4360,9 @@ impl PopoutWindow {
                     .id("popout-huddle-video")
                     .h_full()
                     .px_2p5()
+                    .rounded_l_lg()
                     .cursor_pointer()
-                    .hover(move |el| el.bg(if video_now { active_bg } else { ctrl_hover }))
+                    .hover(move |el| if video_now { el } else { el.bg(ctrl_hover) })
                     .flex()
                     .items_center()
                     .justify_center()
@@ -4350,18 +4397,15 @@ impl PopoutWindow {
                     .id("popout-huddle-camera-btn")
                     .h_full()
                     .px_1p5()
+                    .rounded_r_lg()
                     .cursor_pointer()
-                    .bg(if cam_open || video_now {
-                        active_bg
-                    } else {
-                        ctrl_bg
-                    })
+                    .when(cam_open && !video_now, |el| el.bg(active_bg))
                     .hover(move |el| {
-                        el.bg(if video_now || cam_open {
-                            active_bg
+                        if video_now || cam_open {
+                            el
                         } else {
-                            ctrl_hover
-                        })
+                            el.bg(ctrl_hover)
+                        }
                     })
                     .border_l_1()
                     .border_color(if video_now || cam_open {
