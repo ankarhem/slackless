@@ -33,8 +33,7 @@ slackless/                      (virtual workspace root: [workspace] in /Cargo.t
 ├── apps/
 │   ├── slackless-gui           GPUI Kit desktop app (smol↔tokio bridge + views).
 │   └── slackless-cli           clap binary: search/read/send/reply/react/auth (--json).
-├── skill/                      Agent SKILL.md for the CLI (shipped, installed separately).
-└── spikes/gpui-kit-spike/      Existing proof-of-build (own [workspace], not a member).
+└── skill/                      Agent SKILL.md for the CLI (shipped, installed separately).
 ```
 
 Dependency direction (acyclic): `types` ← {`api`, `rtm`, `store`, `auth`, `platform`} ← `core`
@@ -130,8 +129,8 @@ threads pane, cookie-auth image cache).
 
 ## Workspace-level choices
 
-- Root `Cargo.toml` is a virtual manifest (`[workspace]`, members `crates/*` + `apps/*`;
-  `spikes/*` excluded). Shared deps in `[workspace.dependencies]`; one pinned toolchain.
+- Root `Cargo.toml` is a virtual manifest (`[workspace]`, members `crates/*` + `apps/*`).
+  Shared deps in `[workspace.dependencies]`; one pinned toolchain.
 - Error handling: `thiserror` in libraries, `anyhow` only in the two app binaries.
 - Async: `tokio` in libs/CLI; the GUI never blocks the smol executor — all awaiting Slack work
   crosses the channel bridge.
