@@ -46,6 +46,36 @@ pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};
 
+/// Returns `true` if OS screen recording permission is granted (always `true` on non-macOS).
+pub fn has_screen_capture_permission() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos_media::has_screen_capture_permission()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Prompts for OS screen recording permission on macOS (registers the app in System Settings).
+pub fn request_screen_capture_permission() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos_media::request_screen_capture_permission()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Opens OS Screen Recording privacy settings on macOS (no-op on other platforms).
+pub fn open_screen_capture_settings() {
+    #[cfg(target_os = "macos")]
+    macos_media::open_screen_capture_settings();
+}
+
 /// Errors returned by the native huddle engine.
 #[derive(Debug, Error)]
 pub enum HuddleError {

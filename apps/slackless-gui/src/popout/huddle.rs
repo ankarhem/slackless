@@ -2827,6 +2827,7 @@ impl PopoutWindow {
     ) -> gpui_kit::gpui::Div {
         let send = self.send.clone();
         let loopback = slackless_core::huddle::system_audio_source_label();
+        let has_screen_perm = slackless_core::huddle::has_screen_capture_permission();
         let hover = pal.popover_hover;
         let primary = pal.primary;
         let primary_fg = pal.primary_fg;
@@ -2842,6 +2843,49 @@ impl PopoutWindow {
             .bg(pal.popover_bg)
             .shadow_2xl()
             .text_color(pal.popover_fg)
+            .when(!has_screen_perm, |col| {
+                col.child(
+                    v_flex()
+                        .p_2p5()
+                        .gap_1p5()
+                        .rounded_lg()
+                        .bg(pal.warning.opacity(0.14))
+                        .border_1()
+                        .border_color(pal.warning.opacity(0.55))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(pal.popover_fg)
+                                .child("Screen Recording permission required"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(pal.popover_muted)
+                                .child("macOS hides other apps and disables hardware capture until Slackless is enabled in Screen & System Audio Recording (re-toggle if rebuilt with ad-hoc signing, then restart)."),
+                        )
+                        .child(
+                            h_flex().pt_0p5().child(
+                                div()
+                                    .id("popout-huddle-open-screen-perm")
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(primary)
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(primary_fg)
+                                    .child("Open Screen Recording Settings")
+                                    .on_click(|_, _, _| {
+                                        slackless_core::huddle::request_screen_capture_permission();
+                                        slackless_core::huddle::open_screen_capture_settings();
+                                    }),
+                            ),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .px_2()
@@ -2851,16 +2895,23 @@ impl PopoutWindow {
                     .items_center()
                     .gap_2()
                     .text_xs()
-                    .text_color(if loopback.is_some() {
+                    .text_color(if loopback.is_some() && has_screen_perm {
                         pal.success
                     } else {
                         pal.popover_muted
                     })
-                    .child(if let Some(dev) = loopback {
-                        format!("System audio capture ready via {dev}")
-                    } else {
-                        "System audio: install BlackHole 2ch (or virtual loopback) to share app audio"
-                            .to_owned()
+                    .child(match (has_screen_perm, loopback) {
+                        (true, Some(dev)) => {
+                            format!("Hardware capture ready · System audio via {dev}")
+                        }
+                        (true, None) => {
+                            "Hardware capture ready · Install BlackHole 2ch for system audio"
+                                .to_owned()
+                        }
+                        (false, Some(dev)) => format!("System audio via {dev}"),
+                        (false, None) => {
+                            "System audio: install BlackHole 2ch to share app audio".to_owned()
+                        }
                     }),
             )
             .child(
@@ -3693,6 +3744,9 @@ impl PopoutWindow {
                 this.close_huddle_popovers();
                 this.huddle_share_open = next;
                 if this.huddle_share_open {
+                    if !slackless_core::huddle::has_screen_capture_permission() {
+                        slackless_core::huddle::request_screen_capture_permission();
+                    }
                     cx.spawn(async move |win, cx| {
                         let screens = cx
                             .background_executor()

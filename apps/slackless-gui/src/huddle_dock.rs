@@ -257,6 +257,12 @@ impl HuddleDock {
     }
 
     pub fn update_levels(&mut self, levels: HuddleAudioLevels, cx: &mut Context<Self>) {
+        if (self.levels.local_rms - levels.local_rms).abs() < 0.015
+            && self.levels.active_speakers == levels.active_speakers
+            && self.levels.muted_peers == levels.muted_peers
+        {
+            return;
+        }
         self.levels = levels;
         cx.notify();
     }

@@ -129,9 +129,20 @@ cat >"$APP/Contents/Info.plist" <<EOF
 EOF
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
-SIGN_ID="${SLACKLESS_SIGN_IDENTITY:--}"
+if [[ -z "${SLACKLESS_SIGN_IDENTITY:-}" ]] && command -v security >/dev/null; then
+  # Prefer a persistent local Code Signing certificate (e.g. "Slackless Dev") so macOS TCC
+  # remembers Screen Recording / Microphone / Camera permissions across rebuilds.
+  AUTO_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Slackless Dev\)".*/\1/p' | head -n 1 || true)"
+  if [[ -z "$AUTO_ID" ]]; then
+    AUTO_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  fi
+  SIGN_ID="${AUTO_ID:--}"
+else
+  SIGN_ID="${SLACKLESS_SIGN_IDENTITY:--}"
+fi
 if command -v codesign >/dev/null; then
   codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || true
+  echo "Signed $APP with identity: $SIGN_ID"
 fi
 
 echo "Bundled $APP (version $VERSION)"

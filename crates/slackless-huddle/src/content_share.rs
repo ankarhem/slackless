@@ -66,6 +66,7 @@ pub fn system_audio_source_label() -> Option<String> {
 /// Running `#content` screen-share session handle.
 pub struct ContentShareSession {
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     loopback_device: Option<String>,
 }
 
@@ -162,6 +163,7 @@ impl ContentShareSession {
         let (h264_tx, mut h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let capture = ScreenCapture::start(source_id, h264_tx, preview_tx, perf)?;
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let running = Arc::new(AtomicBool::new(true));
         let running_audio = Arc::clone(&running);
@@ -368,13 +370,17 @@ impl ContentShareSession {
             }
 
             running.store(false, Ordering::Relaxed);
+            drop(capture);
             let _ = sig.send_frame(&build_leave_frame()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(300), sig.next_frame()).await;
             sig.close().await;
             rtc.close().await;
+            let _ = done_tx.send(());
         });
 
         Ok(Self {
             stop_tx: Some(stop_tx),
+            done_rx: Some(done_rx),
             loopback_device,
         })
     }
@@ -382,6 +388,14 @@ impl ContentShareSession {
     pub fn stop(&mut self) {
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
+        }
+    }
+
+    /// Stop the `#content` share and wait briefly for its Chime `LEAVE` frame to flush.
+    pub async fn stop_and_wait(&mut self) {
+        self.stop();
+        if let Some(rx) = self.done_rx.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), rx).await;
         }
     }
 }

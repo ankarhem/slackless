@@ -196,7 +196,8 @@ impl ScreenCapture {
 
                 while run_flag.load(Ordering::Relaxed) {
                     let t0 = Instant::now();
-                    match capture_once_result(&source_id) {
+                    let captured = with_autorelease_pool(|| capture_once_result(&source_id));
+                    match captured {
                         Ok(rgba) => {
                             let (w, h) = downscale_rgba_area_to_bgra_and_i420(
                                 rgba.as_raw(),
@@ -333,6 +334,26 @@ impl ScreenCapture {
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Drains macOS Objective-C autoreleased objects created by `xcap` on plain Rust worker threads.
+fn with_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
+            fn objc_autoreleasePoolPop(pool: *mut std::ffi::c_void);
+        }
+        let pool = unsafe { objc_autoreleasePoolPush() };
+        let res = f();
+        unsafe { objc_autoreleasePoolPop(pool) };
+        res
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        f()
     }
 }
 

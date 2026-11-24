@@ -117,6 +117,8 @@ impl H264VideoEncoder {
             .bitrate(BitRate::from_bps(2_800_000))
             .max_frame_rate(FrameRate::from_hz(20.0))
             .complexity(Complexity::Low)
+            .adaptive_quantization(false)
+            .background_detection(false)
             .num_threads(2)
             .skip_frames(true)
             .intra_frame_period(IntraFramePeriod::from_num_frames(100));

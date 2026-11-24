@@ -41,6 +41,8 @@ type SlacklessDecodedFrameCallback =
     unsafe extern "C" fn(ctx: *mut c_void, bgra: *const u8, len: usize, width: u32, height: u32);
 
 unsafe extern "C" {
+    fn slackless_has_screen_capture_permission() -> bool;
+    fn slackless_request_screen_capture_permission() -> bool;
     fn slackless_sc_capture_start(
         is_monitor: u32,
         target_id: u32,
@@ -67,6 +69,23 @@ unsafe extern "C" {
         on_frame: SlacklessDecodedFrameCallback,
     ) -> bool;
     fn slackless_vt_decoder_free(dec: *mut SlacklessVtDecoder);
+}
+
+/// Returns `true` if macOS Screen Recording permission has been granted to this app bundle.
+pub fn has_screen_capture_permission() -> bool {
+    unsafe { slackless_has_screen_capture_permission() }
+}
+
+/// Triggers the macOS Screen Recording permission prompt (or registers the app in System Settings).
+pub fn request_screen_capture_permission() -> bool {
+    unsafe { slackless_request_screen_capture_permission() }
+}
+
+/// Opens macOS System Settings directly to Privacy & Security -> Screen & System Audio Recording.
+pub fn open_screen_capture_settings() {
+    let _ = std::process::Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .spawn();
 }
 
 struct CaptureCallbackCtx {

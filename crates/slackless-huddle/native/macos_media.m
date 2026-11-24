@@ -59,6 +59,14 @@ static void write_err(char *buf, size_t len, const char *msg) {
     snprintf(buf, len, "%s", msg);
 }
 
+bool slackless_has_screen_capture_permission(void) {
+    return CGPreflightScreenCaptureAccess();
+}
+
+bool slackless_request_screen_capture_permission(void) {
+    return CGRequestScreenCaptureAccess();
+}
+
 static void compute_even_fit(
     uint32_t src_w,
     uint32_t src_h,

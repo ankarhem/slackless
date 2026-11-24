@@ -405,8 +405,18 @@ async fn run_connected_loop(
         ssrc_to_stream_id: ssrc_to_stream_id.clone(),
         remote_sources: Vec::new(),
     }));
+    let (vdec_tx, vdec_rx) = std::sync::mpsc::channel::<Option<InboundVideoPacket>>();
+    let vdec_tx_fwd = vdec_tx.clone();
+    let vdec_fwd = tokio::spawn(async move {
+        let mut rx = inbound_video_rx;
+        while let Some(pkt) = rx.recv().await {
+            if vdec_tx_fwd.send(Some(pkt)).is_err() {
+                break;
+            }
+        }
+    });
     let vdec_handle = spawn_video_decoder_thread(
-        inbound_video_rx,
+        vdec_rx,
         Arc::clone(&vdec_audio_only),
         Arc::clone(&vdec_clear),
         Arc::clone(&vdec_routing),
@@ -884,7 +894,7 @@ async fn run_connected_loop(
                     }
                     Some(HuddleControl::SetScreenShare { source_id }) => {
                         if let Some(mut prev) = content_share.take() {
-                            prev.stop();
+                            prev.stop_and_wait().await;
                         }
                         if let Some(src_id) = source_id {
                             // Native `#content` second Chime session — runs simultaneously with camera!
@@ -1092,11 +1102,12 @@ async fn run_connected_loop(
     }
 
     // 7. Clean teardown: stop captures, content share, music, send Chime LEAVE, close peer & WS.
+    tracing::info!("tearing down huddle session cleanly");
     if let Some(mut cam) = camera_capture.take() {
         cam.stop();
     }
     if let Some(mut cs) = content_share.take() {
-        cs.stop();
+        cs.stop_and_wait().await;
     }
     if let Some(mut mp) = music_player.take() {
         mp.stop();
@@ -1108,11 +1119,15 @@ async fn run_connected_loop(
     let _ = signal.send_frame(&build_leave_frame()).await;
     let _ = tokio::time::timeout(Duration::from_millis(800), signal.next_frame()).await;
     audio_engine.stop();
+    vdec_fwd.abort();
+    let _ = vdec_tx.send(None);
     peer.close().await;
+    drop(peer);
     signal.close().await;
     if let Some(handle) = vdec_handle {
         let _ = handle.join();
     }
+    tracing::info!("huddle session teardown complete");
 
     exit_reason.unwrap_or(LoopExit::LeftCleanly)
 }
@@ -1127,7 +1142,7 @@ struct VideoRoutingTable {
 /// VideoToolbox / OpenH264) so heavy 1080p/4K frames never jitter 20ms audio on the tokio runtime.
 #[allow(clippy::too_many_arguments)]
 fn spawn_video_decoder_thread(
-    mut inbound_video_rx: mpsc::UnboundedReceiver<InboundVideoPacket>,
+    inbound_video_rx: std::sync::mpsc::Receiver<Option<InboundVideoPacket>>,
     audio_only: Arc<AtomicBool>,
     clear_decoders: Arc<AtomicBool>,
     routing: Arc<Mutex<VideoRoutingTable>>,
@@ -1145,7 +1160,7 @@ fn spawn_video_decoder_thread(
             let mut last_keyframe_req: HashMap<u32, Instant> = HashMap::new();
             let mut last_decode_err_log: HashMap<u32, Instant> = HashMap::new();
 
-            while let Some(pkt) = inbound_video_rx.blocking_recv() {
+            while let Ok(Some(pkt)) = inbound_video_rx.recv() {
                 if clear_decoders.swap(false, Ordering::Relaxed) {
                     remote_decoders.clear();
                     decoded_video_ssrcs.clear();
