@@ -1433,12 +1433,131 @@ impl Preferences {
                     .child(debug),
                 cx,
             ))
+            .child(self.cli_install_group(cx))
             .child(self.group(
                 "Local storage & maintenance",
                 Some("Durable local-first SQLite history & FTS5 search index for the active workspace."),
                 storage_summary,
                 cx,
             ))
+    }
+
+    fn cli_install_group(&mut self, cx: &mut Context<Self>) -> Div {
+        use crate::updater::{
+            CliInstallStatus, cli_install_status, installed_version, local_bin_in_path,
+        };
+        let status = cli_install_status();
+        let ver = installed_version();
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let in_path = local_bin_in_path();
+
+        let (desc, action_row) = match status {
+            CliInstallStatus::Installed(path) => (
+                format!(
+                    "Installed at {} (linked to Slackless {} — updates automatically with the app).",
+                    path.display(),
+                    ver
+                ),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("adv-cli-uninstall")
+                            .outline()
+                            .with_size(Size::Small)
+                            .label("Uninstall CLI")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                match crate::updater::uninstall_cli_symlink() {
+                                    Ok(()) => {
+                                        this.cli_status_note =
+                                            Some("Removed ~/.local/bin/slackless.".to_owned());
+                                    }
+                                    Err(err) => {
+                                        this.cli_status_note = Some(format!("Error: {err}"));
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            ),
+            CliInstallStatus::OutOfSync(path) => (
+                format!(
+                    "Found an older or separate CLI at {}. Re-link it so it matches Slackless {} and auto-updates.",
+                    path.display(),
+                    ver
+                ),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("adv-cli-relink")
+                            .primary()
+                            .with_size(Size::Small)
+                            .label("Update CLI link")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                match crate::updater::install_cli_symlink() {
+                                    Ok(p) => {
+                                        this.cli_status_note =
+                                            Some(format!("Linked {} to this app.", p.display()));
+                                    }
+                                    Err(err) => {
+                                        this.cli_status_note = Some(format!("Error: {err}"));
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            ),
+            CliInstallStatus::NotInstalled => (
+                format!(
+                    "Install the slackless CLI to ~/.local/bin/slackless (version {}, stays in sync with app updates).",
+                    ver
+                ),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("adv-cli-install")
+                            .primary()
+                            .with_size(Size::Small)
+                            .label("Install CLI")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                match crate::updater::install_cli_symlink() {
+                                    Ok(p) => {
+                                        this.cli_status_note =
+                                            Some(format!("Installed CLI at {}.", p.display()));
+                                    }
+                                    Err(err) => {
+                                        this.cli_status_note = Some(format!("Error: {err}"));
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            ),
+            CliInstallStatus::Unavailable => (
+                "Launch Slackless from an installed Slackless.app bundle to install the matching CLI binary."
+                    .to_owned(),
+                h_flex(),
+            ),
+        };
+
+        let mut body = v_flex()
+            .gap_2()
+            .child(div().text_xs().text_color(fg).child(desc))
+            .child(action_row);
+        if !in_path {
+            body = body.child(div().text_xs().text_color(muted).child(
+                "Tip: add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile to invoke `slackless` anywhere.",
+            ));
+        }
+        if let Some(note) = &self.cli_status_note {
+            body = body.child(div().text_xs().text_color(muted).child(note.clone()));
+        }
+        self.group(
+            "Command-line interface (`slackless`)",
+            Some("Headless CLI sharing your local SQLite archive and Keychain session."),
+            body,
+            cx,
+        )
     }
 
     fn network_diagnostics_group(&mut self, cx: &mut Context<Self>) -> Div {

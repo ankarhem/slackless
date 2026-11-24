@@ -32,9 +32,15 @@ const READ_LIMIT: usize = 50;
 /// Default result cap of `search`.
 const SEARCH_LIMIT: usize = 20;
 
+const CLI_VERSION: &str = match option_env!("SLACKLESS_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "slackless",
+    version = CLI_VERSION,
     about = "Headless Slack client CLI over the local archive"
 )]
 struct Cli {

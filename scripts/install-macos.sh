@@ -4,15 +4,15 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | bash -s -- --cli
-#   scripts/install-macos.sh --version 2026.11.24-01 --dir ~/Applications --cli
+#   curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | bash -s -- --no-cli
+#   scripts/install-macos.sh --version 2026.11.24-01 --dir ~/Applications
 
 set -euo pipefail
 
 REPO="ankarhem/slackless"
 VERSION="latest"
 INSTALL_DIR=""
-INSTALL_CLI=0
+INSTALL_CLI=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,6 +26,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cli)
       INSTALL_CLI=1
+      shift
+      ;;
+    --no-cli)
+      INSTALL_CLI=0
       shift
       ;;
     -h|--help)
@@ -151,23 +155,35 @@ fi
 
 echo "Installed Slackless ${TAG} -> ${DEST}"
 
-if [[ "$INSTALL_CLI" -eq 1 && -n "$CLI_URL" ]]; then
-  echo "Downloading slackless CLI ${TAG}..."
-  curl -fsSL -o "${TMPDIR}/${CLI_ASSET}" "$CLI_URL"
-  if [[ -f "${TMPDIR}/SHA256SUMS.txt" ]]; then
-    EXPECTED_CLI="$(awk -v f="$CLI_ASSET" '$2 == f { print $1; exit }' "${TMPDIR}/SHA256SUMS.txt")"
-    if [[ -n "$EXPECTED_CLI" ]]; then
-      ACTUAL_CLI="$(shasum -a 256 "${TMPDIR}/${CLI_ASSET}" | awk '{print $1}')"
-      if [[ "$ACTUAL_CLI" != "$EXPECTED_CLI" ]]; then
-        echo "error: SHA-256 mismatch for ${CLI_ASSET}" >&2
-        exit 1
+if [[ "$INSTALL_CLI" -eq 1 ]]; then
+  mkdir -p "$HOME/.local/bin"
+  if [[ -x "${DEST}/Contents/MacOS/slackless" ]]; then
+    ln -sf "${DEST}/Contents/MacOS/slackless" "$HOME/.local/bin/slackless"
+    echo "Linked slackless CLI -> $HOME/.local/bin/slackless (matches ${TAG})"
+  elif [[ -n "$CLI_URL" ]]; then
+    echo "Downloading slackless CLI ${TAG}..."
+    curl -fsSL -o "${TMPDIR}/${CLI_ASSET}" "$CLI_URL"
+    if [[ -f "${TMPDIR}/SHA256SUMS.txt" ]]; then
+      EXPECTED_CLI="$(awk -v f="$CLI_ASSET" '$2 == f { print $1; exit }' "${TMPDIR}/SHA256SUMS.txt")"
+      if [[ -n "$EXPECTED_CLI" ]]; then
+        ACTUAL_CLI="$(shasum -a 256 "${TMPDIR}/${CLI_ASSET}" | awk '{print $1}')"
+        if [[ "$ACTUAL_CLI" != "$EXPECTED_CLI" ]]; then
+          echo "error: SHA-256 mismatch for ${CLI_ASSET}" >&2
+          exit 1
+        fi
       fi
     fi
+    tar -xzf "${TMPDIR}/${CLI_ASSET}" -C "$TMPDIR"
+    install -m 755 "${TMPDIR}/slackless" "$HOME/.local/bin/slackless"
+    echo "Installed slackless CLI -> $HOME/.local/bin/slackless"
   fi
-  tar -xzf "${TMPDIR}/${CLI_ASSET}" -C "$TMPDIR"
-  mkdir -p "$HOME/.local/bin"
-  install -m 755 "${TMPDIR}/slackless" "$HOME/.local/bin/slackless"
-  echo "Installed slackless CLI -> $HOME/.local/bin/slackless"
+  case ":${PATH:-}:" in
+    *":$HOME/.local/bin:"*) ;;
+    *)
+      echo "Note: add $HOME/.local/bin to your PATH to run 'slackless' from the terminal:"
+      echo '  export PATH="$HOME/.local/bin:$PATH"'
+      ;;
+  esac
 fi
 
 echo "Launch with: open \"${DEST}\""

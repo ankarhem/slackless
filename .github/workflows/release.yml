@@ -99,8 +99,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Builds and signs both slackless-gui and slackless CLI inside Slackless.app/Contents/MacOS/
           ./scripts/bundle-macos.sh --release
-          cargo build --release -p slackless-cli
 
       - name: Package DMG, tarballs & checksums
         env:

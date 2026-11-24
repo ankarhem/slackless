@@ -42,10 +42,7 @@ if [[ -z "$PROFILE" ]]; then
 fi
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
-  PKGS=(-p slackless-gui)
-  if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
-    PKGS+=(-p slackless-cli)
-  fi
+  PKGS=(-p slackless-gui -p slackless-cli)
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
   if [[ "$PROFILE" == "release" ]]; then
     CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release "${PKGS[@]}" --manifest-path "$ROOT/Cargo.toml"
@@ -55,6 +52,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
 fi
 
 BIN="$ROOT/target/$PROFILE/slackless-gui"
+CLI_BIN="$ROOT/target/$PROFILE/slackless"
 if [[ ! -x "$BIN" ]]; then
   echo "Expected binary not found at $BIN" >&2
   exit 1
@@ -68,6 +66,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN" "$APP/Contents/MacOS/slackless-gui"
 chmod +x "$APP/Contents/MacOS/slackless-gui"
+if [[ -x "$CLI_BIN" ]]; then
+  cp "$CLI_BIN" "$APP/Contents/MacOS/slackless"
+  chmod +x "$APP/Contents/MacOS/slackless"
+fi
 
 ICON_PNG="$ROOT/apps/slackless-gui/icon.png"
 if [[ -f "$ICON_PNG" ]] && command -v sips >/dev/null && command -v iconutil >/dev/null; then
@@ -174,16 +176,20 @@ if [[ "$DO_INSTALL" -eq 1 ]]; then
 fi
 
 if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
-  CLI_BIN="$ROOT/target/$PROFILE/slackless"
-  if [[ ! -x "$CLI_BIN" ]]; then
-    echo "Expected CLI binary not found at $CLI_BIN" >&2
-    exit 1
-  fi
   mkdir -p "$HOME/.local/bin"
-  cp "$CLI_BIN" "$HOME/.local/bin/slackless"
-  chmod +x "$HOME/.local/bin/slackless"
-  if command -v codesign >/dev/null; then
-    codesign --force --sign - "$HOME/.local/bin/slackless" >/dev/null 2>&1 || true
+  if [[ "$DO_INSTALL" -eq 1 && -x "$HOME/Applications/Slackless.app/Contents/MacOS/slackless" ]]; then
+    ln -sf "$HOME/Applications/Slackless.app/Contents/MacOS/slackless" "$HOME/.local/bin/slackless"
+    echo "Linked $HOME/.local/bin/slackless -> $HOME/Applications/Slackless.app/Contents/MacOS/slackless"
+  else
+    if [[ ! -x "$CLI_BIN" ]]; then
+      echo "Expected CLI binary not found at $CLI_BIN" >&2
+      exit 1
+    fi
+    cp "$CLI_BIN" "$HOME/.local/bin/slackless"
+    chmod +x "$HOME/.local/bin/slackless"
+    if command -v codesign >/dev/null; then
+      codesign --force --sign "$SIGN_ID" "$HOME/.local/bin/slackless" >/dev/null 2>&1 || true
+    fi
+    echo "Installed $HOME/.local/bin/slackless"
   fi
-  echo "Installed $HOME/.local/bin/slackless"
 fi
