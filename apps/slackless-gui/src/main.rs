@@ -237,6 +237,21 @@ fn main() {
         })
         .expect("Failed to open window");
         let _ = handle;
+        // Route POSIX SIGTERM / SIGINT (e.g. `pkill`, Ctrl-C) into GPUI's normal quit path so
+        // `on_app_quit` cleanly leaves any active huddle before terminating.
+        {
+            use futures::StreamExt as _;
+            let (term_tx, mut term_rx) = futures::channel::mpsc::unbounded::<()>();
+            platform::install_termination_monitor(move || {
+                let _ = term_tx.unbounded_send(());
+            });
+            cx.spawn(async move |cx| {
+                if term_rx.next().await.is_some() {
+                    cx.update(|cx| cx.quit());
+                }
+            })
+            .detach();
+        }
         // Drain OS `on_open_urls` and startup CLI deep links (`slack://`, `app.slack.com/client/...`,
         // `*.slack.com/archives/...`) via an async channel (zero idle polling).
         cx.spawn(async move |cx| {

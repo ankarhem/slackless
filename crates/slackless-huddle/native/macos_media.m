@@ -277,8 +277,8 @@ static void vt_compress_output_cb(
         CFRelease(frameProps);
     }
 
-    // Throttle local UI preview copies to ~15 fps while full 30 fps H.264 streams over WebRTC.
-    if (cap->on_preview && (submit_us - cap->last_preview_us) >= 66000ULL) {
+    // Throttle local UI preview copies to ~10 fps while full 30 fps H.264 streams over WebRTC.
+    if (cap->on_preview && (submit_us - cap->last_preview_us) >= 100000ULL) {
         cap->last_preview_us = submit_us;
         if (CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
             size_t w = CVPixelBufferGetWidth(pixelBuffer);

@@ -2112,10 +2112,17 @@ fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App) -> Option
     let fixtures = kcx.fixtures;
     let room = message.extra.get("room")?;
     let theme = cx.theme();
+    let active_participants_empty = room
+        .get("participants")
+        .and_then(|v| v.as_array())
+        .is_none_or(Vec::is_empty);
+    // Match `ShRoom::is_active()`: a huddle room with zero active participants (e.g. prewarmed or
+    // abandoned without a final `has_ended` mutation) is not live.
     let has_ended = room
         .get("has_ended")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || active_participants_empty;
     let custom_name = room
         .get("name")
         .and_then(|v| v.as_str())

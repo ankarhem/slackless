@@ -2226,7 +2226,8 @@ impl App {
             });
         });
         // Close-to-tray (`F-SHELL-141`): when enabled, closing the main window hides the app
-        // to the menu bar instead of terminating.
+        // to the menu bar instead of terminating. Otherwise start leaving any active huddle
+        // immediately so teardown is already underway before exit.
         let close_app = app.downgrade();
         window.on_window_should_close(cx, move |_window, cx| {
             let keep_in_tray = close_app
@@ -2236,8 +2237,55 @@ impl App {
                 cx.hide();
                 false
             } else {
+                if let Some(a) = close_app.upgrade() {
+                    a.update(cx, |app, cx| {
+                        if app.huddle_session.is_some() {
+                            app.leave_huddle(cx);
+                        }
+                    });
+                }
                 true
             }
+        });
+        // Graceful app quit cleanup: whenever Slackless quits (Cmd+Q, Menu Quit, Status Bar Quit,
+        // Dock Quit, OS logout, or SIGTERM/SIGINT), send `Command::Shutdown` to every live core
+        // bridge and wait briefly for active huddles to flush Chime `LEAVE` before exit.
+        let quit_app = app.downgrade();
+        let quit_sub = cx.on_app_quit(move |cx| {
+            let mut tasks: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+            if let Some(a) = quit_app.upgrade() {
+                let app = a.read(cx);
+                if let Some(t) = app.bridge.shutdown_task() {
+                    tasks.push(t);
+                }
+                for parked in app.parked_bridges.iter().flatten() {
+                    if let Some(t) = parked.shutdown_task() {
+                        tasks.push(t);
+                    }
+                }
+            }
+            let bg = cx.background_executor().clone();
+            async move {
+                if tasks.is_empty() {
+                    return;
+                }
+                let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+                let _ = std::thread::Builder::new()
+                    .name("slackless-shutdown".into())
+                    .spawn(move || {
+                        for task in tasks {
+                            task();
+                        }
+                        let _ = done_tx.send(());
+                    });
+                let timeout = bg.timer(Duration::from_millis(1500));
+                futures::pin_mut!(done_rx);
+                futures::pin_mut!(timeout);
+                let _ = futures::future::select(done_rx, timeout).await;
+            }
+        });
+        app.update(cx, |app, _| {
+            app._subscriptions.push(quit_sub);
         });
         // Poll actions clicked in the macOS menu-bar status item (`F-SHELL-168`).
         let status_app = app.downgrade();

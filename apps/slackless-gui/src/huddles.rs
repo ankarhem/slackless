@@ -810,10 +810,15 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
                 continue;
             }
             let room = room_of(message);
+            let has_active_participants = room
+                .and_then(|room| room.get("participants"))
+                .and_then(Value::as_array)
+                .is_some_and(|ids| !ids.is_empty());
             let live = room
                 .and_then(|room| room.get("has_ended"))
                 .and_then(Value::as_bool)
-                .is_some_and(|ended| !ended);
+                .is_some_and(|ended| !ended)
+                && has_active_participants;
             let participants = room
                 .and_then(|room| {
                     room.get(if live {

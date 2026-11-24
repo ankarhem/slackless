@@ -350,11 +350,17 @@ pub enum HuddleControl {
 /// Chime `LEAVE` teardown.
 pub struct HuddleHandle {
     tx: mpsc::UnboundedSender<HuddleControl>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl HuddleHandle {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<HuddleControl>) -> Self {
-        Self { tx }
+    pub(crate) fn new(
+        tx: mpsc::UnboundedSender<HuddleControl>,
+        finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        done: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self { tx, finished, done }
     }
 
     pub fn send(&self, control: HuddleControl) {
@@ -363,6 +369,20 @@ impl HuddleHandle {
 
     pub fn leave(&self) {
         let _ = self.tx.send(HuddleControl::Leave);
+    }
+
+    /// Initiate a clean Chime `LEAVE` teardown and wait up to `timeout` for the session task
+    /// (including any active `#content` screen-share session) to finish flushing and disconnect.
+    pub async fn leave_and_wait(&self, timeout: std::time::Duration) {
+        let _ = self.tx.send(HuddleControl::Leave);
+        if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let notified = self.done.notified();
+        if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, notified).await;
     }
 }
 

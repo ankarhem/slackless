@@ -1833,6 +1833,21 @@ impl App {
         self.bridge.send(Command::OpenConversation(channel.clone()));
         self.messages
             .update(cx, |list, cx| list.set_conversation(channel.clone(), cx));
+        // Seed frame 0 immediately from the read-only WAL SQLite cache (<1ms) so switching to a
+        // prefetched unread channel shows the newest messages instantly without waiting for an
+        // async executor hop or HTTP round-trip; `load_history` then fills the full 500-msg page
+        // and updates read state.
+        let cached_page = self.bridge.history_sync(&channel);
+        if !cached_page.is_empty() {
+            self.resolve_named_users(&cached_page);
+            let mark_read_mode = self.preferences.read(cx).settings().mark_read;
+            self.messages.update(cx, |list, cx| {
+                list.set_history(channel.clone(), cached_page, cx);
+                if mark_read_mode == 0 {
+                    list.scroll_to_unread_once(cx);
+                }
+            });
+        }
         self.load_history(&channel, cx);
         self.channel = channel;
         self.open_members = None;

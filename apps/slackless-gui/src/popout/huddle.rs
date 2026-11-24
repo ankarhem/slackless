@@ -669,7 +669,14 @@ impl PopoutWindow {
                 .and_then(|r| r.get("has_ended"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            (!has_ended).then_some(row.message.ts)
+            let has_participants = row
+                .message
+                .extra
+                .get("room")
+                .and_then(|r| r.get("participants"))
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty());
+            (!has_ended && has_participants).then_some(row.message.ts)
         })
     }
 
@@ -2090,7 +2097,7 @@ impl PopoutWindow {
         state: &crate::huddle_dock::HuddleViewState,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
-        use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
+        use gpui_kit::gpui::{Corners, ObjectFit};
         use slackless_core::huddle::HuddleDrawMessage;
 
         let filter_id = item_id.clone();
@@ -2107,19 +2114,36 @@ impl PopoutWindow {
             .cloned()
             .collect();
         let bounds_cell = Arc::clone(&self.huddle_stage_bounds);
-        let draw_overlay = canvas(
+        let frame_for_layout = Arc::clone(&img_frame);
+        // Render the video frame directly inside a full-size `canvas` with `ObjectFit::Contain`
+        // instead of GPUI's `img` element: `Img::request_layout` injects `style.aspect_ratio`,
+        // which causes Taffy to expand height from `width: 100%` and clip the bottom of tall
+        // windows and 16:10 Retina displays inside `overflow_hidden`.
+        let stage_canvas = canvas(
             move |bounds, _, _| {
+                let image_bounds = ObjectFit::Contain.get_bounds(bounds, frame_for_layout.size(0));
                 if pane_ix == 0 {
                     if let Ok(mut guard) = bounds_cell.lock() {
-                        *guard = bounds;
+                        *guard = image_bounds;
                     }
                 }
+                image_bounds
             },
-            move |bounds, _, window, _| {
-                let left: f32 = bounds.origin.x.into();
-                let top: f32 = bounds.origin.y.into();
-                let width: f32 = bounds.size.width.into();
-                let height: f32 = bounds.size.height.into();
+            move |bounds, image_bounds, window, _| {
+                if img_frame.frame_count() > 0 {
+                    let _ = window.paint_image(
+                        bounds,
+                        image_bounds,
+                        Corners::default(),
+                        Arc::clone(&img_frame),
+                        0,
+                        false,
+                    );
+                }
+                let left: f32 = image_bounds.origin.x.into();
+                let top: f32 = image_bounds.origin.y.into();
+                let width: f32 = image_bounds.size.width.into();
+                let height: f32 = image_bounds.size.height.into();
                 if width <= 1.0 || height <= 1.0 {
                     return;
                 }
@@ -2174,16 +2198,11 @@ impl PopoutWindow {
             .relative()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .h_full()
             .overflow_hidden()
             .bg(rgb(0x0B0D10))
-            .child(
-                img(img_frame)
-                    .w_full()
-                    .h_full()
-                    .object_fit(ObjectFit::Contain),
-            )
-            .child(div().absolute().inset_0().child(draw_overlay));
+            .child(stage_canvas);
 
         if self.huddle_draw_mode && pane_ix == 0 {
             pane = pane
@@ -2970,6 +2989,9 @@ impl PopoutWindow {
                         let prefix = if src.is_monitor { "🖥 " } else { "🪟 " };
                         div()
                             .id(("popout-huddle-src", ix))
+                            .max_w(px(520.))
+                            .min_w_0()
+                            .truncate()
                             .px_2p5()
                             .py_1()
                             .rounded_lg()

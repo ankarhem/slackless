@@ -57,6 +57,103 @@ pub fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'static) {
     fallback::install_screen_lock_monitor(on_lock);
 }
 
+/// Install a POSIX `SIGTERM`/`SIGINT` signal monitor that invokes `on_terminate` on a helper
+/// thread so the application can run graceful quit cleanup (e.g. leaving active huddles before
+/// exiting). A second signal falls back to the OS default action so termination can never hang.
+/// Safe to call once at app startup; no-op on non-Unix platforms.
+pub fn install_termination_monitor(on_terminate: impl Fn() + Send + Sync + 'static) {
+    #[cfg(unix)]
+    unix_termination::install(on_terminate);
+    #[cfg(not(unix))]
+    let _ = on_terminate;
+}
+
+#[cfg(unix)]
+mod unix_termination {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(not(target_os = "macos"))]
+    const O_NONBLOCK: i32 = 0x0800;
+
+    type SigHandler = extern "C" fn(i32);
+
+    extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
+        fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+
+    static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+    static INSTALL_ONCE: Once = Once::new();
+
+    extern "C" fn handle_signal(sig: i32) {
+        // Restore default handler immediately so a second SIGTERM/SIGINT force-terminates cleanly.
+        unsafe {
+            signal(sig, 0);
+        }
+        let fd = WRITE_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let byte: u8 = sig as u8;
+            unsafe {
+                let _ = write(fd, (&byte as *const u8).cast::<std::ffi::c_void>(), 1);
+            }
+        }
+    }
+
+    pub(crate) fn install(on_terminate: impl Fn() + Send + Sync + 'static) {
+        INSTALL_ONCE.call_once(|| {
+            let mut fds = [-1i32; 2];
+            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+                return;
+            }
+            let read_fd = fds[0];
+            let write_fd = fds[1];
+            unsafe {
+                let flags = fcntl(write_fd, F_GETFL);
+                if flags >= 0 {
+                    let _ = fcntl(write_fd, F_SETFL, flags | O_NONBLOCK);
+                }
+            }
+            WRITE_FD.store(write_fd, Ordering::Release);
+            let handler = handle_signal as SigHandler as usize;
+            unsafe {
+                signal(SIGTERM, handler);
+                signal(SIGINT, handler);
+            }
+            let _ = std::thread::Builder::new()
+                .name("slackless-signal".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 8];
+                    loop {
+                        let n = unsafe {
+                            read(
+                                read_fd,
+                                buf.as_mut_ptr().cast::<std::ffi::c_void>(),
+                                buf.len(),
+                            )
+                        };
+                        if n > 0 {
+                            on_terminate();
+                            break;
+                        }
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+        });
+    }
+}
+
 /// Error surfaced by the fallible platform capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlatformError {

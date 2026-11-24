@@ -48,6 +48,18 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+struct SessionDoneGuard {
+    finished: Arc<AtomicBool>,
+    done: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for SessionDoneGuard {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        self.done.notify_waiters();
+    }
+}
+
 /// Start a native audio/video/screen-share huddle session on the current tokio runtime.
 pub fn spawn_huddle_session(
     creds: HuddleCredentials,
@@ -55,8 +67,17 @@ pub fn spawn_huddle_session(
     updates: mpsc::UnboundedSender<HuddleUpdate>,
 ) -> HuddleHandle {
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_session(creds, config, ctrl_rx, updates));
-    HuddleHandle::new(ctrl_tx)
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(tokio::sync::Notify::new());
+    let guard = SessionDoneGuard {
+        finished: Arc::clone(&finished),
+        done: Arc::clone(&done),
+    };
+    tokio::spawn(async move {
+        let _done_guard = guard;
+        run_session(creds, config, ctrl_rx, updates).await;
+    });
+    HuddleHandle::new(ctrl_tx, finished, done)
 }
 
 enum LoopExit {

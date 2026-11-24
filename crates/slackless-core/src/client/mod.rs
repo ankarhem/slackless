@@ -206,6 +206,19 @@ impl ClientHandle {
         (self.commands, self.events, self.store)
     }
 
+    /// Like [`Self::into_parts`], also returning the core runtime thread handle so the caller
+    /// can join it during graceful application quit after sending [`Command::Shutdown`].
+    pub fn into_parts_with_thread(
+        self,
+    ) -> (
+        UnboundedSender<Command>,
+        UnboundedReceiver<Event>,
+        SharedStore,
+        JoinHandle<()>,
+    ) {
+        (self.commands, self.events, self.store, self.thread)
+    }
+
     /// Stops the core and waits for its thread to exit.
     pub fn shutdown(self) -> std::thread::Result<()> {
         let _ = self.commands.unbounded_send(Command::Shutdown);
@@ -306,7 +319,7 @@ pub(crate) async fn run<B: Backend>(
             event = next_rtm(&mut rtm) => core.on_rtm(event).await,
         }
     }
-    core.shutdown();
+    core.shutdown().await;
 }
 
 /// The next websocket event; pends forever once the socket stream has ended.
@@ -349,6 +362,9 @@ pub(crate) struct Core<B: Backend> {
     cloud_draft_ids: Arc<Mutex<HashMap<ChannelId, String>>>,
     /// Whether the RTM websocket is currently disconnected or reconnecting.
     is_offline: bool,
+    /// Becomes `true` after the first RTM `Connected` transition so subsequent reconnects refresh
+    /// `client.counts` and prefetch any messages missed while disconnected or asleep.
+    has_connected_once: bool,
     /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
     offline_queue: VecDeque<(i64, QueuedMutation)>,
     /// Active native Chime audio huddle session handle (at most one per workspace).
@@ -412,6 +428,7 @@ impl<B: Backend> Core<B> {
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
+            has_connected_once: false,
             offline_queue: persisted,
             active_huddle: Arc::new(Mutex::new(None)),
             active_huddle_call_id: Arc::new(Mutex::new(None)),
@@ -549,6 +566,7 @@ impl<B: Backend> Core<B> {
         }
         match self.backend.counts().await {
             Ok(counts) => {
+                self.prefetch_unreads(&counts);
                 self.events.emit(Event::Counts(Box::new(counts)));
             }
             Err(e) => self.events.report("client.counts", e.into()),
@@ -645,6 +663,102 @@ impl<B: Backend> Core<B> {
                     Err(e.into())
                 }
             }
+        });
+    }
+
+    /// Background-prefetch the newest messages of unread conversations reported by
+    /// `client.counts` whose local SQLite cache is behind `latest`, so clicking an unread channel
+    /// or DM renders the new messages on frame 0 without waiting for an HTTP round-trip.
+    fn prefetch_unreads(&self, counts: &crate::api::ClientCounts) {
+        /// Cap per hydrate/reconnect pass so workspaces with hundreds of muted unread channels
+        /// stay well within Slack's Tier-3 rate limits.
+        const MAX_PREFETCH: usize = 25;
+
+        let mut targets: Vec<(ChannelId, Option<Ts>, u32, bool)> = Vec::new();
+        for entry in counts.ims.iter().chain(&counts.mpims) {
+            if entry.is_unread() {
+                targets.push((
+                    entry.id.clone(),
+                    entry.latest.clone(),
+                    entry.effective_mentions(),
+                    true,
+                ));
+            }
+        }
+        for entry in &counts.channels {
+            if entry.is_unread() {
+                targets.push((
+                    entry.id.clone(),
+                    entry.latest.clone(),
+                    entry.effective_mentions(),
+                    false,
+                ));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        // Prioritize DMs and mentions first, then newest activity first.
+        targets.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| b.1.cmp(&a.1))
+        });
+        targets.truncate(MAX_PREFETCH);
+
+        let (backend, store, ws, events, unfurls) = (
+            self.backend.clone(),
+            Arc::clone(&self.store),
+            self.workspace.clone(),
+            self.events.clone(),
+            self.unfurls.clone(),
+        );
+        self.spawn("unread prefetch", async move {
+            let mut fetched = 0usize;
+            for (channel, latest, _, _) in targets {
+                // Skip channels whose local archive already contains `latest`.
+                if let Some(ref latest_ts) = latest {
+                    if !latest_ts.as_str().is_empty() {
+                        let (ws_check, ch_check) = (ws.clone(), channel.clone());
+                        let local_newest = with_store(&store, move |s| {
+                            s.channel_history(&ws_check, &ch_check, None, 1)
+                                .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
+                        })
+                        .await?;
+                        if local_newest
+                            .as_ref()
+                            .is_some_and(|local| local >= latest_ts)
+                        {
+                            continue;
+                        }
+                    }
+                }
+                if fetched >= 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                let items = match wait_out_rate_limits(|| {
+                    backend.recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
+                })
+                .await
+                {
+                    Ok(items) => items,
+                    Err(_) => continue,
+                };
+                fetched += 1;
+                if items.is_empty() {
+                    continue;
+                }
+                unfurls.resolve(items.iter());
+                let (ws_put, target) = (ws.clone(), channel.clone());
+                with_store(&store, move |s| {
+                    items
+                        .iter()
+                        .try_for_each(|message| s.upsert_message(&ws_put, &target, message))
+                })
+                .await?;
+                events.emit(Event::StoreChanged { channel });
+            }
+            Ok(())
         });
     }
 
@@ -2564,8 +2678,82 @@ impl<B: Backend> Core<B> {
                 // Subscriptions last one websocket session: (re)subscribe on every `hello`.
                 match &state {
                     ConnectionState::Connected { .. } => {
+                        let reconnected = self.has_connected_once;
+                        self.has_connected_once = true;
                         self.is_offline = false;
                         self.subscribe_dm_presence();
+                        if reconnected {
+                            let (backend, store, ws, events, unfurls) = (
+                                self.backend.clone(),
+                                Arc::clone(&self.store),
+                                self.workspace.clone(),
+                                self.events.clone(),
+                                self.unfurls.clone(),
+                            );
+                            self.spawn("reconnect counts", async move {
+                                let counts = backend.counts().await?;
+                                let unread_channels: Vec<(ChannelId, Option<Ts>)> = counts
+                                    .ims
+                                    .iter()
+                                    .chain(&counts.mpims)
+                                    .chain(&counts.channels)
+                                    .filter(|c| c.is_unread())
+                                    .take(25)
+                                    .map(|c| (c.id.clone(), c.latest.clone()))
+                                    .collect();
+                                events.emit(Event::Counts(Box::new(counts)));
+                                for (idx, (channel, latest)) in
+                                    unread_channels.into_iter().enumerate()
+                                {
+                                    if let Some(ref latest_ts) = latest {
+                                        if !latest_ts.as_str().is_empty() {
+                                            let (ws_c, ch_c) = (ws.clone(), channel.clone());
+                                            let local_newest = with_store(&store, move |s| {
+                                                s.channel_history(&ws_c, &ch_c, None, 1).map(
+                                                    |rows| {
+                                                        rows.into_iter()
+                                                            .last()
+                                                            .map(|r| r.message.ts)
+                                                    },
+                                                )
+                                            })
+                                            .await?;
+                                            if local_newest
+                                                .as_ref()
+                                                .is_some_and(|local| local >= latest_ts)
+                                            {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    if idx >= 3 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(150))
+                                            .await;
+                                    }
+                                    if let Ok(items) = wait_out_rate_limits(|| {
+                                        backend.recent_history(
+                                            channel.clone(),
+                                            crate::backend::UNREADS_HISTORY_LIMIT,
+                                        )
+                                    })
+                                    .await
+                                    {
+                                        if !items.is_empty() {
+                                            unfurls.resolve(items.iter());
+                                            let (ws_p, target) = (ws.clone(), channel.clone());
+                                            let _ = with_store(&store, move |s| {
+                                                items.iter().try_for_each(|m| {
+                                                    s.upsert_message(&ws_p, &target, m)
+                                                })
+                                            })
+                                            .await;
+                                            events.emit(Event::StoreChanged { channel });
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            });
+                        }
                         if !self.offline_queue.is_empty() {
                             let queued: Vec<(i64, QueuedMutation)> =
                                 self.offline_queue.drain(..).collect();
@@ -3022,14 +3210,21 @@ impl<B: Backend> Core<B> {
         });
     }
 
-    fn shutdown(&mut self) {
-        if let Some(handle) = self
+    async fn shutdown(&mut self) {
+        let _ = self
+            .active_huddle_call_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let active = self
             .active_huddle
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            handle.leave();
+            .take();
+        if let Some(handle) = active {
+            handle
+                .leave_and_wait(std::time::Duration::from_millis(1200))
+                .await;
         }
         for (_, task) in self.backfills.drain() {
             task.abort();

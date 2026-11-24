@@ -121,6 +121,9 @@ pub struct CoreBridge {
     /// The `futures::channel::mpsc::UnboundedSender` it captures is not nameable here, so it
     /// is wrapped in a closure instead of a field.
     command_sink: Option<Arc<dyn Fn(Command) + Send + Sync>>,
+    /// Live mode: the core runtime thread handle, joined during graceful quit so active huddles
+    /// flush Chime `LEAVE` before the process terminates.
+    core_thread: Option<Arc<Mutex<Option<std::thread::JoinHandle<()>>>>>,
     /// Live mode: the store the core keeps current (writer connection). Fixture mode: `None`.
     store: Option<SharedStore>,
     /// Live mode: dedicated read-only WAL connection so UI queries never block on background
@@ -140,6 +143,7 @@ impl CoreBridge {
     pub fn offline() -> Self {
         Self {
             command_sink: None,
+            core_thread: None,
             store: None,
             reader: None,
             session: None,
@@ -167,6 +171,7 @@ impl CoreBridge {
         let fetcher = handle.fetcher();
         let mut bridge = Self {
             command_sink: None,
+            core_thread: None,
             store: None,
             reader,
             session: Some(session),
@@ -174,8 +179,9 @@ impl CoreBridge {
             hub: Some(hub.clone()),
         };
 
-        let (commands, mut events, store) = handle.into_parts();
+        let (commands, mut events, store, thread) = handle.into_parts_with_thread();
         bridge.store = Some(store);
+        bridge.core_thread = Some(Arc::new(Mutex::new(Some(thread))));
         bridge.command_sink = Some(Arc::new(move |command| {
             if let Err(e) = commands.unbounded_send(command) {
                 eprintln!("slackless: core has stopped; command dropped ({e})");
@@ -195,6 +201,19 @@ impl CoreBridge {
         .detach();
 
         Some(bridge)
+    }
+
+    /// Return a blocking closure that sends [`Command::Shutdown`] and joins this workspace's core
+    /// thread so any active huddle flushes its Chime `LEAVE` before process exit.
+    pub fn shutdown_task(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        let sink = self.command_sink.clone()?;
+        let thread_slot = self.core_thread.clone()?;
+        Some(Box::new(move || {
+            sink(Command::Shutdown);
+            if let Some(handle) = thread_slot.lock().ok().and_then(|mut g| g.take()) {
+                let _ = handle.join();
+            }
+        }))
     }
 
     fn read_store(&self) -> Option<&SharedStore> {
