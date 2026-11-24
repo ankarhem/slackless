@@ -2116,13 +2116,17 @@ fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App) -> Option
         .get("participants")
         .and_then(|v| v.as_array())
         .is_none_or(Vec::is_empty);
-    // Match `ShRoom::is_active()`: a huddle room with zero active participants (e.g. prewarmed or
-    // abandoned without a final `has_ended` mutation) is not live.
+    let date_start = room.get("date_start").and_then(|v| v.as_u64());
+    let now_u64 = super::now_secs().max(0) as u64;
+    let stale_empty = active_participants_empty
+        && date_start.is_none_or(|start| now_u64.saturating_sub(start) > 120);
+    // Match `ShRoom::is_active()`: a huddle room with zero active participants after initial
+    // handshake (e.g. abandoned without a final `has_ended` mutation) is not live.
     let has_ended = room
         .get("has_ended")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
-        || active_participants_empty;
+        || stale_empty;
     let custom_name = room
         .get("name")
         .and_then(|v| v.as_str())

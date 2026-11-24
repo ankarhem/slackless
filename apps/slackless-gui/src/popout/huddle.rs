@@ -1260,12 +1260,21 @@ impl PopoutWindow {
         let video_codec = snap
             .active_video_codec
             .as_deref()
-            .unwrap_or(if snap.video || snap.sharing {
-                "video/H264 (OpenH264)"
-            } else {
-                "Idle (AV1 / H.264 ready)"
-            })
-            .to_owned();
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                if let Some(backend) = snap
+                    .perf
+                    .tx_backend
+                    .as_deref()
+                    .filter(|b| !b.is_empty() && *b != "none")
+                {
+                    format!("video/H264 ({backend})")
+                } else if snap.video || snap.sharing {
+                    "video/H264".to_owned()
+                } else {
+                    "Idle (AV1 / H.264 ready)".to_owned()
+                }
+            });
         let tx_kb = snap.bytes_sent as f64 / 1024.0;
         let rx_kb = snap.bytes_received as f64 / 1024.0;
         let rms_pct = (state.levels.local_rms.clamp(0.0, 1.0) * 100.0) as u32;
@@ -1397,9 +1406,18 @@ impl PopoutWindow {
                             ))
                             .child(stat_row(
                                 "Screen audio",
-                                snap.screen_audio_device
-                                    .clone()
-                                    .unwrap_or_else(|| "None (install BlackHole 2ch)".to_owned()),
+                                snap.screen_audio_device.clone().unwrap_or_else(|| {
+                                    if slackless_core::huddle::system_audio_source_label().is_some()
+                                    {
+                                        if snap.sharing {
+                                            "Off (unchecked)".to_owned()
+                                        } else {
+                                            "Ready (macOS Native System Audio)".to_owned()
+                                        }
+                                    } else {
+                                        "None (install BlackHole 2ch)".to_owned()
+                                    }
+                                }),
                             )),
                     )
                     .child(
@@ -2264,8 +2282,8 @@ impl PopoutWindow {
             .min_w_0()
             .min_h_0()
             .h_full()
+            .rounded(px(15.))
             .overflow_hidden()
-            .bg(rgb(0x0B0D10))
             .child(stage_canvas);
 
         if self.huddle_draw_mode && pane_ix == 0 {
@@ -3244,9 +3262,12 @@ impl PopoutWindow {
                             })
                             .child("Share entire screen")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.huddle_share_tab = HuddleShareTab::Screen;
-                                this.refresh_share_thumbnails(true, cx);
-                                cx.notify();
+                                if this.huddle_share_tab != HuddleShareTab::Screen {
+                                    this.huddle_share_tab = HuddleShareTab::Screen;
+                                    this.huddle_share_selected = None;
+                                    this.refresh_share_thumbnails(true, cx);
+                                    cx.notify();
+                                }
                             })),
                     )
                     .child(
@@ -3280,9 +3301,12 @@ impl PopoutWindow {
                             })
                             .child("Window")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.huddle_share_tab = HuddleShareTab::Window;
-                                this.refresh_share_thumbnails(false, cx);
-                                cx.notify();
+                                if this.huddle_share_tab != HuddleShareTab::Window {
+                                    this.huddle_share_tab = HuddleShareTab::Window;
+                                    this.huddle_share_selected = None;
+                                    this.refresh_share_thumbnails(false, cx);
+                                    cx.notify();
+                                }
                             })),
                     ),
             )
@@ -3362,7 +3386,7 @@ impl PopoutWindow {
                                     Hsla::from(rgba(0x00000000))
                                 })
                                 .hover(move |el| if is_selected { el } else { el.bg(hover) })
-                                .child(render_thumb(thumb, true, res, px(244.), px(148.)))
+                                .child(render_thumb(thumb, true, res, px(244.), px(138.)))
                                 .child(
                                     div()
                                         .w_full()
@@ -3439,7 +3463,7 @@ impl PopoutWindow {
                                         Hsla::from(rgba(0x00000000))
                                     })
                                     .hover(move |el| if is_selected { el } else { el.bg(hover) })
-                                    .child(render_thumb(thumb, false, res, px(180.), px(112.)))
+                                    .child(render_thumb(thumb, false, res, px(180.), px(102.)))
                                     .child(
                                         div()
                                             .w(px(180.))
@@ -4165,16 +4189,23 @@ impl PopoutWindow {
             )
             .child(div().my_1().h(px(1.)).bg(pal.popover_border))
             .child(
-                div()
+                h_flex()
                     .id("popout-audio-prefs")
-                    .px_2()
+                    .px_2p5()
                     .py_1p5()
-                    .rounded_md()
+                    .gap_2()
+                    .items_center()
+                    .rounded_lg()
                     .cursor_pointer()
                     .hover(move |el| el.bg(hover))
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(pal.popover_fg)
+                    .child(
+                        gpui_kit::component::Icon::new(IconName::Settings)
+                            .size(px(14.))
+                            .text_color(pal.popover_muted),
+                    )
                     .child("Audio & video preferences")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_audio_video_preferences(cx);
@@ -4450,32 +4481,6 @@ impl PopoutWindow {
                     })),
             );
 
-        let send_blur = self.send.clone();
-        let next_blur = !blur_now;
-        let blur_btn = div()
-            .id("popout-huddle-blur")
-            .h(px(36.))
-            .px_2p5()
-            .rounded_lg()
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(if blur_now { active_bg } else { ctrl_bg })
-            .hover(move |el| el.bg(if blur_now { active_bg } else { ctrl_hover }))
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(if blur_now { active_fg } else { ctrl_fg })
-            .child(if blur_now { "Blur on" } else { "Blur" })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                (send_blur)(Command::SetHuddleBlurBackground(next_blur));
-                if this.fixtures.sample {
-                    if let Some(dock) = this.huddle_dock_entity() {
-                        dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
-                    }
-                }
-            }));
-
         let primary = pal.primary;
         let primary_hover = pal.primary_hover;
         let primary_fg = pal.primary_fg;
@@ -4714,7 +4719,6 @@ impl PopoutWindow {
                     .gap_2()
                     .child(mic_btn)
                     .child(cam_btn)
-                    .when(video_now, |bar| bar.child(blur_btn))
                     .child(share_btn)
                     .child(hand_btn)
                     .child(react_btn)
