@@ -134,10 +134,87 @@ jobs:
           (cd "$DIST" && shasum -a 256 * > SHA256SUMS.txt)
           ls -lh "$DIST"
 
+      - name: Generate grouped release notes
+        id: notes
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          PREV_TAG="$(git tag --sort=-creatordate | grep -E '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]+$' | head -n 1 || true)"
+          if [[ -n "$PREV_TAG" ]]; then
+            RANGE="${PREV_TAG}..${GITHUB_SHA}"
+          else
+            RANGE="${GITHUB_SHA}"
+          fi
+
+          python3 - "$RANGE" "$PREV_TAG" "$VERSION" "$NOTES_FILE" <<'PY'
+          import subprocess, sys
+
+          rev_range, prev_tag, version, out_path = sys.argv[1:5]
+          raw = subprocess.check_output(
+              ["git", "log", "--no-merges", "--format=%h%x09%s", rev_range],
+              text=True,
+          ).splitlines()
+
+          groups = {
+              "Features": [],
+              "Bug Fixes": [],
+              "Performance": [],
+              "Maintenance & Other": [],
+          }
+
+          for line in raw:
+              if "\t" not in line:
+                  continue
+              sha, subj = line.split("\t", 1)
+              low = subj.lower()
+              entry = f"- {subj} (`{sha}`)"
+              if low.startswith("feat"):
+                  groups["Features"].append(entry)
+              elif low.startswith("fix"):
+                  groups["Bug Fixes"].append(entry)
+              elif low.startswith("perf"):
+                  groups["Performance"].append(entry)
+              else:
+                  groups["Maintenance & Other"].append(entry)
+
+          lines = []
+          for heading in ("Features", "Bug Fixes", "Performance", "Maintenance & Other"):
+              items = groups[heading]
+              if items:
+                  lines.append(f"### {heading}")
+                  lines.extend(items)
+                  lines.append("")
+
+          if not lines:
+              lines.append("Maintenance release.\n")
+
+          if prev_tag:
+              lines.append(
+                  f"**Full Changelog**: https://github.com/ankarhem/slackless/compare/{prev_tag}...{version}\n"
+              )
+
+          lines.append("### Install or Update (macOS Apple Silicon)")
+          lines.append("```sh")
+          lines.append("curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | sh")
+          lines.append("# or, if already installed:")
+          lines.append("slackless update --restart")
+          lines.append("```")
+
+          with open(out_path, "w", encoding="utf-8") as f:
+              f.write("\n".join(lines).strip() + "\n")
+          PY
+
+          cat "$NOTES_FILE"
+          echo "file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
+          NOTES_FILE: ${{ steps.notes.outputs.file }}
         shell: bash
         run: |
           set -euo pipefail
@@ -145,4 +222,4 @@ jobs:
             dist/* \
             --target "$GITHUB_SHA" \
             --title "Slackless ${VERSION}" \
-            --generate-notes
+            --notes-file "$NOTES_FILE"
