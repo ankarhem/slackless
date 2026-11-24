@@ -33,11 +33,19 @@ steps:
         exit 1
       fi
 
-      mkdir -p "$HOME/.ssh"
-      chmod 700 "$HOME/.ssh"
-      printf '%s\n' "$GITHUB_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
-      chmod 600 "$HOME/.ssh/id_ed25519"
-      ssh-keyscan -t ed25519,rsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+      # Minimal nixery containers lack /etc/passwd, which OpenSSH requires via getpwuid().
+      if [ ! -f /etc/passwd ]; then
+        mkdir -p /etc /root
+        echo 'root:x:0:0:root:/root:/bin/sh' > /etc/passwd
+      fi
+
+      mkdir -p /tmp/gh-ssh
+      chmod 700 /tmp/gh-ssh
+      printf '%s\n' "$GITHUB_DEPLOY_KEY" > /tmp/gh-ssh/id_ed25519
+      chmod 600 /tmp/gh-ssh/id_ed25519
+      ssh-keyscan -t ed25519,rsa github.com > /tmp/gh-ssh/known_hosts 2>/dev/null
+
+      export GIT_SSH_COMMAND="ssh -i /tmp/gh-ssh/id_ed25519 -o UserKnownHostsFile=/tmp/gh-ssh/known_hosts -o IdentitiesOnly=yes"
 
       if [ -f .git/shallow ]; then
         git fetch --unshallow --tags
