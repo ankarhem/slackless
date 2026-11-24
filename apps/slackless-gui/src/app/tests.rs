@@ -1152,3 +1152,210 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
         let _ = window.draw(cx);
     });
 }
+
+#[gpui::test]
+fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::TestAppContext) {
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let baseline_subs = app.read_with(cx, |app, _| app._subscriptions.len());
+    let sample_images = || {
+        let img = |name: &str| ViewerImage {
+            name: name.to_owned(),
+            source: gpui::ImageSource::Image(Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                Vec::new(),
+            ))),
+            user: None,
+            taken_at: None,
+            download: None,
+        };
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(vec![img("one.png"), img("two.png")])
+    };
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let ch = app.channel.clone();
+            app.open_image_viewer(ch, sample_images(), 0, window, cx);
+        });
+        let _ = window.draw(cx);
+    });
+    assert_eq!(
+        app.read_with(cx, |app, _| app._subscriptions.len()),
+        baseline_subs,
+        "opening ImageViewer must not append to App._subscriptions"
+    );
+
+    // Step forward/back, zoom in/out/reset, then close with Escape.
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .current_index()),
+        1
+    );
+
+    let fit_zoom = app.read_with(cx, |app, cx| {
+        app.image_viewer.as_ref().unwrap().read(cx).zoom_index()
+    });
+    cx.simulate_keystrokes("=");
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .zoom_index()),
+        fit_zoom + 1,
+        "`=` should zoom in"
+    );
+    cx.simulate_keystrokes("0");
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |app, cx| app
+            .image_viewer
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .zoom_index()),
+        fit_zoom,
+        "`0` should reset zoom to fit"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(app.read_with(cx, |app, _| app.image_viewer.is_none()));
+    assert!(app.read_with(cx, |app, _| app._viewer_sub.is_none()));
+}
+
+#[gpui::test]
+fn qa_personal_todo_and_major_views_render_cleanly(cx: &mut gpui::TestAppContext) {
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    let initial_channel = app.read_with(cx, |app, _| app.channel.clone());
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // Add a personal to-do and emit LaterEvent::Open with the sentinel channel:
+            // App must ignore it rather than switching to a nonexistent `"TODO"` channel.
+            app.open_later(cx);
+            app.later.update(cx, |later, cx| {
+                later.add_todo("Review QA checklist".into(), cx)
+            });
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            // Walk every top-level view and draw each frame to catch layout/render regressions.
+            app.open_unreads(window, cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_threads(cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_drafts(cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_activity(cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_directory(cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_files(cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_huddles(cx);
+        });
+        let _ = window.draw(cx);
+
+        app.update(cx, |app, cx| {
+            app.open_home(cx);
+            assert_eq!(app.channel, initial_channel);
+
+            // Populate Preferences -> Advanced with an available release + notes highlights.
+            let info = crate::updater::ReleaseInfo {
+                version: "2026.11.24-99".to_owned(),
+                html_url: "https://github.com/ankarhem/slackless/releases/tag/2026.11.24-99"
+                    .to_owned(),
+                asset_name: "Slackless-2026.11.24-99-macos-arm64.app.tar.gz".to_owned(),
+                download_url: "https://example.com/archive.tar.gz".to_owned(),
+                sha256_url: Some("https://example.com/SHA256SUMS.txt".to_owned()),
+                notes: vec![
+                    "Add cross-workspace search".to_owned(),
+                    "Keep scroll smooth over hover popovers".to_owned(),
+                ],
+            };
+            app.preferences.update(cx, |prefs, cx| {
+                prefs.set_update_state(
+                    crate::updater::UpdateState::Available(info.clone()),
+                    Some(info),
+                    cx,
+                );
+                prefs.show(Section::Advanced, cx);
+            });
+        });
+        let _ = window.draw(cx);
+    });
+}

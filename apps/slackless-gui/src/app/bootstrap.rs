@@ -348,6 +348,19 @@ impl App {
                                     viewer.update(cx, |viewer, cx| viewer.step(1, window, cx));
                                     cx.stop_propagation();
                                 }
+                                "+" | "=" => {
+                                    viewer.update(cx, |viewer, cx| viewer.zoom_step(1, window, cx));
+                                    cx.stop_propagation();
+                                }
+                                "-" | "_" => {
+                                    viewer
+                                        .update(cx, |viewer, cx| viewer.zoom_step(-1, window, cx));
+                                    cx.stop_propagation();
+                                }
+                                "0" => {
+                                    viewer.update(cx, |viewer, cx| viewer.reset_zoom(window, cx));
+                                    cx.stop_propagation();
+                                }
                                 _ => {}
                             }
                         });
@@ -720,15 +733,23 @@ impl App {
                             channel,
                             ts,
                         } => {
+                            if channel.as_str() == crate::later::PERSONAL_TODO_CHANNEL {
+                                return;
+                            }
                             this.switch_workspace(*workspace, window, cx);
-                            this.select(channel.clone(), cx);
-                            this.messages.update(cx, |list, cx| list.reveal(ts, cx));
+                            if this.fixtures.conversation(channel).is_some() {
+                                this.select(channel.clone(), cx);
+                                this.messages.update(cx, |list, cx| list.reveal(ts, cx));
+                            }
                         }
                         LaterEvent::Unsaved {
                             workspace,
                             channel,
                             ts,
                         } => {
+                            if channel.as_str() == crate::later::PERSONAL_TODO_CHANNEL {
+                                return;
+                            }
                             if *workspace == this.workspace {
                                 this.messages
                                     .update(cx, |list, cx| list.set_saved(ts, false, cx));
@@ -1390,6 +1411,7 @@ impl App {
                 profile_hover: hover_card::Lifecycle::default(),
                 remind_menu: None,
                 image_viewer: None,
+                _viewer_sub: None,
                 drafts,
                 drafts_open: false,
                 later,
@@ -1540,7 +1562,10 @@ impl App {
         app.update(cx, |app, _| {
             app._subscriptions.push(quit_sub);
         });
-        // Event-driven actions clicked in the macOS menu-bar status item (`F-SHELL-168`, zero polling).
+        // Event-driven OS monitors (`F-SHELL-168`, mouse Back/Forward, screen lock). Skipped
+        // under `#[cfg(test)]` because these install process-global callbacks whose senders would
+        // be dropped across parallel `#[gpui::test]` threads, waking another test's scheduler.
+        #[cfg(not(test))]
         {
             use futures::StreamExt as _;
             let (status_tx, mut status_rx) = futures::channel::mpsc::unbounded::<StatusBarAction>();
@@ -1597,6 +1622,7 @@ impl App {
             .detach();
         }
         // Catch macOS swipe-based mouse Back/Forward events that GPUI drops (`phase == None`).
+        #[cfg(not(test))]
         {
             use futures::StreamExt as _;
             let (nav_tx, mut nav_rx) = futures::channel::mpsc::unbounded::<MouseNavDirection>();
@@ -1618,6 +1644,7 @@ impl App {
             .detach();
         }
         // Auto-leave active native huddle when the macOS screen locks (`F-COLLAB-059`).
+        #[cfg(not(test))]
         {
             use futures::StreamExt as _;
             let (lock_tx, mut lock_rx) = futures::channel::mpsc::unbounded::<()>();

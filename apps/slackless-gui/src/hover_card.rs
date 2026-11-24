@@ -381,8 +381,7 @@ pub(crate) fn card(
     let (hovered, dismiss) = (actions.hovered.clone(), actions.dismiss.clone());
     div()
         .id("member-hover-card")
-        .occlude()
-        .on_scroll(|_, _, cx| cx.stop_propagation())
+        .block_mouse_except_scroll()
         .w(px(340.))
         .rounded(px(8.))
         .border_1()

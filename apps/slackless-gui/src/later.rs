@@ -234,6 +234,9 @@ enum LaterFilter {
     Todos,
 }
 
+/// Sentinel channel id used for standalone personal to-dos created directly in Later (`F-CORE-162`).
+pub const PERSONAL_TODO_CHANNEL: &str = "TODO";
+
 /// One saved message or standalone personal to-do (`F-CORE-161`..`166`).
 #[derive(Clone)]
 pub struct LaterItem {
@@ -256,6 +259,10 @@ pub struct LaterItem {
 impl LaterItem {
     fn is(&self, workspace: usize, channel: &ChannelId, ts: &Ts) -> bool {
         self.workspace == workspace && self.channel == *channel && self.ts == *ts
+    }
+
+    pub fn is_personal_todo(&self) -> bool {
+        self.channel.as_str() == PERSONAL_TODO_CHANNEL
     }
 }
 
@@ -328,7 +335,7 @@ impl LaterView {
             0,
             LaterItem {
                 workspace: self.workspace,
-                channel: ChannelId::from("TODO"),
+                channel: ChannelId::from(PERSONAL_TODO_CHANNEL),
                 ts,
                 label: "To-dos".to_owned(),
                 author: "Personal to-do".to_owned(),
@@ -845,6 +852,7 @@ impl Render for LaterView {
                             .on_click(cx.listener(move |this, _, _, cx| this.remove(ix, cx))),
                     );
                 let (workspace, channel) = (item.workspace, item.channel.clone());
+                let is_personal_todo = item.is_personal_todo();
                 let completed = item.state == LaterState::Completed;
                 let row_group = SharedString::from(format!("later-row-grp-{ix}"));
                 h_flex()
@@ -908,12 +916,21 @@ impl Render for LaterView {
                             )
                             .on_click(cx.listener({
                                 let open_ts = item.ts.clone();
-                                move |_, _, _, cx| {
-                                    cx.emit(LaterEvent::Open {
-                                        workspace,
-                                        channel: channel.clone(),
-                                        ts: open_ts.clone(),
-                                    });
+                                move |this, _, _, cx| {
+                                    if is_personal_todo {
+                                        let next = if completed {
+                                            LaterState::InProgress
+                                        } else {
+                                            LaterState::Completed
+                                        };
+                                        this.set_state(ix, next, cx);
+                                    } else {
+                                        cx.emit(LaterEvent::Open {
+                                            workspace,
+                                            channel: channel.clone(),
+                                            ts: open_ts.clone(),
+                                        });
+                                    }
                                 }
                             })),
                     )

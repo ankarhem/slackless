@@ -556,8 +556,8 @@ impl App {
                 ViewerEvent::Close => this.close_image_viewer(window, cx),
             },
         );
-        // A replaced viewer drops its subscription with it.
-        self._subscriptions.push(subscription);
+        // Replacing or closing the viewer drops its subscription immediately (no Vec leak).
+        self._viewer_sub = Some(subscription);
         self.image_viewer = Some(viewer);
         cx.notify();
     }
@@ -566,6 +566,7 @@ impl App {
     pub(super) fn close_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(viewer) = self.image_viewer.take() {
             viewer.update(cx, |v, cx| v.evict_assets(window, cx));
+            self._viewer_sub = None;
             cx.notify();
         }
     }

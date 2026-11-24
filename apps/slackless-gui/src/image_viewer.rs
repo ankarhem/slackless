@@ -450,9 +450,27 @@ impl ImageViewer {
         cx.notify();
     }
 
-    fn zoom_step(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Step zoom in (`+1`) or out (`-1`) through `ZOOM_STEPS`.
+    pub fn zoom_step(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         let next = (self.zoom_ix as isize + direction).clamp(0, ZOOM_STEPS.len() as isize - 1);
         self.zoom_to(next as usize, window, cx);
+    }
+
+    /// Reset zoom back to fit (`100%`).
+    pub fn reset_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_to(FIT_INDEX, window, cx);
+    }
+
+    /// Current index in `ZOOM_STEPS` (used by tests).
+    #[cfg(test)]
+    pub fn zoom_index(&self) -> usize {
+        self.zoom_ix
+    }
+
+    /// Current image index (used by tests).
+    #[cfg(test)]
+    pub fn current_index(&self) -> usize {
+        self.index
     }
 
     /// The uploader's name (Slack shows the file's uploader on the chip).
@@ -572,7 +590,18 @@ impl Render for ImageViewer {
         div()
             .id("image-viewer")
             .occlude()
-            .on_scroll(|_, _, cx| cx.stop_propagation())
+            .on_scroll(
+                cx.listener(|viewer, event: &gpui_kit::gpui::ScrollEvent, window, cx| {
+                    cx.stop_propagation();
+                    let dy = match event.delta {
+                        gpui_kit::gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+                        gpui_kit::gpui::ScrollDelta::Lines(p) => p.y * 24.0,
+                    };
+                    if dy.abs() >= 12.0 {
+                        viewer.zoom_step(if dy > 0.0 { 1 } else { -1 }, window, cx);
+                    }
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()

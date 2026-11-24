@@ -240,9 +240,10 @@ use gpui_kit::gpui::{
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
 use slackless_core::platform::{
-    self, AttentionRequester, BadgeSetter, MouseNavDirection, Notifier, SoundPlayer,
-    StatusBarAction, StatusBarItem, StatusBarState,
+    self, AttentionRequester, BadgeSetter, Notifier, SoundPlayer, StatusBarItem, StatusBarState,
 };
+#[cfg(not(test))]
+use slackless_core::platform::{MouseNavDirection, StatusBarAction};
 use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{
     Block, ChannelId, Conversation, ConversationKind, File, Message, RichTextContainer,
@@ -642,6 +643,8 @@ pub struct App {
     remind_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     /// The image viewer overlay (a message image was clicked); `None` keeps it closed.
     image_viewer: Option<Entity<ImageViewer>>,
+    /// Subscription for the active `image_viewer`; dropped on close/replace to avoid leaking.
+    _viewer_sub: Option<Subscription>,
     /// Drafts, scheduled and sent messages; shown in place of the message column while
     /// `drafts_open`.
     drafts: Entity<DraftsView>,
