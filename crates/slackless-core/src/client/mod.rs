@@ -2606,6 +2606,39 @@ impl<B: Backend> Core<B> {
         }
     }
 
+    /// Execute a batch of persisted offline mutations strictly sequentially (FIFO), deleting each
+    /// SQLite row on success or emitting [`Event::OfflineMutationFailed`] on failure.
+    fn flush_queued_mutations_sequentially(&self, queued: Vec<(i64, QueuedMutation)>) {
+        let backend = self.backend.clone();
+        let store = Arc::clone(&self.store);
+        let ws = self.workspace.clone();
+        let events = self.events.clone();
+        let unfurls = self.unfurls.clone();
+        tokio::spawn(async move {
+            for (id, mutation) in queued {
+                let summary = mutation.summary();
+                let outcome = Self::execute_queued_mutation(
+                    &backend, &store, &ws, &events, &unfurls, mutation,
+                )
+                .await;
+                match outcome {
+                    Ok(()) => {
+                        if id > 0 {
+                            let _ = with_store(&store, move |s| s.delete_offline(id)).await;
+                        }
+                    }
+                    Err(err) => {
+                        events.emit(Event::OfflineMutationFailed(FailedMutation {
+                            id,
+                            summary,
+                            error: err.to_string(),
+                        }));
+                    }
+                }
+            }
+        });
+    }
+
     /// Execute one persisted offline mutation; deletes the SQLite row on success or emits
     /// [`Event::OfflineMutationFailed`] on failure so the user can retry or discard it.
     fn flush_queued_mutation(&self, id: i64, mutation: QueuedMutation) {
@@ -2616,38 +2649,9 @@ impl<B: Backend> Core<B> {
         let unfurls = self.unfurls.clone();
         let summary = mutation.summary();
         tokio::spawn(async move {
-            let outcome: Result<(), CoreError> = async {
-                match mutation {
-                    QueuedMutation::SendMessage {
-                        channel,
-                        content,
-                        thread_ts,
-                        broadcast,
-                    } => {
-                        let posted = backend
-                            .post_message(channel.clone(), content, thread_ts, broadcast)
-                            .await?;
-                        if let Some(message) = posted.message {
-                            unfurls.resolve(std::slice::from_ref(&message));
-                            let target = channel.clone();
-                            with_store(&store, move |s| s.upsert_message(&ws, &target, &message))
-                                .await?;
-                            events.emit(Event::StoreChanged { channel });
-                        }
-                    }
-                    QueuedMutation::AddReaction { channel, ts, name } => {
-                        backend.add_reaction(channel, ts, name).await?;
-                    }
-                    QueuedMutation::RemoveReaction { channel, ts, name } => {
-                        backend.remove_reaction(channel, ts, name).await?;
-                    }
-                    QueuedMutation::MarkRead { channel, ts } => {
-                        backend.mark_read(channel, ts).await?;
-                    }
-                }
-                Ok(())
-            }
-            .await;
+            let outcome =
+                Self::execute_queued_mutation(&backend, &store, &ws, &events, &unfurls, mutation)
+                    .await;
             match outcome {
                 Ok(()) => {
                     if id > 0 {
@@ -2663,6 +2667,45 @@ impl<B: Backend> Core<B> {
                 }
             }
         });
+    }
+
+    async fn execute_queued_mutation(
+        backend: &B,
+        store: &SharedStore,
+        ws: &TeamId,
+        events: &Emitter,
+        unfurls: &Unfurls<B>,
+        mutation: QueuedMutation,
+    ) -> Result<(), CoreError> {
+        match mutation {
+            QueuedMutation::SendMessage {
+                channel,
+                content,
+                thread_ts,
+                broadcast,
+            } => {
+                let posted = backend
+                    .post_message(channel.clone(), content, thread_ts, broadcast)
+                    .await?;
+                if let Some(message) = posted.message {
+                    unfurls.resolve(std::slice::from_ref(&message));
+                    let target = channel.clone();
+                    let ws = ws.clone();
+                    with_store(store, move |s| s.upsert_message(&ws, &target, &message)).await?;
+                    events.emit(Event::StoreChanged { channel });
+                }
+            }
+            QueuedMutation::AddReaction { channel, ts, name } => {
+                backend.add_reaction(channel, ts, name).await?;
+            }
+            QueuedMutation::RemoveReaction { channel, ts, name } => {
+                backend.remove_reaction(channel, ts, name).await?;
+            }
+            QueuedMutation::MarkRead { channel, ts } => {
+                backend.mark_read(channel, ts).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Starts (or restarts) the backfill of `channel`, newest page first.
@@ -2764,9 +2807,7 @@ impl<B: Backend> Core<B> {
                             let queued: Vec<(i64, QueuedMutation)> =
                                 self.offline_queue.drain(..).collect();
                             self.events.emit(Event::OfflineQueueChanged(0));
-                            for (id, mutation) in queued {
-                                self.flush_queued_mutation(id, mutation);
-                            }
+                            self.flush_queued_mutations_sequentially(queued);
                         }
                     }
                     ConnectionState::Reconnecting { .. } | ConnectionState::Disconnected { .. } => {

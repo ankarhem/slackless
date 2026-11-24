@@ -136,12 +136,25 @@ pub fn clear_finished_downloads(cx: &mut App) {
 pub fn reveal_in_finder(path: &Path) {
     #[cfg(target_os = "macos")]
     {
-        let _ = ProcessCommand::new("open").arg("-R").arg(path).spawn();
+        if let Ok(mut child) = ProcessCommand::new("open")
+            .arg("-R")
+            .arg("--")
+            .arg(path)
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         if let Some(parent) = path.parent() {
-            let _ = ProcessCommand::new("xdg-open").arg(parent).spawn();
+            if let Ok(mut child) = ProcessCommand::new("xdg-open").arg(parent).spawn() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
         }
     }
 }
@@ -150,11 +163,19 @@ pub fn reveal_in_finder(path: &Path) {
 pub fn open_local_file(path: &Path) {
     #[cfg(target_os = "macos")]
     {
-        let _ = ProcessCommand::new("open").arg(path).spawn();
+        if let Ok(mut child) = ProcessCommand::new("open").arg("--").arg(path).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = ProcessCommand::new("xdg-open").arg(path).spawn();
+        if let Ok(mut child) = ProcessCommand::new("xdg-open").arg(path).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -396,8 +417,34 @@ pub fn toggle_pause_audio(file_id: &str, window: &mut Window, cx: &mut App) {
         extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
         const SIGSTOP: i32 = 17;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
         const SIGCONT: i32 = 19;
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )))]
+        const SIGSTOP: i32 = 19;
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )))]
+        const SIGCONT: i32 = 18;
         let pid = child.id() as i32;
         if active.paused_at.is_some() {
             // SAFETY: sending SIGCONT to our own spawned audio child process.

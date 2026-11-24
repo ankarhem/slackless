@@ -209,7 +209,6 @@ impl App {
                 KeyBinding::new("cmd-shift-s", ToggleWorkspaceRail, None),
                 KeyBinding::new("cmd-.", ToggleRightPane, None),
                 KeyBinding::new("cmd-shift-backspace", UnsendLastMessage, None),
-                KeyBinding::new("cmd-shift-m", OpenMore, None),
                 KeyBinding::new("ctrl-tab", NextNavTab, None),
                 KeyBinding::new("ctrl-shift-tab", PrevNavTab, None),
                 KeyBinding::new("ctrl-down", NextSection, None),

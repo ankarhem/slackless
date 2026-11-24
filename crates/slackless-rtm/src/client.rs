@@ -286,14 +286,31 @@ impl Driver {
         let request = self
             .request(&url)
             .map_err(|e| End::Stop(format!("invalid handshake request: {e}")))?;
-        match tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            Some(self.tls.clone()),
-        )
-        .await
-        {
+        let mut dial_fut = Box::pin(tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                None,
+                false,
+                Some(self.tls.clone()),
+            ),
+        ));
+        let result = loop {
+            tokio::select! {
+                res = &mut dial_fut => match res {
+                    Ok(inner) => break inner,
+                    Err(_) => return Err(End::Lost("websocket handshake timed out".into())),
+                },
+                cmd = self.commands.recv() => match cmd {
+                    Some(Command::Close) | None => return Err(End::Stop("closed during dial".into())),
+                    Some(Command::Send(Outgoing::PresenceSub(ids))) => {
+                        self.presence_sub = Some(ids);
+                    }
+                    Some(Command::Send(_)) => {}
+                },
+            }
+        };
+        match result {
             Ok((socket, _response)) => Ok(socket),
             Err(tungstenite::Error::Http(response))
                 if matches!(
@@ -351,7 +368,13 @@ impl Driver {
                         // Websocket-level pings are answered by tungstenite itself while reading.
                         Some(Ok(_)) => continue,
                     };
-                    let Ok(event) = parse_frame(text.as_str()) else { continue };
+                    let event = match parse_frame(text.as_str()) {
+                        Ok(event) => event,
+                        Err(err) => {
+                            tracing::debug!(error = %err, "ignoring unparseable RTM frame");
+                            continue;
+                        }
+                    };
                     let mut end = None;
                     let mut resubscribe = None;
                     match &event {
