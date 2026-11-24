@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui_kit::assets::IconName;
@@ -93,11 +94,28 @@ impl DisplayVideoFrame {
     }
 }
 
+/// RAII guard tracking open Pop-out Huddle Windows so [`HuddleVideoStore`] skips camera GPU
+/// conversion and UI notifications whenever no huddle window is open to display video.
+pub struct HuddlePopoutGuard {
+    active_popouts: Arc<AtomicUsize>,
+}
+
+impl Drop for HuddlePopoutGuard {
+    fn drop(&mut self) {
+        self.active_popouts.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Separate GPUI entity owning live video/screen frames so 10–30 fps video updates notify ONLY
 /// the Pop-out Huddle Window and never repaint the main window's sidebar (`HuddleDock`).
 pub struct HuddleVideoStore {
     frames: HashMap<VideoTileKey, DisplayVideoFrame>,
     stale_images: Vec<Arc<RenderImage>>,
+    active_popouts: Arc<AtomicUsize>,
+    #[cfg(target_os = "macos")]
+    pending_cam_surfaces: HashMap<VideoTileKey, Arc<slackless_core::huddle::MacVideoSurface>>,
+    #[cfg(target_os = "macos")]
+    cam_in_flight: HashSet<VideoTileKey>,
 }
 
 impl HuddleVideoStore {
@@ -105,7 +123,20 @@ impl HuddleVideoStore {
         cx.new(|_| Self {
             frames: HashMap::new(),
             stale_images: Vec::new(),
+            active_popouts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(target_os = "macos")]
+            pending_cam_surfaces: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            cam_in_flight: HashSet::new(),
         })
+    }
+
+    /// Register a visible Pop-out Huddle Window; dropping the returned guard decrements the count.
+    pub fn register_popout(&self) -> HuddlePopoutGuard {
+        self.active_popouts.fetch_add(1, Ordering::AcqRel);
+        HuddlePopoutGuard {
+            active_popouts: Arc::clone(&self.active_popouts),
+        }
     }
 
     pub fn update_frame(&mut self, tile: VideoTileKey, frame: &VideoFrame, cx: &mut Context<Self>) {
@@ -114,50 +145,102 @@ impl HuddleVideoStore {
             VideoTileKey::LocalScreen | VideoTileKey::RemoteScreen(_)
         );
 
-        let display_frame: Option<DisplayVideoFrame> = {
-            #[cfg(target_os = "macos")]
-            {
-                if let Some(surface) = frame.mac_surface() {
-                    if is_screen {
-                        // Zero-copy Metal GPU surface for 1080p/1200p screen shares!
-                        Some(DisplayVideoFrame::Surface(Arc::clone(surface)))
-                    } else {
-                        // Rounded-2xl camera cards over the gradient stage: NEON `vImage`
-                        // downscaled to 2x Retina card size (<= 480x270) for crisp rounded corners
-                        // and minimal GPU texture upload.
-                        surface.to_bgra_fit(480, 270).and_then(|(w, h, bgra)| {
-                            let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
-                            Some(DisplayVideoFrame::Image(Arc::new(RenderImage::new(
-                                smallvec::smallvec![image::Frame::new(rgba)],
-                            ))))
-                        })
-                    }
-                } else {
-                    frame_to_render_image(frame).map(DisplayVideoFrame::Image)
-                }
+        #[cfg(target_os = "macos")]
+        if let Some(surface) = frame.mac_surface() {
+            let popout_visible = self.active_popouts.load(Ordering::Acquire) > 0;
+            if is_screen {
+                // Zero-copy Metal GPU surface for 1080p/1200p screen shares (~50ns retain).
+                self.insert_display_frame(
+                    tile,
+                    DisplayVideoFrame::Surface(Arc::clone(surface)),
+                    popout_visible,
+                    cx,
+                );
+                return;
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = is_screen;
-                frame_to_render_image(frame).map(DisplayVideoFrame::Image)
+            // Camera card over gradient stage: skip GPU conversion completely when no huddle
+            // popout window is open! When visible, run hardware `VTPixelTransferSession` scaling
+            // to 480x270 on a coalescing background task so the main UI thread never blocks.
+            if !popout_visible {
+                return;
             }
-        };
+            self.pending_cam_surfaces
+                .insert(tile.clone(), Arc::clone(surface));
+            if self.cam_in_flight.insert(tile.clone()) {
+                self.spawn_camera_surface_convert(tile, cx);
+            }
+            return;
+        }
 
-        if let Some(next) = display_frame {
-            if let Some(DisplayVideoFrame::Image(old)) = self.frames.insert(tile, next) {
-                self.stale_images.push(old);
-                // Guard against unbounded growth when no popout window is currently open.
-                if self.stale_images.len() > 8 {
-                    for dropped in self.stale_images.drain(..) {
-                        cx.drop_image(dropped, None);
-                    }
+        let _ = is_screen;
+        if let Some(img) = frame_to_render_image(frame) {
+            self.insert_display_frame(tile, DisplayVideoFrame::Image(img), true, cx);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_camera_surface_convert(&mut self, tile: VideoTileKey, cx: &mut Context<Self>) {
+        let Some(surface) = self.pending_cam_surfaces.remove(&tile) else {
+            self.cam_in_flight.remove(&tile);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let rendered = cx
+                .background_executor()
+                .spawn(async move {
+                    let (w, h, bgra) = surface.to_bgra_fit(480, 270)?;
+                    let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
+                    Some(Arc::new(RenderImage::new(smallvec::smallvec![
+                        image::Frame::new(rgba)
+                    ])))
+                })
+                .await;
+            let _ = this.update(cx, |store: &mut HuddleVideoStore, cx| {
+                let popout_visible = store.active_popouts.load(Ordering::Acquire) > 0;
+                if let Some(img) = rendered {
+                    store.insert_display_frame(
+                        tile.clone(),
+                        DisplayVideoFrame::Image(img),
+                        popout_visible,
+                        cx,
+                    );
+                }
+                if popout_visible && store.pending_cam_surfaces.contains_key(&tile) {
+                    store.spawn_camera_surface_convert(tile, cx);
+                } else {
+                    store.pending_cam_surfaces.remove(&tile);
+                    store.cam_in_flight.remove(&tile);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn insert_display_frame(
+        &mut self,
+        tile: VideoTileKey,
+        next: DisplayVideoFrame,
+        notify: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(DisplayVideoFrame::Image(old)) = self.frames.insert(tile, next) {
+            self.stale_images.push(old);
+            if self.stale_images.len() > 8 {
+                for dropped in self.stale_images.drain(..) {
+                    cx.drop_image(dropped, None);
                 }
             }
+        }
+        if notify {
             cx.notify();
         }
     }
 
     pub fn close_tile(&mut self, tile: &VideoTileKey, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.pending_cam_surfaces.remove(tile);
+        }
         if let Some(old) = self.frames.remove(tile) {
             if let DisplayVideoFrame::Image(img) = old {
                 self.stale_images.push(img);
@@ -167,6 +250,11 @@ impl HuddleVideoStore {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.pending_cam_surfaces.clear();
+            self.cam_in_flight.clear();
+        }
         for (_, old) in self.frames.drain() {
             if let DisplayVideoFrame::Image(img) = old {
                 cx.drop_image(img, None);

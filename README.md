@@ -14,11 +14,24 @@
 
 ## Highlights
 
-- **Native Rust + GPUI performance** — ~2× lower RSS than Electron Slack (`~277 MB` vs `~551 MB`), `0.0%` idle CPU, instant cold boot with persisted bot profiles and channel counts.
+- **Native Rust + GPUI performance** — `0.0%` idle CPU, **3.5×–5.9× lower RAM** and **1.5×–3× lower CPU** than Electron Slack across idle and live video/screen-share huddles (see [Performance Benchmarks](#performance-benchmarks)), instant cold boot with persisted bot profiles and channel counts.
 - **Permanent local archive & offline FTS5 search** — Every message, edit, and deletion observed is stored permanently in a zlib-compressed SQLite archive (`~194 MiB` for 148k messages), with instant offline search (`in:`, `from:`, `has:`, `before:`, `after:`) that outlives Slack's 90-day retention wall.
-- **Native Amazon Chime Huddles** — Pure-Rust WebRTC audio (Sonora AEC3/NS/AGC, Opus PLC packet-loss concealment, automatic AirPods/default-device hot-swap), camera with portrait blur, screen sharing (with macOS 14.2+ CoreAudio system audio tap), live captions, drawing, floating reactions, and interactive huddle cards.
+- **Native Amazon Chime Huddles** — Pluggable hardware media backend (`ScreenCaptureKit` + `AVFoundation` + `VideoToolbox` H.264 High/CABAC + `VTPixelTransferSession` GPU scaling + runtime-gated HW AV1 decode on M3+ + zero-copy `420f` Metal surfaces + parallel `SCScreenshotManager` thumbnails + async Apple Vision ANE / 4× Metal bokeh blur + CoreAudio `VoiceProcessingIO` hardware AEC/NS/AGC on macOS, with portable `cpal`/`sonora`/software fallback for future Linux/Windows ports), parallel per-track remote video decoders, Opus FEC/DTX & CoreAudio hot-plug, macOS 14.2+ CoreAudio system audio tap, smooth Bézier drawing, live captions, and floating reactions.
 - **Daily-driver Slack parity** — Multi-workspace switcher, Slack Connect, full Block Kit, Canvases, Lists (CSV/JSON import & export, item comment threads with `@mention` autocomplete), dual-track H.264/AAC Clips, VIP breakthrough & Focus mode, opt-in macOS Calendar status sync, native macOS notifications, menu bar item, and `slack://` deep links.
 - **Headless CLI & AI agent skill** — Scriptable `slackless` binary sharing the same local archive and macOS Keychain session, emitting single-line `--json` for automation and agents ([`skill/SKILL.md`](skill/SKILL.md)).
+
+## Performance Benchmarks
+
+Measured side-by-side on Apple M4 Pro (macOS, total process tree — 1 native process for Slackless vs. 7 Electron processes for Official Slack `4.49.89`, live huddle in the same channel, 1080p screen share):
+
+| State                                      |                  Slackless (1 proc) |               Official Slack (7 procs) | Delta                                   |
+| ------------------------------------------ | ----------------------------------: | -------------------------------------: | --------------------------------------- |
+| **Idle**                                   |       **`0.0%` CPU** · **`275 MB`** |   `1.0%` CPU (max `3.2%`) · `1,622 MB` | **0% idle CPU · 5.9× less RAM**         |
+| **Audio huddle (unmuted)**                 |    **`9–10.4%` CPU** · **`297 MB`** | `25.4%` CPU (max `30.2%`) · `1,094 MB` | **~2.5× less CPU · 3.7× less RAM**      |
+| **Audio huddle (muted)**                   |       **`7.2%` CPU** · **`296 MB`** | `20.9%` CPU (max `23.3%`) · `1,113 MB` | **~2.9× less CPU · 3.8× less RAM**      |
+| **Screen share only (1080p)**              |      **`19.4%` CPU** · **`320 MB`** | `57.2%` CPU (max `80.4%`) · `1,122 MB` | **~2.9× less CPU · 3.5× less RAM**      |
+| **Screen share + video**                   |      **`30.8%` CPU** · **`335 MB`** | `62.8%` CPU (max `70.3%`) · `1,211 MB` | **~2.0× less CPU · 3.6× less RAM**      |
+| **Screen share + video + background blur** | **`34–45%` CPU** · **`350–355 MB`** | `63.5%` CPU (max `71.3%`) · `1,308 MB` | **~1.5×–1.9× less CPU · 3.7× less RAM** |
 
 ## Install (macOS App + CLI)
 

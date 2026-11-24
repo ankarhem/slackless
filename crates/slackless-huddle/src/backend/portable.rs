@@ -436,6 +436,15 @@ impl MediaBackend for PortableMediaBackend {
         list_nokhwa_cameras()
     }
 
+    fn capture_screen_thumbnails(
+        &self,
+        monitors_only: bool,
+        max_w: u32,
+        max_h: u32,
+    ) -> Vec<(String, VideoFrame)> {
+        crate::screen::capture_screen_thumbnails_xcap(monitors_only, max_w, max_h)
+    }
+
     fn start_screen_share(
         &self,
         config: ScreenShareConfig,

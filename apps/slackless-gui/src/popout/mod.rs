@@ -199,6 +199,7 @@ pub struct PopoutWindow {
     files_items: Vec<(String, String, Option<String>)>,
     huddle_state: Option<crate::huddle_dock::HuddleViewState>,
     huddle_video: Option<WeakEntity<crate::huddle_dock::HuddleVideoStore>>,
+    _huddle_popout_guard: Option<crate::huddle_dock::HuddlePopoutGuard>,
     last_store_revision: u64,
     huddle_invite_open: bool,
     huddle_devices_open: bool,
@@ -349,6 +350,7 @@ impl PopoutWindow {
         let mut files_items = Vec::new();
         let mut huddle_state = None;
         let mut huddle_video = None;
+        let mut huddle_popout_guard = None;
         match &kind {
             PopoutKind::Conversation { source, .. } | PopoutKind::Thread { source, .. } => {
                 if let Some(list) = source.upgrade() {
@@ -391,6 +393,7 @@ impl PopoutWindow {
                     let target = also_send_target(&fixtures, &st.session.channel);
                     composer.update(cx, |c, cx| c.set_also_send(target, cx));
                     huddle_state = Some(st);
+                    huddle_popout_guard = Some(video_store.read(cx).register_popout());
                     huddle_video = Some(video_store.downgrade());
                     subscriptions.push(cx.observe(&video_store, |_this, _vs, cx| {
                         cx.notify();
@@ -464,6 +467,7 @@ impl PopoutWindow {
             files_items,
             huddle_state,
             huddle_video,
+            _huddle_popout_guard: huddle_popout_guard,
             last_store_revision: slackless_core::store::Store::message_revision(),
             huddle_invite_open: false,
             huddle_devices_open: false,

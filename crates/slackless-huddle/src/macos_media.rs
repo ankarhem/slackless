@@ -43,6 +43,25 @@ struct SlacklessAudioDeviceMonitor {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct SlacklessVpio {
+    _private: [u8; 0],
+}
+
+type SlacklessThumbCallback = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    source_id: *const c_char,
+    bgra: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+);
+
+type SlacklessVpioCaptureCallback =
+    unsafe extern "C" fn(ctx: *mut c_void, samples: *const f32, count: usize);
+type SlacklessVpioRenderCallback =
+    unsafe extern "C" fn(ctx: *mut c_void, samples: *mut f32, count: usize);
+
 type SlacklessH264Callback = unsafe extern "C" fn(
     ctx: *mut c_void,
     data: *const u8,
@@ -150,6 +169,25 @@ unsafe extern "C" {
         cb: SlacklessAudioDeviceChangeCallback,
     ) -> *mut SlacklessAudioDeviceMonitor;
     fn slackless_audio_device_monitor_stop(mon: *mut SlacklessAudioDeviceMonitor);
+
+    fn slackless_capture_thumbnails(
+        monitors_only: bool,
+        max_w: u32,
+        max_h: u32,
+        ctx: *mut c_void,
+        cb: SlacklessThumbCallback,
+    ) -> bool;
+
+    fn slackless_vpio_start(
+        sample_rate: u32,
+        enable_vp: bool,
+        enable_agc: bool,
+        ctx: *mut c_void,
+        on_capture: SlacklessVpioCaptureCallback,
+        on_render: SlacklessVpioRenderCallback,
+    ) -> *mut SlacklessVpio;
+    fn slackless_vpio_set_processing(vpio: *mut SlacklessVpio, enable_vp: bool, enable_agc: bool);
+    fn slackless_vpio_stop(vpio: *mut SlacklessVpio);
 }
 
 /// Returns `true` if macOS Screen Recording permission has been granted to this app bundle.
@@ -743,6 +781,153 @@ impl Drop for CoreAudioDeviceMonitor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GPU-Downscaled Screen/Window Thumbnails (`SCScreenshotManager`, macOS 14+)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn on_thumb_cb(
+    ctx: *mut c_void,
+    source_id: *const c_char,
+    bgra: *const u8,
+    len: usize,
+    width: u32,
+    height: u32,
+) {
+    if ctx.is_null() || source_id.is_null() || bgra.is_null() || len == 0 {
+        return;
+    }
+    let out = unsafe { &mut *(ctx as *mut Vec<(String, VideoFrame)>) };
+    let Ok(id) = unsafe { CStr::from_ptr(source_id) }.to_str() else {
+        return;
+    };
+    let slice = unsafe { std::slice::from_raw_parts(bgra, len) };
+    out.push((
+        id.to_owned(),
+        VideoFrame::from_bgra(width, height, slice.to_vec()),
+    ));
+}
+
+/// Capture GPU-downscaled thumbnails via macOS 14+ `SCScreenshotManager` (returns `None` on
+/// macOS 12/13 or if ScreenCaptureKit is unavailable so callers fall back to `xcap`).
+pub fn capture_macos_thumbnails(
+    monitors_only: bool,
+    max_w: u32,
+    max_h: u32,
+) -> Option<Vec<(String, VideoFrame)>> {
+    let mut out = Vec::new();
+    let ok = unsafe {
+        slackless_capture_thumbnails(
+            monitors_only,
+            max_w,
+            max_h,
+            (&mut out as *mut Vec<(String, VideoFrame)>).cast(),
+            on_thumb_cb,
+        )
+    };
+    if ok && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CoreAudio Native `VoiceProcessingIO` Hardware-Tuned Full-Duplex Audio
+// ---------------------------------------------------------------------------
+
+type BoxedCaptureCb = Box<dyn Fn(&[f32]) + Send + Sync>;
+type BoxedRenderCb = Box<dyn Fn(&mut [f32]) + Send + Sync>;
+
+struct VpioCtx {
+    on_capture: BoxedCaptureCb,
+    on_render: BoxedRenderCb,
+}
+
+unsafe extern "C" fn on_vpio_capture_cb(ctx: *mut c_void, samples: *const f32, count: usize) {
+    if ctx.is_null() || samples.is_null() || count == 0 {
+        return;
+    }
+    let state = unsafe { &*(ctx as *const VpioCtx) };
+    let slice = unsafe { std::slice::from_raw_parts(samples, count) };
+    (state.on_capture)(slice);
+}
+
+unsafe extern "C" fn on_vpio_render_cb(ctx: *mut c_void, samples: *mut f32, count: usize) {
+    if ctx.is_null() || samples.is_null() || count == 0 {
+        return;
+    }
+    let state = unsafe { &*(ctx as *const VpioCtx) };
+    let slice = unsafe { std::slice::from_raw_parts_mut(samples, count) };
+    (state.on_render)(slice);
+}
+
+/// Native macOS CoreAudio `kAudioUnitSubType_VoiceProcessingIO` full-duplex 48 kHz mono stream
+/// with hardware-tuned AEC, noise suppression, and AGC (skips software `sonora` DSP completely).
+pub struct MacVoiceProcessingIo {
+    handle: *mut SlacklessVpio,
+    ctx: *mut VpioCtx,
+}
+
+// SAFETY: `slackless_vpio_stop` halts and disposes the AudioUnit synchronously before freeing `ctx`.
+unsafe impl Send for MacVoiceProcessingIo {}
+
+impl MacVoiceProcessingIo {
+    pub fn start(
+        sample_rate: u32,
+        enable_vp: bool,
+        enable_agc: bool,
+        on_capture: impl Fn(&[f32]) + Send + Sync + 'static,
+        on_render: impl Fn(&mut [f32]) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let ctx = Box::into_raw(Box::new(VpioCtx {
+            on_capture: Box::new(on_capture),
+            on_render: Box::new(on_render),
+        }));
+        let handle = unsafe {
+            slackless_vpio_start(
+                sample_rate,
+                enable_vp,
+                enable_agc,
+                ctx.cast(),
+                on_vpio_capture_cb,
+                on_vpio_render_cb,
+            )
+        };
+        if handle.is_null() {
+            unsafe { drop(Box::from_raw(ctx)) };
+            return Err(HuddleError::Audio(
+                "CoreAudio VoiceProcessingIO unavailable".into(),
+            ));
+        }
+        tracing::info!(
+            sample_rate,
+            enable_vp,
+            enable_agc,
+            "started macOS CoreAudio VoiceProcessingIO (hardware AEC/NS/AGC)"
+        );
+        Ok(Self { handle, ctx })
+    }
+
+    pub fn set_processing(&self, enable_vp: bool, enable_agc: bool) {
+        if !self.handle.is_null() {
+            unsafe { slackless_vpio_set_processing(self.handle, enable_vp, enable_agc) };
+        }
+    }
+}
+
+impl Drop for MacVoiceProcessingIo {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { slackless_vpio_stop(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+        if !self.ctx.is_null() {
+            unsafe { drop(Box::from_raw(self.ctx)) };
+            self.ctx = std::ptr::null_mut();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,9 +962,31 @@ mod tests {
         );
         let (bw, bh, bgra) = decoded
             .to_bgra_fit(0, 0)
-            .expect("vImage NEON conversion to BGRA should succeed");
+            .expect("VTPixelTransferSession / vImage conversion to BGRA should succeed");
         assert_eq!((bw, bh), (w as u32, h as u32));
         assert_eq!(bgra.len(), w * h * 4);
+
+        // Also verify hardware downscaling preserves exact BGRA channel ordering (top-right pixel
+        // has high R, low G, high B; bottom-left has low R, high G, high B).
+        let (sw, sh, small_bgra) = decoded
+            .to_bgra_fit(80, 48)
+            .expect("VTPixelTransferSession hardware downscale to BGRA should succeed");
+        assert_eq!((sw, sh), (80, 48));
+        assert_eq!(small_bgra.len(), 80 * 48 * 4);
+        // Top-right corner: R ≈ 255, G ≈ 0, B ≈ 180 -> BGRA = [B≈180, G≈0, R≈255, A=255]
+        let tr = ((2 * sw as usize) + (sw as usize - 3)) * 4;
+        assert!(
+            small_bgra[tr + 2] > 180 && small_bgra[tr + 1] < 60 && small_bgra[tr] > 110,
+            "expected BGRA channel order at top-right, got {:?}",
+            &small_bgra[tr..tr + 4]
+        );
+        // Bottom-left corner: R ≈ 0, G ≈ 255, B ≈ 180 -> BGRA = [B≈180, G≈255, R≈0, A=255]
+        let bl = (((sh as usize - 3) * sw as usize) + 2) * 4;
+        assert!(
+            small_bgra[bl + 1] > 180 && small_bgra[bl + 2] < 60 && small_bgra[bl] > 110,
+            "expected BGRA channel order at bottom-left, got {:?}",
+            &small_bgra[bl..bl + 4]
+        );
     }
 
     #[test]

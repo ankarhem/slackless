@@ -12,7 +12,7 @@ use sonora::config::{Config as SonoraConfig, EchoCanceller, GainController2, Noi
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 use tokio::sync::mpsc;
 
-use crate::backend::{AudioDeviceChangeKind, platform_backend};
+use crate::backend::{AudioDeviceChangeKind, HwAudioDuplexHandle, platform_backend};
 use crate::{HuddleAudioConfig, HuddleError, Result};
 
 /// Chime / Opus native sample rate (48 kHz).
@@ -358,6 +358,72 @@ pub struct AudioEngine {
     worker: Option<std::thread::JoinHandle<mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
 
+enum AudioIoBackend {
+    /// OS-native full-duplex 48 kHz hardware-tuned AEC/NS/AGC (e.g. macOS CoreAudio
+    /// `VoiceProcessingIO`) — skips software `sonora` completely!
+    Hardware(Box<dyn HwAudioDuplexHandle>),
+    /// Cross-platform portable fallback (`cpal` + pure-Rust `sonora` AEC3/NS/AGC2).
+    Cpal {
+        in_stream: Stream,
+        out_stream: Stream,
+        apm: Box<AudioProcessing>,
+    },
+}
+
+fn open_hw_duplex(
+    in_name: Option<&str>,
+    out_name: Option<&str>,
+    aec: bool,
+    ns: bool,
+    agc: bool,
+    capture_signal: &CaptureSignal,
+    playback_ring: &Arc<Mutex<VecDeque<f32>>>,
+) -> Option<Box<dyn HwAudioDuplexHandle>> {
+    let cap_sig = Arc::clone(capture_signal);
+    let play_ring = Arc::clone(playback_ring);
+    let on_capture = Arc::new(move |samples: &[f32]| {
+        let (lock, cvar) = &*cap_sig;
+        if let Ok(mut q) = lock.lock() {
+            if q.len() > FRAME_20MS * 8 {
+                let drop_n = q.len() - FRAME_20MS * 4;
+                q.drain(..drop_n);
+            }
+            q.extend(samples.iter().copied());
+            if q.len() >= FRAME_20MS {
+                cvar.notify_one();
+            }
+        }
+    });
+    let on_render = Arc::new(move |out: &mut [f32]| {
+        if let Ok(mut q) = play_ring.lock() {
+            let avail = q.len().min(out.len());
+            for dst in out.iter_mut().take(avail) {
+                *dst = q.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
+            }
+            for dst in out.iter_mut().skip(avail) {
+                *dst = 0.0;
+            }
+        } else {
+            out.fill(0.0);
+        }
+    });
+    match platform_backend().start_hw_audio_duplex(
+        SAMPLE_RATE,
+        in_name,
+        out_name,
+        aec || ns,
+        agc,
+        on_capture,
+        on_render,
+    )? {
+        Ok(hw) => Some(hw),
+        Err(err) => {
+            tracing::warn!(%err, "hardware audio DSP unavailable; falling back to cpal + sonora");
+            None
+        }
+    }
+}
+
 impl AudioEngine {
     pub fn start(
         cfg: &HuddleAudioConfig,
@@ -375,6 +441,10 @@ impl AudioEngine {
 
         let in_name = cfg.input_device.clone();
         let out_name = cfg.output_device.clone();
+        let init_muted = shared.muted.load(Ordering::Relaxed);
+        let init_aec = cfg.aec;
+        let init_ns = cfg.ns;
+        let init_agc = cfg.agc;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
 
         let worker_shared = shared.clone();
@@ -382,16 +452,32 @@ impl AudioEngine {
         let worker = std::thread::Builder::new()
             .name("slackless-huddle-audio".to_owned())
             .spawn(move || {
-                let streams = (|| -> Result<(Stream, Stream)> {
-                    let in_stream =
-                        open_input_stream(in_name.as_deref(), Arc::clone(&worker_capture))?;
-                    let out_stream =
-                        open_output_stream(out_name.as_deref(), Arc::clone(&playback_ring))?;
-                    Ok((in_stream, out_stream))
-                })();
+                let io_backend: Result<AudioIoBackend> = if let Some(hw) = open_hw_duplex(
+                    in_name.as_deref(),
+                    out_name.as_deref(),
+                    !init_muted && init_aec,
+                    !init_muted && init_ns,
+                    !init_muted && init_agc,
+                    &worker_capture,
+                    &playback_ring,
+                ) {
+                    Ok(AudioIoBackend::Hardware(hw))
+                } else {
+                    (|| -> Result<AudioIoBackend> {
+                        let in_stream =
+                            open_input_stream(in_name.as_deref(), Arc::clone(&worker_capture))?;
+                        let out_stream =
+                            open_output_stream(out_name.as_deref(), Arc::clone(&playback_ring))?;
+                        Ok(AudioIoBackend::Cpal {
+                            in_stream,
+                            out_stream,
+                            apm: Box::new(build_sonora(init_aec, init_ns, init_agc)),
+                        })
+                    })()
+                };
 
-                match streams {
-                    Ok((in_stream, out_stream)) => {
+                match io_backend {
+                    Ok(io) => {
                         let _ = ready_tx.send(Ok(()));
                         run_audio_dsp_loop(
                             worker_shared,
@@ -401,8 +487,7 @@ impl AudioEngine {
                             &mut inbound_opus_rx,
                             in_name,
                             out_name,
-                            in_stream,
-                            out_stream,
+                            io,
                         );
                     }
                     Err(err) => {
@@ -500,8 +585,7 @@ fn run_audio_dsp_loop(
     inbound_opus_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     configured_in: Option<String>,
     configured_out: Option<String>,
-    mut in_stream: Stream,
-    mut out_stream: Stream,
+    mut io: AudioIoBackend,
 ) {
     let Ok(mut encoder) = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip) else {
         return;
@@ -520,12 +604,12 @@ fn run_audio_dsp_loop(
     let mut cur_aec = shared.aec.load(Ordering::Relaxed);
     let mut cur_ns = shared.ns.load(Ordering::Relaxed);
     let mut cur_agc = shared.agc.load(Ordering::Relaxed);
-    let mut apm = build_sonora(cur_aec, cur_ns, cur_agc);
+    let mut cur_muted = shared.muted.load(Ordering::Relaxed);
 
     let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
     let mut opus_out = vec![0u8; 4000];
     let silence_pcm = vec![0.0f32; FRAME_20MS];
-    // Pre-encode one silence packet once so muted frames skip Sonora DSP + Opus encoding entirely.
+    // Pre-encode one silence packet once so muted frames skip DSP + Opus encoding entirely.
     let cached_silence_opus: Vec<u8> = encoder
         .encode_float(&silence_pcm, &mut opus_out)
         .map(|n| opus_out[..n].to_vec())
@@ -572,46 +656,95 @@ fn run_audio_dsp_loop(
             if poll_due {
                 last_device_check = std::time::Instant::now();
             }
-            if configured_in.is_none() && (check_in || poll_due) {
-                let now_in = current_default_input_name();
-                if now_in.is_some() && now_in != last_default_in {
-                    if let Ok(next_stream) = open_input_stream(None, Arc::clone(&capture_signal)) {
-                        in_stream = next_stream;
+            match &mut io {
+                AudioIoBackend::Hardware(_) => {
+                    // Restart hardware VoiceProcessingIO cleanly when the system default input or
+                    // output changes (e.g. AirPods connect/disconnect).
+                    let now_in = current_default_input_name();
+                    let now_out = current_default_output_name();
+                    if now_in != last_default_in || now_out != last_default_out {
                         last_default_in = now_in;
+                        last_default_out = now_out;
+                        if let Some(next_hw) = open_hw_duplex(
+                            None,
+                            None,
+                            !cur_muted && cur_aec,
+                            !cur_muted && cur_ns,
+                            !cur_muted && cur_agc,
+                            &capture_signal,
+                            &playback_ring,
+                        ) {
+                            io = AudioIoBackend::Hardware(next_hw);
+                        }
                     }
                 }
-            }
-            if configured_out.is_none() && (check_out || poll_due) {
-                let now_out = current_default_output_name();
-                if now_out.is_some() && now_out != last_default_out {
-                    if let Ok(next_stream) = open_output_stream(None, Arc::clone(&playback_ring)) {
-                        out_stream = next_stream;
-                        last_default_out = now_out;
+                AudioIoBackend::Cpal {
+                    in_stream,
+                    out_stream,
+                    ..
+                } => {
+                    if configured_in.is_none() && (check_in || poll_due) {
+                        let now_in = current_default_input_name();
+                        if now_in.is_some() && now_in != last_default_in {
+                            if let Ok(next_stream) =
+                                open_input_stream(None, Arc::clone(&capture_signal))
+                            {
+                                *in_stream = next_stream;
+                                last_default_in = now_in;
+                            }
+                        }
+                    }
+                    if configured_out.is_none() && (check_out || poll_due) {
+                        let now_out = current_default_output_name();
+                        if now_out.is_some() && now_out != last_default_out {
+                            if let Ok(next_stream) =
+                                open_output_stream(None, Arc::clone(&playback_ring))
+                            {
+                                *out_stream = next_stream;
+                                last_default_out = now_out;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Reconfigure Sonora live if AEC/NS/AGC toggles changed.
+        // Reconfigure hardware DSP or Sonora live if AEC/NS/AGC or mute toggles changed.
+        // Bypassing VoiceProcessingIO's AEC/NS/AGC while muted cuts idle muted audio CPU
+        // significantly while keeping remote speaker playback untouched.
         let next_aec = shared.aec.load(Ordering::Relaxed);
         let next_ns = shared.ns.load(Ordering::Relaxed);
         let next_agc = shared.agc.load(Ordering::Relaxed);
-        if (next_aec, next_ns, next_agc) != (cur_aec, cur_ns, cur_agc) {
-            (cur_aec, cur_ns, cur_agc) = (next_aec, next_ns, next_agc);
-            apm = build_sonora(cur_aec, cur_ns, cur_agc);
+        let next_muted = shared.muted.load(Ordering::Relaxed);
+        let dsp_changed = (next_aec, next_ns, next_agc) != (cur_aec, cur_ns, cur_agc);
+        let mute_changed = next_muted != cur_muted;
+        if dsp_changed || mute_changed {
+            (cur_aec, cur_ns, cur_agc, cur_muted) = (next_aec, next_ns, next_agc, next_muted);
+            match &mut io {
+                AudioIoBackend::Hardware(hw) => {
+                    hw.set_processing(!cur_muted && (cur_aec || cur_ns), !cur_muted && cur_agc);
+                }
+                AudioIoBackend::Cpal { apm, .. } if dsp_changed => {
+                    **apm = build_sonora(cur_aec, cur_ns, cur_agc);
+                }
+                AudioIoBackend::Cpal { .. } => {}
+            }
         }
 
-        // 1. Drain inbound Opus packets (or empty PLC sentinels) -> decode -> AEC3 ref -> playback.
+        // 1. Drain inbound Opus packets (or empty PLC sentinels) -> decode -> AEC ref -> playback.
         let muted = shared.muted.load(Ordering::Relaxed);
         while let Ok(pkt) = inbound_opus_rx.try_recv() {
             if let Ok(samples) = decode_opus_or_plc(&mut decoder, &pkt, &mut decoded_pcm) {
                 let pcm = &decoded_pcm[..samples];
-                // Only feed AEC3 render reference when mic is live (unmuted).
-                if !muted && cur_aec {
-                    for chunk in pcm.chunks(FRAME_10MS) {
-                        if chunk.len() == FRAME_10MS {
-                            let mut out_ref = [0.0f32; FRAME_10MS];
-                            let _ = apm.process_render_f32(&[chunk], &mut [&mut out_ref[..]]);
+                // Hardware VoiceProcessingIO automatically taps its own render bus for AEC;
+                // only feed Sonora's render reference when running software DSP while unmuted.
+                if let AudioIoBackend::Cpal { apm, .. } = &mut io {
+                    if !muted && cur_aec {
+                        for chunk in pcm.chunks(FRAME_10MS) {
+                            if chunk.len() == FRAME_10MS {
+                                let mut out_ref = [0.0f32; FRAME_10MS];
+                                let _ = apm.process_render_f32(&[chunk], &mut [&mut out_ref[..]]);
+                            }
                         }
                     }
                 }
@@ -625,8 +758,7 @@ fn run_audio_dsp_loop(
             }
         }
 
-        // 2. Drain captured 20ms mic chunks -> Sonora 10ms AEC3/NS/AGC -> Opus encode -> RTC TX.
-        // Wait on the capture Condvar instead of busy-sleeping at 200 Hz!
+        // 2. Drain captured 20ms mic chunks -> (HW already processed or Sonora) -> Opus -> RTC TX.
         mic_frame.clear();
         {
             let (lock, cvar) = &*capture_signal;
@@ -652,31 +784,36 @@ fn run_audio_dsp_loop(
                     .store(0.0f32.to_bits(), Ordering::Relaxed);
                 let _ = outbound_opus_tx.send(cached_silence_opus.clone());
             } else {
-                processed_capture.clear();
-                for chunk in mic_frame.as_chunks::<FRAME_10MS>().0 {
-                    let mut out_chunk = [0.0f32; FRAME_10MS];
-                    if apm
-                        .process_capture_f32(&[chunk.as_slice()], &mut [&mut out_chunk[..]])
-                        .is_ok()
-                    {
-                        processed_capture.extend_from_slice(&out_chunk);
-                    } else {
-                        processed_capture.extend_from_slice(chunk);
+                let pcm_to_encode: &[f32] = match &mut io {
+                    AudioIoBackend::Hardware(_) => &mic_frame,
+                    AudioIoBackend::Cpal { apm, .. } => {
+                        processed_capture.clear();
+                        for chunk in mic_frame.as_chunks::<FRAME_10MS>().0 {
+                            let mut out_chunk = [0.0f32; FRAME_10MS];
+                            if apm
+                                .process_capture_f32(&[chunk.as_slice()], &mut [&mut out_chunk[..]])
+                                .is_ok()
+                            {
+                                processed_capture.extend_from_slice(&out_chunk);
+                            } else {
+                                processed_capture.extend_from_slice(chunk);
+                            }
+                        }
+                        &processed_capture
                     }
-                }
-                let rms = compute_rms_mono(&processed_capture);
+                };
+                let rms = compute_rms_mono(pcm_to_encode);
                 shared
                     .local_rms_bits
                     .store(rms.to_bits(), Ordering::Relaxed);
-                if let Ok(n) = encoder.encode_float(&processed_capture, &mut opus_out) {
+                if let Ok(n) = encoder.encode_float(pcm_to_encode, &mut opus_out) {
                     let _ = outbound_opus_tx.send(opus_out[..n].to_vec());
                 }
             }
         }
     }
     drop(device_monitor);
-    drop(in_stream);
-    drop(out_stream);
+    drop(io);
 }
 
 fn select_input_device(name: Option<&str>) -> Result<cpal::Device> {

@@ -14,13 +14,15 @@ use super::portable::{
     list_nokhwa_cameras,
 };
 use super::{
-    AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle, MediaBackend,
-    MediaCapabilities, ScreenShareConfig, ScreenShareHandle, VideoDecoderHandle,
+    AudioDeviceChangeKind, AudioDeviceMonitorHandle, CameraConfig, CameraHandle,
+    HwAudioDuplexHandle, MediaBackend, MediaCapabilities, ScreenShareConfig, ScreenShareHandle,
+    VideoDecoderHandle,
 };
 use crate::Result;
 use crate::macos_media::{
-    AvVtCameraCapture, CoreAudioDeviceMonitor, ScVtScreenCapture, VtAv1Decoder, VtH264Decoder,
-    list_macos_cameras, supports_hw_av1_decode, supports_hw_h264_decode,
+    AvVtCameraCapture, CoreAudioDeviceMonitor, MacVoiceProcessingIo, ScVtScreenCapture,
+    VtAv1Decoder, VtH264Decoder, capture_macos_thumbnails, list_macos_cameras,
+    supports_hw_av1_decode, supports_hw_h264_decode,
 };
 use crate::metrics::HuddlePerfCounters;
 use crate::video::{CameraDeviceInfo, VideoFrame};
@@ -66,6 +68,12 @@ struct MacAudioDeviceMonitor {
 }
 
 impl AudioDeviceMonitorHandle for MacAudioDeviceMonitor {}
+
+impl HwAudioDuplexHandle for MacVoiceProcessingIo {
+    fn set_processing(&self, enable_aec_ns: bool, enable_agc: bool) {
+        MacVoiceProcessingIo::set_processing(self, enable_aec_ns, enable_agc);
+    }
+}
 
 /// Hardware VideoToolbox H.264 decoder with **lazy** OpenH264 fallback (allocates 0 MB of SW
 /// decoder memory unless HW fails).
@@ -172,6 +180,7 @@ impl MediaBackend for MacOsMediaBackend {
             zero_copy_gpu_surface: true,
             native_system_audio_tap: crate::macos_audio_tap::supports_native_system_audio_tap(),
             native_device_hotplug: true,
+            hw_audio_dsp: true,
         }
     }
 
@@ -181,6 +190,18 @@ impl MediaBackend for MacOsMediaBackend {
             return native;
         }
         list_nokhwa_cameras()
+    }
+
+    fn capture_screen_thumbnails(
+        &self,
+        monitors_only: bool,
+        max_w: u32,
+        max_h: u32,
+    ) -> Vec<(String, VideoFrame)> {
+        if let Some(thumbs) = capture_macos_thumbnails(monitors_only, max_w, max_h) {
+            return thumbs;
+        }
+        crate::screen::capture_screen_thumbnails_xcap(monitors_only, max_w, max_h)
     }
 
     fn start_screen_share(
@@ -268,5 +289,33 @@ impl MediaBackend for MacOsMediaBackend {
             });
         })?;
         Some(Box::new(MacAudioDeviceMonitor { _inner: inner }))
+    }
+
+    fn start_hw_audio_duplex(
+        &self,
+        sample_rate: u32,
+        input_device: Option<&str>,
+        output_device: Option<&str>,
+        enable_aec_ns: bool,
+        enable_agc: bool,
+        on_capture: super::AudioCaptureCallback,
+        on_render: super::AudioRenderCallback,
+    ) -> Option<Result<Box<dyn HwAudioDuplexHandle>>> {
+        // VoiceProcessingIO binds the system default aggregate device seamlessly (including
+        // AirPods/Bluetooth hot-swaps). When the user explicitly pins custom non-default devices,
+        // return `None` so `AudioEngine` uses `cpal` + `sonora` with exact device selection.
+        if input_device.is_some() || output_device.is_some() {
+            return None;
+        }
+        Some(
+            MacVoiceProcessingIo::start(
+                sample_rate,
+                enable_aec_ns,
+                enable_agc,
+                move |samples| on_capture(samples),
+                move |samples| on_render(samples),
+            )
+            .map(|v| Box::new(v) as Box<dyn HwAudioDuplexHandle>),
+        )
     }
 }

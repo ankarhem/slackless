@@ -35,6 +35,7 @@ pub struct MediaCapabilities {
     pub zero_copy_gpu_surface: bool,
     pub native_system_audio_tap: bool,
     pub native_device_hotplug: bool,
+    pub hw_audio_dsp: bool,
 }
 
 impl MediaCapabilities {
@@ -101,6 +102,18 @@ pub trait VideoDecoderHandle: Send {
 /// Active OS audio device hot-plug monitor; dropping stops listening.
 pub trait AudioDeviceMonitorHandle: Send {}
 
+/// Active OS-native full-duplex 48 kHz mono audio stream with built-in hardware AEC/NS/AGC
+/// (e.g. macOS CoreAudio `VoiceProcessingIO`; future Windows WASAPI Voice Capture / Linux PipeWire).
+pub trait HwAudioDuplexHandle: Send {
+    fn set_processing(&self, enable_aec_ns: bool, enable_agc: bool);
+}
+
+/// Callback invoked by an OS-native hardware audio engine when captured 48 kHz mono samples arrive.
+pub type AudioCaptureCallback = Arc<dyn Fn(&[f32]) + Send + Sync>;
+
+/// Callback invoked by an OS-native hardware audio engine to pull 48 kHz mono playback samples.
+pub type AudioRenderCallback = Arc<dyn Fn(&mut [f32]) + Send + Sync>;
+
 /// Pluggable OS media backend factory.
 pub trait MediaBackend: Send + Sync {
     /// Human-readable backend name for diagnostics and logging.
@@ -111,6 +124,14 @@ pub trait MediaBackend: Send + Sync {
 
     /// Enumerate local camera devices in stable index order matching [`Self::start_camera`].
     fn list_cameras(&self) -> Vec<CameraDeviceInfo>;
+
+    /// Capture downscaled screen or window preview thumbnails (GPU-accelerated when available).
+    fn capture_screen_thumbnails(
+        &self,
+        monitors_only: bool,
+        max_w: u32,
+        max_h: u32,
+    ) -> Vec<(String, VideoFrame)>;
 
     /// Start hardware-accelerated (or fallback) screen/window capture + H.264 encode.
     fn start_screen_share(
@@ -141,6 +162,22 @@ pub trait MediaBackend: Send + Sync {
         &self,
         on_change: Arc<dyn Fn(AudioDeviceChangeKind) + Send + Sync>,
     ) -> Option<Box<dyn AudioDeviceMonitorHandle>>;
+
+    /// Start an OS-native full-duplex 48 kHz mono audio stream with built-in hardware AEC/NS/AGC.
+    /// Returns `None` when the caller should use the portable `cpal + sonora` pipeline instead.
+    #[allow(clippy::too_many_arguments)]
+    fn start_hw_audio_duplex(
+        &self,
+        _sample_rate: u32,
+        _input_device: Option<&str>,
+        _output_device: Option<&str>,
+        _enable_aec_ns: bool,
+        _enable_agc: bool,
+        _on_capture: AudioCaptureCallback,
+        _on_render: AudioRenderCallback,
+    ) -> Option<Result<Box<dyn HwAudioDuplexHandle>>> {
+        None
+    }
 }
 
 /// Return the compiled platform's active [`MediaBackend`].

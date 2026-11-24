@@ -324,6 +324,19 @@ async fn run_connected_loop(
     let (keyframe_req_tx, mut keyframe_req_rx) = mpsc::unbounded_channel::<u32>();
     let (codec_tx, mut codec_rx) = mpsc::unbounded_channel::<String>();
 
+    // 3. Kick off full-duplex audio engine initialization (CoreAudio VoiceProcessingIO / cpal)
+    // in parallel with WebRTC ICE gathering & Chime SUBSCRIBE/SUBSCRIBE_ACK so the ~1.5s audio
+    // unit startup overlaps completely with network signaling!
+    let shared = AudioSharedState::from_config(config);
+    let audio_start_handle = {
+        let audio_cfg = config.clone();
+        let audio_shared = shared.clone();
+        let audio_out_tx = outbound_opus_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            AudioEngine::start(&audio_cfg, audio_shared, audio_out_tx, inbound_opus_rx)
+        })
+    };
+
     let (cam_fb_tx, mut cam_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
     let backend = platform_backend();
     tracing::info!(
@@ -335,12 +348,22 @@ async fn run_connected_loop(
     let peer = match ChimeRtcPeer::new(&turn, inbound_opus_tx, inbound_video_tx, pc_state_tx).await
     {
         Ok(p) => p,
-        Err(e) => return LoopExit::Fatal(e),
+        Err(e) => {
+            if let Ok(Ok(mut ae)) = audio_start_handle.await {
+                ae.stop();
+            }
+            return LoopExit::Fatal(e);
+        }
     };
     peer.attach_video_feedback(cam_fb_tx).await;
     let sdp_offer = match peer.create_gathered_offer().await {
         Ok(s) => s,
-        Err(e) => return LoopExit::Fatal(e),
+        Err(e) => {
+            if let Ok(Ok(mut ae)) = audio_start_handle.await {
+                ae.stop();
+            }
+            return LoopExit::Fatal(e);
+        }
     };
 
     // 4. Send SUBSCRIBE and await SUBSCRIBE_ACK with SDP answer.
@@ -353,9 +376,17 @@ async fn run_connected_loop(
         &[],
     ) {
         Ok(f) => f,
-        Err(e) => return LoopExit::Fatal(e),
+        Err(e) => {
+            if let Ok(Ok(mut ae)) = audio_start_handle.await {
+                ae.stop();
+            }
+            return LoopExit::Fatal(e);
+        }
     };
     if let Err(e) = signal.send_frame(&sub).await {
+        if let Ok(Ok(mut ae)) = audio_start_handle.await {
+            ae.stop();
+        }
         return LoopExit::Fatal(e);
     }
 
@@ -389,6 +420,9 @@ async fn run_connected_loop(
         Ok(Ok(ack)) => ack,
         Ok(Err(e)) | Err(e) => {
             tracing::error!(%e, "initial SUBSCRIBE_ACK failed");
+            if let Ok(Ok(mut ae)) = audio_start_handle.await {
+                ae.stop();
+            }
             return LoopExit::Fatal(e);
         }
     };
@@ -406,11 +440,19 @@ async fn run_connected_loop(
         None,
     ) {
         Ok(s) => s,
-        Err(e) => return LoopExit::Fatal(e),
+        Err(e) => {
+            if let Ok(Ok(mut ae)) = audio_start_handle.await {
+                ae.stop();
+            }
+            return LoopExit::Fatal(e);
+        }
     };
     let mut last_sdp_answer = Some(sdp_answer.clone());
     if let Err(e) = peer.set_remote_answer(sdp_answer).await {
         tracing::error!(%e, "initial set_remote_answer failed");
+        if let Ok(Ok(mut ae)) = audio_start_handle.await {
+            ae.stop();
+        }
         return LoopExit::Fatal(e);
     }
     tracing::info!(
@@ -419,16 +461,11 @@ async fn run_connected_loop(
         "initial SUBSCRIBE_ACK applied"
     );
 
-    // 5. Start full-duplex audio engine (cpal + sonora AEC3/NS/AGC + Opus).
-    let shared = AudioSharedState::from_config(config);
-    let mut audio_engine = match AudioEngine::start(
-        config,
-        shared.clone(),
-        outbound_opus_tx.clone(),
-        inbound_opus_rx,
-    ) {
-        Ok(e) => e,
-        Err(e) => return LoopExit::Fatal(e),
+    // 5. Collect the full-duplex audio engine started in parallel with signaling above.
+    let mut audio_engine = match audio_start_handle.await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return LoopExit::Fatal(e),
+        Err(e) => return LoopExit::Fatal(HuddleError::Audio(e.to_string())),
     };
 
     let perf = Arc::new(HuddlePerfCounters::default());
@@ -1186,8 +1223,10 @@ struct VideoRoutingTable {
     remote_sources: Vec<(String, RemoteVideoSource)>,
 }
 
-/// Spawn a dedicated OS thread for video depacketization + decoding (AV1 `rav1d` / H.264
-/// VideoToolbox / OpenH264) so heavy 1080p/4K frames never jitter 20ms audio on the tokio runtime.
+/// Spawn a lightweight dispatcher that routes inbound remote video RTP packets by `ssrc` to
+/// parallel per-track decoder workers (H.264 VideoToolbox / AV1 VideoToolbox or `rav1d` /
+/// OpenH264) so a heavy 1080p remote screen share never head-of-line-blocks other participants'
+/// cameras and decoding scales smoothly across CPU cores.
 #[allow(clippy::too_many_arguments)]
 fn spawn_video_decoder_thread(
     inbound_video_rx: std::sync::mpsc::Receiver<Option<InboundVideoPacket>>,
@@ -1202,42 +1241,64 @@ fn spawn_video_decoder_thread(
     std::thread::Builder::new()
         .name("slackless-huddle-vdec".to_owned())
         .spawn(move || {
-            let mut remote_decoders: HashMap<u32, RemoteVideoDecoder> = HashMap::new();
+            struct TrackWorker {
+                tx: std::sync::mpsc::SyncSender<InboundVideoPacket>,
+                handle: std::thread::JoinHandle<()>,
+            }
+            let mut workers: HashMap<u32, TrackWorker> = HashMap::new();
             let mut unsupported_video_ssrcs: HashSet<u32> = HashSet::new();
-            let mut decoded_video_ssrcs: HashSet<u32> = HashSet::new();
-            let mut last_keyframe_req: HashMap<u32, Instant> = HashMap::new();
-            let mut last_decode_err_log: HashMap<u32, Instant> = HashMap::new();
+
+            let stop_all = |workers: &mut HashMap<u32, TrackWorker>| {
+                let drained: Vec<TrackWorker> = workers.drain().map(|(_, w)| w).collect();
+                for w in drained {
+                    drop(w.tx);
+                    let _ = w.handle.join();
+                }
+            };
 
             while let Ok(Some(pkt)) = inbound_video_rx.recv() {
                 if clear_decoders.swap(false, Ordering::Relaxed) {
-                    remote_decoders.clear();
-                    decoded_video_ssrcs.clear();
+                    stop_all(&mut workers);
                 }
                 if audio_only.load(Ordering::Relaxed) {
                     continue;
                 }
                 perf.record_rx_packet(pkt.payload.len() as u64);
 
-                let is_new = !remote_decoders.contains_key(&pkt.ssrc);
-                if is_new && !unsupported_video_ssrcs.contains(&pkt.ssrc) {
+                let ssrc = pkt.ssrc;
+                if !workers.contains_key(&ssrc) && !unsupported_video_ssrcs.contains(&ssrc) {
                     if let Some(dec) = RemoteVideoDecoder::for_mime(&pkt.mime_type) {
                         let backend = dec.backend_name();
                         tracing::info!(
-                            ssrc = pkt.ssrc,
+                            ssrc,
                             mid = %pkt.mid,
                             mime = %pkt.mime_type,
                             backend,
-                            "initialized remote video decoder on dedicated worker"
+                            "initialized parallel per-track remote video decoder worker"
                         );
                         perf.set_rx_backend(backend);
                         let _ = codec_tx.send(pkt.mime_type.clone());
-                        remote_decoders.insert(pkt.ssrc, dec);
-                        last_keyframe_req.insert(pkt.ssrc, Instant::now());
-                        let _ = keyframe_req_tx.send(pkt.ssrc);
+                        let _ = keyframe_req_tx.send(ssrc);
+
+                        let (tx, rx) = std::sync::mpsc::sync_channel::<InboundVideoPacket>(256);
+                        let w_routing = Arc::clone(&routing);
+                        let w_perf = Arc::clone(&perf);
+                        let w_updates = updates.clone();
+                        let w_kf = keyframe_req_tx.clone();
+                        if let Ok(handle) = std::thread::Builder::new()
+                            .name(format!("slackless-vdec-{ssrc}"))
+                            .spawn(move || {
+                                run_single_track_decoder(
+                                    dec, rx, w_routing, w_perf, w_updates, w_kf,
+                                );
+                            })
+                        {
+                            workers.insert(ssrc, TrackWorker { tx, handle });
+                        }
                     } else {
-                        unsupported_video_ssrcs.insert(pkt.ssrc);
+                        unsupported_video_ssrcs.insert(ssrc);
                         tracing::warn!(
-                            ssrc = pkt.ssrc,
+                            ssrc,
                             mid = %pkt.mid,
                             mime = %pkt.mime_type,
                             "no decoder available for inbound remote video codec"
@@ -1245,77 +1306,85 @@ fn spawn_video_decoder_thread(
                     }
                 }
 
-                if let Some(decoder) = remote_decoders.get_mut(&pkt.ssrc) {
-                    let t0 = Instant::now();
-                    let (frame_opt, decode_err) = decoder.push(&pkt);
-                    if let Some(err) = &decode_err {
-                        if last_decode_err_log
-                            .get(&pkt.ssrc)
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
-                        {
-                            last_decode_err_log.insert(pkt.ssrc, Instant::now());
-                            tracing::warn!(
-                                ssrc = pkt.ssrc,
-                                mid = %pkt.mid,
-                                mime = %pkt.mime_type,
-                                %err,
-                                "remote video decode error; requesting keyframe"
-                            );
-                        }
-                    }
-                    let awaiting_first_frame = !decoded_video_ssrcs.contains(&pkt.ssrc);
-                    let needs_keyframe =
-                        decode_err.is_some() || (awaiting_first_frame && pkt.marker);
-                    if needs_keyframe {
-                        let should_req = last_keyframe_req
-                            .get(&pkt.ssrc)
-                            .is_none_or(|t| t.elapsed() >= Duration::from_millis(1500));
-                        if should_req {
-                            last_keyframe_req.insert(pkt.ssrc, Instant::now());
-                            let _ = keyframe_req_tx.send(pkt.ssrc);
-                        }
-                    }
-                    if let Some(frame) = frame_opt {
-                        let decode_us = t0.elapsed().as_micros() as u64;
-                        perf.record_rx_frame(frame.width, frame.height, decode_us);
-                        let tile = routing.lock().ok().and_then(|rt| {
-                            resolve_remote_video_tile(
-                                pkt.ssrc,
-                                &pkt.mid,
-                                &rt.ssrc_to_stream_id,
-                                &rt.remote_sources,
-                            )
-                        });
-                        if let Some(tile) = tile {
-                            if decoded_video_ssrcs.insert(pkt.ssrc) {
-                                tracing::info!(
-                                    ssrc = pkt.ssrc,
-                                    mid = %pkt.mid,
-                                    mime = %pkt.mime_type,
-                                    width = frame.width,
-                                    height = frame.height,
-                                    decode_us,
-                                    tile = ?tile,
-                                    "decoded first remote video frame"
-                                );
-                            }
-                            let _ = updates.send(HuddleUpdate::VideoFrame { tile, frame });
-                        } else if last_decode_err_log
-                            .get(&pkt.ssrc)
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
-                        {
-                            last_decode_err_log.insert(pkt.ssrc, Instant::now());
-                            tracing::warn!(
-                                ssrc = pkt.ssrc,
-                                mid = %pkt.mid,
-                                "decoded remote video frame but could not map to a tile"
-                            );
-                        }
-                    }
+                if let Some(worker) = workers.get(&ssrc) {
+                    // Non-blocking send: if one track's software decoder momentarily falls behind,
+                    // drop only that track's overflow packet without stalling other tracks.
+                    let _ = worker.tx.try_send(pkt);
                 }
             }
+            stop_all(&mut workers);
         })
         .ok()
+}
+
+fn run_single_track_decoder(
+    mut decoder: RemoteVideoDecoder,
+    rx: std::sync::mpsc::Receiver<InboundVideoPacket>,
+    routing: Arc<Mutex<VideoRoutingTable>>,
+    perf: Arc<HuddlePerfCounters>,
+    updates: mpsc::UnboundedSender<HuddleUpdate>,
+    keyframe_req_tx: mpsc::UnboundedSender<u32>,
+) {
+    let mut decoded_first = false;
+    let mut last_keyframe_req = Instant::now();
+    let mut last_decode_err_log: Option<Instant> = None;
+
+    while let Ok(pkt) = rx.recv() {
+        let t0 = Instant::now();
+        let (frame_opt, decode_err) = decoder.push(&pkt);
+        if let Some(err) = &decode_err {
+            if last_decode_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3)) {
+                last_decode_err_log = Some(Instant::now());
+                tracing::warn!(
+                    ssrc = pkt.ssrc,
+                    mid = %pkt.mid,
+                    mime = %pkt.mime_type,
+                    %err,
+                    "remote video decode error; requesting keyframe"
+                );
+            }
+        }
+        let needs_keyframe = decode_err.is_some() || (!decoded_first && pkt.marker);
+        if needs_keyframe && last_keyframe_req.elapsed() >= Duration::from_millis(1500) {
+            last_keyframe_req = Instant::now();
+            let _ = keyframe_req_tx.send(pkt.ssrc);
+        }
+        if let Some(frame) = frame_opt {
+            let decode_us = t0.elapsed().as_micros() as u64;
+            perf.record_rx_frame(frame.width, frame.height, decode_us);
+            let tile = routing.lock().ok().and_then(|rt| {
+                resolve_remote_video_tile(
+                    pkt.ssrc,
+                    &pkt.mid,
+                    &rt.ssrc_to_stream_id,
+                    &rt.remote_sources,
+                )
+            });
+            if let Some(tile) = tile {
+                if !decoded_first {
+                    decoded_first = true;
+                    tracing::info!(
+                        ssrc = pkt.ssrc,
+                        mid = %pkt.mid,
+                        mime = %pkt.mime_type,
+                        width = frame.width,
+                        height = frame.height,
+                        decode_us,
+                        tile = ?tile,
+                        "decoded first remote video frame"
+                    );
+                }
+                let _ = updates.send(HuddleUpdate::VideoFrame { tile, frame });
+            } else if last_decode_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3)) {
+                last_decode_err_log = Some(Instant::now());
+                tracing::warn!(
+                    ssrc = pkt.ssrc,
+                    mid = %pkt.mid,
+                    "decoded remote video frame but could not map to a tile"
+                );
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

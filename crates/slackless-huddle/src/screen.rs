@@ -121,55 +121,91 @@ fn is_system_chrome_window(app: &str, title: &str) -> bool {
 }
 
 /// Capture live downscaled BGRA preview thumbnails for monitors (`monitors_only == true`) or
-/// visible windows (`monitors_only == false`) for the Screen Sharing picker modal.
+/// visible windows (`monitors_only == false`) via the active platform [`crate::backend::MediaBackend`]
+/// (GPU-accelerated `SCScreenshotManager` on macOS 14+, portable `xcap` fallback elsewhere).
 pub fn capture_screen_thumbnails(
     monitors_only: bool,
     max_w: u32,
     max_h: u32,
 ) -> Vec<(String, VideoFrame)> {
-    let mut out = Vec::new();
+    platform_backend().capture_screen_thumbnails(monitors_only, max_w, max_h)
+}
+
+/// Portable `xcap` + parallel CPU box-downscale thumbnail capture fallback (Linux/Windows/macOS<14).
+pub(crate) fn capture_screen_thumbnails_xcap(
+    monitors_only: bool,
+    max_w: u32,
+    max_h: u32,
+) -> Vec<(String, VideoFrame)> {
     if monitors_only {
-        if let Ok(monitors) = xcap::Monitor::all() {
-            for m in monitors {
-                let Ok(id) = m.id() else { continue };
-                let img = with_autorelease_pool(|| m.capture_image().ok());
-                if let Some(rgba) = img {
-                    if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
-                        out.push((format!("monitor:{id}"), frame));
+        let Ok(monitors) = xcap::Monitor::all() else {
+            return Vec::new();
+        };
+        let mut results: Vec<Option<(String, VideoFrame)>> = vec![None; monitors.len()];
+        std::thread::scope(|s| {
+            for (m, slot) in monitors.into_iter().zip(results.iter_mut()) {
+                s.spawn(move || {
+                    let Ok(id) = m.id() else { return };
+                    let img = with_autorelease_pool(|| m.capture_image().ok());
+                    if let Some(rgba) = img {
+                        if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
+                            *slot = Some((format!("monitor:{id}"), frame));
+                        }
                     }
-                }
+                });
             }
-        }
-    } else if let Ok(windows) = xcap::Window::all() {
-        for w in windows {
-            if out.len() >= 18 {
-                break;
-            }
+        });
+        return results.into_iter().flatten().collect();
+    }
+
+    let Ok(windows) = xcap::Window::all() else {
+        return Vec::new();
+    };
+    let candidates: Vec<(u32, xcap::Window)> = windows
+        .into_iter()
+        .filter_map(|w| {
             if w.is_minimized().unwrap_or(false) {
-                continue;
+                return None;
             }
-            let Ok(id) = w.id() else { continue };
+            let id = w.id().ok()?;
             let width = w.width().unwrap_or(0);
             let height = w.height().unwrap_or(0);
             if width < 120 || height < 120 {
-                continue;
+                return None;
             }
             let title = w.title().unwrap_or_default();
             let app = w.app_name().unwrap_or_default();
             if (title.trim().is_empty() && app.trim().is_empty())
                 || is_system_chrome_window(&app, &title)
             {
-                continue;
+                return None;
             }
-            let img = with_autorelease_pool(|| w.capture_image().ok());
-            if let Some(rgba) = img {
-                if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
-                    out.push((format!("window:{id}"), frame));
-                }
-            }
-        }
+            Some((id, w))
+        })
+        .take(18)
+        .collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
     }
-    out
+    let workers = candidates.len().min(4);
+    let chunk_size = candidates.len().div_ceil(workers);
+    let mut buckets: Vec<Vec<(String, VideoFrame)>> = vec![Vec::new(); workers];
+    std::thread::scope(|s| {
+        for (chunk, bucket) in candidates.chunks(chunk_size).zip(buckets.iter_mut()) {
+            s.spawn(move || {
+                for (id, w) in chunk {
+                    let img = with_autorelease_pool(|| w.capture_image().ok());
+                    if let Some(rgba) = img {
+                        if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
+                            bucket.push((format!("window:{id}"), frame));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    buckets.into_iter().flatten().collect()
 }
 
 /// Fast box/area-averaged RGBA -> BGRA thumbnail downscaler.
