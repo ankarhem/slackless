@@ -133,12 +133,56 @@ pub enum CliInstallStatus {
     Unavailable,
 }
 
-/// Default user-writable CLI symlink path (`~/.local/bin/slackless`).
-pub fn cli_link_path() -> PathBuf {
+/// Candidate directories for installing the `slackless` CLI symlink, ordered by macOS default
+/// `$PATH` availability without requiring `sudo`:
+/// 1. `/usr/local/bin` (in macOS `/etc/paths` by default; used by VS Code, Zed, Cursor, Docker)
+/// 2. `/opt/homebrew/bin` (writable on Apple Silicon Homebrew installs)
+/// 3. `~/.local/bin` (user-writable fallback when system directories are locked down)
+fn cli_candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".local/bin/slackless")
+    dirs.push(home.join(".local/bin"));
+    dirs
+}
+
+fn dir_is_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".slackless-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Best writable symlink path for the `slackless` CLI (`/usr/local/bin/slackless` when writable,
+/// else `/opt/homebrew/bin/slackless`, else `~/.local/bin/slackless`).
+pub fn cli_link_path() -> PathBuf {
+    let dirs = cli_candidate_dirs();
+    for dir in &dirs {
+        if dir_is_writable(dir) {
+            return dir.join("slackless");
+        }
+    }
+    dirs.into_iter()
+        .last()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("slackless")
 }
 
 /// Locate the matching `slackless` CLI executable embedded inside the running `Slackless.app`.
@@ -147,38 +191,49 @@ pub fn bundled_cli_path() -> Option<PathBuf> {
     cli.is_file().then_some(cli)
 }
 
-/// Returns `true` if `~/.local/bin` is present in `$PATH`.
-pub fn local_bin_in_path() -> bool {
-    let Some(local_bin) = cli_link_path().parent().map(Path::to_path_buf) else {
-        return false;
-    };
+/// Returns `true` if `dir` is present in `$PATH`.
+pub fn dir_in_path(dir: &Path) -> bool {
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|p| p == local_bin)
+    std::env::split_paths(&path_var).any(|p| p == dir)
 }
 
-/// Inspect whether `~/.local/bin/slackless` is installed and matches the running `Slackless.app`.
+/// Inspect whether `slackless` CLI is installed (checking `/usr/local/bin`, `/opt/homebrew/bin`,
+/// and `~/.local/bin`) and matches the running `Slackless.app`.
 pub fn cli_install_status() -> CliInstallStatus {
     let Some(bundled) = bundled_cli_path() else {
         return CliInstallStatus::Unavailable;
     };
-    let link = cli_link_path();
-    match std::fs::symlink_metadata(&link) {
-        Err(_) => CliInstallStatus::NotInstalled,
-        Ok(meta) if meta.file_type().is_symlink() => {
-            if std::fs::read_link(&link).ok().as_deref() == Some(bundled.as_path()) {
-                CliInstallStatus::Installed(link)
-            } else {
-                CliInstallStatus::OutOfSync(link)
+    let mut out_of_sync = None;
+    for dir in cli_candidate_dirs() {
+        let link = dir.join("slackless");
+        match std::fs::symlink_metadata(&link) {
+            Err(_) => continue,
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if std::fs::read_link(&link).ok().as_deref() == Some(bundled.as_path()) {
+                    return CliInstallStatus::Installed(link);
+                }
+                if out_of_sync.is_none() {
+                    out_of_sync = Some(link);
+                }
+            }
+            Ok(_) => {
+                if out_of_sync.is_none() {
+                    out_of_sync = Some(link);
+                }
             }
         }
-        Ok(_) => CliInstallStatus::OutOfSync(link),
+    }
+    match out_of_sync {
+        Some(path) => CliInstallStatus::OutOfSync(path),
+        None => CliInstallStatus::NotInstalled,
     }
 }
 
-/// Create or refresh the `~/.local/bin/slackless` symlink pointing to the bundled CLI inside
-/// `Slackless.app` so the CLI always stays at the exact same version as the app.
+/// Create or refresh the `slackless` CLI symlink in the best writable `$PATH` directory
+/// (`/usr/local/bin/slackless`, `/opt/homebrew/bin/slackless`, or `~/.local/bin/slackless`),
+/// pointing directly to the bundled CLI inside `Slackless.app`.
 #[cfg(unix)]
 pub fn install_cli_symlink() -> Result<PathBuf, String> {
     let bundled = bundled_cli_path()
@@ -207,12 +262,14 @@ pub fn install_cli_symlink() -> Result<PathBuf, String> {
     Err("CLI symlink installation is currently supported on macOS/Unix only".to_owned())
 }
 
-/// Remove `~/.local/bin/slackless` if present.
+/// Remove any installed `slackless` CLI symlink across standard bin directories.
 pub fn uninstall_cli_symlink() -> Result<(), String> {
-    let link = cli_link_path();
-    if std::fs::symlink_metadata(&link).is_ok() {
-        std::fs::remove_file(&link)
-            .map_err(|e| format!("cannot remove {}: {e}", link.display()))?;
+    for dir in cli_candidate_dirs() {
+        let link = dir.join("slackless");
+        if std::fs::symlink_metadata(&link).is_ok() {
+            std::fs::remove_file(&link)
+                .map_err(|e| format!("cannot remove {}: {e}", link.display()))?;
+        }
     }
     Ok(())
 }
@@ -456,13 +513,15 @@ else
   exit 1
 fi
 rm -rf "$STAGE"
-# Keep ~/.local/bin/slackless symlinked to the updated bundle so the CLI always matches the app
-# version (also upgrades older standalone copied binaries into a symlink automatically).
+# Keep any installed `slackless` CLI symlink/binary synced to the updated bundle so the CLI always
+# matches the app version.
 CLI_BIN="${DEST}/Contents/MacOS/slackless"
-CLI_LINK="${HOME}/.local/bin/slackless"
-if [ -x "$CLI_BIN" ] && { [ -L "$CLI_LINK" ] || [ -e "$CLI_LINK" ]; }; then
-  mkdir -p "${HOME}/.local/bin"
-  ln -sf "$CLI_BIN" "$CLI_LINK" 2>/dev/null || true
+if [ -x "$CLI_BIN" ]; then
+  for CLI_LINK in /usr/local/bin/slackless /opt/homebrew/bin/slackless "${HOME}/.local/bin/slackless"; do
+    if [ -L "$CLI_LINK" ] || [ -e "$CLI_LINK" ]; then
+      ln -sf "$CLI_BIN" "$CLI_LINK" 2>/dev/null || true
+    fi
+  done
 fi
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true
 open "$DEST"

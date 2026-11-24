@@ -43,7 +43,7 @@ Reproducible total-system measurements (exact cumulative CPU time deltas across 
 curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | bash
 ```
 
-Installs **both** `Slackless.app` (into `/Applications` or `~/Applications`) and the matching `slackless` CLI symlink (`~/.local/bin/slackless`, pass `--no-cli` to skip or install it later from **Preferences → Advanced**).
+Installs **both** `Slackless.app` (into `/Applications` or `~/Applications`) and the matching `slackless` CLI symlink (`/usr/local/bin/slackless`, falling back to `/opt/homebrew/bin` or `~/.local/bin`; pass `--no-cli` to skip or install it later from **Preferences → Advanced**).
 
 Downloads directly from [GitHub Releases](https://github.com/ankarhem/slackless/releases), verifies `SHA256SUMS.txt`, and installs without browser quarantine prompts. Subsequent in-app updates (**Slackless → Check for Updates…**) atomically update both the app and CLI together so they always stay on the exact same version.
 

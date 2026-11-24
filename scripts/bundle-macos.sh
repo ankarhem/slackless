@@ -176,20 +176,28 @@ if [[ "$DO_INSTALL" -eq 1 ]]; then
 fi
 
 if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
-  mkdir -p "$HOME/.local/bin"
+  if [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then
+    CLI_DIR="/usr/local/bin"
+  elif [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
+    CLI_DIR="/opt/homebrew/bin"
+  else
+    CLI_DIR="$HOME/.local/bin"
+    mkdir -p "$CLI_DIR"
+  fi
+  CLI_LINK="${CLI_DIR}/slackless"
   if [[ "$DO_INSTALL" -eq 1 && -x "$HOME/Applications/Slackless.app/Contents/MacOS/slackless" ]]; then
-    ln -sf "$HOME/Applications/Slackless.app/Contents/MacOS/slackless" "$HOME/.local/bin/slackless"
-    echo "Linked $HOME/.local/bin/slackless -> $HOME/Applications/Slackless.app/Contents/MacOS/slackless"
+    ln -sf "$HOME/Applications/Slackless.app/Contents/MacOS/slackless" "$CLI_LINK"
+    echo "Linked ${CLI_LINK} -> $HOME/Applications/Slackless.app/Contents/MacOS/slackless"
   else
     if [[ ! -x "$CLI_BIN" ]]; then
       echo "Expected CLI binary not found at $CLI_BIN" >&2
       exit 1
     fi
-    cp "$CLI_BIN" "$HOME/.local/bin/slackless"
-    chmod +x "$HOME/.local/bin/slackless"
+    cp "$CLI_BIN" "$CLI_LINK"
+    chmod +x "$CLI_LINK"
     if command -v codesign >/dev/null; then
-      codesign --force --sign "$SIGN_ID" "$HOME/.local/bin/slackless" >/dev/null 2>&1 || true
+      codesign --force --sign "$SIGN_ID" "$CLI_LINK" >/dev/null 2>&1 || true
     fi
-    echo "Installed $HOME/.local/bin/slackless"
+    echo "Installed ${CLI_LINK}"
   fi
 fi

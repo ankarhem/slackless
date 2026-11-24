@@ -159,10 +159,18 @@ fi
 echo "Installed Slackless ${TAG} -> ${DEST}"
 
 if [[ "$INSTALL_CLI" -eq 1 ]]; then
-  mkdir -p "$HOME/.local/bin"
+  if [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then
+    CLI_DIR="/usr/local/bin"
+  elif [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
+    CLI_DIR="/opt/homebrew/bin"
+  else
+    CLI_DIR="$HOME/.local/bin"
+    mkdir -p "$CLI_DIR"
+  fi
+  CLI_LINK="${CLI_DIR}/slackless"
   if [[ -x "${DEST}/Contents/MacOS/slackless" ]]; then
-    ln -sf "${DEST}/Contents/MacOS/slackless" "$HOME/.local/bin/slackless"
-    echo "Linked slackless CLI -> $HOME/.local/bin/slackless (matches ${TAG})"
+    ln -sf "${DEST}/Contents/MacOS/slackless" "$CLI_LINK"
+    echo "Linked slackless CLI -> ${CLI_LINK} (matches ${TAG})"
   elif [[ -n "$CLI_URL" ]]; then
     echo "Downloading slackless CLI ${TAG}..."
     curl -fsSL -o "${TMPDIR}/${CLI_ASSET}" "$CLI_URL"
@@ -177,14 +185,14 @@ if [[ "$INSTALL_CLI" -eq 1 ]]; then
       fi
     fi
     tar -xzf "${TMPDIR}/${CLI_ASSET}" -C "$TMPDIR"
-    install -m 755 "${TMPDIR}/slackless" "$HOME/.local/bin/slackless"
-    echo "Installed slackless CLI -> $HOME/.local/bin/slackless"
+    install -m 755 "${TMPDIR}/slackless" "$CLI_LINK"
+    echo "Installed slackless CLI -> ${CLI_LINK}"
   fi
   case ":${PATH:-}:" in
-    *":$HOME/.local/bin:"*) ;;
+    *":${CLI_DIR}:"*) ;;
     *)
-      echo "Note: add $HOME/.local/bin to your PATH to run 'slackless' from the terminal:"
-      echo '  export PATH="$HOME/.local/bin:$PATH"'
+      echo "Note: add ${CLI_DIR} to your PATH to run 'slackless' from the terminal:"
+      echo "  export PATH=\"${CLI_DIR}:\$PATH\""
       ;;
   esac
 fi

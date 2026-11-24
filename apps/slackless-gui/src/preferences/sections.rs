@@ -1444,13 +1444,20 @@ impl Preferences {
 
     fn cli_install_group(&mut self, cx: &mut Context<Self>) -> Div {
         use crate::updater::{
-            CliInstallStatus, cli_install_status, installed_version, local_bin_in_path,
+            CliInstallStatus, cli_install_status, cli_link_path, dir_in_path, installed_version,
         };
         let status = cli_install_status();
+        let target_link = cli_link_path();
         let ver = installed_version();
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
-        let in_path = local_bin_in_path();
+        let effective_dir = match &status {
+            CliInstallStatus::Installed(p) | CliInstallStatus::OutOfSync(p) => {
+                p.parent().map(std::path::Path::to_path_buf)
+            }
+            _ => target_link.parent().map(std::path::Path::to_path_buf),
+        };
+        let in_path = effective_dir.as_deref().is_none_or(dir_in_path);
 
         let (desc, action_row) = match status {
             CliInstallStatus::Installed(path) => (
@@ -1470,7 +1477,7 @@ impl Preferences {
                                 match crate::updater::uninstall_cli_symlink() {
                                     Ok(()) => {
                                         this.cli_status_note =
-                                            Some("Removed ~/.local/bin/slackless.".to_owned());
+                                            Some("Removed slackless CLI link.".to_owned());
                                     }
                                     Err(err) => {
                                         this.cli_status_note = Some(format!("Error: {err}"));
@@ -1482,8 +1489,9 @@ impl Preferences {
             ),
             CliInstallStatus::OutOfSync(path) => (
                 format!(
-                    "Found an older or separate CLI at {}. Re-link it so it matches Slackless {} and auto-updates.",
+                    "Found an older or separate CLI at {}. Re-link it to {} so it matches Slackless {} and auto-updates.",
                     path.display(),
+                    target_link.display(),
                     ver
                 ),
                 h_flex()
@@ -1509,7 +1517,8 @@ impl Preferences {
             ),
             CliInstallStatus::NotInstalled => (
                 format!(
-                    "Install the slackless CLI to ~/.local/bin/slackless (version {}, stays in sync with app updates).",
+                    "Install the slackless CLI to {} (version {}, stays in sync with app updates).",
+                    target_link.display(),
                     ver
                 ),
                 h_flex()
@@ -1545,9 +1554,12 @@ impl Preferences {
             .child(div().text_xs().text_color(fg).child(desc))
             .child(action_row);
         if !in_path {
-            body = body.child(div().text_xs().text_color(muted).child(
-                "Tip: add `export PATH=\"$HOME/.local/bin:$PATH\"` to your shell profile to invoke `slackless` anywhere.",
-            ));
+            if let Some(dir) = effective_dir {
+                body = body.child(div().text_xs().text_color(muted).child(format!(
+                    "Tip: add `export PATH=\"{}:$PATH\"` to your shell profile to invoke `slackless` anywhere.",
+                    dir.display()
+                )));
+            }
         }
         if let Some(note) = &self.cli_status_note {
             body = body.child(div().text_xs().text_color(muted).child(note.clone()));
