@@ -61,6 +61,7 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 VERSION="${SLACKLESS_VERSION:-$(awk -F'"' '/^version *=/{print $2; exit}' "$ROOT/Cargo.toml")}"
+BUNDLE_VERSION="${VERSION//-/.}"
 APP="$ROOT/target/bundle/Slackless.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -105,7 +106,7 @@ cat >"$APP/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key>
   <string>${VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>${VERSION}</string>
+  <string>${BUNDLE_VERSION}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

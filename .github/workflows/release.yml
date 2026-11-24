@@ -27,14 +27,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compute CalVer version (YYYY.MM.DD.xx)
+      - name: Compute CalVer version (YYYY.MM.DD-xx)
         id: ver
         shell: bash
         run: |
           set -euo pipefail
           DATE_PREFIX="$(date -u +%Y.%m.%d)"
-          LAST_NUM="$(git tag -l "${DATE_PREFIX}.*" \
-            | awk -F. '{print $4}' \
+          LAST_NUM="$(git tag -l "${DATE_PREFIX}-*" \
+            | awk -F- '{print $2}' \
             | grep -E '^[0-9]+$' \
             | sort -n \
             | tail -n 1 || true)"
@@ -43,7 +43,7 @@ jobs:
           else
             NEXT_NUM=$((10#$LAST_NUM + 1))
           fi
-          VERSION="$(printf '%s.%02d' "$DATE_PREFIX" "$NEXT_NUM")"
+          VERSION="$(printf '%s-%02d' "$DATE_PREFIX" "$NEXT_NUM")"
           echo "Computed release version: ${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
