@@ -2,16 +2,17 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{SampleFormat, Stream, StreamConfig};
-use opus::{Application, Channels, Decoder, Encoder};
+use opus::{Application, Bitrate, Channels, Decoder, Encoder};
 use sonora::config::{Config as SonoraConfig, EchoCanceller, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 use tokio::sync::mpsc;
 
+use crate::backend::{AudioDeviceChangeKind, platform_backend};
 use crate::{HuddleAudioConfig, HuddleError, Result};
 
 /// Chime / Opus native sample rate (48 kHz).
@@ -345,12 +346,15 @@ impl AudioSharedState {
     }
 }
 
+type CaptureSignal = Arc<(Mutex<VecDeque<f32>>, Condvar)>;
+
 /// Live full-duplex audio engine (capture → sonora AEC3/NS/AGC → Opus TX; Opus RX → sonora ref → speaker).
 ///
 /// Both `cpal::Stream`s live on the dedicated audio worker OS thread so `AudioEngine` stays `Send`
 /// on macOS CoreAudio (where `cpal::Stream` is `!Send`).
 pub struct AudioEngine {
     shared: AudioSharedState,
+    capture_signal: CaptureSignal,
     worker: Option<std::thread::JoinHandle<mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
 
@@ -362,8 +366,10 @@ impl AudioEngine {
         mut inbound_opus_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> Result<Self> {
         shared.running.store(true, Ordering::Relaxed);
-        let capture_ring: Arc<Mutex<VecDeque<f32>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_20MS * 8)));
+        let capture_signal: CaptureSignal = Arc::new((
+            Mutex::new(VecDeque::with_capacity(FRAME_20MS * 8)),
+            Condvar::new(),
+        ));
         let playback_ring: Arc<Mutex<VecDeque<f32>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_20MS * 10)));
 
@@ -372,12 +378,13 @@ impl AudioEngine {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
 
         let worker_shared = shared.clone();
+        let worker_capture = Arc::clone(&capture_signal);
         let worker = std::thread::Builder::new()
             .name("slackless-huddle-audio".to_owned())
             .spawn(move || {
                 let streams = (|| -> Result<(Stream, Stream)> {
                     let in_stream =
-                        open_input_stream(in_name.as_deref(), Arc::clone(&capture_ring))?;
+                        open_input_stream(in_name.as_deref(), Arc::clone(&worker_capture))?;
                     let out_stream =
                         open_output_stream(out_name.as_deref(), Arc::clone(&playback_ring))?;
                     Ok((in_stream, out_stream))
@@ -388,7 +395,7 @@ impl AudioEngine {
                         let _ = ready_tx.send(Ok(()));
                         run_audio_dsp_loop(
                             worker_shared,
-                            capture_ring,
+                            worker_capture,
                             playback_ring,
                             outbound_opus_tx,
                             &mut inbound_opus_rx,
@@ -412,12 +419,14 @@ impl AudioEngine {
             .and_then(|r| r)
         {
             shared.running.store(false, Ordering::Relaxed);
+            capture_signal.1.notify_all();
             let _ = worker.join();
             return Err(err);
         }
 
         Ok(Self {
             shared,
+            capture_signal,
             worker: Some(worker),
         })
     }
@@ -426,6 +435,7 @@ impl AudioEngine {
     /// restart keeps receiving remote audio seamlessly.
     pub fn stop(&mut self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
         self.shared.running.store(false, Ordering::Relaxed);
+        self.capture_signal.1.notify_all();
         self.worker.take().and_then(|handle| handle.join().ok())
     }
 }
@@ -484,7 +494,7 @@ fn current_default_output_name() -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 fn run_audio_dsp_loop(
     shared: AudioSharedState,
-    capture_ring: Arc<Mutex<VecDeque<f32>>>,
+    capture_signal: CaptureSignal,
     playback_ring: Arc<Mutex<VecDeque<f32>>>,
     outbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
     inbound_opus_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
@@ -496,6 +506,13 @@ fn run_audio_dsp_loop(
     let Ok(mut encoder) = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip) else {
         return;
     };
+    // Match Chime SDP `useinbandfec=1` with crisp 32 kbps VBR voice + DTX for low idle uplink.
+    let _ = encoder.set_bitrate(Bitrate::Bits(32_000));
+    let _ = encoder.set_vbr(true);
+    let _ = encoder.set_inband_fec(true);
+    let _ = encoder.set_packet_loss_perc(5);
+    let _ = encoder.set_dtx(true);
+
     let Ok(mut decoder) = Decoder::new(SAMPLE_RATE, Channels::Mono) else {
         return;
     };
@@ -508,10 +525,32 @@ fn run_audio_dsp_loop(
     let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
     let mut opus_out = vec![0u8; 4000];
     let silence_pcm = vec![0.0f32; FRAME_20MS];
+    // Pre-encode one silence packet once so muted frames skip Sonora DSP + Opus encoding entirely.
+    let cached_silence_opus: Vec<u8> = encoder
+        .encode_float(&silence_pcm, &mut opus_out)
+        .map(|n| opus_out[..n].to_vec())
+        .unwrap_or_else(|_| vec![0xF8, 0xFF, 0xFE]);
+    let mut mic_frame = Vec::with_capacity(FRAME_20MS);
     let mut processed_capture = Vec::with_capacity(FRAME_20MS);
 
-    // Watch system default input/output devices (e.g. AirPods connect/disconnect mid-huddle)
-    // and seamlessly rebuild the affected cpal stream in place without dropping the Chime call.
+    // Event-driven OS audio device hot-plug monitor (CoreAudio listener on macOS; falls back to
+    // 1.5s polling only on platforms without a native listener).
+    let in_dirty = Arc::new(AtomicBool::new(false));
+    let out_dirty = Arc::new(AtomicBool::new(false));
+    let device_monitor = {
+        let in_d = Arc::clone(&in_dirty);
+        let out_d = Arc::clone(&out_dirty);
+        let wake = Arc::clone(&capture_signal);
+        platform_backend().start_audio_device_monitor(Arc::new(move |kind| {
+            match kind {
+                AudioDeviceChangeKind::Input => in_d.store(true, Ordering::Release),
+                AudioDeviceChangeKind::Output => out_d.store(true, Ordering::Release),
+            }
+            wake.1.notify_one();
+        }))
+    };
+    let use_polling_hotplug = device_monitor.is_none();
+
     let mut last_default_in = if configured_in.is_none() {
         current_default_input_name()
     } else {
@@ -525,18 +564,24 @@ fn run_audio_dsp_loop(
     let mut last_device_check = std::time::Instant::now();
 
     while shared.running.load(Ordering::Relaxed) {
-        if last_device_check.elapsed() >= Duration::from_millis(1500) {
-            last_device_check = std::time::Instant::now();
-            if configured_in.is_none() {
+        let check_in = in_dirty.swap(false, Ordering::AcqRel);
+        let check_out = out_dirty.swap(false, Ordering::AcqRel);
+        let poll_due =
+            use_polling_hotplug && last_device_check.elapsed() >= Duration::from_millis(1500);
+        if check_in || check_out || poll_due {
+            if poll_due {
+                last_device_check = std::time::Instant::now();
+            }
+            if configured_in.is_none() && (check_in || poll_due) {
                 let now_in = current_default_input_name();
                 if now_in.is_some() && now_in != last_default_in {
-                    if let Ok(next_stream) = open_input_stream(None, Arc::clone(&capture_ring)) {
+                    if let Ok(next_stream) = open_input_stream(None, Arc::clone(&capture_signal)) {
                         in_stream = next_stream;
                         last_default_in = now_in;
                     }
                 }
             }
-            if configured_out.is_none() {
+            if configured_out.is_none() && (check_out || poll_due) {
                 let now_out = current_default_output_name();
                 if now_out.is_some() && now_out != last_default_out {
                     if let Ok(next_stream) = open_output_stream(None, Arc::clone(&playback_ring)) {
@@ -557,13 +602,17 @@ fn run_audio_dsp_loop(
         }
 
         // 1. Drain inbound Opus packets (or empty PLC sentinels) -> decode -> AEC3 ref -> playback.
+        let muted = shared.muted.load(Ordering::Relaxed);
         while let Ok(pkt) = inbound_opus_rx.try_recv() {
             if let Ok(samples) = decode_opus_or_plc(&mut decoder, &pkt, &mut decoded_pcm) {
                 let pcm = &decoded_pcm[..samples];
-                for chunk in pcm.chunks(FRAME_10MS) {
-                    if chunk.len() == FRAME_10MS {
-                        let mut out_ref = [0.0f32; FRAME_10MS];
-                        let _ = apm.process_render_f32(&[chunk], &mut [&mut out_ref[..]]);
+                // Only feed AEC3 render reference when mic is live (unmuted).
+                if !muted && cur_aec {
+                    for chunk in pcm.chunks(FRAME_10MS) {
+                        if chunk.len() == FRAME_10MS {
+                            let mut out_ref = [0.0f32; FRAME_10MS];
+                            let _ = apm.process_render_f32(&[chunk], &mut [&mut out_ref[..]]);
+                        }
                     }
                 }
                 if let Ok(mut ring) = playback_ring.lock() {
@@ -577,31 +626,34 @@ fn run_audio_dsp_loop(
         }
 
         // 2. Drain captured 20ms mic chunks -> Sonora 10ms AEC3/NS/AGC -> Opus encode -> RTC TX.
-        let mut mic_frame = None;
-        if let Ok(mut ring) = capture_ring.lock() {
-            if ring.len() >= FRAME_20MS {
-                let mut frame = Vec::with_capacity(FRAME_20MS);
-                for _ in 0..FRAME_20MS {
-                    if let Some(s) = ring.pop_front() {
-                        frame.push(s);
+        // Wait on the capture Condvar instead of busy-sleeping at 200 Hz!
+        mic_frame.clear();
+        {
+            let (lock, cvar) = &*capture_signal;
+            if let Ok(mut ring) = lock.lock() {
+                if ring.len() < FRAME_20MS && shared.running.load(Ordering::Relaxed) {
+                    if let Ok((guard, _)) = cvar.wait_timeout(ring, Duration::from_millis(18)) {
+                        ring = guard;
+                    } else {
+                        continue;
                     }
                 }
-                mic_frame = Some(frame);
+                if ring.len() >= FRAME_20MS {
+                    mic_frame.extend(ring.drain(..FRAME_20MS));
+                }
             }
         }
 
-        if let Some(frame) = mic_frame {
+        if mic_frame.len() == FRAME_20MS {
             let muted = shared.muted.load(Ordering::Relaxed);
             if muted {
                 shared
                     .local_rms_bits
                     .store(0.0f32.to_bits(), Ordering::Relaxed);
-                if let Ok(n) = encoder.encode_float(&silence_pcm, &mut opus_out) {
-                    let _ = outbound_opus_tx.send(opus_out[..n].to_vec());
-                }
+                let _ = outbound_opus_tx.send(cached_silence_opus.clone());
             } else {
                 processed_capture.clear();
-                for chunk in frame.as_chunks::<FRAME_10MS>().0 {
+                for chunk in mic_frame.as_chunks::<FRAME_10MS>().0 {
                     let mut out_chunk = [0.0f32; FRAME_10MS];
                     if apm
                         .process_capture_f32(&[chunk.as_slice()], &mut [&mut out_chunk[..]])
@@ -620,10 +672,9 @@ fn run_audio_dsp_loop(
                     let _ = outbound_opus_tx.send(opus_out[..n].to_vec());
                 }
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(5));
         }
     }
+    drop(device_monitor);
     drop(in_stream);
     drop(out_stream);
 }
@@ -654,7 +705,7 @@ fn select_output_device(name: Option<&str>) -> Result<cpal::Device> {
         .ok_or_else(|| HuddleError::Audio("no output speaker device found".to_owned()))
 }
 
-fn open_input_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Result<Stream> {
+fn open_input_stream(name: Option<&str>, signal: CaptureSignal) -> Result<Stream> {
     let device = select_input_device(name)?;
     let supported = device
         .default_input_config()
@@ -664,23 +715,36 @@ fn open_input_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Res
     let fmt = supported.sample_format();
     let config: StreamConfig = supported.into();
 
-    let push_mono = move |mono: &[f32]| {
-        let resampled = resample_linear(mono, src_rate, SAMPLE_RATE);
-        if let Ok(mut q) = ring.lock() {
-            if q.len() > FRAME_20MS * 8 {
-                let drop_n = q.len() - FRAME_20MS * 4;
-                q.drain(..drop_n);
-            }
-            q.extend(resampled);
-        }
-    };
+    let mut mono_scratch = Vec::with_capacity(FRAME_20MS * 2);
+    let mut resampled_scratch = Vec::with_capacity(FRAME_20MS * 2);
 
     let stream = match fmt {
         SampleFormat::F32 => device.build_input_stream(
             &config,
             move |data: &[f32], _| {
-                let mono = downmix_to_mono_f32(data, channels);
-                push_mono(&mono);
+                downmix_to_mono_f32_into(data, channels, &mut mono_scratch);
+                let samples: &[f32] = if src_rate == SAMPLE_RATE {
+                    &mono_scratch
+                } else {
+                    resample_linear_into(
+                        &mono_scratch,
+                        src_rate,
+                        SAMPLE_RATE,
+                        &mut resampled_scratch,
+                    );
+                    &resampled_scratch
+                };
+                let (lock, cvar) = &*signal;
+                if let Ok(mut q) = lock.lock() {
+                    if q.len() > FRAME_20MS * 8 {
+                        let drop_n = q.len() - FRAME_20MS * 4;
+                        q.drain(..drop_n);
+                    }
+                    q.extend(samples.iter().copied());
+                    if q.len() >= FRAME_20MS {
+                        cvar.notify_one();
+                    }
+                }
             },
             |_| {},
             None,
@@ -688,13 +752,34 @@ fn open_input_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Res
         SampleFormat::I16 => device.build_input_stream(
             &config,
             move |data: &[i16], _| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|ch| {
-                        ch.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() / channels.max(1) as f32
-                    })
-                    .collect();
-                push_mono(&mono);
+                mono_scratch.clear();
+                let ch_div = channels.max(1) as f32;
+                for ch in data.chunks(channels.max(1)) {
+                    let sum: f32 = ch.iter().map(|&s| s as f32 / 32768.0).sum();
+                    mono_scratch.push(sum / ch_div);
+                }
+                let samples: &[f32] = if src_rate == SAMPLE_RATE {
+                    &mono_scratch
+                } else {
+                    resample_linear_into(
+                        &mono_scratch,
+                        src_rate,
+                        SAMPLE_RATE,
+                        &mut resampled_scratch,
+                    );
+                    &resampled_scratch
+                };
+                let (lock, cvar) = &*signal;
+                if let Ok(mut q) = lock.lock() {
+                    if q.len() > FRAME_20MS * 8 {
+                        let drop_n = q.len() - FRAME_20MS * 4;
+                        q.drain(..drop_n);
+                    }
+                    q.extend(samples.iter().copied());
+                    if q.len() >= FRAME_20MS {
+                        cvar.notify_one();
+                    }
+                }
             },
             |_| {},
             None,
@@ -722,6 +807,9 @@ fn open_output_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Re
     let channels = supported.channels() as usize;
     let config: StreamConfig = supported.into();
 
+    let mut src_scratch = Vec::with_capacity(FRAME_20MS * 2);
+    let mut resampled_scratch = Vec::with_capacity(FRAME_20MS * 2);
+
     let stream = device
         .build_output_stream(
             &config,
@@ -729,17 +817,27 @@ fn open_output_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Re
                 let out_frames = data.len() / channels.max(1);
                 let needed_48k = ((out_frames as u64 * SAMPLE_RATE as u64)
                     .div_ceil(dst_rate.max(1) as u64)) as usize;
-                let mut src = Vec::with_capacity(needed_48k);
+                src_scratch.clear();
                 if let Ok(mut q) = ring.lock() {
-                    for _ in 0..needed_48k {
-                        src.push(q.pop_front().unwrap_or(0.0));
-                    }
-                } else {
-                    src.resize(needed_48k, 0.0);
+                    let avail = q.len().min(needed_48k);
+                    src_scratch.extend(q.drain(..avail));
                 }
-                let resampled = resample_linear(&src, SAMPLE_RATE, dst_rate);
+                if src_scratch.len() < needed_48k {
+                    src_scratch.resize(needed_48k, 0.0);
+                }
+                let samples: &[f32] = if dst_rate == SAMPLE_RATE {
+                    &src_scratch
+                } else {
+                    resample_linear_into(
+                        &src_scratch,
+                        SAMPLE_RATE,
+                        dst_rate,
+                        &mut resampled_scratch,
+                    );
+                    &resampled_scratch
+                };
                 for (i, frame) in data.chunks_mut(channels).enumerate() {
-                    let s = resampled.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                    let s = samples.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
                     for ch in frame.iter_mut() {
                         *ch = s;
                     }
@@ -756,23 +854,34 @@ fn open_output_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Re
     Ok(stream)
 }
 
-fn downmix_to_mono_f32(data: &[f32], channels: usize) -> Vec<f32> {
+fn downmix_to_mono_f32_into(data: &[f32], channels: usize, out: &mut Vec<f32>) {
+    out.clear();
     if channels <= 1 {
-        return data.to_vec();
+        out.extend_from_slice(data);
+        return;
     }
-    data.chunks(channels)
-        .map(|ch| ch.iter().copied().sum::<f32>() / channels as f32)
-        .collect()
+    let div = channels as f32;
+    out.reserve(data.len() / channels);
+    for ch in data.chunks(channels) {
+        out.push(ch.iter().copied().sum::<f32>() / div);
+    }
 }
 
-/// Linear resampler used when a macOS device runs at 44.1 kHz instead of 48 kHz.
-pub fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+fn downmix_to_mono_f32(data: &[f32], channels: usize) -> Vec<f32> {
+    let mut out = Vec::new();
+    downmix_to_mono_f32_into(data, channels, &mut out);
+    out
+}
+
+fn resample_linear_into(input: &[f32], src_rate: u32, dst_rate: u32, out: &mut Vec<f32>) {
+    out.clear();
     if src_rate == dst_rate || input.is_empty() {
-        return input.to_vec();
+        out.extend_from_slice(input);
+        return;
     }
     let ratio = src_rate as f64 / dst_rate as f64;
     let out_len = ((input.len() as f64) / ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_len);
+    out.reserve(out_len);
     for i in 0..out_len {
         let pos = i as f64 * ratio;
         let idx = pos.floor() as usize;
@@ -781,6 +890,12 @@ pub fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> 
         let s1 = input.get(idx + 1).copied().unwrap_or(s0);
         out.push(s0 + (s1 - s0) * frac);
     }
+}
+
+/// Linear resampler used when a macOS device runs at 44.1 kHz instead of 48 kHz.
+pub fn resample_linear(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+    let mut out = Vec::new();
+    resample_linear_into(input, src_rate, dst_rate, &mut out);
     out
 }
 

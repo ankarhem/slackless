@@ -7,16 +7,13 @@
 //!   OpenH264 `ScreenContentRealTime` (`1920x1200` @ 20 fps, 2.8 Mbps, dirty-frame skip).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use crate::Result;
+use crate::backend::{ScreenShareConfig, ScreenShareHandle, platform_backend};
 use crate::metrics::HuddlePerfCounters;
-use crate::video::{
-    H264VideoEncoder, ScreenScaleScratch, VideoFrame, downscale_rgba_area_to_bgra_and_i420,
-};
-use crate::{HuddleError, Result};
+use crate::video::VideoFrame;
 
 /// Maximum dimensions for crisp 1080p/16:10 screen share encoding (even dimensions for YUV420).
 pub const SCREEN_MAX_W: u32 = 1920;
@@ -228,26 +225,12 @@ fn downscale_rgba_thumbnail(
             bgra[dst + 3] = 255;
         }
     }
-    Some(VideoFrame {
-        width: dw,
-        height: dh,
-        bgra: Arc::new(bgra),
-    })
+    Some(VideoFrame::from_bgra(dw, dh, bgra))
 }
 
-enum ScreenCaptureBackend {
-    #[cfg(target_os = "macos")]
-    MacOsHw(crate::macos_media::ScVtScreenCapture),
-    Software {
-        running: Arc<AtomicBool>,
-        force_kf: Arc<AtomicBool>,
-        worker: Option<std::thread::JoinHandle<()>>,
-    },
-}
-
-/// Active screen/window capture session encoding H.264 frames and emitting local preview frames.
+/// Active screen/window capture session backed by the active platform [`crate::backend::MediaBackend`].
 pub struct ScreenCapture {
-    backend: ScreenCaptureBackend,
+    backend: Box<dyn ScreenShareHandle>,
     perf: Arc<HuddlePerfCounters>,
 }
 
@@ -258,206 +241,33 @@ impl ScreenCapture {
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
-        #[cfg(target_os = "macos")]
-        {
-            match crate::macos_media::ScVtScreenCapture::start(
-                &source_id,
-                SCREEN_MAX_W,
-                SCREEN_MAX_H,
-                SCREEN_MAX_FPS,
-                SCREEN_BITRATE_BPS,
-                outbound_h264_tx.clone(),
-                preview_tx.clone(),
-                Arc::clone(&perf),
-            ) {
-                Ok(hw) => {
-                    return Ok(Self {
-                        backend: ScreenCaptureBackend::MacOsHw(hw),
-                        perf,
-                    });
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        source_id = %source_id,
-                        %err,
-                        "ScreenCaptureKit + VideoToolbox unavailable; falling back to tuned OpenH264"
-                    );
-                }
-            }
-        }
-
-        Self::start_software(source_id, outbound_h264_tx, preview_tx, perf)
-    }
-
-    fn start_software(
-        source_id: String,
-        outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
-        preview_tx: mpsc::UnboundedSender<VideoFrame>,
-        perf: Arc<HuddlePerfCounters>,
-    ) -> Result<Self> {
-        perf.set_tx_backend("xcap + OpenH264 ScreenContent (SW)");
-        let running = Arc::new(AtomicBool::new(true));
-        let force_kf = Arc::new(AtomicBool::new(true));
-        let run_flag = Arc::clone(&running);
-        let kf_flag = Arc::clone(&force_kf);
-        let perf_worker = Arc::clone(&perf);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
-
-        let worker = std::thread::Builder::new()
-            .name("slackless-huddle-screen".to_owned())
-            .spawn(move || {
-                let mut enc = match H264VideoEncoder::new_screen() {
-                    Ok(e) => {
-                        let _ = ready_tx.send(Ok(()));
-                        e
-                    }
-                    Err(err) => {
-                        let _ = ready_tx.send(Err(err));
-                        return;
-                    }
-                };
-
-                let mut scratch = ScreenScaleScratch::default();
-                let mut logged_first_frame = false;
-                let mut last_err_log: Option<Instant> = None;
-                let mut last_hash: Option<u64> = None;
-                let mut last_sent = Instant::now() - Duration::from_secs(10);
-                let frame_interval = Duration::from_millis(50); // 20 fps deadline-paced
-                let mut next_tick = Instant::now();
-
-                while run_flag.load(Ordering::Relaxed) {
-                    let t0 = Instant::now();
-                    let captured = with_autorelease_pool(|| capture_once_result(&source_id));
-                    match captured {
-                        Ok(rgba) => {
-                            let (w, h) = downscale_rgba_area_to_bgra_and_i420(
-                                rgba.as_raw(),
-                                rgba.width(),
-                                rgba.height(),
-                                SCREEN_MAX_W,
-                                SCREEN_MAX_H,
-                                &mut scratch,
-                            );
-                            if w >= 2 && h >= 2 {
-                                if !logged_first_frame {
-                                    logged_first_frame = true;
-                                    tracing::info!(
-                                        source_id = %source_id,
-                                        raw_w = rgba.width(),
-                                        raw_h = rgba.height(),
-                                        encoded_w = w,
-                                        encoded_h = h,
-                                        "software screen capture active (OpenH264 ScreenContentRealTime)"
-                                    );
-                                }
-                                let hash = fast_stride_hash(&scratch.y);
-                                let forced = kf_flag.swap(false, Ordering::Relaxed);
-                                let changed = last_hash != Some(hash);
-                                let keepalive_due =
-                                    last_sent.elapsed() >= Duration::from_millis(1500);
-                                if forced || changed || keepalive_due {
-                                    last_hash = Some(hash);
-                                    last_sent = Instant::now();
-                                    if forced {
-                                        enc.force_keyframe();
-                                    }
-                                    if changed || forced {
-                                        let _ = preview_tx.send(VideoFrame {
-                                            width: w,
-                                            height: h,
-                                            bgra: Arc::new(scratch.bgra.clone()),
-                                        });
-                                    }
-                                    match enc.encode_i420(
-                                        &scratch.y,
-                                        &scratch.u,
-                                        &scratch.v,
-                                        w as usize,
-                                        h as usize,
-                                    ) {
-                                        Ok(h264) if !h264.is_empty() => {
-                                            let enc_us = t0.elapsed().as_micros() as u64;
-                                            perf_worker.record_tx_frame(
-                                                w,
-                                                h,
-                                                h264.len() as u64,
-                                                enc_us,
-                                            );
-                                            let _ = outbound_h264_tx.send(h264);
-                                        }
-                                        Ok(_) => {}
-                                        Err(err) => {
-                                            if last_err_log.is_none_or(|t| {
-                                                t.elapsed() >= Duration::from_secs(5)
-                                            }) {
-                                                last_err_log = Some(Instant::now());
-                                                tracing::warn!(%err, "screen H.264 encode error");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            if last_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-                                last_err_log = Some(Instant::now());
-                                tracing::warn!(
-                                    source_id = %source_id,
-                                    %err,
-                                    "screen capture failed"
-                                );
-                            }
-                        }
-                    }
-                    next_tick += frame_interval;
-                    let now = Instant::now();
-                    if next_tick > now {
-                        std::thread::sleep(next_tick - now);
-                    } else {
-                        next_tick = now;
-                    }
-                }
-            })
-            .map_err(|e| HuddleError::Video(e.to_string()))?;
-
-        ready_rx
-            .recv()
-            .map_err(|e| HuddleError::Video(e.to_string()))??;
-
-        Ok(Self {
-            backend: ScreenCaptureBackend::Software {
-                running,
-                force_kf,
-                worker: Some(worker),
+        let backend = platform_backend().start_screen_share(
+            ScreenShareConfig {
+                source_id,
+                max_w: SCREEN_MAX_W,
+                max_h: SCREEN_MAX_H,
+                max_fps: SCREEN_MAX_FPS,
+                bitrate_bps: SCREEN_BITRATE_BPS,
             },
-            perf,
-        })
+            outbound_h264_tx,
+            preview_tx,
+            Arc::clone(&perf),
+        )?;
+        Ok(Self { backend, perf })
     }
 
     /// Force an immediate IDR keyframe on the next encoded screen frame.
     pub fn force_keyframe(&self) {
-        match &self.backend {
-            #[cfg(target_os = "macos")]
-            ScreenCaptureBackend::MacOsHw(hw) => hw.force_keyframe(),
-            ScreenCaptureBackend::Software { force_kf, .. } => {
-                force_kf.store(true, Ordering::Relaxed);
-            }
-        }
+        self.backend.force_keyframe();
+    }
+
+    /// Dynamically adjust target encoder bitrate (e.g. from RTCP REMB feedback).
+    pub fn set_target_bitrate(&self, bitrate_bps: u32) {
+        self.backend.set_target_bitrate(bitrate_bps);
     }
 
     pub fn stop(&mut self) {
-        match &mut self.backend {
-            #[cfg(target_os = "macos")]
-            ScreenCaptureBackend::MacOsHw(hw) => hw.stop(),
-            ScreenCaptureBackend::Software {
-                running, worker, ..
-            } => {
-                running.store(false, Ordering::Relaxed);
-                if let Some(handle) = worker.take() {
-                    let _ = handle.join();
-                }
-            }
-        }
+        self.backend.stop();
         self.perf.clear_tx();
     }
 }
@@ -469,7 +279,7 @@ impl Drop for ScreenCapture {
 }
 
 /// Drains macOS Objective-C autoreleased objects created by `xcap` on plain Rust worker threads.
-fn with_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn with_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "macos")]
     {
         #[link(name = "objc")]
@@ -489,7 +299,7 @@ fn with_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Fast strided FNV-1a fingerprint over the luma plane to skip re-encoding static frames.
-fn fast_stride_hash(y: &[u8]) -> u64 {
+pub(crate) fn fast_stride_hash(y: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let step = (y.len() / 2048).max(1);
     for &b in y.iter().step_by(step) {
@@ -503,7 +313,9 @@ pub(crate) fn capture_once(source_id: &str) -> Option<xcap::image::RgbaImage> {
     capture_once_result(source_id).ok()
 }
 
-fn capture_once_result(source_id: &str) -> std::result::Result<xcap::image::RgbaImage, String> {
+pub(crate) fn capture_once_result(
+    source_id: &str,
+) -> std::result::Result<xcap::image::RgbaImage, String> {
     if let Some(mon_id) = source_id
         .strip_prefix("monitor:")
         .and_then(|s| s.parse::<u32>().ok())

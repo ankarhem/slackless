@@ -19,7 +19,7 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
 use crate::metrics::HuddlePerfCounters;
 use crate::proto::{SdkPingPongType, sdk_signal_frame};
-use crate::rtc::ChimeRtcPeer;
+use crate::rtc::{ChimeRtcPeer, VideoSenderFeedback};
 use crate::screen::ScreenCapture;
 use crate::signaling::{
     ChimeSignalClient, ClientMetricsSnapshot, build_client_metric_frame,
@@ -163,6 +163,8 @@ impl ContentShareSession {
         );
 
         let (h264_tx, mut h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (video_fb_tx, mut video_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
+        rtc.attach_video_feedback(video_fb_tx).await;
         let capture = ScreenCapture::start(source_id, h264_tx, preview_tx, perf)?;
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -280,8 +282,8 @@ impl ContentShareSession {
                     });
             }
         }
-        // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) or 20ms stereo Opus
-        // silence (matching official Chime SDK) on the `#content` audio m-line.
+        // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) or a cached 20ms
+        // stereo Opus silence packet (skipping 50 Hz Opus encode when `share_audio == false`).
         tokio::spawn(async move {
             let _tap_guard = native_tap;
             let Ok(mut enc) =
@@ -289,26 +291,37 @@ impl ContentShareSession {
             else {
                 return;
             };
+            let _ = enc.set_bitrate(opus::Bitrate::Bits(96_000));
+            let _ = enc.set_vbr(true);
+            let _ = enc.set_inband_fec(true);
             let silence = vec![0i16; 960 * 2];
             let mut pcm = vec![0i16; 960 * 2];
             let mut out = vec![0u8; 4000];
+            let cached_silence = enc
+                .encode(&silence, &mut out)
+                .map(|n| out[..n].to_vec())
+                .unwrap_or_else(|_| vec![0xFC, 0xFF, 0xFE]);
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             while running_audio.load(Ordering::Relaxed) {
                 tick.tick().await;
-                let has_audio = loopback_pcm.lock().ok().is_some_and(|mut q| {
-                    if q.len() >= 960 * 2 {
-                        for dst in &mut pcm {
-                            *dst = q.pop_front().unwrap_or(0);
+                let has_audio = share_audio
+                    && loopback_pcm.lock().ok().is_some_and(|mut q| {
+                        if q.len() >= 960 * 2 {
+                            for dst in &mut pcm {
+                                *dst = q.pop_front().unwrap_or(0);
+                            }
+                            true
+                        } else {
+                            false
                         }
-                        true
-                    } else {
-                        false
+                    });
+                if has_audio {
+                    if let Ok(n) = enc.encode(&pcm, &mut out) {
+                        let _ = rtc_audio.write_opus_frame(out[..n].to_vec()).await;
                     }
-                });
-                let frame = if has_audio { &pcm } else { &silence };
-                if let Ok(n) = enc.encode(frame, &mut out) {
-                    let _ = rtc_audio.write_opus_frame(out[..n].to_vec()).await;
+                } else {
+                    let _ = rtc_audio.write_opus_frame(cached_silence.clone()).await;
                 }
             }
         });
@@ -319,10 +332,25 @@ impl ContentShareSession {
             metric_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut connected = false;
             let mut sent_first_frame = false;
+            let mut last_abr_bps: u32 = crate::screen::SCREEN_BITRATE_BPS;
 
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
+                    Some(fb) = video_fb_rx.recv() => {
+                        match fb {
+                            VideoSenderFeedback::ForceKeyframe => {
+                                capture.force_keyframe();
+                            }
+                            VideoSenderFeedback::TargetBitrateBps(bps) => {
+                                let clamped = bps.clamp(800_000, 3_500_000);
+                                if clamped.abs_diff(last_abr_bps) >= 200_000 {
+                                    last_abr_bps = clamped;
+                                    capture.set_target_bitrate(clamped);
+                                }
+                            }
+                        }
+                    }
                     Some(st) = state_rx.recv() => {
                         tracing::info!(state = ?st, "#content peer connection state");
                         match st {

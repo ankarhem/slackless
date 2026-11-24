@@ -264,8 +264,41 @@ fn declared_url_schemes() -> Vec<String> {
     schemes
 }
 
+type StatusBarCallback = Box<dyn Fn(StatusBarAction) + Send + Sync + 'static>;
+
 static STATUS_ACTIONS: LazyLock<Mutex<VecDeque<StatusBarAction>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
+static STATUS_CALLBACK: LazyLock<Mutex<Option<StatusBarCallback>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn emit_status_bar_action(action: StatusBarAction) {
+    if let Ok(guard) = STATUS_CALLBACK.lock() {
+        if let Some(cb) = guard.as_ref() {
+            cb(action);
+            return;
+        }
+    }
+    STATUS_ACTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push_back(action);
+}
+
+pub(crate) fn install_status_bar_action_monitor(
+    on_action: impl Fn(StatusBarAction) + Send + Sync + 'static,
+) {
+    let drained: Vec<StatusBarAction> = STATUS_ACTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .drain(..)
+        .collect();
+    for action in drained {
+        on_action(action);
+    }
+    if let Ok(mut guard) = STATUS_CALLBACK.lock() {
+        *guard = Some(Box::new(on_action));
+    }
+}
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -276,10 +309,7 @@ define_class!(
     impl StatusBarTarget {
         #[unsafe(method(showWindow:))]
         fn show_window(&self, _sender: Option<&AnyObject>) {
-            STATUS_ACTIONS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push_back(StatusBarAction::ShowWindow);
+            emit_status_bar_action(StatusBarAction::ShowWindow);
             if let Some(mtm) = MainThreadMarker::new() {
                 let app = NSApplication::sharedApplication(mtm);
                 app.unhide(None);
@@ -292,10 +322,7 @@ define_class!(
         fn switch_workspace(&self, sender: Option<&NSMenuItem>) {
             let tag = sender.map(|item| item.tag()).unwrap_or(0);
             if tag >= 0 {
-                STATUS_ACTIONS
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push_back(StatusBarAction::SwitchWorkspace(tag as usize));
+                emit_status_bar_action(StatusBarAction::SwitchWorkspace(tag as usize));
             }
             if let Some(mtm) = MainThreadMarker::new() {
                 let app = NSApplication::sharedApplication(mtm);
@@ -307,18 +334,12 @@ define_class!(
 
         #[unsafe(method(toggleDnd:))]
         fn toggle_dnd(&self, _sender: Option<&AnyObject>) {
-            STATUS_ACTIONS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push_back(StatusBarAction::ToggleDnd);
+            emit_status_bar_action(StatusBarAction::ToggleDnd);
         }
 
         #[unsafe(method(quitApp:))]
         fn quit_app(&self, _sender: Option<&AnyObject>) {
-            STATUS_ACTIONS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push_back(StatusBarAction::Quit);
+            emit_status_bar_action(StatusBarAction::Quit);
         }
     }
 );

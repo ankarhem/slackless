@@ -398,10 +398,15 @@ impl PopoutWindow {
 
         let header = self.render_huddle_titlebar(&snap, people.len(), &pal, cx);
 
-        let has_screen_share = state
-            .video_frames
-            .keys()
-            .any(|k| matches!(k, VideoTileKey::RemoteScreen(_) | VideoTileKey::LocalScreen));
+        let has_screen_share =
+            self.huddle_video
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .is_some_and(|vs| {
+                    vs.read(cx).frames().keys().any(|k| {
+                        matches!(k, VideoTileKey::RemoteScreen(_) | VideoTileKey::LocalScreen)
+                    })
+                });
 
         let mut stage = v_flex()
             .id("popout-huddle-stage-container")
@@ -578,20 +583,7 @@ impl PopoutWindow {
             stage = stage.child(captions_el);
         }
 
-        // Floating popover panel anchored right above the bottom dock
-        if let Some(popover) = self.render_huddle_active_popover(&snap, &channel, &people, &pal, cx)
-        {
-            stage = stage.child(
-                h_flex()
-                    .absolute()
-                    .bottom(px(10.))
-                    .left_0()
-                    .right_0()
-                    .justify_center()
-                    .px_4()
-                    .child(popover),
-            );
-        }
+        let active_popover = self.render_huddle_active_popover(&snap, &channel, &people, &pal, cx);
 
         let body: gpui_kit::gpui::AnyElement = if let Some(drawer) = self.huddle_drawer {
             let drawer_el = self.render_huddle_drawer(
@@ -662,6 +654,40 @@ impl PopoutWindow {
             .child(header)
             .child(body)
             .child(self.render_huddle_controls(&snap, status_color, &pal, cx))
+            .when_some(active_popover, |root, popover| {
+                // Full-window transparent click-away backdrop so clicking anywhere outside any
+                // huddle dropdown (audio, video, reactions, theme, invite, more) dismisses it.
+                root.child(
+                    div()
+                        .id("popout-huddle-popover-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.close_huddle_popovers();
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            h_flex()
+                                .absolute()
+                                .bottom(px(68.))
+                                .left_0()
+                                .right_0()
+                                .justify_center()
+                                .px_4()
+                                .child(
+                                    div()
+                                        .id("popout-huddle-popover-surface")
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .child(popover),
+                                ),
+                        ),
+                )
+            })
             .when(self.huddle_share_open, |root| {
                 root.child(self.render_huddle_share_modal(
                     snap.share_source_id.as_deref(),
@@ -1877,28 +1903,31 @@ impl PopoutWindow {
     ) -> Option<gpui_kit::gpui::Div> {
         use slackless_core::huddle::{HuddleDrawMessage, VideoTileKey};
 
-        let mut screens: Vec<(String, String, Arc<gpui_kit::gpui::RenderImage>)> = Vec::new();
-        for (k, v) in &state.video_frames {
-            if let VideoTileKey::RemoteScreen(uid) = k {
+        let mut screens: Vec<(String, String, crate::huddle_dock::DisplayVideoFrame)> = Vec::new();
+        if let Some(vs) = self.huddle_video.as_ref().and_then(WeakEntity::upgrade) {
+            let frames = vs.read(cx).frames();
+            for (k, v) in frames {
+                if let VideoTileKey::RemoteScreen(uid) = k {
+                    screens.push((
+                        uid.to_string(),
+                        format!("{} is sharing their screen", self.fixtures.user_name(uid)),
+                        v.clone(),
+                    ));
+                }
+            }
+            screens.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(v) = frames.get(&VideoTileKey::LocalScreen) {
+                let local_item = if !state.session.attendee_id.is_empty() {
+                    state.session.attendee_id.clone()
+                } else {
+                    self.fixtures.self_user.to_string()
+                };
                 screens.push((
-                    uid.to_string(),
-                    format!("{} is sharing their screen", self.fixtures.user_name(uid)),
+                    local_item,
+                    "You are sharing your screen".to_owned(),
                     v.clone(),
                 ));
             }
-        }
-        screens.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some(v) = state.video_frames.get(&VideoTileKey::LocalScreen) {
-            let local_item = if !state.session.attendee_id.is_empty() {
-                state.session.attendee_id.clone()
-            } else {
-                self.fixtures.self_user.to_string()
-            };
-            screens.push((
-                local_item,
-                "You are sharing your screen".to_owned(),
-                v.clone(),
-            ));
         }
         if screens.is_empty() {
             return None;
@@ -2068,7 +2097,7 @@ impl PopoutWindow {
                 }))
         });
 
-        let visible_screens: Vec<(String, String, Arc<gpui_kit::gpui::RenderImage>)> =
+        let visible_screens: Vec<(String, String, crate::huddle_dock::DisplayVideoFrame)> =
             if let Some(ix) = focused {
                 vec![screens[ix].clone()]
             } else {
@@ -2186,7 +2215,7 @@ impl PopoutWindow {
         &self,
         pane_ix: usize,
         item_id: String,
-        img_frame: Arc<gpui_kit::gpui::RenderImage>,
+        frame: crate::huddle_dock::DisplayVideoFrame,
         state: &crate::huddle_dock::HuddleViewState,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
@@ -2221,14 +2250,40 @@ impl PopoutWindow {
             })
             .collect();
         let bounds_cell = Arc::clone(&self.huddle_stage_bounds);
-        let frame_for_layout = Arc::clone(&img_frame);
+        let (fw, fh) = frame.dimensions();
+        #[cfg(target_os = "macos")]
+        let is_surface = matches!(frame, crate::huddle_dock::DisplayVideoFrame::Surface(_));
+        #[cfg(not(target_os = "macos"))]
+        let is_surface = false;
         // Render the video frame directly inside a full-size `canvas` with `ObjectFit::Contain`
         // instead of GPUI's `img` element: `Img::request_layout` injects `style.aspect_ratio`,
         // which causes Taffy to expand height from `width: 100%` and clip the bottom of tall
         // windows and 16:10 Retina displays inside `overflow_hidden`.
+        // On macOS, `DisplayVideoFrame::Surface` paints zero-copy directly via GPUI's Metal
+        // YCbCr shader (`window.paint_surface`) with zero CPU pixel copy or atlas churn!
         let stage_canvas = canvas(
             move |bounds, _, _| {
-                let image_bounds = ObjectFit::Contain.get_bounds(bounds, frame_for_layout.size(0));
+                let fit_bounds = if is_surface {
+                    // Subtle 4px bezel keeps `paint_surface` strictly inside the rounded_2xl
+                    // dark stage border with zero corner bleed.
+                    let inset = px(4.);
+                    Bounds {
+                        origin: point(bounds.origin.x + inset, bounds.origin.y + inset),
+                        size: size(
+                            (bounds.size.width - inset * 2.).max(px(1.)),
+                            (bounds.size.height - inset * 2.).max(px(1.)),
+                        ),
+                    }
+                } else {
+                    bounds
+                };
+                let image_bounds = ObjectFit::Contain.get_bounds(
+                    fit_bounds,
+                    size(
+                        gpui_kit::gpui::DevicePixels(fw as i32),
+                        gpui_kit::gpui::DevicePixels(fh as i32),
+                    ),
+                );
                 if pane_ix == 0 {
                     if let Ok(mut guard) = bounds_cell.lock() {
                         *guard = image_bounds;
@@ -2237,15 +2292,31 @@ impl PopoutWindow {
                 image_bounds
             },
             move |bounds, image_bounds, window, _| {
-                if img_frame.frame_count() > 0 {
-                    let _ = window.paint_image(
-                        bounds,
-                        image_bounds,
-                        Corners::all(px(15.)),
-                        Arc::clone(&img_frame),
-                        0,
-                        false,
-                    );
+                match &frame {
+                    #[cfg(target_os = "macos")]
+                    crate::huddle_dock::DisplayVideoFrame::Surface(surface) => {
+                        let ptr = surface.retain_cv_pixel_buffer_ptr()
+                            as *mut objc2_core_video::CVPixelBuffer;
+                        if let Some(nn) = std::ptr::NonNull::new(ptr) {
+                            // SAFETY: `retain_cv_pixel_buffer_ptr` returned a +1 retained
+                            // `420f` IOSurface-backed `CVPixelBuffer`; `CFRetained::from_raw`
+                            // takes ownership and releases on Drop.
+                            let cv_buf = unsafe { objc2_core_foundation::CFRetained::from_raw(nn) };
+                            window.paint_surface(image_bounds, cv_buf);
+                        }
+                    }
+                    crate::huddle_dock::DisplayVideoFrame::Image(img_frame) => {
+                        if img_frame.frame_count() > 0 {
+                            let _ = window.paint_image(
+                                bounds,
+                                image_bounds,
+                                Corners::all(px(15.)),
+                                Arc::clone(img_frame),
+                                0,
+                                false,
+                            );
+                        }
+                    }
                 }
                 let left: f32 = image_bounds.origin.x.into();
                 let top: f32 = image_bounds.origin.y.into();
@@ -2512,7 +2583,7 @@ impl PopoutWindow {
         state: &crate::huddle_dock::HuddleViewState,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         let solo = people.len() <= 1;
         // Official Slack renders a single participant as a crisp centered rounded-square portrait
@@ -2532,7 +2603,7 @@ impl PopoutWindow {
             .gap_4()
             .children(people.iter().map(|uid| {
                 self.render_huddle_participant_tile(
-                    state, uid, pal, tile_w, tile_h, avatar_px, solo,
+                    state, uid, pal, tile_w, tile_h, avatar_px, solo, cx,
                 )
             }))
     }
@@ -2542,7 +2613,7 @@ impl PopoutWindow {
         state: &crate::huddle_dock::HuddleViewState,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         if self.huddle_stage_expanded {
             return div();
@@ -2554,7 +2625,16 @@ impl PopoutWindow {
             .justify_center()
             .gap_2p5()
             .children(people.iter().take(6).map(|uid| {
-                self.render_huddle_participant_tile(state, uid, pal, px(148.), px(96.), 44.0, false)
+                self.render_huddle_participant_tile(
+                    state,
+                    uid,
+                    pal,
+                    px(148.),
+                    px(96.),
+                    44.0,
+                    false,
+                    cx,
+                )
             }))
     }
 
@@ -2568,6 +2648,7 @@ impl PopoutWindow {
         tile_h: Pixels,
         avatar_px: f32,
         full_bleed_avatar: bool,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
         use gpui_kit::gpui::ObjectFit;
@@ -2594,14 +2675,19 @@ impl PopoutWindow {
             .get(uid)
             .map(|s| sticky_emoji_glyph(s).to_owned())
             .or_else(|| state.raised_hands.contains(uid).then(|| "✋".to_owned()));
-        let video_frame = if is_self {
-            state.video_frames.get(&VideoTileKey::LocalCamera).cloned()
-        } else {
-            state
-                .video_frames
-                .get(&VideoTileKey::RemoteCamera(uid.clone()))
-                .cloned()
-        };
+        let video_frame = self
+            .huddle_video
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .and_then(|vs| {
+                let frames = vs.read(cx).frames();
+                let key = if is_self {
+                    VideoTileKey::LocalCamera
+                } else {
+                    VideoTileKey::RemoteCamera(uid.clone())
+                };
+                frames.get(&key).and_then(|f| f.as_render_image().cloned())
+            });
         let has_video = video_frame.is_some();
         let name = self.fixtures.user_name(uid).to_owned();
         let display_name = if is_self {

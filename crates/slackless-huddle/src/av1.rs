@@ -2,7 +2,6 @@
 //! screen shares and video streams (official Slack clients publish `#content` screen shares in AV1).
 
 use std::ptr::NonNull;
-use std::sync::Arc;
 
 use rav1d::include::dav1d::common::Dav1dDataProps;
 use rav1d::include::dav1d::data::Dav1dData;
@@ -402,11 +401,7 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
                 }
             }
             if pairs_h == h && pairs_w == w {
-                return Some(VideoFrame {
-                    width: w as u32,
-                    height: h as u32,
-                    bgra: Arc::new(bgra),
-                });
+                return Some(VideoFrame::from_bgra(w as u32, h as u32, bgra));
             }
         }
     }
@@ -448,11 +443,7 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
             write_yuv_pixel(&mut bgra[o..o + 4], y, u, v);
         }
     }
-    Some(VideoFrame {
-        width: w as u32,
-        height: h as u32,
-        bgra: Arc::new(bgra),
-    })
+    Some(VideoFrame::from_bgra(w as u32, h as u32, bgra))
 }
 
 #[cfg(test)]

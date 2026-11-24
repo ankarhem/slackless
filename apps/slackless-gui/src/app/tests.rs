@@ -961,11 +961,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
 
             // 4b. Phase 2–4: video frames (camera & screen share) and DATA_MESSAGE events
             // (reactions, hand raise, topic, captions) flow into HuddleDock -> HuddleViewState.
-            let frame = slackless_core::huddle::VideoFrame {
-                width: 4,
-                height: 4,
-                bgra: std::sync::Arc::new(vec![180u8; 4 * 4 * 4]),
-            };
+            let frame = slackless_core::huddle::VideoFrame::from_bgra(4, 4, vec![180u8; 4 * 4 * 4]);
             app.on_core_event(
                 &Event::HuddleVideoFrame {
                     tile: slackless_core::huddle::VideoTileKey::LocalCamera,
@@ -1088,7 +1084,8 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 cx,
             );
             let vs = app.huddle_dock.as_ref().unwrap().read(cx).view_state();
-            assert_eq!(vs.video_frames.len(), 2);
+            let video_store = app.huddle_dock.as_ref().unwrap().read(cx).video_store();
+            assert_eq!(video_store.read(cx).frames().len(), 2);
             assert!(vs.raised_hands.contains(&inviter));
             assert_eq!(
                 vs.sticky_emojis.get(&inviter).map(String::as_str),
@@ -1110,16 +1107,7 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 window,
                 cx,
             );
-            assert_eq!(
-                app.huddle_dock
-                    .as_ref()
-                    .unwrap()
-                    .read(cx)
-                    .view_state()
-                    .video_frames
-                    .len(),
-                1
-            );
+            assert_eq!(video_store.read(cx).frames().len(), 1);
 
             // 5. Incoming DM huddle invite banner mounts and cancels cleanly.
             app.on_core_event(

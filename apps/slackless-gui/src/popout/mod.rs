@@ -198,6 +198,8 @@ pub struct PopoutWindow {
     later_items: Vec<LaterItem>,
     files_items: Vec<(String, String, Option<String>)>,
     huddle_state: Option<crate::huddle_dock::HuddleViewState>,
+    huddle_video: Option<WeakEntity<crate::huddle_dock::HuddleVideoStore>>,
+    last_store_revision: u64,
     huddle_invite_open: bool,
     huddle_devices_open: bool,
     huddle_camera_open: bool,
@@ -346,6 +348,7 @@ impl PopoutWindow {
         let mut later_items = Vec::new();
         let mut files_items = Vec::new();
         let mut huddle_state = None;
+        let mut huddle_video = None;
         match &kind {
             PopoutKind::Conversation { source, .. } | PopoutKind::Thread { source, .. } => {
                 if let Some(list) = source.upgrade() {
@@ -384,9 +387,14 @@ impl PopoutWindow {
             PopoutKind::Huddle { source, .. } => {
                 if let Some(dock) = source.upgrade() {
                     let st = dock.read(cx).view_state();
+                    let video_store = dock.read(cx).video_store();
                     let target = also_send_target(&fixtures, &st.session.channel);
                     composer.update(cx, |c, cx| c.set_also_send(target, cx));
                     huddle_state = Some(st);
+                    huddle_video = Some(video_store.downgrade());
+                    subscriptions.push(cx.observe(&video_store, |_this, _vs, cx| {
+                        cx.notify();
+                    }));
                     subscriptions.push(cx.observe(&dock, |this, dock, cx| {
                         let st = dock.read(cx).view_state();
                         let prev_ch = this
@@ -408,14 +416,25 @@ impl PopoutWindow {
             }
             PopoutKind::Canvas { .. } => {}
         }
-        // Fallback periodic refresh from the shared SQLite store for conversations that are not
-        // currently selected in the main window's `MessageList` (and live huddle threads).
+        // Lightweight fallback refresh from the shared SQLite store for secondary windows:
+        // checks an O(1) atomic revision first so idle windows do zero SQLite queries and zero
+        // repaints.
         if store.is_some() && (has_composer || is_huddle) {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let rev = slackless_core::store::Store::message_revision();
                     let keep = this
                         .update(cx, |win, cx| {
+                            if rev == win.last_store_revision {
+                                return;
+                            }
+                            if matches!(&win.kind, PopoutKind::Huddle { .. })
+                                && win.huddle_drawer != Some(HuddleDrawer::Thread)
+                            {
+                                return;
+                            }
+                            win.last_store_revision = rev;
                             win.reload_from_store(cx);
                         })
                         .is_ok();
@@ -444,6 +463,8 @@ impl PopoutWindow {
             later_items,
             files_items,
             huddle_state,
+            huddle_video,
+            last_store_revision: slackless_core::store::Store::message_revision(),
             huddle_invite_open: false,
             huddle_devices_open: false,
             huddle_camera_open: false,
@@ -1138,18 +1159,25 @@ fn load_messages(
 }
 
 impl Render for PopoutWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let PopoutKind::Huddle {
             on_jump,
             on_open_canvas,
             ..
         } = &self.kind
         {
+            // Immediately free replaced Metal sprite-atlas tiles on this owning window.
+            if let Some(vs) = self.huddle_video.as_ref().and_then(WeakEntity::upgrade) {
+                let stale = vs.update(cx, |store, _| store.drain_stale_images());
+                for img in stale {
+                    cx.drop_image(img, Some(window));
+                }
+            }
             let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);
             let root = self.render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx);
             return root
                 .when_some(picker_pos, |root, pos| {
-                    let viewport = _window.viewport_size();
+                    let viewport = window.viewport_size();
                     let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
                         (true, true) => Anchor::BottomRight,
                         (true, false) => Anchor::BottomLeft,
@@ -1664,7 +1692,7 @@ impl Render for PopoutWindow {
             root = root.child(div().flex_none().p_2().child(self.composer.clone()));
         }
         root.when_some(picker_pos, |root, pos| {
-            let viewport = _window.viewport_size();
+            let viewport = window.viewport_size();
             let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
                 (true, true) => Anchor::BottomRight,
                 (true, false) => Anchor::BottomLeft,

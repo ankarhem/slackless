@@ -40,12 +40,153 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Convert a BGRA8888 [`VideoFrame`] into a GPU-ready GPUI [`RenderImage`].
+/// Convert a [`VideoFrame`] into a GPU-ready GPUI [`RenderImage`] (uses NEON `vImage` on macOS
+/// GPU surfaces, or clones bytes for portable BGRA frames).
 pub fn frame_to_render_image(frame: &VideoFrame) -> Option<Arc<RenderImage>> {
-    let rgba = image::RgbaImage::from_raw(frame.width, frame.height, (*frame.bgra).clone())?;
+    let (w, h, bgra) = frame.to_bgra_fit(0, 0)?;
+    let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
     Some(Arc::new(RenderImage::new(smallvec::smallvec![
         image::Frame::new(rgba)
     ])))
+}
+
+/// Convert an owned [`VideoFrame`] into a [`RenderImage`] without cloning when uniquely owned.
+pub fn frame_into_render_image(frame: VideoFrame) -> Option<Arc<RenderImage>> {
+    let (w, h, bgra) = frame.into_bgra()?;
+    let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
+    Some(Arc::new(RenderImage::new(smallvec::smallvec![
+        image::Frame::new(rgba)
+    ])))
+}
+
+/// Display-ready video frame stored in [`HuddleVideoStore`].
+///
+/// - `Surface` (macOS): zero-copy `IOSurface`-backed `420f` `CVPixelBuffer` painted directly by
+///   GPUI's Metal YCbCr shader (`window.paint_surface`) with zero CPU readback or atlas upload.
+/// - `Image`: portable GPUI `RenderImage` (used for rounded-corner camera tiles and non-macOS /
+///   software fallback frames).
+#[derive(Clone)]
+pub enum DisplayVideoFrame {
+    Image(Arc<RenderImage>),
+    #[cfg(target_os = "macos")]
+    Surface(Arc<slackless_core::huddle::MacVideoSurface>),
+}
+
+impl DisplayVideoFrame {
+    pub fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Image(img) => {
+                let sz = img.size(0);
+                (sz.width.0.max(0) as u32, sz.height.0.max(0) as u32)
+            }
+            #[cfg(target_os = "macos")]
+            Self::Surface(surface) => (surface.width(), surface.height()),
+        }
+    }
+
+    pub fn as_render_image(&self) -> Option<&Arc<RenderImage>> {
+        match self {
+            Self::Image(img) => Some(img),
+            #[cfg(target_os = "macos")]
+            Self::Surface(_) => None,
+        }
+    }
+}
+
+/// Separate GPUI entity owning live video/screen frames so 10–30 fps video updates notify ONLY
+/// the Pop-out Huddle Window and never repaint the main window's sidebar (`HuddleDock`).
+pub struct HuddleVideoStore {
+    frames: HashMap<VideoTileKey, DisplayVideoFrame>,
+    stale_images: Vec<Arc<RenderImage>>,
+}
+
+impl HuddleVideoStore {
+    pub fn new(cx: &mut App) -> Entity<Self> {
+        cx.new(|_| Self {
+            frames: HashMap::new(),
+            stale_images: Vec::new(),
+        })
+    }
+
+    pub fn update_frame(&mut self, tile: VideoTileKey, frame: &VideoFrame, cx: &mut Context<Self>) {
+        let is_screen = matches!(
+            tile,
+            VideoTileKey::LocalScreen | VideoTileKey::RemoteScreen(_)
+        );
+
+        let display_frame: Option<DisplayVideoFrame> = {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(surface) = frame.mac_surface() {
+                    if is_screen {
+                        // Zero-copy Metal GPU surface for 1080p/1200p screen shares!
+                        Some(DisplayVideoFrame::Surface(Arc::clone(surface)))
+                    } else {
+                        // Rounded-2xl camera cards over the gradient stage: NEON `vImage`
+                        // downscaled to 2x Retina card size (<= 480x270) for crisp rounded corners
+                        // and minimal GPU texture upload.
+                        surface.to_bgra_fit(480, 270).and_then(|(w, h, bgra)| {
+                            let rgba = image::RgbaImage::from_raw(w, h, bgra)?;
+                            Some(DisplayVideoFrame::Image(Arc::new(RenderImage::new(
+                                smallvec::smallvec![image::Frame::new(rgba)],
+                            ))))
+                        })
+                    }
+                } else {
+                    frame_to_render_image(frame).map(DisplayVideoFrame::Image)
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = is_screen;
+                frame_to_render_image(frame).map(DisplayVideoFrame::Image)
+            }
+        };
+
+        if let Some(next) = display_frame {
+            if let Some(DisplayVideoFrame::Image(old)) = self.frames.insert(tile, next) {
+                self.stale_images.push(old);
+                // Guard against unbounded growth when no popout window is currently open.
+                if self.stale_images.len() > 8 {
+                    for dropped in self.stale_images.drain(..) {
+                        cx.drop_image(dropped, None);
+                    }
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn close_tile(&mut self, tile: &VideoTileKey, cx: &mut Context<Self>) {
+        if let Some(old) = self.frames.remove(tile) {
+            if let DisplayVideoFrame::Image(img) = old {
+                self.stale_images.push(img);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        for (_, old) in self.frames.drain() {
+            if let DisplayVideoFrame::Image(img) = old {
+                cx.drop_image(img, None);
+            }
+        }
+        for img in self.stale_images.drain(..) {
+            cx.drop_image(img, None);
+        }
+        cx.notify();
+    }
+
+    /// Drain evicted `RenderImage`s so the owning `PopoutWindow` can immediately free their
+    /// Metal sprite-atlas slots via `cx.drop_image(img, Some(window))`.
+    pub fn drain_stale_images(&mut self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut self.stale_images)
+    }
+
+    pub fn frames(&self) -> &HashMap<VideoTileKey, DisplayVideoFrame> {
+        &self.frames
+    }
 }
 
 /// Format an elapsed duration in seconds as `MM:SS` or `H:MM:SS`.
@@ -91,14 +232,14 @@ pub struct ReactionEntry {
 }
 
 /// Snapshot consumed by `PopoutKind::Huddle` so the Pop-out Huddle Window stays in lock-step with
-/// the sidebar mini-dock.
+/// the sidebar mini-dock. Live video frames live in a separate [`HuddleVideoStore`] entity so
+/// 10–30 fps video updates never repaint the main window.
 #[derive(Clone)]
 pub struct HuddleViewState {
     pub session: HuddleSessionSnapshot,
     pub participants: Vec<UserId>,
     pub levels: HuddleAudioLevels,
     pub elapsed_secs: u64,
-    pub video_frames: HashMap<VideoTileKey, Arc<RenderImage>>,
     pub raised_hands: HashSet<UserId>,
     pub sticky_emojis: HashMap<UserId, String>,
     pub reactions: Vec<ReactionEntry>,
@@ -131,7 +272,7 @@ pub struct HuddleDock {
     participants: Vec<UserId>,
     levels: HuddleAudioLevels,
     elapsed_secs: u64,
-    video_frames: HashMap<VideoTileKey, Arc<RenderImage>>,
+    video_store: Entity<HuddleVideoStore>,
     raised_hands: HashSet<UserId>,
     sticky_emojis: HashMap<UserId, String>,
     reactions: Vec<ReactionEntry>,
@@ -153,6 +294,7 @@ impl HuddleDock {
         participants: Vec<UserId>,
         cx: &mut App,
     ) -> Entity<Self> {
+        let video_store = HuddleVideoStore::new(cx);
         cx.new(|cx| {
             // 1-second timer to advance the elapsed duration clock & expire floating reactions.
             cx.spawn(async move |this, cx| {
@@ -229,7 +371,7 @@ impl HuddleDock {
                 } else {
                     0
                 },
-                video_frames: HashMap::new(),
+                video_store,
                 raised_hands: HashSet::new(),
                 sticky_emojis: HashMap::new(),
                 reactions: Vec::new(),
@@ -275,31 +417,34 @@ impl HuddleDock {
         cx.notify();
     }
 
+    /// Separate video-frame store observed exclusively by the Pop-out Huddle Window.
+    pub fn video_store(&self) -> Entity<HuddleVideoStore> {
+        self.video_store.clone()
+    }
+
     pub fn update_video_frame(
         &mut self,
         tile: VideoTileKey,
         frame: &VideoFrame,
         cx: &mut Context<Self>,
     ) {
-        if let Some(img) = frame_to_render_image(frame) {
-            if let Some(old) = self.video_frames.insert(tile, img) {
-                cx.drop_image(old, None);
-            }
-            cx.notify();
-        }
+        // Update ONLY `video_store` — never call `cx.notify()` on `HuddleDock` so the main
+        // window doesn't repaint 10–30×/sec for video frames it never renders!
+        self.video_store.update(cx, |vs, cx| {
+            vs.update_frame(tile, frame, cx);
+        });
     }
 
     pub fn close_video_tile(&mut self, tile: &VideoTileKey, cx: &mut Context<Self>) {
-        if let Some(old) = self.video_frames.remove(tile) {
-            cx.drop_image(old, None);
-            cx.notify();
-        }
+        self.video_store.update(cx, |vs, cx| {
+            vs.close_tile(tile, cx);
+        });
     }
 
     pub fn clear_video_frames(&mut self, cx: &mut Context<Self>) {
-        for (_, old) in self.video_frames.drain() {
-            cx.drop_image(old, None);
-        }
+        self.video_store.update(cx, |vs, cx| {
+            vs.clear(cx);
+        });
     }
 
     pub fn apply_room_meta(
@@ -589,7 +734,7 @@ impl HuddleDock {
             self.session.audio_only = enabled;
             if enabled {
                 self.session.video = false;
-                self.video_frames.clear();
+                self.video_store.update(cx, |vs, cx| vs.clear(cx));
             }
             cx.notify();
         }
@@ -605,7 +750,6 @@ impl HuddleDock {
             participants: self.participants.clone(),
             levels: self.levels.clone(),
             elapsed_secs: self.elapsed_secs,
-            video_frames: self.video_frames.clone(),
             raised_hands: self.raised_hands.clone(),
             sticky_emojis: self.sticky_emojis.clone(),
             reactions: self.reactions.clone(),
@@ -1324,10 +1468,17 @@ impl Render for HuddleDock {
         if self.menu_open {
             bar = bar.child(
                 div()
+                    .id("huddle-dock-menu-surface")
                     .absolute()
                     .right_2()
                     .bottom(px(52.))
                     .w(px(260.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if this.menu_open {
+                            this.menu_open = false;
+                            cx.notify();
+                        }
+                    }))
                     .child(self.render_menu(&channel, browser_url, cx)),
             );
         }

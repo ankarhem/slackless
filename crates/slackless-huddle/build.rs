@@ -19,12 +19,18 @@ fn main() {
             .flag("-Wno-deprecated-declarations")
             .compile("slackless_macos_media");
         for fw in [
-            "ScreenCaptureKit",
-            "VideoToolbox",
+            "AVFoundation",
+            "Accelerate",
+            "CoreAudio",
+            "CoreGraphics",
+            "CoreImage",
             "CoreMedia",
             "CoreVideo",
-            "CoreGraphics",
             "Foundation",
+            "Metal",
+            "ScreenCaptureKit",
+            "VideoToolbox",
+            "Vision",
         ] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }

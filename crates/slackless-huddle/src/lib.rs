@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod av1;
+pub mod backend;
 pub mod clips;
 pub mod content_share;
 #[cfg(target_os = "macos")]
@@ -36,15 +37,20 @@ pub use audio::{
     AmbientMusicPlayer, AudioDeviceInfo, AudioDevices, HuddleChime, MicLevelProbe,
     list_audio_devices, play_huddle_chime, play_speaker_test_tone,
 };
+pub use backend::{MediaCapabilities, platform_backend};
 pub use clips::{
     AudioClipRecorder, ClipVideoSource, MAX_CLIP_DURATION_MS, RecordedClip, VideoClipRecorder,
     finish_audio_clip,
 };
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
+#[cfg(target_os = "macos")]
+pub use macos_media::MacVideoSurface;
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
 pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
-pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};
+pub use video::{
+    CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,
+};
 
 /// Returns `true` if OS screen recording permission is granted (always `true` on non-macOS).
 pub fn has_screen_capture_permission() -> bool {

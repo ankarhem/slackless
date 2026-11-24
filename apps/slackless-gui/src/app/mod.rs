@@ -2287,9 +2287,62 @@ impl App {
         app.update(cx, |app, _| {
             app._subscriptions.push(quit_sub);
         });
-        // Poll actions clicked in the macOS menu-bar status item (`F-SHELL-168`).
-        let status_app = app.downgrade();
-        let status_window = window.window_handle();
+        // Event-driven actions clicked in the macOS menu-bar status item (`F-SHELL-168`, zero polling).
+        {
+            use futures::StreamExt as _;
+            let (status_tx, mut status_rx) = futures::channel::mpsc::unbounded::<StatusBarAction>();
+            platform::install_status_bar_action_monitor(move |action| {
+                let _ = status_tx.unbounded_send(action);
+            });
+            let status_app = app.downgrade();
+            let status_window = window.window_handle();
+            cx.spawn(async move |cx| {
+                while let Some(action) = status_rx.next().await {
+                    match action {
+                        StatusBarAction::ShowWindow => {
+                            let _ = status_window.update(cx, |_, window, cx| {
+                                cx.activate(true);
+                                window.activate_window();
+                            });
+                        }
+                        StatusBarAction::SwitchWorkspace(ix) => {
+                            let _ = status_window.update(cx, |_, window, cx| {
+                                cx.activate(true);
+                                window.activate_window();
+                                let _ = status_app.update(cx, |app, cx| {
+                                    app.switch_workspace(ix, window, cx);
+                                });
+                            });
+                        }
+                        StatusBarAction::ToggleDnd => {
+                            let _ = status_window.update(cx, |_, _, cx| {
+                                let _ = status_app.update(cx, |app, cx| {
+                                    if app.self_state.paused() {
+                                        app.self_state.paused_until = None;
+                                        if !app.fixtures.sample {
+                                            app.bridge.send(Command::EndDndSnooze);
+                                        }
+                                    } else {
+                                        app.self_state.paused_until =
+                                            Some(crate::messages::now_secs() + 3_600);
+                                        if !app.fixtures.sample {
+                                            app.bridge.send(Command::SetDndSnooze { minutes: 60 });
+                                        }
+                                    }
+                                    app.push_self_state(cx);
+                                    app.sync_badge(cx);
+                                });
+                            });
+                        }
+                        StatusBarAction::Quit => {
+                            cx.update(|cx| cx.quit());
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
         // Catch macOS swipe-based mouse Back/Forward events that GPUI drops (`phase == None`).
         {
             use futures::StreamExt as _;
@@ -2332,61 +2385,6 @@ impl App {
             })
             .detach();
         }
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(200))
-                    .await;
-                let action = status_app
-                    .upgrade()
-                    .and_then(|a| a.read_with(cx, |app, _| app.os.take_status_bar_action()));
-                let Some(action) = action else {
-                    continue;
-                };
-                match action {
-                    StatusBarAction::ShowWindow => {
-                        let _ = status_window.update(cx, |_, window, cx| {
-                            cx.activate(true);
-                            window.activate_window();
-                        });
-                    }
-                    StatusBarAction::SwitchWorkspace(ix) => {
-                        let _ = status_window.update(cx, |_, window, cx| {
-                            cx.activate(true);
-                            window.activate_window();
-                            let _ = status_app.update(cx, |app, cx| {
-                                app.switch_workspace(ix, window, cx);
-                            });
-                        });
-                    }
-                    StatusBarAction::ToggleDnd => {
-                        let _ = status_window.update(cx, |_, _, cx| {
-                            let _ = status_app.update(cx, |app, cx| {
-                                if app.self_state.paused() {
-                                    app.self_state.paused_until = None;
-                                    if !app.fixtures.sample {
-                                        app.bridge.send(Command::EndDndSnooze);
-                                    }
-                                } else {
-                                    app.self_state.paused_until =
-                                        Some(crate::messages::now_secs() + 3_600);
-                                    if !app.fixtures.sample {
-                                        app.bridge.send(Command::SetDndSnooze { minutes: 60 });
-                                    }
-                                }
-                                app.push_self_state(cx);
-                                app.sync_badge(cx);
-                            });
-                        });
-                    }
-                    StatusBarAction::Quit => {
-                        cx.update(|cx| cx.quit());
-                        break;
-                    }
-                }
-            }
-        })
-        .detach();
         app.update(cx, |app, cx| {
             app.push_self_state(cx);
             app.sync_saved(cx);

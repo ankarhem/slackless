@@ -7,38 +7,112 @@ use std::time::Duration;
 
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType};
+use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use openh264::OpenH264API;
-use openh264::decoder::Decoder as H264Decoder;
 use openh264::encoder::{
     BitRate, Complexity, Encoder as H264Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
     RateControlMode, UsageType,
 };
-use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSlices, YUVSource as _};
+use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSlices};
 use slackless_types::UserId;
 use tokio::sync::mpsc;
 use webrtc::rtp::codecs::h264::H264Packet;
 use webrtc::rtp::packetizer::Depacketizer as _;
 
+use crate::backend::{CameraConfig, CameraHandle, VideoDecoderHandle, platform_backend};
 use crate::{HuddleError, Result};
 
 /// Maximum dimensions for webcam capture (720p, even numbers required for YUV420).
 pub const CAMERA_MAX_W: u32 = 1280;
 pub const CAMERA_MAX_H: u32 = 720;
+/// Target webcam frame rate for hardware capture.
+pub const CAMERA_MAX_FPS: u32 = 24;
+/// Target average H.264 bitrate for webcam streams (1.2 Mbps).
+pub const CAMERA_BITRATE_BPS: u32 = 1_200_000;
 
-/// One decoded or captured video frame in BGRA8888 byte order (ready for GPUI `RenderImage`).
+/// Platform-extensible backing storage for a decoded or captured [`VideoFrame`].
+#[derive(Debug, Clone)]
+pub enum VideoFrameData {
+    /// Portable tightly-packed BGRA8888 CPU pixel buffer.
+    Bgra(Arc<Vec<u8>>),
+    /// Zero-copy macOS `IOSurface`-backed `420f` `CVPixelBuffer` rendered directly by Metal.
+    #[cfg(target_os = "macos")]
+    MacSurface(Arc<crate::macos_media::MacVideoSurface>),
+}
+
+/// One decoded or captured video frame (zero-copy GPU surface on macOS, or portable BGRA8888).
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
-    pub bgra: Arc<Vec<u8>>,
+    pub data: VideoFrameData,
+}
+
+impl VideoFrame {
+    /// Construct a portable BGRA8888 [`VideoFrame`].
+    pub fn from_bgra(width: u32, height: u32, bgra: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data: VideoFrameData::Bgra(Arc::new(bgra)),
+        }
+    }
+
+    /// Wrap a zero-copy macOS `IOSurface`-backed `CVPixelBuffer`.
+    #[cfg(target_os = "macos")]
+    pub fn from_mac_surface(surface: crate::macos_media::MacVideoSurface) -> Self {
+        Self {
+            width: surface.width(),
+            height: surface.height(),
+            data: VideoFrameData::MacSurface(Arc::new(surface)),
+        }
+    }
+
+    /// Borrow the underlying zero-copy macOS GPU surface if this frame is GPU-backed.
+    #[cfg(target_os = "macos")]
+    pub fn mac_surface(&self) -> Option<&Arc<crate::macos_media::MacVideoSurface>> {
+        match &self.data {
+            VideoFrameData::MacSurface(s) => Some(s),
+            VideoFrameData::Bgra(_) => None,
+        }
+    }
+
+    /// Extract owned BGRA8888 bytes without cloning when uniquely owned (`Arc::try_unwrap`),
+    /// or convert from a GPU surface via hardware-accelerated readback.
+    pub fn into_bgra(self) -> Option<(u32, u32, Vec<u8>)> {
+        match self.data {
+            VideoFrameData::Bgra(arc) => {
+                let bytes = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
+                Some((self.width, self.height, bytes))
+            }
+            #[cfg(target_os = "macos")]
+            VideoFrameData::MacSurface(surface) => surface.to_bgra_fit(0, 0),
+        }
+    }
+
+    /// Obtain BGRA8888 bytes fit within `(max_w, max_h)` (pass `0, 0` for native size).
+    /// On macOS GPU surfaces, uses NEON `vImage` YCbCr->BGRA + high-quality downscaling.
+    pub fn to_bgra_fit(&self, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
+        match &self.data {
+            VideoFrameData::Bgra(arc) => Some((self.width, self.height, (**arc).clone())),
+            #[cfg(target_os = "macos")]
+            VideoFrameData::MacSurface(surface) => surface.to_bgra_fit(max_w, max_h),
+        }
+    }
 }
 
 impl PartialEq for VideoFrame {
     fn eq(&self, other: &Self) -> bool {
-        self.width == other.width
-            && self.height == other.height
-            && Arc::ptr_eq(&self.bgra, &other.bgra)
+        if self.width != other.width || self.height != other.height {
+            return false;
+        }
+        match (&self.data, &other.data) {
+            (VideoFrameData::Bgra(a), VideoFrameData::Bgra(b)) => Arc::ptr_eq(a, b),
+            #[cfg(target_os = "macos")]
+            (VideoFrameData::MacSurface(a), VideoFrameData::MacSurface(b)) => Arc::ptr_eq(a, b),
+            #[cfg(target_os = "macos")]
+            _ => false,
+        }
     }
 }
 
@@ -58,23 +132,9 @@ pub struct CameraDeviceInfo {
     pub name: String,
 }
 
-/// Enumerate all host cameras (`AVFoundation` on macOS, V4L2 on Linux, MSMF on Windows).
+/// Enumerate all host cameras via the active platform [`crate::backend::MediaBackend`].
 pub fn list_cameras() -> Vec<CameraDeviceInfo> {
-    nokhwa::query(ApiBackend::Auto)
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-        .map(|(fallback_ix, info)| {
-            let index = match info.index() {
-                CameraIndex::Index(i) => *i as usize,
-                CameraIndex::String(_) => fallback_ix,
-            };
-            CameraDeviceInfo {
-                index,
-                name: info.human_name(),
-            }
-        })
-        .collect()
+    crate::backend::platform_backend().list_cameras()
 }
 
 /// Encode RGB888 or I420 YUV frames into Annex-B H.264 NAL units via Cisco OpenH264.
@@ -172,36 +232,26 @@ impl H264VideoEncoder {
     }
 }
 
-/// Depacketize RTP H.264 payloads (Single NAL, STAP-A, FU-A) and decode to BGRA8888 [`VideoFrame`].
-/// Uses Apple Silicon `VideoToolbox` hardware decoding on macOS with automatic OpenH264 fallback.
+/// Depacketize RTP H.264 payloads (Single NAL, STAP-A, FU-A) and decode via the active platform
+/// [`crate::backend::MediaBackend`] (hardware VideoToolbox zero-copy on macOS with lazy OpenH264 fallback).
 pub struct H264VideoDecoder {
-    #[cfg(target_os = "macos")]
-    vt: Option<crate::macos_media::VtH264Decoder>,
-    decoder: H264Decoder,
+    inner: Box<dyn VideoDecoderHandle>,
     depacketizer: H264Packet,
     annex_b_buf: Vec<u8>,
 }
 
 impl H264VideoDecoder {
     pub fn new() -> Result<Self> {
-        let decoder = H264Decoder::new().map_err(|e| HuddleError::Codec(e.to_string()))?;
-        #[cfg(target_os = "macos")]
-        let vt = crate::macos_media::VtH264Decoder::new().ok();
+        let inner = platform_backend().create_h264_decoder()?;
         Ok(Self {
-            #[cfg(target_os = "macos")]
-            vt,
-            decoder,
+            inner,
             depacketizer: H264Packet::default(),
             annex_b_buf: Vec::with_capacity(64 * 1024),
         })
     }
 
     pub fn backend_name(&self) -> &'static str {
-        #[cfg(target_os = "macos")]
-        if self.vt.is_some() {
-            return "H.264 (VideoToolbox HW)";
-        }
-        "H.264 (OpenH264 SW)"
+        self.inner.backend_name()
     }
 
     /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit).
@@ -222,30 +272,9 @@ impl H264VideoDecoder {
         frame
     }
 
-    /// Decode a complete Annex-B H.264 access unit into a BGRA8888 [`VideoFrame`].
+    /// Decode a complete Annex-B H.264 access unit into a [`VideoFrame`].
     pub fn decode_annex_b(&mut self, bitstream: &[u8]) -> Option<VideoFrame> {
-        #[cfg(target_os = "macos")]
-        if let Some(vt) = self.vt.as_mut() {
-            if let Some(frame) = vt.decode_annex_b(bitstream) {
-                return Some(frame);
-            }
-        }
-        let yuv = self.decoder.decode(bitstream).ok()??;
-        let (w, h) = yuv.dimensions();
-        if w == 0 || h == 0 {
-            return None;
-        }
-        let mut rgba = vec![0u8; w * h * 4];
-        yuv.write_rgba8(&mut rgba);
-        // Convert RGBA8888 -> BGRA8888 in-place for GPUI `RenderImage`.
-        for px in rgba.as_chunks_mut::<4>().0 {
-            px.swap(0, 2);
-        }
-        Some(VideoFrame {
-            width: w as u32,
-            height: h as u32,
-            bgra: Arc::new(rgba),
-        })
+        self.inner.decode_unit(bitstream)
     }
 }
 
@@ -543,11 +572,12 @@ pub fn apply_portrait_blur(rgb: &mut [u8], w: usize, h: usize) {
     }
 }
 
-/// Active webcam capture & H.264 encoder running on a dedicated OS thread.
+/// Active webcam capture & H.264 encoder backed by the active platform [`crate::backend::MediaBackend`].
+///
+/// - macOS: hardware `AVCaptureSession` (`420f`) + `VideoToolbox` H.264 High + Vision/Metal blur
+/// - Linux/Windows/fallback: `nokhwa` + `OpenH264`
 pub struct CameraCapture {
-    running: Arc<AtomicBool>,
-    blur: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    inner: Box<dyn CameraHandle>,
 }
 
 impl CameraCapture {
@@ -557,99 +587,35 @@ impl CameraCapture {
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
     ) -> Result<Self> {
-        let running = Arc::new(AtomicBool::new(true));
-        let blur = Arc::new(AtomicBool::new(blur_background));
-        let run_flag = Arc::clone(&running);
-        let blur_flag = Arc::clone(&blur);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
-        let idx = device_index.unwrap_or(0) as u32;
-
-        let worker = std::thread::Builder::new()
-            .name("slackless-huddle-camera".to_owned())
-            .spawn(move || {
-                let open = (|| -> Result<(Camera, H264VideoEncoder)> {
-                    let req = RequestedFormat::new::<RgbFormat>(
-                        RequestedFormatType::AbsoluteHighestFrameRate,
-                    );
-                    let mut cam = Camera::new(CameraIndex::Index(idx), req)
-                        .map_err(|e| HuddleError::Video(format!("camera open failed: {e}")))?;
-                    cam.open_stream()
-                        .map_err(|e| HuddleError::Video(format!("camera stream failed: {e}")))?;
-                    let enc = H264VideoEncoder::new()?;
-                    Ok((cam, enc))
-                })();
-
-                let (mut cam, mut enc) = match open {
-                    Ok(pair) => {
-                        let _ = ready_tx.send(Ok(()));
-                        pair
-                    }
-                    Err(err) => {
-                        let _ = ready_tx.send(Err(err));
-                        return;
-                    }
-                };
-
-                while run_flag.load(Ordering::Relaxed) {
-                    if let Ok(frame) = cam.frame() {
-                        if let Ok(img) = frame.decode_image::<RgbFormat>() {
-                            let (mut rgb, w, h) = resize_rgb_even(
-                                img.as_raw(),
-                                img.width(),
-                                img.height(),
-                                CAMERA_MAX_W,
-                                CAMERA_MAX_H,
-                            );
-                            if w >= 2 && h >= 2 {
-                                if blur_flag.load(Ordering::Relaxed) {
-                                    apply_portrait_blur(&mut rgb, w as usize, h as usize);
-                                }
-                                let bgra = rgb_to_bgra(&rgb);
-                                let _ = preview_tx.send(VideoFrame {
-                                    width: w,
-                                    height: h,
-                                    bgra: Arc::new(bgra),
-                                });
-                                if let Ok(h264) = enc.encode_rgb(&rgb, w as usize, h as usize) {
-                                    if !h264.is_empty() {
-                                        let _ = outbound_h264_tx.send(h264);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(66)); // ~15 fps
-                }
-                let _ = cam.stop_stream();
-            })
-            .map_err(|e| HuddleError::Video(e.to_string()))?;
-
-        if let Err(err) = ready_rx
-            .recv()
-            .map_err(|e| HuddleError::Video(e.to_string()))
-            .and_then(|r| r)
-        {
-            running.store(false, Ordering::Relaxed);
-            let _ = worker.join();
-            return Err(err);
-        }
-
-        Ok(Self {
-            running,
-            blur,
-            worker: Some(worker),
-        })
+        let inner = platform_backend().start_camera(
+            CameraConfig {
+                device_index,
+                max_w: CAMERA_MAX_W,
+                max_h: CAMERA_MAX_H,
+                max_fps: CAMERA_MAX_FPS,
+                bitrate_bps: CAMERA_BITRATE_BPS,
+                blur_background,
+            },
+            outbound_h264_tx,
+            preview_tx,
+        )?;
+        Ok(Self { inner })
     }
 
     pub fn set_blur(&self, enabled: bool) {
-        self.blur.store(enabled, Ordering::Relaxed);
+        self.inner.set_blur(enabled);
+    }
+
+    pub fn force_keyframe(&self) {
+        self.inner.force_keyframe();
+    }
+
+    pub fn set_target_bitrate(&self, bitrate_bps: u32) {
+        self.inner.set_target_bitrate(bitrate_bps);
     }
 
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
+        self.inner.stop();
     }
 }
 
@@ -710,11 +676,7 @@ impl CameraPreviewProbe {
                                 if blur_flag.load(Ordering::Relaxed) {
                                     apply_portrait_blur(&mut rgb, w as usize, h as usize);
                                 }
-                                let vf = VideoFrame {
-                                    width: w,
-                                    height: h,
-                                    bgra: Arc::new(rgb_to_bgra(&rgb)),
-                                };
+                                let vf = VideoFrame::from_bgra(w, h, rgb_to_bgra(&rgb));
                                 if let Ok(mut guard) = latest_cb.lock() {
                                     *guard = Some(vf);
                                 }
@@ -782,7 +744,9 @@ mod tests {
             .expect("keyframe should decode immediately");
         assert_eq!(decoded.width, w as u32);
         assert_eq!(decoded.height, h as u32);
-        assert_eq!(decoded.bgra.len(), w * h * 4);
+        let (bw, bh, bgra) = decoded.into_bgra().expect("frame should convert to BGRA");
+        assert_eq!((bw, bh), (w as u32, h as u32));
+        assert_eq!(bgra.len(), w * h * 4);
     }
 
     #[test]

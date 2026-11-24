@@ -608,11 +608,7 @@ fn record_encoded_frame(
         return;
     }
     let frame_idx = frames_cb.lock().map(|g| g.len()).unwrap_or(0);
-    let vf = VideoFrame {
-        width: ew,
-        height: eh,
-        bgra: Arc::new(rgb_to_bgra(&enc_rgb)),
-    };
+    let vf = VideoFrame::from_bgra(ew, eh, rgb_to_bgra(&enc_rgb));
     if let Ok(mut p) = preview_cb.lock() {
         *p = Some(vf.clone());
     }

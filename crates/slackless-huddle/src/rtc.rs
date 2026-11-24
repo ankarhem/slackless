@@ -27,6 +27,7 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtcp::payload_feedbacks::full_intra_request::{FirEntry, FullIntraRequest};
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability, RTPCodecType,
 };
@@ -108,17 +109,32 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
         ]
     };
 
-    // Only register video codecs we actually decode natively (`rav1d` AV1 + `openh264` H.264).
-    // Advertising VP8/VP9 causes Chime's `supported_receive_codec_intersection` to negotiate
-    // streams we cannot decode.
-    for (mime, pt, fmtp) in [
-        (MIME_TYPE_AV1, 45u8, ""),
-        (
-            MIME_TYPE_H264,
-            108u8,
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
-        ),
-    ] {
+    // Register only video codecs we decode natively (`AV1` + `H.264`).
+    // Codec order adapts dynamically to runtime hardware capabilities (never assumes M3+):
+    // - M3/M4 Macs (`hw_av1_decode == true`): AV1 first (both AV1 & H.264 decode in HW).
+    // - M1/M2 Macs (`hw_h264_decode && !hw_av1_decode`): H.264 first so peers prefer HW-decoded
+    //   H.264 while still allowing seamless `rav1d` fallback when Chime forces AV1.
+    let caps = crate::backend::platform_backend().capabilities();
+    let video_codecs = if caps.prefer_h264_over_av1() {
+        [
+            (
+                MIME_TYPE_H264,
+                108u8,
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+            ),
+            (MIME_TYPE_AV1, 45u8, ""),
+        ]
+    } else {
+        [
+            (MIME_TYPE_AV1, 45u8, ""),
+            (
+                MIME_TYPE_H264,
+                108u8,
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
+            ),
+        ]
+    };
+    for (mime, pt, fmtp) in video_codecs {
         m.register_codec(
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
@@ -189,6 +205,15 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
     }
 
     Ok(m)
+}
+
+/// Inbound RTCP feedback received on an outbound local video `RTCRtpSender`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoSenderFeedback {
+    /// Remote SFU/viewer requested an immediate IDR keyframe (RTCP PLI or FIR).
+    ForceKeyframe,
+    /// Remote SFU/viewer estimated available uplink bandwidth in bits per second (RTCP REMB).
+    TargetBitrateBps(u32),
 }
 
 /// One inbound RTP video packet read from a remote Chime video/content track.
@@ -470,6 +495,41 @@ impl ChimeRtcPeer {
             })
             .collect();
         Ok((offer, mids))
+    }
+
+    /// Spawn a lightweight RTCP feedback reader on the local outbound video `RTCRtpSender` so
+    /// incoming PLI/FIR trigger instant IDR keyframes (enabling longer 10s GOPs without pulsing)
+    /// and incoming REMB smoothly adapts encoder bitrate.
+    pub async fn attach_video_feedback(&self, tx: mpsc::UnboundedSender<VideoSenderFeedback>) {
+        let senders = self.pc.get_senders().await;
+        for sender in senders {
+            let is_video = sender
+                .track()
+                .await
+                .is_some_and(|t| t.kind() == RTPCodecType::Video);
+            if !is_video {
+                continue;
+            }
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Ok((packets, _)) = sender.read_rtcp().await {
+                    for pkt in packets {
+                        let any = pkt.as_any();
+                        if any.downcast_ref::<PictureLossIndication>().is_some()
+                            || any.downcast_ref::<FullIntraRequest>().is_some()
+                        {
+                            let _ = tx.send(VideoSenderFeedback::ForceKeyframe);
+                        } else if let Some(remb) =
+                            any.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                        {
+                            let bps = remb.bitrate.clamp(100_000.0, 10_000_000.0) as u32;
+                            let _ = tx.send(VideoSenderFeedback::TargetBitrateBps(bps));
+                        }
+                    }
+                }
+            });
+            break;
+        }
     }
 
     /// Send RTCP PLI + FIR to request an immediate keyframe for `media_ssrc` (prevents frozen

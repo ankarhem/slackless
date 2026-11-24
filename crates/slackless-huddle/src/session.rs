@@ -18,7 +18,8 @@ use tokio::sync::mpsc;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
 use crate::audio::{AmbientMusicPlayer, AudioEngine, AudioSharedState};
-use crate::av1::{Av1Decoder, Av1Frames};
+use crate::av1::Av1Frames;
+use crate::backend::{VideoDecoderHandle, platform_backend};
 use crate::content_share::ContentShareSession;
 use crate::metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
 use crate::peer_message::{
@@ -28,7 +29,7 @@ use crate::peer_message::{
     decode_chime_transcript_frame, decode_slack_peer_message,
 };
 use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame, sdk_signal_frame};
-use crate::rtc::{ChimeRtcPeer, InboundVideoPacket};
+use crate::rtc::{ChimeRtcPeer, InboundVideoPacket, VideoSenderFeedback};
 use crate::signaling::{
     ChimeSignalClient, RemoteVideoSource, build_audio_control_frame, build_client_metric_frame,
     build_data_message_frame, build_join_frame, build_leave_frame, build_pong_frame,
@@ -87,17 +88,23 @@ enum LoopExit {
 }
 
 enum RemoteVideoDecoder {
-    Av1 { frames: Av1Frames, dec: Av1Decoder },
+    Av1 {
+        frames: Av1Frames,
+        dec: Box<dyn VideoDecoderHandle>,
+    },
     H264(H264VideoDecoder),
 }
 
 impl RemoteVideoDecoder {
     fn for_mime(mime: &str) -> Option<Self> {
         if mime.eq_ignore_ascii_case("video/AV1") {
-            Av1Decoder::new().ok().map(|dec| Self::Av1 {
-                frames: Av1Frames::default(),
-                dec,
-            })
+            platform_backend()
+                .create_av1_decoder()
+                .ok()
+                .map(|dec| Self::Av1 {
+                    frames: Av1Frames::default(),
+                    dec,
+                })
         } else if mime.eq_ignore_ascii_case("video/H264") {
             H264VideoDecoder::new().ok().map(Self::H264)
         } else {
@@ -107,7 +114,7 @@ impl RemoteVideoDecoder {
 
     fn backend_name(&self) -> &'static str {
         match self {
-            Self::Av1 { .. } => "AV1 (rav1d)",
+            Self::Av1 { dec, .. } => dec.backend_name(),
             Self::H264(dec) => dec.backend_name(),
         }
     }
@@ -116,10 +123,7 @@ impl RemoteVideoDecoder {
         match self {
             Self::Av1 { frames, dec } => {
                 if let Some(unit) = frames.push(pkt.seq, pkt.marker, &pkt.payload) {
-                    match dec.decode(&unit) {
-                        Ok(frame) => (frame, None),
-                        Err(err) => (None, Some(err.to_string())),
-                    }
+                    (dec.decode_unit(&unit), None)
                 } else {
                     (None, None)
                 }
@@ -320,11 +324,20 @@ async fn run_connected_loop(
     let (keyframe_req_tx, mut keyframe_req_rx) = mpsc::unbounded_channel::<u32>();
     let (codec_tx, mut codec_rx) = mpsc::unbounded_channel::<String>();
 
+    let (cam_fb_tx, mut cam_fb_rx) = mpsc::unbounded_channel::<VideoSenderFeedback>();
+    let backend = platform_backend();
+    tracing::info!(
+        backend = backend.name(),
+        caps = ?backend.capabilities(),
+        "huddle media backend capabilities"
+    );
+
     let peer = match ChimeRtcPeer::new(&turn, inbound_opus_tx, inbound_video_tx, pc_state_tx).await
     {
         Ok(p) => p,
         Err(e) => return LoopExit::Fatal(e),
     };
+    peer.attach_video_feedback(cam_fb_tx).await;
     let sdp_offer = match peer.create_gathered_offer().await {
         Ok(s) => s,
         Err(e) => return LoopExit::Fatal(e),
@@ -534,7 +547,17 @@ async fn run_connected_loop(
                 let _ = peer.write_opus_frame(opus_pkt).await;
             }
             Some(h264_frame) = outbound_h264_rx.recv() => {
-                let _ = peer.write_h264_frame(h264_frame, Duration::from_millis(66)).await;
+                let _ = peer.write_h264_frame(h264_frame, Duration::from_millis(42)).await;
+            }
+            Some(fb) = cam_fb_rx.recv() => {
+                if let Some(cap) = &camera_capture {
+                    match fb {
+                        VideoSenderFeedback::ForceKeyframe => cap.force_keyframe(),
+                        VideoSenderFeedback::TargetBitrateBps(bps) => {
+                            cap.set_target_bitrate(bps.clamp(350_000, 1_500_000));
+                        }
+                    }
+                }
             }
             Some(frame) = local_cam_rx.recv() => {
                 let _ = updates.send(HuddleUpdate::VideoFrame {

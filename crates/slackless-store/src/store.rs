@@ -80,12 +80,27 @@ impl Drop for Store {
     }
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic revision bumped whenever message rows are mutated in any [`Store`] instance.
+/// Lets secondary windows skip idle SQLite polling with a single atomic load.
+static MESSAGE_REVISION: AtomicU64 = AtomicU64::new(1);
+
 /// Durable local-first message store; the rendering source of truth.
 pub struct Store {
     pub(crate) conn: Connection,
 }
 
 impl Store {
+    /// Current monotonic message-mutation revision (O(1) atomic read, zero SQLite I/O).
+    pub fn message_revision() -> u64 {
+        MESSAGE_REVISION.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn bump_message_revision() {
+        MESSAGE_REVISION.fetch_add(1, Ordering::Release);
+    }
     /// Opens (creating if needed) the database at `path` and migrates it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -202,6 +217,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        Self::bump_message_revision();
         Ok(())
     }
 
@@ -209,12 +225,16 @@ impl Store {
     /// preview): Slack keeps no copy, so one left from a past session would otherwise show
     /// forever. Their revisions stay in the log. Returns how many were dropped.
     pub fn drop_ephemeral(&mut self, workspace: &TeamId) -> Result<usize> {
-        Ok(self.conn.execute(
+        let n = self.conn.execute(
             "DELETE FROM message_current
              WHERE workspace_id = ?1 AND typeof(json) = 'text'
                AND json_extract(json, '$.is_ephemeral') = 1",
             params![workspace.as_str()],
-        )?)
+        )?;
+        if n > 0 {
+            Self::bump_message_revision();
+        }
+        Ok(n)
     }
 
     /// Records a `message_deleted` as a tombstone revision carrying the prior content
@@ -271,6 +291,7 @@ impl Store {
             &stored_json,
         )?;
         tx.commit()?;
+        Self::bump_message_revision();
         Ok(())
     }
 

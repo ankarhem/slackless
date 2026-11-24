@@ -537,19 +537,7 @@ impl Composer {
                                 let thumbs: Vec<Arc<RenderImage>> = clip
                                     .thumbnail_frames
                                     .iter()
-                                    .filter_map(|vf| {
-                                        let buf = image::ImageBuffer::<
-                                                    image::Rgba<u8>,
-                                                    Vec<u8>,
-                                                >::from_raw(
-                                                    vf.width,
-                                                    vf.height,
-                                                    (*vf.bgra).clone(),
-                                                )?;
-                                        Some(Arc::new(RenderImage::new(vec![image::Frame::new(
-                                            buf,
-                                        )])))
-                                    })
+                                    .filter_map(crate::huddle_dock::frame_to_render_image)
                                     .collect();
                                 if thumbs.is_empty() {
                                     composer.attachments.push(PendingAttachment {
@@ -620,16 +608,8 @@ impl Composer {
                         }
                         if let ActiveClipRecorder::Video { recorder, .. } = active {
                             if let Some(vf) = recorder.latest_preview() {
-                                if let Some(buf) =
-                                    image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
-                                        vf.width,
-                                        vf.height,
-                                        (*vf.bgra).clone(),
-                                    )
-                                {
-                                    let frame = image::Frame::new(buf);
-                                    composer.clip_preview =
-                                        Some(Arc::new(RenderImage::new(vec![frame])));
+                                if let Some(img) = crate::huddle_dock::frame_into_render_image(vf) {
+                                    composer.clip_preview = Some(img);
                                 }
                             }
                         }

@@ -57,6 +57,17 @@ pub fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'static) {
     fallback::install_screen_lock_monitor(on_lock);
 }
 
+/// Install an event-driven listener for clicks on the OS menu-bar / tray status item so the GUI
+/// never needs a background polling timer. Safe to call once at app startup.
+pub fn install_status_bar_action_monitor(
+    on_action: impl Fn(StatusBarAction) + Send + Sync + 'static,
+) {
+    #[cfg(target_os = "macos")]
+    macos::install_status_bar_action_monitor(on_action);
+    #[cfg(not(target_os = "macos"))]
+    fallback::install_status_bar_action_monitor(on_action);
+}
+
 /// Install a POSIX `SIGTERM`/`SIGINT` signal monitor that invokes `on_terminate` on a helper
 /// thread so the application can run graceful quit cleanup (e.g. leaving active huddles before
 /// exiting). A second signal falls back to the OS default action so termination can never hang.
