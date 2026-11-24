@@ -1433,6 +1433,7 @@ impl Preferences {
                     .child(debug),
                 cx,
             ))
+            .child(self.software_updates_group(cx))
             .child(self.cli_install_group(cx))
             .child(self.group(
                 "Local storage & maintenance",
@@ -1440,6 +1441,155 @@ impl Preferences {
                 storage_summary,
                 cx,
             ))
+    }
+
+    fn software_updates_group(&mut self, cx: &mut Context<Self>) -> Div {
+        use crate::updater::{UpdateState, installed_version};
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let current = installed_version();
+
+        let (status_line, is_err, action_row) = match &self.update_state {
+            UpdateState::Checking => (
+                "Checking GitHub Releases for updates…".to_owned(),
+                false,
+                h_flex().gap_2().child(
+                    Button::new("adv-upd-checking")
+                        .outline()
+                        .with_size(Size::Small)
+                        .disabled(true)
+                        .label("Checking…"),
+                ),
+            ),
+            UpdateState::Downloading(ver) => (
+                format!(
+                    "Downloading and verifying Slackless {ver}… Slackless will restart automatically."
+                ),
+                false,
+                h_flex().gap_2().child(
+                    Button::new("adv-upd-downloading")
+                        .primary()
+                        .with_size(Size::Small)
+                        .disabled(true)
+                        .label(format!("Downloading {ver}…")),
+                ),
+            ),
+            UpdateState::Available(rel) => {
+                let ver = rel.version.clone();
+                let notes_url = rel.html_url.clone();
+                (
+                    format!("Slackless {ver} is available (currently on {current})."),
+                    false,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("adv-upd-download")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label(format!("Download & restart ({ver})"))
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(PreferencesEvent::InstallUpdate);
+                                })),
+                        )
+                        .child(
+                            Button::new("adv-upd-notes")
+                                .ghost()
+                                .with_size(Size::Small)
+                                .label("Release notes")
+                                .on_click(move |_, _, cx| cx.open_url(&notes_url)),
+                        ),
+                )
+            }
+            UpdateState::UpToDate => (
+                format!("Slackless {current} is up to date."),
+                false,
+                h_flex().gap_2().child(
+                    Button::new("adv-upd-check-again")
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Check for updates")
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(PreferencesEvent::CheckForUpdates);
+                        })),
+                ),
+            ),
+            UpdateState::Error(err) => (
+                format!("Update failed: {err}"),
+                true,
+                h_flex().gap_2().child(
+                    Button::new("adv-upd-retry")
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Check for updates")
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(PreferencesEvent::CheckForUpdates);
+                        })),
+                ),
+            ),
+            UpdateState::Idle => match &self.available_update {
+                Some(rel) => {
+                    let ver = rel.version.clone();
+                    let notes_url = rel.html_url.clone();
+                    (
+                        format!("Slackless {ver} is ready to download (currently on {current})."),
+                        false,
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("adv-upd-download-cached")
+                                    .primary()
+                                    .with_size(Size::Small)
+                                    .label(format!("Download & restart ({ver})"))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(PreferencesEvent::InstallUpdate);
+                                    })),
+                            )
+                            .child(
+                                Button::new("adv-upd-notes-cached")
+                                    .ghost()
+                                    .with_size(Size::Small)
+                                    .label("Release notes")
+                                    .on_click(move |_, _, cx| cx.open_url(&notes_url)),
+                            ),
+                    )
+                }
+                None => (
+                    format!("Installed version: {current}"),
+                    false,
+                    h_flex().gap_2().child(
+                        Button::new("adv-upd-check")
+                            .outline()
+                            .with_size(Size::Small)
+                            .label("Check for updates")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(PreferencesEvent::CheckForUpdates);
+                            })),
+                    ),
+                ),
+            },
+        };
+
+        self.group(
+            "Software updates",
+            Some("Checks for new releases on startup or when requested; updates both Slackless.app and the CLI together."),
+            v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(if is_err { danger } else { fg })
+                        .child(status_line),
+                )
+                .child(action_row)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Also available anytime from Slackless → Check for Updates… in the menu bar."),
+                ),
+            cx,
+        )
     }
 
     fn cli_install_group(&mut self, cx: &mut Context<Self>) -> Div {

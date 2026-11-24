@@ -447,9 +447,18 @@ impl App {
             )
     }
 
+    fn sync_update_ui(&mut self, cx: &mut Context<Self>) {
+        let state = self.update_state.clone();
+        let available = self.available_update.clone();
+        self.preferences
+            .update(cx, |p, cx| p.set_update_state(state, available, cx));
+        self.update_menus(cx);
+        cx.notify();
+    }
+
     /// Check GitHub Releases (`ankarhem/slackless`) for a newer `YYYY.MM.DD-xx` macOS build.
     /// Silent when `manual == false`; surfaces "up to date" and errors when triggered via
-    /// `Slackless -> Check for Updates…`.
+    /// `Slackless -> Check for Updates…` or Preferences -> Advanced.
     pub(super) fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         use crate::updater::UpdateState;
         if matches!(
@@ -461,8 +470,7 @@ impl App {
         if manual {
             self.update_dismissed = None;
             self.update_state = UpdateState::Checking;
-            self.update_menus(cx);
-            cx.notify();
+            self.sync_update_ui(cx);
         }
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -474,7 +482,7 @@ impl App {
                     Ok(Some(release)) => {
                         app.available_update = Some(release.clone());
                         if !manual && app.update_dismissed.as_deref() == Some(&release.version) {
-                            app.update_menus(cx);
+                            app.sync_update_ui(cx);
                             return;
                         }
                         app.update_state = UpdateState::Available(release);
@@ -492,8 +500,7 @@ impl App {
                                 let _ = this.update(cx, |app, cx| {
                                     if matches!(app.update_state, UpdateState::UpToDate) {
                                         app.update_state = UpdateState::Idle;
-                                        app.update_menus(cx);
-                                        cx.notify();
+                                        app.sync_update_ui(cx);
                                     }
                                 });
                             })
@@ -509,8 +516,7 @@ impl App {
                         };
                     }
                 }
-                app.update_menus(cx);
-                cx.notify();
+                app.sync_update_ui(cx);
             });
         })
         .detach();
@@ -527,8 +533,7 @@ impl App {
         };
         let version = release.version.clone();
         self.update_state = UpdateState::Downloading(version);
-        self.update_menus(cx);
-        cx.notify();
+        self.sync_update_ui(cx);
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -541,8 +546,7 @@ impl App {
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to install update");
                     app.update_state = UpdateState::Error(err);
-                    app.update_menus(cx);
-                    cx.notify();
+                    app.sync_update_ui(cx);
                 }
             });
         })

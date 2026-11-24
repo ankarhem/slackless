@@ -43,6 +43,10 @@ pub enum PreferencesEvent {
     ExportNetLog,
     /// User clicked "Test speaker" in Preferences -> Audio & video (`F-COLLAB-040`).
     TestSpeaker(Option<String>),
+    /// User clicked "Check for updates" in Preferences -> Advanced (`F-SHELL-163`).
+    CheckForUpdates,
+    /// User clicked "Download & restart" in Preferences -> Advanced (`F-SHELL-163`).
+    InstallUpdate,
 }
 
 /// Snapshot of local SQLite & media cache metrics shown in Preferences -> Advanced.
@@ -760,6 +764,8 @@ pub struct Preferences {
     slack_theme_import: Entity<TextareaState>,
     storage_stats: Option<StorageInfo>,
     cli_status_note: Option<String>,
+    update_state: crate::updater::UpdateState,
+    available_update: Option<crate::updater::ReleaseInfo>,
     audio_devices: slackless_core::huddle::AudioDevices,
     cameras: Vec<slackless_core::huddle::CameraDeviceInfo>,
     audio_loading: bool,
@@ -899,6 +905,8 @@ impl Preferences {
                 slack_theme_import,
                 storage_stats: None,
                 cli_status_note: None,
+                update_state: crate::updater::UpdateState::Idle,
+                available_update: None,
                 audio_devices: slackless_core::huddle::AudioDevices::default(),
                 cameras: Vec::new(),
                 audio_loading: false,
@@ -917,6 +925,18 @@ impl Preferences {
     /// Update the local SQLite & media cache metrics shown in Preferences -> Advanced.
     pub fn set_storage_stats(&mut self, stats: Option<StorageInfo>, cx: &mut Context<Self>) {
         self.storage_stats = stats;
+        cx.notify();
+    }
+
+    /// Mirror the live auto-updater state into Preferences -> Advanced -> Software updates.
+    pub fn set_update_state(
+        &mut self,
+        state: crate::updater::UpdateState,
+        available: Option<crate::updater::ReleaseInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_state = state;
+        self.available_update = available;
         cx.notify();
     }
 

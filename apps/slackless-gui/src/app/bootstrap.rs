@@ -603,6 +603,8 @@ impl App {
                                 });
                             }
                         }
+                        PreferencesEvent::CheckForUpdates => this.check_for_updates(true, cx),
+                        PreferencesEvent::InstallUpdate => this.install_available_update(cx),
                     },
                 ),
                 cx.observe_window_appearance(window, |this: &mut App, window, cx| {
