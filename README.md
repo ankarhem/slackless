@@ -37,6 +37,22 @@ Reproducible total-system measurements (exact cumulative CPU time deltas across 
 
 ## Install (macOS App + CLI)
 
+### Prebuilt macOS release (Apple Silicon)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | bash
+```
+
+To also install the headless `slackless` CLI to `~/.local/bin/slackless`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ankarhem/slackless/main/scripts/install-macos.sh | bash -s -- --cli
+```
+
+Downloads directly from [GitHub Releases](https://github.com/ankarhem/slackless/releases), verifies `SHA256SUMS.txt`, and installs without browser quarantine prompts. Subsequent updates are handled automatically in-app (**Slackless → Check for Updates…**).
+
+### Build from source
+
 ```sh
 nix develop   # or: direnv allow
 scripts/bundle-macos.sh --install --install-cli

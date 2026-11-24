@@ -29,6 +29,7 @@ actions!(
     menu_bar,
     [
         About,
+        CheckForUpdates,
         Quit,
         Hide,
         HideOthers,
@@ -91,6 +92,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
     cx.set_menus([
         Menu::new("Slackless").items([
             MenuItem::action("About Slackless", About),
+            MenuItem::action("Check for Updates\u{2026}", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Preferences\u{2026}", OpenPreferences),
             MenuItem::separator(),

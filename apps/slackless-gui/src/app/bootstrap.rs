@@ -1446,6 +1446,8 @@ impl App {
                 sound_fetch: gpui::Task::ready(()),
                 sound_choice: None,
                 focus,
+                update_state: crate::updater::UpdateState::Idle,
+                update_dismissed: None,
                 workspace_subscriptions,
                 _subscriptions: subscriptions,
             }
@@ -1670,6 +1672,28 @@ impl App {
             app.sync_composer_placeholder(cx);
             app.update_menus(cx);
         });
+        // Background in-app auto-update check (`F-SHELL-163`) when running as an installed `.app`
+        // bundle in live mode: checks 6s after launch and every 6 hours thereafter.
+        if !app.read(cx).fixtures.sample && crate::updater::current_app_bundle().is_some() {
+            let upd_app = app.downgrade();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(Duration::from_secs(6)).await;
+                loop {
+                    let keep = upd_app
+                        .update(cx, |app, cx| {
+                            app.check_for_updates(false, cx);
+                        })
+                        .is_ok();
+                    if !keep {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_secs(6 * 60 * 60))
+                        .await;
+                }
+            })
+            .detach();
+        }
         app
     }
 }

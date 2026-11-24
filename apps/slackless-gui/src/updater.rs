@@ -1,0 +1,398 @@
+//! In-app auto-updater (`F-SHELL-163`) backed by GitHub Releases (`ankarhem/slackless`).
+//!
+//! Checks `https://api.github.com/repos/ankarhem/slackless/releases/latest` for newer
+//! `YYYY.MM.DD-xx` releases, verifies `SHA256SUMS.txt`, atomically swaps the running `.app`
+//! bundle in place without setting `com.apple.quarantine`, and relaunches Slackless.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::Deserialize;
+
+use crate::blockkit::serde_json;
+
+/// GitHub repository hosting official Slackless releases.
+pub const RELEASES_REPO: &str = "ankarhem/slackless";
+
+/// Release version embedded at build time (`SLACKLESS_VERSION` in CI, falling back to Cargo.toml).
+pub const CURRENT_VERSION: &str = match option_env!("SLACKLESS_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
+/// Metadata for an available GitHub Release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseInfo {
+    pub version: String,
+    pub html_url: String,
+    pub asset_name: String,
+    pub download_url: String,
+    pub sha256_url: Option<String>,
+}
+
+/// UI state for the top update banner and `Slackless -> Check for Updates…`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    Available(ReleaseInfo),
+    Downloading(String),
+    UpToDate,
+    Error(String),
+}
+
+#[derive(Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    html_url: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GhAsset>,
+}
+
+#[derive(Deserialize)]
+struct GhAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// Parse a `YYYY.MM.DD-xx`, `YYYY.MM.DD.xx`, or `major.minor.patch` version into a comparable tuple.
+pub fn parse_version(raw: &str) -> Option<(u32, u32, u32, u32)> {
+    let s = raw.trim().trim_start_matches('v');
+    if s.is_empty() {
+        return None;
+    }
+    // Split `YYYY.MM.DD-xx` first if `-` is present.
+    let (base, seq) = match s.split_once('-') {
+        Some((lhs, rhs)) => {
+            let seq = rhs.parse::<u32>().ok()?;
+            (lhs, Some(seq))
+        }
+        None => (s, None),
+    };
+    let nums: Vec<u32> = base
+        .split('.')
+        .map(|part| part.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    match (nums.as_slice(), seq) {
+        (&[y, m, d], Some(n)) => Some((y, m, d, n)),
+        (&[y, m, d, n], None) => Some((y, m, d, n)),
+        (&[maj, min, patch], None) => Some((maj, min, patch, 0)),
+        _ => None,
+    }
+}
+
+/// Returns `true` if `latest` is strictly newer than `current`.
+pub fn is_newer_version(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => latest.trim() != current.trim() && !latest.trim().is_empty(),
+    }
+}
+
+/// Locate the `.app` bundle containing the currently running executable (macOS only).
+/// Returns `None` when running unbundled (e.g. `cargo run`).
+pub fn current_app_bundle() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().ok()?;
+        let macos_dir = exe.parent()?;
+        if macos_dir.file_name()?.to_str()? != "MacOS" {
+            return None;
+        }
+        let contents_dir = macos_dir.parent()?;
+        if contents_dir.file_name()?.to_str()? != "Contents" {
+            return None;
+        }
+        let app_dir = contents_dir.parent()?;
+        if app_dir.extension()?.to_str()? != "app" {
+            return None;
+        }
+        Some(app_dir.to_path_buf())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Return the installed app's version string (prefers `SLACKLESS_VERSION` compiled into the binary;
+/// falls back to reading `CFBundleShortVersionString` from `Info.plist` when running bundled).
+pub fn installed_version() -> String {
+    if CURRENT_VERSION != "0.1.0" {
+        return CURRENT_VERSION.to_owned();
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(app) = current_app_bundle() {
+        let plist = app.join("Contents/Info.plist");
+        if let Ok(out) = Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleShortVersionString"])
+            .arg(&plist)
+            .output()
+        {
+            if out.status.success() {
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+    }
+    CURRENT_VERSION.to_owned()
+}
+
+/// Query GitHub Releases for the latest macOS arm64 release.
+/// Returns `Ok(Some(info))` if a newer version is available, `Ok(None)` if already up to date.
+pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
+    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
+    let ua = format!("Slackless/{CURRENT_VERSION}");
+    let out = Command::new("/usr/bin/curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "10",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            &format!("User-Agent: {ua}"),
+            &url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("GitHub API request failed (status {})", out.status)
+        } else {
+            stderr
+        });
+    }
+
+    let rel: GhRelease = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("invalid GitHub release JSON: {e}"))?;
+    if rel.draft || rel.prerelease {
+        return Ok(None);
+    }
+
+    let current = installed_version();
+    if !is_newer_version(&rel.tag_name, &current) {
+        return Ok(None);
+    }
+
+    let expected_name = format!("Slackless-{}-macos-arm64.app.tar.gz", rel.tag_name);
+    let asset = rel
+        .assets
+        .iter()
+        .find(|a| a.name == expected_name)
+        .or_else(|| {
+            rel.assets
+                .iter()
+                .find(|a| a.name.ends_with("-macos-arm64.app.tar.gz"))
+        })
+        .ok_or_else(|| format!("release {} has no macOS arm64 app archive", rel.tag_name))?;
+
+    let sha256_url = rel
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS.txt")
+        .map(|a| a.browser_download_url.clone());
+
+    Ok(Some(ReleaseInfo {
+        version: rel.tag_name,
+        html_url: rel.html_url,
+        asset_name: asset.name.clone(),
+        download_url: asset.browser_download_url.clone(),
+        sha256_url,
+    }))
+}
+
+fn verify_sha256(archive_path: &Path, expected_hex: &str) -> Result<(), String> {
+    let out = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(archive_path)
+        .output()
+        .map_err(|e| format!("failed to run shasum: {e}"))?;
+    if !out.status.success() {
+        return Err("shasum verification failed".to_owned());
+    }
+    let actual = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let expected = expected_hex.trim().to_ascii_lowercase();
+    if actual != expected {
+        return Err(format!(
+            "SHA-256 mismatch (expected {expected}, got {actual})"
+        ));
+    }
+    Ok(())
+}
+
+/// Download `release`, verify its SHA-256 checksum, extract `Slackless.app`, and spawn a detached
+/// swap-and-relaunch helper that waits for this PID to exit. Caller should immediately quit the
+/// app (`cx.quit()`) upon `Ok(())`.
+#[cfg(target_os = "macos")]
+pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
+    let target_app = current_app_bundle().unwrap_or_else(|| {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        let sys_apps = PathBuf::from("/Applications/Slackless.app");
+        if sys_apps.exists() {
+            sys_apps
+        } else {
+            home.join("Applications/Slackless.app")
+        }
+    });
+    let parent = target_app
+        .parent()
+        .ok_or_else(|| "cannot determine Applications directory".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("cannot write to {}: {e}", parent.display()))?;
+
+    let stage_dir = parent.join(format!(".slackless-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    std::fs::create_dir_all(&stage_dir).map_err(|e| {
+        format!(
+            "cannot create staging directory in {}: {e}",
+            parent.display()
+        )
+    })?;
+
+    let result = (|| -> Result<PathBuf, String> {
+        let archive = stage_dir.join(&release.asset_name);
+        let dl = Command::new("/usr/bin/curl")
+            .args(["-fsSL", "--max-time", "180", "-o"])
+            .arg(&archive)
+            .arg(&release.download_url)
+            .status()
+            .map_err(|e| format!("download failed: {e}"))?;
+        if !dl.success() {
+            return Err(format!("download failed (curl exited {})", dl));
+        }
+
+        if let Some(sums_url) = &release.sha256_url {
+            let sums_out = Command::new("/usr/bin/curl")
+                .args(["-fsSL", "--max-time", "15", sums_url])
+                .output()
+                .map_err(|e| format!("failed to fetch SHA256SUMS.txt: {e}"))?;
+            if !sums_out.status.success() {
+                return Err("failed to fetch SHA256SUMS.txt".to_owned());
+            }
+            let sums_text = String::from_utf8_lossy(&sums_out.stdout);
+            if let Some(expected) = sums_text.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                let hash = parts.next()?;
+                let name = parts.next()?.trim_start_matches('*');
+                (name == release.asset_name).then_some(hash)
+            }) {
+                verify_sha256(&archive, expected)?;
+            }
+        }
+
+        let extract = Command::new("/usr/bin/tar")
+            .args(["-xzf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage_dir)
+            .status()
+            .map_err(|e| format!("failed to extract update archive: {e}"))?;
+        if !extract.success() {
+            return Err("failed to extract update archive".to_owned());
+        }
+
+        let new_app = stage_dir.join("Slackless.app");
+        if !new_app.join("Contents/MacOS/slackless-gui").is_file() {
+            return Err("update archive did not contain Slackless.app".to_owned());
+        }
+        let _ = Command::new("/usr/bin/xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(&new_app)
+            .status();
+        Ok(new_app)
+    })();
+
+    let new_app = match result {
+        Ok(app) => app,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            return Err(err);
+        }
+    };
+
+    // Spawn a detached shell script that waits for our PID to exit cleanly, atomically swaps the
+    // `.app` bundle (with rollback on error), registers LaunchServices, and relaunches Slackless.
+    let script = r#"
+PID="$1"
+NEW_APP="$2"
+DEST="$3"
+STAGE="$4"
+i=0
+while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 150 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+rm -rf "${DEST}.prev"
+if [ -d "$DEST" ]; then
+  mv "$DEST" "${DEST}.prev" 2>/dev/null || true
+fi
+if mv "$NEW_APP" "$DEST"; then
+  rm -rf "${DEST}.prev"
+else
+  if [ -d "${DEST}.prev" ]; then
+    mv "${DEST}.prev" "$DEST" 2>/dev/null || true
+  fi
+  rm -rf "$STAGE"
+  exit 1
+fi
+rm -rf "$STAGE"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST" >/dev/null 2>&1 || true
+open "$DEST"
+"#;
+
+    Command::new("/bin/sh")
+        .args(["-c", script, "slackless-updater"])
+        .arg(std::process::id().to_string())
+        .arg(&new_app)
+        .arg(&target_app)
+        .arg(&stage_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&stage_dir);
+            format!("failed to launch updater helper: {e}")
+        })?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn download_and_schedule_swap(_release: &ReleaseInfo) -> Result<(), String> {
+    Err("in-app updates are currently supported on macOS only".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calver_and_semver_comparison_works() {
+        assert_eq!(parse_version("2026.11.24-01"), Some((2026, 11, 24, 1)));
+        assert_eq!(parse_version("2026.11.24-12"), Some((2026, 11, 24, 12)));
+        assert_eq!(parse_version("0.1.0"), Some((0, 1, 0, 0)));
+
+        assert!(is_newer_version("2026.11.24-01", "0.1.0"));
+        assert!(is_newer_version("2026.11.24-02", "2026.11.24-01"));
+        assert!(is_newer_version("2026.11.24-10", "2026.11.24-09"));
+        assert!(is_newer_version("2026.11.25-01", "2026.11.24-99"));
+        assert!(!is_newer_version("2026.11.24-01", "2026.11.24-01"));
+        assert!(!is_newer_version("2026.11.24-01", "2026.11.24-02"));
+    }
+}

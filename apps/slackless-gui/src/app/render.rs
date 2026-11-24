@@ -97,6 +97,7 @@ impl Render for App {
                 .then(|| bookmarks::bar(bookmark_list, pin_count, self.pins_open, clicks, cx));
             let column = v_flex()
                 .size_full()
+                .children(self.update_banner(cx))
                 .children(self.connection_banner(cx))
                 .children(self.failed_mutations_banner(cx))
                 .child(header);
@@ -537,6 +538,11 @@ impl Render for App {
             .on_action(cx.listener(|this, _: &OpenPreferences, window, cx| {
                 this.open_preferences(None, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::menu_bar::CheckForUpdates, _, cx| {
+                    this.check_for_updates(true, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &ShowShortcuts, window, cx| this.open_shortcuts(window, cx)),
             )

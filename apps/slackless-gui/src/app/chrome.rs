@@ -447,6 +447,287 @@ impl App {
             )
     }
 
+    /// Check GitHub Releases (`ankarhem/slackless`) for a newer `YYYY.MM.DD-xx` macOS build.
+    /// Silent when `manual == false`; surfaces "up to date" and errors when triggered via
+    /// `Slackless -> Check for Updates…`.
+    pub(super) fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        use crate::updater::UpdateState;
+        if matches!(
+            self.update_state,
+            UpdateState::Checking | UpdateState::Downloading(_)
+        ) {
+            return;
+        }
+        if manual {
+            self.update_dismissed = None;
+            self.update_state = UpdateState::Checking;
+            cx.notify();
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::updater::check_for_update() })
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                match result {
+                    Ok(Some(release)) => {
+                        if !manual && app.update_dismissed.as_deref() == Some(&release.version) {
+                            return;
+                        }
+                        app.update_state = UpdateState::Available(release);
+                    }
+                    Ok(None) => {
+                        app.update_state = if manual {
+                            UpdateState::UpToDate
+                        } else {
+                            UpdateState::Idle
+                        };
+                        if manual {
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(Duration::from_secs(5)).await;
+                                let _ = this.update(cx, |app, cx| {
+                                    if matches!(app.update_state, UpdateState::UpToDate) {
+                                        app.update_state = UpdateState::Idle;
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "auto-update check failed");
+                        app.update_state = if manual {
+                            UpdateState::Error(err)
+                        } else {
+                            UpdateState::Idle
+                        };
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Download, verify SHA-256, atomically swap the running `.app`, and relaunch (`F-SHELL-163`).
+    pub(super) fn install_available_update(&mut self, cx: &mut Context<Self>) {
+        use crate::updater::UpdateState;
+        let UpdateState::Available(release) = self.update_state.clone() else {
+            return;
+        };
+        let version = release.version.clone();
+        self.update_state = UpdateState::Downloading(version);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { crate::updater::download_and_schedule_swap(&release) })
+                .await;
+            let _ = this.update(cx, |app, cx| match res {
+                Ok(()) => {
+                    cx.quit();
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to install update");
+                    app.update_state = UpdateState::Error(err);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Slim banner shown at the top of the window when a newer GitHub Release is available
+    /// (or while checking / downloading via `Slackless -> Check for Updates…`).
+    pub(super) fn update_banner(&self, cx: &Context<Self>) -> Option<Div> {
+        use crate::updater::{UpdateState, installed_version};
+        let theme = cx.theme();
+        let (primary, fg, muted, danger, success) = (
+            theme.primary,
+            theme.foreground,
+            theme.muted_foreground,
+            theme.danger,
+            theme.success,
+        );
+        match &self.update_state {
+            UpdateState::Idle => None,
+            UpdateState::Checking => Some(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1p5()
+                    .bg(primary.opacity(0.12))
+                    .border_b_1()
+                    .border_color(primary.opacity(0.28))
+                    .child(
+                        Icon::new(IconName::RefreshCw)
+                            .size(px(13.))
+                            .text_color(primary),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(fg)
+                            .child("Checking for Slackless updates…"),
+                    ),
+            ),
+            UpdateState::UpToDate => Some(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1p5()
+                    .bg(success.opacity(0.14))
+                    .border_b_1()
+                    .border_color(success.opacity(0.30))
+                    .child(Icon::new(IconName::Check).size(px(13.)).text_color(success))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(fg)
+                            .child(format!("Slackless {} is up to date.", installed_version())),
+                    )
+                    .child(
+                        Button::new("update-banner-dismiss")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_state = UpdateState::Idle;
+                                cx.notify();
+                            })),
+                    ),
+            ),
+            UpdateState::Downloading(ver) => Some(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1p5()
+                    .bg(primary.opacity(0.16))
+                    .border_b_1()
+                    .border_color(primary.opacity(0.32))
+                    .child(
+                        Icon::new(IconName::Download)
+                            .size(px(13.))
+                            .text_color(primary),
+                    )
+                    .child(div().text_xs().text_color(fg).child(format!(
+                        "Downloading and verifying Slackless {ver}… will restart automatically."
+                    ))),
+            ),
+            UpdateState::Available(rel) => {
+                let ver = rel.version.clone();
+                let notes_url = rel.html_url.clone();
+                let dismiss_ver = ver.clone();
+                Some(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .gap_2p5()
+                        .px_4()
+                        .py_1p5()
+                        .bg(primary.opacity(0.16))
+                        .border_b_1()
+                        .border_color(primary.opacity(0.32))
+                        .child(
+                            Icon::new(IconName::Download)
+                                .size(px(14.))
+                                .text_color(primary),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child(format!("Slackless {ver} is available")),
+                        )
+                        .child(
+                            Button::new("update-banner-install")
+                                .primary()
+                                .with_size(Size::XSmall)
+                                .label("Update & Restart")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.install_available_update(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("update-banner-notes")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .label("Release notes")
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&notes_url);
+                                }),
+                        )
+                        .child(
+                            Button::new("update-banner-dismiss")
+                                .ghost()
+                                .with_size(Size::XSmall)
+                                .icon(IconName::Close)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_dismissed = Some(dismiss_ver.clone());
+                                    this.update_state = UpdateState::Idle;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            }
+            UpdateState::Error(msg) => Some(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1p5()
+                    .bg(danger.opacity(0.14))
+                    .border_b_1()
+                    .border_color(danger.opacity(0.32))
+                    .child(
+                        Icon::new(IconName::TriangleAlert)
+                            .size(px(13.))
+                            .text_color(danger),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(fg)
+                            .child(format!("Update check failed: {msg}")),
+                    )
+                    .child(
+                        Button::new("update-banner-retry")
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_for_updates(true, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("update-banner-close-err")
+                            .ghost()
+                            .with_size(Size::XSmall)
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_state = UpdateState::Idle;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_xs().text_color(muted)),
+            ),
+        }
+    }
+
     /// Offline / reconnecting notice at the top of the conversation column while Slack's RTM
     /// socket is dropped (`F-SHELL-169`). Also displays the number of queued outgoing mutations
     /// that will automatically flush on reconnect. Hidden once connected and drained.

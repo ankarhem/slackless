@@ -758,6 +758,10 @@ pub struct App {
     sound_choice: Option<usize>,
     /// Root focus target, so Cmd+K / Cmd+, reach the root with nothing else focused.
     focus: FocusHandle,
+    /// In-app GitHub Releases auto-updater state (`F-SHELL-163`).
+    update_state: crate::updater::UpdateState,
+    /// Version tag dismissed by the user for the current session.
+    update_dismissed: Option<String>,
     /// Subscriptions to the shown workspace's views (parked with them on a switch).
     workspace_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,

@@ -71,6 +71,7 @@ mod threads_view;
 mod thumbnail;
 mod tools_page;
 mod unreads;
+mod updater;
 mod zoom;
 
 use std::sync::Arc;
