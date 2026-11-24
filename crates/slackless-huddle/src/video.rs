@@ -8,9 +8,13 @@ use std::time::Duration;
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType};
+use openh264::OpenH264API;
 use openh264::decoder::Decoder as H264Decoder;
-use openh264::encoder::Encoder as H264Encoder;
-use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSource as _};
+use openh264::encoder::{
+    BitRate, Complexity, Encoder as H264Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
+    RateControlMode, UsageType,
+};
+use openh264::formats::{RgbSliceU8, YUVBuffer, YUVSlices, YUVSource as _};
 use slackless_types::UserId;
 use tokio::sync::mpsc;
 use webrtc::rtp::codecs::h264::H264Packet;
@@ -18,9 +22,9 @@ use webrtc::rtp::packetizer::Depacketizer as _;
 
 use crate::{HuddleError, Result};
 
-/// Maximum dimensions for webcam capture (even numbers required for YUV420).
-pub const CAMERA_MAX_W: u32 = 640;
-pub const CAMERA_MAX_H: u32 = 360;
+/// Maximum dimensions for webcam capture (720p, even numbers required for YUV420).
+pub const CAMERA_MAX_W: u32 = 1280;
+pub const CAMERA_MAX_H: u32 = 720;
 
 /// One decoded or captured video frame in BGRA8888 byte order (ready for GPUI `RenderImage`).
 #[derive(Debug, Clone)]
@@ -73,18 +77,55 @@ pub fn list_cameras() -> Vec<CameraDeviceInfo> {
         .collect()
 }
 
-/// Encode RGB888 frames into Annex-B H.264 NAL units via Cisco OpenH264.
+/// Encode RGB888 or I420 YUV frames into Annex-B H.264 NAL units via Cisco OpenH264.
 pub struct H264VideoEncoder {
     encoder: H264Encoder,
     frame_count: u64,
+    keyframe_interval: u64,
 }
 
 impl H264VideoEncoder {
+    /// Camera-tuned H.264 encoder (1.5 Mbps, 24 fps, multi-threaded).
     pub fn new() -> Result<Self> {
-        let encoder = H264Encoder::new().map_err(|e| HuddleError::Codec(e.to_string()))?;
+        Self::new_camera()
+    }
+
+    pub fn new_camera() -> Result<Self> {
+        let cfg = EncoderConfig::new()
+            .usage_type(UsageType::CameraVideoRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(1_500_000))
+            .max_frame_rate(FrameRate::from_hz(24.0))
+            .complexity(Complexity::Low)
+            .num_threads(2)
+            .skip_frames(true)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(72));
+        let encoder = H264Encoder::with_api_config(OpenH264API::from_source(), cfg)
+            .map_err(|e| HuddleError::Codec(e.to_string()))?;
         Ok(Self {
             encoder,
             frame_count: 0,
+            keyframe_interval: 72,
+        })
+    }
+
+    /// Screen-content-tuned H.264 encoder (`ScreenContentRealTime`, 2.8 Mbps, 20 fps, sharp text).
+    pub fn new_screen() -> Result<Self> {
+        let cfg = EncoderConfig::new()
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .bitrate(BitRate::from_bps(2_800_000))
+            .max_frame_rate(FrameRate::from_hz(20.0))
+            .complexity(Complexity::Low)
+            .num_threads(2)
+            .skip_frames(true)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(100));
+        let encoder = H264Encoder::with_api_config(OpenH264API::from_source(), cfg)
+            .map_err(|e| HuddleError::Codec(e.to_string()))?;
+        Ok(Self {
+            encoder,
+            frame_count: 0,
+            keyframe_interval: 100,
         })
     }
 
@@ -95,7 +136,7 @@ impl H264VideoEncoder {
 
     /// Encode one RGB888 frame (dimensions MUST be even) into Annex-B H.264 bytes.
     pub fn encode_rgb(&mut self, rgb: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
-        if self.frame_count.is_multiple_of(30) {
+        if self.frame_count.is_multiple_of(self.keyframe_interval) {
             self.encoder.force_intra_frame();
         }
         self.frame_count = self.frame_count.wrapping_add(1);
@@ -106,10 +147,34 @@ impl H264VideoEncoder {
             .map_err(|e| HuddleError::Codec(e.to_string()))?;
         Ok(bs.to_vec())
     }
+
+    /// Encode one planar I420 YUV420 frame directly (zero intermediate RGB allocation).
+    pub fn encode_i420(
+        &mut self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<u8>> {
+        if self.frame_count.is_multiple_of(self.keyframe_interval) {
+            self.encoder.force_intra_frame();
+        }
+        self.frame_count = self.frame_count.wrapping_add(1);
+        let slices = YUVSlices::new((y, u, v), (width, height), (width, width / 2, width / 2));
+        let bs = self
+            .encoder
+            .encode(&slices)
+            .map_err(|e| HuddleError::Codec(e.to_string()))?;
+        Ok(bs.to_vec())
+    }
 }
 
 /// Depacketize RTP H.264 payloads (Single NAL, STAP-A, FU-A) and decode to BGRA8888 [`VideoFrame`].
+/// Uses Apple Silicon `VideoToolbox` hardware decoding on macOS with automatic OpenH264 fallback.
 pub struct H264VideoDecoder {
+    #[cfg(target_os = "macos")]
+    vt: Option<crate::macos_media::VtH264Decoder>,
     decoder: H264Decoder,
     depacketizer: H264Packet,
     annex_b_buf: Vec<u8>,
@@ -118,11 +183,23 @@ pub struct H264VideoDecoder {
 impl H264VideoDecoder {
     pub fn new() -> Result<Self> {
         let decoder = H264Decoder::new().map_err(|e| HuddleError::Codec(e.to_string()))?;
+        #[cfg(target_os = "macos")]
+        let vt = crate::macos_media::VtH264Decoder::new().ok();
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            vt,
             decoder,
             depacketizer: H264Packet::default(),
             annex_b_buf: Vec::with_capacity(64 * 1024),
         })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        if self.vt.is_some() {
+            return "H.264 (VideoToolbox HW)";
+        }
+        "H.264 (OpenH264 SW)"
     }
 
     /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit).
@@ -136,13 +213,21 @@ impl H264VideoDecoder {
         if !marker || self.annex_b_buf.is_empty() {
             return None;
         }
-        let frame = self.decode_annex_b(&self.annex_b_buf.clone());
+        let bitstream = std::mem::take(&mut self.annex_b_buf);
+        let frame = self.decode_annex_b(&bitstream);
+        self.annex_b_buf = bitstream;
         self.annex_b_buf.clear();
         frame
     }
 
     /// Decode a complete Annex-B H.264 access unit into a BGRA8888 [`VideoFrame`].
     pub fn decode_annex_b(&mut self, bitstream: &[u8]) -> Option<VideoFrame> {
+        #[cfg(target_os = "macos")]
+        if let Some(vt) = self.vt.as_mut() {
+            if let Some(frame) = vt.decode_annex_b(bitstream) {
+                return Some(frame);
+            }
+        }
         let yuv = self.decoder.decode(bitstream).ok()??;
         let (w, h) = yuv.dimensions();
         if w == 0 || h == 0 {
@@ -162,8 +247,8 @@ impl H264VideoDecoder {
     }
 }
 
-/// Fast bilinear/nearest downscale of an RGB888 buffer into even `(dst_w, dst_h)` dimensions
-/// fitting within `(max_w, max_h)`.
+/// Area-averaged box downscale of an RGB888 buffer into even `(dst_w, dst_h)` dimensions
+/// fitting within `(max_w, max_h)` — preserves crisp text and avoids nearest-neighbor aliasing.
 pub fn resize_rgb_even(
     rgb: &[u8],
     src_w: u32,
@@ -182,19 +267,164 @@ pub fn resize_rgb_even(
     if dst_w == src_w && dst_h == src_h {
         return (rgb.to_vec(), src_w, src_h);
     }
-    let mut out = vec![0u8; (dst_w * dst_h * 3) as usize];
-    for y in 0..dst_h {
-        let sy = ((y as u64 * src_h as u64) / dst_h as u64).min(src_h as u64 - 1) as usize;
-        for x in 0..dst_w {
-            let sx = ((x as u64 * src_w as u64) / dst_w as u64).min(src_w as u64 - 1) as usize;
-            let s_off = (sy * src_w as usize + sx) * 3;
-            let d_off = (y as usize * dst_w as usize + x as usize) * 3;
-            if s_off + 3 <= rgb.len() {
-                out[d_off..d_off + 3].copy_from_slice(&rgb[s_off..s_off + 3]);
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+    let mut out = vec![0u8; dw * dh * 3];
+    for y in 0..dh {
+        let sy0 = (y * sh) / dh;
+        let sy1 = (((y + 1) * sh) / dh).max(sy0 + 1).min(sh);
+        for x in 0..dw {
+            let sx0 = (x * sw) / dw;
+            let sx1 = (((x + 1) * sw) / dw).max(sx0 + 1).min(sw);
+            let mut r_sum = 0u32;
+            let mut g_sum = 0u32;
+            let mut b_sum = 0u32;
+            let mut cnt = 0u32;
+            for sy in sy0..sy1 {
+                let row = sy * sw;
+                for sx in sx0..sx1 {
+                    let off = (row + sx) * 3;
+                    if off + 3 <= rgb.len() {
+                        r_sum += rgb[off] as u32;
+                        g_sum += rgb[off + 1] as u32;
+                        b_sum += rgb[off + 2] as u32;
+                        cnt += 1;
+                    }
+                }
+            }
+            if let Some(r) = r_sum.checked_div(cnt) {
+                let d_off = (y * dw + x) * 3;
+                out[d_off] = r as u8;
+                out[d_off + 1] = g_sum.checked_div(cnt).unwrap_or(0) as u8;
+                out[d_off + 2] = b_sum.checked_div(cnt).unwrap_or(0) as u8;
             }
         }
     }
     (out, dst_w, dst_h)
+}
+
+/// Reusable scratch buffers for single-pass area-averaged RGBA -> BGRA + I420 downscaling
+/// (zero per-frame heap churn for software screen sharing).
+#[derive(Default)]
+pub struct ScreenScaleScratch {
+    pub bgra: Vec<u8>,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+/// Single-pass integer area-averaged downscale directly from RGBA8888 into BGRA8888 (for preview)
+/// and planar I420 YUV (for OpenH264), returning `(dst_w, dst_h)`.
+pub fn downscale_rgba_area_to_bgra_and_i420(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    max_w: u32,
+    max_h: u32,
+    scratch: &mut ScreenScaleScratch,
+) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || rgba.len() < (src_w as usize * src_h as usize * 4) {
+        return (0, 0);
+    }
+    let scale = (max_w as f32 / src_w as f32)
+        .min(max_h as f32 / src_h as f32)
+        .min(1.0);
+    let dst_w = (((src_w as f32 * scale) as u32) & !1).max(2);
+    let dst_h = (((src_h as f32 * scale) as u32) & !1).max(2);
+    let sw = src_w as usize;
+    let sh = src_h as usize;
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+
+    scratch.bgra.resize(dw * dh * 4, 0);
+    scratch.y.resize(dw * dh, 0);
+    let cw = dw / 2;
+    let ch = dh / 2;
+    scratch.u.resize(cw * ch, 128);
+    scratch.v.resize(cw * ch, 128);
+
+    // Precompute source x intervals once per frame.
+    let mut x_bounds = Vec::with_capacity(dw);
+    for x in 0..dw {
+        let sx0 = (x * sw) / dw;
+        let sx1 = (((x + 1) * sw) / dw).max(sx0 + 1).min(sw);
+        x_bounds.push((sx0, sx1));
+    }
+
+    for y in 0..dh {
+        let sy0 = (y * sh) / dh;
+        let sy1 = (((y + 1) * sh) / dh).max(sy0 + 1).min(sh);
+        let dy_row = y * dw;
+        for (x, &(sx0, sx1)) in x_bounds.iter().enumerate() {
+            let mut r_sum = 0u32;
+            let mut g_sum = 0u32;
+            let mut b_sum = 0u32;
+            let cnt = ((sy1 - sy0) * (sx1 - sx0)) as u32;
+            for sy in sy0..sy1 {
+                let row_off = sy * sw;
+                for sx in sx0..sx1 {
+                    let off = (row_off + sx) * 4;
+                    r_sum += rgba[off] as u32;
+                    g_sum += rgba[off + 1] as u32;
+                    b_sum += rgba[off + 2] as u32;
+                }
+            }
+            let r = (r_sum / cnt) as i32;
+            let g = (g_sum / cnt) as i32;
+            let b = (b_sum / cnt) as i32;
+
+            let px_idx = dy_row + x;
+            let boff = px_idx * 4;
+            scratch.bgra[boff] = b as u8;
+            scratch.bgra[boff + 1] = g as u8;
+            scratch.bgra[boff + 2] = r as u8;
+            scratch.bgra[boff + 3] = 255;
+
+            // BT.601 studio-swing integer Y.
+            let y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            scratch.y[px_idx] = y_val.clamp(0, 255) as u8;
+        }
+    }
+
+    // 2x2 chroma planes from the already anti-aliased BGRA buffer.
+    for cy in 0..ch {
+        let y0 = cy * 2;
+        let y1 = y0 + 1;
+        let c_row = cy * cw;
+        for cx in 0..cw {
+            let x0 = cx * 2;
+            let p00 = (y0 * dw + x0) * 4;
+            let p01 = p00 + 4;
+            let p10 = (y1 * dw + x0) * 4;
+            let p11 = p10 + 4;
+            let b = (scratch.bgra[p00] as i32
+                + scratch.bgra[p01] as i32
+                + scratch.bgra[p10] as i32
+                + scratch.bgra[p11] as i32
+                + 2)
+                >> 2;
+            let g = (scratch.bgra[p00 + 1] as i32
+                + scratch.bgra[p01 + 1] as i32
+                + scratch.bgra[p10 + 1] as i32
+                + scratch.bgra[p11 + 1] as i32
+                + 2)
+                >> 2;
+            let r = (scratch.bgra[p00 + 2] as i32
+                + scratch.bgra[p01 + 2] as i32
+                + scratch.bgra[p10 + 2] as i32
+                + scratch.bgra[p11 + 2] as i32
+                + 2)
+                >> 2;
+            let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+            let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            scratch.u[c_row + cx] = u.clamp(0, 255) as u8;
+            scratch.v[c_row + cx] = v.clamp(0, 255) as u8;
+        }
+    }
+
+    (dst_w, dst_h)
 }
 
 /// Convert RGB888 into BGRA8888 for GPUI `RenderImage`.

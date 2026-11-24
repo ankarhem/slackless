@@ -312,8 +312,8 @@ impl Drop for Av1Decoder {
     }
 }
 
-/// Convert an 8-bit or 10-bit `Dav1dPicture` (`I420`, `I422`, `I444`, or `I400`) into a BGRA8888
-/// [`VideoFrame`] for GPUI.
+/// Fast integer fixed-point conversion of an 8-bit or 10-bit `Dav1dPicture` (`I420`, `I422`,
+/// `I444`, or `I400`) into a BGRA8888 [`VideoFrame`] for GPUI.
 unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
     let w = pic.p.w.max(0) as usize;
     let h = pic.p.h.max(0) as usize;
@@ -343,52 +343,109 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
     };
     let y_stride = pic.stride[0];
     let c_stride = pic.stride[1];
-    let shift16 = (bpc - 8) as u32;
-
     let mut bgra = vec![0u8; w * h * 4];
+
+    #[inline(always)]
+    fn write_yuv_pixel(dst: &mut [u8], y: i32, u: i32, v: i32) {
+        let c = y - 16;
+        let d = u - 128;
+        let e = v - 128;
+        let yy = 298 * c + 128;
+        let r = (yy + 409 * e) >> 8;
+        let g = (yy - 100 * d - 208 * e) >> 8;
+        let b = (yy + 516 * d) >> 8;
+        dst[0] = b.clamp(0, 255) as u8;
+        dst[1] = g.clamp(0, 255) as u8;
+        dst[2] = r.clamp(0, 255) as u8;
+        dst[3] = 255;
+    }
+
+    // Hot path: 8-bit 4:2:0 processed in 2x2 blocks sharing chroma loads (zero float math).
+    if bpc == 8 && layout == DAV1D_PIXEL_LAYOUT_I420 {
+        if let (Some(up), Some(vp)) = (u_ptr, v_ptr) {
+            let pairs_h = h & !1;
+            let pairs_w = w & !1;
+            for row in (0..pairs_h).step_by(2) {
+                let y_row0 = (row as isize) * y_stride;
+                let y_row1 = ((row + 1) as isize) * y_stride;
+                let c_row = ((row >> 1) as isize) * c_stride;
+                let out_row0 = row * w * 4;
+                let out_row1 = (row + 1) * w * 4;
+                for col in (0..pairs_w).step_by(2) {
+                    let cx = (col >> 1) as isize;
+                    let u = unsafe { *up.offset(c_row + cx) } as i32;
+                    let v = unsafe { *vp.offset(c_row + cx) } as i32;
+                    let d = u - 128;
+                    let e = v - 128;
+                    let r_add = 409 * e + 128;
+                    let g_add = -100 * d - 208 * e + 128;
+                    let b_add = 516 * d + 128;
+
+                    let c00 = (unsafe { *y_ptr.offset(y_row0 + col as isize) } as i32 - 16) * 298;
+                    let c01 =
+                        (unsafe { *y_ptr.offset(y_row0 + (col + 1) as isize) } as i32 - 16) * 298;
+                    let c10 = (unsafe { *y_ptr.offset(y_row1 + col as isize) } as i32 - 16) * 298;
+                    let c11 =
+                        (unsafe { *y_ptr.offset(y_row1 + (col + 1) as isize) } as i32 - 16) * 298;
+
+                    let o00 = out_row0 + col * 4;
+                    let o01 = o00 + 4;
+                    let o10 = out_row1 + col * 4;
+                    let o11 = o10 + 4;
+
+                    for (o, cy) in [(o00, c00), (o01, c01), (o10, c10), (o11, c11)] {
+                        bgra[o] = ((cy + b_add) >> 8).clamp(0, 255) as u8;
+                        bgra[o + 1] = ((cy + g_add) >> 8).clamp(0, 255) as u8;
+                        bgra[o + 2] = ((cy + r_add) >> 8).clamp(0, 255) as u8;
+                        bgra[o + 3] = 255;
+                    }
+                }
+            }
+            if pairs_h == h && pairs_w == w {
+                return Some(VideoFrame {
+                    width: w as u32,
+                    height: h as u32,
+                    bgra: Arc::new(bgra),
+                });
+            }
+        }
+    }
+
+    let shift16 = (bpc - 8) as u32;
     for row in 0..h {
         let y_row = (row as isize) * y_stride;
         let c_row = ((row >> ch_shift) as isize) * c_stride;
+        let out_row = row * w * 4;
         for col in 0..w {
             let (y, u, v) = if bpc == 8 {
-                let y = unsafe { *y_ptr.offset(y_row + col as isize) } as f32;
+                let y = unsafe { *y_ptr.offset(y_row + col as isize) } as i32;
                 let (u, v) = match (u_ptr, v_ptr) {
                     (Some(up), Some(vp)) => {
                         let cx = (col >> cw_shift) as isize;
                         (
-                            unsafe { *up.offset(c_row + cx) } as f32 - 128.0,
-                            unsafe { *vp.offset(c_row + cx) } as f32 - 128.0,
+                            unsafe { *up.offset(c_row + cx) } as i32,
+                            unsafe { *vp.offset(c_row + cx) } as i32,
                         )
                     }
-                    _ => (0.0, 0.0),
+                    _ => (128, 128),
                 };
                 (y, u, v)
             } else {
                 let y16 = unsafe { *(y_ptr.offset(y_row) as *const u16).add(col) };
-                let y = (y16 >> shift16) as f32;
+                let y = (y16 >> shift16) as i32;
                 let (u, v) = match (u_ptr, v_ptr) {
                     (Some(up), Some(vp)) => {
                         let cx = col >> cw_shift;
                         let u16v = unsafe { *(up.offset(c_row) as *const u16).add(cx) };
                         let v16v = unsafe { *(vp.offset(c_row) as *const u16).add(cx) };
-                        (
-                            (u16v >> shift16) as f32 - 128.0,
-                            (v16v >> shift16) as f32 - 128.0,
-                        )
+                        ((u16v >> shift16) as i32, (v16v >> shift16) as i32)
                     }
-                    _ => (0.0, 0.0),
+                    _ => (128, 128),
                 };
                 (y, u, v)
             };
-            let yy = (y - 16.0) * 1.164;
-            let r = (yy + 1.596 * v).clamp(0.0, 255.0) as u8;
-            let g = (yy - 0.392 * u - 0.813 * v).clamp(0.0, 255.0) as u8;
-            let b = (yy + 2.017 * u).clamp(0.0, 255.0) as u8;
-            let out = (row * w + col) * 4;
-            bgra[out] = b;
-            bgra[out + 1] = g;
-            bgra[out + 2] = r;
-            bgra[out + 3] = 255;
+            let o = out_row + col * 4;
+            write_yuv_pixel(&mut bgra[o..o + 4], y, u, v);
         }
     }
     Some(VideoFrame {

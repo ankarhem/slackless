@@ -160,7 +160,9 @@ pub fn build_join_frame(audio_session_id: u64) -> SdkSignalFrame {
                 ..Default::default()
             }),
             audio_session_id: Some(audio_session_id),
-            wants_compressed_sdp: Some(true),
+            // Plaintext SDP answers avoid Chime's XOR-diff renegotiation delta format while adding
+            // only ~2 KB per SUBSCRIBE_ACK.
+            wants_compressed_sdp: Some(false),
             server_side_network_adaption: Some(adaption),
             supported_server_side_network_adaptions: vec![adaption],
             ..Default::default()
@@ -352,16 +354,16 @@ pub fn build_content_subscribe_frame(
         },
         SdkStreamDescriptor {
             stream_id: Some(2),
-            framerate: Some(15),
-            max_bitrate_kbps: Some(3000),
+            framerate: Some(30),
+            max_bitrate_kbps: Some(3500),
             track_label: Some("AmazonChimeExpressVideo".to_owned()),
             group_id: Some(2),
-            avg_bitrate_bps: Some(1_500_000),
+            avg_bitrate_bps: Some(3_000_000),
             attendee_id: Some(creds.attendee_id.clone()),
             media_type: Some(SdkStreamMediaType::Video as i32),
             external_user_id: Some(creds.external_user_id.clone()),
-            width: Some(1280),
-            height: Some(720),
+            width: Some(1920),
+            height: Some(1200),
         },
     ];
     Ok(SdkSignalFrame {
@@ -554,15 +556,38 @@ pub fn deflate_sdp(sdp: &str) -> Result<Vec<u8>> {
 /// Decode SDP answer from `SdkSubscribeAckFrame` (supporting both raw-deflate `compressed_sdp_answer`
 /// and plain `sdp_answer`).
 pub fn decode_sdp_answer(sdp_answer: Option<&str>, compressed: Option<&[u8]>) -> Result<String> {
-    if let Some(raw) = compressed.filter(|b| !b.is_empty()) {
-        let mut dec = DeflateDecoder::new(raw);
-        let mut out = String::new();
-        dec.read_to_string(&mut out)
-            .map_err(|e| HuddleError::Signaling(format!("sdp inflate failed: {e}")))?;
-        return Ok(out);
-    }
+    decode_sdp_answer_with_prev(sdp_answer, compressed, None)
+}
+
+/// Decode SDP answer from `SdkSubscribeAckFrame`, handling Chime's renegotiation XOR-diff
+/// compression against `prev_sdp_answer` whenever `compressed_sdp_answer` is used.
+pub fn decode_sdp_answer_with_prev(
+    sdp_answer: Option<&str>,
+    compressed: Option<&[u8]>,
+    prev_sdp_answer: Option<&str>,
+) -> Result<String> {
     if let Some(plain) = sdp_answer.filter(|s| !s.is_empty()) {
         return Ok(plain.to_owned());
+    }
+    if let Some(raw) = compressed.filter(|b| !b.is_empty()) {
+        let mut dec = DeflateDecoder::new(raw);
+        let mut inflated = Vec::new();
+        dec.read_to_end(&mut inflated)
+            .map_err(|e| HuddleError::Signaling(format!("sdp inflate failed: {e}")))?;
+        if let Some(prev) = prev_sdp_answer {
+            if inflated.contains(&0) {
+                let prev_bytes = prev.as_bytes();
+                let mut restored = Vec::with_capacity(inflated.len());
+                for (i, &b) in inflated.iter().enumerate() {
+                    let p = prev_bytes.get(i).copied().unwrap_or(0);
+                    restored.push(b ^ p);
+                }
+                return String::from_utf8(restored)
+                    .map_err(|e| HuddleError::Signaling(format!("sdp xor-diff utf8 failed: {e}")));
+            }
+        }
+        return String::from_utf8(inflated)
+            .map_err(|e| HuddleError::Signaling(format!("sdp inflate utf8 failed: {e}")));
     }
     Err(HuddleError::Signaling(
         "SUBSCRIBE_ACK contained neither sdp_answer nor compressed_sdp_answer".to_owned(),
@@ -624,6 +649,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored, sdp);
+
+        // Chime XOR-diffs renegotiated compressed SDP answers against the previous SDP answer.
+        let sdp2 = "v=0\r\no=- 1 3 IN IP4 127.0.0.1\r\ns=-\r\n";
+        let xor_bytes: Vec<u8> = sdp2
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ sdp.as_bytes().get(i).copied().unwrap_or(0))
+            .collect();
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&xor_bytes).unwrap();
+        let xor_compressed = enc.finish().unwrap();
+        let restored2 =
+            decode_sdp_answer_with_prev(None, Some(&xor_compressed), Some(sdp)).unwrap();
+        assert_eq!(restored2, sdp2);
     }
 
     #[test]

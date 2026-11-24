@@ -1334,6 +1334,65 @@ impl PopoutWindow {
                     .child(
                         v_flex()
                             .p_3()
+                            .gap_1p5()
+                            .rounded_xl()
+                            .bg(pal.drawer_surface)
+                            .border_1()
+                            .border_color(pal.drawer_border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(pal.drawer_fg)
+                                    .child("Performance & Video Pipeline"),
+                            )
+                            .child(stat_row(
+                                "CPU / Memory",
+                                format!(
+                                    "{}.{}%  ·  {} MB RSS",
+                                    snap.perf.cpu_tenths_pct / 10,
+                                    snap.perf.cpu_tenths_pct % 10,
+                                    snap.perf.rss_mb
+                                ),
+                            ))
+                            .when_some(snap.perf.tx_backend.clone(), |col, backend| {
+                                let res = snap
+                                    .perf
+                                    .tx_resolution
+                                    .clone()
+                                    .unwrap_or_else(|| "—".to_owned());
+                                col.child(stat_row("TX encoder", backend)).child(stat_row(
+                                    "TX stream",
+                                    format!(
+                                        "{res} @ {}.{} fps · {:.1} ms · {} kbps",
+                                        snap.perf.tx_fps_tenths / 10,
+                                        snap.perf.tx_fps_tenths % 10,
+                                        snap.perf.tx_encode_us as f64 / 1000.0,
+                                        snap.perf.tx_kbps
+                                    ),
+                                ))
+                            })
+                            .when_some(snap.perf.rx_backend.clone(), |col, backend| {
+                                let res = snap
+                                    .perf
+                                    .rx_resolution
+                                    .clone()
+                                    .unwrap_or_else(|| "—".to_owned());
+                                col.child(stat_row("RX decoder", backend)).child(stat_row(
+                                    "RX stream",
+                                    format!(
+                                        "{res} @ {}.{} fps · {:.1} ms · {} kbps",
+                                        snap.perf.rx_fps_tenths / 10,
+                                        snap.perf.rx_fps_tenths % 10,
+                                        snap.perf.rx_decode_us as f64 / 1000.0,
+                                        snap.perf.rx_kbps
+                                    ),
+                                ))
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .p_3()
                             .gap_2()
                             .rounded_xl()
                             .bg(pal.drawer_surface)

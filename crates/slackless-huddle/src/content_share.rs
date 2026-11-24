@@ -17,6 +17,7 @@ use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 
+use crate::metrics::HuddlePerfCounters;
 use crate::proto::{SdkPingPongType, sdk_signal_frame};
 use crate::rtc::ChimeRtcPeer;
 use crate::screen::ScreenCapture;
@@ -79,6 +80,7 @@ impl ContentShareSession {
         base_creds: HuddleCredentials,
         source_id: String,
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
+        perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
         let content_creds = HuddleCredentials {
             attendee_id: format!("{}#content", base_creds.attendee_id),
@@ -126,7 +128,7 @@ impl ContentShareSession {
         );
 
         let offer_sdp = rtc.create_gathered_offer().await?;
-        let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, true)?;
+        let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, false)?;
         sig.send_frame(&sub_frame).await?;
 
         let sub_ack = loop {
@@ -158,7 +160,7 @@ impl ContentShareSession {
         );
 
         let (h264_tx, mut h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let capture = ScreenCapture::start(source_id, h264_tx, preview_tx)?;
+        let capture = ScreenCapture::start(source_id, h264_tx, preview_tx, perf)?;
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
 
         let running = Arc::new(AtomicBool::new(true));
@@ -304,7 +306,7 @@ impl ContentShareSession {
         });
 
         tokio::spawn(async move {
-            let _capture = capture;
+            let capture = capture;
             let mut metric_tick = tokio::time::interval(Duration::from_secs(1));
             metric_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut connected = false;
@@ -316,14 +318,18 @@ impl ContentShareSession {
                     Some(st) = state_rx.recv() => {
                         tracing::info!(state = ?st, "#content peer connection state");
                         match st {
-                            RTCPeerConnectionState::Connected => connected = true,
+                            RTCPeerConnectionState::Connected => {
+                                connected = true;
+                                // Force an immediate IDR keyframe once WebRTC media is open.
+                                capture.force_keyframe();
+                            }
                             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => break,
                             _ => {}
                         }
                     }
                     Some(annex_b) = h264_rx.recv() => {
                         if connected {
-                            match rtc.write_h264_frame(annex_b, Duration::from_millis(125)).await {
+                            match rtc.write_h264_frame(annex_b, Duration::from_millis(33)).await {
                                 Ok(()) if !sent_first_frame => {
                                     sent_first_frame = true;
                                     tracing::info!("#content first H.264 screen frame sent");

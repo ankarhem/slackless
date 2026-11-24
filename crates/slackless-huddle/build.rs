@@ -9,4 +9,24 @@ fn main() {
     prost_build::Config::new()
         .compile_fds(fds)
         .expect("generate prost types for SignalingProtocol.proto and PeerMessage.proto");
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rerun-if-changed=native/macos_media.m");
+        cc::Build::new()
+            .file("native/macos_media.m")
+            .flag("-fobjc-arc")
+            .flag("-Wno-deprecated-declarations")
+            .compile("slackless_macos_media");
+        for fw in [
+            "ScreenCaptureKit",
+            "VideoToolbox",
+            "CoreMedia",
+            "CoreVideo",
+            "CoreGraphics",
+            "Foundation",
+        ] {
+            println!("cargo:rustc-link-lib=framework={fw}");
+        }
+    }
 }

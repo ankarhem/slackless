@@ -31,6 +31,9 @@ image = { version = "0.25", default-features = false }
 prost-build = "0.14"
 protox = "0.10"
 
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.1"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "test-util"] }
 

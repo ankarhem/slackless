@@ -8,6 +8,9 @@ pub mod clips;
 pub mod content_share;
 #[cfg(target_os = "macos")]
 pub mod macos_audio_tap;
+#[cfg(target_os = "macos")]
+pub mod macos_media;
+pub mod metrics;
 pub mod peer_message;
 pub mod rtc;
 pub mod screen;
@@ -38,6 +41,7 @@ pub use clips::{
     finish_audio_clip,
 };
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
+pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
 pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};
@@ -158,6 +162,7 @@ pub struct HuddleSessionSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub pongs_sent: u32,
+    pub perf: HuddlePerfSnapshot,
 }
 
 /// Live speaking / audio-level update pushed at ~10 Hz while connected.
