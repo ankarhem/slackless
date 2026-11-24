@@ -35,10 +35,10 @@ Sign-in is interactive: `slackless auth login` (or the desktop app's first launc
 ### search
 
 ```
-slackless search <QUERY> [--limit N]
+slackless search <QUERY> [--limit N] [--all-workspaces]
 ```
 
-Full-text search of the local archive. The query is one quoted string with Slack-style modifiers:
+Full-text search of the local archive (pass `--all-workspaces` to search across every locally archived workspace and merge hits newest first). The query is one quoted string with Slack-style modifiers:
 
 - `in:#eng`, `in:eng`, or `in:C0123ABC` restricts to one channel; repeat it for alternatives, which OR together.
 - `from:@ana` or `from:U0123ABC` restricts to an author; repeats OR together too.

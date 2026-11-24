@@ -28,6 +28,8 @@ pub struct ReleaseInfo {
     pub asset_name: String,
     pub download_url: String,
     pub sha256_url: Option<String>,
+    /// Concise bullet highlights parsed from the GitHub Release body for in-app preview.
+    pub notes: Vec<String>,
 }
 
 /// UI state for the top update banner and `Slackless -> Check for Updates…`.
@@ -47,11 +49,53 @@ struct GhRelease {
     tag_name: String,
     html_url: String,
     #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
     draft: bool,
     #[serde(default)]
     prerelease: bool,
     #[serde(default)]
     assets: Vec<GhAsset>,
+}
+
+/// Extract up to 8 concise bullet highlights from a GitHub Release markdown body, skipping
+/// install/changelog boilerplate and stripping trailing `(`abc1234`)` commit hashes.
+pub fn parse_release_highlights(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_install_section = false;
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('#') {
+            let lower = line.to_ascii_lowercase();
+            in_install_section = lower.contains("install") || lower.contains("update (macos");
+            continue;
+        }
+        if in_install_section {
+            continue;
+        }
+        let Some(item) = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if item.is_empty() {
+            continue;
+        }
+        // Strip trailing commit hash link/code suffix like ` (`34f04a1`)`.
+        let cleaned = match item.rsplit_once(" (`") {
+            Some((prefix, tail)) if tail.ends_with("`)") && tail.len() <= 16 => prefix.trim(),
+            _ => item,
+        };
+        if !cleaned.is_empty() {
+            out.push(cleaned.to_owned());
+            if out.len() >= 8 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -373,12 +417,19 @@ pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
         .find(|a| a.name == "SHA256SUMS.txt")
         .map(|a| a.browser_download_url.clone());
 
+    let notes = rel
+        .body
+        .as_deref()
+        .map(parse_release_highlights)
+        .unwrap_or_default();
+
     Ok(Some(ReleaseInfo {
         version: rel.tag_name,
         html_url: rel.html_url,
         asset_name: asset.name.clone(),
         download_url: asset.browser_download_url.clone(),
         sha256_url,
+        notes,
     }))
 }
 
@@ -629,6 +680,31 @@ mod tests {
         assert_eq!(
             find_sha256_entry("notahash  Slackless.tar.gz\n", "Slackless.tar.gz"),
             None
+        );
+    }
+
+    #[test]
+    fn parses_release_highlights_and_skips_install_section() {
+        let body = r#"
+## What's Changed
+
+### Features
+- Add cross-workspace CLI search (`abc1234`)
+* Show release notes preview in Preferences (`def5678`)
+
+### Bug Fixes
+- Keep message scrolling smooth over hover actions
+
+## Install / Update (macOS Apple Silicon)
+- Run `slackless update --restart`
+"#;
+        assert_eq!(
+            parse_release_highlights(body),
+            vec![
+                "Add cross-workspace CLI search",
+                "Show release notes preview in Preferences",
+                "Keep message scrolling smooth over hover actions",
+            ]
         );
     }
 }

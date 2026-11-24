@@ -1705,10 +1705,55 @@ impl Preferences {
         };
 
         let card = self.status_card(dot_color, title, chip, detail, is_err, actions, cx);
+        let release_notes = match &self.update_state {
+            UpdateState::Available(rel) => Some(rel),
+            UpdateState::Idle => self.available_update.as_ref(),
+            _ => None,
+        }
+        .filter(|rel| !rel.notes.is_empty())
+        .map(|rel| (rel.version.clone(), rel.notes.clone()));
+
+        let body = if let Some((ver, notes)) = release_notes {
+            let theme = cx.theme();
+            let (border, card_bg, fg, muted) = (
+                theme.border,
+                theme.secondary.opacity(0.25),
+                theme.foreground,
+                theme.muted_foreground,
+            );
+            v_flex().gap_2().child(card).child(
+                v_flex()
+                    .gap_1()
+                    .px_3p5()
+                    .py_2p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(card_bg)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(format!("What's new in {ver}")),
+                    )
+                    .children(notes.into_iter().map(move |item| {
+                        h_flex()
+                            .items_start()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(div().flex_none().child("\u{2022}"))
+                            .child(div().flex_1().min_w_0().child(item))
+                    })),
+            )
+        } else {
+            v_flex().child(card)
+        };
         self.group(
             "Software updates",
             Some("Checks for new releases on startup or when requested; updates both Slackless.app and the CLI together."),
-            card,
+            body,
             cx,
         )
     }

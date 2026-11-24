@@ -1260,6 +1260,18 @@ impl Render for ThreadPanel {
             .bg(background)
             .border_l_1()
             .border_color(border)
+            .on_drop::<gpui_kit::gpui::ExternalPaths>(cx.listener(
+                |this, paths: &gpui_kit::gpui::ExternalPaths, _, cx| {
+                    if !paths.paths().is_empty() {
+                        this.composer.update(cx, |composer, cx| {
+                            composer.attach_paths(paths.paths().to_vec(), cx);
+                        });
+                    }
+                },
+            ))
+            .drag_over::<gpui_kit::gpui::ExternalPaths>(|style, _, _, cx| {
+                style.border_2().border_color(cx.theme().link)
+            })
             .child(header)
             .child(body)
             .child(composer_area)

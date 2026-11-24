@@ -453,6 +453,18 @@ impl Render for App {
                             .rounded_tr(px(PANEL_RADIUS))
                             .rounded_br(px(PANEL_RADIUS))
                     })
+                    .on_drop::<gpui::ExternalPaths>(cx.listener(
+                        |this, paths: &gpui::ExternalPaths, _, cx| {
+                            if !paths.paths().is_empty() {
+                                this.composer.update(cx, |composer, cx| {
+                                    composer.attach_paths(paths.paths().to_vec(), cx);
+                                });
+                            }
+                        },
+                    ))
+                    .drag_over::<gpui::ExternalPaths>(|style, _, _, cx| {
+                        style.border_2().border_color(cx.theme().link)
+                    })
                     .child(main_column)
                     // Light Slack's side panel casts its shadow over the conversation's edge.
                     .when(!dark && side_panel, |column| {

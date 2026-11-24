@@ -69,6 +69,9 @@ enum Commands {
         /// Maximum number of results.
         #[arg(long, value_name = "N", default_value_t = SEARCH_LIMIT)]
         limit: usize,
+        /// Search across every locally archived workspace at once (merges hits newest first).
+        #[arg(long)]
+        all_workspaces: bool,
         /// Optional export format (`md` or `json`) for search results.
         #[arg(long, value_enum)]
         format: Option<ExportFormat>,
@@ -492,16 +495,23 @@ async fn dispatch(
         Commands::Search {
             query,
             limit,
+            all_workspaces,
             format,
             out,
-        } => cmd_search(
-            ctx,
-            workspace.as_ref(),
-            &query,
-            limit,
-            format,
-            out.as_deref(),
-        ),
+        } => {
+            if all_workspaces {
+                cmd_search_all_workspaces(ctx, &query, limit)
+            } else {
+                cmd_search(
+                    ctx,
+                    workspace.as_ref(),
+                    &query,
+                    limit,
+                    format,
+                    out.as_deref(),
+                )
+            }
+        }
         Commands::Read { channel, limit } => cmd_read(ctx, workspace.as_ref(), &channel, limit),
         Commands::Thread {
             channel,
@@ -678,6 +688,86 @@ async fn dispatch(
             AuthCommand::Logout => cmd_auth_logout(ctx, flag),
         },
     }
+}
+
+fn cmd_search_all_workspaces(ctx: &Ctx, query: &str, limit: usize) -> Result<ExitCode> {
+    let mut team_ids: Vec<TeamId> = Vec::new();
+    if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
+        for s in sessions {
+            if !team_ids.contains(&s.team_id) {
+                team_ids.push(s.team_id);
+            }
+        }
+    }
+    for tid in archive::stored_team_ids() {
+        if !team_ids.contains(&tid) {
+            team_ids.push(tid);
+        }
+    }
+    if team_ids.is_empty() {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({
+                "query": query,
+                "all_workspaces": true,
+                "workspaces_searched": [],
+                "count": 0,
+                "messages": [],
+            }),
+            "searching across workspaces",
+        ));
+    }
+
+    let parsed = SearchQuery::parse(query);
+    let mut hits: Vec<(String, Option<String>, MessageRow)> = Vec::new();
+    for ws in &team_ids {
+        let Some(store) = open_archive_store(ws) else {
+            continue;
+        };
+        let messages = store
+            .search(ws, &parsed, limit)
+            .with_context(|| format!("searching the local archive of {ws}"))?;
+        if messages.is_empty() {
+            continue;
+        }
+        let archive = Archive::open(ws);
+        let names = archive
+            .as_ref()
+            .map_or_else(Default::default, |a| a.channel_names(ws));
+        for message in &messages {
+            let row = MessageRow::from_stored(message, archive.as_ref(), ws);
+            let label = names.get(row.channel.as_str()).cloned();
+            hits.push((ws.as_str().to_owned(), label, row));
+        }
+    }
+    hits.sort_by(|a, b| b.2.ts.cmp(&a.2.ts));
+    hits.truncate(limit);
+
+    let mut human = String::new();
+    let json_rows: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(ws_id, label, row)| {
+            human.push_str(&format!("{ws_id}\t{}", row.human_line(label.as_deref())));
+            let mut val = serde_json::to_value(row).unwrap_or_default();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("workspace".to_owned(), serde_json::json!(ws_id));
+            }
+            val
+        })
+        .collect();
+    let searched: Vec<&str> = team_ids.iter().map(TeamId::as_str).collect();
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "query": query,
+            "all_workspaces": true,
+            "workspaces_searched": searched,
+            "count": json_rows.len(),
+            "messages": json_rows,
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_search(
