@@ -1743,11 +1743,62 @@ pub(super) fn render_code(block: &RichTextPreformatted, theme: &RunTheme) -> Div
     )
 }
 
+fn highlight_hash(code: &str, lang: crate::syntax::Lang) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (lang as u64);
+    for &b in code.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+fn cached_highlight(
+    code: &str,
+    lang: crate::syntax::Lang,
+) -> Vec<(usize, crate::syntax::TokenKind)> {
+    struct Entry {
+        hash: u64,
+        lang: crate::syntax::Lang,
+        code: String,
+        tokens: Vec<(usize, crate::syntax::TokenKind)>,
+    }
+    thread_local! {
+        static CACHE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    }
+    const MAX_ENTRIES: usize = 64;
+    let hash = highlight_hash(code, lang);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(pos) = cache
+            .iter()
+            .position(|e| e.hash == hash && e.lang == lang && e.code == code)
+        {
+            let entry = cache.remove(pos);
+            let tokens = entry.tokens.clone();
+            cache.push(entry);
+            return tokens;
+        }
+        let tokens = crate::syntax::highlight(lang, code);
+        if code.len() <= 32 * 1024 {
+            if cache.len() >= MAX_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push(Entry {
+                hash,
+                lang,
+                code: code.to_owned(),
+                tokens: tokens.clone(),
+            });
+        }
+        tokens
+    })
+}
+
 fn highlighted_code_runs(code: &str, lang: crate::syntax::Lang, theme: &RunTheme) -> Vec<TextRun> {
     if code.is_empty() {
         return Vec::new();
     }
-    crate::syntax::highlight(lang, code)
+    cached_highlight(code, lang)
         .into_iter()
         .map(|(len, kind)| {
             let color = crate::syntax::token_color(kind, theme.dark, theme.foreground);

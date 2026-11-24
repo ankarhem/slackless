@@ -246,6 +246,8 @@ struct MessageData {
     messages: Vec<Message>,
     /// The conversation's read cursor; the first message past it gets the new-messages divider.
     last_read: Option<Ts>,
+    /// Precomputed index of the first unread message from someone else (O(1) lookup per row).
+    first_unread_ix: Option<usize>,
     /// Interactive Block Kit control state (selections, checks, input drafts).
     kit: Entity<BlockKitState>,
     /// Messages saved for later (fixture mode: in memory).
@@ -259,6 +261,53 @@ struct MessageData {
     /// The message being edited in place; its WYSIWYG draft is `edit_composer`.
     editing: Option<Ts>,
     edit_composer: Entity<Composer>,
+}
+
+impl MessageData {
+    fn recompute_first_unread(&mut self) {
+        self.first_unread_ix = self.last_read.as_ref().and_then(|read| {
+            self.messages
+                .iter()
+                .position(|m| &m.ts > read && m.user.as_ref() != Some(&self.fixtures.self_user))
+        });
+    }
+}
+
+/// Collect remote non-avatar attachment/thumbnail URLs from `messages` so switching channels can
+/// evict decoded channel media from GPUI's texture atlas without touching avatars or emoji.
+fn collect_channel_media_urls(messages: &[Message]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for m in messages {
+        for f in &m.files {
+            for candidate in [
+                f.thumb_720.as_deref(),
+                f.thumb_480.as_deref(),
+                f.thumb_360.as_deref(),
+                f.thumb_160.as_deref(),
+                f.url_private.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if candidate.starts_with("https://") {
+                    urls.push(candidate.to_owned());
+                }
+            }
+        }
+        for att in &m.attachments {
+            for candidate in [att.image_url.as_deref(), att.thumb_url.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if candidate.starts_with("https://") {
+                    urls.push(candidate.to_owned());
+                }
+            }
+        }
+    }
+    urls.sort();
+    urls.dedup();
+    urls
 }
 
 /// Maximum number of recently visited channels kept warm in [`MessageList`] so switching
@@ -289,6 +338,9 @@ pub struct MessageList {
     pending_initial_unread_jump: bool,
     /// Timer that clears the jump-to highlight after a short flash.
     highlight_clear: gpui_kit::gpui::Task<()>,
+    /// Non-avatar image URLs from the previously viewed channel queued for GPU texture eviction
+    /// on the next `Render::render` (keeps long multi-channel sessions flat in RAM/VRAM).
+    pending_evict_urls: Vec<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -339,20 +391,25 @@ impl MessageList {
                     list.request_older_near_top(&scroller, cx)
                 }),
             ];
-            let data = cx.new(|_| MessageData {
-                fixtures: fixtures.clone(),
-                channel: channel.clone(),
-                messages: history,
-                last_read: fixtures
-                    .conversation(&channel)
-                    .and_then(|conversation| conversation.last_read.clone()),
-                kit,
-                saved: HashSet::new(),
-                active: None,
-                open_thread: None,
-                highlighted: None,
-                editing: None,
-                edit_composer,
+            let data = cx.new(|_| {
+                let mut data = MessageData {
+                    fixtures: fixtures.clone(),
+                    channel: channel.clone(),
+                    messages: history,
+                    last_read: fixtures
+                        .conversation(&channel)
+                        .and_then(|conversation| conversation.last_read.clone()),
+                    first_unread_ix: None,
+                    kit,
+                    saved: HashSet::new(),
+                    active: None,
+                    open_thread: None,
+                    highlighted: None,
+                    editing: None,
+                    edit_composer,
+                };
+                data.recompute_first_unread();
+                data
             });
             MessageList {
                 fixtures,
@@ -366,6 +423,7 @@ impl MessageList {
                 pending_highlight: None,
                 pending_initial_unread_jump: false,
                 highlight_clear: gpui_kit::gpui::Task::ready(()),
+                pending_evict_urls: Vec::new(),
                 _subscriptions: subscriptions,
             }
         })
@@ -458,6 +516,12 @@ impl MessageList {
     }
 
     pub fn set_conversation(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        if self.channel != channel {
+            let old_urls = collect_channel_media_urls(&self.data.read(cx).messages);
+            if !old_urls.is_empty() {
+                self.pending_evict_urls.extend(old_urls);
+            }
+        }
         self.channel = channel.clone();
         self.touch_cache(&channel);
         self.pending_initial_unread_jump = true;
@@ -469,6 +533,7 @@ impl MessageList {
         let changed = self.data.update(cx, |data, _| {
             if data.last_read != last_read {
                 data.last_read = last_read;
+                data.recompute_first_unread();
                 true
             } else {
                 false
@@ -484,8 +549,10 @@ impl MessageList {
     pub fn append(&mut self, channel: ChannelId, message: Message, cx: &mut Context<Self>) {
         let visible = channel == self.channel && !message.hidden;
         if visible {
-            self.data
-                .update(cx, |data, _| data.messages.push(message.clone()));
+            self.data.update(cx, |data, _| {
+                data.messages.push(message.clone());
+                data.recompute_first_unread();
+            });
         }
         self.messages.entry(channel).or_default().push(message);
         if visible {
@@ -551,7 +618,10 @@ impl MessageList {
         if !preserves_window {
             return self.sync(cx);
         }
-        self.data.update(cx, |data, _| data.messages = history);
+        self.data.update(cx, |data, _| {
+            data.messages = history;
+            data.recompute_first_unread();
+        });
         self.scroller.update(cx, |scroller, cx| {
             if prefix > 0 {
                 scroller.prepend(prefix, cx);
@@ -594,7 +664,10 @@ impl MessageList {
         if added == 0 {
             return;
         }
-        self.data.update(cx, |data, _| data.messages = history);
+        self.data.update(cx, |data, _| {
+            data.messages = history;
+            data.recompute_first_unread();
+        });
         self.scroller
             .update(cx, |scroller, cx| scroller.prepend(added, cx));
         cx.notify();
@@ -644,6 +717,7 @@ impl MessageList {
             if switching || data.last_read.is_none() {
                 data.last_read = last_read;
             }
+            data.recompute_first_unread();
             data.editing = None;
             data.active = None;
         });
@@ -656,7 +730,10 @@ impl MessageList {
     /// heights are remeasured.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let history = history_of(&self.messages, &self.channel);
-        self.data.update(cx, |data, _| data.messages = history);
+        self.data.update(cx, |data, _| {
+            data.messages = history;
+            data.recompute_first_unread();
+        });
         self.scroller
             .update(cx, |scroller, cx| scroller.remeasure(cx));
         cx.notify();
@@ -836,6 +913,7 @@ impl MessageList {
                 }
                 self.data.update(cx, |data, cx| {
                     data.messages.retain(|m| m.ts != target);
+                    data.recompute_first_unread();
                     cx.notify();
                 });
                 cx.notify();
@@ -1288,6 +1366,7 @@ impl MessageList {
                 .map(|message| message.ts.clone());
             let cursor = before.unwrap_or_else(|| ts_just_before(ts));
             data.last_read = Some(cursor.clone());
+            data.recompute_first_unread();
             cursor
         });
         cx.emit(MessageListEvent::Changed {
@@ -1359,6 +1438,7 @@ impl MessageList {
         let history = history_of(&self.messages, &self.channel);
         self.data.update(cx, |data, _| {
             data.messages = history;
+            data.recompute_first_unread();
             data.saved.remove(ts);
             if data.editing.as_ref() == Some(ts) {
                 data.editing = None;
@@ -1388,7 +1468,12 @@ fn history_of(messages: &HashMap<ChannelId, Vec<Message>>, channel: &ChannelId) 
 }
 
 impl Render for MessageList {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.pending_evict_urls.is_empty() {
+            for url in self.pending_evict_urls.drain(..) {
+                crate::emoji::evict_gif_asset(&url, window, cx);
+            }
+        }
         let data = self.data.clone();
         let this = cx.entity();
         let scroller = self.scroller.clone();
@@ -1446,17 +1531,9 @@ fn transcript_row(
     }
 
     let date_break = previous.is_none_or(|prev| day_index(&prev.ts) != day_index(&message.ts));
-    // Like Slack, your own messages never count as new: the line goes above the first unread
-    // message from someone else (the scan back only crosses this conversation's unread tail).
-    let own = |m: &Message| m.user.as_ref() == Some(&fixtures.self_user);
-    let new_break = match store.last_read.as_ref() {
-        Some(read) if !date_break && &message.ts > read && !own(message) => messages[..ix]
-            .iter()
-            .rev()
-            .take_while(|prev| &prev.ts > read)
-            .all(own),
-        _ => false,
-    };
+    // Like Slack, your own messages never count as new: `first_unread_ix` is precomputed once
+    // when messages or `last_read` change so row rendering is O(1).
+    let new_break = !date_break && store.first_unread_ix == Some(ix);
     let grouped =
         !date_break && !new_break && previous.is_some_and(|prev| same_group(prev, message));
     let editing = store.editing.as_ref() == Some(&message.ts);
