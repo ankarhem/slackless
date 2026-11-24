@@ -596,12 +596,24 @@ impl ChimeRtcPeer {
             .map_err(|e| HuddleError::WebRtc(e.to_string()))
     }
 
-    /// Write one encoded 20ms Opus audio packet onto the local track.
-    pub async fn write_opus_frame(&self, opus_bytes: Vec<u8>) -> Result<()> {
+    /// Cloneable handle for writing outbound H.264 frames on a dedicated async task without
+    /// blocking the main audio/signaling select loop during large IDR keyframe bursts.
+    pub fn video_sender(&self) -> VideoTrackSender {
+        VideoTrackSender {
+            video_track: Arc::clone(&self.video_track),
+            packets_sent: Arc::clone(&self.packets_sent),
+            bytes_sent: Arc::clone(&self.bytes_sent),
+            total_packets_sent: Arc::clone(&self.total_packets_sent),
+            total_bytes_sent: Arc::clone(&self.total_bytes_sent),
+        }
+    }
+
+    /// Write one encoded 20ms Opus audio packet onto the local track (zero-copy `Bytes`).
+    pub async fn write_opus_frame(&self, opus_bytes: Bytes) -> Result<()> {
         let len = opus_bytes.len() as u64;
         self.audio_track
             .write_sample(&Sample {
-                data: Bytes::from(opus_bytes),
+                data: opus_bytes,
                 duration: Duration::from_millis(20),
                 ..Default::default()
             })
@@ -616,20 +628,9 @@ impl ChimeRtcPeer {
 
     /// Write one Annex-B H.264 video frame onto the local video track.
     pub async fn write_h264_frame(&self, annex_b: Vec<u8>, duration: Duration) -> Result<()> {
-        let len = annex_b.len() as u64;
-        self.video_track
-            .write_sample(&Sample {
-                data: Bytes::from(annex_b),
-                duration,
-                ..Default::default()
-            })
+        self.video_sender()
+            .write_h264_frame(annex_b, duration)
             .await
-            .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
-        self.total_bytes_sent.fetch_add(len, Ordering::Relaxed);
-        Ok(())
     }
 
     pub fn connection_state(&self) -> RTCPeerConnectionState {
@@ -670,6 +671,36 @@ impl ChimeRtcPeer {
 
     pub async fn close(&self) {
         let _ = self.pc.close().await;
+    }
+}
+
+/// Dedicated outbound H.264 RTP track sender so video frame writes run concurrently with
+/// 20 ms Opus audio and Chime signaling.
+#[derive(Clone)]
+pub struct VideoTrackSender {
+    video_track: Arc<TrackLocalStaticSample>,
+    packets_sent: Arc<AtomicU64>,
+    bytes_sent: Arc<AtomicU64>,
+    total_packets_sent: Arc<AtomicU64>,
+    total_bytes_sent: Arc<AtomicU64>,
+}
+
+impl VideoTrackSender {
+    pub async fn write_h264_frame(&self, annex_b: Vec<u8>, duration: Duration) -> Result<()> {
+        let len = annex_b.len() as u64;
+        self.video_track
+            .write_sample(&Sample {
+                data: Bytes::from(annex_b),
+                duration,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.total_packets_sent.fetch_add(1, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(len, Ordering::Relaxed);
+        self.total_bytes_sent.fetch_add(len, Ordering::Relaxed);
+        Ok(())
     }
 }
 

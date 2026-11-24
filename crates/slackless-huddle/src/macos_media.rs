@@ -142,6 +142,7 @@ unsafe extern "C" {
     fn slackless_cam_capture_set_blur(cap: *mut SlacklessCamCapture, enabled: bool);
     fn slackless_cam_capture_force_keyframe(cap: *mut SlacklessCamCapture);
     fn slackless_cam_capture_set_bitrate(cap: *mut SlacklessCamCapture, bitrate_bps: u32);
+    fn slackless_cam_capture_set_compact(cap: *mut SlacklessCamCapture, compact: bool);
     fn slackless_cam_capture_stop(cap: *mut SlacklessCamCapture);
 
     fn slackless_vt_decoder_new() -> *mut SlacklessVtDecoder;
@@ -592,6 +593,12 @@ impl AvVtCameraCapture {
     pub fn set_target_bitrate(&self, bitrate_bps: u32) {
         if !self.handle.is_null() {
             unsafe { slackless_cam_capture_set_bitrate(self.handle, bitrate_bps) };
+        }
+    }
+
+    pub fn set_compact(&self, compact: bool) {
+        if !self.handle.is_null() {
+            unsafe { slackless_cam_capture_set_compact(self.handle, compact) };
         }
     }
 

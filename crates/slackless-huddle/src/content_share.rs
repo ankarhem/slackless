@@ -297,10 +297,10 @@ impl ContentShareSession {
             let silence = vec![0i16; 960 * 2];
             let mut pcm = vec![0i16; 960 * 2];
             let mut out = vec![0u8; 4000];
-            let cached_silence = enc
+            let cached_silence: bytes::Bytes = enc
                 .encode(&silence, &mut out)
-                .map(|n| out[..n].to_vec())
-                .unwrap_or_else(|_| vec![0xFC, 0xFF, 0xFE]);
+                .map(|n| bytes::Bytes::copy_from_slice(&out[..n]))
+                .unwrap_or_else(|_| bytes::Bytes::from_static(&[0xFC, 0xFF, 0xFE]));
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             while running_audio.load(Ordering::Relaxed) {
@@ -318,7 +318,9 @@ impl ContentShareSession {
                     });
                 if has_audio {
                     if let Ok(n) = enc.encode(&pcm, &mut out) {
-                        let _ = rtc_audio.write_opus_frame(out[..n].to_vec()).await;
+                        let _ = rtc_audio
+                            .write_opus_frame(bytes::Bytes::copy_from_slice(&out[..n]))
+                            .await;
                     }
                 } else {
                     let _ = rtc_audio.write_opus_frame(cached_silence.clone()).await;

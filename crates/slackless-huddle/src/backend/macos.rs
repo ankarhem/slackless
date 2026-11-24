@@ -58,6 +58,10 @@ impl CameraHandle for AvVtCameraCapture {
         AvVtCameraCapture::set_target_bitrate(self, bitrate_bps);
     }
 
+    fn set_compact(&self, compact: bool) {
+        AvVtCameraCapture::set_compact(self, compact);
+    }
+
     fn stop(&mut self) {
         AvVtCameraCapture::stop(self);
     }

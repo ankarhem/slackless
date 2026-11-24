@@ -1238,8 +1238,13 @@ SlacklessCamCapture *slackless_cam_capture_start(
 
         AVCaptureSession *session = [[AVCaptureSession alloc] init];
         [session beginConfiguration];
-        if ([session canSetSessionPreset:AVCaptureSessionPreset1280x720]) {
+        bool want_compact = (max_w > 0 && max_w <= 640);
+        if (want_compact && [session canSetSessionPreset:AVCaptureSessionPreset640x480]) {
+            session.sessionPreset = AVCaptureSessionPreset640x480;
+        } else if ([session canSetSessionPreset:AVCaptureSessionPreset1280x720]) {
             session.sessionPreset = AVCaptureSessionPreset1280x720;
+        } else if ([session canSetSessionPreset:AVCaptureSessionPreset640x480]) {
+            session.sessionPreset = AVCaptureSessionPreset640x480;
         } else if ([session canSetSessionPreset:AVCaptureSessionPresetMedium]) {
             session.sessionPreset = AVCaptureSessionPresetMedium;
         }
@@ -1331,6 +1336,30 @@ void slackless_cam_capture_set_bitrate(SlacklessCamCapture *cap, uint32_t bitrat
     if (cap->enc.vt) {
         vt_set_bitrate(cap->enc.vt, bitrate_bps);
     }
+}
+
+void slackless_cam_capture_set_compact(SlacklessCamCapture *cap, bool compact) {
+    if (!cap || atomic_load(&cap->enc.stopped) || !cap->session_obj || !cap->sample_queue) return;
+    uint32_t target_bps = compact ? 500000U : 1200000U;
+    cap->bitrate_bps = target_bps;
+    dispatch_async(cap->sample_queue, ^{
+        @autoreleasepool {
+            if (atomic_load(&cap->enc.stopped) || !cap->session_obj) return;
+            AVCaptureSession *session = (__bridge AVCaptureSession *)cap->session_obj;
+            AVCaptureSessionPreset desired = compact
+                ? AVCaptureSessionPreset640x480
+                : AVCaptureSessionPreset1280x720;
+            if ([session canSetSessionPreset:desired] && ![session.sessionPreset isEqualToString:desired]) {
+                [session beginConfiguration];
+                session.sessionPreset = desired;
+                [session commitConfiguration];
+            }
+            if (cap->enc.vt) {
+                vt_set_bitrate(cap->enc.vt, target_bps);
+            }
+            atomic_store(&cap->enc.force_keyframe, true);
+        }
+    });
 }
 
 void slackless_cam_capture_stop(SlacklessCamCapture *cap) {

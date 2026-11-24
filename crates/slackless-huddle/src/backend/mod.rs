@@ -90,6 +90,8 @@ pub trait CameraHandle: Send {
     fn set_blur(&self, enabled: bool);
     fn force_keyframe(&self);
     fn set_target_bitrate(&self, bitrate_bps: u32);
+    /// Switch between compact resolution (`640x480` while screen-sharing) and standard (`1280x720`).
+    fn set_compact(&self, _compact: bool) {}
     fn stop(&mut self);
 }
 

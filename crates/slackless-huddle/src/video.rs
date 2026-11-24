@@ -584,16 +584,22 @@ impl CameraCapture {
     pub fn start(
         device_index: Option<usize>,
         blur_background: bool,
+        compact: bool,
         outbound_h264_tx: mpsc::UnboundedSender<Vec<u8>>,
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
     ) -> Result<Self> {
+        let (max_w, max_h, bitrate_bps) = if compact {
+            (640, 480, 500_000)
+        } else {
+            (CAMERA_MAX_W, CAMERA_MAX_H, CAMERA_BITRATE_BPS)
+        };
         let inner = platform_backend().start_camera(
             CameraConfig {
                 device_index,
-                max_w: CAMERA_MAX_W,
-                max_h: CAMERA_MAX_H,
+                max_w,
+                max_h,
                 max_fps: CAMERA_MAX_FPS,
-                bitrate_bps: CAMERA_BITRATE_BPS,
+                bitrate_bps,
                 blur_background,
             },
             outbound_h264_tx,
@@ -604,6 +610,10 @@ impl CameraCapture {
 
     pub fn set_blur(&self, enabled: bool) {
         self.inner.set_blur(enabled);
+    }
+
+    pub fn set_compact(&self, compact: bool) {
+        self.inner.set_compact(compact);
     }
 
     pub fn force_keyframe(&self) {

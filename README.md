@@ -24,14 +24,16 @@
 
 Measured side-by-side on Apple M4 Pro (macOS, total process tree — 1 native process for Slackless vs. 7 Electron processes for Official Slack `4.49.89`, live huddle in the same channel, 1080p screen share):
 
-| State                                      |                  Slackless (1 proc) |               Official Slack (7 procs) | Delta                                   |
-| ------------------------------------------ | ----------------------------------: | -------------------------------------: | --------------------------------------- |
-| **Idle**                                   |       **`0.0%` CPU** · **`275 MB`** |   `1.0%` CPU (max `3.2%`) · `1,622 MB` | **0% idle CPU · 5.9× less RAM**         |
-| **Audio huddle (unmuted)**                 |    **`9–10.4%` CPU** · **`297 MB`** | `25.4%` CPU (max `30.2%`) · `1,094 MB` | **~2.5× less CPU · 3.7× less RAM**      |
-| **Audio huddle (muted)**                   |       **`7.2%` CPU** · **`296 MB`** | `20.9%` CPU (max `23.3%`) · `1,113 MB` | **~2.9× less CPU · 3.8× less RAM**      |
-| **Screen share only (1080p)**              |      **`19.4%` CPU** · **`320 MB`** | `57.2%` CPU (max `80.4%`) · `1,122 MB` | **~2.9× less CPU · 3.5× less RAM**      |
-| **Screen share + video**                   |      **`30.8%` CPU** · **`335 MB`** | `62.8%` CPU (max `70.3%`) · `1,211 MB` | **~2.0× less CPU · 3.6× less RAM**      |
-| **Screen share + video + background blur** | **`34–45%` CPU** · **`350–355 MB`** | `63.5%` CPU (max `71.3%`) · `1,308 MB` | **~1.5×–1.9× less CPU · 3.7× less RAM** |
+| State                                      |                      Slackless (1 proc) |               Official Slack (7 procs) | Delta                                   |
+| ------------------------------------------ | --------------------------------------: | -------------------------------------: | --------------------------------------- |
+| **Idle**                                   |       **`0.0%` CPU** · **`275–280 MB`** |   `1.0%` CPU (max `3.2%`) · `1,622 MB` | **0% idle CPU · 5.8× less RAM**         |
+| **Audio huddle (unmuted)**                 |    **`9–12.6%` CPU** · **`297–300 MB`** | `25.4%` CPU (max `30.2%`) · `1,094 MB` | **~2.0×–2.5× less CPU · 3.7× less RAM** |
+| **Audio huddle (muted)**                   |  **`7.2–10.1%` CPU** · **`296–299 MB`** | `20.9%` CPU (max `23.3%`) · `1,113 MB` | **~2.1×–2.9× less CPU · 3.7× less RAM** |
+| **Screen share only (1080p)**              | **`17.2–19.4%` CPU** · **`308–320 MB`** | `57.2%` CPU (max `80.4%`) · `1,122 MB` | **~3.0×–3.3× less CPU · 3.6× less RAM** |
+| **Screen share + video**                   |          **`28.0%` CPU** · **`321 MB`** | `62.8%` CPU (max `70.3%`) · `1,211 MB` | **~2.2× less CPU · 3.8× less RAM**      |
+| **Screen share + video + background blur** |       **`34–40.6%` CPU** · **`338 MB`** | `63.5%` CPU (max `71.3%`) · `1,308 MB` | **~1.6×–1.9× less CPU · 3.9× less RAM** |
+
+Reproducible total-system measurements (exact cumulative CPU time deltas across both app PIDs and macOS system daemons `WindowServer`, `coreaudiod`, `VTEncoderXPCService`, `VTDecoderXPCService`, `aned`) can be run via `scripts/bench-huddle.py`.
 
 ## Install (macOS App + CLI)
 

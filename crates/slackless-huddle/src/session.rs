@@ -315,7 +315,7 @@ async fn run_connected_loop(
 
     // 3. Build WebRTC peer with relay-only UDP TURN and gather non-trickle SDP offer.
     let (inbound_opus_tx, inbound_opus_rx) = mpsc::unbounded_channel();
-    let (outbound_opus_tx, mut outbound_opus_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (outbound_opus_tx, mut outbound_opus_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
     let (inbound_video_tx, inbound_video_rx) = mpsc::unbounded_channel::<InboundVideoPacket>();
     let (outbound_h264_tx, mut outbound_h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (local_cam_tx, mut local_cam_rx) = mpsc::unbounded_channel::<VideoFrame>();
@@ -566,7 +566,21 @@ async fn run_connected_loop(
         .await;
     }
 
+    let video_tx_task = {
+        let video_sender = peer.video_sender();
+        tokio::spawn(async move {
+            while let Some(h264_frame) = outbound_h264_rx.recv().await {
+                let _ = video_sender
+                    .write_h264_frame(h264_frame, Duration::from_millis(42))
+                    .await;
+            }
+        })
+    };
+
     let mut exit_reason: Option<LoopExit> = None;
+    let mut last_levels_rms_bucket: u8 = 0;
+    let mut last_levels_speakers: Vec<(UserId, f32)> = Vec::new();
+    let mut last_levels_muted: Vec<UserId> = Vec::new();
 
     while exit_reason.is_none() {
         let connect_timeout = async {
@@ -582,9 +596,6 @@ async fn run_connected_loop(
             }
             Some(opus_pkt) = outbound_opus_rx.recv() => {
                 let _ = peer.write_opus_frame(opus_pkt).await;
-            }
-            Some(h264_frame) = outbound_h264_rx.recv() => {
-                let _ = peer.write_h264_frame(h264_frame, Duration::from_millis(42)).await;
             }
             Some(fb) = cam_fb_rx.recv() => {
                 if let Some(cap) = &camera_capture {
@@ -860,11 +871,29 @@ async fn run_connected_loop(
                 }
             }
             _ = level_tick.tick() => {
-                let _ = updates.send(HuddleUpdate::AudioLevels(HuddleAudioLevels {
-                    local_rms: shared.local_rms(),
-                    active_speakers: remote_speakers.clone(),
-                    muted_peers: muted_peers.iter().cloned().collect(),
-                }));
+                // Skip emitting 8.3 Hz audio-level UI updates during silence when neither local
+                // RMS bucket nor remote speakers/muted peers changed.
+                let local_rms = shared.local_rms();
+                let rms_bucket = if local_rms < 0.005 {
+                    0
+                } else {
+                    ((local_rms * 32.0).round() as u8).clamp(1, 32)
+                };
+                let mut cur_muted: Vec<UserId> = muted_peers.iter().cloned().collect();
+                cur_muted.sort();
+                if rms_bucket != last_levels_rms_bucket
+                    || remote_speakers != last_levels_speakers
+                    || cur_muted != last_levels_muted
+                {
+                    last_levels_rms_bucket = rms_bucket;
+                    last_levels_speakers = remote_speakers.clone();
+                    last_levels_muted = cur_muted.clone();
+                    let _ = updates.send(HuddleUpdate::AudioLevels(HuddleAudioLevels {
+                        local_rms: if rms_bucket == 0 { 0.0 } else { local_rms },
+                        active_speakers: remote_speakers.clone(),
+                        muted_peers: cur_muted,
+                    }));
+                }
             }
             ctrl = ctrl_rx.recv() => {
                 match ctrl {
@@ -919,6 +948,7 @@ async fn run_connected_loop(
                             match CameraCapture::start(
                                 device_index,
                                 blur,
+                                snap.sharing,
                                 outbound_h264_tx.clone(),
                                 local_cam_tx.clone(),
                             ) {
@@ -998,6 +1028,9 @@ async fn run_connected_loop(
                                     snap.sharing = true;
                                     snap.share_source_id = Some(src_id.clone());
                                     snap.error = None;
+                                    if let Some(cap) = &camera_capture {
+                                        cap.set_compact(true);
+                                    }
                                     // Announce draw capability + content source details on official `"data-channel"`.
                                     let cap_bytes =
                                         build_capabilities_message(&creds.attendee_id, true);
@@ -1039,6 +1072,9 @@ async fn run_connected_loop(
                         } else {
                             snap.sharing = false;
                             snap.share_source_id = None;
+                            if let Some(cap) = &camera_capture {
+                                cap.set_compact(false);
+                            }
                             let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalScreen));
                         }
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -1204,6 +1240,7 @@ async fn run_connected_loop(
     let _ = signal.send_frame(&build_leave_frame()).await;
     let _ = tokio::time::timeout(Duration::from_millis(800), signal.next_frame()).await;
     audio_engine.stop();
+    video_tx_task.abort();
     vdec_fwd.abort();
     let _ = vdec_tx.send(None);
     peer.close().await;

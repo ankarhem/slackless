@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use opus::{Application, Bitrate, Channels, Decoder, Encoder};
@@ -428,7 +429,7 @@ impl AudioEngine {
     pub fn start(
         cfg: &HuddleAudioConfig,
         shared: AudioSharedState,
-        outbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
+        outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
         mut inbound_opus_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) -> Result<Self> {
         shared.running.store(true, Ordering::Relaxed);
@@ -581,7 +582,7 @@ fn run_audio_dsp_loop(
     shared: AudioSharedState,
     capture_signal: CaptureSignal,
     playback_ring: Arc<Mutex<VecDeque<f32>>>,
-    outbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
+    outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
     inbound_opus_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     configured_in: Option<String>,
     configured_out: Option<String>,
@@ -608,12 +609,14 @@ fn run_audio_dsp_loop(
 
     let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
     let mut opus_out = vec![0u8; 4000];
+    // Chunked arena for outbound Opus packets: amortizes heap allocation to ~1 alloc/sec instead
+    // of 50 Vec<u8> allocs/sec, and `cached_silence_opus.clone()` is a zero-alloc refcount bump.
+    let mut opus_arena = BytesMut::with_capacity(8192);
     let silence_pcm = vec![0.0f32; FRAME_20MS];
-    // Pre-encode one silence packet once so muted frames skip DSP + Opus encoding entirely.
-    let cached_silence_opus: Vec<u8> = encoder
+    let cached_silence_opus: Bytes = encoder
         .encode_float(&silence_pcm, &mut opus_out)
-        .map(|n| opus_out[..n].to_vec())
-        .unwrap_or_else(|_| vec![0xF8, 0xFF, 0xFE]);
+        .map(|n| Bytes::copy_from_slice(&opus_out[..n]))
+        .unwrap_or_else(|_| Bytes::from_static(&[0xF8, 0xFF, 0xFE]));
     let mut mic_frame = Vec::with_capacity(FRAME_20MS);
     let mut processed_capture = Vec::with_capacity(FRAME_20MS);
 
@@ -807,7 +810,11 @@ fn run_audio_dsp_loop(
                     .local_rms_bits
                     .store(rms.to_bits(), Ordering::Relaxed);
                 if let Ok(n) = encoder.encode_float(pcm_to_encode, &mut opus_out) {
-                    let _ = outbound_opus_tx.send(opus_out[..n].to_vec());
+                    if opus_arena.capacity() < n {
+                        opus_arena = BytesMut::with_capacity(8192.max(n));
+                    }
+                    opus_arena.extend_from_slice(&opus_out[..n]);
+                    let _ = outbound_opus_tx.send(opus_arena.split().freeze());
                 }
             }
         }
