@@ -13,11 +13,10 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{
-    MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9, MediaEngine,
-};
+use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::dtls::extension::extension_use_srtp::SrtpProtectionProfile;
+use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
@@ -109,6 +108,9 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
         ]
     };
 
+    // Only register video codecs we actually decode natively (`rav1d` AV1 + `openh264` H.264).
+    // Advertising VP8/VP9 causes Chime's `supported_receive_codec_intersection` to negotiate
+    // streams we cannot decode.
     for (mime, pt, fmtp) in [
         (MIME_TYPE_AV1, 45u8, ""),
         (
@@ -116,8 +118,6 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
             108u8,
             "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
         ),
-        (MIME_TYPE_VP8, 96u8, ""),
-        (MIME_TYPE_VP9, 98u8, "profile-id=0"),
     ] {
         m.register_codec(
             RTCRtpCodecParameters {
@@ -136,7 +136,7 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
         .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
     }
 
-    for (primary, rtx_pt) in [(45u8, 46u8), (108, 109), (96, 97), (98, 99)] {
+    for (primary, rtx_pt) in [(45u8, 46u8), (108, 109)] {
         m.register_codec(
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
@@ -340,11 +340,34 @@ impl ChimeRtcPeer {
                     RTPCodecType::Video => {
                         let ssrc = track.ssrc();
                         let track_id = track.id();
-                        let mime_type = track.codec().capability.mime_type;
+                        let codec = track.codec();
+                        let mime_type = codec.capability.mime_type;
+                        let payload_type = codec.payload_type;
                         let mid = transceiver.mid().unwrap_or_default();
+                        tracing::info!(
+                            ssrc,
+                            mid = %mid,
+                            track_id = %track_id,
+                            mime = %mime_type,
+                            pt = payload_type,
+                            "remote video track attached"
+                        );
+                        let mut logged_first_pkt = false;
                         while let Ok((rtp, _)) = track.read_rtp().await {
                             if rtp.payload.is_empty() {
                                 continue;
+                            }
+                            if !logged_first_pkt {
+                                logged_first_pkt = true;
+                                tracing::info!(
+                                    ssrc,
+                                    mid = %mid,
+                                    mime = %mime_type,
+                                    seq = rtp.header.sequence_number,
+                                    marker = rtp.header.marker,
+                                    bytes = rtp.payload.len(),
+                                    "received first RTP video packet"
+                                );
                             }
                             rx_pkts.fetch_add(1, Ordering::Relaxed);
                             rx_total.fetch_add(1, Ordering::Relaxed);
@@ -366,6 +389,7 @@ impl ChimeRtcPeer {
                                 break;
                             }
                         }
+                        tracing::info!(ssrc, mid = %mid, "remote video track ended");
                     }
                     _ => {}
                 }
@@ -471,19 +495,26 @@ impl ChimeRtcPeer {
 
     /// Create and fully gather a non-trickle SDP offer containing the relay candidate.
     pub async fn create_gathered_offer(&self) -> Result<String> {
+        let already_gathered = self.pc.ice_gathering_state() == RTCIceGatheringState::Complete;
         let offer = self
             .pc
             .create_offer(None)
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
-        let mut gather_complete = self.pc.gathering_complete_promise().await;
+        let mut gather_complete = if already_gathered {
+            None
+        } else {
+            Some(self.pc.gathering_complete_promise().await)
+        };
         self.pc
             .set_local_description(offer)
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
-        // Wait up to 6s for TURN relay candidate gathering.
-        let _ = tokio::time::timeout(Duration::from_secs(6), gather_complete.recv()).await;
+        // Wait up to 6s for TURN relay candidate gathering on the initial offer.
+        if let Some(rx) = gather_complete.as_mut() {
+            let _ = tokio::time::timeout(Duration::from_secs(6), rx.recv()).await;
+        }
 
         let local =
             self.pc.local_description().await.ok_or_else(|| {

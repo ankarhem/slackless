@@ -153,6 +153,15 @@ unsafe fn cf_str(s: &CStr) -> CFStringRef {
     unsafe { CFStringCreateWithCString(kCFAllocatorDefault, s.as_ptr(), kCFStringEncodingUTF8) }
 }
 
+unsafe fn responds_to_selector(obj: *const c_void, sel: *const c_void) -> bool {
+    if obj.is_null() || sel.is_null() {
+        return false;
+    }
+    let msg_responds: unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> i8 =
+        unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { msg_responds(obj, sel_registerName(c"respondsToSelector:".as_ptr()), sel) != 0 }
+}
+
 /// Returns `true` when macOS 14.2+ CoreAudio Process Taps (`CATapDescription`) are available at runtime.
 pub fn supports_native_system_audio_tap() -> bool {
     // SAFETY: `objc_getClass` safely returns null if `CATapDescription` does not exist.
@@ -279,23 +288,36 @@ impl SystemAudioTap {
 
             let empty_arr = msg_0(arr_cls, sel_registerName(c"array".as_ptr()));
             let alloc_desc = msg_0(tap_cls, sel_registerName(c"alloc".as_ptr()));
-            let desc = msg_1_ptr(
-                alloc_desc,
-                sel_registerName(c"initStereoGlobalTapButExcludeProcesses:".as_ptr()),
-                empty_arr,
-            );
+            let init_sel = sel_registerName(c"initStereoGlobalTapButExcludeProcesses:".as_ptr());
+            if !responds_to_selector(alloc_desc, init_sel) {
+                msg_void(alloc_desc, sel_registerName(c"release".as_ptr()));
+                return Err(HuddleError::Audio(
+                    "CATapDescription missing initStereoGlobalTapButExcludeProcesses:".into(),
+                ));
+            }
+            let desc = msg_1_ptr(alloc_desc, init_sel, empty_arr);
             if desc.is_null() {
                 return Err(HuddleError::Audio(
                     "failed to initialize CATapDescription".into(),
                 ));
             }
             // CATapUnmuted = 0 so local playback continues normally.
-            msg_1_i64(desc, sel_registerName(c"setMuteBehavior:".as_ptr()), 0);
-            msg_1_bool(desc, sel_registerName(c"setPrivateTap:".as_ptr()), 1);
+            let set_mute_sel = sel_registerName(c"setMuteBehavior:".as_ptr());
+            if responds_to_selector(desc, set_mute_sel) {
+                msg_1_i64(desc, set_mute_sel, 0);
+            }
+            // Note: Apple's `CATapDescription.h` declares
+            // `@property (..., getter=isPrivate, setter=setPrivate:) BOOL privateTap;`
+            // so the ObjC setter selector is `setPrivate:`, NOT `setPrivateTap:`.
+            let set_private_sel = sel_registerName(c"setPrivate:".as_ptr());
+            if responds_to_selector(desc, set_private_sel) {
+                msg_1_bool(desc, set_private_sel, 1);
+            }
 
             let mut tap_id: AudioObjectID = 0;
             let status = AudioHardwareCreateProcessTap(desc, &mut tap_id);
             if status != 0 || tap_id == 0 {
+                tracing::warn!(status, "AudioHardwareCreateProcessTap failed");
                 msg_void(desc, sel_registerName(c"release".as_ptr()));
                 return Err(HuddleError::Audio(format!(
                     "AudioHardwareCreateProcessTap failed (OSStatus {status})"
@@ -454,6 +476,13 @@ impl SystemAudioTap {
             }
 
             let _ = kAudioObjectSystemObject;
+            tracing::info!(
+                tap_id,
+                agg_device_id,
+                channels,
+                non_interleaved,
+                "macOS CoreAudio Process Tap started"
+            );
             Ok(Self {
                 tap_id,
                 agg_device_id,
@@ -495,5 +524,53 @@ mod tests {
     fn runtime_detects_process_tap_class_without_panicking() {
         // On macOS 14.2+ this is true; on older macOS it returns false cleanly.
         let _supported = supports_native_system_audio_tap();
+    }
+
+    #[test]
+    fn tap_description_selectors_exist_and_configure_cleanly() {
+        if !supports_native_system_audio_tap() {
+            return;
+        }
+        unsafe {
+            let tap_cls = objc_getClass(c"CATapDescription".as_ptr());
+            let arr_cls = objc_getClass(c"NSArray".as_ptr());
+            assert!(!tap_cls.is_null());
+            assert!(!arr_cls.is_null());
+
+            let msg_0: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg_1_ptr: unsafe extern "C" fn(
+                *const c_void,
+                *const c_void,
+                *const c_void,
+            ) -> *const c_void = std::mem::transmute(objc_msgSend as *const ());
+            let msg_1_bool: unsafe extern "C" fn(*const c_void, *const c_void, i8) =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg_1_i64: unsafe extern "C" fn(*const c_void, *const c_void, i64) =
+                std::mem::transmute(objc_msgSend as *const ());
+            let msg_void: unsafe extern "C" fn(*const c_void, *const c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+
+            let empty_arr = msg_0(arr_cls, sel_registerName(c"array".as_ptr()));
+            let alloc_desc = msg_0(tap_cls, sel_registerName(c"alloc".as_ptr()));
+            let init_sel = sel_registerName(c"initStereoGlobalTapButExcludeProcesses:".as_ptr());
+            assert!(responds_to_selector(alloc_desc, init_sel));
+            let desc = msg_1_ptr(alloc_desc, init_sel, empty_arr);
+            assert!(!desc.is_null());
+
+            let set_mute_sel = sel_registerName(c"setMuteBehavior:".as_ptr());
+            let set_private_sel = sel_registerName(c"setPrivate:".as_ptr());
+            assert!(responds_to_selector(desc, set_mute_sel));
+            assert!(responds_to_selector(desc, set_private_sel));
+            // Verify the bogus selector that previously caused SIGABRT is rejected safely.
+            assert!(!responds_to_selector(
+                desc,
+                sel_registerName(c"setPrivateTap:".as_ptr())
+            ));
+
+            msg_1_i64(desc, set_mute_sel, 0);
+            msg_1_bool(desc, set_private_sel, 1);
+            msg_void(desc, sel_registerName(c"release".as_ptr()));
+        }
     }
 }

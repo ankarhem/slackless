@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+tracing.workspace = true
+log.workspace = true
 # Deep-link parsing (slack://, https://app.slack.com/client) — pure, tested.
 url = "2.5.8"
 percent-encoding = "2.3.2"

@@ -367,13 +367,62 @@ fn huddle_popout_thread_starts_empty_filters_root_and_uses_composer(cx: &mut Tes
     // 3. Submitting through PopoutWindow's real Composer sends into the huddle thread!
     vcx.update(|_, cx| {
         popout.update(cx, |win, cx| {
-            let content = crate::composer::content_of("Notes from call", &win.fixtures);
+            let content = crate::composer::content_of("https://example.com", &win.fixtures);
             win.send_content(content, cx);
         });
     });
-    let recorded = sent.lock().unwrap();
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].0, channel);
-    assert_eq!(recorded[0].1, Some(root_ts));
-    assert_eq!(recorded[0].2, "Notes from call");
+    {
+        let recorded = sent.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, channel);
+        assert_eq!(recorded[0].1, Some(root_ts.clone()));
+        assert_eq!(recorded[0].2, "https://example.com");
+    }
+
+    // 4. Once Slack echoes the reply with server-normalized text and server `ts`,
+    //    `huddle_thread_messages` must NOT show a duplicate.
+    let now_ts = Ts::from(format!(
+        "{}.123456",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    ));
+    let echoed = Message {
+        ts: now_ts,
+        thread_ts: Some(root_ts.clone()),
+        user: Some(fixtures.self_user.clone()),
+        text: "<https://example.com>".to_owned(),
+        ..Default::default()
+    };
+    let mut updated_fixtures = crate::fixtures::load();
+    updated_fixtures.threads.insert(
+        (channel.clone(), root_ts.clone()),
+        vec![
+            Message {
+                ts: root_ts.clone(),
+                subtype: Some(MessageSubtype::HuddleThread),
+                text: "A huddle started".to_owned(),
+                ..Default::default()
+            },
+            Message {
+                ts: reply_ts,
+                thread_ts: Some(root_ts.clone()),
+                text: "Agenda link".to_owned(),
+                ..Default::default()
+            },
+            echoed,
+        ],
+    );
+    vcx.update(|_, cx| {
+        popout.update(cx, |win, _| {
+            win.fixtures = Arc::new(updated_fixtures);
+            let msgs = win.huddle_thread_messages(&with_root);
+            assert_eq!(
+                msgs.len(),
+                2,
+                "echoed server reply must deduplicate against the optimistic local entry"
+            );
+        });
+    });
 }

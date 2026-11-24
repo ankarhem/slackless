@@ -90,6 +90,7 @@ fn main() {
     if std::env::args().any(|arg| arg == sign_in::FLAG) {
         std::process::exit(sign_in::run_helper());
     }
+    let _log_path = platform::init_file_logging("slackless-gui");
     let startup_urls: Vec<String> = std::env::args()
         .skip(1)
         .filter(|arg| {

@@ -86,6 +86,11 @@ impl ContentShareSession {
             ..base_creds
         };
 
+        tracing::info!(
+            source_id = %source_id,
+            attendee = %content_creds.attendee_id,
+            "starting #content screen share session"
+        );
         let mut sig = ChimeSignalClient::connect(&content_creds).await?;
         let audio_session_id: u64 = rand::random();
         sig.send_frame(&build_join_frame(audio_session_id)).await?;
@@ -96,6 +101,12 @@ impl ContentShareSession {
                     "content share WS closed before JOIN_ACK".into(),
                 ));
             };
+            if let Some(err) = frame.error {
+                return Err(HuddleError::Protocol {
+                    status: err.status.unwrap_or(500),
+                    description: err.description.unwrap_or_default(),
+                });
+            }
             if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32) {
                 break frame.joinack.ok_or_else(|| {
                     HuddleError::Signaling("content JOIN_ACK missing payload".into())
@@ -124,6 +135,12 @@ impl ContentShareSession {
                     "content share WS closed before SUBSCRIBE_ACK".into(),
                 ));
             };
+            if let Some(err) = frame.error {
+                return Err(HuddleError::Protocol {
+                    status: err.status.unwrap_or(500),
+                    description: err.description.unwrap_or_default(),
+                });
+            }
             if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32) {
                 break frame.suback.ok_or_else(|| {
                     HuddleError::Signaling("content SUBSCRIBE_ACK missing payload".into())
@@ -135,6 +152,10 @@ impl ContentShareSession {
             sub_ack.compressed_sdp_answer.as_deref(),
         )?;
         rtc.set_remote_answer(answer).await?;
+        tracing::info!(
+            source_id = %source_id,
+            "#content SUBSCRIBE_ACK applied; starting screen capture"
+        );
 
         let (h264_tx, mut h264_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let capture = ScreenCapture::start(source_id, h264_tx, preview_tx)?;
@@ -151,7 +172,16 @@ impl ContentShareSession {
         // Priority 1 (macOS 14.2+): Zero-driver CoreAudio Process Tap (`F-COLLAB-022`).
         #[cfg(target_os = "macos")]
         let native_tap = if crate::macos_audio_tap::supports_native_system_audio_tap() {
-            crate::macos_audio_tap::SystemAudioTap::start(Arc::clone(&loopback_pcm)).ok()
+            match crate::macos_audio_tap::SystemAudioTap::start(Arc::clone(&loopback_pcm)) {
+                Ok(tap) => Some(tap),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "macOS native system audio tap unavailable; continuing without native tap"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -278,11 +308,13 @@ impl ContentShareSession {
             let mut metric_tick = tokio::time::interval(Duration::from_secs(1));
             metric_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut connected = false;
+            let mut sent_first_frame = false;
 
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     Some(st) = state_rx.recv() => {
+                        tracing::info!(state = ?st, "#content peer connection state");
                         match st {
                             RTCPeerConnectionState::Connected => connected = true,
                             RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => break,
@@ -291,7 +323,16 @@ impl ContentShareSession {
                     }
                     Some(annex_b) = h264_rx.recv() => {
                         if connected {
-                            let _ = rtc.write_h264_frame(annex_b, Duration::from_millis(125)).await;
+                            match rtc.write_h264_frame(annex_b, Duration::from_millis(125)).await {
+                                Ok(()) if !sent_first_frame => {
+                                    sent_first_frame = true;
+                                    tracing::info!("#content first H.264 screen frame sent");
+                                }
+                                Ok(()) => {}
+                                Err(err) => {
+                                    tracing::warn!(%err, "#content write_h264_frame error");
+                                }
+                            }
                         }
                     }
                     _ = metric_tick.tick() => {

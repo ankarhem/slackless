@@ -8,6 +8,7 @@ license.workspace = true
 slackless-core.workspace = true
 # `HttpClient::send`'s error type (GPUI's image loader).
 anyhow.workspace = true
+tracing.workspace = true
 # The sign-in window (`--sign-in` helper process).
 slackless-auth = { workspace = true, features = ["webview"] }
 gpui-kit = "0.10.0"

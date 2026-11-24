@@ -13,6 +13,7 @@ slackless-auth.workspace = true
 slackless-huddle.workspace = true
 slackless-platform.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true

@@ -123,27 +123,62 @@ impl ScreenCapture {
                     }
                 };
 
+                let mut logged_first_frame = false;
+                let mut last_err_log: Option<std::time::Instant> = None;
+
                 while run_flag.load(Ordering::Relaxed) {
-                    if let Some(rgba) = capture_once(&source_id) {
-                        let (rgb_full, _bgra_full) = rgba_to_rgb_and_bgra(rgba.as_raw());
-                        let (rgb, w, h) = resize_rgb_even(
-                            &rgb_full,
-                            rgba.width(),
-                            rgba.height(),
-                            SCREEN_MAX_W,
-                            SCREEN_MAX_H,
-                        );
-                        if w >= 2 && h >= 2 {
-                            let bgra = crate::video::rgb_to_bgra(&rgb);
-                            let _ = preview_tx.send(VideoFrame {
-                                width: w,
-                                height: h,
-                                bgra: Arc::new(bgra),
-                            });
-                            if let Ok(h264) = enc.encode_rgb(&rgb, w as usize, h as usize) {
-                                if !h264.is_empty() {
-                                    let _ = outbound_h264_tx.send(h264);
+                    match capture_once_result(&source_id) {
+                        Ok(rgba) => {
+                            let (rgb_full, _bgra_full) = rgba_to_rgb_and_bgra(rgba.as_raw());
+                            let (rgb, w, h) = resize_rgb_even(
+                                &rgb_full,
+                                rgba.width(),
+                                rgba.height(),
+                                SCREEN_MAX_W,
+                                SCREEN_MAX_H,
+                            );
+                            if w >= 2 && h >= 2 {
+                                if !logged_first_frame {
+                                    logged_first_frame = true;
+                                    tracing::info!(
+                                        source_id = %source_id,
+                                        raw_w = rgba.width(),
+                                        raw_h = rgba.height(),
+                                        encoded_w = w,
+                                        encoded_h = h,
+                                        "screen capture active"
+                                    );
                                 }
+                                let bgra = crate::video::rgb_to_bgra(&rgb);
+                                let _ = preview_tx.send(VideoFrame {
+                                    width: w,
+                                    height: h,
+                                    bgra: Arc::new(bgra),
+                                });
+                                match enc.encode_rgb(&rgb, w as usize, h as usize) {
+                                    Ok(h264) if !h264.is_empty() => {
+                                        let _ = outbound_h264_tx.send(h264);
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        if last_err_log
+                                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+                                        {
+                                            last_err_log = Some(std::time::Instant::now());
+                                            tracing::warn!(%err, "screen H.264 encode error");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if last_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+                                last_err_log = Some(std::time::Instant::now());
+                                tracing::warn!(
+                                    source_id = %source_id,
+                                    %err,
+                                    "screen capture failed"
+                                );
                             }
                         }
                     }
@@ -177,27 +212,43 @@ impl Drop for ScreenCapture {
 }
 
 pub(crate) fn capture_once(source_id: &str) -> Option<xcap::image::RgbaImage> {
+    capture_once_result(source_id).ok()
+}
+
+fn capture_once_result(source_id: &str) -> std::result::Result<xcap::image::RgbaImage, String> {
     if let Some(mon_id) = source_id
         .strip_prefix("monitor:")
         .and_then(|s| s.parse::<u32>().ok())
     {
         let monitor = xcap::Monitor::all()
-            .ok()?
+            .map_err(|e| format!("Monitor::all failed: {e}"))?
             .into_iter()
-            .find(|m| m.id().ok() == Some(mon_id))?;
-        return monitor.capture_image().ok();
+            .find(|m| m.id().ok() == Some(mon_id))
+            .ok_or_else(|| format!("monitor {mon_id} not found"))?;
+        return monitor
+            .capture_image()
+            .map_err(|e| format!("monitor {mon_id} capture_image failed: {e}"));
     }
     if let Some(win_id) = source_id
         .strip_prefix("window:")
         .and_then(|s| s.parse::<u32>().ok())
     {
         let window = xcap::Window::all()
-            .ok()?
+            .map_err(|e| format!("Window::all failed: {e}"))?
             .into_iter()
-            .find(|w| w.id().ok() == Some(win_id))?;
-        return window.capture_image().ok();
+            .find(|w| w.id().ok() == Some(win_id))
+            .ok_or_else(|| format!("window {win_id} not found"))?;
+        return window
+            .capture_image()
+            .map_err(|e| format!("window {win_id} capture_image failed: {e}"));
     }
     // Fallback to primary monitor when no explicit id matches.
-    let monitor = xcap::Monitor::all().ok()?.into_iter().next()?;
-    monitor.capture_image().ok()
+    let monitor = xcap::Monitor::all()
+        .map_err(|e| format!("Monitor::all failed: {e}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no monitors available".to_owned())?;
+    monitor
+        .capture_image()
+        .map_err(|e| format!("primary monitor capture_image failed: {e}"))
 }

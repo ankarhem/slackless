@@ -232,6 +232,10 @@ impl HuddlePalette {
     }
 }
 
+fn parse_ts_secs(ts: &str) -> Option<f64> {
+    ts.trim().parse::<f64>().ok()
+}
+
 impl PopoutWindow {
     fn huddle_dock_entity(&self) -> Option<Entity<crate::huddle_dock::HuddleDock>> {
         match &self.kind {
@@ -718,16 +722,102 @@ impl PopoutWindow {
             // channel chat!).
             None => Vec::new(),
         };
+        let mut matched_store = vec![false; out.len()];
         for local in &self.huddle_thread_local {
-            let echoed = out.iter().any(|m| {
-                m.ts == local.ts
-                    || (m.user == local.user && !local.text.is_empty() && m.text == local.text)
+            let local_preview = self.fixtures.preview(local);
+            let local_secs = parse_ts_secs(local.ts.as_str());
+            let found = out.iter().enumerate().find(|(ix, m)| {
+                if matched_store[*ix] {
+                    return false;
+                }
+                if m.ts == local.ts {
+                    return true;
+                }
+                if m.user != local.user {
+                    return false;
+                }
+                let exact = !local.text.trim().is_empty() && m.text.trim() == local.text.trim();
+                let same_preview = !local_preview.trim().is_empty()
+                    && self.fixtures.preview(m).trim() == local_preview.trim();
+                let close_in_time = match (parse_ts_secs(m.ts.as_str()), local_secs) {
+                    (Some(ms), Some(ls)) => (ms - ls) >= -10.0 && (ms - ls) <= 30.0,
+                    _ => false,
+                };
+                exact || same_preview || close_in_time
             });
-            if !echoed {
+            if let Some((ix, _)) = found {
+                matched_store[ix] = true;
+            } else {
                 out.push(local.clone());
             }
         }
         out
+    }
+
+    /// Drop any optimistic local huddle replies that have already been echoed into the store.
+    pub(super) fn prune_echoed_huddle_locals(
+        &mut self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+    ) {
+        if self.huddle_thread_local.is_empty() {
+            return;
+        }
+        let Some(root) = self.resolve_huddle_thread_root(snap) else {
+            return;
+        };
+        let (Some(store), Some(team)) = (&self.store, &self.team) else {
+            return;
+        };
+        let store_msgs: Vec<Message> = store
+            .lock()
+            .ok()
+            .and_then(|guard| guard.thread_replies(team, &snap.channel, &root).ok())
+            .map(|list| {
+                list.into_iter()
+                    .filter(|r| {
+                        !r.deleted
+                            && r.message.ts != root
+                            && r.message.subtype
+                                != Some(slackless_core::types::MessageSubtype::HuddleThread)
+                    })
+                    .map(|r| r.message)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if store_msgs.is_empty() {
+            return;
+        }
+        let mut matched = vec![false; store_msgs.len()];
+        let fixtures = &self.fixtures;
+        self.huddle_thread_local.retain(|local| {
+            let local_preview = fixtures.preview(local);
+            let local_secs = parse_ts_secs(local.ts.as_str());
+            let found = store_msgs.iter().enumerate().find(|(ix, m)| {
+                if matched[*ix] {
+                    return false;
+                }
+                if m.ts == local.ts {
+                    return true;
+                }
+                if m.user != local.user {
+                    return false;
+                }
+                let exact = !local.text.trim().is_empty() && m.text.trim() == local.text.trim();
+                let same_preview = !local_preview.trim().is_empty()
+                    && fixtures.preview(m).trim() == local_preview.trim();
+                let close_in_time = match (parse_ts_secs(m.ts.as_str()), local_secs) {
+                    (Some(ms), Some(ls)) => (ms - ls) >= -10.0 && (ms - ls) <= 30.0,
+                    _ => false,
+                };
+                exact || same_preview || close_in_time
+            });
+            if let Some((ix, _)) = found {
+                matched[ix] = true;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn render_huddle_thread_drawer(

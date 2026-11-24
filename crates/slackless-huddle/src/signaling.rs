@@ -1,5 +1,6 @@
 //! Amazon Chime SDK signaling WebSocket client (`[0x05][SdkSignalFrame]` protobuf framing).
 
+use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,10 +19,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use crate::proto::{
     SdkAudioControlFrame, SdkClientDetails, SdkClientMetricFrame, SdkDataMessageFrame,
     SdkDataMessagePayload, SdkIndexFrame, SdkJoinFlags, SdkJoinFrame, SdkLeaveFrame, SdkMetric,
-    SdkPingPongFrame, SdkPingPongType, SdkRemoteVideoUpdateFrame, SdkSignalFrame,
-    SdkStreamDescriptor, SdkStreamMediaType, SdkStreamMetricFrame, SdkStreamServiceType,
-    SdkSubscribeFrame, SdkVideoQualityAdaptationPreference, SdkVideoSubscriptionConfiguration,
-    sdk_metric, sdk_signal_frame,
+    SdkPingPongFrame, SdkPingPongType, SdkRemoteVideoUpdateFrame, SdkServerSideNetworkAdaption,
+    SdkSignalFrame, SdkStreamDescriptor, SdkStreamMediaType, SdkStreamMetricFrame,
+    SdkStreamServiceType, SdkSubscribeFrame, SdkVideoQualityAdaptationPreference,
+    SdkVideoSubscriptionConfiguration, sdk_metric, sdk_signal_frame,
 };
 use crate::{HuddleCredentials, HuddleError, Result};
 
@@ -131,15 +132,21 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build the initial Chime `JOIN` frame (`protocol_version = 2`, `HAS_STREAM_UPDATE`).
+/// Build the initial Chime `JOIN` frame (`protocol_version = 2`, full stream-update flags, and
+/// server-side network adaptation so `video_subscription_configuration` / `REMOTE_VIDEO_UPDATE`
+/// are active on the SFU).
 pub fn build_join_frame(audio_session_id: u64) -> SdkSignalFrame {
+    let flags = SdkJoinFlags::HasStreamUpdate as u32
+        | SdkJoinFlags::CompleteVideoSourcesList as u32
+        | SdkJoinFlags::ExcludeSelfContentInIndex as u32;
+    let adaption = SdkServerSideNetworkAdaption::BandwidthProbingAndVideoQualityAdaption as i32;
     SdkSignalFrame {
         timestamp_ms: Some(now_ms()),
         r#type: Some(sdk_signal_frame::Type::Join as i32),
         join: Some(SdkJoinFrame {
             protocol_version: Some(2),
             max_num_of_videos: Some(25),
-            flags: Some(SdkJoinFlags::HasStreamUpdate as u32),
+            flags: Some(flags),
             client_details: Some(SdkClientDetails {
                 app_name: Some("slackless".to_owned()),
                 app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
@@ -154,6 +161,8 @@ pub fn build_join_frame(audio_session_id: u64) -> SdkSignalFrame {
             }),
             audio_session_id: Some(audio_session_id),
             wants_compressed_sdp: Some(true),
+            server_side_network_adaption: Some(adaption),
+            supported_server_side_network_adaptions: vec![adaption],
             ..Default::default()
         }),
         ..Default::default()
@@ -171,12 +180,25 @@ pub struct RemoteVideoSource {
     pub max_bitrate_kbps: u32,
 }
 
-/// Extract remote camera and `#content` screen-share sources from an `SdkIndexFrame`.
+/// Extract remote camera and `#content` screen-share sources from an `SdkIndexFrame`,
+/// deduplicating simulcast layers by `(attendee_id, group_id)` (picking the highest-bitrate
+/// stream per group, matching `amazon-chime-sdk-js`).
 pub fn parse_index_sources(
     index: &SdkIndexFrame,
     self_attendee_id: &str,
 ) -> Vec<RemoteVideoSource> {
-    let mut out = Vec::new();
+    parse_index_sources_with_lookup(index, self_attendee_id, &HashMap::new())
+}
+
+/// Same as [`parse_index_sources`], using `attendee_to_user` as a fallback when a `#content`
+/// stream descriptor omits `external_user_id`.
+pub fn parse_index_sources_with_lookup(
+    index: &SdkIndexFrame,
+    self_attendee_id: &str,
+    attendee_to_user: &HashMap<String, UserId>,
+) -> Vec<RemoteVideoSource> {
+    let mut best_by_group: HashMap<(String, u32), RemoteVideoSource> = HashMap::new();
+    let mut order: Vec<(String, u32)> = Vec::new();
     for src in &index.sources {
         let Some(stream_id) = src.stream_id else {
             continue;
@@ -187,21 +209,41 @@ pub fn parse_index_sources(
         }
         let external = src.external_user_id.as_deref().unwrap_or("");
         let is_content = external.ends_with("#content") || attendee_id.ends_with("#content");
-        let Some(user_id) = parse_external_user_id(external) else {
-            continue;
-        };
-        out.push(RemoteVideoSource {
+        let base_attendee = attendee_id.strip_suffix("#content").unwrap_or(&attendee_id);
+        let user_id = parse_external_user_id(external)
+            .or_else(|| attendee_to_user.get(base_attendee).cloned())
+            .unwrap_or_else(|| UserId::from(base_attendee));
+        let group_id = src.group_id.unwrap_or(1);
+        let max_bitrate_kbps = src
+            .max_bitrate_kbps
+            .unwrap_or(if is_content { 1500 } else { 350 });
+        let candidate = RemoteVideoSource {
             stream_id,
-            group_id: src.group_id.unwrap_or(1),
-            attendee_id,
+            group_id,
+            attendee_id: attendee_id.clone(),
             user_id,
             is_content,
-            max_bitrate_kbps: src
-                .max_bitrate_kbps
-                .unwrap_or(if is_content { 1500 } else { 350 }),
-        });
+            max_bitrate_kbps,
+        };
+        let key = (attendee_id, group_id);
+        match best_by_group.get(&key) {
+            Some(prev)
+                if prev.max_bitrate_kbps > candidate.max_bitrate_kbps
+                    || (prev.max_bitrate_kbps == candidate.max_bitrate_kbps
+                        && prev.stream_id >= candidate.stream_id) => {}
+            Some(_) => {
+                best_by_group.insert(key, candidate);
+            }
+            None => {
+                order.push(key.clone());
+                best_by_group.insert(key, candidate);
+            }
+        }
     }
-    out
+    order
+        .into_iter()
+        .filter_map(|k| best_by_group.remove(&k))
+        .collect()
 }
 
 /// Build a Chime `SUBSCRIBE` frame for audio-only (`send_video = false`) or full `DUPLEX`
@@ -250,9 +292,13 @@ pub fn build_subscribe_frame(
             height: Some(360),
         });
     }
+    // Mid 1 is always present in our SDP offer (local camera slot), so whenever we are sending
+    // video or subscribing to mid-2+ remote video streams, prepend `0` for mid 1 so
+    // `receive_stream_ids` lines up positionally with every video m-section.
+    let needs_mid1_placeholder = send_video || !receive_sources.is_empty();
     let mut receive_stream_ids =
-        Vec::with_capacity(receive_sources.len() + usize::from(send_video));
-    if send_video {
+        Vec::with_capacity(receive_sources.len() + usize::from(needs_mid1_placeholder));
+    if needs_mid1_placeholder {
         receive_stream_ids.push(0);
     }
     receive_stream_ids.extend(receive_sources.iter().map(|(_, s)| s.stream_id));
@@ -605,6 +651,95 @@ mod tests {
         let built = build_signaling_url("wss://signal.z3.ec1.m.chime.aws/control/abc").unwrap();
         assert!(built.contains("X-Chime-Control-Protocol-Version=3"));
         assert!(built.contains("X-Amzn-Chime-Send-Close-On-Error=1"));
+    }
+
+    #[test]
+    fn parse_index_deduplicates_simulcast_and_resolves_missing_external_user_id() {
+        let mut lookup = HashMap::new();
+        lookup.insert("att-bob".to_owned(), UserId::from("U0BOB"));
+
+        let index = SdkIndexFrame {
+            sources: vec![
+                // Two simulcast layers for Alice's camera (same attendee + group).
+                SdkStreamDescriptor {
+                    stream_id: Some(7),
+                    group_id: Some(2),
+                    max_bitrate_kbps: Some(300),
+                    attendee_id: Some("att-alice".to_owned()),
+                    external_user_id: Some("T1-R1-U0ALICE".to_owned()),
+                    ..Default::default()
+                },
+                SdkStreamDescriptor {
+                    stream_id: Some(8),
+                    group_id: Some(2),
+                    max_bitrate_kbps: Some(1200),
+                    attendee_id: Some("att-alice".to_owned()),
+                    external_user_id: Some("T1-R1-U0ALICE".to_owned()),
+                    ..Default::default()
+                },
+                // Bob's #content screen share omitting external_user_id.
+                SdkStreamDescriptor {
+                    stream_id: Some(12),
+                    group_id: Some(5),
+                    max_bitrate_kbps: Some(2000),
+                    attendee_id: Some("att-bob#content".to_owned()),
+                    external_user_id: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let parsed = parse_index_sources_with_lookup(&index, "att-self", &lookup);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].stream_id, 8);
+        assert_eq!(parsed[0].user_id, UserId::from("U0ALICE"));
+        assert!(!parsed[0].is_content);
+        assert_eq!(parsed[1].stream_id, 12);
+        assert_eq!(parsed[1].user_id, UserId::from("U0BOB"));
+        assert!(parsed[1].is_content);
+    }
+
+    #[test]
+    fn subscribe_prepends_zero_placeholder_for_mid1_when_receiving_remote_video() {
+        let creds = HuddleCredentials {
+            channel: slackless_types::ChannelId::from("C1"),
+            call_id: "R1".to_owned(),
+            meeting_id: "M1".to_owned(),
+            signaling_url: "wss://example.invalid".to_owned(),
+            audio_host_url: "audio.invalid:3478".to_owned(),
+            turn_control_url: String::new(),
+            attendee_id: "att-self".to_owned(),
+            external_user_id: "T1-R1-U0SELF".to_owned(),
+            join_token: "tok".to_owned(),
+            thread_root_ts: None,
+            canvas_file_id: None,
+            huddle_link: None,
+        };
+        let remote = RemoteVideoSource {
+            stream_id: 12,
+            group_id: 5,
+            attendee_id: "att-bob#content".to_owned(),
+            user_id: UserId::from("U0BOB"),
+            is_content: true,
+            max_bitrate_kbps: 2000,
+        };
+        let frame = build_subscribe_frame(
+            &creds,
+            "v=0\r\n",
+            false,
+            false,
+            false, // camera OFF, still receiving Bob's screen share on mid 2
+            &[("2".to_owned(), remote)],
+        )
+        .unwrap();
+        let sub = frame.sub.unwrap();
+        assert_eq!(sub.receive_stream_ids, vec![0, 12]);
+        assert_eq!(sub.video_subscription_configuration.len(), 1);
+        assert_eq!(
+            sub.video_subscription_configuration[0].mid.as_deref(),
+            Some("2")
+        );
     }
 
     #[tokio::test]

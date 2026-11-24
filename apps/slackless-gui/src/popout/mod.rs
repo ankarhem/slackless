@@ -887,6 +887,9 @@ impl PopoutWindow {
                 if let Some(dock) = source.upgrade() {
                     self.huddle_state = Some(dock.read(cx).view_state());
                 }
+                if let Some(st) = self.huddle_state.clone() {
+                    self.prune_echoed_huddle_locals(&st.session);
+                }
                 if self.huddle_drawer == Some(HuddleDrawer::Thread) {
                     self.maybe_fetch_huddle_thread();
                     cx.notify();

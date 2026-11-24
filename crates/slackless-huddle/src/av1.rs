@@ -7,6 +7,10 @@ use std::sync::Arc;
 use rav1d::include::dav1d::common::Dav1dDataProps;
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
+use rav1d::include::dav1d::headers::{
+    DAV1D_PIXEL_LAYOUT_I400, DAV1D_PIXEL_LAYOUT_I420, DAV1D_PIXEL_LAYOUT_I422,
+    DAV1D_PIXEL_LAYOUT_I444,
+};
 use rav1d::include::dav1d::picture::Dav1dPicture;
 use rav1d::src::lib::{
     dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_get_picture,
@@ -43,12 +47,18 @@ fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-/// Appends one size-stripped wire OBU to a low-overhead bitstream temporal unit, restoring the
-/// `obu_has_size_field` bit and LEB128 payload size expected by `rav1d`.
+/// Appends one wire OBU to a low-overhead bitstream temporal unit, restoring the
+/// `obu_has_size_field` bit and LEB128 payload size expected by `rav1d` when stripped on the wire.
 fn append_sized_obu(out: &mut Vec<u8>, obu: &[u8]) {
     let Some(&first) = obu.first() else {
         return;
     };
+    // If the wire OBU already carries `obu_has_size_field` (bit 1), preserve it verbatim instead
+    // of prepending a duplicate LEB128 size field.
+    if first & 0b0000_0010 != 0 {
+        out.extend_from_slice(obu);
+        return;
+    }
     let header_len = if first & 0b0000_0100 != 0 { 2 } else { 1 };
     if obu.len() < header_len {
         return;
@@ -71,12 +81,32 @@ pub struct Av1Frames {
 impl Av1Frames {
     /// Push one RTP packet payload; returns `Some(temporal_unit)` when `marker` closes a valid unit.
     pub fn push(&mut self, seq: u16, marker: bool, payload: &[u8]) -> Option<Vec<u8>> {
-        if let Some(prev) = self.last_seq {
-            if seq.wrapping_sub(prev) != 1 {
+        let Some(&header) = payload.first() else {
+            self.last_seq = Some(seq);
+            return None;
+        };
+        let z_continues_prev = header & 0b1000_0000 != 0;
+        let n_new_cvs = header & 0b0000_1000 != 0;
+
+        let seq_gap = self
+            .last_seq
+            .is_some_and(|prev| seq.wrapping_sub(prev) != 1);
+        self.last_seq = Some(seq);
+
+        // An SFU routinely skips RTP sequence numbers between complete frames (e.g. dropped
+        // non-reference frames, layer switches, or padding). Only treat a gap as breaking an
+        // in-progress frame or a continuation packet (`Z=1`); a clean new frame (`Z=0`) when no
+        // prior frame is in progress—or any New Coded Video Sequence (`N=1`, keyframe)—recovers
+        // immediately instead of discarding the new frame.
+        if n_new_cvs && !z_continues_prev {
+            self.reset();
+        } else if seq_gap {
+            if !self.unit.is_empty() || !self.partial.is_empty() || z_continues_prev {
                 self.broken = true;
+            } else {
+                self.reset();
             }
         }
-        self.last_seq = Some(seq);
 
         if self.broken {
             if marker {
@@ -87,6 +117,9 @@ impl Av1Frames {
 
         if self.parse_packet(payload).is_none() {
             self.broken = true;
+            if marker {
+                self.reset();
+            }
             return None;
         }
 
@@ -197,6 +230,11 @@ impl Av1Decoder {
         if unit.is_empty() {
             return Ok(None);
         }
+        // Prepend a 2-byte Temporal Delimiter OBU (`obu_type=2`, `obu_has_size_field=1`, `size=0`)
+        // when stripped on the RTP wire so `rav1d` flushes the decoded picture immediately.
+        let starts_with_td = ((unit[0] >> 3) & 0x0f) == 2;
+        let total_len = unit.len() + if starts_with_td { 0 } else { 2 };
+
         // SAFETY: `Dav1dData` and `Dav1dPicture` are initialized per dav1d's FFI contract and
         // released with `dav1d_picture_unref` before returning.
         unsafe {
@@ -206,24 +244,47 @@ impl Av1Decoder {
                 r#ref: None,
                 m: Dav1dDataProps::default(),
             };
-            let buf = dav1d_data_create(NonNull::new(&mut data as *mut _), unit.len());
+            let buf = dav1d_data_create(NonNull::new(&mut data as *mut _), total_len);
             if buf.is_null() {
                 return Err(HuddleError::Codec("rav1d buffer allocation failed".into()));
             }
-            std::ptr::copy_nonoverlapping(unit.as_ptr(), buf, unit.len());
-            let res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
-            // -11 == EAGAIN: decoder queue full, drain a picture below.
-            if res.0 < 0 && res.0 != -11 {
+            if starts_with_td {
+                std::ptr::copy_nonoverlapping(unit.as_ptr(), buf, unit.len());
+            } else {
+                *buf = 0x12;
+                *buf.add(1) = 0x00;
+                std::ptr::copy_nonoverlapping(unit.as_ptr(), buf.add(2), unit.len());
+            }
+
+            let mut out_frame = None;
+            let mut send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
+            if send_res.0 == -11 {
+                // EAGAIN: drain any queued picture first, then retry sending the new unit.
+                if let Some(frame) = self.drain_picture()? {
+                    out_frame = Some(frame);
+                }
+                send_res = dav1d_send_data(self.ctx, NonNull::new(&mut data as *mut _));
+            }
+            if send_res.0 < 0 && send_res.0 != -11 {
                 dav1d_data_unref(NonNull::new(&mut data as *mut _));
                 return Err(HuddleError::Codec(format!(
                     "rav1d send_data error {}",
-                    res.0
+                    send_res.0
                 )));
             }
-            if res.0 == -11 {
+            if send_res.0 == -11 {
                 dav1d_data_unref(NonNull::new(&mut data as *mut _));
             }
 
+            if let Some(frame) = self.drain_picture()? {
+                out_frame = Some(frame);
+            }
+            Ok(out_frame)
+        }
+    }
+
+    unsafe fn drain_picture(&mut self) -> Result<Option<VideoFrame>> {
+        unsafe {
             let mut pic = std::mem::MaybeUninit::<Dav1dPicture>::zeroed().assume_init();
             let res = dav1d_get_picture(self.ctx, NonNull::new(&mut pic as *mut _));
             if res.0 == -11 {
@@ -251,28 +312,74 @@ impl Drop for Av1Decoder {
     }
 }
 
-/// Convert an 8-bit 4:2:0 `Dav1dPicture` into a BGRA8888 [`VideoFrame`] for GPUI.
+/// Convert an 8-bit or 10-bit `Dav1dPicture` (`I420`, `I422`, `I444`, or `I400`) into a BGRA8888
+/// [`VideoFrame`] for GPUI.
 unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
     let w = pic.p.w.max(0) as usize;
     let h = pic.p.h.max(0) as usize;
-    if w == 0 || h == 0 || pic.p.bpc != 8 {
+    let bpc = pic.p.bpc;
+    if w == 0 || h == 0 || (bpc != 8 && bpc != 10) {
         return None;
     }
+    let layout = pic.p.layout;
+    let (cw_shift, ch_shift, has_chroma) = match layout {
+        DAV1D_PIXEL_LAYOUT_I420 => (1usize, 1usize, true),
+        DAV1D_PIXEL_LAYOUT_I422 => (1usize, 0usize, true),
+        DAV1D_PIXEL_LAYOUT_I444 => (0usize, 0usize, true),
+        DAV1D_PIXEL_LAYOUT_I400 => (0usize, 0usize, false),
+        _ => return None,
+    };
+
     let y_ptr = pic.data[0]?.as_ptr() as *const u8;
-    let u_ptr = pic.data[1]?.as_ptr() as *const u8;
-    let v_ptr = pic.data[2]?.as_ptr() as *const u8;
-    let y_stride = pic.stride[0] as usize;
-    let c_stride = pic.stride[1] as usize;
+    let u_ptr = if has_chroma {
+        Some(pic.data[1]?.as_ptr() as *const u8)
+    } else {
+        None
+    };
+    let v_ptr = if has_chroma {
+        Some(pic.data[2]?.as_ptr() as *const u8)
+    } else {
+        None
+    };
+    let y_stride = pic.stride[0];
+    let c_stride = pic.stride[1];
+    let shift16 = (bpc - 8) as u32;
 
     let mut bgra = vec![0u8; w * h * 4];
     for row in 0..h {
-        let y_row = row * y_stride;
-        let c_row = (row / 2) * c_stride;
+        let y_row = (row as isize) * y_stride;
+        let c_row = ((row >> ch_shift) as isize) * c_stride;
         for col in 0..w {
-            // SAFETY: coordinates lie within `[0..w) x [0..h)` and plane strides match `pic`.
-            let y = unsafe { *y_ptr.add(y_row + col) } as f32;
-            let u = unsafe { *u_ptr.add(c_row + col / 2) } as f32 - 128.0;
-            let v = unsafe { *v_ptr.add(c_row + col / 2) } as f32 - 128.0;
+            let (y, u, v) = if bpc == 8 {
+                let y = unsafe { *y_ptr.offset(y_row + col as isize) } as f32;
+                let (u, v) = match (u_ptr, v_ptr) {
+                    (Some(up), Some(vp)) => {
+                        let cx = (col >> cw_shift) as isize;
+                        (
+                            unsafe { *up.offset(c_row + cx) } as f32 - 128.0,
+                            unsafe { *vp.offset(c_row + cx) } as f32 - 128.0,
+                        )
+                    }
+                    _ => (0.0, 0.0),
+                };
+                (y, u, v)
+            } else {
+                let y16 = unsafe { *(y_ptr.offset(y_row) as *const u16).add(col) };
+                let y = (y16 >> shift16) as f32;
+                let (u, v) = match (u_ptr, v_ptr) {
+                    (Some(up), Some(vp)) => {
+                        let cx = col >> cw_shift;
+                        let u16v = unsafe { *(up.offset(c_row) as *const u16).add(cx) };
+                        let v16v = unsafe { *(vp.offset(c_row) as *const u16).add(cx) };
+                        (
+                            (u16v >> shift16) as f32 - 128.0,
+                            (v16v >> shift16) as f32 - 128.0,
+                        )
+                    }
+                    _ => (0.0, 0.0),
+                };
+                (y, u, v)
+            };
             let yy = (y - 16.0) * 1.164;
             let r = (yy + 1.596 * v).clamp(0.0, 255.0) as u8;
             let g = (yy - 0.392 * u - 0.813 * v).clamp(0.0, 255.0) as u8;
@@ -330,6 +437,50 @@ mod tests {
             .push(11, true, &make_rtp_packet(true, false, &[&tail]))
             .expect("temporal unit");
         assert_eq!(unit, vec![(6 << 3) | 0b10, 5, b'h', b'e', b'l', b'l', b'o']);
+    }
+
+    #[test]
+    fn av1_frames_recovers_after_sequence_gap_between_complete_frames() {
+        let mut f = Av1Frames::default();
+        let obu1 = make_obu(6, b"one");
+        let u1 = f
+            .push(10, true, &make_rtp_packet(false, false, &[&obu1]))
+            .expect("first unit");
+        assert_eq!(u1, vec![(6 << 3) | 0b10, 3, b'o', b'n', b'e']);
+
+        // SFU skips seq 11..14 and delivers a fresh keyframe starting at seq 15 (2 packets).
+        let mut obu2 = make_obu(6, b"keyframe");
+        let tail = obu2.split_off(4);
+        assert!(
+            f.push(15, false, &make_rtp_packet(false, true, &[&obu2]))
+                .is_none()
+        );
+        let u2 = f
+            .push(16, true, &make_rtp_packet(true, false, &[&tail]))
+            .expect("frame after inter-frame seq gap must not be dropped");
+        assert_eq!(
+            u2,
+            vec![
+                (6 << 3) | 0b10,
+                8,
+                b'k',
+                b'e',
+                b'y',
+                b'f',
+                b'r',
+                b'a',
+                b'm',
+                b'e'
+            ]
+        );
+    }
+
+    #[test]
+    fn append_sized_obu_preserves_already_sized_obus() {
+        let already_sized = vec![(6 << 3) | 0b10, 2, b'h', b'i'];
+        let mut out = Vec::new();
+        append_sized_obu(&mut out, &already_sized);
+        assert_eq!(out, already_sized);
     }
 
     #[test]

@@ -9120,6 +9120,7 @@ dependencies = [
  "slackless-types",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -9138,6 +9139,7 @@ dependencies = [
  "slackless-auth",
  "slackless-core",
  "smallvec",
+ "tracing",
 ]
 
 [[package]]
@@ -9163,6 +9165,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
  "url",
  "webrtc",
  "xcap",
@@ -9174,12 +9177,14 @@ version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
+ "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "percent-encoding",
  "security-framework",
  "thiserror 1.0.69",
+ "tracing",
  "url",
 ]
 

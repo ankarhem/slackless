@@ -25,13 +25,13 @@ use crate::peer_message::{
     build_mute_request_message, build_reacji_message, build_sticky_emoji_awareness,
     decode_chime_transcript_frame, decode_slack_peer_message,
 };
-use crate::proto::sdk_signal_frame;
+use crate::proto::{SdkAudioStreamIdInfoFrame, SdkIndexFrame, sdk_signal_frame};
 use crate::rtc::{ChimeRtcPeer, InboundVideoPacket};
 use crate::signaling::{
     ChimeSignalClient, RemoteVideoSource, build_audio_control_frame, build_client_metric_frame,
     build_data_message_frame, build_join_frame, build_leave_frame, build_pong_frame,
-    build_remote_video_update_frame, build_subscribe_frame, build_video_subscriptions,
-    decode_sdp_answer, now_ms, parse_external_user_id, parse_index_sources,
+    build_remote_video_update_frame, build_subscribe_frame, decode_sdp_answer, now_ms,
+    parse_external_user_id, parse_index_sources_with_lookup,
 };
 use crate::video::{CameraCapture, H264VideoDecoder, VideoFrame, VideoTileKey};
 use crate::{
@@ -82,19 +82,19 @@ impl RemoteVideoDecoder {
         }
     }
 
-    fn push(&mut self, pkt: &InboundVideoPacket) -> (Option<VideoFrame>, bool) {
+    fn push(&mut self, pkt: &InboundVideoPacket) -> (Option<VideoFrame>, Option<String>) {
         match self {
             Self::Av1 { frames, dec } => {
                 if let Some(unit) = frames.push(pkt.seq, pkt.marker, &pkt.payload) {
                     match dec.decode(&unit) {
-                        Ok(frame) => (frame, false),
-                        Err(_) => (None, true),
+                        Ok(frame) => (frame, None),
+                        Err(err) => (None, Some(err.to_string())),
                     }
                 } else {
-                    (None, false)
+                    (None, None)
                 }
             }
-            Self::H264(dec) => (dec.push_rtp_payload(&pkt.payload, pkt.marker), false),
+            Self::H264(dec) => (dec.push_rtp_payload(&pkt.payload, pkt.marker), None),
         }
     }
 }
@@ -204,18 +204,39 @@ async fn run_connected_loop(
     updates: &mpsc::UnboundedSender<HuddleUpdate>,
 ) -> LoopExit {
     // 1. Connect Chime signaling WebSocket and send JOIN.
+    tracing::info!(
+        channel = %creds.channel,
+        call_id = %creds.call_id,
+        attendee_id = %creds.attendee_id,
+        "connecting to Chime huddle signaling"
+    );
     let mut signal = match ChimeSignalClient::connect(creds).await {
         Ok(s) => s,
-        Err(e) => return LoopExit::Fatal(e),
+        Err(e) => {
+            tracing::error!(%e, "Chime signaling connect failed");
+            return LoopExit::Fatal(e);
+        }
     };
     let audio_session_id: u64 = rand::rng().random();
     if let Err(e) = signal.send_frame(&build_join_frame(audio_session_id)).await {
+        tracing::error!(%e, "failed to send Chime JOIN");
         return LoopExit::Fatal(e);
     }
+
+    // Buffer any INDEX or AUDIO_STREAM_ID_INFO frames sent by Chime during the initial handshake
+    // so screen shares / cameras already active when we join are never missed.
+    let mut pending_index: Option<SdkIndexFrame> = None;
+    let mut pending_audio_info: Vec<SdkAudioStreamIdInfoFrame> = Vec::new();
 
     // 2. Await JOIN_ACK carrying TURN credentials.
     let join_ack = match tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(frame) = signal.next_frame().await? {
+            if let Some(idx) = frame.index {
+                pending_index = Some(idx);
+            }
+            if let Some(info) = frame.audio_stream_id_info {
+                pending_audio_info.push(info);
+            }
             if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32) {
                 if let Some(ack) = frame.joinack {
                     return Ok(ack);
@@ -236,7 +257,10 @@ async fn run_connected_loop(
     .map_err(|_| HuddleError::Signaling("timed out waiting for JOIN_ACK".to_owned()))
     {
         Ok(Ok(ack)) => ack,
-        Ok(Err(e)) | Err(e) => return LoopExit::Fatal(e),
+        Ok(Err(e)) | Err(e) => {
+            tracing::error!(%e, "JOIN_ACK failed");
+            return LoopExit::Fatal(e);
+        }
     };
 
     let Some(turn) = join_ack.turn_credentials else {
@@ -245,6 +269,12 @@ async fn run_connected_loop(
         ));
     };
     let wants_compressed = join_ack.wants_compressed_sdp.unwrap_or(true);
+    tracing::info!(
+        video_limit = join_ack.video_subscription_limit.unwrap_or(0),
+        wants_compressed,
+        turn_uris = turn.uris.len(),
+        "received Chime JOIN_ACK"
+    );
 
     // 3. Build WebRTC peer with relay-only UDP TURN and gather non-trickle SDP offer.
     let (inbound_opus_tx, inbound_opus_rx) = mpsc::unbounded_channel();
@@ -283,6 +313,12 @@ async fn run_connected_loop(
 
     let sub_ack = match tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(frame) = signal.next_frame().await? {
+            if let Some(idx) = frame.index {
+                pending_index = Some(idx);
+            }
+            if let Some(info) = frame.audio_stream_id_info {
+                pending_audio_info.push(info);
+            }
             if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32) {
                 if let Some(ack) = frame.suback {
                     return Ok(ack);
@@ -303,7 +339,10 @@ async fn run_connected_loop(
     .map_err(|_| HuddleError::Signaling("timed out waiting for SUBSCRIBE_ACK".to_owned()))
     {
         Ok(Ok(ack)) => ack,
-        Ok(Err(e)) | Err(e) => return LoopExit::Fatal(e),
+        Ok(Err(e)) | Err(e) => {
+            tracing::error!(%e, "initial SUBSCRIBE_ACK failed");
+            return LoopExit::Fatal(e);
+        }
     };
 
     let mut ssrc_to_stream_id: HashMap<u32, u32> = HashMap::new();
@@ -321,8 +360,14 @@ async fn run_connected_loop(
         Err(e) => return LoopExit::Fatal(e),
     };
     if let Err(e) = peer.set_remote_answer(sdp_answer).await {
+        tracing::error!(%e, "initial set_remote_answer failed");
         return LoopExit::Fatal(e);
     }
+    tracing::info!(
+        tracks = sub_ack.tracks.len(),
+        buffered_index = pending_index.is_some(),
+        "initial SUBSCRIBE_ACK applied"
+    );
 
     // 5. Start full-duplex audio engine (cpal + sonora AEC3/NS/AGC + Opus).
     let shared = AudioSharedState::from_config(config);
@@ -341,7 +386,10 @@ async fn run_connected_loop(
     let mut music_player: Option<AmbientMusicPlayer> = None;
     let mut remote_sources: Vec<(String, RemoteVideoSource)> = Vec::new();
     let mut remote_decoders: HashMap<u32, RemoteVideoDecoder> = HashMap::new();
+    let mut unsupported_video_ssrcs: HashSet<u32> = HashSet::new();
+    let mut decoded_video_ssrcs: HashSet<u32> = HashSet::new();
     let mut last_keyframe_req: HashMap<u32, Instant> = HashMap::new();
+    let mut last_decode_err_log: HashMap<u32, Instant> = HashMap::new();
     let mut active_remote_tiles: HashSet<VideoTileKey> = HashSet::new();
 
     let mut ever_connected = peer.connection_state() == RTCPeerConnectionState::Connected;
@@ -353,6 +401,7 @@ async fn run_connected_loop(
     let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(12);
 
     let mut stream_users: HashMap<u32, UserId> = HashMap::new();
+    let mut attendee_to_user: HashMap<String, UserId> = HashMap::new();
     let mut muted_peers: HashSet<UserId> = HashSet::new();
     let mut remote_speakers: Vec<(UserId, f32)> = Vec::new();
     let mut metric_tick = tokio::time::interval(Duration::from_secs(1));
@@ -361,6 +410,48 @@ async fn run_connected_loop(
     let self_user =
         parse_external_user_id(&creds.external_user_id).unwrap_or_else(|| UserId::from("U0SELF"));
     let self_content_attendee = format!("{}#content", creds.attendee_id);
+
+    // Apply any AUDIO_STREAM_ID_INFO and INDEX frames captured during the initial handshake.
+    for info in pending_audio_info.drain(..) {
+        for stream in info.streams {
+            if let (Some(att), Some(uid)) = (
+                stream.attendee_id.as_deref(),
+                stream
+                    .external_user_id
+                    .as_deref()
+                    .and_then(parse_external_user_id),
+            ) {
+                let base = att.strip_suffix("#content").unwrap_or(att);
+                attendee_to_user.insert(base.to_owned(), uid.clone());
+                if let Some(sid) = stream.audio_stream_id {
+                    if stream.dropped != Some(true) {
+                        stream_users.insert(sid, uid.clone());
+                        if stream.muted == Some(true) {
+                            muted_peers.insert(uid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(index) = pending_index.take() {
+        apply_index_frame(
+            &index,
+            creds,
+            wants_compressed,
+            config.muted,
+            snap.video,
+            snap.audio_only,
+            &self_content_attendee,
+            &attendee_to_user,
+            &peer,
+            &mut signal,
+            &mut remote_sources,
+            &mut active_remote_tiles,
+            updates,
+        )
+        .await;
+    }
 
     let mut exit_reason: Option<LoopExit> = None;
 
@@ -399,20 +490,51 @@ async fn run_connected_loop(
                     continue;
                 }
                 let is_new = !remote_decoders.contains_key(&pkt.ssrc);
-                if is_new {
+                if is_new && !unsupported_video_ssrcs.contains(&pkt.ssrc) {
                     if let Some(dec) = RemoteVideoDecoder::for_mime(&pkt.mime_type) {
+                        tracing::info!(
+                            ssrc = pkt.ssrc,
+                            mid = %pkt.mid,
+                            mime = %pkt.mime_type,
+                            "initialized remote video decoder"
+                        );
                         snap.active_video_codec = Some(pkt.mime_type.clone());
                         remote_decoders.insert(pkt.ssrc, dec);
                         last_keyframe_req.insert(pkt.ssrc, Instant::now());
                         peer.request_keyframe(pkt.ssrc).await;
+                    } else {
+                        unsupported_video_ssrcs.insert(pkt.ssrc);
+                        tracing::warn!(
+                            ssrc = pkt.ssrc,
+                            mid = %pkt.mid,
+                            mime = %pkt.mime_type,
+                            "no decoder available for inbound remote video codec"
+                        );
                     }
                 }
                 if let Some(decoder) = remote_decoders.get_mut(&pkt.ssrc) {
-                    let (frame_opt, needs_keyframe) = decoder.push(&pkt);
+                    let (frame_opt, decode_err) = decoder.push(&pkt);
+                    if let Some(err) = &decode_err {
+                        if last_decode_err_log
+                            .get(&pkt.ssrc)
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
+                        {
+                            last_decode_err_log.insert(pkt.ssrc, Instant::now());
+                            tracing::warn!(
+                                ssrc = pkt.ssrc,
+                                mid = %pkt.mid,
+                                mime = %pkt.mime_type,
+                                %err,
+                                "remote video decode error; requesting keyframe"
+                            );
+                        }
+                    }
+                    let awaiting_first_frame = !decoded_video_ssrcs.contains(&pkt.ssrc);
+                    let needs_keyframe = decode_err.is_some() || (awaiting_first_frame && pkt.marker);
                     if needs_keyframe {
                         let should_req = last_keyframe_req
                             .get(&pkt.ssrc)
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                            .is_none_or(|t| t.elapsed() >= Duration::from_millis(1500));
                         if should_req {
                             last_keyframe_req.insert(pkt.ssrc, Instant::now());
                             peer.request_keyframe(pkt.ssrc).await;
@@ -425,12 +547,35 @@ async fn run_connected_loop(
                             &ssrc_to_stream_id,
                             &remote_sources,
                         ) {
+                            if decoded_video_ssrcs.insert(pkt.ssrc) {
+                                tracing::info!(
+                                    ssrc = pkt.ssrc,
+                                    mid = %pkt.mid,
+                                    mime = %pkt.mime_type,
+                                    width = frame.width,
+                                    height = frame.height,
+                                    tile = ?tile,
+                                    "decoded first remote video frame"
+                                );
+                            }
                             let _ = updates.send(HuddleUpdate::VideoFrame { tile, frame });
+                        } else if last_decode_err_log
+                            .get(&pkt.ssrc)
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
+                        {
+                            last_decode_err_log.insert(pkt.ssrc, Instant::now());
+                            tracing::warn!(
+                                ssrc = pkt.ssrc,
+                                mid = %pkt.mid,
+                                sources = remote_sources.len(),
+                                "decoded remote video frame but could not map to a tile"
+                            );
                         }
                     }
                 }
             }
             Some(pc_state) = pc_state_rx.recv() => {
+                tracing::info!(state = ?pc_state, "huddle RTCPeerConnection state changed");
                 match pc_state {
                     RTCPeerConnectionState::Connected => {
                         if !ever_connected {
@@ -469,66 +614,22 @@ async fn run_connected_loop(
                             }
                         }
                         if let Some(index) = frame.index {
-                            // Ignore our own camera and our own `#content` screen share.
-                            let next_raw: Vec<RemoteVideoSource> = if snap.audio_only {
-                                Vec::new()
-                            } else {
-                                parse_index_sources(&index, &creds.attendee_id)
-                                    .into_iter()
-                                    .filter(|s| s.attendee_id != self_content_attendee)
-                                    .collect()
-                            };
-                            let next_tiles: HashSet<VideoTileKey> = next_raw
-                                .iter()
-                                .map(|s| {
-                                    if s.is_content {
-                                        VideoTileKey::RemoteScreen(s.user_id.clone())
-                                    } else {
-                                        VideoTileKey::RemoteCamera(s.user_id.clone())
-                                    }
-                                })
-                                .collect();
-                            for removed in active_remote_tiles.difference(&next_tiles) {
-                                let _ = updates.send(HuddleUpdate::VideoTileClosed(removed.clone()));
-                            }
-                            let cur_raw: Vec<&RemoteVideoSource> =
-                                remote_sources.iter().map(|(_, s)| s).collect();
-                            let same_sources = cur_raw.len() == next_raw.len()
-                                && cur_raw.iter().zip(&next_raw).all(|(a, b)| *a == b);
-                            if !same_sources {
-                                if next_raw.is_empty() {
-                                    let removed_mids: Vec<String> =
-                                        remote_sources.iter().map(|(m, _)| m.clone()).collect();
-                                    if !removed_mids.is_empty() {
-                                        let upd = build_remote_video_update_frame(
-                                            Vec::new(),
-                                            removed_mids,
-                                        );
-                                        let _ = signal.send_frame(&upd).await;
-                                    }
-                                    remote_sources.clear();
-                                } else if let Ok((offer, mids)) =
-                                    peer.prepare_video_receive_offer(next_raw.len()).await
-                                {
-                                    let paired: Vec<(String, RemoteVideoSource)> =
-                                        mids.into_iter().zip(next_raw).collect();
-                                    if let Ok(sub_f) = build_subscribe_frame(
-                                        creds,
-                                        &offer,
-                                        wants_compressed,
-                                        config.muted,
-                                        snap.video,
-                                        &paired,
-                                    ) {
-                                        let _ = signal.send_frame(&sub_f).await;
-                                    }
-                                    let subs = build_video_subscriptions(&paired);
-                                    let upd = build_remote_video_update_frame(subs, Vec::new());
-                                    let _ = signal.send_frame(&upd).await;
-                                    remote_sources = paired;
-                                }
-                            }
-                            active_remote_tiles = next_tiles;
+                            apply_index_frame(
+                                &index,
+                                creds,
+                                wants_compressed,
+                                config.muted,
+                                snap.video,
+                                snap.audio_only,
+                                &self_content_attendee,
+                                &attendee_to_user,
+                                &peer,
+                                &mut signal,
+                                &mut remote_sources,
+                                &mut active_remote_tiles,
+                                updates,
+                            )
+                            .await;
                         }
                         if let Some(ack) = frame.suback {
                             for tm in &ack.tracks {
@@ -536,11 +637,29 @@ async fn run_connected_loop(
                                     ssrc_to_stream_id.insert(ssrc, sid);
                                 }
                             }
-                            if let Ok(answer) = decode_sdp_answer(
+                            tracing::info!(
+                                tracks = ack.tracks.len(),
+                                mapped_ssrcs = ssrc_to_stream_id.len(),
+                                "received renegotiation SUBSCRIBE_ACK"
+                            );
+                            match decode_sdp_answer(
                                 ack.sdp_answer.as_deref(),
                                 ack.compressed_sdp_answer.as_deref(),
                             ) {
-                                let _ = peer.set_remote_answer(answer).await;
+                                Ok(answer) => {
+                                    if let Err(err) = peer.set_remote_answer(answer).await {
+                                        tracing::error!(
+                                            %err,
+                                            "renegotiation set_remote_answer failed"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        %err,
+                                        "renegotiation decode_sdp_answer failed"
+                                    );
+                                }
                             }
                         }
                         if let Some(dm) = frame.data_message {
@@ -587,6 +706,10 @@ async fn run_connected_loop(
                                     .as_deref()
                                     .and_then(parse_external_user_id)
                                 {
+                                    if let Some(att) = stream.attendee_id.as_deref() {
+                                        let base = att.strip_suffix("#content").unwrap_or(att);
+                                        attendee_to_user.insert(base.to_owned(), uid.clone());
+                                    }
                                     stream_users.insert(sid, uid.clone());
                                     if stream.muted == Some(true) {
                                         muted_peers.insert(uid);
@@ -826,6 +949,11 @@ async fn run_connected_loop(
                                         .await;
                                 }
                                 Err(err) => {
+                                    tracing::error!(
+                                        source_id = %src_id,
+                                        %err,
+                                        "failed to start screen share session"
+                                    );
                                     snap.sharing = false;
                                     snap.share_source_id = None;
                                     snap.error = Some(err.to_string());
@@ -998,6 +1126,107 @@ async fn run_connected_loop(
     signal.close().await;
 
     exit_reason.unwrap_or(LoopExit::LeftCleanly)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_index_frame(
+    index: &SdkIndexFrame,
+    creds: &HuddleCredentials,
+    wants_compressed: bool,
+    audio_muted: bool,
+    send_video: bool,
+    audio_only: bool,
+    self_content_attendee: &str,
+    attendee_to_user: &HashMap<String, UserId>,
+    peer: &ChimeRtcPeer,
+    signal: &mut ChimeSignalClient,
+    remote_sources: &mut Vec<(String, RemoteVideoSource)>,
+    active_remote_tiles: &mut HashSet<VideoTileKey>,
+    updates: &mpsc::UnboundedSender<HuddleUpdate>,
+) {
+    // Ignore our own camera and our own `#content` screen share.
+    let next_raw: Vec<RemoteVideoSource> = if audio_only {
+        Vec::new()
+    } else {
+        parse_index_sources_with_lookup(index, &creds.attendee_id, attendee_to_user)
+            .into_iter()
+            .filter(|s| s.attendee_id != self_content_attendee)
+            .collect()
+    };
+
+    let next_tiles: HashSet<VideoTileKey> = next_raw
+        .iter()
+        .map(|s| {
+            if s.is_content {
+                VideoTileKey::RemoteScreen(s.user_id.clone())
+            } else {
+                VideoTileKey::RemoteCamera(s.user_id.clone())
+            }
+        })
+        .collect();
+    for removed in active_remote_tiles.difference(&next_tiles) {
+        let _ = updates.send(HuddleUpdate::VideoTileClosed(removed.clone()));
+    }
+
+    let cur_raw: Vec<&RemoteVideoSource> = remote_sources.iter().map(|(_, s)| s).collect();
+    let same_sources =
+        cur_raw.len() == next_raw.len() && cur_raw.iter().zip(&next_raw).all(|(a, b)| *a == b);
+
+    if !same_sources {
+        tracing::info!(
+            raw_descriptors = index.sources.len(),
+            deduped = next_raw.len(),
+            codec_intersection = ?index.supported_receive_codec_intersection,
+            sources = ?next_raw,
+            "Chime INDEX updated remote video sources"
+        );
+        if next_raw.is_empty() {
+            let removed_mids: Vec<String> = remote_sources.iter().map(|(m, _)| m.clone()).collect();
+            if !removed_mids.is_empty() {
+                let upd = build_remote_video_update_frame(Vec::new(), removed_mids);
+                if let Err(err) = signal.send_frame(&upd).await {
+                    tracing::warn!(%err, "failed to send REMOTE_VIDEO_UPDATE unsubscribe");
+                }
+            }
+            remote_sources.clear();
+        } else {
+            match peer.prepare_video_receive_offer(next_raw.len()).await {
+                Ok((offer, mids)) => {
+                    let paired: Vec<(String, RemoteVideoSource)> =
+                        mids.into_iter().zip(next_raw).collect();
+                    tracing::info!(
+                        count = paired.len(),
+                        mids = ?paired.iter().map(|(m, s)| (m.as_str(), s.stream_id, s.is_content)).collect::<Vec<_>>(),
+                        send_video,
+                        "sending renegotiation SUBSCRIBE for remote video/screen sources"
+                    );
+                    match build_subscribe_frame(
+                        creds,
+                        &offer,
+                        wants_compressed,
+                        audio_muted,
+                        send_video,
+                        &paired,
+                    ) {
+                        Ok(sub_f) => {
+                            if let Err(err) = signal.send_frame(&sub_f).await {
+                                tracing::error!(%err, "failed to send renegotiation SUBSCRIBE");
+                            } else {
+                                *remote_sources = paired;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(%err, "failed to build renegotiation SUBSCRIBE");
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(%err, "prepare_video_receive_offer failed");
+                }
+            }
+        }
+    }
+    *active_remote_tiles = next_tiles;
 }
 
 fn resolve_remote_video_tile(
