@@ -1443,68 +1443,152 @@ impl Preferences {
             ))
     }
 
-    fn software_updates_group(&mut self, cx: &mut Context<Self>) -> Div {
-        use crate::updater::{UpdateState, installed_version};
-        let fg = cx.theme().foreground;
-        let muted = cx.theme().muted_foreground;
-        let danger = cx.theme().danger;
-        let current = installed_version();
+    fn mono_chip(&self, text: impl Into<SharedString>, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        div()
+            .px_1p5()
+            .py(px(1.))
+            .rounded_sm()
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.border)
+            .font_family(theme.mono_font_family.clone())
+            .text_xs()
+            .text_color(theme.foreground)
+            .child(text.into())
+    }
 
-        let (status_line, is_err, action_row) = match &self.update_state {
+    #[allow(clippy::too_many_arguments)]
+    fn status_card(
+        &self,
+        dot_color: gpui_kit::gpui::Hsla,
+        title: impl Into<SharedString>,
+        chip: Option<SharedString>,
+        detail: impl Into<SharedString>,
+        detail_is_err: bool,
+        actions: Div,
+        cx: &Context<Self>,
+    ) -> Div {
+        let theme = cx.theme();
+        let fg = theme.foreground;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let border = theme.border;
+        let card_bg = theme.secondary.opacity(0.35);
+
+        let mut header_row = h_flex()
+            .items_center()
+            .gap_2()
+            .flex_wrap()
+            .child(div().size(px(8.)).rounded_full().flex_none().bg(dot_color))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if detail_is_err { danger } else { fg })
+                    .child(title.into()),
+            );
+        if let Some(chip_text) = chip {
+            header_row = header_row.child(self.mono_chip(chip_text, cx));
+        }
+
+        h_flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3p5()
+            .py_2p5()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(card_bg)
+            .child(
+                v_flex().flex_1().min_w_0().gap_1().child(header_row).child(
+                    div()
+                        .text_xs()
+                        .text_color(if detail_is_err { danger } else { muted })
+                        .child(detail.into()),
+                ),
+            )
+            .child(actions.flex_none())
+    }
+
+    fn software_updates_group(&mut self, cx: &mut Context<Self>) -> Div {
+        use crate::updater::{UpdateState, installed_version, is_dev_build};
+        let theme = cx.theme();
+        let success = theme.success;
+        let primary = theme.primary;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let current = installed_version();
+        let dev = is_dev_build();
+
+        let (dot_color, title, chip, detail, is_err, actions) = match &self.update_state {
             UpdateState::Checking => (
-                "Checking GitHub Releases for updates…".to_owned(),
+                muted,
+                "Checking for updates\u{2026}".to_owned(),
+                Some(SharedString::from(current)),
+                "Contacting GitHub Releases.".to_owned(),
                 false,
-                h_flex().gap_2().child(
+                h_flex().gap_1p5().child(
                     Button::new("adv-upd-checking")
                         .outline()
                         .with_size(Size::Small)
                         .disabled(true)
-                        .label("Checking…"),
+                        .label("Checking\u{2026}"),
                 ),
             ),
             UpdateState::Downloading(ver) => (
-                format!(
-                    "Downloading and verifying Slackless {ver}… Slackless will restart automatically."
-                ),
+                primary,
+                "Downloading update\u{2026}".to_owned(),
+                Some(SharedString::from(ver.clone())),
+                "Verifying package and preparing restart.".to_owned(),
                 false,
-                h_flex().gap_2().child(
+                h_flex().gap_1p5().child(
                     Button::new("adv-upd-downloading")
                         .primary()
                         .with_size(Size::Small)
                         .disabled(true)
-                        .label(format!("Downloading {ver}…")),
+                        .label("Downloading\u{2026}"),
                 ),
             ),
             UpdateState::Available(rel) => {
                 let ver = rel.version.clone();
                 let notes_url = rel.html_url.clone();
                 (
-                    format!("Slackless {ver} is available (currently on {current})."),
+                    primary,
+                    "Update available".to_owned(),
+                    Some(SharedString::from(ver)),
+                    format!("Currently running {current}."),
                     false,
                     h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("adv-upd-download")
-                                .primary()
-                                .with_size(Size::Small)
-                                .label(format!("Download & restart ({ver})"))
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(PreferencesEvent::InstallUpdate);
-                                })),
-                        )
+                        .items_center()
+                        .gap_1p5()
                         .child(
                             Button::new("adv-upd-notes")
                                 .ghost()
                                 .with_size(Size::Small)
                                 .label("Release notes")
                                 .on_click(move |_, _, cx| cx.open_url(&notes_url)),
+                        )
+                        .child(
+                            Button::new("adv-upd-download")
+                                .primary()
+                                .with_size(Size::Small)
+                                .label("Download & restart")
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(PreferencesEvent::InstallUpdate);
+                                })),
                         ),
                 )
             }
             UpdateState::UpToDate => (
-                format!("Slackless {current} is up to date."),
+                success,
+                "Up to date".to_owned(),
+                Some(SharedString::from(current)),
+                "You have the latest release of Slackless.".to_owned(),
                 false,
-                h_flex().gap_2().child(
+                h_flex().gap_1p5().child(
                     Button::new("adv-upd-check-again")
                         .outline()
                         .with_size(Size::Small)
@@ -1515,13 +1599,16 @@ impl Preferences {
                 ),
             ),
             UpdateState::Error(err) => (
-                format!("Update failed: {err}"),
+                danger,
+                "Update check failed".to_owned(),
+                Some(SharedString::from(current)),
+                err.clone(),
                 true,
-                h_flex().gap_2().child(
+                h_flex().gap_1p5().child(
                     Button::new("adv-upd-retry")
                         .outline()
                         .with_size(Size::Small)
-                        .label("Check for updates")
+                        .label("Try again")
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.emit(PreferencesEvent::CheckForUpdates);
                         })),
@@ -1532,32 +1619,49 @@ impl Preferences {
                     let ver = rel.version.clone();
                     let notes_url = rel.html_url.clone();
                     (
-                        format!("Slackless {ver} is ready to download (currently on {current})."),
+                        primary,
+                        "Update available".to_owned(),
+                        Some(SharedString::from(ver)),
+                        format!("Currently running {current}."),
                         false,
                         h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("adv-upd-download-cached")
-                                    .primary()
-                                    .with_size(Size::Small)
-                                    .label(format!("Download & restart ({ver})"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(PreferencesEvent::InstallUpdate);
-                                    })),
-                            )
+                            .items_center()
+                            .gap_1p5()
                             .child(
                                 Button::new("adv-upd-notes-cached")
                                     .ghost()
                                     .with_size(Size::Small)
                                     .label("Release notes")
                                     .on_click(move |_, _, cx| cx.open_url(&notes_url)),
+                            )
+                            .child(
+                                Button::new("adv-upd-download-cached")
+                                    .primary()
+                                    .with_size(Size::Small)
+                                    .label("Download & restart")
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(PreferencesEvent::InstallUpdate);
+                                    })),
                             ),
                     )
                 }
                 None => (
-                    format!("Installed version: {current}"),
+                    if dev { muted } else { success },
+                    if dev {
+                        "Development build"
+                    } else {
+                        "Current version"
+                    }
+                    .to_owned(),
+                    Some(SharedString::from(current)),
+                    if dev {
+                        "Automatic startup checks are paused on dev builds."
+                    } else {
+                        "Checks automatically on startup."
+                    }
+                    .to_owned(),
                     false,
-                    h_flex().gap_2().child(
+                    h_flex().gap_1p5().child(
                         Button::new("adv-upd-check")
                             .outline()
                             .with_size(Size::Small)
@@ -1570,24 +1674,11 @@ impl Preferences {
             },
         };
 
+        let card = self.status_card(dot_color, title, chip, detail, is_err, actions, cx);
         self.group(
             "Software updates",
             Some("Checks for new releases on startup or when requested; updates both Slackless.app and the CLI together."),
-            v_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if is_err { danger } else { fg })
-                        .child(status_line),
-                )
-                .child(action_row)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Also available anytime from Slackless → Check for Updates… in the menu bar."),
-                ),
+            card,
             cx,
         )
     }
@@ -1599,8 +1690,14 @@ impl Preferences {
         let status = cli_install_status();
         let target_link = cli_link_path();
         let ver = installed_version();
-        let muted = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
+        let theme = cx.theme();
+        let success = theme.success;
+        let warning = theme.warning;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+        let border = theme.border;
+        let card_bg = theme.secondary.opacity(0.35);
+
         let effective_dir = match &status {
             CliInstallStatus::Installed(p) | CliInstallStatus::OutOfSync(p) => {
                 p.parent().map(std::path::Path::to_path_buf)
@@ -1609,114 +1706,154 @@ impl Preferences {
         };
         let in_path = effective_dir.as_deref().is_none_or(dir_in_path);
 
-        let (desc, action_row) = match status {
+        let (dot_color, title, chip, detail, actions) = match status {
             CliInstallStatus::Installed(path) => (
-                format!(
-                    "Installed at {} (linked to Slackless {} — updates automatically with the app).",
-                    path.display(),
-                    ver
-                ),
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("adv-cli-uninstall")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label("Uninstall CLI")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                match crate::updater::uninstall_cli_symlink() {
-                                    Ok(()) => {
-                                        this.cli_status_note =
-                                            Some("Removed slackless CLI link.".to_owned());
-                                    }
-                                    Err(err) => {
-                                        this.cli_status_note = Some(format!("Error: {err}"));
-                                    }
+                success,
+                "Installed".to_owned(),
+                Some(SharedString::from(path.display().to_string())),
+                format!("Version {ver} · stays in sync with app updates"),
+                h_flex().gap_1p5().child(
+                    Button::new("adv-cli-uninstall")
+                        .outline()
+                        .with_size(Size::Small)
+                        .label("Uninstall")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match crate::updater::uninstall_cli_symlink() {
+                                Ok(()) => {
+                                    this.cli_status_note =
+                                        Some("Removed slackless CLI link.".to_owned());
                                 }
-                                cx.notify();
-                            })),
-                    ),
+                                Err(err) => {
+                                    this.cli_status_note = Some(format!("Error: {err}"));
+                                }
+                            }
+                            cx.notify();
+                        })),
+                ),
             ),
             CliInstallStatus::OutOfSync(path) => (
-                format!(
-                    "Found an older or separate CLI at {}. Re-link it to {} so it matches Slackless {} and auto-updates.",
-                    path.display(),
-                    target_link.display(),
-                    ver
-                ),
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("adv-cli-relink")
-                            .primary()
-                            .with_size(Size::Small)
-                            .label("Update CLI link")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                match crate::updater::install_cli_symlink() {
-                                    Ok(p) => {
-                                        this.cli_status_note =
-                                            Some(format!("Linked {} to this app.", p.display()));
-                                    }
-                                    Err(err) => {
-                                        this.cli_status_note = Some(format!("Error: {err}"));
-                                    }
+                warning,
+                "Out of sync".to_owned(),
+                Some(SharedString::from(path.display().to_string())),
+                format!("Points to a different build. Re-link to match Slackless {ver}."),
+                h_flex().gap_1p5().child(
+                    Button::new("adv-cli-relink")
+                        .primary()
+                        .with_size(Size::Small)
+                        .label("Update link")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match crate::updater::install_cli_symlink() {
+                                Ok(p) => {
+                                    this.cli_status_note =
+                                        Some(format!("Linked {} to this app.", p.display()));
                                 }
-                                cx.notify();
-                            })),
-                    ),
+                                Err(err) => {
+                                    this.cli_status_note = Some(format!("Error: {err}"));
+                                }
+                            }
+                            cx.notify();
+                        })),
+                ),
             ),
             CliInstallStatus::NotInstalled => (
+                muted,
+                "Not installed".to_owned(),
+                Some(SharedString::from(target_link.display().to_string())),
                 format!(
-                    "Install the slackless CLI to {} (version {}, stays in sync with app updates).",
-                    target_link.display(),
-                    ver
+                    "Links the bundled CLI (version {ver}) so it stays in sync with app updates."
                 ),
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("adv-cli-install")
-                            .primary()
-                            .with_size(Size::Small)
-                            .label("Install CLI")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                match crate::updater::install_cli_symlink() {
-                                    Ok(p) => {
-                                        this.cli_status_note =
-                                            Some(format!("Installed CLI at {}.", p.display()));
-                                    }
-                                    Err(err) => {
-                                        this.cli_status_note = Some(format!("Error: {err}"));
-                                    }
+                h_flex().gap_1p5().child(
+                    Button::new("adv-cli-install")
+                        .primary()
+                        .with_size(Size::Small)
+                        .label("Install CLI")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match crate::updater::install_cli_symlink() {
+                                Ok(p) => {
+                                    this.cli_status_note =
+                                        Some(format!("Installed CLI at {}.", p.display()));
                                 }
-                                cx.notify();
-                            })),
-                    ),
+                                Err(err) => {
+                                    this.cli_status_note = Some(format!("Error: {err}"));
+                                }
+                            }
+                            cx.notify();
+                        })),
+                ),
             ),
             CliInstallStatus::Unavailable => (
-                "Launch Slackless from an installed Slackless.app bundle to install the matching CLI binary."
+                muted,
+                "Unavailable".to_owned(),
+                None,
+                "Launch from an installed Slackless.app bundle to install the matching CLI."
                     .to_owned(),
                 h_flex(),
             ),
         };
 
-        let mut body = v_flex()
-            .gap_2()
-            .child(div().text_xs().text_color(fg).child(desc))
-            .child(action_row);
+        let card = self.status_card(dot_color, title, chip, detail, false, actions, cx);
+        let mut body = v_flex().gap_2().child(card);
+
         if !in_path {
             if let Some(dir) = effective_dir {
-                body = body.child(div().text_xs().text_color(muted).child(format!(
-                    "Tip: add `export PATH=\"{}:$PATH\"` to your shell profile to invoke `slackless` anywhere.",
-                    dir.display()
-                )));
+                let export_cmd = format!("export PATH=\"{}:$PATH\"", dir.display());
+                let copy_cmd = export_cmd.clone();
+                body = body.child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(card_bg)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .flex_wrap()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child("Add to your shell profile:"),
+                                )
+                                .child(self.mono_chip(export_cmd, cx)),
+                        )
+                        .child(
+                            Button::new("adv-cli-copy-path")
+                                .ghost()
+                                .with_size(Size::Small)
+                                .icon(IconName::Copy)
+                                .label("Copy")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(
+                                        gpui_kit::gpui::ClipboardItem::new_string(copy_cmd.clone()),
+                                    );
+                                    this.cli_status_note =
+                                        Some("Copied PATH export command.".to_owned());
+                                    cx.notify();
+                                })),
+                        ),
+                );
             }
         }
         if let Some(note) = &self.cli_status_note {
-            body = body.child(div().text_xs().text_color(muted).child(note.clone()));
+            let note_color = if note.starts_with("Error:") {
+                danger
+            } else {
+                muted
+            };
+            body = body.child(div().text_xs().text_color(note_color).child(note.clone()));
         }
+
         self.group(
-            "Command-line interface (`slackless`)",
-            Some("Headless CLI sharing your local SQLite archive and Keychain session."),
+            "Command-line interface",
+            Some("Use the slackless CLI from your terminal with your local archive and session."),
             body,
             cx,
         )
