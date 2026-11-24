@@ -136,14 +136,12 @@ pub enum CliInstallStatus {
 /// Candidate directories for installing the `slackless` CLI symlink, ordered by macOS default
 /// `$PATH` availability without requiring `sudo`:
 /// 1. `/usr/local/bin` (in macOS `/etc/paths` by default; used by VS Code, Zed, Cursor, Docker)
-/// 2. `/opt/homebrew/bin` (writable on Apple Silicon Homebrew installs)
-/// 3. `~/.local/bin` (user-writable fallback when system directories are locked down)
+/// 2. `~/.local/bin` (user-writable fallback when `/usr/local/bin` is not writable)
 fn cli_candidate_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     #[cfg(target_os = "macos")]
     {
         dirs.push(PathBuf::from("/usr/local/bin"));
-        dirs.push(PathBuf::from("/opt/homebrew/bin"));
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -171,7 +169,7 @@ fn dir_is_writable(dir: &Path) -> bool {
 }
 
 /// Best writable symlink path for the `slackless` CLI (`/usr/local/bin/slackless` when writable,
-/// else `/opt/homebrew/bin/slackless`, else `~/.local/bin/slackless`).
+/// else `~/.local/bin/slackless`).
 pub fn cli_link_path() -> PathBuf {
     let dirs = cli_candidate_dirs();
     for dir in &dirs {
@@ -199,8 +197,8 @@ pub fn dir_in_path(dir: &Path) -> bool {
     std::env::split_paths(&path_var).any(|p| p == dir)
 }
 
-/// Inspect whether `slackless` CLI is installed (checking `/usr/local/bin`, `/opt/homebrew/bin`,
-/// and `~/.local/bin`) and matches the running `Slackless.app`.
+/// Inspect whether `slackless` CLI is installed (checking `/usr/local/bin` and `~/.local/bin`)
+/// and matches the running `Slackless.app`.
 pub fn cli_install_status() -> CliInstallStatus {
     let Some(bundled) = bundled_cli_path() else {
         return CliInstallStatus::Unavailable;
@@ -232,8 +230,8 @@ pub fn cli_install_status() -> CliInstallStatus {
 }
 
 /// Create or refresh the `slackless` CLI symlink in the best writable `$PATH` directory
-/// (`/usr/local/bin/slackless`, `/opt/homebrew/bin/slackless`, or `~/.local/bin/slackless`),
-/// pointing directly to the bundled CLI inside `Slackless.app`.
+/// (`/usr/local/bin/slackless` or `~/.local/bin/slackless`), pointing directly to the bundled CLI
+/// inside `Slackless.app`.
 #[cfg(unix)]
 pub fn install_cli_symlink() -> Result<PathBuf, String> {
     let bundled = bundled_cli_path()
@@ -517,7 +515,7 @@ rm -rf "$STAGE"
 # matches the app version.
 CLI_BIN="${DEST}/Contents/MacOS/slackless"
 if [ -x "$CLI_BIN" ]; then
-  for CLI_LINK in /usr/local/bin/slackless /opt/homebrew/bin/slackless "${HOME}/.local/bin/slackless"; do
+  for CLI_LINK in /usr/local/bin/slackless "${HOME}/.local/bin/slackless"; do
     if [ -L "$CLI_LINK" ] || [ -e "$CLI_LINK" ]; then
       ln -sf "$CLI_BIN" "$CLI_LINK" 2>/dev/null || true
     fi

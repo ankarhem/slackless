@@ -178,8 +178,6 @@ fi
 if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
   if [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then
     CLI_DIR="/usr/local/bin"
-  elif [[ -d "/opt/homebrew/bin" && -w "/opt/homebrew/bin" ]]; then
-    CLI_DIR="/opt/homebrew/bin"
   else
     CLI_DIR="$HOME/.local/bin"
     mkdir -p "$CLI_DIR"
