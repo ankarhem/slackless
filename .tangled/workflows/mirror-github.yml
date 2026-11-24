@@ -1,0 +1,51 @@
+# Mirror pushes and tags from Tangled to https://github.com/ankarhem/slackless
+#
+# One-time setup:
+#   1. Generate a deploy key:
+#        ssh-keygen -t ed25519 -C "tangled-github-mirror" -f /tmp/tangled_gh_mirror -N ""
+#   2. GitHub -> ankarhem/slackless -> Settings -> Deploy keys -> Add deploy key:
+#        Paste /tmp/tangled_gh_mirror.pub and enable "Allow write access".
+#   3. Tangled -> slackless -> Settings -> Pipelines:
+#        Select the hosted Spindle and add secret `GITHUB_DEPLOY_KEY` containing the contents
+#        of /tmp/tangled_gh_mirror (private key), then delete the /tmp key files.
+
+when:
+  - event: ["push", "manual"]
+    branch: ["main"]
+
+engine: "nixery"
+
+dependencies:
+  nixpkgs:
+    - git
+    - openssh
+
+clone:
+  depth: 0
+
+steps:
+  - name: "Mirror to GitHub"
+    command: |
+      set -eu
+
+      if [ -z "${GITHUB_DEPLOY_KEY:-}" ]; then
+        echo "error: GITHUB_DEPLOY_KEY secret is not configured in Tangled Pipelines settings" >&2
+        exit 1
+      fi
+
+      mkdir -p "$HOME/.ssh"
+      chmod 700 "$HOME/.ssh"
+      printf '%s\n' "$GITHUB_DEPLOY_KEY" > "$HOME/.ssh/id_ed25519"
+      chmod 600 "$HOME/.ssh/id_ed25519"
+      ssh-keyscan -t ed25519,rsa github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+
+      if [ -f .git/shallow ]; then
+        git fetch --unshallow --tags
+      else
+        git fetch --tags
+      fi
+
+      git remote remove github 2>/dev/null || true
+      git remote add github git@github.com:ankarhem/slackless.git
+      git push github HEAD:refs/heads/main
+      git push github --tags
