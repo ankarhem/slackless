@@ -439,3 +439,133 @@ impl Driver {
         self.events.send(event).await.is_ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn next_event(rx: &mut mpsc::Receiver<RtmEvent>) -> RtmEvent {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for RTM event")
+            .expect("RTM event stream ended unexpectedly")
+    }
+
+    #[tokio::test]
+    async fn hello_replays_presence_sub_ignores_bad_frames_and_reconnects_on_goodbye() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Session 1: accept, send hello + garbage frame, expect presence_sub, send goodbye.
+            let (stream1, _) = listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(stream1).await.unwrap();
+            ws1.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            ws1.send(Message::text("not valid json {{{")).await.unwrap();
+            let sub1 = ws1.next().await.unwrap().unwrap().into_text().unwrap();
+            assert!(sub1.contains("presence_sub"), "got: {sub1}");
+            assert!(sub1.contains("U123"), "got: {sub1}");
+            ws1.send(Message::text(r#"{"type":"goodbye"}"#))
+                .await
+                .unwrap();
+            let _ = ws1.close(None).await;
+
+            // Session 2: accept reconnect, send hello, verify presence_sub is automatically replayed.
+            let (stream2, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(stream2).await.unwrap();
+            ws2.send(Message::text(r#"{"type":"hello","fast_reconnect":true}"#))
+                .await
+                .unwrap();
+            let sub2 = ws2.next().await.unwrap().unwrap().into_text().unwrap();
+            assert!(sub2.contains("presence_sub"), "got: {sub2}");
+            assert!(sub2.contains("U123"), "got: {sub2}");
+            // Keep open briefly until client closes.
+            let _ = ws2.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-test"));
+        cfg.base_url = format!("ws://{addr}/link/");
+        cfg.backoff = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        // Queue presence_sub before hello arrives; driver must replay it after hello.
+        client.presence_sub(vec![UserId::from("U123")]).unwrap();
+
+        assert_eq!(
+            next_event(&mut rx).await,
+            RtmEvent::State(ConnectionState::Connecting)
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            RtmEvent::State(ConnectionState::Connected {
+                fast_reconnect: false
+            })
+        );
+        // Hello event + Goodbye event + Reconnecting + Connecting + Connected (fast_reconnect: true)
+        let mut saw_reconnect = false;
+        let mut saw_second_connect = false;
+        for _ in 0..8 {
+            match next_event(&mut rx).await {
+                RtmEvent::State(ConnectionState::Reconnecting { .. }) => saw_reconnect = true,
+                RtmEvent::State(ConnectionState::Connected {
+                    fast_reconnect: true,
+                }) => {
+                    saw_second_connect = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_reconnect);
+        assert!(saw_second_connect);
+
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_handshake_stops_without_reconnecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = sock.shutdown().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-expired"));
+        cfg.base_url = format!("ws://{addr}/link/");
+        let (_client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        assert_eq!(
+            next_event(&mut rx).await,
+            RtmEvent::State(ConnectionState::Connecting)
+        );
+        match next_event(&mut rx).await {
+            RtmEvent::State(ConnectionState::Disconnected { reason }) => {
+                assert!(reason.contains("401"), "got: {reason}");
+            }
+            other => panic!("expected Disconnected on 401, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(2), drv)
+            .await
+            .expect("driver should exit promptly on 401")
+            .unwrap();
+        server.await.unwrap();
+    }
+}

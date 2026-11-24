@@ -291,3 +291,86 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn populated_v1_database_migrates_cleanly_to_latest() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Bootstrap strictly at schema V1 with populated untouched, edited, and deleted rows.
+        conn.execute_batch(V1).unwrap();
+        conn.pragma_update(None, "user_version", 1u32).unwrap();
+
+        let untouched_json = r#"{"ts":"1700000001.000100","text":"untouched original"}"#;
+        let edited_v1_json = r#"{"ts":"1700000002.000100","text":"before edit"}"#;
+        let edited_v2_json = r#"{"ts":"1700000002.000100","text":"after edit","edited":{"user":"U1","ts":"1700000002.000200"}}"#;
+        let deleted_json = r#"{"ts":"1700000003.000100","text":"gone message"}"#;
+
+        conn.execute(
+            "INSERT INTO message_revision
+             (workspace_id, channel_id, ts, edit_ts, user_id, text, deleted, json, recorded_at)
+             VALUES
+             ('T1','C1','1700000001.000100','','U1','untouched original',0,?1,100),
+             ('T1','C1','1700000002.000100','','U1','before edit',0,?2,100),
+             ('T1','C1','1700000002.000100','1700000002.000200','U1','after edit',0,?3,101),
+             ('T1','C1','1700000003.000100','1700000003.000200','U1','gone message',1,?4,102)",
+            rusqlite::params![untouched_json, edited_v1_json, edited_v2_json, deleted_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_current
+             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names, deleted,
+              has_link, has_file, is_pinned, reply_count, json, updated_at)
+             VALUES
+             ('T1','C1','1700000001.000100',1700000001000100,'','U1','untouched original','',0,0,0,0,NULL,?1,100),
+             ('T1','C1','1700000002.000100',1700000002000100,'1700000002.000200','U1','after edit','',0,0,0,0,2,?2,101),
+             ('T1','C1','1700000003.000100',1700000003000100,'1700000003.000200','U1','gone message','',1,0,0,0,NULL,?3,102)",
+            rusqlite::params![untouched_json, edited_v2_json, deleted_json],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Untouched single-revision row was pruned from message_revision while edited + deleted survive.
+        let rev_count: i64 = conn
+            .query_row("SELECT count(*) FROM message_revision", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rev_count, 3);
+
+        // All 3 messages survive in message_current and FTS5 remains searchable.
+        let cur_count: i64 = conn
+            .query_row("SELECT count(*) FROM message_current", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cur_count, 3);
+        let fts_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM message_fts WHERE message_fts MATCH 'untouched'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_hits, 1);
+
+        // Append-only triggers survived the V6/V7 table rebuilds.
+        assert!(conn.execute("DELETE FROM message_revision", []).is_err());
+
+        // V8 covering/partial indexes are present.
+        for idx in [
+            "message_current_user_ts",
+            "message_current_ws_ts",
+            "message_current_threads",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing V8 index {idx}");
+        }
+    }
+}

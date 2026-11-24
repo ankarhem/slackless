@@ -2765,4 +2765,72 @@ mod tests {
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].message.text, long_text);
     }
+
+    #[test]
+    fn chunked_in_queries_and_batch_upserts_handle_large_sets() {
+        let mut store = Store::open_in_memory().unwrap();
+        let n = 1_100usize;
+        let users: Vec<User> = (0..n)
+            .map(|i| User {
+                id: UserId::from(format!("U{i:05}")),
+                name: format!("user{i}"),
+                is_bot: i % 10 == 0,
+                deleted: i % 25 == 0,
+                team_id: Some(if i % 50 == 0 {
+                    TeamId::from("TEXTERNAL")
+                } else {
+                    ws()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let convs: Vec<Conversation> = (0..n)
+            .map(|i| Conversation {
+                id: ChannelId::from(format!("C{i:05}")),
+                name: Some(format!("chan-{i}")),
+                is_channel: true,
+                is_member: i % 2 == 0,
+                ..Default::default()
+            })
+            .collect();
+
+        store.upsert_users(&ws(), &users).unwrap();
+        store.upsert_conversations(&ws(), &convs).unwrap();
+
+        let user_ids: Vec<UserId> = users.iter().map(|u| u.id.clone()).collect();
+        let counts = store.member_counts(&ws(), &user_ids).unwrap();
+        assert!(counts.humans > 0 && counts.apps > 0);
+        let ext_teams = store.member_team_ids(&ws(), &user_ids).unwrap();
+        assert_eq!(ext_teams, vec![TeamId::from("TEXTERNAL")]);
+
+        let chan_ids: Vec<ChannelId> = convs.iter().map(|c| c.id.clone()).collect();
+        let flags = store.member_flags(&ws(), &chan_ids).unwrap();
+        assert_eq!(flags.len(), n / 2);
+
+        // Flip memberships via temp-table path (> SQL_IN_CHUNK) so only odd channels are members.
+        let odd_ids: Vec<ChannelId> = chan_ids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let flipped = store.set_channel_memberships(&ws(), &odd_ids).unwrap();
+        assert_eq!(flipped.len(), n);
+        assert_eq!(store.member_flags(&ws(), &chan_ids).unwrap().len(), n / 2);
+
+        // Batch upsert_messages + single-row PK Store::message lookup + chunked channels_with_messages.
+        let batch = vec![
+            msg("1700001001.000100", "U00001", "batch one"),
+            msg("1700001002.000100", "U00002", "batch two"),
+        ];
+        store.upsert_messages(&ws(), &chan_ids[0], &batch).unwrap();
+        let found = store
+            .message(&ws(), &chan_ids[0], &Ts::from("1700001002.000100"))
+            .unwrap()
+            .expect("single-row PK lookup finds stored message");
+        assert_eq!(found.message.text, "batch two");
+        let with_msgs = store.channels_with_messages(&ws(), &chan_ids).unwrap();
+        assert_eq!(with_msgs.len(), 1);
+        assert!(with_msgs.contains(&chan_ids[0]));
+    }
 }

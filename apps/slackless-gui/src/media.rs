@@ -958,3 +958,68 @@ fn schedule(due: Instant, tick: Duration, view: EntityId, cx: &mut App) {
     })
     .detach();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Delay, Frame, RgbaImage};
+
+    #[test]
+    fn save_download_sanitizes_traversal_and_numbers_collisions() {
+        let dir = std::env::temp_dir().join(format!("slackless-dl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let p1 = save_download(Some(dir.clone()), "../../secret/report.pdf", b"v1").unwrap();
+        assert_eq!(p1, dir.join("report.pdf"));
+        assert_eq!(std::fs::read(&p1).unwrap(), b"v1");
+
+        let p2 = save_download(Some(dir.clone()), "report.pdf", b"v2").unwrap();
+        assert_eq!(p2, dir.join("report (1).pdf"));
+        assert_eq!(std::fs::read(&p2).unwrap(), b"v2");
+
+        let p3 = save_download(Some(dir.clone()), "report.pdf", b"v3").unwrap();
+        assert_eq!(p3, dir.join("report (2).pdf"));
+
+        let no_ext = save_download(Some(dir.clone()), "README", b"hi").unwrap();
+        assert_eq!(no_ext, dir.join("README"));
+        let no_ext_2 = save_download(Some(dir.clone()), "README", b"hi2").unwrap();
+        assert_eq!(no_ext_2, dir.join("README (1)"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_at_clamps_short_delays_and_loops() {
+        let img = RenderImage::new(vec![
+            // <=10ms delay is clamped to 100ms (browser/Slack behavior).
+            Frame::from_parts(RgbaImage::new(1, 1), 0, 0, Delay::from_numer_denom_ms(5, 1)),
+            Frame::from_parts(
+                RgbaImage::new(1, 1),
+                0,
+                0,
+                Delay::from_numer_denom_ms(200, 1),
+            ),
+        ]);
+        assert_eq!(
+            frame_at(&img, Duration::from_millis(0)),
+            (0, Duration::from_millis(100))
+        );
+        assert_eq!(
+            frame_at(&img, Duration::from_millis(40)),
+            (0, Duration::from_millis(60))
+        );
+        assert_eq!(
+            frame_at(&img, Duration::from_millis(100)),
+            (1, Duration::from_millis(200))
+        );
+        assert_eq!(
+            frame_at(&img, Duration::from_millis(250)),
+            (1, Duration::from_millis(50))
+        );
+        // Wraps modulo 300ms total loop duration.
+        assert_eq!(
+            frame_at(&img, Duration::from_millis(310)),
+            (0, Duration::from_millis(90))
+        );
+    }
+}
