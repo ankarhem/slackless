@@ -108,8 +108,8 @@ impl Store {
         let _ = conn.execute_batch(
             "PRAGMA synchronous = NORMAL;
              PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -12000;
-             PRAGMA mmap_size = 67108864;",
+             PRAGMA cache_size = -4000;
+             PRAGMA mmap_size = 16777216;",
         );
         Self::init(conn)
     }
@@ -124,8 +124,8 @@ impl Store {
         let _ = conn.execute_batch(
             "PRAGMA query_only = ON;
              PRAGMA temp_store = MEMORY;
-             PRAGMA cache_size = -6000;
-             PRAGMA mmap_size = 67108864;",
+             PRAGMA cache_size = -2000;
+             PRAGMA mmap_size = 8388608;",
         );
         Ok(Self { conn })
     }

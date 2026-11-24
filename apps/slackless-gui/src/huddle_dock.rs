@@ -371,6 +371,41 @@ pub struct HuddleDock {
     captions: Vec<(UserId, String, bool)>,
     menu_open: bool,
     devices: AudioDevices,
+    #[cfg(target_os = "macos")]
+    overlay_visible: bool,
+    #[cfg(target_os = "macos")]
+    overlay_fade_task: Option<gpui_kit::gpui::Task<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for HuddleDock {
+    fn drop(&mut self) {
+        if self.overlay_visible {
+            slackless_core::huddle::hide_desktop_draw_overlay();
+            self.overlay_visible = false;
+        }
+    }
+}
+
+/// Fade curve shared with the pop-out stage: active strokes stay opaque; completed strokes hold
+/// for 3.8s and ease out smoothly over 1.6s.
+#[cfg(target_os = "macos")]
+fn overlay_stroke_fade(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, f32) {
+    const HOLD_MS: f32 = 3_800.0;
+    const FADE_MS: f32 = 1_600.0;
+    let Some(ended_at) = ended_at_ms else {
+        return (1.0, 1.0);
+    };
+    let elapsed = now_ms.saturating_sub(ended_at) as f32;
+    if elapsed < HOLD_MS {
+        return (1.0, 1.0);
+    }
+    if elapsed >= HOLD_MS + FADE_MS {
+        return (0.0, 0.72);
+    }
+    let t = ((elapsed - HOLD_MS) / FADE_MS).clamp(0.0, 1.0);
+    let smooth = 1.0 - t * t * (3.0 - 2.0 * t);
+    (smooth, 0.72 + 0.28 * smooth)
 }
 
 impl EventEmitter<HuddleDockEvent> for HuddleDock {}
@@ -426,15 +461,15 @@ impl HuddleDock {
                                     s.updated_at_ms >= stale_cutoff
                                 }
                             });
-                            if dock.draw_strokes.len() != strokes_before {
-                                dirty = true;
-                            }
                             let cursor_cutoff = now.saturating_sub(3_000);
                             let cursors_before = dock.draw_cursors.len();
                             dock.draw_cursors
                                 .retain(|_, c| c.updated_at_ms >= cursor_cutoff);
-                            if dock.draw_cursors.len() != cursors_before {
+                            if dock.draw_strokes.len() != strokes_before
+                                || dock.draw_cursors.len() != cursors_before
+                            {
                                 dirty = true;
+                                dock.sync_desktop_draw_overlay(cx);
                             }
                             if dirty {
                                 cx.notify();
@@ -470,9 +505,109 @@ impl HuddleDock {
                 captions: Vec::new(),
                 menu_open: false,
                 devices: AudioDevices::default(),
+                #[cfg(target_os = "macos")]
+                overlay_visible: false,
+                #[cfg(target_os = "macos")]
+                overlay_fade_task: None,
             }
         })
     }
+
+    #[cfg(target_os = "macos")]
+    fn sync_desktop_draw_overlay(&mut self, cx: &mut Context<Self>) {
+        let Some(source_id) = self
+            .session
+            .sharing
+            .then_some(self.session.share_source_id.as_deref())
+            .flatten()
+            .filter(|s| !s.is_empty())
+        else {
+            self.overlay_fade_task = None;
+            if self.overlay_visible {
+                slackless_core::huddle::hide_desktop_draw_overlay();
+                self.overlay_visible = false;
+            }
+            return;
+        };
+
+        let now = now_ms();
+        let mut segs = Vec::new();
+        for stroke in &self.draw_strokes {
+            let (alpha, width_scale) = overlay_stroke_fade(stroke.ended_at_ms, now);
+            if alpha <= 0.01 {
+                continue;
+            }
+            let width = 5.0 * width_scale;
+            for seg in &stroke.segments {
+                segs.push(slackless_core::huddle::OverlaySegmentFfi {
+                    ax: seg.a[0],
+                    ay: seg.a[1],
+                    bx: seg.b[0],
+                    by: seg.b[1],
+                    cx: seg.c[0],
+                    cy: seg.c[1],
+                    dx: seg.d[0],
+                    dy: seg.d[1],
+                    hue: stroke.hue,
+                    alpha,
+                    width,
+                });
+            }
+        }
+
+        let mut cursors = Vec::new();
+        for cur in self.draw_cursors.values() {
+            let age = now.saturating_sub(cur.updated_at_ms);
+            if age >= 3_000 {
+                continue;
+            }
+            let alpha = if age > 2_400 {
+                ((3_000 - age) as f32 / 600.0).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            cursors.push(slackless_core::huddle::OverlayCursorFfi {
+                x: cur.x,
+                y: cur.y,
+                hue: cur.hue,
+                alpha,
+            });
+        }
+
+        if segs.is_empty() && cursors.is_empty() {
+            self.overlay_fade_task = None;
+            if self.overlay_visible {
+                slackless_core::huddle::hide_desktop_draw_overlay();
+                self.overlay_visible = false;
+            }
+            return;
+        }
+
+        slackless_core::huddle::update_desktop_draw_overlay(source_id, &segs, &cursors);
+        self.overlay_visible = true;
+
+        if self.overlay_fade_task.is_none() {
+            self.overlay_fade_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(33))
+                        .await;
+                    let keep = this
+                        .update(cx, |dock: &mut HuddleDock, cx| {
+                            dock.sync_desktop_draw_overlay(cx);
+                            dock.overlay_visible
+                        })
+                        .unwrap_or(false);
+                    if !keep {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sync_desktop_draw_overlay(&mut self, _cx: &mut Context<Self>) {}
 
     pub fn update_session(&mut self, session: HuddleSessionSnapshot, cx: &mut Context<Self>) {
         if session.started_at_secs > 0 {
@@ -483,7 +618,12 @@ impl HuddleDock {
         } else {
             self.raised_hands.remove(&self.fixtures.self_user);
         }
+        let share_changed = self.session.sharing != session.sharing
+            || self.session.share_source_id != session.share_source_id;
         self.session = session;
+        if share_changed {
+            self.sync_desktop_draw_overlay(cx);
+        }
         cx.notify();
     }
 
@@ -533,6 +673,14 @@ impl HuddleDock {
         self.video_store.update(cx, |vs, cx| {
             vs.clear(cx);
         });
+        #[cfg(target_os = "macos")]
+        {
+            self.overlay_fade_task = None;
+            if self.overlay_visible {
+                slackless_core::huddle::hide_desktop_draw_overlay();
+                self.overlay_visible = false;
+            }
+        }
     }
 
     pub fn apply_room_meta(
@@ -733,6 +881,7 @@ impl HuddleDock {
                         );
                     }
                 }
+                self.sync_desktop_draw_overlay(cx);
             }
             HuddleDataEvent::Jukebox { song_key, .. } => {
                 self.session.jukebox_song = song_key.clone();
@@ -774,6 +923,7 @@ impl HuddleDock {
         if !self.session.sharing {
             self.close_video_tile(&VideoTileKey::LocalScreen, cx);
         }
+        self.sync_desktop_draw_overlay(cx);
         cx.notify();
     }
 
@@ -807,6 +957,7 @@ impl HuddleDock {
             let excess = self.draw_strokes.len() - 64;
             self.draw_strokes.drain(0..excess);
         }
+        self.sync_desktop_draw_overlay(cx);
         cx.notify();
     }
 

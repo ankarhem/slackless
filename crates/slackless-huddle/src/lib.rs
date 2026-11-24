@@ -44,7 +44,10 @@ pub use clips::{
 };
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
 #[cfg(target_os = "macos")]
-pub use macos_media::MacVideoSurface;
+pub use macos_media::{
+    MacVideoSurface, OverlayCursorFfi, OverlaySegmentFfi, hide_desktop_draw_overlay,
+    update_desktop_draw_overlay,
+};
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
 pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;

@@ -90,6 +90,7 @@ struct ZoomPlatform {
 struct ZoomWindow {
     inner: Box<dyn PlatformWindow>,
     zoom: Factor,
+    restoring_state: Rc<Cell<bool>>,
 }
 
 /// Map an input event from native points into the zoomed logical space.
@@ -225,6 +226,7 @@ impl Platform for ZoomPlatform {
         Ok(Box::new(ZoomWindow {
             inner,
             zoom: self.zoom.clone(),
+            restoring_state: Rc::new(Cell::new(false)),
         }))
     }
     fn window_appearance(&self) -> WindowAppearance {
@@ -548,8 +550,15 @@ impl PlatformWindow for ZoomWindow {
     }
     fn on_resize(&self, a0: Box<dyn FnMut(Size<Pixels>, f32)>) {
         let zoom = self.zoom.clone();
+        let restoring = self.restoring_state.clone();
         let mut callback = a0;
         self.inner.on_resize(Box::new(move |size, scale| {
+            // Suppress synchronous AppKit `windowDidResize:` callbacks fired re-entrantly while
+            // `restore_native_window_state` runs inside an active GPUI `App` borrow; the caller
+            // follows restoration immediately with `window.bounds_changed(cx)`.
+            if restoring.get() {
+                return;
+            }
             let z = zoom.get();
             callback(size.map(|v| v / z), scale * z)
         }))
@@ -649,7 +658,9 @@ impl PlatformWindow for ZoomWindow {
         self.inner.native_window_state()
     }
     fn restore_native_window_state(&self, a0: &[u8]) {
-        self.inner.restore_native_window_state(a0)
+        self.restoring_state.set(true);
+        self.inner.restore_native_window_state(a0);
+        self.restoring_state.set(false);
     }
     fn inner_window_bounds(&self) -> WindowBounds {
         self.inner.inner_window_bounds()

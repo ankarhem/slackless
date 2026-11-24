@@ -21,6 +21,7 @@ fn main() {
         for fw in [
             "AVFoundation",
             "Accelerate",
+            "AppKit",
             "AudioToolbox",
             "CoreAudio",
             "CoreGraphics",

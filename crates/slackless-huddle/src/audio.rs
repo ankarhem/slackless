@@ -176,6 +176,16 @@ pub fn play_huddle_chime(chime: HuddleChime, output_device: Option<&str>) -> Res
             #[cfg(target_os = "macos")]
             {
                 if let Some(path) = ensure_cached_slack_audio(chime.slack_asset_filename()) {
+                    // Prefer CoreAudio device-routed NSSound so chimes play on the user's chosen
+                    // huddle headset/speaker without spawning a child process; fall back to afplay
+                    // only if NSSound fails.
+                    if crate::macos_media::play_routed_audio_oneshot(
+                        &path,
+                        device_name.as_deref(),
+                        0.85,
+                    ) {
+                        return;
+                    }
                     if std::process::Command::new("/usr/bin/afplay")
                         .args(["-v", "0.85"])
                         .arg(&path)
@@ -1482,6 +1492,19 @@ impl AmbientMusicPlayer {
                 #[cfg(target_os = "macos")]
                 {
                     if let Some(path) = ensure_cached_slack_audio(&filename) {
+                        // Prefer CoreAudio device-routed looping NSSound (routes Smooth Jazz
+                        // directly to the user's chosen huddle headset/speaker with 0 subprocesses).
+                        if let Some(mut routed) = crate::macos_media::MacRoutedAudioLoop::start(
+                            &path,
+                            output_device.as_deref(),
+                            0.32,
+                        ) {
+                            while run_flag.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(80));
+                            }
+                            routed.stop();
+                            return;
+                        }
                         while run_flag.load(Ordering::Relaxed) {
                             let Ok(mut child) = std::process::Command::new("/usr/bin/afplay")
                                 .args(["-v", "0.32"])

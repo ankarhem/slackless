@@ -730,9 +730,9 @@ pub struct Picture {
 
 /// Animation redraw grid for full GIF attachments (20 fps — silky smooth, 33% lighter than 30 fps).
 const TICK_GIF: Duration = Duration::from_nanos(1_000_000_000 / 20);
-/// Animation redraw grid for tiny inline custom emoji (<= 48px: 12 fps cuts full-window relayout
-/// CPU by ~2.5x while staying visually indistinguishable at 20x20 px).
-const TICK_EMOJI: Duration = Duration::from_nanos(1_000_000_000 / 12);
+/// Animation redraw grid for tiny inline custom emoji (<= 48px: 10 fps matches GIF's standard
+/// 100ms frame delay and cuts full-window relayout CPU by 3x while staying crisp at 20x20 px).
+const TICK_EMOJI: Duration = Duration::from_nanos(1_000_000_000 / 10);
 
 /// The clock animated [`Picture`]s pick their frame from, and the next redraw: when it lands
 /// and the views it notifies.

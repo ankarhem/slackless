@@ -189,6 +189,58 @@ unsafe extern "C" {
     ) -> *mut SlacklessVpio;
     fn slackless_vpio_set_processing(vpio: *mut SlacklessVpio, enable_vp: bool, enable_agc: bool);
     fn slackless_vpio_stop(vpio: *mut SlacklessVpio);
+
+    fn slackless_audio_file_play_oneshot(
+        path: *const c_char,
+        device_name: *const c_char,
+        volume: f32,
+    ) -> bool;
+    fn slackless_audio_file_start_loop(
+        path: *const c_char,
+        device_name: *const c_char,
+        volume: f32,
+    ) -> *mut SlacklessAudioHandle;
+    fn slackless_audio_file_stop_loop(handle: *mut SlacklessAudioHandle);
+
+    fn slackless_draw_overlay_update(
+        is_monitor: bool,
+        target_id: u32,
+        segs: *const OverlaySegmentFfi,
+        seg_count: usize,
+        cur: *const OverlayCursorFfi,
+        cur_count: usize,
+    );
+    fn slackless_draw_overlay_hide();
+}
+
+#[repr(C)]
+struct SlacklessAudioHandle {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OverlaySegmentFfi {
+    pub ax: f64,
+    pub ay: f64,
+    pub bx: f64,
+    pub by: f64,
+    pub cx: f64,
+    pub cy: f64,
+    pub dx: f64,
+    pub dy: f64,
+    pub hue: i32,
+    pub alpha: f32,
+    pub width: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OverlayCursorFfi {
+    pub x: f64,
+    pub y: f64,
+    pub hue: i32,
+    pub alpha: f32,
 }
 
 /// Returns `true` if macOS Screen Recording permission has been granted to this app bundle.
@@ -935,6 +987,99 @@ impl Drop for MacVoiceProcessingIo {
     }
 }
 
+/// Play a one-shot audio file (`.mp3` / `.wav`) via native `NSSound` routed to the exact
+/// CoreAudio output device matching `device_name` (or system default when `None`).
+pub fn play_routed_audio_oneshot(
+    path: &std::path::Path,
+    device_name: Option<&str>,
+    volume: f32,
+) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) else {
+        return false;
+    };
+    let c_dev = device_name
+        .filter(|s| !s.is_empty())
+        .and_then(|s| std::ffi::CString::new(s).ok());
+    let dev_ptr = c_dev.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+    unsafe { slackless_audio_file_play_oneshot(c_path.as_ptr(), dev_ptr, volume) }
+}
+
+/// Active looping `NSSound` playback handle routed to a specific CoreAudio output device.
+pub struct MacRoutedAudioLoop {
+    handle: *mut SlacklessAudioHandle,
+}
+
+// SAFETY: `slackless_audio_file_stop_loop` dispatches stop/release onto the main queue safely.
+unsafe impl Send for MacRoutedAudioLoop {}
+
+impl MacRoutedAudioLoop {
+    pub fn start(path: &std::path::Path, device_name: Option<&str>, volume: f32) -> Option<Self> {
+        let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+        let c_dev = device_name
+            .filter(|s| !s.is_empty())
+            .and_then(|s| std::ffi::CString::new(s).ok());
+        let dev_ptr = c_dev.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        let handle = unsafe { slackless_audio_file_start_loop(c_path.as_ptr(), dev_ptr, volume) };
+        (!handle.is_null()).then_some(Self { handle })
+    }
+
+    pub fn stop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { slackless_audio_file_stop_loop(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+impl Drop for MacRoutedAudioLoop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Update (or hide when empty) the click-through transparent desktop drawing overlay positioned
+/// over the shared monitor (`monitor:<id>`) or window (`window:<id>`).
+pub fn update_desktop_draw_overlay(
+    source_id: &str,
+    segments: &[OverlaySegmentFfi],
+    cursors: &[OverlayCursorFfi],
+) {
+    let (is_monitor, target_id) = if let Some(rest) = source_id.strip_prefix("monitor:") {
+        let Ok(id) = rest.parse::<u32>() else { return };
+        (true, id)
+    } else if let Some(rest) = source_id.strip_prefix("window:") {
+        let Ok(id) = rest.parse::<u32>() else { return };
+        (false, id)
+    } else {
+        return;
+    };
+    let seg_ptr = if segments.is_empty() {
+        std::ptr::null()
+    } else {
+        segments.as_ptr()
+    };
+    let cur_ptr = if cursors.is_empty() {
+        std::ptr::null()
+    } else {
+        cursors.as_ptr()
+    };
+    unsafe {
+        slackless_draw_overlay_update(
+            is_monitor,
+            target_id,
+            seg_ptr,
+            segments.len(),
+            cur_ptr,
+            cursors.len(),
+        );
+    }
+}
+
+/// Immediately hide and clear the click-through desktop drawing overlay.
+pub fn hide_desktop_draw_overlay() {
+    unsafe { slackless_draw_overlay_hide() };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,5 +1146,14 @@ mod tests {
         let supported = supports_hw_av1_decode();
         let dec = VtAv1Decoder::new();
         assert_eq!(dec.is_ok(), supported);
+    }
+
+    #[test]
+    fn draw_overlay_handles_empty_and_invalid_sources_safely() {
+        // Invalid prefixes and unparseable IDs must safely no-op without calling into AppKit.
+        update_desktop_draw_overlay("invalid:abc", &[], &[]);
+        update_desktop_draw_overlay("monitor:notanumber", &[], &[]);
+        update_desktop_draw_overlay("window:notanumber", &[], &[]);
+        hide_desktop_draw_overlay();
     }
 }
