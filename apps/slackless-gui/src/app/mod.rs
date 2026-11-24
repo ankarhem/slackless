@@ -2810,16 +2810,12 @@ impl Render for App {
             },
         ));
         if nav != NavItem::Activity {
-            let sidebar_col = v_flex()
-                .size_full()
-                .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
-                .when_some(self.huddle_dock.clone(), |col, dock| col.child(dock));
             panels = panels.child(
                 resizable_panel()
                     .size(sidebar_width)
                     .size_range(px(288.)..px(728.))
                     .fixed()
-                    .child(sidebar_col),
+                    .child(self.sidebar.clone()),
             );
         }
         let mut panels = panels.child(
@@ -3220,24 +3216,6 @@ impl Render for App {
                                                 .child(banner),
                                         )
                                     })
-                                    .when(
-                                        nav == NavItem::Activity && self.huddle_dock.is_some(),
-                                        |panel| {
-                                            panel.child(
-                                                div()
-                                                    .id("huddle-dock-activity-float")
-                                                    .occlude()
-                                                    .absolute()
-                                                    .left_4()
-                                                    .bottom_4()
-                                                    .w(px(280.))
-                                                    .rounded_lg()
-                                                    .overflow_hidden()
-                                                    .shadow_lg()
-                                                    .children(self.huddle_dock.clone()),
-                                            )
-                                        },
-                                    )
                                     .when(side_panel, |panel| {
                                         let outline = dark.then_some(outline);
                                         panel
@@ -3247,6 +3225,10 @@ impl Render for App {
                             ),
                     ),
             )
+            // Official Slack full-width bottom huddle strip spanning across the main window.
+            .when_some(self.huddle_dock.clone(), |root, dock| {
+                root.child(div().flex_none().w_full().px_1().pb_1().child(dock))
+            })
             .when(self.user_menu_open, |root| {
                 root.child(
                     div()
