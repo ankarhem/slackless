@@ -68,6 +68,8 @@ pub struct DrawStrokeEntry {
     pub hue: i32,
     pub segments: Vec<HuddleDrawSegment>,
     pub updated_at_ms: u64,
+    pub ended: bool,
+    pub ended_at_ms: Option<u64>,
 }
 
 /// Live colored pointer cursor on a shared screen (`PeerMessage.Draw` `POSITION`).
@@ -184,10 +186,16 @@ impl HuddleDock {
                                 dock.active_effect = None;
                                 dirty = true;
                             }
-                            let stroke_cutoff = now.saturating_sub(6_000);
+                            let ended_cutoff = now.saturating_sub(5_800);
+                            let stale_cutoff = now.saturating_sub(15_000);
                             let strokes_before = dock.draw_strokes.len();
-                            dock.draw_strokes
-                                .retain(|s| s.updated_at_ms >= stroke_cutoff);
+                            dock.draw_strokes.retain(|s| {
+                                if let Some(ended_at) = s.ended_at_ms {
+                                    ended_at >= ended_cutoff
+                                } else {
+                                    s.updated_at_ms >= stale_cutoff
+                                }
+                            });
                             if dock.draw_strokes.len() != strokes_before {
                                 dirty = true;
                             }
@@ -423,19 +431,17 @@ impl HuddleDock {
                     }
                     HuddleDrawMessage::New { item_id, segment } => {
                         let hue = *self.user_hues.get(user).unwrap_or(&210);
-                        // Append to an active stroke from this user if fresh (<250ms), else start new.
-                        let append_to_last = self.draw_strokes.last().is_some_and(|s| {
-                            s.user == *user
+                        // Append to this user's open (un-ended) stroke on the same item, unless
+                        // it went stale (>10s) without an `End` packet.
+                        if let Some(open) = self.draw_strokes.iter_mut().rev().find(|s| {
+                            !s.ended
+                                && s.user == *user
                                 && s.item_id == *item_id
                                 && s.hue == hue
-                                && ts.saturating_sub(s.updated_at_ms) < 250
-                                && s.segments.len() < 120
-                        });
-                        if append_to_last {
-                            if let Some(last) = self.draw_strokes.last_mut() {
-                                last.segments.push(*segment);
-                                last.updated_at_ms = ts;
-                            }
+                                && ts.saturating_sub(s.updated_at_ms) < 10_000
+                        }) {
+                            open.segments.push(*segment);
+                            open.updated_at_ms = ts;
                         } else {
                             self.draw_strokes.push(DrawStrokeEntry {
                                 user: user.clone(),
@@ -443,6 +449,8 @@ impl HuddleDock {
                                 hue,
                                 segments: vec![*segment],
                                 updated_at_ms: ts,
+                                ended: false,
+                                ended_at_ms: None,
                             });
                             if self.draw_strokes.len() > 64 {
                                 let excess = self.draw_strokes.len() - 64;
@@ -455,13 +463,29 @@ impl HuddleDock {
                             .draw_strokes
                             .iter_mut()
                             .rev()
-                            .find(|s| s.user == *user && s.item_id == *item_id)
+                            .find(|s| !s.ended && s.user == *user && s.item_id == *item_id)
                         {
-                            stroke.segments.push(*segment);
+                            // `Edit` refines the most recent cubic segment in-place.
+                            if let Some(last) = stroke.segments.last_mut() {
+                                *last = *segment;
+                            } else {
+                                stroke.segments.push(*segment);
+                            }
                             stroke.updated_at_ms = ts;
                         }
                     }
-                    HuddleDrawMessage::End { .. } => {}
+                    HuddleDrawMessage::End { item_id } => {
+                        if let Some(stroke) = self
+                            .draw_strokes
+                            .iter_mut()
+                            .rev()
+                            .find(|s| !s.ended && s.user == *user && s.item_id == *item_id)
+                        {
+                            stroke.ended = true;
+                            stroke.ended_at_ms = Some(ts);
+                            stroke.updated_at_ms = ts;
+                        }
+                    }
                     HuddleDrawMessage::Position { item_id, x, y } => {
                         let hue = *self.user_hues.get(user).unwrap_or(&210);
                         self.draw_cursors.insert(
@@ -523,6 +547,34 @@ impl HuddleDock {
     /// Ask the main window to open Preferences directly on the Audio & video section.
     pub fn open_audio_settings(&mut self, cx: &mut Context<Self>) {
         cx.emit(HuddleDockEvent::OpenAudioSettings);
+    }
+
+    /// Commit a completed local drawing stroke so it smoothly fades out alongside remote strokes.
+    pub fn commit_local_draw_stroke(
+        &mut self,
+        item_id: String,
+        hue: i32,
+        segments: Vec<HuddleDrawSegment>,
+        cx: &mut Context<Self>,
+    ) {
+        if segments.is_empty() {
+            return;
+        }
+        let ts = now_ms();
+        self.draw_strokes.push(DrawStrokeEntry {
+            user: self.fixtures.self_user.clone(),
+            item_id,
+            hue,
+            segments,
+            updated_at_ms: ts,
+            ended: true,
+            ended_at_ms: Some(ts),
+        });
+        if self.draw_strokes.len() > 64 {
+            let excess = self.draw_strokes.len() - 64;
+            self.draw_strokes.drain(0..excess);
+        }
+        cx.notify();
     }
 
     pub fn set_captions_local(&mut self, enabled: bool, cx: &mut Context<Self>) {

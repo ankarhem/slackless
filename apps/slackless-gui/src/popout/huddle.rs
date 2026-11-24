@@ -1968,7 +1968,9 @@ impl PopoutWindow {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.huddle_draw_mode = !this.huddle_draw_mode;
                     this.huddle_drawing_active = false;
-                    this.huddle_draw_last_pt = None;
+                    this.huddle_draw_points.clear();
+                    this.huddle_draw_local_segments.clear();
+                    this.huddle_draw_local_item.clear();
                     if this.huddle_draw_mode {
                         let msg = HuddleDrawMessage::ChangeHue {
                             item_id: item.clone(),
@@ -2198,11 +2200,25 @@ impl PopoutWindow {
             .filter(|s| s.item_id.is_empty() || s.item_id == filter_id || pane_ix == 0)
             .cloned()
             .collect();
+        let local_live_segments = if pane_ix == 0
+            && self.huddle_drawing_active
+            && !self.huddle_draw_local_segments.is_empty()
+        {
+            Some((
+                self.huddle_draw_hue,
+                self.huddle_draw_local_segments.clone(),
+            ))
+        } else {
+            None
+        };
         let cursors: Vec<_> = state
             .draw_cursors
-            .values()
-            .filter(|c| c.item_id.is_empty() || c.item_id == filter_id || pane_ix == 0)
-            .cloned()
+            .iter()
+            .filter(|(_, c)| c.item_id.is_empty() || c.item_id == filter_id || pane_ix == 0)
+            .map(|(uid, c)| {
+                let is_me = *uid == self.fixtures.self_user;
+                (is_me, c.clone())
+            })
             .collect();
         let bounds_cell = Arc::clone(&self.huddle_stage_bounds);
         let frame_for_layout = Arc::clone(&img_frame);
@@ -2238,43 +2254,55 @@ impl PopoutWindow {
                 if width <= 1.0 || height <= 1.0 {
                     return;
                 }
-                let to_pt = |[nx, ny]: [f64; 2]| {
-                    point(px(left + nx as f32 * width), px(top + ny as f32 * height))
-                };
+                let now_ms = current_time_ms();
+                let mut needs_anim_frame = false;
+
                 for stroke in &strokes {
                     if stroke.segments.is_empty() {
                         continue;
                     }
-                    let color = hsla(
-                        (stroke.hue.rem_euclid(360)) as f32 / 360.0,
-                        0.88,
-                        0.56,
-                        0.92,
-                    );
-                    let mut path = PathBuilder::stroke(px(3.5));
-                    for (ix, seg) in stroke.segments.iter().enumerate() {
-                        if ix == 0 {
-                            path.move_to(to_pt(seg.a));
-                        }
-                        path.cubic_bezier_to(to_pt(seg.d), to_pt(seg.b), to_pt(seg.c));
+                    let (alpha, width_scale, fading) =
+                        stroke_fade_curve(stroke.ended_at_ms, now_ms);
+                    if fading {
+                        needs_anim_frame = true;
                     }
-                    if let Ok(built) = path.build() {
-                        window.paint_path(built, color);
+                    if alpha <= 0.005 {
+                        continue;
+                    }
+                    paint_smooth_stroke(
+                        window,
+                        &stroke.segments,
+                        stroke.hue,
+                        alpha,
+                        width_scale,
+                        left,
+                        top,
+                        width,
+                        height,
+                    );
+                }
+                if let Some((hue, ref live_segs)) = local_live_segments {
+                    paint_smooth_stroke(window, live_segs, hue, 1.0, 1.0, left, top, width, height);
+                }
+                for (is_me, cur) in &cursors {
+                    if *is_me {
+                        continue;
+                    }
+                    let cx_px = left + cur.x as f32 * width;
+                    let cy_px = top + cur.y as f32 * height;
+                    let h = (cur.hue.rem_euclid(360)) as f32 / 360.0;
+                    if let Ok(halo) = build_smooth_circle(cx_px, cy_px, 11.0).build() {
+                        window.paint_path(halo, hsla(h, 0.90, 0.56, 0.22));
+                    }
+                    if let Ok(ring) = build_smooth_circle(cx_px, cy_px, 6.5).build() {
+                        window.paint_path(ring, hsla(0.0, 0.0, 1.0, 0.95));
+                    }
+                    if let Ok(dot) = build_smooth_circle(cx_px, cy_px, 4.5).build() {
+                        window.paint_path(dot, hsla(h, 0.92, 0.54, 0.98));
                     }
                 }
-                for cur in &cursors {
-                    let color = hsla((cur.hue.rem_euclid(360)) as f32 / 360.0, 0.9, 0.58, 0.95);
-                    let center = to_pt([cur.x, cur.y]);
-                    let r = px(6.);
-                    let mut dot = PathBuilder::fill();
-                    dot.move_to(point(center.x - r, center.y));
-                    dot.line_to(point(center.x, center.y - r));
-                    dot.line_to(point(center.x + r, center.y));
-                    dot.line_to(point(center.x, center.y + r));
-                    dot.close();
-                    if let Ok(built) = dot.build() {
-                        window.paint_path(built, color);
-                    }
+                if needs_anim_frame {
+                    window.request_animation_frame();
                 }
             },
         )
@@ -2282,7 +2310,8 @@ impl PopoutWindow {
 
         let item_down = item_id.clone();
         let item_move = item_id.clone();
-        let item_up = item_id;
+        let item_up = item_id.clone();
+        let item_up_out = item_id;
 
         let mut pane = div()
             .id(("popout-huddle-stage-pane", pane_ix))
@@ -2301,63 +2330,166 @@ impl PopoutWindow {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        // Never merge into a stale un-ended stroke if a prior mouse-up was missed.
+                        if this.huddle_drawing_active {
+                            this.finish_local_draw_stroke(&item_down, cx);
+                        }
                         let Some(pt) = this.normalize_stage_point(ev.position) else {
                             return;
                         };
                         this.huddle_drawing_active = true;
-                        this.huddle_draw_last_pt = Some(pt);
+                        this.huddle_draw_points.clear();
+                        this.huddle_draw_points.push(pt);
+                        this.huddle_draw_local_segments.clear();
+                        this.huddle_draw_local_item = item_down.clone();
+                        // Emit an initial dot segment so single-click highlights work cleanly.
+                        let dot_seg = make_catmull_rom_segment(pt, pt, pt, pt);
+                        this.huddle_draw_local_segments.push(dot_seg);
                         let hue_msg = HuddleDrawMessage::ChangeHue {
                             item_id: item_down.clone(),
                             hue: this.huddle_draw_hue,
                         };
-                        (this.send)(Command::SendHuddleDraw(hue_msg.clone()));
-                        this.apply_local_draw(hue_msg, cx);
+                        (this.send)(Command::SendHuddleDraw(hue_msg));
+                        cx.notify();
                     }),
                 )
                 .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                    let Some(pt) = this.normalize_stage_point(ev.position) else {
+                    // If the left button was released anywhere (e.g. over an overlay pill or
+                    // outside the window), finalize the previous stroke immediately so moving
+                    // to write the next letter never bridges them with a connecting line.
+                    if this.huddle_drawing_active && ev.pressed_button != Some(MouseButton::Left) {
+                        this.finish_local_draw_stroke(&item_move, cx);
+                    }
+                    let Some(raw_pt) = this.normalize_stage_point(ev.position) else {
                         return;
                     };
                     if this.huddle_drawing_active {
-                        if let Some(prev) = this.huddle_draw_last_pt {
-                            let dx = pt.0 - prev.0;
-                            let dy = pt.1 - prev.1;
-                            if dx * dx + dy * dy > 0.00004 {
-                                let msg = HuddleDrawMessage::New {
-                                    item_id: item_move.clone(),
-                                    segment: make_linear_segment(prev, pt),
-                                };
-                                this.huddle_draw_last_pt = Some(pt);
-                                (this.send)(Command::SendHuddleDraw(msg.clone()));
-                                this.apply_local_draw(msg, cx);
+                        if let Some(&prev) = this.huddle_draw_points.last() {
+                            // Measure distance in actual stage pixels (aspect-corrected) so
+                            // curves & handwriting have crisp uniform density.
+                            let (stage_w, stage_h) = this.stage_pixel_size();
+                            let dx_px = (raw_pt.0 - prev.0) * stage_w;
+                            let dy_px = (raw_pt.1 - prev.1) * stage_h;
+                            if dx_px * dx_px + dy_px * dy_px < 2.5 * 2.5 {
+                                return;
                             }
+                            let pt = (
+                                prev.0 * 0.18 + raw_pt.0 * 0.82,
+                                prev.1 * 0.18 + raw_pt.1 * 0.82,
+                            );
+                            this.huddle_draw_points.push(pt);
+                            let n = this.huddle_draw_points.len();
+                            if n == 2 {
+                                let p0 = this.huddle_draw_points[0];
+                                let p1 = this.huddle_draw_points[1];
+                                let seg = make_catmull_rom_segment(p0, p0, p1, p1);
+                                this.huddle_draw_local_segments.clear();
+                                this.huddle_draw_local_segments.push(seg);
+                                (this.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+                                    item_id: item_move.clone(),
+                                    segment: seg,
+                                }));
+                            } else {
+                                let p_prev2 = if n >= 4 {
+                                    this.huddle_draw_points[n - 4]
+                                } else {
+                                    this.huddle_draw_points[0]
+                                };
+                                let p_prev1 = this.huddle_draw_points[n - 3];
+                                let p_curr = this.huddle_draw_points[n - 2];
+                                let p_next = this.huddle_draw_points[n - 1];
+                                let refined =
+                                    make_catmull_rom_segment(p_prev2, p_prev1, p_curr, p_next);
+                                if let Some(last) = this.huddle_draw_local_segments.last_mut() {
+                                    *last = refined;
+                                }
+                                (this.send)(Command::SendHuddleDraw(HuddleDrawMessage::Edit {
+                                    item_id: item_move.clone(),
+                                    segment: refined,
+                                }));
+                                let new_seg =
+                                    make_catmull_rom_segment(p_prev1, p_curr, p_next, p_next);
+                                this.huddle_draw_local_segments.push(new_seg);
+                                (this.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+                                    item_id: item_move.clone(),
+                                    segment: new_seg,
+                                }));
+                            }
+                            cx.notify();
                         }
                     } else {
-                        let pos_msg = HuddleDrawMessage::Position {
-                            item_id: item_move.clone(),
-                            x: pt.0,
-                            y: pt.1,
-                        };
-                        (this.send)(Command::SendHuddleDraw(pos_msg.clone()));
-                        this.apply_local_draw(pos_msg, cx);
+                        let now = current_time_ms();
+                        if now.saturating_sub(this.huddle_draw_last_cursor_ms) >= 33 {
+                            this.huddle_draw_last_cursor_ms = now;
+                            let pos_msg = HuddleDrawMessage::Position {
+                                item_id: item_move.clone(),
+                                x: raw_pt.0,
+                                y: raw_pt.1,
+                            };
+                            (this.send)(Command::SendHuddleDraw(pos_msg));
+                        }
                     }
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _ev: &MouseUpEvent, _, cx| {
-                        if this.huddle_drawing_active {
-                            this.huddle_drawing_active = false;
-                            this.huddle_draw_last_pt = None;
-                            let end_msg = HuddleDrawMessage::End {
-                                item_id: item_up.clone(),
-                            };
-                            (this.send)(Command::SendHuddleDraw(end_msg.clone()));
-                            this.apply_local_draw(end_msg, cx);
-                        }
+                        this.finish_local_draw_stroke(&item_up, cx);
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &MouseUpEvent, _, cx| {
+                        this.finish_local_draw_stroke(&item_up_out, cx);
                     }),
                 );
         }
         pane
+    }
+
+    fn finish_local_draw_stroke(&mut self, fallback_item: &str, cx: &mut Context<Self>) {
+        use slackless_core::huddle::HuddleDrawMessage;
+        if !self.huddle_drawing_active {
+            return;
+        }
+        self.huddle_drawing_active = false;
+        let segs = std::mem::take(&mut self.huddle_draw_local_segments);
+        let item = if self.huddle_draw_local_item.is_empty() {
+            fallback_item.to_owned()
+        } else {
+            std::mem::take(&mut self.huddle_draw_local_item)
+        };
+        if self.huddle_draw_points.len() == 1 {
+            if let Some(&dot) = segs.first() {
+                (self.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+                    item_id: item.clone(),
+                    segment: dot,
+                }));
+            }
+        }
+        self.huddle_draw_points.clear();
+        let end_msg = HuddleDrawMessage::End {
+            item_id: item.clone(),
+        };
+        (self.send)(Command::SendHuddleDraw(end_msg));
+        if let Some(dock) = self.huddle_dock_entity() {
+            let hue = self.huddle_draw_hue;
+            dock.update(cx, |d, cx| {
+                d.commit_local_draw_stroke(item, hue, segs, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn stage_pixel_size(&self) -> (f64, f64) {
+        self.huddle_stage_bounds
+            .lock()
+            .ok()
+            .map(|b| {
+                let w: f32 = b.size.width.into();
+                let h: f32 = b.size.height.into();
+                (w.max(1.0) as f64, h.max(1.0) as f64)
+            })
+            .unwrap_or((1280.0, 720.0))
     }
 
     fn normalize_stage_point(&self, pos: Point<Pixels>) -> Option<(f64, f64)> {
@@ -4739,16 +4871,224 @@ impl PopoutWindow {
     }
 }
 
-fn make_linear_segment(
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Compute `(alpha, width_scale, needs_anim_frame)` for a fading huddle draw stroke.
+/// Active strokes stay bright at `1.0`; completed strokes hold for 3.8s then smoothly ease out
+/// over 1.6s at display refresh rate.
+fn stroke_fade_curve(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, f32, bool) {
+    const HOLD_MS: f32 = 3_800.0;
+    const FADE_MS: f32 = 1_600.0;
+    let Some(ended_at) = ended_at_ms else {
+        return (1.0, 1.0, false);
+    };
+    let elapsed = now_ms.saturating_sub(ended_at) as f32;
+    if elapsed < HOLD_MS {
+        // Request animation frames once within the last 100ms of hold so the fade starts smoothly.
+        return (1.0, 1.0, elapsed >= HOLD_MS - 100.0);
+    }
+    if elapsed >= HOLD_MS + FADE_MS {
+        return (0.0, 0.72, false);
+    }
+    let t = ((elapsed - HOLD_MS) / FADE_MS).clamp(0.0, 1.0);
+    // Smooth cubic ease-out (`(1 - t)^2` * `(1 + 2t)` complement -> smoothstep).
+    let smooth = 1.0 - t * t * (3.0 - 2.0 * t);
+    let width_scale = 0.72 + 0.28 * smooth;
+    (smooth, width_scale, true)
+}
+
+/// Fit a $C^1$-smooth Catmull-Rom cubic Bézier segment from `p1` to `p2` using neighbors `p0`/`p3`,
+/// clamping control handles to `0.45 * chord` so sharp bends never self-intersect.
+fn make_catmull_rom_segment(
     p0: (f64, f64),
     p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
 ) -> slackless_core::huddle::HuddleDrawSegment {
-    let lerp = |t: f64| [p0.0 + (p1.0 - p0.0) * t, p0.1 + (p1.1 - p0.1) * t];
+    let chord_dx = p2.0 - p1.0;
+    let chord_dy = p2.1 - p1.1;
+    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
+    if chord_len < 1e-9 {
+        return slackless_core::huddle::HuddleDrawSegment {
+            a: [p1.0, p1.1],
+            b: [p1.0, p1.1],
+            c: [p2.0, p2.1],
+            d: [p2.0, p2.1],
+        };
+    }
+    let max_handle = chord_len * 0.45;
+    let clamp_vec = |vx: f64, vy: f64| -> (f64, f64) {
+        let len = (vx * vx + vy * vy).sqrt();
+        if len > max_handle && len > 1e-9 {
+            let s = max_handle / len;
+            (vx * s, vy * s)
+        } else {
+            (vx, vy)
+        }
+    };
+    let (h1x, h1y) = clamp_vec((p2.0 - p0.0) / 6.0, (p2.1 - p0.1) / 6.0);
+    let (h2x, h2y) = clamp_vec((p3.0 - p1.0) / 6.0, (p3.1 - p1.1) / 6.0);
     slackless_core::huddle::HuddleDrawSegment {
-        a: [p0.0, p0.1],
-        b: lerp(1.0 / 3.0),
-        c: lerp(2.0 / 3.0),
-        d: [p1.0, p1.1],
+        a: [p1.0, p1.1],
+        b: [p1.0 + h1x, p1.1 + h1y],
+        c: [p2.0 - h2x, p2.1 - h2y],
+        d: [p2.0, p2.1],
+    }
+}
+
+fn build_smooth_circle(cx: f32, cy: f32, radius: f32) -> PathBuilder {
+    const N: usize = 16;
+    let mut pb = PathBuilder::fill();
+    for i in 0..N {
+        let ang = (i as f32 / N as f32) * std::f32::consts::TAU;
+        let p = point(px(cx + radius * ang.cos()), px(cy + radius * ang.sin()));
+        if i == 0 {
+            pb.move_to(p);
+        } else {
+            pb.line_to(p);
+        }
+    }
+    pb.close();
+    pb
+}
+
+/// Build an outward-only semicircular end cap centered at `(cx, cy)` extending in unit direction
+/// `(dx, dy)` so it meets a butt-capped stroke edge with zero overlap.
+fn build_outward_cap(cx: f32, cy: f32, dx: f32, dy: f32, radius: f32) -> PathBuilder {
+    const STEPS: usize = 8;
+    let base_ang = dy.atan2(dx) - std::f32::consts::FRAC_PI_2;
+    let mut pb = PathBuilder::fill();
+    for s in 0..=STEPS {
+        let ang = base_ang + (s as f32 / STEPS as f32) * std::f32::consts::PI;
+        let p = point(px(cx + radius * ang.cos()), px(cy + radius * ang.sin()));
+        if s == 0 {
+            pb.move_to(p);
+        } else {
+            pb.line_to(p);
+        }
+    }
+    pb.close();
+    pb
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_smooth_stroke(
+    window: &mut Window,
+    segments: &[slackless_core::huddle::HuddleDrawSegment],
+    hue: i32,
+    alpha: f32,
+    width_scale: f32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+) {
+    use gpui_kit::gpui::{PathStyle, StrokeOptions};
+
+    if segments.is_empty() {
+        return;
+    }
+    let to_xy = |p: [f64; 2]| (left + p[0] as f32 * width, top + p[1] as f32 * height);
+    let h = (hue.rem_euclid(360)) as f32 / 360.0;
+    let color = hsla(h, 0.90, 0.54, 0.96 * alpha);
+    let stroke_w = 5.0 * width_scale;
+    let cap_r = stroke_w * 0.5;
+
+    // Split into contiguous sub-chains so disjoint segments never bridge with a stray line.
+    let mut chains: Vec<&[slackless_core::huddle::HuddleDrawSegment]> = Vec::new();
+    let mut start = 0usize;
+    for i in 1..segments.len() {
+        let prev_d = to_xy(segments[i - 1].d);
+        let curr_a = to_xy(segments[i].a);
+        if (curr_a.0 - prev_d.0).hypot(curr_a.1 - prev_d.1) > 4.0 {
+            chains.push(&segments[start..i]);
+            start = i;
+        }
+    }
+    chains.push(&segments[start..]);
+
+    for chain in chains {
+        // Single-click dot or degenerate zero-length stroke.
+        let first_a = to_xy(chain[0].a);
+        let total_chord: f32 = chain
+            .iter()
+            .map(|s| {
+                let a = to_xy(s.a);
+                let d = to_xy(s.d);
+                (d.0 - a.0).hypot(d.1 - a.1)
+            })
+            .sum();
+        if total_chord < 1.0 {
+            if let Ok(dot) = build_smooth_circle(first_a.0, first_a.1, cap_r).build() {
+                window.paint_path(dot, color);
+            }
+            continue;
+        }
+
+        // Use Lyon's `StrokeTessellator` on the true cubic Bézier curve (never punches holes on
+        // self-crossing loops like cursive letters or figure-8s!) with clamped miter limit and
+        // clean outward semicircular end caps.
+        let opts = StrokeOptions::default()
+            .with_line_width(stroke_w)
+            .with_miter_limit(1.5)
+            .with_tolerance(0.15);
+        let mut pb = PathBuilder::default().with_style(PathStyle::Stroke(opts));
+        for (ix, seg) in chain.iter().enumerate() {
+            let a = to_xy(seg.a);
+            let b = to_xy(seg.b);
+            let c = to_xy(seg.c);
+            let d = to_xy(seg.d);
+            if ix == 0 {
+                pb.move_to(point(px(a.0), px(a.1)));
+            }
+            pb.cubic_bezier_to(
+                point(px(d.0), px(d.1)),
+                point(px(b.0), px(b.1)),
+                point(px(c.0), px(c.1)),
+            );
+        }
+        if let Ok(built) = pb.build() {
+            window.paint_path(built, color);
+        }
+
+        // Start & end outward semicircular caps (strictly outside stroke butt edges -> zero seam).
+        let s0 = chain[0];
+        let a0 = to_xy(s0.a);
+        let t0 = {
+            let b0 = to_xy(s0.b);
+            let d0 = to_xy(s0.d);
+            let (dx, dy) = if (b0.0 - a0.0).hypot(b0.1 - a0.1) > 0.2 {
+                (a0.0 - b0.0, a0.1 - b0.1)
+            } else {
+                (a0.0 - d0.0, a0.1 - d0.1)
+            };
+            let l = dx.hypot(dy).max(1e-5);
+            (dx / l, dy / l)
+        };
+        if let Ok(cap) = build_outward_cap(a0.0, a0.1, t0.0, t0.1, cap_r).build() {
+            window.paint_path(cap, color);
+        }
+        let sl = chain[chain.len() - 1];
+        let dl = to_xy(sl.d);
+        let tl = {
+            let cl = to_xy(sl.c);
+            let al = to_xy(sl.a);
+            let (dx, dy) = if (dl.0 - cl.0).hypot(dl.1 - cl.1) > 0.2 {
+                (dl.0 - cl.0, dl.1 - cl.1)
+            } else {
+                (dl.0 - al.0, dl.1 - al.1)
+            };
+            let l = dx.hypot(dy).max(1e-5);
+            (dx / l, dy / l)
+        };
+        if let Ok(cap) = build_outward_cap(dl.0, dl.1, tl.0, tl.1, cap_r).build() {
+            window.paint_path(cap, color);
+        }
     }
 }
 
