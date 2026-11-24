@@ -86,6 +86,9 @@ type SlacklessCameraEnumCallback =
 
 type SlacklessAudioDeviceChangeCallback = unsafe extern "C" fn(ctx: *mut c_void, is_input: bool);
 
+type SlacklessOverlayMouseCallback =
+    unsafe extern "C" fn(ctx: *mut c_void, kind: u8, nx: f64, ny: f64);
+
 unsafe extern "C" {
     fn slackless_has_screen_capture_permission() -> bool;
     fn slackless_request_screen_capture_permission() -> bool;
@@ -201,6 +204,7 @@ unsafe extern "C" {
         volume: f32,
     ) -> *mut SlacklessAudioHandle;
     fn slackless_audio_file_stop_loop(handle: *mut SlacklessAudioHandle);
+    fn slackless_audio_file_measure_rms(path: *const c_char) -> f32;
 
     fn slackless_draw_overlay_update(
         is_monitor: bool,
@@ -210,7 +214,16 @@ unsafe extern "C" {
         cur: *const OverlayCursorFfi,
         cur_count: usize,
     );
+    fn slackless_draw_overlay_set_pen_mode(
+        enabled: bool,
+        is_monitor: bool,
+        target_id: u32,
+        hue: i32,
+        ctx: *mut c_void,
+        cb: Option<SlacklessOverlayMouseCallback>,
+    );
     fn slackless_draw_overlay_hide();
+    fn slackless_configure_floating_panel(ns_view_ptr: *mut c_void);
 }
 
 #[repr(C)]
@@ -987,6 +1000,13 @@ impl Drop for MacVoiceProcessingIo {
     }
 }
 
+/// Measure gated linear RMS loudness of an audio file via CoreAudio `ExtAudioFile`.
+pub fn measure_audio_file_rms(path: &std::path::Path) -> Option<f32> {
+    let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()?;
+    let rms = unsafe { slackless_audio_file_measure_rms(c_path.as_ptr()) };
+    (rms.is_finite() && rms > 1e-5).then_some(rms)
+}
+
 /// Play a one-shot audio file (`.mp3` / `.wav`) via native `NSSound` routed to the exact
 /// CoreAudio output device matching `device_name` (or system default when `None`).
 pub fn play_routed_audio_oneshot(
@@ -1075,9 +1095,105 @@ pub fn update_desktop_draw_overlay(
     }
 }
 
+/// Mouse event kind delivered from the interactive macOS desktop drawing overlay when pen mode is
+/// enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayMouseKind {
+    Down,
+    Drag,
+    Up,
+    Move,
+}
+
+type OverlayMouseHandler = Arc<dyn Fn(OverlayMouseKind, f64, f64) + Send + Sync>;
+
+static OVERLAY_MOUSE_HANDLER: std::sync::OnceLock<std::sync::Mutex<Option<OverlayMouseHandler>>> =
+    std::sync::OnceLock::new();
+
+unsafe extern "C" fn on_overlay_mouse_cb(_ctx: *mut c_void, kind: u8, nx: f64, ny: f64) {
+    let ev = match kind {
+        0 => OverlayMouseKind::Down,
+        1 => OverlayMouseKind::Drag,
+        2 => OverlayMouseKind::Up,
+        _ => OverlayMouseKind::Move,
+    };
+    let handler = OVERLAY_MOUSE_HANDLER
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.clone());
+    if let Some(cb) = handler {
+        cb(ev, nx, ny);
+    }
+}
+
+/// Enable or disable interactive pen mode on the transparent desktop drawing overlay over the
+/// shared monitor (`monitor:<id>`) or window (`window:<id>`). Stays enabled across Cmd+Tab until
+/// explicitly disabled!
+pub fn set_desktop_draw_pen_mode(
+    enabled: bool,
+    source_id: Option<&str>,
+    hue: i32,
+    on_mouse: Option<OverlayMouseHandler>,
+) {
+    let slot = OVERLAY_MOUSE_HANDLER.get_or_init(|| std::sync::Mutex::new(None));
+    if !enabled {
+        if let Ok(mut g) = slot.lock() {
+            *g = None;
+        }
+        unsafe {
+            slackless_draw_overlay_set_pen_mode(false, true, 0, hue, std::ptr::null_mut(), None);
+        }
+        return;
+    }
+
+    let Some(src) = source_id else {
+        return;
+    };
+    let (is_monitor, target_id) = if let Some(rest) = src.strip_prefix("monitor:") {
+        let Ok(id) = rest.parse::<u32>() else { return };
+        (true, id)
+    } else if let Some(rest) = src.strip_prefix("window:") {
+        let Ok(id) = rest.parse::<u32>() else { return };
+        (false, id)
+    } else {
+        return;
+    };
+
+    if let Ok(mut g) = slot.lock() {
+        *g = on_mouse;
+    }
+    unsafe {
+        slackless_draw_overlay_set_pen_mode(
+            true,
+            is_monitor,
+            target_id,
+            hue,
+            std::ptr::null_mut(),
+            Some(on_overlay_mouse_cb),
+        );
+    }
+}
+
 /// Immediately hide and clear the click-through desktop drawing overlay.
 pub fn hide_desktop_draw_overlay() {
+    if let Some(slot) = OVERLAY_MOUSE_HANDLER.get() {
+        if let Ok(mut g) = slot.lock() {
+            *g = None;
+        }
+    }
     unsafe { slackless_draw_overlay_hide() };
+}
+
+/// Promote a GPUI window (via its AppKit `NSView` raw pointer) into an always-on-top, movable,
+/// `NSWindowSharingNone` floating control panel that stays visible across Cmd+Tab and sits above
+/// the transparent desktop drawing overlay.
+///
+/// # Safety
+/// `ns_view_ptr` must be a valid `NSView *` pointer (from `raw_window_handle::AppKitWindowHandle`).
+pub unsafe fn configure_floating_panel(ns_view_ptr: *mut c_void) {
+    if !ns_view_ptr.is_null() {
+        unsafe { slackless_configure_floating_panel(ns_view_ptr) };
+    }
 }
 
 #[cfg(test)]

@@ -319,6 +319,45 @@ pub struct ReactionEntry {
     pub at_ms: u64,
 }
 
+/// Fit a $C^1$-smooth Catmull-Rom cubic Bézier segment from `p1` to `p2` using neighbors `p0`/`p3`,
+/// clamping control handles to `0.45 * chord` so sharp bends never self-intersect.
+pub fn make_catmull_rom_segment(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+) -> HuddleDrawSegment {
+    let chord_dx = p2.0 - p1.0;
+    let chord_dy = p2.1 - p1.1;
+    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
+    if chord_len < 1e-9 {
+        return HuddleDrawSegment {
+            a: [p1.0, p1.1],
+            b: [p1.0, p1.1],
+            c: [p2.0, p2.1],
+            d: [p2.0, p2.1],
+        };
+    }
+    let max_handle = chord_len * 0.45;
+    let clamp_vec = |vx: f64, vy: f64| -> (f64, f64) {
+        let len = (vx * vx + vy * vy).sqrt();
+        if len > max_handle && len > 1e-9 {
+            let s = max_handle / len;
+            (vx * s, vy * s)
+        } else {
+            (vx, vy)
+        }
+    };
+    let (h1x, h1y) = clamp_vec((p2.0 - p0.0) / 6.0, (p2.1 - p0.1) / 6.0);
+    let (h2x, h2y) = clamp_vec((p3.0 - p1.0) / 6.0, (p3.1 - p1.1) / 6.0);
+    HuddleDrawSegment {
+        a: [p1.0, p1.1],
+        b: [p1.0 + h1x, p1.1 + h1y],
+        c: [p2.0 - h2x, p2.1 - h2y],
+        d: [p2.0, p2.1],
+    }
+}
+
 /// Snapshot consumed by `PopoutKind::Huddle` so the Pop-out Huddle Window stays in lock-step with
 /// the sidebar mini-dock. Live video frames live in a separate [`HuddleVideoStore`] entity so
 /// 10–30 fps video updates never repaint the main window.
@@ -334,6 +373,8 @@ pub struct HuddleViewState {
     pub active_effect: Option<(UserId, String, u64)>,
     pub draw_strokes: Vec<DrawStrokeEntry>,
     pub draw_cursors: HashMap<UserId, DrawCursorEntry>,
+    pub draw_mode: bool,
+    pub draw_hue: i32,
     pub captions: Vec<(UserId, String, bool)>,
 }
 
@@ -343,6 +384,9 @@ pub enum HuddleDockEvent {
     ToggleScreenShare,
     Leave,
     PopOut,
+    OpenFloatingPanel,
+    CloseFloatingPanel,
+    SendDraw(HuddleDrawMessage),
     JumpToChannel(ChannelId),
     OpenThread,
     OpenCanvas(String),
@@ -367,6 +411,8 @@ pub struct HuddleDock {
     active_effect: Option<(UserId, String, u64)>,
     draw_strokes: Vec<DrawStrokeEntry>,
     draw_cursors: HashMap<UserId, DrawCursorEntry>,
+    draw_mode: bool,
+    draw_hue: i32,
     user_hues: HashMap<UserId, i32>,
     captions: Vec<(UserId, String, bool)>,
     menu_open: bool,
@@ -375,14 +421,29 @@ pub struct HuddleDock {
     overlay_visible: bool,
     #[cfg(target_os = "macos")]
     overlay_fade_task: Option<gpui_kit::gpui::Task<()>>,
+    #[cfg(target_os = "macos")]
+    desktop_pen_active: bool,
+    #[cfg(target_os = "macos")]
+    desktop_pen_source: Option<String>,
+    #[cfg(target_os = "macos")]
+    desktop_pen_task: Option<gpui_kit::gpui::Task<()>>,
+    #[cfg(target_os = "macos")]
+    desktop_draw_down: bool,
+    #[cfg(target_os = "macos")]
+    desktop_draw_pts: Vec<(f64, f64)>,
+    #[cfg(target_os = "macos")]
+    desktop_draw_segs: Vec<HuddleDrawSegment>,
+    #[cfg(target_os = "macos")]
+    desktop_draw_last_cursor_ms: u64,
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for HuddleDock {
     fn drop(&mut self) {
-        if self.overlay_visible {
+        if self.overlay_visible || self.desktop_pen_active {
             slackless_core::huddle::hide_desktop_draw_overlay();
             self.overlay_visible = false;
+            self.desktop_pen_active = false;
         }
     }
 }
@@ -501,6 +562,8 @@ impl HuddleDock {
                 active_effect: None,
                 draw_strokes: Vec::new(),
                 draw_cursors: HashMap::new(),
+                draw_mode: false,
+                draw_hue: 210,
                 user_hues: HashMap::new(),
                 captions: Vec::new(),
                 menu_open: false,
@@ -509,9 +572,274 @@ impl HuddleDock {
                 overlay_visible: false,
                 #[cfg(target_os = "macos")]
                 overlay_fade_task: None,
+                #[cfg(target_os = "macos")]
+                desktop_pen_active: false,
+                #[cfg(target_os = "macos")]
+                desktop_pen_source: None,
+                #[cfg(target_os = "macos")]
+                desktop_pen_task: None,
+                #[cfg(target_os = "macos")]
+                desktop_draw_down: false,
+                #[cfg(target_os = "macos")]
+                desktop_draw_pts: Vec::new(),
+                #[cfg(target_os = "macos")]
+                desktop_draw_segs: Vec::new(),
+                #[cfg(target_os = "macos")]
+                desktop_draw_last_cursor_ms: 0,
             }
         })
     }
+
+    pub fn draw_mode(&self) -> bool {
+        self.draw_mode
+    }
+
+    pub fn draw_hue(&self) -> i32 {
+        self.draw_hue
+    }
+
+    fn local_draw_item_id(&self) -> String {
+        if !self.session.attendee_id.is_empty() {
+            self.session.attendee_id.clone()
+        } else {
+            self.fixtures.self_user.to_string()
+        }
+    }
+
+    /// Toggle pen mode on/off. Persists across Cmd+Tab / focus loss until explicitly disabled.
+    pub fn toggle_draw_mode(&mut self, cx: &mut Context<Self>) {
+        self.set_draw_mode(!self.draw_mode, cx);
+    }
+
+    pub fn set_draw_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.draw_mode == enabled {
+            return;
+        }
+        self.draw_mode = enabled;
+        if enabled {
+            let msg = HuddleDrawMessage::ChangeHue {
+                item_id: self.local_draw_item_id(),
+                hue: self.draw_hue,
+            };
+            cx.emit(HuddleDockEvent::SendDraw(msg));
+        }
+        self.sync_desktop_pen_mode(cx);
+        self.sync_desktop_draw_overlay(cx);
+        cx.notify();
+    }
+
+    pub fn set_draw_hue(&mut self, hue: i32, cx: &mut Context<Self>) {
+        self.draw_hue = hue;
+        let msg = HuddleDrawMessage::ChangeHue {
+            item_id: self.local_draw_item_id(),
+            hue,
+        };
+        cx.emit(HuddleDockEvent::SendDraw(msg));
+        #[cfg(target_os = "macos")]
+        if self.desktop_pen_active {
+            // Re-sync the overlay perimeter accent color to match the new pen color.
+            self.desktop_pen_active = false;
+            self.sync_desktop_pen_mode(cx);
+        }
+        cx.notify();
+    }
+
+    /// Ask the main window to open or focus the always-on-top floating huddle control panel.
+    pub fn request_open_floating_panel(&mut self, cx: &mut Context<Self>) {
+        cx.emit(HuddleDockEvent::OpenFloatingPanel);
+    }
+
+    pub fn request_toggle_mute(&mut self, cx: &mut Context<Self>) {
+        cx.emit(HuddleDockEvent::ToggleMute);
+    }
+
+    pub fn request_toggle_camera(&mut self, cx: &mut Context<Self>) {
+        cx.emit(HuddleDockEvent::ToggleCamera);
+    }
+
+    pub fn request_toggle_screen_share(&mut self, cx: &mut Context<Self>) {
+        cx.emit(HuddleDockEvent::ToggleScreenShare);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_desktop_draw_stroke(&mut self, cx: &mut Context<Self>) {
+        if !self.desktop_draw_down {
+            return;
+        }
+        self.desktop_draw_down = false;
+        let segs = std::mem::take(&mut self.desktop_draw_segs);
+        let item_id = self.local_draw_item_id();
+        if self.desktop_draw_pts.len() == 1 {
+            if let Some(&seg) = segs.first() {
+                cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::New {
+                    item_id: item_id.clone(),
+                    segment: seg,
+                }));
+            }
+        }
+        self.desktop_draw_pts.clear();
+        cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::End {
+            item_id: item_id.clone(),
+        }));
+        if !segs.is_empty() {
+            self.commit_local_draw_stroke(item_id, self.draw_hue, segs, cx);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_desktop_pen_event(
+        &mut self,
+        kind: slackless_core::huddle::OverlayMouseKind,
+        nx: f64,
+        ny: f64,
+        cx: &mut Context<Self>,
+    ) {
+        use slackless_core::huddle::OverlayMouseKind;
+        if !self.draw_mode || !self.session.sharing {
+            return;
+        }
+        let item_id = self.local_draw_item_id();
+        let raw_pt = (nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0));
+        match kind {
+            OverlayMouseKind::Down => {
+                if self.desktop_draw_down {
+                    self.finish_desktop_draw_stroke(cx);
+                }
+                self.desktop_draw_down = true;
+                self.desktop_draw_pts.clear();
+                self.desktop_draw_pts.push(raw_pt);
+                self.desktop_draw_segs.clear();
+                let dot = make_catmull_rom_segment(raw_pt, raw_pt, raw_pt, raw_pt);
+                self.desktop_draw_segs.push(dot);
+                cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::ChangeHue {
+                    item_id,
+                    hue: self.draw_hue,
+                }));
+                self.sync_desktop_draw_overlay(cx);
+            }
+            OverlayMouseKind::Drag => {
+                if !self.desktop_draw_down {
+                    return;
+                }
+                let Some(&prev) = self.desktop_draw_pts.last() else {
+                    return;
+                };
+                let dx = raw_pt.0 - prev.0;
+                let dy = raw_pt.1 - prev.1;
+                if dx * dx + dy * dy < 0.0018 * 0.0018 {
+                    return;
+                }
+                let pt = (
+                    prev.0 * 0.18 + raw_pt.0 * 0.82,
+                    prev.1 * 0.18 + raw_pt.1 * 0.82,
+                );
+                self.desktop_draw_pts.push(pt);
+                let n = self.desktop_draw_pts.len();
+                if n == 2 {
+                    let p0 = self.desktop_draw_pts[0];
+                    let p1 = self.desktop_draw_pts[1];
+                    let seg = make_catmull_rom_segment(p0, p0, p1, p1);
+                    self.desktop_draw_segs.clear();
+                    self.desktop_draw_segs.push(seg);
+                    cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::New {
+                        item_id,
+                        segment: seg,
+                    }));
+                } else {
+                    let p_prev2 = if n >= 4 {
+                        self.desktop_draw_pts[n - 4]
+                    } else {
+                        self.desktop_draw_pts[0]
+                    };
+                    let p_prev1 = self.desktop_draw_pts[n - 3];
+                    let p_curr = self.desktop_draw_pts[n - 2];
+                    let p_next = self.desktop_draw_pts[n - 1];
+                    let refined = make_catmull_rom_segment(p_prev2, p_prev1, p_curr, p_next);
+                    if let Some(last) = self.desktop_draw_segs.last_mut() {
+                        *last = refined;
+                    }
+                    cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::Edit {
+                        item_id: item_id.clone(),
+                        segment: refined,
+                    }));
+                    let next_seg = make_catmull_rom_segment(p_prev1, p_curr, p_next, p_next);
+                    self.desktop_draw_segs.push(next_seg);
+                    cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::New {
+                        item_id,
+                        segment: next_seg,
+                    }));
+                }
+                self.sync_desktop_draw_overlay(cx);
+            }
+            OverlayMouseKind::Up => {
+                self.finish_desktop_draw_stroke(cx);
+            }
+            OverlayMouseKind::Move => {
+                let now = now_ms();
+                if now.saturating_sub(self.desktop_draw_last_cursor_ms) >= 33 {
+                    self.desktop_draw_last_cursor_ms = now;
+                    cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::Position {
+                        item_id,
+                        x: raw_pt.0,
+                        y: raw_pt.1,
+                    }));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_desktop_pen_mode(&mut self, cx: &mut Context<Self>) {
+        let wanted_source = (self.draw_mode && self.session.sharing)
+            .then(|| self.session.share_source_id.clone())
+            .flatten()
+            .filter(|s| !s.is_empty());
+
+        let Some(src) = wanted_source else {
+            if self.desktop_draw_down {
+                self.finish_desktop_draw_stroke(cx);
+            }
+            self.desktop_pen_task = None;
+            self.desktop_pen_source = None;
+            if self.desktop_pen_active {
+                self.desktop_pen_active = false;
+                slackless_core::huddle::set_desktop_draw_pen_mode(false, None, self.draw_hue, None);
+            }
+            return;
+        };
+
+        if self.desktop_pen_active && self.desktop_pen_source.as_deref() == Some(src.as_str()) {
+            return;
+        }
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        slackless_core::huddle::set_desktop_draw_pen_mode(
+            true,
+            Some(&src),
+            self.draw_hue,
+            Some(Arc::new(move |kind, nx, ny| {
+                let _ = tx.unbounded_send((kind, nx, ny));
+            })),
+        );
+        self.desktop_pen_active = true;
+        self.desktop_pen_source = Some(src);
+        self.desktop_pen_task = Some(cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some((kind, nx, ny)) = rx.next().await {
+                if this
+                    .update(cx, |dock: &mut HuddleDock, cx| {
+                        dock.handle_desktop_pen_event(kind, nx, ny, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sync_desktop_pen_mode(&mut self, _cx: &mut Context<Self>) {}
 
     #[cfg(target_os = "macos")]
     fn sync_desktop_draw_overlay(&mut self, cx: &mut Context<Self>) {
@@ -554,6 +882,22 @@ impl HuddleDock {
                 });
             }
         }
+        // Paint the in-progress desktop pen stroke immediately with zero latency.
+        for seg in &self.desktop_draw_segs {
+            segs.push(slackless_core::huddle::OverlaySegmentFfi {
+                ax: seg.a[0],
+                ay: seg.a[1],
+                bx: seg.b[0],
+                by: seg.b[1],
+                cx: seg.c[0],
+                cy: seg.c[1],
+                dx: seg.d[0],
+                dy: seg.d[1],
+                hue: self.draw_hue,
+                alpha: 1.0,
+                width: 5.0,
+            });
+        }
 
         let mut cursors = Vec::new();
         for cur in self.draw_cursors.values() {
@@ -576,7 +920,11 @@ impl HuddleDock {
 
         if segs.is_empty() && cursors.is_empty() {
             self.overlay_fade_task = None;
-            if self.overlay_visible {
+            if self.desktop_pen_active {
+                // Keep the interactive pen overlay open; just clear any faded strokes.
+                slackless_core::huddle::update_desktop_draw_overlay(source_id, &[], &[]);
+                self.overlay_visible = false;
+            } else if self.overlay_visible {
                 slackless_core::huddle::hide_desktop_draw_overlay();
                 self.overlay_visible = false;
             }
@@ -618,11 +966,21 @@ impl HuddleDock {
         } else {
             self.raised_hands.remove(&self.fixtures.self_user);
         }
+        let was_sharing = self.session.sharing;
         let share_changed = self.session.sharing != session.sharing
             || self.session.share_source_id != session.share_source_id;
         self.session = session;
         if share_changed {
+            if !self.session.sharing {
+                self.draw_mode = false;
+            }
+            self.sync_desktop_pen_mode(cx);
             self.sync_desktop_draw_overlay(cx);
+            if !was_sharing && self.session.sharing {
+                cx.emit(HuddleDockEvent::OpenFloatingPanel);
+            } else if was_sharing && !self.session.sharing {
+                cx.emit(HuddleDockEvent::CloseFloatingPanel);
+            }
         }
         cx.notify();
     }
@@ -673,12 +1031,19 @@ impl HuddleDock {
         self.video_store.update(cx, |vs, cx| {
             vs.clear(cx);
         });
+        self.draw_mode = false;
         #[cfg(target_os = "macos")]
         {
+            self.desktop_pen_task = None;
+            self.desktop_pen_source = None;
+            self.desktop_draw_down = false;
+            self.desktop_draw_pts.clear();
+            self.desktop_draw_segs.clear();
             self.overlay_fade_task = None;
-            if self.overlay_visible {
+            if self.overlay_visible || self.desktop_pen_active {
                 slackless_core::huddle::hide_desktop_draw_overlay();
                 self.overlay_visible = false;
+                self.desktop_pen_active = false;
             }
         }
     }
@@ -918,12 +1283,20 @@ impl HuddleDock {
     }
 
     pub fn set_sharing_local(&mut self, source_id: Option<String>, cx: &mut Context<Self>) {
+        let was_sharing = self.session.sharing;
         self.session.sharing = source_id.is_some();
         self.session.share_source_id = source_id;
         if !self.session.sharing {
+            self.draw_mode = false;
             self.close_video_tile(&VideoTileKey::LocalScreen, cx);
         }
+        self.sync_desktop_pen_mode(cx);
         self.sync_desktop_draw_overlay(cx);
+        if !was_sharing && self.session.sharing {
+            cx.emit(HuddleDockEvent::OpenFloatingPanel);
+        } else if was_sharing && !self.session.sharing {
+            cx.emit(HuddleDockEvent::CloseFloatingPanel);
+        }
         cx.notify();
     }
 
@@ -995,6 +1368,8 @@ impl HuddleDock {
             active_effect: self.active_effect.clone(),
             draw_strokes: self.draw_strokes.clone(),
             draw_cursors: self.draw_cursors.clone(),
+            draw_mode: self.draw_mode,
+            draw_hue: self.draw_hue,
             captions: self.captions.clone(),
         }
     }
@@ -1141,6 +1516,24 @@ impl HuddleDock {
                     }))
             }))
             .child(div().h(px(1.)).my_1().bg(border))
+            .child(
+                h_flex()
+                    .id("dock-floating-controls")
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(hover_bg))
+                    .child(Icon::new(IconName::Pin).size(px(12.)).text_color(muted_fg))
+                    .child("Floating controls panel")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.menu_open = false;
+                        cx.emit(HuddleDockEvent::OpenFloatingPanel);
+                        cx.notify();
+                    })),
+            )
             .child(
                 h_flex()
                     .id("dock-open-thread")

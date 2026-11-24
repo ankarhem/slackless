@@ -35,6 +35,7 @@ actions!(
         ShowAll,
         Minimize,
         Zoom,
+        CloseWindow,
         ToggleFullScreen,
         OpenHelpCenter,
     ]
@@ -59,6 +60,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
     ]);
     cx.on_action(|_: &About, _| platform::current().show_about());
@@ -182,6 +184,8 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
                 ),
         ),
         Menu::new("Window").items([
+            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::separator(),
             MenuItem::action("Minimize", Minimize),
             MenuItem::action("Zoom", Zoom),
         ]),

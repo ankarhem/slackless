@@ -8,7 +8,7 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         people_count: usize,
         pal: &HuddlePalette,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         use gpui_kit::component::Icon;
 
@@ -28,6 +28,8 @@ impl PopoutWindow {
             format!("{people_count} people")
         };
         let ctrl_hover = pal.ctrl_hover;
+        let ctrl_bg = pal.ctrl_bg;
+        let ctrl_fg = pal.chrome_fg;
 
         TitleBar::new()
             .h(px(38.))
@@ -71,23 +73,56 @@ impl PopoutWindow {
                             ),
                     )
                     .child(
-                        div()
-                            .id("popout-huddle-dock-back")
-                            .size(px(26.))
-                            .rounded_md()
-                            .hover(move |el| el.bg(ctrl_hover))
-                            .cursor_pointer()
-                            .flex()
+                        h_flex()
+                            .flex_none()
                             .items_center()
-                            .justify_center()
+                            .gap_1()
                             .child(
-                                Icon::new(IconName::PanelLeft)
-                                    .size(px(14.))
-                                    .text_color(pal.chrome_muted),
+                                h_flex()
+                                    .id("popout-huddle-open-floating-panel")
+                                    .h(px(24.))
+                                    .px_2()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(ctrl_bg)
+                                    .hover(move |el| el.bg(ctrl_hover))
+                                    .text_xs()
+                                    .text_color(ctrl_fg)
+                                    .child(
+                                        Icon::new(IconName::Pin)
+                                            .size(px(12.))
+                                            .text_color(pal.chrome_muted),
+                                    )
+                                    .child("Floating bar")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(dock) = this.huddle_dock_entity() {
+                                            dock.update(cx, |d, cx| {
+                                                d.request_open_floating_panel(cx);
+                                            });
+                                        }
+                                    })),
                             )
-                            .on_click(|_, window, _| {
-                                window.remove_window();
-                            }),
+                            .child(
+                                div()
+                                    .id("popout-huddle-dock-back")
+                                    .size(px(26.))
+                                    .rounded_md()
+                                    .hover(move |el| el.bg(ctrl_hover))
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(IconName::PanelLeft)
+                                            .size(px(14.))
+                                            .text_color(pal.chrome_muted),
+                                    )
+                                    .on_click(|_, window, _| {
+                                        window.remove_window();
+                                    }),
+                            ),
                     ),
             )
     }

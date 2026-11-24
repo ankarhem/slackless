@@ -45,7 +45,8 @@ pub use clips::{
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
 #[cfg(target_os = "macos")]
 pub use macos_media::{
-    MacVideoSurface, OverlayCursorFfi, OverlaySegmentFfi, hide_desktop_draw_overlay,
+    MacVideoSurface, OverlayCursorFfi, OverlayMouseKind, OverlaySegmentFfi,
+    configure_floating_panel, hide_desktop_draw_overlay, set_desktop_draw_pen_mode,
     update_desktop_draw_overlay,
 };
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};

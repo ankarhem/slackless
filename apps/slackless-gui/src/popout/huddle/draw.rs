@@ -33,44 +33,7 @@ pub(super) fn stroke_fade_curve(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, 
     (smooth, width_scale, true)
 }
 
-/// Fit a $C^1$-smooth Catmull-Rom cubic Bézier segment from `p1` to `p2` using neighbors `p0`/`p3`,
-/// clamping control handles to `0.45 * chord` so sharp bends never self-intersect.
-pub(super) fn make_catmull_rom_segment(
-    p0: (f64, f64),
-    p1: (f64, f64),
-    p2: (f64, f64),
-    p3: (f64, f64),
-) -> slackless_core::huddle::HuddleDrawSegment {
-    let chord_dx = p2.0 - p1.0;
-    let chord_dy = p2.1 - p1.1;
-    let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
-    if chord_len < 1e-9 {
-        return slackless_core::huddle::HuddleDrawSegment {
-            a: [p1.0, p1.1],
-            b: [p1.0, p1.1],
-            c: [p2.0, p2.1],
-            d: [p2.0, p2.1],
-        };
-    }
-    let max_handle = chord_len * 0.45;
-    let clamp_vec = |vx: f64, vy: f64| -> (f64, f64) {
-        let len = (vx * vx + vy * vy).sqrt();
-        if len > max_handle && len > 1e-9 {
-            let s = max_handle / len;
-            (vx * s, vy * s)
-        } else {
-            (vx, vy)
-        }
-    };
-    let (h1x, h1y) = clamp_vec((p2.0 - p0.0) / 6.0, (p2.1 - p0.1) / 6.0);
-    let (h2x, h2y) = clamp_vec((p3.0 - p1.0) / 6.0, (p3.1 - p1.1) / 6.0);
-    slackless_core::huddle::HuddleDrawSegment {
-        a: [p1.0, p1.1],
-        b: [p1.0 + h1x, p1.1 + h1y],
-        c: [p2.0 - h2x, p2.1 - h2y],
-        d: [p2.0, p2.1],
-    }
-}
+pub(super) use crate::huddle_dock::make_catmull_rom_segment;
 
 pub(super) fn build_smooth_circle(cx: f32, cy: f32, radius: f32) -> PathBuilder {
     const N: usize = 16;

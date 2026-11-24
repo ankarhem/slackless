@@ -1180,7 +1180,11 @@ impl Render for PopoutWindow {
                 }
             }
             let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);
-            let root = self.render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx);
+            let root = self
+                .render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx)
+                .on_action(|_: &crate::menu_bar::CloseWindow, window, _| {
+                    window.remove_window();
+                });
             return root
                 .when_some(picker_pos, |root, pos| {
                     let viewport = window.viewport_size();
@@ -1681,6 +1685,9 @@ impl Render for PopoutWindow {
             .size_full()
             .bg(bg)
             .text_color(fg)
+            .on_action(|_: &crate::menu_bar::CloseWindow, window, _| {
+                window.remove_window();
+            })
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape" {
@@ -1753,6 +1760,9 @@ impl Render for PopoutWindow {
     }
 }
 
+pub mod floating_controls;
 mod huddle;
 #[cfg(test)]
 mod tests;
+
+pub use floating_controls::open_huddle_floating_panel;

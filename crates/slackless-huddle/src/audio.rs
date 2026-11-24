@@ -164,10 +164,145 @@ fn ensure_cached_slack_audio(filename: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Real-time generalized audio loudness normalizer (voice-activity-gated RMS leveler + soft-knee
+/// peak limiter).
+///
+/// Keeps both remote speakers' voices and local microphone output at a consistent, comfortable
+/// conversational loudness (`-18 dBFS` target RMS) without boosting background silence or clipping
+/// loud transients.
+#[derive(Debug, Clone)]
+pub struct LoudnessNormalizer {
+    target_rms: f32,
+    gate_rms: f32,
+    min_gain: f32,
+    max_gain: f32,
+    attack: f32,
+    release: f32,
+    current_gain: f32,
+}
+
+impl LoudnessNormalizer {
+    /// Speech-tuned leveler for 20ms VoIP frames (`-18 dBFS` target, `-44 dBFS` silence gate,
+    /// fast ~80ms attack against shouting, gentle ~800ms release to lift quiet mics cleanly).
+    pub fn speech() -> Self {
+        Self {
+            target_rms: 0.125, // ~ -18 dBFS
+            gate_rms: 0.006,   // ~ -44 dBFS (ignores room noise / pauses)
+            min_gain: 0.25,    // -12 dB max attenuation
+            max_gain: 4.0,     // +12 dB max boost
+            attack: 0.24,
+            release: 0.03,
+            current_gain: 1.0,
+        }
+    }
+
+    /// Smoothly normalize a 20ms mono PCM frame in-place with soft-knee peak limiting.
+    pub fn process_frame(&mut self, samples: &mut [f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+        let rms = (sum_sq / samples.len() as f32).sqrt();
+
+        let prev_gain = self.current_gain;
+        if rms > self.gate_rms {
+            let desired = (self.target_rms / rms).clamp(self.min_gain, self.max_gain);
+            let alpha = if desired < self.current_gain {
+                self.attack
+            } else {
+                self.release
+            };
+            self.current_gain += (desired - self.current_gain) * alpha;
+        } else {
+            // Gently drift back toward unity during extended silence so the next utterance starts
+            // cleanly without an aggressive residual boost.
+            self.current_gain += (1.0 - self.current_gain) * 0.005;
+        }
+
+        let next_gain = self.current_gain;
+        let denom = samples.len().max(1) as f32;
+        for (i, s) in samples.iter_mut().enumerate() {
+            // Interpolate gain across the 20ms frame to prevent zipper noise.
+            let g = prev_gain + (next_gain - prev_gain) * (i as f32 / denom);
+            *s = soft_limit_sample(*s * g);
+        }
+    }
+
+    #[cfg(test)]
+    fn gain(&self) -> f32 {
+        self.current_gain
+    }
+}
+
+#[inline]
+fn soft_limit_sample(x: f32) -> f32 {
+    const KNEE: f32 = 0.80;
+    const HEADROOM: f32 = 0.18;
+    let abs_x = x.abs();
+    if abs_x <= KNEE {
+        x
+    } else {
+        let excess = (abs_x - KNEE) / HEADROOM;
+        let limited = KNEE + HEADROOM * excess.tanh();
+        x.signum() * limited.min(0.98)
+    }
+}
+
+/// Compute a bounded playback volume scaling factor to match `target_rms` given a file's measured
+/// active RMS loudness.
+pub fn normalized_gain_for_rms(rms: f32, target_rms: f32, min_gain: f32, max_gain: f32) -> f32 {
+    if !rms.is_finite() || rms <= 1e-5 {
+        return target_rms.clamp(min_gain, max_gain);
+    }
+    (target_rms / rms).clamp(min_gain, max_gain)
+}
+
+#[cfg(target_os = "macos")]
+fn normalized_file_volume(
+    path: &std::path::Path,
+    target_rms: f32,
+    min_gain: f32,
+    max_gain: f32,
+    fallback: f32,
+) -> f32 {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static FILE_RMS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<f32>>>> = OnceLock::new();
+    let cache = FILE_RMS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cache.lock().ok().and_then(|g| g.get(path).copied());
+    let measured = match cached {
+        Some(v) => v,
+        None => {
+            let rms = crate::macos_media::measure_audio_file_rms(path);
+            if let Ok(mut g) = cache.lock() {
+                g.insert(path.to_path_buf(), rms);
+            }
+            rms
+        }
+    };
+    match measured {
+        Some(rms) => {
+            let vol = normalized_gain_for_rms(rms, target_rms, min_gain, max_gain);
+            let gain_db = 20.0 * vol.log10();
+            tracing::info!(
+                file = %path.file_name().and_then(|n| n.to_str()).unwrap_or("audio"),
+                measured_rms_db = format!("{:.1}", 20.0 * rms.log10()),
+                gain_db = format!("{gain_db:+.1}"),
+                linear_gain = format!("{vol:.2}x"),
+                "normalized huddle audio file loudness"
+            );
+            vol
+        }
+        None => fallback,
+    }
+}
+
 /// Play an official Slack huddle lifecycle sound (`you_joined_call_v2`, `you_left_call_v2`,
 /// `they_joined_call_v2`, `they_left_call_v2`, `outgoing_ring_v2`) without blocking the caller.
-/// Uses the cached official MP3 via native macOS `afplay` (zero `cpal` contention), falling back
-/// to a short synthesized chime only if offline or on non-macOS hosts.
+/// Uses the cached official MP3 via native macOS `NSSound` routed to `output_device`, with loudness
+/// normalization and fallback to `afplay` or a synthesized chime.
 pub fn play_huddle_chime(chime: HuddleChime, output_device: Option<&str>) -> Result<()> {
     let device_name = output_device.map(ToOwned::to_owned);
     std::thread::Builder::new()
@@ -176,18 +311,20 @@ pub fn play_huddle_chime(chime: HuddleChime, output_device: Option<&str>) -> Res
             #[cfg(target_os = "macos")]
             {
                 if let Some(path) = ensure_cached_slack_audio(chime.slack_asset_filename()) {
-                    // Prefer CoreAudio device-routed NSSound so chimes play on the user's chosen
-                    // huddle headset/speaker without spawning a child process; fall back to afplay
-                    // only if NSSound fails.
+                    // Normalize chimes to ~ -22 dBFS weighted RMS (0.080 linear), supporting real
+                    // boost up to +20 dB (10.0x) via AVAudioEngine + AVAudioUnitEQ so quiet MP3s
+                    // match louder ones cleanly.
+                    let volume = normalized_file_volume(&path, 0.080, 0.15, 10.0, 1.0);
                     if crate::macos_media::play_routed_audio_oneshot(
                         &path,
                         device_name.as_deref(),
-                        0.85,
+                        volume,
                     ) {
                         return;
                     }
+                    let vol_arg = format!("{volume:.3}");
                     if std::process::Command::new("/usr/bin/afplay")
-                        .args(["-v", "0.85"])
+                        .args(["-v", &vol_arg])
                         .arg(&path)
                         .status()
                         .is_ok_and(|s| s.success())
@@ -950,6 +1087,7 @@ fn run_inbound_audio_rx_loop(
         return;
     };
     let mut jitter = AudioJitterBuffer::new();
+    let mut normalizer = LoudnessNormalizer::speech();
     let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
 
     while shared.running.load(Ordering::Relaxed) {
@@ -970,7 +1108,10 @@ fn run_inbound_audio_rx_loop(
                 JitterStep::Plc => decode_opus_or_plc(&mut decoder, &[], &mut decoded_pcm),
             };
             if let Ok(samples) = decoded_res {
-                let pcm = &decoded_pcm[..samples];
+                let pcm = &mut decoded_pcm[..samples];
+                // Generalized per-stream speech loudness normalization: lifts quiet mics and tames
+                // hot mics to a consistent conversational level without boosting silence.
+                normalizer.process_frame(pcm);
                 if let Ok(mut pb) = playback_buf.lock() {
                     pb.push(pcm);
                 }
@@ -1035,6 +1176,7 @@ fn run_audio_dsp_loop(
         .unwrap_or_else(|_| Bytes::from_static(&[0xF8, 0xFF, 0xFE]));
     let mut mic_frame = Vec::with_capacity(FRAME_20MS);
     let mut processed_capture = Vec::with_capacity(FRAME_20MS);
+    let mut mic_normalizer = LoudnessNormalizer::speech();
     let mut aec_ref_chunk = [0.0f32; FRAME_10MS];
 
     // Event-driven OS audio device hot-plug monitor (CoreAudio listener on macOS; falls back to
@@ -1197,8 +1339,8 @@ fn run_audio_dsp_loop(
                     .store(0.0f32.to_bits(), Ordering::Relaxed);
                 let _ = outbound_opus_tx.send(cached_silence_opus.clone());
             } else {
-                let pcm_to_encode: &[f32] = match &mut io {
-                    AudioIoBackend::Hardware(_) => &mic_frame,
+                let pcm_to_encode: &mut [f32] = match &mut io {
+                    AudioIoBackend::Hardware(_) => &mut mic_frame,
                     AudioIoBackend::Cpal { apm, .. } => {
                         processed_capture.clear();
                         for chunk in mic_frame.as_chunks::<FRAME_10MS>().0 {
@@ -1212,9 +1354,14 @@ fn run_audio_dsp_loop(
                                 processed_capture.extend_from_slice(chunk);
                             }
                         }
-                        &processed_capture
+                        &mut processed_capture
                     }
                 };
+                // Normalize local microphone volume when AGC is enabled so quiet Bluetooth/USB mics
+                // and hot desk mics both transmit at consistent conversational loudness.
+                if cur_agc {
+                    mic_normalizer.process_frame(pcm_to_encode);
+                }
                 let rms = compute_rms_mono(pcm_to_encode);
                 shared
                     .local_rms_bits
@@ -1492,12 +1639,18 @@ impl AmbientMusicPlayer {
                 #[cfg(target_os = "macos")]
                 {
                     if let Some(path) = ensure_cached_slack_audio(&filename) {
+                        // Normalize every lounge track to an identical gentle background loudness
+                        // (-30 dBFS 200Hz-weighted RMS = 0.032 linear). Slack's CDN MP3s span a
+                        // 30 dB range (-46 dBFS piano_concerto to -16 dBFS lofihaus), so allow
+                        // true linear gain from 0.08x (-22 dB) up to 14.0x (+23 dB) via
+                        // AVAudioEngine + AVAudioUnitEQ!
+                        let volume = normalized_file_volume(&path, 0.032, 0.08, 14.0, 1.0);
                         // Prefer CoreAudio device-routed looping NSSound (routes Smooth Jazz
                         // directly to the user's chosen huddle headset/speaker with 0 subprocesses).
                         if let Some(mut routed) = crate::macos_media::MacRoutedAudioLoop::start(
                             &path,
                             output_device.as_deref(),
-                            0.32,
+                            volume,
                         ) {
                             while run_flag.load(Ordering::Relaxed) {
                                 std::thread::sleep(Duration::from_millis(80));
@@ -1505,9 +1658,10 @@ impl AmbientMusicPlayer {
                             routed.stop();
                             return;
                         }
+                        let vol_arg = format!("{volume:.3}");
                         while run_flag.load(Ordering::Relaxed) {
                             let Ok(mut child) = std::process::Command::new("/usr/bin/afplay")
-                                .args(["-v", "0.32"])
+                                .args(["-v", &vol_arg])
                                 .arg(&path)
                                 .spawn()
                             else {
@@ -1608,6 +1762,64 @@ impl Drop for AmbientMusicPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loudness_normalizer_lifts_quiet_tames_loud_and_ignores_silence() {
+        let mut quiet_norm = LoudnessNormalizer::speech();
+        let mut quiet_frame = vec![0.0f32; FRAME_20MS];
+        // Feed 1.5s of quiet speech (~0.025 peak -> ~0.0177 RMS).
+        for f in 0..75 {
+            for (i, s) in quiet_frame.iter_mut().enumerate() {
+                let t = (f * FRAME_20MS + i) as f32 / SAMPLE_RATE as f32;
+                *s = (2.0 * std::f32::consts::PI * 300.0 * t).sin() * 0.025;
+            }
+            quiet_norm.process_frame(&mut quiet_frame);
+        }
+        assert!(
+            quiet_norm.gain() > 2.2,
+            "expected quiet voice to be boosted, got gain={}",
+            quiet_norm.gain()
+        );
+
+        let mut loud_norm = LoudnessNormalizer::speech();
+        let mut loud_frame = vec![0.0f32; FRAME_20MS];
+        // Feed hot mic (~0.85 peak -> ~0.60 RMS): should tame quickly with zero hard clipping.
+        for f in 0..25 {
+            for (i, s) in loud_frame.iter_mut().enumerate() {
+                let t = (f * FRAME_20MS + i) as f32 / SAMPLE_RATE as f32;
+                *s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.85;
+            }
+            loud_norm.process_frame(&mut loud_frame);
+            assert!(
+                loud_frame.iter().all(|s| s.abs() <= 0.985),
+                "soft limiter must prevent clipping"
+            );
+        }
+        assert!(
+            loud_norm.gain() < 0.45,
+            "expected hot voice to be attenuated, got gain={}",
+            loud_norm.gain()
+        );
+
+        // Background noise below gate (-50 dBFS) must NOT be boosted.
+        let mut noise_norm = LoudnessNormalizer::speech();
+        let mut noise = vec![0.002f32; FRAME_20MS];
+        for _ in 0..50 {
+            noise.fill(0.002);
+            noise_norm.process_frame(&mut noise);
+        }
+        assert!(
+            (noise_norm.gain() - 1.0).abs() < 0.05,
+            "noise below gate must remain near unity, got {}",
+            noise_norm.gain()
+        );
+
+        // File RMS normalization scales louder tracks down and quieter tracks up cleanly.
+        let loud_vol = normalized_gain_for_rms(0.30, 0.063, 0.06, 0.72);
+        let quiet_vol = normalized_gain_for_rms(0.10, 0.063, 0.06, 0.72);
+        assert!((loud_vol - 0.21).abs() < 0.01);
+        assert!((quiet_vol - 0.63).abs() < 0.01);
+    }
 
     #[test]
     fn synthetic_sonora_and_opus_round_trip_preserves_signal() {

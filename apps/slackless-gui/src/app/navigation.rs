@@ -1311,6 +1311,17 @@ impl App {
                 }
                 crate::huddle_dock::HuddleDockEvent::Leave => this.leave_huddle(cx),
                 crate::huddle_dock::HuddleDockEvent::PopOut => this.pop_out_huddle(window, cx),
+                crate::huddle_dock::HuddleDockEvent::OpenFloatingPanel => {
+                    this.open_huddle_floating_panel(window, cx);
+                }
+                crate::huddle_dock::HuddleDockEvent::CloseFloatingPanel => {
+                    this.close_huddle_floating_panel(cx);
+                }
+                crate::huddle_dock::HuddleDockEvent::SendDraw(msg) => {
+                    if !this.fixtures.sample {
+                        this.bridge.send(Command::SendHuddleDraw(msg.clone()));
+                    }
+                }
                 crate::huddle_dock::HuddleDockEvent::JumpToChannel(ch) => {
                     this.select(ch.clone(), cx);
                 }
@@ -1415,7 +1426,36 @@ impl App {
         }));
     }
 
+    pub(super) fn open_huddle_floating_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self.huddle_floating_panel {
+            if existing
+                .update(cx, |_, win, _| win.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.huddle_floating_panel = None;
+        }
+        let Some(dock) = &self.huddle_dock else {
+            return;
+        };
+        let display_id = window.display(cx).map(|d| d.id());
+        self.huddle_floating_panel =
+            crate::popout::open_huddle_floating_panel(dock.downgrade(), display_id, cx);
+    }
+
+    pub(super) fn close_huddle_floating_panel(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.huddle_floating_panel.take() {
+            let _ = handle.update(cx, |_, win, _| win.remove_window());
+        }
+    }
+
     pub(super) fn clear_huddle_dock(&mut self, cx: &mut Context<Self>) {
+        self.close_huddle_floating_panel(cx);
         self.huddle_alone_music_task = None;
         if let Some(dock) = &self.huddle_dock {
             dock.update(cx, |d, cx| d.clear_video_frames(cx));

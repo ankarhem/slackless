@@ -66,9 +66,10 @@ impl PopoutWindow {
         let white = pal.scrim_fg;
         let emerald = pal.success;
         let primary = pal.primary;
+        let draw_mode = state.draw_mode;
+        let draw_hue = state.draw_hue;
         let draw_btn = {
             let item = primary_item_id.clone();
-            let hue = self.huddle_draw_hue;
             h_flex()
                 .id("popout-huddle-stage-draw")
                 .h(px(26.))
@@ -77,13 +78,13 @@ impl PopoutWindow {
                 .items_center()
                 .rounded_full()
                 .cursor_pointer()
-                .bg(if self.huddle_draw_mode {
+                .bg(if draw_mode {
                     primary
                 } else {
                     Hsla::from(rgba(0xFFFFFF1C))
                 })
                 .hover(move |el| {
-                    el.bg(if self.huddle_draw_mode {
+                    el.bg(if draw_mode {
                         emerald
                     } else {
                         Hsla::from(rgba(0xFFFFFF2E))
@@ -97,21 +98,20 @@ impl PopoutWindow {
                         .size(px(12.))
                         .text_color(white),
                 )
-                .child(if self.huddle_draw_mode {
-                    "Drawing"
-                } else {
-                    "Draw"
-                })
+                .child(if draw_mode { "Drawing" } else { "Draw" })
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.huddle_draw_mode = !this.huddle_draw_mode;
+                    let next = !draw_mode;
+                    this.huddle_draw_mode = next;
                     this.huddle_drawing_active = false;
                     this.huddle_draw_points.clear();
                     this.huddle_draw_local_segments.clear();
                     this.huddle_draw_local_item.clear();
-                    if this.huddle_draw_mode {
+                    if let Some(dock) = this.huddle_dock_entity() {
+                        dock.update(cx, |d, cx| d.set_draw_mode(next, cx));
+                    } else if next {
                         let msg = HuddleDrawMessage::ChangeHue {
                             item_id: item.clone(),
-                            hue,
+                            hue: draw_hue,
                         };
                         (this.send)(Command::SendHuddleDraw(msg.clone()));
                         this.apply_local_draw(msg, cx);
@@ -120,13 +120,13 @@ impl PopoutWindow {
                 }))
         };
 
-        let swatches = self.huddle_draw_mode.then(|| {
+        let swatches = draw_mode.then(|| {
             h_flex()
                 .items_center()
                 .gap_1()
                 .px_1()
                 .children(HUES.iter().enumerate().map(|(ix, &(hue, _label))| {
-                    let selected = self.huddle_draw_hue == hue;
+                    let selected = draw_hue == hue;
                     let item = primary_item_id.clone();
                     div()
                         .id(("popout-draw-hue", ix))
@@ -142,12 +142,16 @@ impl PopoutWindow {
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.huddle_draw_hue = hue;
-                            let msg = HuddleDrawMessage::ChangeHue {
-                                item_id: item.clone(),
-                                hue,
-                            };
-                            (this.send)(Command::SendHuddleDraw(msg.clone()));
-                            this.apply_local_draw(msg, cx);
+                            if let Some(dock) = this.huddle_dock_entity() {
+                                dock.update(cx, |d, cx| d.set_draw_hue(hue, cx));
+                            } else {
+                                let msg = HuddleDrawMessage::ChangeHue {
+                                    item_id: item.clone(),
+                                    hue,
+                                };
+                                (this.send)(Command::SendHuddleDraw(msg.clone()));
+                                this.apply_local_draw(msg, cx);
+                            }
                             cx.notify();
                         }))
                 }))
@@ -274,6 +278,34 @@ impl PopoutWindow {
                         .child(draw_btn)
                         .child(
                             div()
+                                .id("popout-huddle-stage-floating-panel")
+                                .h(px(26.))
+                                .px_2()
+                                .rounded_full()
+                                .cursor_pointer()
+                                .bg(rgba(0xFFFFFF14))
+                                .hover(|el| el.bg(rgba(0xFFFFFF28)))
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(white)
+                                .child(
+                                    gpui_kit::component::Icon::new(IconName::Pin)
+                                        .size(px(11.))
+                                        .text_color(white),
+                                )
+                                .child("Controls")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(dock) = this.huddle_dock_entity() {
+                                        dock.update(cx, |d, cx| {
+                                            d.request_open_floating_panel(cx);
+                                        });
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
                                 .id("popout-huddle-stage-expand")
                                 .h(px(26.))
                                 .px_2()
@@ -337,14 +369,12 @@ impl PopoutWindow {
             .filter(|s| s.item_id.is_empty() || s.item_id == filter_id || pane_ix == 0)
             .cloned()
             .collect();
+        let active_hue = state.draw_hue;
         let local_live_segments = if pane_ix == 0
             && self.huddle_drawing_active
             && !self.huddle_draw_local_segments.is_empty()
         {
-            Some((
-                self.huddle_draw_hue,
-                self.huddle_draw_local_segments.clone(),
-            ))
+            Some((active_hue, self.huddle_draw_local_segments.clone()))
         } else {
             None
         };
@@ -503,7 +533,7 @@ impl PopoutWindow {
             .overflow_hidden()
             .child(stage_canvas);
 
-        if self.huddle_draw_mode && pane_ix == 0 {
+        if state.draw_mode && pane_ix == 0 {
             pane = pane
                 .cursor_crosshair()
                 .on_mouse_down(
@@ -524,9 +554,12 @@ impl PopoutWindow {
                         // Emit an initial dot segment so single-click highlights work cleanly.
                         let dot_seg = make_catmull_rom_segment(pt, pt, pt, pt);
                         this.huddle_draw_local_segments.push(dot_seg);
+                        let hue = this
+                            .huddle_dock_entity()
+                            .map_or(this.huddle_draw_hue, |d| d.read(cx).draw_hue());
                         let hue_msg = HuddleDrawMessage::ChangeHue {
                             item_id: item_down.clone(),
-                            hue: this.huddle_draw_hue,
+                            hue,
                         };
                         (this.send)(Command::SendHuddleDraw(hue_msg));
                         cx.notify();
@@ -651,7 +684,7 @@ impl PopoutWindow {
         };
         (self.send)(Command::SendHuddleDraw(end_msg));
         if let Some(dock) = self.huddle_dock_entity() {
-            let hue = self.huddle_draw_hue;
+            let hue = dock.read(cx).draw_hue();
             dock.update(cx, |d, cx| {
                 d.commit_local_draw_stroke(item, hue, segs, cx);
             });

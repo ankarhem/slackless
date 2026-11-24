@@ -594,6 +594,7 @@ pub struct App {
     huddle_session: Option<slackless_core::huddle::HuddleSessionSnapshot>,
     /// Persistent sidebar mini-dock mounted at the bottom of the sidebar while in a huddle.
     huddle_dock: Option<Entity<HuddleDock>>,
+    huddle_floating_panel: Option<gpui::AnyWindowHandle>,
     _huddle_dock_sub: Option<Subscription>,
     /// Floating incoming DM huddle ring banner (`huddle_invite`).
     huddle_invite: Option<Entity<HuddleInviteBanner>>,

@@ -2439,40 +2439,35 @@ void slackless_vpio_stop(SlacklessVpio *vpio) {
 }
 
 // ---------------------------------------------------------------------------
-// CoreAudio Output-Device-Routed Native Audio Player (`NSSound` + DeviceUID)
+// CoreAudio Output-Device-Routed Native Audio Player (`AVAudioEngine` + Gain)
 // ---------------------------------------------------------------------------
 
-static NSString *resolve_output_device_uid_by_name(const char *device_name) {
-    if (!device_name || device_name[0] == '\0') return nil;
+static AudioDeviceID resolve_output_device_id_by_name(const char *device_name) {
+    if (!device_name || device_name[0] == '\0') return kAudioObjectUnknown;
     NSString *target = [NSString stringWithUTF8String:device_name];
-    if (!target || target.length == 0) return nil;
+    if (!target || target.length == 0) return kAudioObjectUnknown;
 
-    AudioObjectPropertyAddress devsAddr = {
+    AudioObjectPropertyAddress prop = {
         kAudioHardwarePropertyDevices,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain,
     };
     UInt32 dataSize = 0;
-    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devsAddr, 0, NULL, &dataSize) != noErr ||
-        dataSize < sizeof(AudioDeviceID)) {
-        return nil;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &prop, 0, NULL, &dataSize) != noErr ||
+        dataSize == 0) {
+        return kAudioObjectUnknown;
     }
     UInt32 count = dataSize / (UInt32)sizeof(AudioDeviceID);
     AudioDeviceID *devs = (AudioDeviceID *)malloc(dataSize);
-    if (!devs) return nil;
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devsAddr, 0, NULL, &dataSize, devs) != noErr) {
+    if (!devs) return kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &prop, 0, NULL, &dataSize, devs) != noErr) {
         free(devs);
-        return nil;
+        return kAudioObjectUnknown;
     }
 
-    NSString *matchedUid = nil;
+    AudioDeviceID matched = kAudioObjectUnknown;
     AudioObjectPropertyAddress nameAddr = {
         kAudioObjectPropertyName,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain,
-    };
-    AudioObjectPropertyAddress uidAddr = {
-        kAudioDevicePropertyDeviceUID,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain,
     };
@@ -2492,66 +2487,163 @@ static NSString *resolve_output_device_uid_by_name(const char *device_name) {
         if (AudioObjectGetPropertyData(devs[i], &nameAddr, 0, NULL, &sz, &cfName) == noErr && cfName) {
             NSString *name = (__bridge_transfer NSString *)cfName;
             if ([name isEqualToString:target]) {
-                CFStringRef cfUid = NULL;
-                UInt32 uidSz = (UInt32)sizeof(cfUid);
-                if (AudioObjectGetPropertyData(devs[i], &uidAddr, 0, NULL, &uidSz, &cfUid) == noErr && cfUid) {
-                    matchedUid = (__bridge_transfer NSString *)cfUid;
-                    break;
-                }
+                matched = devs[i];
+                break;
             }
         }
     }
     free(devs);
-    return matchedUid;
+    return matched;
 }
 
-@interface SlacklessSoundHolder : NSObject <NSSoundDelegate>
-@property(nonatomic, strong) NSSound *sound;
-@property(nonatomic, assign) bool oneShot;
-@end
-
-static NSMutableSet<SlacklessSoundHolder *> *g_active_oneshot_sounds = nil;
-
-@implementation SlacklessSoundHolder
-- (void)sound:(NSSound *)sound didFinishPlaying:(BOOL)flag {
-    (void)sound;
-    (void)flag;
-    if (self.oneShot) {
-        self.sound = nil;
-        [g_active_oneshot_sounds removeObject:self];
+static NSString *resolve_output_device_uid_by_name(const char *device_name) {
+    AudioDeviceID dev = resolve_output_device_id_by_name(device_name);
+    if (dev == kAudioObjectUnknown) return nil;
+    AudioObjectPropertyAddress uidAddr = {
+        kAudioDevicePropertyDeviceUID,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    CFStringRef cfUid = NULL;
+    UInt32 uidSz = (UInt32)sizeof(cfUid);
+    if (AudioObjectGetPropertyData(dev, &uidAddr, 0, NULL, &uidSz, &cfUid) == noErr && cfUid) {
+        return (__bridge_transfer NSString *)cfUid;
     }
+    return nil;
 }
+
+@interface SlacklessEnginePlayer : NSObject
+@property(nonatomic, strong) AVAudioEngine *engine;
+@property(nonatomic, strong) AVAudioPlayerNode *player;
+@property(nonatomic, strong) AVAudioUnitEQ *eq;
+@property(nonatomic, strong) AVAudioFile *file;
+@property(nonatomic, assign) bool loops;
+@property(nonatomic, assign) bool stopped;
+- (void)scheduleLoop;
+- (void)stopNow;
 @end
+
+static NSMutableSet<SlacklessEnginePlayer *> *g_active_oneshot_engines = nil;
+
+@implementation SlacklessEnginePlayer
+
+- (void)scheduleLoop {
+    if (self.stopped || !self.player || !self.file) return;
+    __weak SlacklessEnginePlayer *weakSelf = self;
+    [self.player scheduleFile:self.file
+                       atTime:nil
+               completionCallbackType:AVAudioPlayerNodeCompletionDataPlayedBack
+                    completionHandler:^(AVAudioPlayerNodeCompletionCallbackType type) {
+                        (void)type;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            SlacklessEnginePlayer *strongSelf = weakSelf;
+                            if (!strongSelf || strongSelf.stopped) return;
+                            if (strongSelf.loops) {
+                                [strongSelf scheduleLoop];
+                            } else {
+                                [strongSelf stopNow];
+                                [g_active_oneshot_engines removeObject:strongSelf];
+                            }
+                        });
+                    }];
+}
+
+- (void)stopNow {
+    self.stopped = true;
+    if (self.player) {
+        [self.player stop];
+        self.player = nil;
+    }
+    if (self.engine) {
+        [self.engine stop];
+        self.engine = nil;
+    }
+    self.eq = nil;
+    self.file = nil;
+}
+
+@end
+
+// Populate and start a CoreAudio-routed AVAudioEngine player inside `holder`, supporting true
+// linear gain from -48 dB to +24 dB via AVAudioUnitEQ.globalGain (unlike NSSound.volume which
+// caps at 1.0 and cannot lift quiet tracks like -46 dBFS piano_concerto).
+static bool start_engine_audio_player_into(
+    SlacklessEnginePlayer *holder,
+    NSString *nsPath,
+    AudioDeviceID deviceId,
+    float linearGain,
+    bool loops) {
+    NSURL *url = [NSURL fileURLWithPath:nsPath];
+    NSError *err = nil;
+    AVAudioFile *file = [[AVAudioFile alloc] initForReading:url error:&err];
+    if (!file || err) return false;
+
+    AVAudioEngine *engine = [[AVAudioEngine alloc] init];
+    if (deviceId != kAudioObjectUnknown && engine.outputNode.audioUnit) {
+        AudioUnitSetProperty(
+            engine.outputNode.audioUnit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceId,
+            sizeof(deviceId));
+    }
+
+    AVAudioPlayerNode *player = [[AVAudioPlayerNode alloc] init];
+    AVAudioUnitEQ *eq = [[AVAudioUnitEQ alloc] initWithNumberOfBands:0];
+    float gain = linearGain > 1e-4f ? linearGain : 0.32f;
+    float gainDb = 20.0f * log10f(gain);
+    if (gainDb < -48.0f) gainDb = -48.0f;
+    if (gainDb > 24.0f) gainDb = 24.0f;
+    eq.globalGain = gainDb;
+
+    [engine attachNode:player];
+    [engine attachNode:eq];
+    [engine connect:player to:eq format:file.processingFormat];
+    [engine connect:eq to:engine.mainMixerNode format:file.processingFormat];
+
+    if (![engine startAndReturnError:&err] || err) {
+        return false;
+    }
+
+    holder.engine = engine;
+    holder.player = player;
+    holder.eq = eq;
+    holder.file = file;
+    holder.loops = loops;
+    holder.stopped = false;
+    [holder scheduleLoop];
+    [player play];
+    return true;
+}
 
 typedef struct SlacklessAudioHandle {
-    void *holder_obj; // retained SlacklessSoundHolder*
+    void *holder_obj; // retained SlacklessEnginePlayer*
 } SlacklessAudioHandle;
 
 bool slackless_audio_file_play_oneshot(const char *path, const char *device_name, float volume) {
     if (!path || path[0] == '\0') return false;
     NSString *nsPath = [NSString stringWithUTF8String:path];
+    AudioDeviceID devId = resolve_output_device_id_by_name(device_name);
     NSString *uid = resolve_output_device_uid_by_name(device_name);
     if (!nsPath) return false;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            if (!g_active_oneshot_sounds) {
-                g_active_oneshot_sounds = [NSMutableSet set];
+            if (!g_active_oneshot_engines) {
+                g_active_oneshot_engines = [NSMutableSet set];
             }
+            SlacklessEnginePlayer *holder = [[SlacklessEnginePlayer alloc] init];
+            if (start_engine_audio_player_into(holder, nsPath, devId, volume, false)) {
+                [g_active_oneshot_engines addObject:holder];
+                return;
+            }
+            // Fallback to NSSound if AVAudioEngine fails to start.
             NSSound *sound = [[NSSound alloc] initWithContentsOfFile:nsPath byReference:YES];
             if (!sound) return;
-            sound.volume = volume > 0.0f ? volume : 0.85f;
+            sound.volume = volume > 1.0f ? 1.0f : (volume > 0.0f ? volume : 0.85f);
             sound.loops = NO;
-            if (uid) {
-                sound.playbackDeviceIdentifier = uid;
-            }
-            SlacklessSoundHolder *holder = [[SlacklessSoundHolder alloc] init];
-            holder.sound = sound;
-            holder.oneShot = true;
-            sound.delegate = holder;
-            [g_active_oneshot_sounds addObject:holder];
-            if (![sound play]) {
-                [g_active_oneshot_sounds removeObject:holder];
-            }
+            if (uid) sound.playbackDeviceIdentifier = uid;
+            [sound play];
         }
     });
     return true;
@@ -2563,28 +2655,110 @@ SlacklessAudioHandle *slackless_audio_file_start_loop(
     float volume) {
     if (!path || path[0] == '\0') return NULL;
     NSString *nsPath = [NSString stringWithUTF8String:path];
-    NSString *uid = resolve_output_device_uid_by_name(device_name);
+    AudioDeviceID devId = resolve_output_device_id_by_name(device_name);
     if (!nsPath) return NULL;
-    SlacklessSoundHolder *holder = [[SlacklessSoundHolder alloc] init];
-    holder.oneShot = false;
+    SlacklessEnginePlayer *holder = [[SlacklessEnginePlayer alloc] init];
+    holder.loops = true;
+    holder.stopped = false;
     SlacklessAudioHandle *h = (SlacklessAudioHandle *)calloc(1, sizeof(SlacklessAudioHandle));
     if (!h) return NULL;
     h->holder_obj = (__bridge_retained void *)holder;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            NSSound *sound = [[NSSound alloc] initWithContentsOfFile:nsPath byReference:YES];
-            if (!sound) return;
-            sound.volume = volume > 0.0f ? volume : 0.32f;
-            sound.loops = YES;
-            if (uid) {
-                sound.playbackDeviceIdentifier = uid;
-            }
-            holder.sound = sound;
-            [sound play];
+            if (holder.stopped) return;
+            start_engine_audio_player_into(holder, nsPath, devId, volume, true);
         }
     });
     return h;
+}
+
+// Measure full-track perceptually weighted (200 Hz high-pass) gated RMS loudness of an audio file
+// via CoreAudio ExtAudioFile so quiet tracks (-46 dBFS piano) and hot tracks (-16 dBFS lofi) are
+// normalized to the exact same perceived level. Also caps gain against peak headroom so playback
+// never clips.
+// Returns linear weighted RMS in (0.0, 1.0], or -1.0f if decoding fails.
+float slackless_audio_file_measure_rms(const char *path) {
+    if (!path || path[0] == '\0') return -1.0f;
+    @autoreleasepool {
+        NSString *nsPath = [NSString stringWithUTF8String:path];
+        if (!nsPath) return -1.0f;
+        NSURL *url = [NSURL fileURLWithPath:nsPath];
+        ExtAudioFileRef extFile = NULL;
+        if (ExtAudioFileOpenURL((__bridge CFURLRef)url, &extFile) != noErr || !extFile) {
+            return -1.0f;
+        }
+        AudioStreamBasicDescription clientFmt;
+        memset(&clientFmt, 0, sizeof(clientFmt));
+        clientFmt.mSampleRate = 24000.0;
+        clientFmt.mFormatID = kAudioFormatLinearPCM;
+        clientFmt.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        clientFmt.mFramesPerPacket = 1;
+        clientFmt.mChannelsPerFrame = 1;
+        clientFmt.mBitsPerChannel = 32;
+        clientFmt.mBytesPerFrame = 4;
+        clientFmt.mBytesPerPacket = 4;
+        if (ExtAudioFileSetProperty(extFile,
+                                    kExtAudioFileProperty_ClientDataFormat,
+                                    sizeof(clientFmt),
+                                    &clientFmt) != noErr) {
+            ExtAudioFileDispose(extFile);
+            return -1.0f;
+        }
+
+        // Decode the full track (up to 6 minutes at 24 kHz mono) with a 1st-order 200 Hz high-pass
+        // weighting filter (approximating ITU-R BS.1770 K-weighting so bass-heavy tracks aren't
+        // over-attenuated relative to bright mid-range tracks).
+        const UInt32 chunkFrames = 8192;
+        float buf[8192];
+        double gatedSumSq = 0.0;
+        uint64_t gatedSamples = 0;
+        double allSumSq = 0.0;
+        uint64_t allSamples = 0;
+        const uint64_t maxFrames = 24000ULL * 360ULL;
+        const double rc = 1.0 / (2.0 * M_PI * 200.0);
+        const double dt = 1.0 / 24000.0;
+        const double hpAlpha = rc / (rc + dt);
+        double hpY = 0.0;
+        double hpPrevX = 0.0;
+
+        while (allSamples < maxFrames) {
+            AudioBufferList abl;
+            abl.mNumberBuffers = 1;
+            abl.mBuffers[0].mNumberChannels = 1;
+            abl.mBuffers[0].mDataByteSize = chunkFrames * sizeof(float);
+            abl.mBuffers[0].mData = buf;
+            UInt32 nFrames = chunkFrames;
+            OSStatus st = ExtAudioFileRead(extFile, &nFrames, &abl);
+            if (st != noErr || nFrames == 0) break;
+
+            double blockSq = 0.0;
+            for (UInt32 i = 0; i < nFrames; i++) {
+                double x = (double)buf[i];
+                hpY = hpAlpha * (hpY + x - hpPrevX);
+                hpPrevX = x;
+                blockSq += hpY * hpY;
+            }
+            double blockRms = sqrt(blockSq / (double)nFrames);
+            allSumSq += blockSq;
+            allSamples += nFrames;
+            // Gate only true silence (below -60 dBFS = 0.001) so ultra-quiet tracks like
+            // piano_concerto (-46 dBFS) are measured accurately across the entire track.
+            if (blockRms > 0.001) {
+                gatedSumSq += blockSq;
+                gatedSamples += nFrames;
+            }
+        }
+        ExtAudioFileDispose(extFile);
+
+        if (gatedSamples > 0) {
+            return (float)sqrt(gatedSumSq / (double)gatedSamples);
+        }
+        if (allSamples > 0) {
+            return (float)sqrt(allSumSq / (double)allSamples);
+        }
+        return -1.0f;
+    }
 }
 
 void slackless_audio_file_stop_loop(SlacklessAudioHandle *handle) {
@@ -2595,11 +2769,8 @@ void slackless_audio_file_stop_loop(SlacklessAudioHandle *handle) {
     if (!obj) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            SlacklessSoundHolder *holder = (__bridge_transfer SlacklessSoundHolder *)obj;
-            if (holder.sound) {
-                [holder.sound stop];
-                holder.sound = nil;
-            }
+            SlacklessEnginePlayer *holder = (__bridge_transfer SlacklessEnginePlayer *)obj;
+            [holder stopNow];
         }
     });
 }
@@ -2643,13 +2814,21 @@ static void hsl_hue_to_rgb(int32_t hue_deg, CGFloat *r, CGFloat *g, CGFloat *b) 
     *b = (CGFloat)(bb + m);
 }
 
+typedef void (*SlacklessOverlayMouseCallback)(void *ctx, uint8_t kind, double nx, double ny);
+
 @interface SlacklessDrawOverlayView : NSView {
 @public
     SlacklessOverlaySegment *segments;
     size_t segment_count;
     SlacklessOverlayCursor *cursors;
     size_t cursor_count;
+    bool pen_enabled;
+    int32_t pen_hue;
+    SlacklessOverlayMouseCallback mouse_cb;
+    void *mouse_ctx;
+    NSTrackingArea *tracking_area;
 }
+- (void)syncTrackingArea;
 @end
 
 @implementation SlacklessDrawOverlayView
@@ -2662,9 +2841,78 @@ static void hsl_hue_to_rgb(int32_t hue_deg, CGFloat *r, CGFloat *g, CGFloat *b) 
     return NO;
 }
 
+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+    (void)event;
+    return pen_enabled ? YES : NO;
+}
+
 - (void)dealloc {
     free(segments);
     free(cursors);
+}
+
+- (void)syncTrackingArea {
+    if (tracking_area) {
+        [self removeTrackingArea:tracking_area];
+        tracking_area = nil;
+    }
+    if (pen_enabled) {
+        NSTrackingAreaOptions opts = NSTrackingMouseMoved | NSTrackingActiveAlways |
+                                     NSTrackingInVisibleRect | NSTrackingCursorUpdate;
+        tracking_area = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                     options:opts
+                                                       owner:self
+                                                    userInfo:nil];
+        [self addTrackingArea:tracking_area];
+    }
+    if (self.window) {
+        [self.window invalidateCursorRectsForView:self];
+    }
+}
+
+- (void)resetCursorRects {
+    [super resetCursorRects];
+    if (pen_enabled) {
+        [self addCursorRect:self.bounds cursor:[NSCursor crosshairCursor]];
+    }
+}
+
+- (void)cursorUpdate:(NSEvent *)event {
+    (void)event;
+    if (pen_enabled) {
+        [[NSCursor crosshairCursor] set];
+    }
+}
+
+- (void)emitMouseKind:(uint8_t)kind event:(NSEvent *)event {
+    if (!pen_enabled || !mouse_cb) return;
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    if (w < 2.0 || h < 2.0) return;
+    double nx = (double)(p.x / w);
+    double ny = (double)(p.y / h);
+    if (nx < 0.0) nx = 0.0;
+    if (nx > 1.0) nx = 1.0;
+    if (ny < 0.0) ny = 0.0;
+    if (ny > 1.0) ny = 1.0;
+    mouse_cb(mouse_ctx, kind, nx, ny);
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    [self emitMouseKind:0 event:event];
+}
+
+- (void)mouseDragged:(NSEvent *)event {
+    [self emitMouseKind:1 event:event];
+}
+
+- (void)mouseUp:(NSEvent *)event {
+    [self emitMouseKind:2 event:event];
+}
+
+- (void)mouseMoved:(NSEvent *)event {
+    [self emitMouseKind:3 event:event];
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -2676,6 +2924,16 @@ static void hsl_hue_to_rgb(int32_t hue_deg, CGFloat *r, CGFloat *g, CGFloat *b) 
     CGFloat w = self.bounds.size.width;
     CGFloat h = self.bounds.size.height;
     if (w < 2.0 || h < 2.0) return;
+
+    if (pen_enabled) {
+        // Subtle glowing perimeter frame while desktop pen mode is active so the presenter knows
+        // annotations are armed without obstructing the shared app.
+        CGFloat br = 0, bg = 0, bb = 0;
+        hsl_hue_to_rgb(pen_hue, &br, &bg, &bb);
+        CGContextSetLineWidth(ctx, 4.0);
+        CGContextSetRGBStrokeColor(ctx, br, bg, bb, 0.55);
+        CGContextStrokeRect(ctx, CGRectInset(self.bounds, 2.0, 2.0));
+    }
 
     CGContextSetLineCap(ctx, kCGLineCapRound);
     CGContextSetLineJoin(ctx, kCGLineJoinRound);
@@ -2726,8 +2984,45 @@ static void hsl_hue_to_rgb(int32_t hue_deg, CGFloat *r, CGFloat *g, CGFloat *b) 
 
 @end
 
-static NSWindow *g_draw_overlay_win = nil;
+static NSPanel *g_draw_overlay_win = nil;
 static SlacklessDrawOverlayView *g_draw_overlay_view = nil;
+
+static void ensure_draw_overlay_window(NSRect frame) {
+    if (!g_draw_overlay_win) {
+        // Non-activating NSPanel with `hidesOnDeactivate = NO`: stays live across Cmd+Tab so
+        // desktop pen mode never silently disables when switching apps, and drawing over another
+        // app never steals focus away from it.
+        NSPanel *win = [[NSPanel alloc]
+            initWithContentRect:frame
+                      styleMask:(NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel)
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        win.opaque = NO;
+        win.backgroundColor = [NSColor clearColor];
+        win.hasShadow = NO;
+        win.hidesOnDeactivate = NO;
+        win.floatingPanel = YES;
+        win.becomesKeyOnlyIfNeeded = YES;
+        win.ignoresMouseEvents = YES;
+        win.acceptsMouseMovedEvents = YES;
+        win.level = NSFloatingWindowLevel;
+        // Critical: exclude the overlay from ScreenCaptureKit so teammates' strokes and our pen
+        // border never feed back into the captured video stream!
+        win.sharingType = NSWindowSharingNone;
+        win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                 NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                 NSWindowCollectionBehaviorStationary |
+                                 NSWindowCollectionBehaviorIgnoresCycle;
+        SlacklessDrawOverlayView *view =
+            [[SlacklessDrawOverlayView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
+        view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        win.contentView = view;
+        g_draw_overlay_win = win;
+        g_draw_overlay_view = view;
+    } else if (!NSEqualRects(g_draw_overlay_win.frame, frame)) {
+        [g_draw_overlay_win setFrame:frame display:NO];
+    }
+}
 
 static bool resolve_share_target_nsrect(bool is_monitor, uint32_t target_id, NSRect *out_rect) {
     CGRect primary = CGDisplayBounds(CGMainDisplayID());
@@ -2779,10 +3074,20 @@ void slackless_draw_overlay_update(
 
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
+            bool pen_on = g_draw_overlay_view && g_draw_overlay_view->pen_enabled;
             if ((!segs_copy || seg_count == 0) && (!cur_copy || cur_count == 0)) {
                 free(segs_copy);
                 free(cur_copy);
-                if (g_draw_overlay_win) {
+                if (g_draw_overlay_view) {
+                    free(g_draw_overlay_view->segments);
+                    g_draw_overlay_view->segments = NULL;
+                    g_draw_overlay_view->segment_count = 0;
+                    free(g_draw_overlay_view->cursors);
+                    g_draw_overlay_view->cursors = NULL;
+                    g_draw_overlay_view->cursor_count = 0;
+                    [g_draw_overlay_view setNeedsDisplay:YES];
+                }
+                if (g_draw_overlay_win && !pen_on) {
                     [g_draw_overlay_win orderOut:nil];
                 }
                 return;
@@ -2793,33 +3098,7 @@ void slackless_draw_overlay_update(
                 free(cur_copy);
                 return;
             }
-            if (!g_draw_overlay_win) {
-                NSWindow *win = [[NSWindow alloc]
-                    initWithContentRect:frame
-                              styleMask:NSWindowStyleMaskBorderless
-                                backing:NSBackingStoreBuffered
-                                  defer:NO];
-                win.opaque = NO;
-                win.backgroundColor = [NSColor clearColor];
-                win.hasShadow = NO;
-                win.ignoresMouseEvents = YES;
-                win.level = NSFloatingWindowLevel;
-                // Critical: exclude the click-through overlay from ScreenCaptureKit so teammates'
-                // strokes never feed back into the captured video stream as a mirror loop!
-                win.sharingType = NSWindowSharingNone;
-                win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                         NSWindowCollectionBehaviorStationary |
-                                         NSWindowCollectionBehaviorIgnoresCycle;
-                SlacklessDrawOverlayView *view =
-                    [[SlacklessDrawOverlayView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
-                view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-                win.contentView = view;
-                g_draw_overlay_win = win;
-                g_draw_overlay_view = view;
-            }
-            if (!NSEqualRects(g_draw_overlay_win.frame, frame)) {
-                [g_draw_overlay_win setFrame:frame display:NO];
-            }
+            ensure_draw_overlay_window(frame);
             free(g_draw_overlay_view->segments);
             g_draw_overlay_view->segments = segs_copy;
             g_draw_overlay_view->segment_count = segs_copy ? seg_count : 0;
@@ -2834,10 +3113,58 @@ void slackless_draw_overlay_update(
     });
 }
 
+void slackless_draw_overlay_set_pen_mode(
+    bool enabled,
+    bool is_monitor,
+    uint32_t target_id,
+    int32_t hue,
+    void *ctx,
+    SlacklessOverlayMouseCallback cb) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            if (!enabled) {
+                if (g_draw_overlay_view) {
+                    g_draw_overlay_view->pen_enabled = false;
+                    g_draw_overlay_view->mouse_cb = NULL;
+                    g_draw_overlay_view->mouse_ctx = NULL;
+                    [g_draw_overlay_view syncTrackingArea];
+                    [g_draw_overlay_view setNeedsDisplay:YES];
+                }
+                if (g_draw_overlay_win) {
+                    g_draw_overlay_win.ignoresMouseEvents = YES;
+                    if (!g_draw_overlay_view ||
+                        (g_draw_overlay_view->segment_count == 0 && g_draw_overlay_view->cursor_count == 0)) {
+                        [g_draw_overlay_win orderOut:nil];
+                    }
+                }
+                return;
+            }
+
+            NSRect frame = NSZeroRect;
+            if (!resolve_share_target_nsrect(is_monitor, target_id, &frame)) {
+                return;
+            }
+            ensure_draw_overlay_window(frame);
+            g_draw_overlay_view->pen_enabled = true;
+            g_draw_overlay_view->pen_hue = hue;
+            g_draw_overlay_view->mouse_cb = cb;
+            g_draw_overlay_view->mouse_ctx = ctx;
+            g_draw_overlay_win.ignoresMouseEvents = NO;
+            [g_draw_overlay_view syncTrackingArea];
+            [g_draw_overlay_view setNeedsDisplay:YES];
+            [g_draw_overlay_win orderFrontRegardless];
+        }
+    });
+}
+
 void slackless_draw_overlay_hide(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             if (g_draw_overlay_view) {
+                g_draw_overlay_view->pen_enabled = false;
+                g_draw_overlay_view->mouse_cb = NULL;
+                g_draw_overlay_view->mouse_ctx = NULL;
+                [g_draw_overlay_view syncTrackingArea];
                 free(g_draw_overlay_view->segments);
                 g_draw_overlay_view->segments = NULL;
                 g_draw_overlay_view->segment_count = 0;
@@ -2846,8 +3173,98 @@ void slackless_draw_overlay_hide(void) {
                 g_draw_overlay_view->cursor_count = 0;
             }
             if (g_draw_overlay_win) {
+                g_draw_overlay_win.ignoresMouseEvents = YES;
                 [g_draw_overlay_win orderOut:nil];
             }
         }
     });
+}
+
+static void clamp_floating_panel_to_visible_frame(NSWindow *win, CGFloat bottomMargin) {
+    if (!win) return;
+    NSScreen *scr = win.screen ?: [NSScreen mainScreen];
+    if (!scr) return;
+    // `visibleFrame` excludes the macOS Dock (bottom/left/right) and the top menu bar, so
+    // `vf.origin.y` is the exact top edge of a bottom-anchored Dock in AppKit coordinates.
+    NSRect vf = scr.visibleFrame;
+    NSRect f = win.frame;
+    CGFloat minY = vf.origin.y + bottomMargin;
+    CGFloat maxY = NSMaxY(vf) - f.size.height;
+    CGFloat minX = vf.origin.x;
+    CGFloat maxX = NSMaxX(vf) - f.size.width;
+    if (maxY < minY) maxY = minY;
+    if (maxX < minX) maxX = minX;
+
+    CGFloat nx = f.origin.x;
+    CGFloat ny = f.origin.y;
+    if (ny < minY) ny = minY;
+    if (ny > maxY) ny = maxY;
+    if (nx < minX) nx = minX;
+    if (nx > maxX) nx = maxX;
+
+    if (fabs(nx - f.origin.x) > 0.5 || fabs(ny - f.origin.y) > 0.5) {
+        [win setFrameOrigin:NSMakePoint(nx, ny)];
+    }
+}
+
+void slackless_configure_floating_panel(void *ns_view_ptr) {
+    if (!ns_view_ptr) return;
+    NSView *view = (__bridge NSView *)ns_view_ptr;
+    void (^apply)(void) = ^{
+        @autoreleasepool {
+            NSWindow *win = view.window;
+            if (!win) return;
+            // One level above `NSFloatingWindowLevel` so the movable control panel ALWAYS sits
+            // above the transparent desktop drawing overlay even while pen mode is active!
+            win.level = NSFloatingWindowLevel + 1;
+            win.hidesOnDeactivate = NO;
+            win.sharingType = NSWindowSharingNone;
+            win.movableByWindowBackground = YES;
+            win.opaque = NO;
+            win.backgroundColor = [NSColor clearColor];
+            win.hasShadow = YES;
+            win.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                                     NSWindowCollectionBehaviorFullScreenAuxiliary;
+
+            // Clamp initial placement comfortably above the macOS Dock (`visibleFrame.origin.y`).
+            clamp_floating_panel_to_visible_frame(win, 12.0);
+
+            // Prevent dragging or resizing the floating panel below the top edge of the Dock.
+            NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+            __weak NSWindow *weakWin = win;
+            id moveObs = [nc addObserverForName:NSWindowDidMoveNotification
+                                         object:win
+                                          queue:[NSOperationQueue mainQueue]
+                                     usingBlock:^(NSNotification *note) {
+                                         (void)note;
+                                         clamp_floating_panel_to_visible_frame(weakWin, 0.0);
+                                     }];
+            id resizeObs = [nc addObserverForName:NSWindowDidResizeNotification
+                                           object:win
+                                            queue:[NSOperationQueue mainQueue]
+                                       usingBlock:^(NSNotification *note) {
+                                           (void)note;
+                                           clamp_floating_panel_to_visible_frame(weakWin, 0.0);
+                                       }];
+            __block id closeObs = nil;
+            closeObs = [nc addObserverForName:NSWindowWillCloseNotification
+                                       object:win
+                                        queue:[NSOperationQueue mainQueue]
+                                   usingBlock:^(NSNotification *note) {
+                                       (void)note;
+                                       NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+                                       [center removeObserver:moveObs];
+                                       [center removeObserver:resizeObs];
+                                       if (closeObs) {
+                                           [center removeObserver:closeObs];
+                                           closeObs = nil;
+                                       }
+                                   }];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        apply();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), apply);
+    }
 }

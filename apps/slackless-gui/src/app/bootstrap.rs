@@ -1364,6 +1364,7 @@ impl App {
                 huddle_open: false,
                 huddle_session: None,
                 huddle_dock: None,
+                huddle_floating_panel: None,
                 _huddle_dock_sub: None,
                 huddle_invite: None,
                 _huddle_invite_sub: None,
