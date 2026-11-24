@@ -322,7 +322,7 @@ pub struct WorkspaceBadge {
 /// signed-in user did not author that are newer than the newest message in the open
 /// conversation (the fixture-mode "read" watermark). `mentions` is the subset of `count`
 /// that @-mentions the signed-in user.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Unread {
     pub(super) count: u32,
     pub(super) mentions: u32,
@@ -1490,23 +1490,30 @@ impl Sidebar {
 
     pub(super) fn unread_in(&self, conversation: &Conversation, watermark: Option<&Ts>) -> Unread {
         // Live: Slack's own unread state. A DM's unread messages all count as mentions.
-        if let Some(counts) = self.fixtures.counts.get(&conversation.id) {
+        let unread = if let Some(counts) = self.fixtures.counts.get(&conversation.id) {
             if conversation.id == self.selected || self.read.contains(&conversation.id) {
                 return Unread::default();
             }
-            return Unread {
+            Unread {
                 count: u32::from(counts.is_unread()),
                 mentions: counts.effective_mentions(),
-            };
+            }
+        } else {
+            let messages = self.unread_messages(conversation, watermark);
+            Unread {
+                count: messages.len() as u32,
+                mentions: messages
+                    .iter()
+                    .filter(|message| mentions_user(message, &self.fixtures.self_user))
+                    .count() as u32,
+            }
+        };
+        // Muted conversations never surface as unread unless they mention you (matches Slack and
+        // `unreads::local_groups`).
+        if self.notify_level(&conversation.id) == Some(NotifyLevel::Muted) && unread.mentions == 0 {
+            return Unread::default();
         }
-        let messages = self.unread_messages(conversation, watermark);
-        Unread {
-            count: messages.len() as u32,
-            mentions: messages
-                .iter()
-                .filter(|message| mentions_user(message, &self.fixtures.self_user))
-                .count() as u32,
-        }
+        unread
     }
 
     pub(super) fn total_unread(
@@ -2403,6 +2410,62 @@ mod tests {
             assert_ne!(next_head.as_ref(), Some(&first));
             let prev_head = s.step_section(&dm, false);
             assert!(prev_head.is_some());
+        });
+
+        // Muted channels with 0 mentions must never bold Unreads, light dots, or enter unread_ids;
+        // muted channels with mentions still surface.
+        let mut muted_fixtures = crate::fixtures::load();
+        muted_fixtures.messages.clear();
+        muted_fixtures.counts.clear();
+        let muted_ch = muted_fixtures.channels[1].id.clone();
+        let muted_mention_ch = muted_fixtures.channels[2].id.clone();
+        muted_fixtures
+            .notify_levels
+            .insert(muted_ch.clone(), NotifyLevel::Muted);
+        muted_fixtures
+            .notify_levels
+            .insert(muted_mention_ch.clone(), NotifyLevel::Muted);
+        muted_fixtures.counts.insert(
+            muted_ch.clone(),
+            slackless_core::api::ConversationCounts {
+                id: muted_ch.clone(),
+                has_unreads: true,
+                mention_count: 0,
+                ..Default::default()
+            },
+        );
+        let muted_fixtures = Arc::new(muted_fixtures);
+        sidebar.update(cx, |s, cx| s.set_fixtures(muted_fixtures.clone(), cx));
+        sidebar.update(cx, |s, cx| s.set_activity_unread(0, cx));
+        sidebar.read_with(cx, |s, _| {
+            let conv = muted_fixtures.conversation(&muted_ch).unwrap();
+            assert_eq!(s.unread_in(conv, None), Unread::default());
+            assert!(s.unread_ids().is_empty());
+            assert!(!s.has_any_unreads());
+        });
+        let mut next_counts = muted_fixtures.counts.clone();
+        next_counts.insert(
+            muted_mention_ch.clone(),
+            slackless_core::api::ConversationCounts {
+                id: muted_mention_ch.clone(),
+                has_unreads: true,
+                mention_count: 1,
+                ..Default::default()
+            },
+        );
+        let with_mention = Arc::new(muted_fixtures.with_counts(next_counts));
+        sidebar.update(cx, |s, cx| s.set_fixtures(with_mention.clone(), cx));
+        sidebar.read_with(cx, |s, _| {
+            let conv = with_mention.conversation(&muted_mention_ch).unwrap();
+            assert_eq!(
+                s.unread_in(conv, None),
+                Unread {
+                    count: 1,
+                    mentions: 1
+                }
+            );
+            assert_eq!(s.unread_ids(), vec![muted_mention_ch.clone()]);
+            assert!(s.has_any_unreads());
         });
     }
 }

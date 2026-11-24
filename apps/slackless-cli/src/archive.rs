@@ -190,6 +190,23 @@ impl Archive {
             .map_or(0, |n| u64::try_from(n.max(0)).unwrap_or(0))
     }
 
+    /// Per-channel notification overrides (e.g. muted channels) parsed from cached Slack `prefs`.
+    pub fn notify_levels(
+        &self,
+        workspace: &TeamId,
+    ) -> std::collections::HashMap<ChannelId, slackless_core::NotifyLevel> {
+        let Ok(json) = self.conn.query_row(
+            "SELECT json FROM prefs WHERE workspace_id = ?1",
+            params![workspace.as_str()],
+            |row| row.get::<_, String>(0),
+        ) else {
+            return std::collections::HashMap::new();
+        };
+        serde_json::from_str::<serde_json::Value>(&json)
+            .map(|prefs| slackless_core::notify_levels(&prefs))
+            .unwrap_or_default()
+    }
+
     /// Every stored conversation of the given kinds. An unreadable archive or row is skipped:
     /// the tables exist from the first migration, so absence means "not synced yet".
     fn conversations(&self, workspace: &TeamId, kinds: &[&str]) -> Vec<ConversationRow> {

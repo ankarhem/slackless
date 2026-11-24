@@ -1247,6 +1247,10 @@ pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
     let archive = Archive::open(&workspace);
+    let notify_levels = archive
+        .as_ref()
+        .map(|a| a.notify_levels(&workspace))
+        .unwrap_or_default();
     let label_for = |id: &ChannelId| -> String {
         archive
             .as_ref()
@@ -1267,6 +1271,11 @@ pub async fn run_unread(ctx: &Ctx, flag: Option<&str>) -> Result<ExitCode> {
     for (kind, list) in groups {
         for c in list.iter().filter(|c| c.is_unread()) {
             let mentions = c.effective_mentions();
+            if notify_levels.get(&c.id) == Some(&slackless_core::NotifyLevel::Muted)
+                && mentions == 0
+            {
+                continue;
+            }
             total_mentions = total_mentions.saturating_add(mentions);
             let label = label_for(&c.id);
             lines.push_str(&format!(
