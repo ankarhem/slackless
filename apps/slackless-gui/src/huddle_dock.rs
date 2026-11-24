@@ -12,7 +12,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, EventEmitter, FontWeight, Hsla, InteractiveElement as _,
     IntoElement, ObjectFit, ParentElement as _, Render, RenderImage,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px, rgb,
     rgba,
@@ -603,11 +603,13 @@ impl HuddleDock {
         browser_url: String,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let (card_bg, border, muted_fg, fg) = (
-            rgb(0x222529),
-            rgba(0xFFFFFF22),
-            rgb(0xABABAD),
-            rgb(0xFFFFFF),
+        let theme = cx.theme();
+        let (card_bg, border, muted_fg, fg, hover_bg) = (
+            theme.popover,
+            theme.border,
+            theme.muted_foreground,
+            theme.popover_foreground,
+            theme.accent,
         );
         let copy_ch = channel.clone();
         let canvas_id = self.session.canvas_file_id.clone();
@@ -642,7 +644,7 @@ impl HuddleDock {
                     .rounded_md()
                     .cursor_pointer()
                     .truncate()
-                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .hover(move |el| el.bg(hover_bg))
                     .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
                     .child(if selected {
                         format!("✓ {}", dev.name)
@@ -673,7 +675,7 @@ impl HuddleDock {
                     .rounded_md()
                     .cursor_pointer()
                     .truncate()
-                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .hover(move |el| el.bg(hover_bg))
                     .when(selected, |el| el.font_weight(FontWeight::SEMIBOLD))
                     .child(if selected {
                         format!("✓ {}", dev.name)
@@ -696,7 +698,7 @@ impl HuddleDock {
                     .items_center()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .hover(move |el| el.bg(hover_bg))
                     .child(
                         Icon::new(IconName::MessageSquare)
                             .size(px(12.))
@@ -718,7 +720,7 @@ impl HuddleDock {
                     .items_center()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .hover(move |el| el.bg(hover_bg))
                     .child(Icon::new(IconName::Link).size(px(12.)).text_color(muted_fg))
                     .child("Copy huddle link")
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -737,7 +739,7 @@ impl HuddleDock {
                         .items_center()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                        .hover(move |el| el.bg(hover_bg))
                         .child(
                             Icon::new(IconName::FileText)
                                 .size(px(12.))
@@ -760,7 +762,7 @@ impl HuddleDock {
                     .items_center()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .hover(move |el| el.bg(hover_bg))
                     .child(
                         Icon::new(IconName::Settings)
                             .size(px(12.))
@@ -782,7 +784,7 @@ impl HuddleDock {
                     .items_center()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|el| el.bg(rgba(0xFFFFFF14)))
+                    .hover(move |el| el.bg(hover_bg))
                     .child(
                         Icon::new(IconName::ExternalLink)
                             .size(px(12.))
@@ -797,13 +799,18 @@ impl HuddleDock {
             )
     }
 
-    fn render_action_bar(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
-        let dark_btn = rgb(0x2E3136);
-        let dark_hover = rgb(0x3B3F46);
-        let white = rgb(0xFFFFFF);
-        let obsidian = rgb(0x1A1D21);
-        let crimson = rgb(0xE01E5A);
-        let emerald = rgb(0x007A5A);
+    fn render_action_bar(&self, pal: &DockPalette, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
+        let btn_bg = pal.btn_bg;
+        let btn_hover = pal.btn_hover;
+        let btn_fg = pal.card_fg;
+        let active_bg = pal.active_btn_bg;
+        let active_fg = pal.active_btn_fg;
+        let danger = pal.danger;
+        let danger_hover = pal.danger_hover;
+        let danger_fg = pal.danger_fg;
+        let primary = pal.primary;
+        let primary_hover = pal.primary_hover;
+        let primary_fg = pal.primary_fg;
 
         let mic_btn = div()
             .id("huddle-dock-mic")
@@ -815,15 +822,15 @@ impl HuddleDock {
             .items_center()
             .justify_center()
             .bg(if self.session.muted {
-                crimson
+                danger
             } else {
-                dark_btn
+                active_bg
             })
-            .hover(|el| {
+            .hover(move |el| {
                 el.bg(if self.session.muted {
-                    rgb(0xC91A50)
+                    danger_hover
                 } else {
-                    dark_hover
+                    btn_hover
                 })
             })
             .child(
@@ -833,7 +840,11 @@ impl HuddleDock {
                     IconName::Mic
                 })
                 .size(px(14.))
-                .text_color(white),
+                .text_color(if self.session.muted {
+                    danger_fg
+                } else {
+                    active_fg
+                }),
             )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleMute)));
 
@@ -846,14 +857,12 @@ impl HuddleDock {
             .flex()
             .items_center()
             .justify_center()
-            .bg(if self.session.video { white } else { dark_btn })
-            .hover(|el| {
-                el.bg(if self.session.video {
-                    rgb(0xE8E8E8)
-                } else {
-                    dark_hover
-                })
+            .bg(if self.session.video {
+                active_bg
+            } else {
+                btn_bg
             })
+            .hover(move |el| el.bg(btn_hover))
             .child(
                 Icon::new(if self.session.video {
                     IconName::Video
@@ -861,7 +870,11 @@ impl HuddleDock {
                     IconName::VideoOff
                 })
                 .size(px(14.))
-                .text_color(if self.session.video { obsidian } else { white }),
+                .text_color(if self.session.video {
+                    active_fg
+                } else {
+                    btn_fg
+                }),
             )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleCamera)));
 
@@ -875,22 +888,24 @@ impl HuddleDock {
             .items_center()
             .justify_center()
             .bg(if self.session.sharing {
-                emerald
+                primary
             } else {
-                dark_btn
+                btn_bg
             })
-            .hover(|el| {
+            .hover(move |el| {
                 el.bg(if self.session.sharing {
-                    rgb(0x2BAC76)
+                    primary_hover
                 } else {
-                    dark_hover
+                    btn_hover
                 })
             })
-            .child(
-                Icon::new(IconName::ScreenShare)
-                    .size(px(14.))
-                    .text_color(white),
-            )
+            .child(Icon::new(IconName::ScreenShare).size(px(14.)).text_color(
+                if self.session.sharing {
+                    primary_fg
+                } else {
+                    btn_fg
+                },
+            ))
             .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::ToggleScreenShare)));
 
         let more_btn = div()
@@ -902,12 +917,12 @@ impl HuddleDock {
             .flex()
             .items_center()
             .justify_center()
-            .bg(if self.menu_open { dark_hover } else { dark_btn })
-            .hover(|el| el.bg(dark_hover))
+            .bg(if self.menu_open { btn_hover } else { btn_bg })
+            .hover(move |el| el.bg(btn_hover))
             .child(
                 Icon::new(IconName::Ellipsis)
                     .size(px(14.))
-                    .text_color(white),
+                    .text_color(btn_fg),
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 this.menu_open = !this.menu_open;
@@ -936,12 +951,12 @@ impl HuddleDock {
             .flex()
             .items_center()
             .justify_center()
-            .bg(crimson)
-            .hover(|el| el.bg(rgb(0xC91A50)))
+            .bg(danger)
+            .hover(move |el| el.bg(danger_hover))
             .child(
                 Icon::new(IconName::PhoneOff)
                     .size(px(14.))
-                    .text_color(white),
+                    .text_color(danger_fg),
             )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(HuddleDockEvent::Leave)));
 
@@ -959,14 +974,11 @@ impl HuddleDock {
         &self,
         channel: &ChannelId,
         channel_label: String,
-        status_color: gpui_kit::gpui::Rgba,
+        status_color: Hsla,
         status_text: String,
-        stage_bg: gpui_kit::gpui::Rgba,
+        pal: &DockPalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let white = rgb(0xFFFFFF);
-        let emerald = rgb(0x2BAC76);
-        let crimson = rgb(0xE01E5A);
         let people = self.all_people();
         let visible_people: Vec<UserId> = people.iter().take(3).cloned().collect();
         let overflow_count = people.len().saturating_sub(visible_people.len());
@@ -989,16 +1001,36 @@ impl HuddleDock {
             })
             .or_else(|| self.video_frames.get(&VideoTileKey::LocalCamera).cloned());
 
+        let has_video = preview_frame.is_some();
+        let chip_bg = if has_video {
+            Hsla::from(rgba(0x0E1014CC))
+        } else {
+            pal.chip_bg
+        };
+        let chip_fg = if has_video {
+            Hsla::from(rgb(0xFFFFFF))
+        } else {
+            pal.chip_fg
+        };
+        let chip_hover = if has_video {
+            Hsla::from(rgba(0xFFFFFF2E))
+        } else {
+            pal.btn_hover
+        };
+        let stage_bg = pal.stage_bg;
+        let emerald = pal.success;
+        let crimson = pal.danger;
         let jump_ch = channel.clone();
+
         div()
             .relative()
             .w_full()
-            .h(px(104.))
+            .h(px(if has_video { 108. } else { 88. }))
             .rounded_lg()
             .overflow_hidden()
             .bg(stage_bg)
             .border_1()
-            .border_color(rgba(0xFFFFFF14))
+            .border_color(pal.border)
             .child(if let Some(frame) = preview_frame {
                 img(frame)
                     .w_full()
@@ -1020,8 +1052,8 @@ impl HuddleDock {
                             .p(px(2.))
                             .rounded_xl()
                             .border_2()
-                            .border_color(if speaking { emerald } else { rgba(0xFFFFFF18) })
-                            .child(user_chip(&self.fixtures, &uid, 38.))
+                            .border_color(if speaking { emerald } else { pal.avatar_ring })
+                            .child(user_chip(&self.fixtures, &uid, 36.))
                             .when(user_muted, |el| {
                                 el.child(
                                     div()
@@ -1030,9 +1062,9 @@ impl HuddleDock {
                                         .bottom(px(-3.))
                                         .size(px(15.))
                                         .rounded_full()
-                                        .bg(rgb(0x1A1D21))
+                                        .bg(pal.card_bg)
                                         .border_1()
-                                        .border_color(rgba(0xFFFFFF22))
+                                        .border_color(pal.border)
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -1050,29 +1082,29 @@ impl HuddleDock {
                                 .px_1p5()
                                 .py_1()
                                 .rounded_lg()
-                                .bg(rgba(0xFFFFFF18))
+                                .bg(pal.btn_bg)
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(white)
+                                .text_color(pal.card_fg)
                                 .child(format!("+{overflow_count}")),
                         )
                     })
                     .into_any_element()
             })
-            // Top-left frosted channel + live status chip
+            // Top-left channel + live status chip
             .child(
                 h_flex()
                     .id("huddle-dock-jump")
                     .absolute()
                     .left(px(6.))
                     .top(px(6.))
-                    .max_w(px(156.))
+                    .max_w(px(164.))
                     .px_1p5()
                     .py_0p5()
                     .gap_1()
                     .items_center()
                     .rounded_md()
-                    .bg(rgba(0x0E1014CC))
+                    .bg(chip_bg)
                     .cursor_pointer()
                     .child(
                         Icon::new(IconName::Headphones)
@@ -1086,7 +1118,7 @@ impl HuddleDock {
                             .truncate()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(white)
+                            .text_color(chip_fg)
                             .child(channel_label),
                     )
                     .child(
@@ -1100,7 +1132,7 @@ impl HuddleDock {
                         cx.emit(HuddleDockEvent::JumpToChannel(jump_ch.clone()));
                     })),
             )
-            // Top-right frosted pop-out expand icon button
+            // Top-right pop-out expand icon button
             .child(
                 div()
                     .id("huddle-dock-popout")
@@ -1109,8 +1141,8 @@ impl HuddleDock {
                     .top(px(6.))
                     .size(px(22.))
                     .rounded_md()
-                    .bg(rgba(0x0E1014CC))
-                    .hover(|el| el.bg(rgba(0xFFFFFF2E)))
+                    .bg(chip_bg)
+                    .hover(move |el| el.bg(chip_hover))
                     .cursor_pointer()
                     .flex()
                     .items_center()
@@ -1118,7 +1150,7 @@ impl HuddleDock {
                     .child(
                         Icon::new(IconName::Maximize2)
                             .size(px(11.))
-                            .text_color(white),
+                            .text_color(chip_fg),
                     )
                     .on_click(cx.listener(|_, _, _, cx| {
                         cx.emit(HuddleDockEvent::PopOut);
@@ -1133,7 +1165,7 @@ impl HuddleDock {
                         .right_0()
                         .bottom_0()
                         .h(px(2.5))
-                        .bg(rgba(0xFFFFFF10))
+                        .bg(pal.border)
                         .child(
                             div()
                                 .h_full()
@@ -1145,14 +1177,134 @@ impl HuddleDock {
     }
 }
 
-fn dock_theme_colors(bg_id: Option<&str>) -> (gpui_kit::gpui::Rgba, gpui_kit::gpui::Rgba) {
-    match bg_id {
-        Some("midnight") => (rgb(0x10172A), rgb(0x1B2440)),
-        Some("sunset") => (rgb(0x2B1818), rgb(0x3B2222)),
-        Some("forest") => (rgb(0x11221B), rgb(0x1B3328)),
-        Some("ocean") => (rgb(0x0F212E), rgb(0x183244)),
-        Some("plum") => (rgb(0x24142B), rgb(0x351F3E)),
-        _ => (rgb(0x1A1D21), rgb(0x23262B)),
+struct DockPalette {
+    card_bg: Hsla,
+    stage_bg: Hsla,
+    card_fg: Hsla,
+    muted_fg: Hsla,
+    border: Hsla,
+    btn_bg: Hsla,
+    btn_hover: Hsla,
+    active_btn_bg: Hsla,
+    active_btn_fg: Hsla,
+    chip_bg: Hsla,
+    chip_fg: Hsla,
+    avatar_ring: Hsla,
+    primary: Hsla,
+    primary_hover: Hsla,
+    primary_fg: Hsla,
+    danger: Hsla,
+    danger_hover: Hsla,
+    danger_fg: Hsla,
+    success: Hsla,
+    warning: Hsla,
+}
+
+fn dock_palette(bg_id: Option<&str>, cx: &App) -> DockPalette {
+    let theme = cx.theme();
+    let sidebar_dark = crate::theme::sidebar_is_dark(cx);
+    let (card_bg, card_fg, muted_fg, border, btn_bg, btn_hover, active_btn_bg, active_btn_fg) =
+        if sidebar_dark {
+            let fg = theme.sidebar_foreground;
+            (
+                theme.sidebar.blend(fg.opacity(0.08)),
+                fg,
+                fg.opacity(0.68),
+                fg.opacity(0.14),
+                fg.opacity(0.12),
+                fg.opacity(0.22),
+                fg.opacity(0.92),
+                theme.sidebar,
+            )
+        } else {
+            (
+                theme.background,
+                theme.foreground,
+                theme.muted_foreground,
+                theme.border,
+                theme.secondary,
+                theme.secondary_hover,
+                theme.foreground,
+                theme.background,
+            )
+        };
+    let (stage_bg, chip_bg, chip_fg, avatar_ring) = match bg_id {
+        Some("meadow") => (
+            Hsla::from(rgb(0xC8E8D5)),
+            Hsla::from(rgba(0xFFFFFFD8)),
+            Hsla::from(rgb(0x1D1C1D)),
+            Hsla::from(rgba(0xFFFFFFCC)),
+        ),
+        Some("sky") => (
+            Hsla::from(rgb(0xD3ECFA)),
+            Hsla::from(rgba(0xFFFFFFD8)),
+            Hsla::from(rgb(0x1D1C1D)),
+            Hsla::from(rgba(0xFFFFFFCC)),
+        ),
+        Some("midnight") => (
+            Hsla::from(rgb(0x1B2440)),
+            Hsla::from(rgba(0x0E1014CC)),
+            Hsla::from(rgb(0xFFFFFF)),
+            Hsla::from(rgba(0xFFFFFF22)),
+        ),
+        Some("sunset") => (
+            Hsla::from(rgb(0x3B2222)),
+            Hsla::from(rgba(0x0E1014CC)),
+            Hsla::from(rgb(0xFFFFFF)),
+            Hsla::from(rgba(0xFFFFFF22)),
+        ),
+        Some("forest") => (
+            Hsla::from(rgb(0x1B3328)),
+            Hsla::from(rgba(0x0E1014CC)),
+            Hsla::from(rgb(0xFFFFFF)),
+            Hsla::from(rgba(0xFFFFFF22)),
+        ),
+        Some("ocean") => (
+            Hsla::from(rgb(0x183244)),
+            Hsla::from(rgba(0x0E1014CC)),
+            Hsla::from(rgb(0xFFFFFF)),
+            Hsla::from(rgba(0xFFFFFF22)),
+        ),
+        Some("plum") => (
+            Hsla::from(rgb(0x351F3E)),
+            Hsla::from(rgba(0x0E1014CC)),
+            Hsla::from(rgb(0xFFFFFF)),
+            Hsla::from(rgba(0xFFFFFF22)),
+        ),
+        _ if sidebar_dark => (
+            theme.sidebar.blend(theme.sidebar_foreground.opacity(0.04)),
+            theme.sidebar.opacity(0.84),
+            theme.sidebar_foreground,
+            theme.sidebar_foreground.opacity(0.18),
+        ),
+        _ => (
+            Hsla::from(rgb(0xD7EEDF)),
+            theme.background.opacity(0.88),
+            theme.foreground,
+            Hsla::from(rgb(0xFFFFFF)),
+        ),
+    };
+    DockPalette {
+        card_bg,
+        stage_bg,
+        card_fg,
+        muted_fg,
+        border,
+        btn_bg,
+        btn_hover,
+        active_btn_bg,
+        active_btn_fg,
+        chip_bg,
+        chip_fg,
+        avatar_ring,
+        primary: theme.primary,
+        primary_hover: theme.primary_hover,
+        primary_fg: theme.primary_foreground,
+        danger: theme.danger,
+        danger_hover: theme.danger_hover,
+        danger_fg: theme.danger_foreground,
+        success: theme.success,
+        warning: theme.warning,
     }
 }
 
@@ -1160,35 +1312,24 @@ impl Render for HuddleDock {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let sidebar_bg = theme.sidebar;
-        let sidebar_border = theme.border;
-        let emerald = rgb(0x2BAC76);
-        let amber = rgb(0xECB22E);
-        let crimson = rgb(0xE01E5A);
-        let muted_fg = rgb(0xABABAD);
-        let white = rgb(0xFFFFFF);
+        let sidebar_border = theme.sidebar_border;
+        let pal = dock_palette(self.session.background_id.as_deref(), cx);
 
-        let (card_bg, stage_bg) = dock_theme_colors(self.session.background_id.as_deref());
         let (status_color, status_text) = match self.session.phase {
-            HuddlePhase::Joining | HuddlePhase::Connecting => (amber, "…".to_owned()),
-            HuddlePhase::Connected => (emerald, format_elapsed(self.elapsed_secs)),
-            HuddlePhase::Reconnecting => (amber, "…".to_owned()),
-            HuddlePhase::Leaving => (muted_fg, "Leaving".to_owned()),
-            HuddlePhase::Failed => (crimson, "Failed".to_owned()),
-            HuddlePhase::Idle => (muted_fg, "Ended".to_owned()),
+            HuddlePhase::Joining | HuddlePhase::Connecting => (pal.warning, "…".to_owned()),
+            HuddlePhase::Connected => (pal.success, format_elapsed(self.elapsed_secs)),
+            HuddlePhase::Reconnecting => (pal.warning, "…".to_owned()),
+            HuddlePhase::Leaving => (pal.muted_fg, "Leaving".to_owned()),
+            HuddlePhase::Failed => (pal.danger, "Failed".to_owned()),
+            HuddlePhase::Idle => (pal.muted_fg, "Ended".to_owned()),
         };
 
         let channel = self.session.channel.clone();
         let channel_label = self.channel_label();
         let browser_url = self.browser_url();
-        let mini_stage = self.render_mini_stage(
-            &channel,
-            channel_label,
-            status_color,
-            status_text,
-            stage_bg,
-            cx,
-        );
-        let action_bar = self.render_action_bar(cx);
+        let mini_stage =
+            self.render_mini_stage(&channel, channel_label, status_color, status_text, &pal, cx);
+        let action_bar = self.render_action_bar(&pal, cx);
 
         let mut outer = v_flex()
             .id("huddle-sidebar-dock")
@@ -1210,15 +1351,15 @@ impl Render for HuddleDock {
                 .p_2()
                 .gap_2()
                 .rounded_xl()
-                .bg(card_bg)
+                .bg(pal.card_bg)
                 .border_1()
                 .border_color(if self.session.phase == HuddlePhase::Connected {
-                    emerald.opacity(0.45)
+                    pal.success.opacity(0.45)
                 } else {
-                    rgba(0xFFFFFF1C)
+                    pal.border
                 })
-                .shadow_md()
-                .text_color(white)
+                .shadow_sm()
+                .text_color(pal.card_fg)
                 .child(mini_stage)
                 .when_some(self.session.topic.clone(), |box_el, topic| {
                     box_el.child(
@@ -1226,7 +1367,7 @@ impl Render for HuddleDock {
                             .px_1()
                             .text_xs()
                             .truncate()
-                            .text_color(muted_fg)
+                            .text_color(pal.muted_fg)
                             .child(topic),
                     )
                 })
@@ -1238,9 +1379,9 @@ impl Render for HuddleDock {
                             .p_2()
                             .gap_1p5()
                             .rounded_lg()
-                            .bg(crimson.opacity(0.16))
+                            .bg(pal.danger.opacity(0.14))
                             .border_1()
-                            .border_color(crimson.opacity(0.45))
+                            .border_color(pal.danger.opacity(0.45))
                             .child(
                                 h_flex()
                                     .gap_1()
@@ -1248,10 +1389,14 @@ impl Render for HuddleDock {
                                     .child(
                                         Icon::new(IconName::TriangleAlert)
                                             .size(px(12.))
-                                            .text_color(crimson),
+                                            .text_color(pal.danger),
                                     )
                                     .child(
-                                        div().flex_1().text_xs().text_color(white).child(err_msg),
+                                        div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(pal.card_fg)
+                                            .child(err_msg),
                                     ),
                             )
                             .child(

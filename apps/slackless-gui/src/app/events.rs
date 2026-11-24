@@ -661,12 +661,11 @@ impl App {
                             .active_huddles
                             .insert(channel.clone(), participants.clone());
                     }
-                    let keys: HashSet<ChannelId> =
-                        parked.state.active_huddles.keys().cloned().collect();
+                    let huddles = parked.state.active_huddles.clone();
                     parked
                         .views
                         .sidebar
-                        .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
+                        .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
                 }
             }
             _ => {}
@@ -1085,9 +1084,9 @@ impl App {
                         .active_huddles
                         .insert(channel.clone(), participants.clone());
                 }
-                let keys: HashSet<ChannelId> = self.ws.active_huddles.keys().cloned().collect();
+                let huddles = self.ws.active_huddles.clone();
                 self.sidebar
-                    .update(cx, |sidebar, cx| sidebar.set_huddles(keys, cx));
+                    .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
                 if let Some(dock) = &self.huddle_dock {
                     if dock.read(cx).session().channel == *channel {
                         let alone_music =

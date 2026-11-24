@@ -195,13 +195,32 @@ impl Sidebar {
                 .gap_4()
                 .child(create_btn)
                 .child(self.focus_button(cx))
-                .child(
+                .child(if self.self_in_huddle {
+                    v_flex()
+                        .id("rail-avatar")
+                        .w(px(36.))
+                        .pt(px(5.))
+                        .gap(px(4.))
+                        .items_center()
+                        .rounded_lg()
+                        .bg(create_bg)
+                        .cursor_pointer()
+                        .child(
+                            Icon::new(IconName::Headphones)
+                                .text_color(create_fg)
+                                .size(px(16.)),
+                        )
+                        .child(avatar)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUserMenu)))
+                        .into_any_element()
+                } else {
                     div()
                         .id("rail-avatar")
                         .cursor_pointer()
                         .child(avatar)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUserMenu))),
-                ),
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUserMenu)))
+                        .into_any_element()
+                }),
         )
     }
 

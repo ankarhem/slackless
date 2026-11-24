@@ -7,7 +7,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
-    div, px, rgb, rgba,
+    div, px,
 };
 use slackless_core::types::{ChannelId, UserId};
 
@@ -46,12 +46,15 @@ impl HuddleInviteBanner {
 
 impl Render for HuddleInviteBanner {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = cx.theme();
-        let card_bg = rgb(0x1E2228);
-        let fg = rgb(0xFFFFFF);
-        let muted = rgb(0xABABAD);
-        let emerald = rgb(0x2BAC76);
-        let join_green = rgb(0x007A5A);
+        let theme = cx.theme();
+        let card_bg = theme.popover;
+        let fg = theme.popover_foreground;
+        let muted = theme.muted_foreground;
+        let emerald = theme.success;
+        let join_green = theme.primary;
+        let join_fg = theme.primary_foreground;
+        let decline_bg = theme.secondary;
+        let decline_hover = theme.secondary_hover;
 
         let inviter_name = self.fixtures.user_name(&self.invite.inviter).to_owned();
         let channel = self.invite.channel.clone();
@@ -114,8 +117,8 @@ impl Render for HuddleInviteBanner {
                             .id("huddle-invite-decline")
                             .size(px(32.))
                             .rounded_full()
-                            .bg(rgba(0xFFFFFF16))
-                            .hover(|el| el.bg(rgba(0xFFFFFF26)))
+                            .bg(decline_bg)
+                            .hover(|el| el.bg(decline_hover))
                             .cursor_pointer()
                             .flex()
                             .items_center()
@@ -139,8 +142,12 @@ impl Render for HuddleInviteBanner {
                             .cursor_pointer()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child(Icon::new(IconName::Headphones).size(px(13.)).text_color(fg))
+                            .text_color(join_fg)
+                            .child(
+                                Icon::new(IconName::Headphones)
+                                    .size(px(13.))
+                                    .text_color(join_fg),
+                            )
                             .child("Join")
                             .on_click(cx.listener(move |_, _, _, cx| {
                                 cx.emit(HuddleInviteEvent::Accept(channel.clone()));

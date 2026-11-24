@@ -936,12 +936,67 @@ impl Sidebar {
         } else {
             row.child(name.flex_1())
         };
-        if self.huddles.contains(&conversation.id) {
-            let live = if selected { color } else { theme.success };
+        if let Some(participants) = self.huddles.get(&conversation.id) {
+            let count = participants.len();
+            let ring_bg = if selected {
+                theme.sidebar_accent
+            } else {
+                theme.sidebar
+            };
+            let (pill_bg, pill_fg) = if selected {
+                (theme.sidebar_accent_foreground, theme.sidebar_accent)
+            } else {
+                (theme.sidebar_accent, theme.sidebar_accent_foreground)
+            };
+            let tip_text: SharedString = if participants.is_empty() {
+                "Huddle in progress".into()
+            } else {
+                let names: Vec<_> = participants
+                    .iter()
+                    .take(4)
+                    .map(|u| self.fixtures.user_name(u))
+                    .collect();
+                let word = if count == 1 { "person" } else { "people" };
+                format!("{count} {word} in the huddle — {}", names.join(", ")).into()
+            };
+            let pill_id = SharedString::from(format!("sidebar-huddle-pill-{id}"));
             row = row.child(
-                Icon::new(IconName::Headphones)
-                    .text_color(live)
-                    .size(px(14.)),
+                h_flex()
+                    .id(pill_id)
+                    .flex_none()
+                    .items_center()
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tip_text.clone())
+                            .build(window, cx)
+                    })
+                    .children(participants.iter().take(2).enumerate().map(|(ix, uid)| {
+                        div()
+                            .when(ix > 0, |el| el.ml(px(-3.)))
+                            .rounded(px(4.))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(ring_bg)
+                            .child(crate::avatars::user_chip(&self.fixtures, uid, 18.))
+                    }))
+                    .child(
+                        h_flex()
+                            .when(!participants.is_empty(), |el| el.ml(px(-2.)))
+                            .h(px(18.))
+                            .px_1p5()
+                            .gap_1()
+                            .items_center()
+                            .rounded(px(4.))
+                            .bg(pill_bg)
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(pill_fg)
+                            .child(
+                                Icon::new(IconName::Headphones)
+                                    .text_color(pill_fg)
+                                    .size(px(11.)),
+                            )
+                            .when(count > 0, |el| el.child(count.to_string())),
+                    ),
             );
         }
         if focus && unread.count > 0 {

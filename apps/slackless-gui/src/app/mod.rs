@@ -1837,10 +1837,21 @@ impl App {
                 cx.subscribe_in(
                     &huddles,
                     window,
-                    |this: &mut App, _, event: &HuddlesEvent, _, cx| match event {
+                    |this: &mut App, _, event: &HuddlesEvent, window, cx| match event {
                         HuddlesEvent::Open(channel) => {
                             this.select(channel.clone(), cx);
                             this.huddle_open = this.huddle_here();
+                            cx.notify();
+                        }
+                        HuddlesEvent::Join(channel) => {
+                            this.huddles_open = false;
+                            this.select(channel.clone(), cx);
+                            this.start_huddle(window, cx);
+                            cx.notify();
+                        }
+                        HuddlesEvent::NewHuddle => {
+                            this.huddles_open = false;
+                            this.start_huddle(window, cx);
                             cx.notify();
                         }
                         HuddlesEvent::OpenThread(channel, ts) => {
@@ -3458,13 +3469,17 @@ fn build_workspace(
     let thread = ThreadPanel::new(fixtures.clone(), window, cx);
     let results = SearchView::new(fixtures.clone(), archive, cx);
     let browser = ChannelBrowser::new(fixtures.clone(), window, cx);
+    let huddle_map: HashMap<ChannelId, Vec<slackless_core::types::UserId>> =
+        huddle::fixture(fixtures)
+            .map(|h| (h.channel, h.participants))
+            .into_iter()
+            .collect();
     let huddle = huddle::fixture(fixtures).map(|huddle| {
         let channel = huddle.channel.clone();
         (channel, HuddleBar::new(fixtures.clone(), huddle, cx))
     });
-    let huddle_channel = huddle.as_ref().map(|(channel, _)| channel.clone());
     sidebar.update(cx, |sidebar, cx| {
-        sidebar.set_huddle(huddle_channel, cx);
+        sidebar.set_huddles(huddle_map, cx);
         sidebar.set_workspace(index, cx);
     });
     let profile = ProfilePanel::new(fixtures.clone(), cx);

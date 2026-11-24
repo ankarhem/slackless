@@ -1,6 +1,236 @@
 //! Huddle pop-out stage, video tiles, drawing, captions, drawers, and popovers.
+//!
+//! Styled to match official Slack's Huddle window across Light, Dark, and tinted workspace themes:
+//! theme-matched top title bar & bottom control bar (left: diagnostics + invite; center: mic,
+//! camera, share, hand, reactions, background/theme, thread, more; right: red Leave button),
+//! luminous rounded-square participant cards on the stage, and a crisp theme-matched side drawer.
+
+use gpui_kit::gpui::{Background, Hsla, linear_color_stop, linear_gradient};
 
 use super::*;
+
+#[derive(Clone, Copy)]
+struct HuddlePalette {
+    /// Top titlebar and bottom control bar chrome.
+    chrome_bg: Hsla,
+    chrome_fg: Hsla,
+    chrome_muted: Hsla,
+    chrome_border: Hsla,
+    /// Neutral control button fill & hover on the chrome bar.
+    ctrl_bg: Hsla,
+    ctrl_hover: Hsla,
+    /// Emphasized active control button (e.g., unmuted mic / open thread toggle, like Slack).
+    ctrl_active_bg: Hsla,
+    ctrl_active_fg: Hsla,
+    /// Stage backdrop gradient and participant card surface.
+    stage_bg: Background,
+    stage_solid: Hsla,
+    tile_bg: Hsla,
+    tile_border: Hsla,
+    tile_pill_bg: Hsla,
+    tile_pill_fg: Hsla,
+    /// Floating scrim overlays on top of video / stage.
+    scrim_bg: Hsla,
+    scrim_fg: Hsla,
+    scrim_muted: Hsla,
+    /// Right-hand companion drawer (Thread / Notes / Diagnostics).
+    drawer_bg: Hsla,
+    drawer_fg: Hsla,
+    drawer_muted: Hsla,
+    drawer_border: Hsla,
+    drawer_surface: Hsla,
+    drawer_hover: Hsla,
+    /// Popovers anchored above the bottom bar.
+    popover_bg: Hsla,
+    popover_fg: Hsla,
+    popover_muted: Hsla,
+    popover_border: Hsla,
+    popover_hover: Hsla,
+    /// Semantic accents.
+    primary: Hsla,
+    primary_hover: Hsla,
+    primary_fg: Hsla,
+    danger: Hsla,
+    danger_hover: Hsla,
+    danger_fg: Hsla,
+    success: Hsla,
+    warning: Hsla,
+    warning_fg: Hsla,
+    link: Hsla,
+}
+
+impl HuddlePalette {
+    fn for_theme(bg_id: Option<&str>, cx: &App) -> Self {
+        let theme = cx.theme();
+        let dark_mode = theme.mode.is_dark();
+        let chrome_dark = crate::theme::sidebar_is_dark(cx);
+
+        let (
+            chrome_bg,
+            chrome_fg,
+            chrome_muted,
+            chrome_border,
+            ctrl_bg,
+            ctrl_hover,
+            ctrl_active_bg,
+            ctrl_active_fg,
+        ) = if chrome_dark {
+            let fg = theme.sidebar_foreground;
+            (
+                theme.title_bar,
+                fg,
+                fg.opacity(0.68),
+                theme.sidebar_border,
+                fg.opacity(0.12),
+                fg.opacity(0.22),
+                fg.opacity(0.92),
+                theme.title_bar,
+            )
+        } else {
+            // Light default Slack huddle chrome: cool pale sky tint matching `theme.title_bar`
+            // blended gently toward soft mist, crisp dark icons, dark charcoal active pills!
+            let bar = theme.title_bar.blend(theme.background.opacity(0.55));
+            (
+                bar,
+                theme.foreground,
+                theme.muted_foreground,
+                theme.border,
+                theme.foreground.opacity(0.08),
+                theme.foreground.opacity(0.15),
+                Hsla::from(rgb(0x2B2D31)),
+                Hsla::from(rgb(0xFFFFFF)),
+            )
+        };
+
+        let (stage_a, stage_b, stage_solid, tile_bg, stage_is_dark) = match bg_id {
+            Some("meadow") => (
+                Hsla::from(rgb(0xBCE3CC)),
+                Hsla::from(rgb(0xDCF2E4)),
+                Hsla::from(rgb(0xCBEAD7)),
+                Hsla::from(rgb(0xFFFFFF)),
+                false,
+            ),
+            Some("sky") => (
+                Hsla::from(rgb(0xC5E5FA)),
+                Hsla::from(rgb(0xE8F5FE)),
+                Hsla::from(rgb(0xD6EEFC)),
+                Hsla::from(rgb(0xFFFFFF)),
+                false,
+            ),
+            Some("midnight") => (
+                Hsla::from(rgb(0x0E1629)),
+                Hsla::from(rgb(0x1B294A)),
+                Hsla::from(rgb(0x10172A)),
+                Hsla::from(rgb(0x1B2440)),
+                true,
+            ),
+            Some("sunset") => (
+                Hsla::from(rgb(0x2B1818)),
+                Hsla::from(rgb(0x472329)),
+                Hsla::from(rgb(0x2B1818)),
+                Hsla::from(rgb(0x3B2222)),
+                true,
+            ),
+            Some("forest") => (
+                Hsla::from(rgb(0x10241C)),
+                Hsla::from(rgb(0x1C3D30)),
+                Hsla::from(rgb(0x11221B)),
+                Hsla::from(rgb(0x1B3328)),
+                true,
+            ),
+            Some("ocean") => (
+                Hsla::from(rgb(0x0D2230)),
+                Hsla::from(rgb(0x183A52)),
+                Hsla::from(rgb(0x0F212E)),
+                Hsla::from(rgb(0x183244)),
+                true,
+            ),
+            Some("plum") => (
+                Hsla::from(rgb(0x24142B)),
+                Hsla::from(rgb(0x3D1D47)),
+                Hsla::from(rgb(0x24142B)),
+                Hsla::from(rgb(0x351F3E)),
+                true,
+            ),
+            _ if dark_mode => {
+                let top = theme.background.blend(theme.title_bar.opacity(0.35));
+                let bot = theme.background;
+                (top, bot, bot, theme.muted, true)
+            }
+            _ => {
+                // Light default: serene pastel sage wash reminiscent of official Slack's
+                // sunlit botanical huddle canvas, bright and airy instead of black.
+                (
+                    Hsla::from(rgb(0xC2E6CE)),
+                    Hsla::from(rgb(0xE1F4E8)),
+                    Hsla::from(rgb(0xD2EEDC)),
+                    Hsla::from(rgb(0xFFFFFF)),
+                    false,
+                )
+            }
+        };
+
+        let stage_bg = linear_gradient(
+            145.,
+            linear_color_stop(stage_a, 0.),
+            linear_color_stop(stage_b, 1.),
+        );
+        let (tile_border, tile_pill_bg, tile_pill_fg) = if stage_is_dark {
+            (
+                Hsla::from(rgba(0xFFFFFF22)),
+                Hsla::from(rgba(0x0E1014CC)),
+                Hsla::from(rgb(0xFFFFFF)),
+            )
+        } else {
+            (
+                Hsla::from(rgba(0xFFFFFFEE)),
+                Hsla::from(rgba(0xFFFFFFE6)),
+                Hsla::from(rgb(0x1D1C1D)),
+            )
+        };
+
+        Self {
+            chrome_bg,
+            chrome_fg,
+            chrome_muted,
+            chrome_border,
+            ctrl_bg,
+            ctrl_hover,
+            ctrl_active_bg,
+            ctrl_active_fg,
+            stage_bg,
+            stage_solid,
+            tile_bg,
+            tile_border,
+            tile_pill_bg,
+            tile_pill_fg,
+            scrim_bg: Hsla::from(rgba(0x14171CE2)),
+            scrim_fg: Hsla::from(rgb(0xFFFFFF)),
+            scrim_muted: Hsla::from(rgb(0xD1D2D3)),
+            drawer_bg: theme.background,
+            drawer_fg: theme.foreground,
+            drawer_muted: theme.muted_foreground,
+            drawer_border: theme.border,
+            drawer_surface: theme.muted,
+            drawer_hover: theme.accent,
+            popover_bg: theme.popover,
+            popover_fg: theme.popover_foreground,
+            popover_muted: theme.muted_foreground,
+            popover_border: theme.border,
+            popover_hover: theme.accent,
+            primary: theme.primary,
+            primary_hover: theme.primary_hover,
+            primary_fg: theme.primary_foreground,
+            danger: theme.danger,
+            danger_hover: theme.danger_hover,
+            danger_fg: theme.danger_foreground,
+            success: theme.success,
+            warning: theme.warning,
+            warning_fg: theme.warning_foreground,
+            link: theme.link,
+        }
+    }
+}
 
 impl PopoutWindow {
     fn huddle_dock_entity(&self) -> Option<Entity<crate::huddle_dock::HuddleDock>> {
@@ -16,6 +246,7 @@ impl PopoutWindow {
         self.huddle_share_open = false;
         self.huddle_reactions_open = false;
         self.huddle_theme_open = false;
+        self.huddle_more_open = false;
     }
 
     pub(super) fn render_huddle_window(
@@ -27,46 +258,41 @@ impl PopoutWindow {
         use gpui_kit::component::Icon;
         use slackless_core::huddle::{HuddlePhase, VideoTileKey};
 
-        let white = rgb(0xFFFFFF);
-        let muted = rgb(0xABABAD);
-        let emerald = rgb(0x2BAC76);
-        let amber = rgb(0xECB22E);
-        let crimson = rgb(0xE01E5A);
-
         let bg_id = self
             .huddle_state
             .as_ref()
             .and_then(|s| s.session.background_id.as_deref());
-        let (stage_bg, tile_bg) = huddle_theme_surface(bg_id);
+        let pal = HuddlePalette::for_theme(bg_id, cx);
 
         let Some(state) = self.huddle_state.clone() else {
             return v_flex()
                 .id("popout-huddle-ended")
                 .size_full()
-                .bg(stage_bg)
-                .text_color(white)
+                .bg(pal.drawer_bg)
+                .text_color(pal.drawer_fg)
                 .child(
                     TitleBar::new()
-                        .h(px(44.))
-                        .bg(stage_bg)
+                        .h(px(38.))
+                        .bg(pal.chrome_bg)
                         .border_b_1()
-                        .border_color(rgba(0xFFFFFF12))
+                        .border_color(pal.chrome_border)
                         .child(
                             h_flex()
                                 .flex_1()
                                 .h_full()
                                 .items_center()
-                                .gap_2()
+                                .justify_center()
+                                .gap_1p5()
                                 .child(
                                     Icon::new(IconName::Headphones)
-                                        .size(px(14.))
-                                        .text_color(muted),
+                                        .size(px(13.))
+                                        .text_color(pal.chrome_muted),
                                 )
                                 .child(
                                     div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(white)
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(pal.chrome_fg)
                                         .child(self.title.clone()),
                                 ),
                         ),
@@ -80,12 +306,12 @@ impl PopoutWindow {
                         .child(
                             Icon::new(IconName::Headphones)
                                 .size(px(32.))
-                                .text_color(muted),
+                                .text_color(pal.drawer_muted),
                         )
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(muted)
+                                .text_color(pal.drawer_muted)
                                 .child("This huddle has ended."),
                         ),
                 );
@@ -98,18 +324,20 @@ impl PopoutWindow {
             people.push(self.fixtures.self_user.clone());
         }
         let (status_color, status_text) = match snap.phase {
-            HuddlePhase::Joining | HuddlePhase::Connecting => (amber, "Connecting…".to_owned()),
+            HuddlePhase::Joining | HuddlePhase::Connecting => {
+                (pal.warning, "Connecting…".to_owned())
+            }
             HuddlePhase::Connected => (
-                emerald,
+                pal.success,
                 crate::huddle_dock::format_elapsed(state.elapsed_secs),
             ),
-            HuddlePhase::Reconnecting => (amber, "Reconnecting…".to_owned()),
-            HuddlePhase::Leaving => (muted, "Leaving…".to_owned()),
-            HuddlePhase::Failed => (crimson, "Failed".to_owned()),
-            HuddlePhase::Idle => (muted, "Ended".to_owned()),
+            HuddlePhase::Reconnecting => (pal.warning, "Reconnecting…".to_owned()),
+            HuddlePhase::Leaving => (pal.chrome_muted, "Leaving…".to_owned()),
+            HuddlePhase::Failed => (pal.danger, "Failed".to_owned()),
+            HuddlePhase::Idle => (pal.chrome_muted, "Ended".to_owned()),
         };
 
-        let header = self.render_huddle_titlebar(&snap, status_color, status_text, stage_bg, cx);
+        let header = self.render_huddle_titlebar(&snap, people.len(), &pal, cx);
 
         let has_screen_share = state
             .video_frames
@@ -122,25 +350,54 @@ impl PopoutWindow {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .px_4()
-            .py_3()
+            .bg(pal.stage_bg)
+            .px_5()
+            .py_4()
             .gap_3();
+
+        // Top-left compact floating status + topic pill (matches official Slack's top-left chip).
+        stage = stage.child(
+            h_flex()
+                .absolute()
+                .left(px(14.))
+                .top(px(12.))
+                .px_2p5()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .rounded_lg()
+                .bg(pal.tile_pill_bg)
+                .border_1()
+                .border_color(pal.drawer_border)
+                .shadow_sm()
+                .child(div().size(px(7.)).rounded_full().bg(status_color))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(pal.tile_pill_fg)
+                        .child(status_text),
+                )
+                .child(self.render_huddle_topic_bar(snap.topic.as_deref(), &pal, cx)),
+        );
 
         if snap.audio_only {
             let send_resume = self.send.clone();
             stage = stage.child(
                 h_flex()
+                    .mt(px(36.))
                     .px_3()
                     .py_1p5()
                     .gap_2()
                     .items_center()
                     .justify_between()
                     .rounded_xl()
-                    .bg(amber.opacity(0.16))
+                    .bg(pal.popover_bg)
                     .border_1()
-                    .border_color(amber.opacity(0.45))
+                    .border_color(pal.warning.opacity(0.65))
+                    .shadow_sm()
                     .text_xs()
-                    .text_color(white)
+                    .text_color(pal.popover_fg)
                     .child(
                         h_flex()
                             .items_center()
@@ -148,7 +405,7 @@ impl PopoutWindow {
                             .child(
                                 Icon::new(IconName::Headphones)
                                     .size(px(13.))
-                                    .text_color(amber),
+                                    .text_color(pal.warning),
                             )
                             .child("Audio-only mode — video paused to save bandwidth"),
                     )
@@ -159,8 +416,8 @@ impl PopoutWindow {
                             .px_2()
                             .py_0p5()
                             .rounded_md()
-                            .bg(rgba(0xFFFFFF18))
-                            .hover(|el| el.bg(rgba(0xFFFFFF2A)))
+                            .bg(pal.drawer_surface)
+                            .hover(move |el| el.bg(pal.drawer_hover))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Resume video")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -178,30 +435,32 @@ impl PopoutWindow {
         if let Some(err) = snap.error.clone() {
             stage = stage.child(
                 h_flex()
+                    .mt(px(36.))
                     .px_3()
                     .py_2()
                     .gap_2()
                     .items_center()
                     .rounded_xl()
-                    .bg(crimson.opacity(0.18))
+                    .bg(pal.popover_bg)
                     .border_1()
-                    .border_color(crimson.opacity(0.5))
+                    .border_color(pal.danger.opacity(0.65))
+                    .shadow_sm()
                     .text_xs()
-                    .text_color(white)
+                    .text_color(pal.popover_fg)
                     .child(
                         Icon::new(IconName::TriangleAlert)
                             .size(px(14.))
-                            .text_color(crimson),
+                            .text_color(pal.danger),
                     )
                     .child(err),
             );
         }
 
         if has_screen_share {
-            if let Some(screen_stage) = self.render_huddle_stage(&state, cx) {
+            if let Some(screen_stage) = self.render_huddle_stage(&state, &pal, cx) {
                 stage = stage.child(screen_stage);
             }
-            stage = stage.child(self.render_huddle_filmstrip(&state, &people, tile_bg, cx));
+            stage = stage.child(self.render_huddle_filmstrip(&state, &people, &pal, cx));
         } else {
             let has_bottom_overlay = state.session.captions_enabled
                 || !state.captions.is_empty()
@@ -214,7 +473,7 @@ impl PopoutWindow {
                     .when(has_bottom_overlay, |el| el.pb(px(48.)))
                     .items_center()
                     .justify_center()
-                    .child(self.render_huddle_tiles(&state, &people, tile_bg, cx)),
+                    .child(self.render_huddle_tiles(&state, &people, &pal, cx)),
             );
         }
 
@@ -236,13 +495,13 @@ impl PopoutWindow {
                             .gap_2()
                             .items_center()
                             .rounded_full()
-                            .bg(rgba(0x14171CE6))
+                            .bg(pal.popover_bg)
                             .border_1()
-                            .border_color(emerald.opacity(0.65))
+                            .border_color(pal.success.opacity(0.65))
                             .shadow_xl()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(white)
+                            .text_color(pal.popover_fg)
                             .child(format!(
                                 "{glyph} {glyph} {who} triggered {label}! {glyph} {glyph}"
                             )),
@@ -251,17 +510,18 @@ impl PopoutWindow {
         }
 
         // Floating stacking reactions (bottom-left above dock)
-        if let Some(reactions_el) = self.render_huddle_floating_reactions(&state) {
+        if let Some(reactions_el) = self.render_huddle_floating_reactions(&state, &pal) {
             stage = stage.child(reactions_el);
         }
 
         // Floating live captions subtitle overlay (bottom-center above dock)
-        if let Some(captions_el) = self.render_huddle_floating_captions(&state) {
+        if let Some(captions_el) = self.render_huddle_floating_captions(&state, &pal) {
             stage = stage.child(captions_el);
         }
 
         // Floating popover panel anchored right above the bottom dock
-        if let Some(popover) = self.render_huddle_active_popover(&snap, &channel, &people, cx) {
+        if let Some(popover) = self.render_huddle_active_popover(&snap, &channel, &people, &pal, cx)
+        {
             stage = stage.child(
                 h_flex()
                     .absolute()
@@ -280,6 +540,7 @@ impl PopoutWindow {
                 row.child(self.render_huddle_drawer(
                     drawer,
                     &state,
+                    &pal,
                     on_jump.clone(),
                     on_open_canvas.clone(),
                     cx,
@@ -291,8 +552,8 @@ impl PopoutWindow {
             .id("popout-huddle-root")
             .relative()
             .size_full()
-            .bg(stage_bg)
-            .text_color(white)
+            .bg(pal.stage_solid)
+            .text_color(pal.drawer_fg)
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape"
@@ -300,6 +561,7 @@ impl PopoutWindow {
                             || this.huddle_share_open
                             || this.huddle_reactions_open
                             || this.huddle_theme_open
+                            || this.huddle_more_open
                             || this.huddle_invite_open
                             || this.huddle_devices_open
                             || this.huddle_drawer.take().is_some())
@@ -311,36 +573,37 @@ impl PopoutWindow {
             )
             .child(header)
             .child(body)
-            .child(self.render_huddle_controls(&snap, stage_bg, cx))
+            .child(self.render_huddle_controls(&snap, status_color, &pal, cx))
     }
 
     fn render_huddle_drawer(
         &self,
         drawer: HuddleDrawer,
         state: &crate::huddle_dock::HuddleViewState,
+        pal: &HuddlePalette,
         on_jump: JumpHandler,
         on_open_canvas: CanvasOpenHandler,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
         let content: gpui_kit::gpui::AnyElement = match drawer {
             HuddleDrawer::Thread => self
-                .render_huddle_thread_drawer(&state.session, on_jump, cx)
+                .render_huddle_thread_drawer(&state.session, pal, on_jump, cx)
                 .into_any_element(),
             HuddleDrawer::Notes => self
-                .render_huddle_notes_drawer(&state.session, on_open_canvas, cx)
+                .render_huddle_notes_drawer(&state.session, pal, on_open_canvas, cx)
                 .into_any_element(),
             HuddleDrawer::Diagnostics => self
-                .render_huddle_diagnostics_drawer(state, cx)
+                .render_huddle_diagnostics_drawer(state, pal, cx)
                 .into_any_element(),
         };
         v_flex()
             .flex_none()
-            .w(px(340.))
+            .w(px(316.))
             .h_full()
-            .bg(rgb(0x1B1D21))
+            .bg(pal.drawer_bg)
             .border_l_1()
-            .border_color(rgba(0xFFFFFF16))
-            .text_color(rgb(0xFFFFFF))
+            .border_color(pal.drawer_border)
+            .text_color(pal.drawer_fg)
             .child(content)
     }
 
@@ -390,18 +653,18 @@ impl PopoutWindow {
     fn render_huddle_thread_drawer(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        pal: &HuddlePalette,
         on_jump: JumpHandler,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
 
-        let (white, muted, border, emerald) = (
-            rgb(0xFFFFFF),
-            rgb(0xABABAD),
-            rgba(0xFFFFFF16),
-            rgb(0x007A5A),
-        );
         let channel = snap.channel.clone();
+        let channel_label = self
+            .fixtures
+            .conversation(&channel)
+            .map(|c| self.fixtures.conversation_label(c))
+            .unwrap_or_else(|| self.title.clone());
         let thread_ts = snap.thread_root_ts.clone();
         let jump_ch = channel.clone();
         let jump_ts = thread_ts.clone();
@@ -409,34 +672,25 @@ impl PopoutWindow {
         let send = self.send.clone();
         let reply_ch = channel.clone();
         let reply_ts = thread_ts.clone();
+        let hover = pal.drawer_hover;
 
         v_flex()
             .flex_1()
             .min_h_0()
             .child(
                 h_flex()
-                    .px_3p5()
-                    .py_2p5()
+                    .px_4()
+                    .h(px(46.))
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(border)
+                    .border_color(pal.drawer_border)
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Icon::new(IconName::MessageSquare)
-                                    .size(px(14.))
-                                    .text_color(muted),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(white)
-                                    .child("Huddle thread"),
-                            ),
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(pal.drawer_fg)
+                            .child("Thread"),
                     )
                     .child(
                         h_flex()
@@ -445,17 +699,17 @@ impl PopoutWindow {
                             .child(
                                 div()
                                     .id("huddle-drawer-thread-pop")
-                                    .size(px(24.))
+                                    .size(px(26.))
                                     .rounded_md()
                                     .cursor_pointer()
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .hover(|el| el.bg(rgba(0xFFFFFF1A)))
+                                    .hover(move |el| el.bg(hover))
                                     .child(
-                                        Icon::new(IconName::ExternalLink)
-                                            .size(px(13.))
-                                            .text_color(muted),
+                                        Icon::new(IconName::EllipsisVertical)
+                                            .size(px(14.))
+                                            .text_color(pal.drawer_muted),
                                     )
                                     .on_click(move |_, _, cx| {
                                         on_jump(
@@ -469,14 +723,18 @@ impl PopoutWindow {
                             .child(
                                 div()
                                     .id("huddle-drawer-close")
-                                    .size(px(24.))
+                                    .size(px(26.))
                                     .rounded_md()
                                     .cursor_pointer()
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .hover(|el| el.bg(rgba(0xFFFFFF1A)))
-                                    .child(Icon::new(IconName::X).size(px(13.)).text_color(muted))
+                                    .hover(move |el| el.bg(hover))
+                                    .child(
+                                        Icon::new(IconName::X)
+                                            .size(px(14.))
+                                            .text_color(pal.drawer_muted),
+                                    )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.huddle_drawer = None;
                                         cx.notify();
@@ -490,13 +748,37 @@ impl PopoutWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px_3()
-                    .py_2p5()
+                    .px_4()
+                    .py_3()
                     .gap_2p5()
                     .when(messages.is_empty(), |col| {
-                        col.child(div().py_6().text_xs().text_color(muted).child(
-                            "No messages in this huddle thread yet. Drop a link or note below.",
-                        ))
+                        col.child(
+                            v_flex()
+                                .gap_1p5()
+                                .py_2()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            Icon::new(IconName::MessageSquare)
+                                                .size(px(14.))
+                                                .text_color(pal.drawer_fg),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(pal.drawer_fg)
+                                                .child("Every huddle has a thread"),
+                                        ),
+                                )
+                                .child(div().text_xs().text_color(pal.drawer_muted).child(
+                                    format!(
+                                        "Send messages, files, and links to everyone in the huddle. They're saved as a thread in {channel_label}, so you can access it even after the huddle is done."
+                                    ),
+                                )),
+                        )
                     })
                     .children(messages.into_iter().map(|msg| {
                         let author = msg
@@ -506,20 +788,25 @@ impl PopoutWindow {
                             .or_else(|| msg.username.clone())
                             .unwrap_or_else(|| "Slack".to_owned());
                         v_flex()
-                            .p_2()
+                            .p_2p5()
                             .gap_1()
                             .rounded_lg()
-                            .bg(rgba(0xFFFFFF0A))
+                            .bg(pal.drawer_surface)
                             .border_1()
-                            .border_color(rgba(0xFFFFFF0F))
+                            .border_color(pal.drawer_border)
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(white)
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(pal.drawer_fg)
                                     .child(author),
                             )
-                            .child(div().text_xs().text_color(rgb(0xD1D2D3)).child(msg.text))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(pal.drawer_fg.opacity(0.9))
+                                    .child(msg.text),
+                            )
                     })),
             )
             .child(
@@ -527,15 +814,15 @@ impl PopoutWindow {
                     .p_3()
                     .gap_2()
                     .border_t_1()
-                    .border_color(border)
+                    .border_color(pal.drawer_border)
                     .child(
                         div()
                             .rounded_lg()
                             .border_1()
-                            .border_color(rgba(0xFFFFFF22))
-                            .bg(rgb(0x222529))
-                            .px_2()
-                            .py_1()
+                            .border_color(pal.drawer_border)
+                            .bg(pal.drawer_bg)
+                            .px_2p5()
+                            .py_1p5()
                             .child(Textarea::new(&self.huddle_thread_input).appearance(false)),
                     )
                     .child(
@@ -546,11 +833,14 @@ impl PopoutWindow {
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
-                                .bg(emerald)
-                                .hover(|el| el.bg(rgb(0x008E69)))
+                                .bg(pal.primary)
+                                .hover({
+                                    let h = pal.primary_hover;
+                                    move |el| el.bg(h)
+                                })
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(white)
+                                .text_color(pal.primary_fg)
                                 .child("Send")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     let raw = this.huddle_thread_input.read(cx).value().to_string();
@@ -588,17 +878,12 @@ impl PopoutWindow {
     fn render_huddle_notes_drawer(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        pal: &HuddlePalette,
         on_open_canvas: CanvasOpenHandler,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
 
-        let (white, muted, border, emerald) = (
-            rgb(0xFFFFFF),
-            rgb(0xABABAD),
-            rgba(0xFFFFFF16),
-            rgb(0x007A5A),
-        );
         let send_notes = self.send.clone();
         let notes_ch = snap.channel.clone();
         let canvas_id = snap.canvas_file_id.clone();
@@ -607,42 +892,52 @@ impl PopoutWindow {
             .clone()
             .map(|t| format!("Huddle notes: {t}"))
             .unwrap_or_else(|| "Huddle notes".to_owned());
+        let hover = pal.drawer_hover;
+        let p_hover = pal.primary_hover;
 
         v_flex()
             .flex_1()
             .min_h_0()
             .child(
                 h_flex()
-                    .px_3p5()
-                    .py_2p5()
+                    .px_4()
+                    .h(px(46.))
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(border)
+                    .border_color(pal.drawer_border)
                     .child(
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(Icon::new(IconName::FileText).size(px(14.)).text_color(muted))
+                            .child(
+                                Icon::new(IconName::FileText)
+                                    .size(px(14.))
+                                    .text_color(pal.drawer_muted),
+                            )
                             .child(
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(white)
+                                    .text_color(pal.drawer_fg)
                                     .child("Huddle notes"),
                             ),
                     )
                     .child(
                         div()
                             .id("huddle-drawer-notes-close")
-                            .size(px(24.))
+                            .size(px(26.))
                             .rounded_md()
                             .cursor_pointer()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .hover(|el| el.bg(rgba(0xFFFFFF1A)))
-                            .child(Icon::new(IconName::X).size(px(13.)).text_color(muted))
+                            .hover(move |el| el.bg(hover))
+                            .child(
+                                Icon::new(IconName::X)
+                                    .size(px(14.))
+                                    .text_color(pal.drawer_muted),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.huddle_drawer = None;
                                 cx.notify();
@@ -657,13 +952,13 @@ impl PopoutWindow {
                         div()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(white)
+                            .text_color(pal.drawer_fg)
                             .child(topic_title.clone()),
                     )
                     .child(
                         div()
                             .text_xs()
-                            .text_color(muted)
+                            .text_color(pal.drawer_muted)
                             .child(if canvas_id.is_some() {
                                 "A collaborative Slack canvas is attached to this huddle. Open it in the main window to edit sections and action items live."
                             } else {
@@ -680,12 +975,16 @@ impl PopoutWindow {
                             .items_center()
                             .justify_center()
                             .rounded_lg()
-                            .bg(emerald)
-                            .hover(|el| el.bg(rgb(0x008E69)))
+                            .bg(pal.primary)
+                            .hover(move |el| el.bg(p_hover))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(white)
-                            .child(Icon::new(IconName::FileText).size(px(14.)).text_color(white))
+                            .text_color(pal.primary_fg)
+                            .child(
+                                Icon::new(IconName::FileText)
+                                    .size(px(14.))
+                                    .text_color(pal.primary_fg),
+                            )
                             .child("Open huddle canvas")
                             .on_click(move |_, _, cx| on_open_canvas(fid.clone(), cx))
                     } else {
@@ -698,12 +997,16 @@ impl PopoutWindow {
                             .items_center()
                             .justify_center()
                             .rounded_lg()
-                            .bg(emerald)
-                            .hover(|el| el.bg(rgb(0x008E69)))
+                            .bg(pal.primary)
+                            .hover(move |el| el.bg(p_hover))
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(white)
-                            .child(Icon::new(IconName::Plus).size(px(14.)).text_color(white))
+                            .text_color(pal.primary_fg)
+                            .child(
+                                Icon::new(IconName::Plus)
+                                    .size(px(14.))
+                                    .text_color(pal.primary_fg),
+                            )
                             .child("Create huddle notes canvas")
                             .on_click(move |_, window, cx| {
                                 (send_notes)(Command::CreateCanvas {
@@ -726,6 +1029,7 @@ impl PopoutWindow {
     fn render_huddle_diagnostics_drawer(
         &self,
         state: &crate::huddle_dock::HuddleViewState,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::component::Icon;
@@ -733,23 +1037,15 @@ impl PopoutWindow {
             HuddleChime, HuddlePhase, play_huddle_chime, play_speaker_test_tone,
         };
 
-        let (white, muted, border, emerald, amber, crimson) = (
-            rgb(0xFFFFFF),
-            rgb(0xABABAD),
-            rgba(0xFFFFFF16),
-            rgb(0x2BAC76),
-            rgb(0xECB22E),
-            rgb(0xE01E5A),
-        );
         let snap = &state.session;
         let (phase_color, phase_label) = match snap.phase {
-            HuddlePhase::Connected => (emerald, "Connected (UDP TURN Relay)"),
-            HuddlePhase::Joining | HuddlePhase::Connecting => (amber, "Connecting…"),
-            HuddlePhase::Reconnecting => (amber, "Reconnecting…"),
-            HuddlePhase::Failed if snap.udp_blocked => (crimson, "UDP Blocked — Check Firewall"),
-            HuddlePhase::Failed => (crimson, "Connection Failed"),
-            HuddlePhase::Leaving => (muted, "Leaving…"),
-            HuddlePhase::Idle => (muted, "Idle"),
+            HuddlePhase::Connected => (pal.success, "Connected (UDP TURN Relay)"),
+            HuddlePhase::Joining | HuddlePhase::Connecting => (pal.warning, "Connecting…"),
+            HuddlePhase::Reconnecting => (pal.warning, "Reconnecting…"),
+            HuddlePhase::Failed if snap.udp_blocked => (pal.danger, "UDP Blocked — Check Firewall"),
+            HuddlePhase::Failed => (pal.danger, "Connection Failed"),
+            HuddlePhase::Leaving => (pal.drawer_muted, "Leaving…"),
+            HuddlePhase::Idle => (pal.drawer_muted, "Idle"),
         };
         let video_codec = snap
             .active_video_codec
@@ -767,17 +1063,18 @@ impl PopoutWindow {
         let send_ao = self.send.clone();
         let test_out = snap.output_device.clone();
         let chime_out = snap.output_device.clone();
+        let hover = pal.drawer_hover;
 
         let stat_row = |label: &'static str, value: String| {
             h_flex()
                 .justify_between()
                 .items_center()
                 .text_xs()
-                .child(div().text_color(muted).child(label))
+                .child(div().text_color(pal.drawer_muted).child(label))
                 .child(
                     div()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(white)
+                        .text_color(pal.drawer_fg)
                         .child(value),
                 )
         };
@@ -787,13 +1084,13 @@ impl PopoutWindow {
                 .py_0p5()
                 .rounded_full()
                 .bg(if on {
-                    emerald.opacity(0.2)
+                    pal.success.opacity(0.18)
                 } else {
-                    rgba(0xFFFFFF12)
+                    pal.drawer_border.opacity(0.5)
                 })
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(if on { emerald } else { muted })
+                .text_color(if on { pal.success } else { pal.drawer_muted })
                 .child(label)
         };
 
@@ -804,12 +1101,12 @@ impl PopoutWindow {
             .overflow_y_scroll()
             .child(
                 h_flex()
-                    .px_3p5()
-                    .py_2p5()
+                    .px_4()
+                    .h(px(46.))
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(border)
+                    .border_color(pal.drawer_border)
                     .child(
                         h_flex()
                             .items_center()
@@ -823,21 +1120,25 @@ impl PopoutWindow {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(white)
+                                    .text_color(pal.drawer_fg)
                                     .child("Connection & diagnostics"),
                             ),
                     )
                     .child(
                         div()
                             .id("huddle-drawer-diag-close")
-                            .size(px(24.))
+                            .size(px(26.))
                             .rounded_md()
                             .cursor_pointer()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .hover(|el| el.bg(rgba(0xFFFFFF1A)))
-                            .child(Icon::new(IconName::X).size(px(13.)).text_color(muted))
+                            .hover(move |el| el.bg(hover))
+                            .child(
+                                Icon::new(IconName::X)
+                                    .size(px(14.))
+                                    .text_color(pal.drawer_muted),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.huddle_drawer = None;
                                 cx.notify();
@@ -853,9 +1154,9 @@ impl PopoutWindow {
                             .p_3()
                             .gap_1p5()
                             .rounded_xl()
-                            .bg(rgba(0xFFFFFF0A))
+                            .bg(pal.drawer_surface)
                             .border_1()
-                            .border_color(border)
+                            .border_color(pal.drawer_border)
                             .child(
                                 h_flex()
                                     .items_center()
@@ -866,7 +1167,7 @@ impl PopoutWindow {
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(white)
+                                            .text_color(pal.drawer_fg)
                                             .child(phase_label),
                                     ),
                             )
@@ -896,14 +1197,14 @@ impl PopoutWindow {
                             .p_3()
                             .gap_2()
                             .rounded_xl()
-                            .bg(rgba(0xFFFFFF0A))
+                            .bg(pal.drawer_surface)
                             .border_1()
-                            .border_color(border)
+                            .border_color(pal.drawer_border)
                             .child(
                                 div()
                                     .text_xs()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(white)
+                                    .text_color(pal.drawer_fg)
                                     .child("Sonora Audio Processing"),
                             )
                             .child(
@@ -919,9 +1220,9 @@ impl PopoutWindow {
                             .p_3()
                             .gap_2()
                             .rounded_xl()
-                            .bg(rgba(0xFFFFFF0A))
+                            .bg(pal.drawer_surface)
                             .border_1()
-                            .border_color(border)
+                            .border_color(pal.drawer_border)
                             .child(
                                 h_flex()
                                     .items_center()
@@ -933,13 +1234,13 @@ impl PopoutWindow {
                                                 div()
                                                     .text_xs()
                                                     .font_weight(FontWeight::BOLD)
-                                                    .text_color(white)
+                                                    .text_color(pal.drawer_fg)
                                                     .child("Audio-only mode"),
                                             )
                                             .child(
                                                 div()
                                                     .text_xs()
-                                                    .text_color(muted)
+                                                    .text_color(pal.drawer_muted)
                                                     .child("Pause video to save bandwidth"),
                                             ),
                                     )
@@ -950,13 +1251,17 @@ impl PopoutWindow {
                                             .px_2p5()
                                             .py_1()
                                             .rounded_full()
-                                            .bg(if audio_only { amber } else { rgba(0xFFFFFF18) })
+                                            .bg(if audio_only {
+                                                pal.warning
+                                            } else {
+                                                pal.drawer_border
+                                            })
                                             .text_xs()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(if audio_only {
-                                                rgb(0x14171C)
+                                                pal.warning_fg
                                             } else {
-                                                white
+                                                pal.drawer_fg
                                             })
                                             .child(if audio_only { "On" } else { "Off" })
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -978,14 +1283,14 @@ impl PopoutWindow {
                             .p_3()
                             .gap_2()
                             .rounded_xl()
-                            .bg(rgba(0xFFFFFF0A))
+                            .bg(pal.drawer_surface)
                             .border_1()
-                            .border_color(border)
+                            .border_color(pal.drawer_border)
                             .child(
                                 div()
                                     .text_xs()
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(white)
+                                    .text_color(pal.drawer_fg)
                                     .child("Audio self-test"),
                             )
                             .child(
@@ -997,14 +1302,14 @@ impl PopoutWindow {
                                             .w_full()
                                             .h(px(6.))
                                             .rounded_full()
-                                            .bg(rgba(0xFFFFFF18))
+                                            .bg(pal.drawer_border)
                                             .overflow_hidden()
                                             .child(
                                                 div()
                                                     .h_full()
-                                                    .w(px((2.8 * rms_pct as f32).clamp(4., 280.)))
+                                                    .w(px((2.8 * rms_pct as f32).clamp(4., 260.)))
                                                     .rounded_full()
-                                                    .bg(emerald),
+                                                    .bg(pal.success),
                                             ),
                                     ),
                             )
@@ -1019,14 +1324,16 @@ impl PopoutWindow {
                                             .cursor_pointer()
                                             .py_1p5()
                                             .rounded_lg()
-                                            .bg(rgba(0xFFFFFF14))
-                                            .hover(|el| el.bg(rgba(0xFFFFFF24)))
+                                            .bg(pal.drawer_bg)
+                                            .border_1()
+                                            .border_color(pal.drawer_border)
+                                            .hover(move |el| el.bg(hover))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .text_xs()
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(white)
+                                            .text_color(pal.drawer_fg)
                                             .child("Test speaker")
                                             .on_click(move |_, _, _| {
                                                 let _ = play_speaker_test_tone(test_out.as_deref());
@@ -1039,14 +1346,16 @@ impl PopoutWindow {
                                             .cursor_pointer()
                                             .py_1p5()
                                             .rounded_lg()
-                                            .bg(rgba(0xFFFFFF14))
-                                            .hover(|el| el.bg(rgba(0xFFFFFF24)))
+                                            .bg(pal.drawer_bg)
+                                            .border_1()
+                                            .border_color(pal.drawer_border)
+                                            .hover(move |el| el.bg(hover))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .text_xs()
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(white)
+                                            .text_color(pal.drawer_fg)
                                             .child("Test chime")
                                             .on_click(move |_, _, _| {
                                                 let _ = play_huddle_chime(
@@ -1060,79 +1369,43 @@ impl PopoutWindow {
             )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_huddle_titlebar(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
-        status_color: Rgba,
-        status_text: String,
-        bar_bg: Rgba,
-        cx: &mut Context<Self>,
+        people_count: usize,
+        pal: &HuddlePalette,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         use gpui_kit::component::Icon;
 
-        let white = rgb(0xFFFFFF);
-        let muted = rgb(0xABABAD);
-        let channel = snap.channel.clone();
-        let browser_url = snap.huddle_link.clone().unwrap_or_else(|| {
-            let team = self
-                .fixtures
-                .workspaces
-                .first()
-                .map(|t| t.id.to_string())
-                .unwrap_or_default();
-            format!("https://app.slack.com/huddle/{team}/{channel}")
-        });
-        let send_copy = self.send.clone();
-        let copy_ch = channel.clone();
-        let notes_open = self.huddle_drawer == Some(HuddleDrawer::Notes);
-        let thread_open = self.huddle_drawer == Some(HuddleDrawer::Thread);
-        let diag_open = self.huddle_drawer == Some(HuddleDrawer::Diagnostics);
-
-        let notes_pill = h_flex()
-            .id("popout-huddle-canvas")
-            .h(px(28.))
-            .px_2p5()
-            .gap_1p5()
-            .items_center()
-            .rounded_lg()
-            .bg(if notes_open {
-                rgba(0xFFFFFF2A)
-            } else {
-                rgba(0xFFFFFF12)
+        let channel_name = self
+            .fixtures
+            .conversation(&snap.channel)
+            .map(|c| {
+                self.fixtures
+                    .conversation_label(c)
+                    .trim_start_matches("# ")
+                    .to_owned()
             })
-            .hover(|el| el.bg(rgba(0xFFFFFF22)))
-            .cursor_pointer()
-            .text_xs()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(white)
-            .child(
-                Icon::new(IconName::FileText)
-                    .size(px(13.))
-                    .text_color(white),
-            )
-            .child("Notes")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.huddle_drawer = if this.huddle_drawer == Some(HuddleDrawer::Notes) {
-                    None
-                } else {
-                    Some(HuddleDrawer::Notes)
-                };
-                cx.notify();
-            }));
+            .unwrap_or_else(|| self.title.clone());
+        let count_text = if people_count == 1 {
+            "1 person".to_owned()
+        } else {
+            format!("{people_count} people")
+        };
+        let ctrl_hover = pal.ctrl_hover;
 
         TitleBar::new()
-            .h(px(44.))
-            .bg(bar_bg)
+            .h(px(38.))
+            .bg(pal.chrome_bg)
             .border_b_1()
-            .border_color(rgba(0xFFFFFF10))
+            .border_color(pal.chrome_border)
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .pr_3()
-                    .gap_2()
+                    .pr_2p5()
                     .items_center()
                     .justify_between()
                     .child(
@@ -1140,174 +1413,47 @@ impl PopoutWindow {
                             .flex_1()
                             .min_w_0()
                             .items_center()
-                            .gap_2()
+                            .justify_center()
+                            .gap_1p5()
                             .child(
                                 Icon::new(IconName::Headphones)
-                                    .size(px(14.))
-                                    .text_color(status_color),
+                                    .size(px(13.))
+                                    .text_color(pal.chrome_muted),
                             )
                             .child(
                                 div()
                                     .truncate()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(white)
-                                    .child(self.title.clone()),
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(pal.chrome_fg)
+                                    .child(format!("Huddle in {channel_name}")),
                             )
                             .child(
                                 div()
                                     .flex_none()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(status_color.opacity(0.18))
                                     .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(status_color)
-                                    .child(status_text),
-                            )
-                            .child(self.render_huddle_topic_bar(snap.topic.as_deref(), cx)),
+                                    .text_color(pal.chrome_muted)
+                                    .child(count_text),
+                            ),
                     )
                     .child(
-                        h_flex()
-                            .flex_none()
+                        div()
+                            .id("popout-huddle-dock-back")
+                            .size(px(26.))
+                            .rounded_md()
+                            .hover(move |el| el.bg(ctrl_hover))
+                            .cursor_pointer()
+                            .flex()
                             .items_center()
-                            .gap_1p5()
+                            .justify_center()
                             .child(
-                                h_flex()
-                                    .id("popout-huddle-header-invite")
-                                    .h(px(28.))
-                                    .px_2p5()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .rounded_lg()
-                                    .bg(if self.huddle_invite_open {
-                                        rgba(0xFFFFFF28)
-                                    } else {
-                                        rgba(0xFFFFFF12)
-                                    })
-                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(white)
-                                    .child(
-                                        Icon::new(IconName::UserPlus)
-                                            .size(px(13.))
-                                            .text_color(white),
-                                    )
-                                    .child("Invite")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let next = !this.huddle_invite_open;
-                                        this.close_huddle_popovers();
-                                        this.huddle_invite_open = next;
-                                        cx.notify();
-                                    })),
+                                Icon::new(IconName::PanelLeft)
+                                    .size(px(14.))
+                                    .text_color(pal.chrome_muted),
                             )
-                            .child(notes_pill)
-                            .child(
-                                h_flex()
-                                    .id("popout-huddle-thread")
-                                    .h(px(28.))
-                                    .px_2p5()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .rounded_lg()
-                                    .bg(if thread_open {
-                                        rgba(0xFFFFFF2A)
-                                    } else {
-                                        rgba(0xFFFFFF12)
-                                    })
-                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(white)
-                                    .child(
-                                        Icon::new(IconName::MessageSquare)
-                                            .size(px(13.))
-                                            .text_color(white),
-                                    )
-                                    .child("Thread")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.huddle_drawer =
-                                            if this.huddle_drawer == Some(HuddleDrawer::Thread) {
-                                                None
-                                            } else {
-                                                Some(HuddleDrawer::Thread)
-                                            };
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("popout-huddle-diag")
-                                    .size(px(28.))
-                                    .rounded_lg()
-                                    .bg(if diag_open {
-                                        rgba(0xFFFFFF2A)
-                                    } else {
-                                        rgba(0xFFFFFF12)
-                                    })
-                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::new(IconName::Activity)
-                                            .size(px(13.))
-                                            .text_color(status_color),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.huddle_drawer = if this.huddle_drawer
-                                            == Some(HuddleDrawer::Diagnostics)
-                                        {
-                                            None
-                                        } else {
-                                            Some(HuddleDrawer::Diagnostics)
-                                        };
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("popout-huddle-copy-link")
-                                    .size(px(28.))
-                                    .rounded_lg()
-                                    .bg(rgba(0xFFFFFF12))
-                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::new(IconName::Link).size(px(13.)).text_color(muted),
-                                    )
-                                    .on_click(move |_, _, _| {
-                                        (send_copy)(Command::CopyHuddleLink {
-                                            channel: copy_ch.clone(),
-                                        });
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("popout-huddle-browser")
-                                    .size(px(28.))
-                                    .rounded_lg()
-                                    .bg(rgba(0xFFFFFF12))
-                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
-                                    .cursor_pointer()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        Icon::new(IconName::ExternalLink)
-                                            .size(px(13.))
-                                            .text_color(muted),
-                                    )
-                                    .on_click(move |_, _, cx| cx.open_url(&browser_url)),
-                            ),
+                            .on_click(|_, window, _| {
+                                window.remove_window();
+                            }),
                     ),
             )
     }
@@ -1315,25 +1461,25 @@ impl PopoutWindow {
     fn render_huddle_topic_bar(
         &self,
         topic: Option<&str>,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let white = rgb(0xFFFFFF);
-        let muted = rgb(0xABABAD);
+        let hover = pal.drawer_hover;
         if let Some(input) = &self.huddle_topic_editing {
             return h_flex()
                 .items_center()
                 .gap_1p5()
-                .px_2()
+                .px_1p5()
                 .py_0p5()
-                .rounded_lg()
+                .rounded_md()
                 .border_1()
-                .border_color(rgba(0xFFFFFF28))
-                .bg(rgb(0x2B2E33))
+                .border_color(pal.drawer_border)
+                .bg(pal.drawer_bg)
                 .child(
                     div()
                         .w(px(180.))
                         .text_xs()
-                        .text_color(white)
+                        .text_color(pal.drawer_fg)
                         .child(Textarea::new(input).appearance(false).bordered(false)),
                 )
                 .child(
@@ -1342,11 +1488,11 @@ impl PopoutWindow {
                         .px_2()
                         .py_0p5()
                         .rounded_md()
-                        .bg(rgb(0x007A5A))
+                        .bg(pal.primary)
                         .cursor_pointer()
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(white)
+                        .text_color(pal.primary_fg)
                         .child("Save")
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(inp) = this.huddle_topic_editing.take() {
@@ -1376,10 +1522,10 @@ impl PopoutWindow {
                         .px_1p5()
                         .py_0p5()
                         .rounded_md()
-                        .hover(|el| el.bg(rgba(0xFFFFFF16)))
+                        .hover(move |el| el.bg(hover))
                         .cursor_pointer()
                         .text_xs()
-                        .text_color(muted)
+                        .text_color(pal.drawer_muted)
                         .child("✕")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.huddle_topic_editing = None;
@@ -1391,17 +1537,21 @@ impl PopoutWindow {
         h_flex().min_w_0().items_center().child(
             h_flex()
                 .id("popout-huddle-topic-edit")
-                .px_2()
+                .px_1p5()
                 .py_0p5()
                 .gap_1()
                 .items_center()
                 .rounded_md()
-                .hover(|el| el.bg(rgba(0xFFFFFF12)))
+                .hover(move |el| el.bg(hover))
                 .cursor_pointer()
                 .text_xs()
-                .text_color(if topic.is_some() { white } else { muted })
+                .text_color(if topic.is_some() {
+                    pal.tile_pill_fg
+                } else {
+                    pal.drawer_muted
+                })
                 .child(
-                    div().max_w(px(220.)).truncate().child(
+                    div().max_w(px(200.)).truncate().child(
                         topic
                             .map(ToOwned::to_owned)
                             .unwrap_or_else(|| "Add a topic".to_owned()),
@@ -1426,6 +1576,7 @@ impl PopoutWindow {
     fn render_huddle_stage(
         &self,
         state: &crate::huddle_dock::HuddleViewState,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
         use slackless_core::huddle::{HuddleDrawMessage, VideoTileKey};
@@ -1457,8 +1608,6 @@ impl PopoutWindow {
             return None;
         }
 
-        let white = rgb(0xFFFFFF);
-        let emerald = rgb(0x2BAC76);
         let focused = self.huddle_focused_screen.filter(|&i| i < screens.len());
         let primary_item_id = screens
             .get(focused.unwrap_or(0))
@@ -1481,6 +1630,9 @@ impl PopoutWindow {
             (285, "Purple"),
         ];
 
+        let white = pal.scrim_fg;
+        let emerald = pal.success;
+        let primary = pal.primary;
         let draw_btn = {
             let item = primary_item_id.clone();
             let hue = self.huddle_draw_hue;
@@ -1493,15 +1645,15 @@ impl PopoutWindow {
                 .rounded_full()
                 .cursor_pointer()
                 .bg(if self.huddle_draw_mode {
-                    rgb(0x007A5A)
+                    primary
                 } else {
-                    rgba(0xFFFFFF16)
+                    Hsla::from(rgba(0xFFFFFF1C))
                 })
-                .hover(|el| {
+                .hover(move |el| {
                     el.bg(if self.huddle_draw_mode {
                         emerald
                     } else {
-                        rgba(0xFFFFFF28)
+                        Hsla::from(rgba(0xFFFFFF2E))
                     })
                 })
                 .text_xs()
@@ -1548,7 +1700,11 @@ impl PopoutWindow {
                         .cursor_pointer()
                         .bg(hsla(hue as f32 / 360.0, 0.88, 0.56, 1.0))
                         .border_2()
-                        .border_color(if selected { white } else { rgba(0xFFFFFF30) })
+                        .border_color(if selected {
+                            white
+                        } else {
+                            Hsla::from(rgba(0xFFFFFF30))
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.huddle_draw_hue = hue;
                             let msg = HuddleDrawMessage::ChangeHue {
@@ -1627,10 +1783,11 @@ impl PopoutWindow {
                 .flex_1()
                 .min_h_0()
                 .w_full()
+                .mt(px(36.))
                 .rounded_2xl()
                 .overflow_hidden()
                 .border_1()
-                .border_color(rgba(0xFFFFFF18))
+                .border_color(pal.drawer_border)
                 .bg(rgb(0x0B0D10))
                 .child(h_flex().size_full().gap_1p5().children(
                     visible_screens.into_iter().enumerate().map(
@@ -1649,7 +1806,7 @@ impl PopoutWindow {
                         .gap_2()
                         .items_center()
                         .rounded_full()
-                        .bg(rgba(0x0E1014CC))
+                        .bg(pal.scrim_bg)
                         .border_1()
                         .border_color(rgba(0xFFFFFF1A))
                         .child(
@@ -1675,7 +1832,7 @@ impl PopoutWindow {
                         .gap_1()
                         .items_center()
                         .rounded_full()
-                        .bg(rgba(0x0E1014CC))
+                        .bg(pal.scrim_bg)
                         .border_1()
                         .border_color(rgba(0xFFFFFF1A))
                         .children(swatches)
@@ -1687,8 +1844,8 @@ impl PopoutWindow {
                                 .px_2()
                                 .rounded_full()
                                 .cursor_pointer()
-                                .bg(rgba(0xFFFFFF12))
-                                .hover(|el| el.bg(rgba(0xFFFFFF24)))
+                                .bg(rgba(0xFFFFFF14))
+                                .hover(|el| el.bg(rgba(0xFFFFFF28)))
                                 .flex()
                                 .items_center()
                                 .text_xs()
@@ -1914,23 +2071,29 @@ impl PopoutWindow {
         &self,
         state: &crate::huddle_dock::HuddleViewState,
         people: &[slackless_core::types::UserId],
-        tile_bg: Rgba,
+        pal: &HuddlePalette,
         _cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
+        let solo = people.len() <= 1;
+        // Official Slack renders a single participant as a crisp centered rounded-square portrait
+        // card, and scales smoothly into balanced square/4:3 cards as more teammates join.
         let (tile_w, tile_h, avatar_px, grid_max_w) = match people.len() {
-            0..=2 => (px(360.), px(244.), 88.0, px(820.)),
-            3 => (px(268.), px(196.), 76.0, px(860.)),
-            4 => (px(304.), px(192.), 74.0, px(660.)),
-            _ => (px(236.), px(154.), 62.0, px(840.)),
+            0..=1 => (px(276.), px(276.), 272.0, px(360.)),
+            2 => (px(272.), px(252.), 112.0, px(640.)),
+            3 => (px(236.), px(216.), 88.0, px(780.)),
+            4 => (px(252.), px(208.), 84.0, px(560.)),
+            _ => (px(212.), px(164.), 66.0, px(760.)),
         };
         h_flex()
             .max_w(grid_max_w)
             .flex_wrap()
             .items_center()
             .justify_center()
-            .gap_3p5()
+            .gap_4()
             .children(people.iter().map(|uid| {
-                self.render_huddle_participant_tile(state, uid, tile_bg, tile_w, tile_h, avatar_px)
+                self.render_huddle_participant_tile(
+                    state, uid, pal, tile_w, tile_h, avatar_px, solo,
+                )
             }))
     }
 
@@ -1938,7 +2101,7 @@ impl PopoutWindow {
         &self,
         state: &crate::huddle_dock::HuddleViewState,
         people: &[slackless_core::types::UserId],
-        tile_bg: Rgba,
+        pal: &HuddlePalette,
         _cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         if self.huddle_stage_expanded {
@@ -1951,26 +2114,25 @@ impl PopoutWindow {
             .justify_center()
             .gap_2p5()
             .children(people.iter().take(6).map(|uid| {
-                self.render_huddle_participant_tile(state, uid, tile_bg, px(148.), px(92.), 42.0)
+                self.render_huddle_participant_tile(state, uid, pal, px(148.), px(96.), 44.0, false)
             }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_huddle_participant_tile(
         &self,
         state: &crate::huddle_dock::HuddleViewState,
         uid: &slackless_core::types::UserId,
-        tile_bg: Rgba,
+        pal: &HuddlePalette,
         tile_w: Pixels,
         tile_h: Pixels,
         avatar_px: f32,
+        full_bleed_avatar: bool,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
         use gpui_kit::gpui::{ObjectFit, StyledImage as _, img};
         use slackless_core::huddle::VideoTileKey;
 
-        let white = rgb(0xFFFFFF);
-        let emerald = rgb(0x2BAC76);
-        let crimson = rgb(0xE01E5A);
         let snap = &state.session;
         let is_self = *uid == self.fixtures.self_user;
         let speaking = if is_self {
@@ -2000,11 +2162,23 @@ impl PopoutWindow {
                 .get(&VideoTileKey::RemoteCamera(uid.clone()))
                 .cloned()
         };
+        let has_video = video_frame.is_some();
         let name = self.fixtures.user_name(uid).to_owned();
         let display_name = if is_self {
             format!("{name} (You)")
         } else {
             name
+        };
+
+        let pill_bg = if has_video {
+            pal.scrim_bg
+        } else {
+            pal.tile_pill_bg
+        };
+        let pill_fg = if has_video {
+            pal.scrim_fg
+        } else {
+            pal.tile_pill_fg
         };
 
         div()
@@ -2013,13 +2187,26 @@ impl PopoutWindow {
             .h(tile_h)
             .rounded_2xl()
             .overflow_hidden()
-            .bg(tile_bg)
-            .border_2()
-            .border_color(if speaking { emerald } else { rgba(0xFFFFFF14) })
+            .bg(pal.tile_bg)
+            .shadow_xl()
+            .border(px(if speaking { 3. } else { 2. }))
+            .border_color(if speaking {
+                pal.success
+            } else {
+                pal.tile_border
+            })
             .child(if let Some(frame) = video_frame {
                 img(frame)
                     .size_full()
                     .object_fit(ObjectFit::Cover)
+                    .into_any_element()
+            } else if full_bleed_avatar {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(crate::avatars::user_chip(&self.fixtures, uid, avatar_px))
                     .into_any_element()
             } else {
                 v_flex()
@@ -2032,15 +2219,15 @@ impl PopoutWindow {
                             .rounded_2xl()
                             .border_2()
                             .border_color(if speaking {
-                                emerald.opacity(0.65)
+                                pal.success.opacity(0.65)
                             } else {
-                                rgba(0x00000000)
+                                Hsla::from(rgba(0x00000000))
                             })
                             .child(crate::avatars::user_chip(&self.fixtures, uid, avatar_px)),
                     )
                     .into_any_element()
             })
-            // Top-left frosted sticky/hand-raise pill
+            // Top-left sticky/hand-raise pill
             .when_some(badge_glyph, |el, glyph| {
                 el.child(
                     div()
@@ -2050,14 +2237,15 @@ impl PopoutWindow {
                         .px_2()
                         .py_0p5()
                         .rounded_full()
-                        .bg(rgba(0x0E1014D6))
+                        .bg(pill_bg)
                         .border_1()
-                        .border_color(rgba(0xFFFFFF1F))
+                        .border_color(pal.drawer_border)
+                        .shadow_sm()
                         .text_sm()
                         .child(glyph),
                 )
             })
-            // Bottom-left frosted dark name pill with inline mic-off / active-speaker indicator
+            // Bottom-left compact audio/name badge (matches official Slack's clean white pill)
             .child(
                 h_flex()
                     .absolute()
@@ -2068,39 +2256,45 @@ impl PopoutWindow {
                     .py_1()
                     .gap_1p5()
                     .items_center()
-                    .rounded_lg()
-                    .bg(rgba(0x0E1014C8))
+                    .rounded_full()
+                    .bg(pill_bg)
+                    .shadow_sm()
                     .when(is_muted, |pill| {
                         pill.child(
                             Icon::new(IconName::MicOff)
                                 .size(px(11.))
-                                .text_color(crimson),
+                                .text_color(pal.danger),
                         )
                     })
-                    .when(!is_muted && speaking, |pill| {
-                        pill.child(div().size(px(7.)).rounded_full().bg(emerald))
+                    .when(!is_muted, |pill| {
+                        pill.child(div().size(px(7.)).rounded_full().bg(if speaking {
+                            pal.success
+                        } else {
+                            pal.drawer_muted
+                        }))
                     })
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(white)
-                            .child(display_name),
-                    ),
+                    .when(!full_bleed_avatar, |pill| {
+                        pill.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(pill_fg)
+                                .child(display_name),
+                        )
+                    }),
             )
     }
 
     fn render_huddle_floating_reactions(
         &self,
         state: &crate::huddle_dock::HuddleViewState,
+        pal: &HuddlePalette,
     ) -> Option<gpui_kit::gpui::Div> {
         if state.reactions.is_empty() {
             return None;
         }
-        let white = rgb(0xFFFFFF);
-        let muted = rgb(0xABABAD);
         let mut stacked: Vec<(String, usize, Vec<String>)> = Vec::new();
         for entry in &state.reactions {
             let who = self.fixtures.user_name(&entry.user).to_owned();
@@ -2133,14 +2327,14 @@ impl PopoutWindow {
                         .gap_1p5()
                         .items_center()
                         .rounded_full()
-                        .bg(rgba(0x14171CE0))
+                        .bg(pal.popover_bg)
                         .border_1()
-                        .border_color(rgba(0xFFFFFF1F))
+                        .border_color(pal.popover_border)
                         .shadow_lg()
                         .text_xs()
-                        .text_color(white)
+                        .text_color(pal.popover_fg)
                         .child(label)
-                        .child(div().text_color(muted).child(names.join(", ")))
+                        .child(div().text_color(pal.popover_muted).child(names.join(", ")))
                 })),
         )
     }
@@ -2148,29 +2342,28 @@ impl PopoutWindow {
     fn render_huddle_floating_captions(
         &self,
         state: &crate::huddle_dock::HuddleViewState,
+        pal: &HuddlePalette,
     ) -> Option<gpui_kit::gpui::Div> {
         let show_captions = state.session.captions_enabled || !state.captions.is_empty();
         if !show_captions {
             return None;
         }
-        let white = rgb(0xFFFFFF);
-        let muted = rgb(0xABABAD);
         let mut cap_box = v_flex()
             .max_w(px(620.))
             .px_4()
             .py_2()
             .gap_0p5()
             .rounded_xl()
-            .bg(rgba(0x0B0D10DC))
+            .bg(pal.scrim_bg)
             .border_1()
             .border_color(rgba(0xFFFFFF18))
             .shadow_xl()
             .text_xs()
-            .text_color(white);
+            .text_color(pal.scrim_fg);
         if state.captions.is_empty() {
             cap_box = cap_box.child(
                 div()
-                    .text_color(muted)
+                    .text_color(pal.scrim_muted)
                     .child("CC · Listening for live speech transcripts…"),
             );
         } else {
@@ -2181,12 +2374,16 @@ impl PopoutWindow {
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(muted)
+                            .text_color(pal.scrim_muted)
                             .child(format!("{who}:")),
                     )
                     .child(
                         div()
-                            .text_color(if *is_partial { muted } else { white })
+                            .text_color(if *is_partial {
+                                pal.scrim_muted
+                            } else {
+                                pal.scrim_fg
+                            })
                             .child(text.clone()),
                     )
             }));
@@ -2208,65 +2405,257 @@ impl PopoutWindow {
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
         channel: &ChannelId,
         people: &[slackless_core::types::UserId],
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
         if self.huddle_share_open {
-            return Some(self.render_huddle_share_panel(snap.share_source_id.as_deref(), cx));
+            return Some(self.render_huddle_share_panel(snap.share_source_id.as_deref(), pal, cx));
         }
         if self.huddle_reactions_open {
-            return Some(self.render_huddle_reactions_panel(snap, cx));
+            return Some(self.render_huddle_reactions_panel(snap, pal, cx));
         }
         if self.huddle_theme_open {
-            return Some(self.render_huddle_theme_panel(snap.background_id.as_deref(), cx));
+            return Some(self.render_huddle_theme_panel(snap.background_id.as_deref(), pal, cx));
         }
         if self.huddle_invite_open {
-            return Some(self.render_huddle_invite_panel(channel, people, cx));
+            return Some(self.render_huddle_invite_panel(channel, people, pal, cx));
         }
         if self.huddle_devices_open {
             return Some(self.render_huddle_devices_panel(
                 snap.input_device.clone(),
                 snap.output_device.clone(),
+                pal,
                 cx,
             ));
         }
+        if self.huddle_more_open {
+            return Some(self.render_huddle_more_panel(snap, pal, cx));
+        }
         None
+    }
+
+    fn render_huddle_more_panel(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        pal: &HuddlePalette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        use gpui_kit::component::Icon;
+        use slackless_core::huddle::list_audio_devices;
+
+        let hover = pal.popover_hover;
+        let captions_now = snap.captions_enabled;
+        let music_on = snap.jukebox_song.is_some();
+        let notes_open = self.huddle_drawer == Some(HuddleDrawer::Notes);
+        let channel = snap.channel.clone();
+        let browser_url = snap.huddle_link.clone().unwrap_or_else(|| {
+            let team = self
+                .fixtures
+                .workspaces
+                .first()
+                .map(|t| t.id.to_string())
+                .unwrap_or_default();
+            format!("https://app.slack.com/huddle/{team}/{channel}")
+        });
+        let send_cc = self.send.clone();
+        let send_music = self.send.clone();
+        let send_copy = self.send.clone();
+        let copy_ch = channel.clone();
+
+        let item = |id: &'static str, icon: IconName, label: String, active: bool| {
+            h_flex()
+                .id(id)
+                .px_2p5()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .rounded_lg()
+                .cursor_pointer()
+                .hover(move |el| el.bg(hover))
+                .text_xs()
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .text_color(if active { pal.link } else { pal.popover_fg })
+                .child(Icon::new(icon).size(px(14.)).text_color(if active {
+                    pal.link
+                } else {
+                    pal.popover_muted
+                }))
+                .child(label)
+        };
+
+        v_flex()
+            .w(px(248.))
+            .p_2()
+            .gap_0p5()
+            .rounded_xl()
+            .border_1()
+            .border_color(pal.popover_border)
+            .bg(pal.popover_bg)
+            .shadow_2xl()
+            .text_color(pal.popover_fg)
+            .child(
+                item(
+                    "popout-huddle-canvas",
+                    IconName::FileText,
+                    if notes_open {
+                        "Hide huddle notes".to_owned()
+                    } else {
+                        "Open huddle notes".to_owned()
+                    },
+                    notes_open,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.huddle_more_open = false;
+                    this.huddle_drawer = if this.huddle_drawer == Some(HuddleDrawer::Notes) {
+                        None
+                    } else {
+                        Some(HuddleDrawer::Notes)
+                    };
+                    cx.notify();
+                })),
+            )
+            .child(
+                item(
+                    "popout-huddle-cc",
+                    IconName::Captions,
+                    if captions_now {
+                        "Turn off live captions".to_owned()
+                    } else {
+                        "Turn on live captions".to_owned()
+                    },
+                    captions_now,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next = !captions_now;
+                    (send_cc)(Command::SetHuddleCaptions(next));
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_captions_local(next, cx));
+                        }
+                    }
+                    this.huddle_more_open = false;
+                    cx.notify();
+                })),
+            )
+            .child(
+                item(
+                    "popout-huddle-music",
+                    IconName::Music,
+                    if music_on {
+                        "Stop background music".to_owned()
+                    } else {
+                        "Play lo-fi background music".to_owned()
+                    },
+                    music_on,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next_song = (!music_on).then(|| "lofi".to_owned());
+                    (send_music)(Command::SetHuddleJukebox(next_song.clone()));
+                    if this.fixtures.sample {
+                        if let Some(dock) = this.huddle_dock_entity() {
+                            dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
+                        }
+                    }
+                    this.huddle_more_open = false;
+                    cx.notify();
+                })),
+            )
+            .child(
+                item(
+                    "popout-huddle-devices-menu",
+                    IconName::SlidersHorizontal,
+                    "Audio devices…".to_owned(),
+                    false,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_huddle_popovers();
+                    this.huddle_devices_open = true;
+                    cx.spawn(async move |win, cx| {
+                        let devices = cx
+                            .background_executor()
+                            .spawn(async move { list_audio_devices() })
+                            .await;
+                        let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
+                            win.huddle_devices = devices;
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                    cx.notify();
+                })),
+            )
+            .child(div().h(px(1.)).my_1().bg(pal.popover_border))
+            .child(
+                item(
+                    "popout-huddle-copy-link",
+                    IconName::Link,
+                    "Copy huddle link".to_owned(),
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    (send_copy)(Command::CopyHuddleLink {
+                        channel: copy_ch.clone(),
+                    });
+                    this.huddle_more_open = false;
+                    cx.notify();
+                })),
+            )
+            .child(
+                item(
+                    "popout-huddle-browser",
+                    IconName::ExternalLink,
+                    "Open in browser".to_owned(),
+                    false,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.open_url(&browser_url);
+                    this.huddle_more_open = false;
+                    cx.notify();
+                })),
+            )
     }
 
     fn render_huddle_share_panel(
         &self,
         active_source: Option<&str>,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let (card_bg, border, muted, white, emerald, crimson) = (
-            rgb(0x222529),
-            rgba(0xFFFFFF22),
-            rgb(0xABABAD),
-            rgb(0xFFFFFF),
-            rgb(0x007A5A),
-            rgb(0xE01E5A),
-        );
         let send = self.send.clone();
         let loopback = slackless_core::huddle::system_audio_source_label();
+        let hover = pal.popover_hover;
+        let primary = pal.primary;
+        let primary_fg = pal.primary_fg;
+        let surface = pal.drawer_surface;
+
         v_flex()
             .max_w(px(560.))
             .p_3()
             .gap_2p5()
             .rounded_2xl()
             .border_1()
-            .border_color(border)
-            .bg(card_bg)
+            .border_color(pal.popover_border)
+            .bg(pal.popover_bg)
             .shadow_2xl()
-            .text_color(white)
+            .text_color(pal.popover_fg)
             .child(
                 h_flex()
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgba(0xFFFFFF0A))
+                    .bg(surface)
                     .items_center()
                     .gap_2()
                     .text_xs()
-                    .text_color(if loopback.is_some() { emerald } else { muted })
+                    .text_color(if loopback.is_some() {
+                        pal.success
+                    } else {
+                        pal.popover_muted
+                    })
                     .child(if let Some(dev) = loopback {
                         format!("System audio capture ready via {dev}")
                     } else {
@@ -2283,7 +2672,7 @@ impl PopoutWindow {
                         div()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(muted)
+                            .text_color(pal.popover_muted)
                             .child("Share a screen or window"),
                     )
                     .when(active_source.is_some(), |row| {
@@ -2294,11 +2683,11 @@ impl PopoutWindow {
                                 .px_2p5()
                                 .py_1()
                                 .rounded_full()
-                                .bg(crimson)
+                                .bg(pal.danger)
                                 .cursor_pointer()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(white)
+                                .text_color(pal.danger_fg)
                                 .child("Stop sharing")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     (send_stop)(Command::SetHuddleScreenShare { source_id: None });
@@ -2316,7 +2705,7 @@ impl PopoutWindow {
             .child(if self.huddle_screens.is_empty() {
                 div()
                     .text_xs()
-                    .text_color(muted)
+                    .text_color(pal.popover_muted)
                     .child("Scanning screens & windows… (grant Screen Recording permission in macOS System Settings if none appear)")
                     .into_any_element()
             } else {
@@ -2334,10 +2723,10 @@ impl PopoutWindow {
                             .py_1()
                             .rounded_lg()
                             .cursor_pointer()
-                            .bg(if selected { emerald } else { rgba(0xFFFFFF12) })
-                            .hover(|el| el.bg(if selected { emerald } else { rgba(0xFFFFFF22) }))
+                            .bg(if selected { primary } else { surface })
+                            .hover(move |el| el.bg(if selected { primary } else { hover }))
                             .text_xs()
-                            .text_color(white)
+                            .text_color(if selected { primary_fg } else { pal.popover_fg })
                             .child(if selected {
                                 format!("✓ {prefix}{}", src.name)
                             } else {
@@ -2365,6 +2754,7 @@ impl PopoutWindow {
     fn render_huddle_reactions_panel(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use slackless_core::huddle::{HuddleDataEvent, HuddleReactionKind};
@@ -2394,31 +2784,34 @@ impl PopoutWindow {
             ("✅", "Ready", "white_check_mark"),
         ];
 
-        let (card_bg, border, muted, white, emerald) = (
-            rgb(0x222529),
-            rgba(0xFFFFFF22),
-            rgb(0xABABAD),
-            rgb(0xFFFFFF),
-            rgb(0x007A5A),
-        );
         let send = self.send.clone();
         let active_sticky = snap.sticky_emoji.clone();
+        let hover = pal.popover_hover;
+        let surface = pal.drawer_surface;
+        let primary = pal.primary;
+        let primary_fg = pal.primary_fg;
 
         v_flex()
             .p_3()
             .gap_2p5()
             .rounded_2xl()
             .border_1()
-            .border_color(border)
-            .bg(card_bg)
+            .border_color(pal.popover_border)
+            .bg(pal.popover_bg)
             .shadow_2xl()
-            .text_color(white)
+            .text_color(pal.popover_fg)
             .child(
                 h_flex()
                     .flex_wrap()
                     .gap_1()
                     .items_center()
-                    .child(div().w(px(52.)).text_xs().text_color(muted).child("React"))
+                    .child(
+                        div()
+                            .w(px(52.))
+                            .text_xs()
+                            .text_color(pal.popover_muted)
+                            .child("React"),
+                    )
                     .children(QUICK.iter().enumerate().map(|(ix, &(glyph, code))| {
                         let em = code.to_owned();
                         let send_em = send.clone();
@@ -2427,7 +2820,7 @@ impl PopoutWindow {
                             .size(px(32.))
                             .rounded_lg()
                             .cursor_pointer()
-                            .hover(|el| el.bg(rgba(0xFFFFFF1C)))
+                            .hover(move |el| el.bg(hover))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -2469,7 +2862,7 @@ impl PopoutWindow {
                         div()
                             .w(px(52.))
                             .text_xs()
-                            .text_color(muted)
+                            .text_color(pal.popover_muted)
                             .child("Effects"),
                     )
                     .children(
@@ -2485,10 +2878,10 @@ impl PopoutWindow {
                                     .py_1()
                                     .rounded_full()
                                     .cursor_pointer()
-                                    .bg(rgba(0xFFFFFF12))
-                                    .hover(|el| el.bg(rgba(0xFFFFFF22)))
+                                    .bg(surface)
+                                    .hover(move |el| el.bg(hover))
                                     .text_xs()
-                                    .text_color(white)
+                                    .text_color(pal.popover_fg)
                                     .child(format!("{glyph} {label}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         (send_ef)(Command::SendHuddleReaction {
@@ -2524,7 +2917,13 @@ impl PopoutWindow {
                     .flex_wrap()
                     .gap_1p5()
                     .items_center()
-                    .child(div().w(px(52.)).text_xs().text_color(muted).child("Sticky"))
+                    .child(
+                        div()
+                            .w(px(52.))
+                            .text_xs()
+                            .text_color(pal.popover_muted)
+                            .child("Sticky"),
+                    )
                     .children(
                         STICKY
                             .iter()
@@ -2539,12 +2938,10 @@ impl PopoutWindow {
                                     .py_1()
                                     .rounded_full()
                                     .cursor_pointer()
-                                    .bg(if selected { emerald } else { rgba(0xFFFFFF12) })
-                                    .hover(|el| {
-                                        el.bg(if selected { emerald } else { rgba(0xFFFFFF22) })
-                                    })
+                                    .bg(if selected { primary } else { surface })
+                                    .hover(move |el| el.bg(if selected { primary } else { hover }))
                                     .text_xs()
-                                    .text_color(white)
+                                    .text_color(if selected { primary_fg } else { pal.popover_fg })
                                     .child(format!("{glyph} {label}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         (send_st)(Command::SetHuddleStickyEmoji(next.clone()));
@@ -2572,24 +2969,21 @@ impl PopoutWindow {
     fn render_huddle_theme_panel(
         &self,
         active_bg: Option<&str>,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        const THEMES: [(&str, &str, u32); 6] = [
-            ("default", "Obsidian", 0x1A1D21),
+        const THEMES: [(&str, &str, u32); 7] = [
+            ("default", "Match theme", 0xCBEAD7),
+            ("meadow", "Meadow", 0xBCE3CC),
+            ("sky", "Daylight", 0xC5E5FA),
             ("midnight", "Midnight", 0x10172A),
-            ("sunset", "Sunset", 0x2B1818),
             ("forest", "Forest", 0x11221B),
-            ("ocean", "Ocean", 0x0F212E),
+            ("sunset", "Sunset", 0x2B1818),
             ("plum", "Aubergine", 0x24142B),
         ];
-        let (card_bg, border, muted, white, emerald) = (
-            rgb(0x222529),
-            rgba(0xFFFFFF22),
-            rgb(0xABABAD),
-            rgb(0xFFFFFF),
-            rgb(0x2BAC76),
-        );
         let send = self.send.clone();
+        let hover = pal.popover_hover;
+        let surface = pal.drawer_surface;
         h_flex()
             .p_3()
             .flex_wrap()
@@ -2597,17 +2991,17 @@ impl PopoutWindow {
             .items_center()
             .rounded_2xl()
             .border_1()
-            .border_color(border)
-            .bg(card_bg)
+            .border_color(pal.popover_border)
+            .bg(pal.popover_bg)
             .shadow_2xl()
-            .text_color(white)
+            .text_color(pal.popover_fg)
             .child(
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(muted)
+                    .text_color(pal.popover_muted)
                     .mr_1()
-                    .child("Theme"),
+                    .child("Background"),
             )
             .children(THEMES.iter().enumerate().map(|(ix, &(id, label, hex))| {
                 let selected = active_bg == Some(id) || (active_bg.is_none() && id == "default");
@@ -2621,23 +3015,23 @@ impl PopoutWindow {
                     .items_center()
                     .rounded_full()
                     .cursor_pointer()
-                    .bg(if selected {
-                        rgba(0xFFFFFF24)
-                    } else {
-                        rgba(0xFFFFFF10)
-                    })
+                    .bg(if selected { hover } else { surface })
                     .border_1()
-                    .border_color(if selected { emerald } else { rgba(0xFFFFFF18) })
-                    .hover(|el| el.bg(rgba(0xFFFFFF20)))
+                    .border_color(if selected {
+                        pal.success
+                    } else {
+                        pal.popover_border
+                    })
+                    .hover(move |el| el.bg(hover))
                     .text_xs()
-                    .text_color(white)
+                    .text_color(pal.popover_fg)
                     .child(
                         div()
                             .size(px(12.))
                             .rounded_full()
                             .bg(rgb(hex))
                             .border_1()
-                            .border_color(rgba(0xFFFFFF44)),
+                            .border_color(pal.popover_border),
                     )
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2655,14 +3049,9 @@ impl PopoutWindow {
         &self,
         channel: &ChannelId,
         people: &[slackless_core::types::UserId],
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let (card_bg, border, muted, white) = (
-            rgb(0x222529),
-            rgba(0xFFFFFF22),
-            rgb(0xABABAD),
-            rgb(0xFFFFFF),
-        );
         let candidates: Vec<_> = self
             .fixtures
             .users
@@ -2673,21 +3062,24 @@ impl PopoutWindow {
             .collect();
         let inv_ch = channel.clone();
         let send_inv = self.send.clone();
+        let hover = pal.popover_hover;
+        let surface = pal.drawer_surface;
+
         v_flex()
             .max_w(px(520.))
             .p_3()
             .gap_2()
             .rounded_2xl()
             .border_1()
-            .border_color(border)
-            .bg(card_bg)
+            .border_color(pal.popover_border)
+            .bg(pal.popover_bg)
             .shadow_2xl()
-            .text_color(white)
+            .text_color(pal.popover_fg)
             .child(
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(muted)
+                    .text_color(pal.popover_muted)
                     .child("Invite people to this huddle"),
             )
             .child(
@@ -2707,14 +3099,14 @@ impl PopoutWindow {
                             .items_center()
                             .rounded_full()
                             .cursor_pointer()
-                            .bg(rgba(0xFFFFFF12))
-                            .hover(|el| el.bg(rgba(0xFFFFFF22)))
+                            .bg(surface)
+                            .hover(move |el| el.bg(hover))
                             .text_xs()
-                            .text_color(white)
+                            .text_color(pal.popover_fg)
                             .child(
                                 gpui_kit::component::Icon::new(IconName::UserPlus)
                                     .size(px(12.))
-                                    .text_color(muted),
+                                    .text_color(pal.popover_muted),
                             )
                             .child(label)
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2739,32 +3131,31 @@ impl PopoutWindow {
         &self,
         cur_in: Option<String>,
         cur_out: Option<String>,
+        pal: &HuddlePalette,
         _cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
-        let (card_bg, border, muted, white, emerald) = (
-            rgb(0x222529),
-            rgba(0xFFFFFF22),
-            rgb(0xABABAD),
-            rgb(0xFFFFFF),
-            rgb(0x007A5A),
-        );
         let send_in = self.send.clone();
         let send_out = self.send.clone();
+        let hover = pal.popover_hover;
+        let surface = pal.drawer_surface;
+        let primary = pal.primary;
+        let primary_fg = pal.primary_fg;
+
         v_flex()
             .max_w(px(540.))
             .p_3()
             .gap_2()
             .rounded_2xl()
             .border_1()
-            .border_color(border)
-            .bg(card_bg)
+            .border_color(pal.popover_border)
+            .bg(pal.popover_bg)
             .shadow_2xl()
-            .text_color(white)
+            .text_color(pal.popover_fg)
             .child(
                 div()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(muted)
+                    .text_color(pal.popover_muted)
                     .child("Microphone"),
             )
             .child(
@@ -2785,12 +3176,10 @@ impl PopoutWindow {
                                 .py_1()
                                 .rounded_lg()
                                 .cursor_pointer()
-                                .bg(if selected { emerald } else { rgba(0xFFFFFF12) })
-                                .hover(|el| {
-                                    el.bg(if selected { emerald } else { rgba(0xFFFFFF22) })
-                                })
+                                .bg(if selected { primary } else { surface })
+                                .hover(move |el| el.bg(if selected { primary } else { hover }))
                                 .text_xs()
-                                .text_color(white)
+                                .text_color(if selected { primary_fg } else { pal.popover_fg })
                                 .child(if selected {
                                     format!("✓ {}", d.name)
                                 } else {
@@ -2810,7 +3199,7 @@ impl PopoutWindow {
                     .mt_1()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(muted)
+                    .text_color(pal.popover_muted)
                     .child("Speaker"),
             )
             .child(
@@ -2831,12 +3220,10 @@ impl PopoutWindow {
                                 .py_1()
                                 .rounded_lg()
                                 .cursor_pointer()
-                                .bg(if selected { emerald } else { rgba(0xFFFFFF12) })
-                                .hover(|el| {
-                                    el.bg(if selected { emerald } else { rgba(0xFFFFFF22) })
-                                })
+                                .bg(if selected { primary } else { surface })
+                                .hover(move |el| el.bg(if selected { primary } else { hover }))
                                 .text_xs()
-                                .text_color(white)
+                                .text_color(if selected { primary_fg } else { pal.popover_fg })
                                 .child(if selected {
                                     format!("✓ {}", d.name)
                                 } else {
@@ -2853,77 +3240,190 @@ impl PopoutWindow {
             )
     }
 
-    fn render_huddle_media_controls(
+    fn render_huddle_controls(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
+        status_color: Hsla,
+        pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
-        use slackless_core::huddle::list_screen_sources;
+        use slackless_core::huddle::{list_audio_devices, list_screen_sources};
 
-        let (muted_now, video_now, blur_now, sharing_now) =
-            (snap.muted, snap.video, snap.blur_background, snap.sharing);
-        let (dark_btn, dark_hover, white, obsidian, crimson, emerald) = (
-            rgb(0x2E3136),
-            rgb(0x3B3F46),
-            rgb(0xFFFFFF),
-            rgb(0x1A1D21),
-            rgb(0xE01E5A),
-            rgb(0x007A5A),
+        let (muted_now, video_now, blur_now, sharing_now, hand_now) = (
+            snap.muted,
+            snap.video,
+            snap.blur_background,
+            snap.sharing,
+            snap.hand_raised,
         );
+        let thread_open = self.huddle_drawer == Some(HuddleDrawer::Thread);
+        let diag_open = self.huddle_drawer == Some(HuddleDrawer::Diagnostics);
+        let ctrl_bg = pal.ctrl_bg;
+        let ctrl_hover = pal.ctrl_hover;
+        let ctrl_fg = pal.chrome_fg;
+        let active_bg = pal.ctrl_active_bg;
+        let active_fg = pal.ctrl_active_fg;
 
+        // Left utility cluster: signal/diagnostics + invite (matches official Slack).
+        let left_cluster = h_flex()
+            .items_center()
+            .gap_1p5()
+            .child(
+                div()
+                    .id("popout-huddle-diag")
+                    .size(px(34.))
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if diag_open { ctrl_hover } else { ctrl_bg })
+                    .hover(move |el| el.bg(ctrl_hover))
+                    .child(
+                        Icon::new(IconName::Activity)
+                            .size(px(15.))
+                            .text_color(status_color),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.huddle_drawer =
+                            if this.huddle_drawer == Some(HuddleDrawer::Diagnostics) {
+                                None
+                            } else {
+                                Some(HuddleDrawer::Diagnostics)
+                            };
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("popout-huddle-header-invite")
+                    .size(px(34.))
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if self.huddle_invite_open {
+                        ctrl_hover
+                    } else {
+                        ctrl_bg
+                    })
+                    .hover(move |el| el.bg(ctrl_hover))
+                    .child(
+                        Icon::new(IconName::UserPlus)
+                            .size(px(15.))
+                            .text_color(ctrl_fg),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = !this.huddle_invite_open;
+                        this.close_huddle_popovers();
+                        this.huddle_invite_open = next;
+                        cx.notify();
+                    })),
+            );
+
+        // Center primary cluster (matches official Slack's exact order:
+        // Mic + caret | Camera (+ Blur) | Screen Share | Hand | Reactions | Theme | Thread | More).
         let send_mute = self.send.clone();
         let next_muted = !muted_now;
-        let mic_btn = div()
-            .id("popout-huddle-mic")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(if muted_now { crimson } else { dark_btn })
-            .hover(|el| el.bg(if muted_now { rgb(0xC91A50) } else { dark_hover }))
+        let mic_btn = h_flex()
+            .h(px(36.))
+            .rounded_lg()
+            .overflow_hidden()
+            .bg(if muted_now { pal.danger } else { active_bg })
             .child(
-                Icon::new(if muted_now {
-                    IconName::MicOff
-                } else {
-                    IconName::Mic
-                })
-                .size(px(17.))
-                .text_color(white),
+                div()
+                    .id("popout-huddle-mic")
+                    .h_full()
+                    .px_2p5()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(if muted_now {
+                            IconName::MicOff
+                        } else {
+                            IconName::Mic
+                        })
+                        .size(px(16.))
+                        .text_color(if muted_now {
+                            pal.danger_fg
+                        } else {
+                            active_fg
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        (send_mute)(Command::SetHuddleMuted(next_muted));
+                        if this.fixtures.sample {
+                            if let Some(dock) = this.huddle_dock_entity() {
+                                dock.update(cx, |d, cx| d.set_muted_local(next_muted, cx));
+                            }
+                        }
+                    })),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                (send_mute)(Command::SetHuddleMuted(next_muted));
-                if this.fixtures.sample {
-                    if let Some(dock) = this.huddle_dock_entity() {
-                        dock.update(cx, |d, cx| d.set_muted_local(next_muted, cx));
-                    }
-                }
-            }));
+            .child(
+                div()
+                    .id("popout-huddle-devices-btn")
+                    .h_full()
+                    .px_1p5()
+                    .cursor_pointer()
+                    .border_l_1()
+                    .border_color(if muted_now {
+                        pal.danger_fg.opacity(0.2)
+                    } else {
+                        active_fg.opacity(0.18)
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::ChevronUp)
+                            .size(px(12.))
+                            .text_color(if muted_now { pal.danger_fg } else { active_fg }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = !this.huddle_devices_open;
+                        this.close_huddle_popovers();
+                        this.huddle_devices_open = next;
+                        if this.huddle_devices_open {
+                            cx.spawn(async move |win, cx| {
+                                let devices = cx
+                                    .background_executor()
+                                    .spawn(async move { list_audio_devices() })
+                                    .await;
+                                let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
+                                    win.huddle_devices = devices;
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        }
+                        cx.notify();
+                    })),
+            );
 
         let send_cam = self.send.clone();
         let next_cam = !video_now;
         let cam_btn = div()
             .id("popout-huddle-video")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
+            .size(px(36.))
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if video_now { white } else { dark_btn })
-            .hover(|el| el.bg(if video_now { rgb(0xE8E8E8) } else { dark_hover }))
+            .bg(if video_now { active_bg } else { ctrl_bg })
+            .hover(move |el| el.bg(if video_now { active_bg } else { ctrl_hover }))
             .child(
                 Icon::new(if video_now {
                     IconName::Video
                 } else {
                     IconName::VideoOff
                 })
-                .size(px(17.))
-                .text_color(if video_now { obsidian } else { white }),
+                .size(px(16.))
+                .text_color(if video_now { active_fg } else { ctrl_fg }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 (send_cam)(Command::SetHuddleCamera {
@@ -2942,18 +3442,18 @@ impl PopoutWindow {
         let next_blur = !blur_now;
         let blur_btn = div()
             .id("popout-huddle-blur")
-            .h(px(40.))
-            .px_3()
-            .rounded_full()
+            .h(px(36.))
+            .px_2p5()
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if blur_now { white } else { dark_btn })
-            .hover(|el| el.bg(if blur_now { rgb(0xE8E8E8) } else { dark_hover }))
+            .bg(if blur_now { active_bg } else { ctrl_bg })
+            .hover(move |el| el.bg(if blur_now { active_bg } else { ctrl_hover }))
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(if blur_now { obsidian } else { white })
+            .text_color(if blur_now { active_fg } else { ctrl_fg })
             .child(if blur_now { "Blur on" } else { "Blur" })
             .on_click(cx.listener(move |this, _, _, cx| {
                 (send_blur)(Command::SetHuddleBlurBackground(next_blur));
@@ -2964,27 +3464,29 @@ impl PopoutWindow {
                 }
             }));
 
+        let primary = pal.primary;
+        let primary_hover = pal.primary_hover;
+        let primary_fg = pal.primary_fg;
         let share_btn = div()
             .id("popout-huddle-share")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
+            .size(px(36.))
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if sharing_now { emerald } else { dark_btn })
-            .hover(|el| {
+            .bg(if sharing_now { primary } else { ctrl_bg })
+            .hover(move |el| {
                 el.bg(if sharing_now {
-                    rgb(0x2BAC76)
+                    primary_hover
                 } else {
-                    dark_hover
+                    ctrl_hover
                 })
             })
             .child(
                 Icon::new(IconName::ScreenShare)
-                    .size(px(17.))
-                    .text_color(white),
+                    .size(px(16.))
+                    .text_color(if sharing_now { primary_fg } else { ctrl_fg }),
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 let next = !this.huddle_share_open;
@@ -3006,48 +3508,24 @@ impl PopoutWindow {
                 cx.notify();
             }));
 
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(mic_btn)
-            .child(cam_btn)
-            .when(video_now, |bar| bar.child(blur_btn))
-            .child(share_btn)
-    }
-
-    fn render_huddle_collab_controls(
-        &self,
-        snap: &slackless_core::huddle::HuddleSessionSnapshot,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::gpui::Div {
-        let (dark_btn, dark_hover, white, obsidian, amber) = (
-            rgb(0x2E3136),
-            rgb(0x3B3F46),
-            rgb(0xFFFFFF),
-            rgb(0x1A1D21),
-            rgb(0xECB22E),
-        );
-        let hand_now = snap.hand_raised;
-        let captions_now = snap.captions_enabled;
-        let music_on = snap.jukebox_song.is_some();
-
         let send_hand = self.send.clone();
         let next_hand = !hand_now;
+        let warn = pal.warning;
+        let warn_fg = pal.warning_fg;
         let hand_btn = div()
             .id("popout-huddle-hand")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
+            .size(px(36.))
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if hand_now { amber } else { dark_btn })
-            .hover(|el| el.bg(if hand_now { amber } else { dark_hover }))
+            .bg(if hand_now { warn } else { ctrl_bg })
+            .hover(move |el| el.bg(if hand_now { warn } else { ctrl_hover }))
             .child(
-                gpui_kit::component::Icon::new(IconName::Hand)
-                    .size(px(17.))
-                    .text_color(if hand_now { obsidian } else { white }),
+                Icon::new(IconName::Hand)
+                    .size(px(16.))
+                    .text_color(if hand_now { warn_fg } else { ctrl_fg }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 (send_hand)(Command::SetHuddleHandRaised(next_hand));
@@ -3069,21 +3547,23 @@ impl PopoutWindow {
 
         let react_btn = div()
             .id("popout-huddle-react-btn")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
+            .size(px(36.))
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
             .bg(if self.huddle_reactions_open {
-                dark_hover
+                ctrl_hover
             } else {
-                dark_btn
+                ctrl_bg
             })
-            .hover(|el| el.bg(dark_hover))
-            .text_base()
-            .child("😊")
+            .hover(move |el| el.bg(ctrl_hover))
+            .child(
+                Icon::new(IconName::FaceSlightlySmiling)
+                    .size(px(16.))
+                    .text_color(ctrl_fg),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
                 let next = !this.huddle_reactions_open;
                 this.close_huddle_popovers();
@@ -3091,213 +3571,129 @@ impl PopoutWindow {
                 cx.notify();
             }));
 
-        let send_cc = self.send.clone();
-        let next_cc = !captions_now;
-        let cc_btn = div()
-            .id("popout-huddle-cc")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
+        let theme_btn = div()
+            .id("popout-huddle-theme-btn")
+            .size(px(36.))
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if captions_now { white } else { dark_btn })
-            .hover(|el| {
-                el.bg(if captions_now {
-                    rgb(0xE8E8E8)
-                } else {
-                    dark_hover
-                })
+            .bg(if self.huddle_theme_open {
+                ctrl_hover
+            } else {
+                ctrl_bg
             })
+            .hover(move |el| el.bg(ctrl_hover))
             .child(
-                gpui_kit::component::Icon::new(IconName::Captions)
-                    .size(px(17.))
-                    .text_color(if captions_now { obsidian } else { white }),
+                Icon::new(IconName::Sparkles)
+                    .size(px(16.))
+                    .text_color(ctrl_fg),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                (send_cc)(Command::SetHuddleCaptions(next_cc));
-                if this.fixtures.sample {
-                    if let Some(dock) = this.huddle_dock_entity() {
-                        dock.update(cx, |d, cx| d.set_captions_local(next_cc, cx));
-                    }
-                }
+            .on_click(cx.listener(|this, _, _, cx| {
+                let next = !this.huddle_theme_open;
+                this.close_huddle_popovers();
+                this.huddle_theme_open = next;
+                cx.notify();
             }));
 
-        let send_music = self.send.clone();
-        let next_song = (!music_on).then(|| "lofi".to_owned());
-        let music_btn = div()
-            .id("popout-huddle-music")
-            .w(px(44.))
-            .h(px(40.))
-            .rounded_full()
+        let thread_btn = div()
+            .id("popout-huddle-thread")
+            .size(px(36.))
+            .rounded_lg()
             .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
-            .bg(if music_on { rgb(0x611F69) } else { dark_btn })
-            .hover(|el| el.bg(if music_on { rgb(0x7A2A84) } else { dark_hover }))
+            .bg(if thread_open { active_bg } else { ctrl_bg })
+            .hover(move |el| el.bg(if thread_open { active_bg } else { ctrl_hover }))
             .child(
-                gpui_kit::component::Icon::new(IconName::Music)
+                Icon::new(IconName::MessageSquare)
                     .size(px(16.))
-                    .text_color(white),
+                    .text_color(if thread_open { active_fg } else { ctrl_fg }),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                (send_music)(Command::SetHuddleJukebox(next_song.clone()));
-                if this.fixtures.sample {
-                    if let Some(dock) = this.huddle_dock_entity() {
-                        dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
-                    }
-                }
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.huddle_drawer = if this.huddle_drawer == Some(HuddleDrawer::Thread) {
+                    None
+                } else {
+                    Some(HuddleDrawer::Thread)
+                };
+                cx.notify();
             }));
 
-        h_flex()
-            .gap_2()
+        let more_btn = div()
+            .id("popout-huddle-more-btn")
+            .size(px(36.))
+            .rounded_lg()
+            .cursor_pointer()
+            .flex()
             .items_center()
-            .child(react_btn)
-            .child(hand_btn)
-            .child(cc_btn)
-            .child(music_btn)
-            .child(self.render_huddle_utility_controls(cx))
-    }
+            .justify_center()
+            .bg(if self.huddle_more_open {
+                ctrl_hover
+            } else {
+                ctrl_bg
+            })
+            .hover(move |el| el.bg(ctrl_hover))
+            .child(
+                Icon::new(IconName::EllipsisVertical)
+                    .size(px(16.))
+                    .text_color(ctrl_fg),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                let next = !this.huddle_more_open;
+                this.close_huddle_popovers();
+                this.huddle_more_open = next;
+                cx.notify();
+            }));
 
-    fn render_huddle_utility_controls(&self, cx: &mut Context<Self>) -> gpui_kit::gpui::Div {
-        use gpui_kit::component::Icon;
-        use slackless_core::huddle::list_audio_devices;
-
-        let (dark_btn, dark_hover, white, crimson) =
-            (rgb(0x2E3136), rgb(0x3B3F46), rgb(0xFFFFFF), rgb(0xE01E5A));
+        // Far-right crimson "Leave" button (matches official Slack).
         let send_leave = self.send.clone();
-        h_flex()
-            .gap_2()
+        let danger_hover = pal.danger_hover;
+        let leave_btn = h_flex()
+            .id("popout-huddle-leave")
+            .h(px(36.))
+            .px_4()
             .items_center()
-            .child(
-                div()
-                    .id("popout-huddle-theme-btn")
-                    .w(px(44.))
-                    .h(px(40.))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(if self.huddle_theme_open {
-                        dark_hover
-                    } else {
-                        dark_btn
-                    })
-                    .hover(|el| el.bg(dark_hover))
-                    .child(
-                        Icon::new(IconName::Sparkles)
-                            .size(px(16.))
-                            .text_color(white),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next = !this.huddle_theme_open;
-                        this.close_huddle_popovers();
-                        this.huddle_theme_open = next;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("popout-huddle-devices-btn")
-                    .w(px(44.))
-                    .h(px(40.))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(if self.huddle_devices_open {
-                        dark_hover
-                    } else {
-                        dark_btn
-                    })
-                    .hover(|el| el.bg(dark_hover))
-                    .child(
-                        Icon::new(IconName::SlidersHorizontal)
-                            .size(px(16.))
-                            .text_color(white),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let next = !this.huddle_devices_open;
-                        this.close_huddle_popovers();
-                        this.huddle_devices_open = next;
-                        if this.huddle_devices_open {
-                            cx.spawn(async move |win, cx| {
-                                let devices = cx
-                                    .background_executor()
-                                    .spawn(async move { list_audio_devices() })
-                                    .await;
-                                let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
-                                    win.huddle_devices = devices;
-                                    cx.notify();
-                                });
-                            })
-                            .detach();
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(div().w(px(1.)).h(px(24.)).mx_1().bg(rgba(0xFFFFFF1C)))
-            .child(
-                h_flex()
-                    .id("popout-huddle-leave")
-                    .h(px(40.))
-                    .px_4()
-                    .gap_2()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(crimson)
-                    .hover(|el| el.bg(rgb(0xC91A50)))
-                    .cursor_pointer()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(white)
-                    .child(
-                        Icon::new(IconName::PhoneOff)
-                            .size(px(15.))
-                            .text_color(white),
-                    )
-                    .child("Leave")
-                    .on_click(move |_, window, _| {
-                        (send_leave)(Command::LeaveHuddle);
-                        window.remove_window();
-                    }),
-            )
-    }
+            .justify_center()
+            .rounded_lg()
+            .bg(pal.danger)
+            .hover(move |el| el.bg(danger_hover))
+            .cursor_pointer()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(pal.danger_fg)
+            .child("Leave")
+            .on_click(move |_, window, _| {
+                (send_leave)(Command::LeaveHuddle);
+                window.remove_window();
+            });
 
-    fn render_huddle_controls(
-        &self,
-        snap: &slackless_core::huddle::HuddleSessionSnapshot,
-        bar_bg: Rgba,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::gpui::Div {
         h_flex()
             .flex_none()
-            .h(px(72.))
-            .px_4()
-            .gap_2()
+            .h(px(56.))
+            .px_3p5()
             .items_center()
-            .justify_center()
-            .bg(bar_bg)
+            .justify_between()
+            .bg(pal.chrome_bg)
             .border_t_1()
-            .border_color(rgba(0xFFFFFF10))
-            .child(self.render_huddle_media_controls(snap, cx))
-            .child(self.render_huddle_collab_controls(snap, cx))
-    }
-}
-
-fn huddle_theme_surface(bg_id: Option<&str>) -> (Rgba, Rgba) {
-    match bg_id {
-        Some("midnight") => (rgb(0x10172A), rgb(0x1B2440)),
-        Some("sunset") => (rgb(0x2B1818), rgb(0x3B2222)),
-        Some("forest") => (rgb(0x11221B), rgb(0x1B3328)),
-        Some("ocean") => (rgb(0x0F212E), rgb(0x183244)),
-        Some("plum") => (rgb(0x24142B), rgb(0x351F3E)),
-        _ => (rgb(0x1A1D21), rgb(0x23262B)),
+            .border_color(pal.chrome_border)
+            .child(left_cluster)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(mic_btn)
+                    .child(cam_btn)
+                    .when(video_now, |bar| bar.child(blur_btn))
+                    .child(share_btn)
+                    .child(hand_btn)
+                    .child(react_btn)
+                    .child(theme_btn)
+                    .child(thread_btn)
+                    .child(more_btn),
+            )
+            .child(leave_btn)
     }
 }
 

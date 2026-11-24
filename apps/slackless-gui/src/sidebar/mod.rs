@@ -363,8 +363,11 @@ pub struct Sidebar {
     pub(super) dm_unreads_only: bool,
     /// Channels joined from the channel browser this session, listed after the fixtures'.
     pub(super) joined: Vec<Conversation>,
-    /// Conversations with a live huddle; their rows carry the headphones indicator.
-    pub(super) huddles: HashSet<ChannelId>,
+    /// Conversations with a live huddle and their active participants; their rows carry
+    /// Slack's avatar + headphones count pill.
+    pub(super) huddles: HashMap<ChannelId, Vec<slackless_core::types::UserId>>,
+    /// Whether the signed-in user is currently in a live huddle (draws the rail avatar capsule).
+    pub(super) self_in_huddle: bool,
     /// Saved drafts, shown on the "Drafts & sent" row.
     pub(super) draft_count: usize,
     /// In-progress Later items, shown on the "Later" row.
@@ -509,7 +512,8 @@ impl Sidebar {
                 threads_unread: (false, 0),
                 dm_unreads_only: false,
                 joined: Vec::new(),
-                huddles: HashSet::new(),
+                huddles: HashMap::new(),
+                self_in_huddle: false,
                 draft_count: 0,
                 later_count: 0,
                 settings_menu_open: false,
@@ -775,19 +779,23 @@ impl Sidebar {
         self.show_nav(NavItem::Home, cx);
     }
 
-    /// Mark `channel` as having a live huddle (`None`: no huddle anywhere).
-    pub fn set_huddle(&mut self, channel: Option<ChannelId>, cx: &mut Context<Self>) {
-        self.huddles.clear();
-        if let Some(channel) = channel {
-            self.huddles.insert(channel);
-        }
-        cx.notify();
-    }
-
-    /// Replace the set of conversations currently running a live huddle.
-    pub fn set_huddles(&mut self, huddles: HashSet<ChannelId>, cx: &mut Context<Self>) {
+    /// Replace the map of conversations currently running a live huddle and their participants.
+    pub fn set_huddles(
+        &mut self,
+        huddles: HashMap<ChannelId, Vec<slackless_core::types::UserId>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.huddles != huddles {
             self.huddles = huddles;
+            cx.notify();
+        }
+    }
+
+    /// Whether the signed-in user is currently inside an active huddle (renders the rail
+    /// headphones capsule above the self-avatar, matching official Slack).
+    pub fn set_self_in_huddle(&mut self, in_huddle: bool, cx: &mut Context<Self>) {
+        if self.self_in_huddle != in_huddle {
+            self.self_in_huddle = in_huddle;
             cx.notify();
         }
     }
@@ -2069,16 +2077,39 @@ impl Render for Sidebar {
                         row.child(count_pill(self.threads_unread.1, true, cx))
                     })
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenThreads))),
-                    self.nav_row(
-                        "huddles",
-                        IconName::Headphones,
-                        "Huddles",
-                        false,
-                        self.active_home_page == Some(HomePage::Huddles),
-                        None,
-                        cx,
-                    )
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles))),
+                    {
+                        let mut active_people: Vec<slackless_core::types::UserId> = Vec::new();
+                        for users in self.huddles.values() {
+                            for uid in users {
+                                if !active_people.contains(uid) && active_people.len() < 2 {
+                                    active_people.push(uid.clone());
+                                }
+                            }
+                        }
+                        self.nav_row(
+                            "huddles",
+                            IconName::Headphones,
+                            "Huddles",
+                            false,
+                            self.active_home_page == Some(HomePage::Huddles),
+                            None,
+                            cx,
+                        )
+                        .when(!active_people.is_empty(), |row| {
+                            row.child(h_flex().items_center().children(
+                                active_people.iter().enumerate().map(|(ix, uid)| {
+                                    div()
+                                        .when(ix > 0, |el| el.ml(px(-4.)))
+                                        .rounded(px(4.))
+                                        .overflow_hidden()
+                                        .border_1()
+                                        .border_color(sidebar_bg)
+                                        .child(crate::avatars::user_chip(&self.fixtures, uid, 18.))
+                                }),
+                            ))
+                        })
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles)))
+                    },
                     self.nav_row(
                         "drafts",
                         IconName::Send,

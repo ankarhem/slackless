@@ -2168,6 +2168,109 @@ fn render_huddle_thread_card(message: &Message, kcx: &KitCx, cx: &App) -> Option
             }
         }
     };
+    // Live huddle row: Official Slack's soft mint-green full-width callout banner with
+    // green headphones, participant summary, and prominent green "Join Huddle" button.
+    if !has_ended {
+        let who = match participant_ids.as_slice() {
+            [] => String::new(),
+            [only] => format!(" {} is already there.", fixtures.user_name(only)),
+            [first, second] => format!(
+                " {} and {} are already there.",
+                fixtures.user_name(first),
+                fixtures.user_name(second),
+            ),
+            [first, second, rest @ ..] => format!(
+                " {}, {} and {} others are already there.",
+                fixtures.user_name(first),
+                fixtures.user_name(second),
+                rest.len(),
+            ),
+        };
+        let banner_bg = if theme.mode.is_dark() {
+            theme.success.opacity(0.14)
+        } else {
+            theme.success.opacity(0.10)
+        };
+        return Some(
+            h_flex()
+                .w_full()
+                .px_3()
+                .py_2p5()
+                .gap_3()
+                .items_start()
+                .rounded_lg()
+                .bg(banner_bg)
+                .child(
+                    div().pt(px(2.)).flex_none().child(
+                        Icon::new(IconName::Headphones)
+                            .size(px(16.))
+                            .text_color(theme.primary),
+                    ),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.foreground)
+                                .child(format!("{title}.{who}")),
+                        )
+                        .when_some(kcx.on_action.clone(), |col, handler| {
+                            let ts_key = message.ts.as_str().to_owned();
+                            let join_handler = handler.clone();
+                            let thread_id = SharedString::from(format!("huddle-thread-{ts_key}"));
+                            col.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "huddle-join-{ts_key}"
+                                        )))
+                                        .primary()
+                                        .with_size(Size::Small)
+                                        .label("Join Huddle")
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                join_handler(
+                                                    crate::actions::MessageAction::JoinHuddle,
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        ),
+                                    )
+                                    .when(message.reply_count.unwrap_or(0) > 0, |btns| {
+                                        let replies = message.reply_count.unwrap_or(0);
+                                        let label = if replies == 1 {
+                                            "1 reply".to_owned()
+                                        } else {
+                                            format!("{replies} replies")
+                                        };
+                                        btns.child(
+                                            Button::new(thread_id)
+                                                .ghost()
+                                                .with_size(Size::Small)
+                                                .icon(IconName::MessageSquare)
+                                                .label(label)
+                                                .on_click(move |_, window, cx| {
+                                                    handler(
+                                                        crate::actions::MessageAction::ReplyInThread,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                        )
+                                    }),
+                            )
+                        }),
+                ),
+        );
+    }
+
     Some(
         h_flex()
             .max_w(px(460.))

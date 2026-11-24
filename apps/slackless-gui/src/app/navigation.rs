@@ -1352,6 +1352,8 @@ impl App {
         );
         self.huddle_dock = Some(dock);
         self._huddle_dock_sub = Some(sub);
+        self.sidebar
+            .update(cx, |s, cx| s.set_self_in_huddle(true, cx));
         if let Some((ch, bar)) = &self.huddle {
             if *ch == snap.channel {
                 bar.update(cx, |b, cx| b.update_session(Some(snap), cx));
@@ -1381,6 +1383,8 @@ impl App {
         self.huddle_session = None;
         self.huddle_dock = None;
         self._huddle_dock_sub = None;
+        self.sidebar
+            .update(cx, |s, cx| s.set_self_in_huddle(false, cx));
         if let Some((_, bar)) = &self.huddle {
             bar.update(cx, |b, cx| b.update_session(None, cx));
         }
