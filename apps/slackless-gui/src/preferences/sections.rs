@@ -1251,7 +1251,7 @@ impl Preferences {
         let compact_db = Button::new("adv-compact-db")
             .outline()
             .with_size(Size::Small)
-            .label("Compact database (VACUUM)")
+            .label("Compact database")
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::CompactStorage)));
         let prune_media = Button::new("adv-prune-media")
             .outline()
@@ -1259,42 +1259,59 @@ impl Preferences {
             .label("Prune media cache")
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::PruneMediaCache)));
         let reset_cache = Button::new("adv-reset-cache")
-            .outline()
+            .danger()
             .with_size(Size::Small)
             .label("Clear local cache & reload")
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ResetCache)));
         let storage_summary = {
-            let muted = cx.theme().muted_foreground;
-            let border = cx.theme().border;
-            let card_bg = cx.theme().secondary.opacity(0.35);
-            let body = match &self.storage_stats {
-                Some(st) => v_flex()
-                    .gap_1()
-                    .child(
-                        div().text_sm().child(format!(
-                            "SQLite database: {} · Media cache: {}",
-                            format_bytes(st.db_bytes),
-                            format_bytes(st.media_cache_bytes),
-                        )),
-                    )
-                    .child(div().text_xs().text_color(muted).child(format!(
-                        "{} messages ({} revisions) · {} conversations · {} users · {} queued offline",
-                        st.messages,
-                        st.revisions,
-                        st.conversations,
-                        st.users,
-                        st.offline_queued,
-                    ))),
-                None => v_flex().child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Local SQLite metrics are shown when connected to a live workspace."),
-                ),
-            };
+            let theme = cx.theme();
+            let fg = theme.foreground;
+            let muted = theme.muted_foreground;
+            let border = theme.border;
+            let card_bg = theme.secondary.opacity(0.35);
+            let body =
+                match self.storage_stats.clone() {
+                    Some(st) => {
+                        let mut metrics = h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child("SQLite"),
+                            )
+                            .child(self.mono_chip(format_bytes(st.db_bytes), cx))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child("Media cache"),
+                            )
+                            .child(self.mono_chip(format_bytes(st.media_cache_bytes), cx));
+                        if st.offline_queued > 0 {
+                            metrics = metrics.child(
+                                self.mono_chip(format!("{} queued offline", st.offline_queued), cx),
+                            );
+                        }
+                        v_flex().gap_1p5().child(metrics).child(
+                            div().text_xs().text_color(muted).child(format!(
+                                "{} messages ({} revisions) · {} conversations · {} users",
+                                st.messages, st.revisions, st.conversations, st.users,
+                            )),
+                        )
+                    }
+                    None => v_flex().child(div().text_xs().text_color(muted).child(
+                        "Local SQLite metrics are shown when connected to a live workspace.",
+                    )),
+                };
             v_flex()
-                .gap_2()
-                .p_3()
+                .gap_3()
+                .px_3p5()
+                .py_3()
                 .rounded_md()
                 .border_1()
                 .border_color(border)
@@ -1302,10 +1319,18 @@ impl Preferences {
                 .child(body)
                 .child(
                     h_flex()
+                        .items_center()
+                        .justify_between()
                         .gap_2()
                         .flex_wrap()
-                        .child(compact_db)
-                        .child(prune_media)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .flex_wrap()
+                                .child(compact_db)
+                                .child(prune_media),
+                        )
                         .child(reset_cache),
                 )
         };
@@ -1316,7 +1341,10 @@ impl Preferences {
         };
         let has_custom_dl = !self.settings.download_dir.is_empty();
         let dl_muted = cx.theme().muted_foreground;
-        let dl_border = cx.theme().input;
+        let dl_fg = cx.theme().foreground;
+        let dl_border = cx.theme().border;
+        let dl_bg = cx.theme().secondary.opacity(0.35);
+        let dl_mono = cx.theme().mono_font_family.clone();
         let download_row = h_flex()
             .items_center()
             .gap_2()
@@ -1330,8 +1358,10 @@ impl Preferences {
                     .rounded_md()
                     .border_1()
                     .border_color(dl_border)
-                    .text_sm()
-                    .text_color(dl_muted)
+                    .bg(dl_bg)
+                    .font_family(dl_mono)
+                    .text_xs()
+                    .text_color(if has_custom_dl { dl_fg } else { dl_muted })
                     .child(dl_label),
             )
             .child(
@@ -1860,7 +1890,14 @@ impl Preferences {
     }
 
     fn network_diagnostics_group(&mut self, cx: &mut Context<Self>) -> Div {
-        let dl_border = cx.theme().input;
+        let theme = cx.theme();
+        let dl_border = theme.input;
+        let mono = theme.mono_font_family.clone();
+        let dot_color = if self.settings.net_log_enabled {
+            theme.success
+        } else {
+            theme.muted_foreground
+        };
         let proxy_field = div()
             .w(px(420.))
             .px_2()
@@ -1868,7 +1905,8 @@ impl Preferences {
             .rounded_md()
             .border_1()
             .border_color(dl_border)
-            .text_sm()
+            .font_family(mono)
+            .text_xs()
             .child(
                 Textarea::new(&self.proxy_input)
                     .appearance(false)
@@ -1881,67 +1919,106 @@ impl Preferences {
             cx,
         );
         let net_log_count = slackless_core::api::net_log_snapshot().len();
-        let net_log_actions = h_flex()
-            .items_center()
-            .gap_2()
-            .child(
-                Button::new("adv-net-log-export")
-                    .outline()
-                    .with_size(Size::Small)
-                    .icon(IconName::Download)
-                    .label(format!("Export net log ({net_log_count})"))
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog))),
-            )
-            .child(
-                Button::new("adv-net-log-clear")
-                    .ghost()
-                    .with_size(Size::Small)
-                    .label("Clear")
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        slackless_core::api::clear_net_log();
-                        cx.notify();
-                    })),
-            );
+        let net_log_card = self.status_card(
+            dot_color,
+            if self.settings.net_log_enabled {
+                "Capturing requests"
+            } else {
+                "Capture paused"
+            },
+            Some(SharedString::from(format!(
+                "{net_log_count} {}",
+                if net_log_count == 1 {
+                    "request"
+                } else {
+                    "requests"
+                }
+            ))),
+            "Credentials and tokens are redacted before recording.",
+            false,
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    Button::new("adv-net-log-clear")
+                        .ghost()
+                        .with_size(Size::Small)
+                        .disabled(net_log_count == 0)
+                        .label("Clear")
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            slackless_core::api::clear_net_log();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("adv-net-log-export")
+                        .outline()
+                        .with_size(Size::Small)
+                        .disabled(net_log_count == 0)
+                        .icon(IconName::Download)
+                        .label("Export")
+                        .on_click(
+                            cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog)),
+                        ),
+                ),
+            cx,
+        );
         self.group(
             "Network & diagnostics",
             Some("Optional HTTP/HTTPS/SOCKS proxy (leave empty to use system environment variables) and redacted HTTP net-log capture."),
             v_flex()
-                .gap_2()
+                .gap_2p5()
                 .child(self.labeled("Proxy URL (applies to new connections)", proxy_field))
                 .child(net_log_toggle)
-                .child(net_log_actions),
+                .child(net_log_card),
             cx,
         )
     }
+
+    fn device_choice_button(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        selected: bool,
+    ) -> Button {
+        let btn = Button::new(id).with_size(Size::Small).label(label);
+        if selected {
+            btn.primary().icon(IconName::Check)
+        } else {
+            btn.outline()
+        }
+    }
+
     fn audio_video(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let (border, muted, success) = (theme.border, theme.muted_foreground, theme.success);
+        let (border, muted, success, card_bg) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.success,
+            theme.secondary.opacity(0.35),
+        );
         let active_in = self.settings.huddle_input_device.clone();
         let active_out = self.settings.huddle_output_device.clone();
         let meter_pct = (self.mic_level * 3.5).clamp(0.0, 1.0);
+        let mic_active = self.mic_probe.is_some();
 
         let mic_picker = v_flex()
-            .gap_2()
+            .gap_2p5()
             .child(
                 h_flex()
                     .flex_wrap()
                     .gap_1p5()
-                    .child({
-                        let is_def = active_in.is_none();
-                        Button::new("prefs-mic-default")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label(if is_def {
-                                "✓ System default"
-                            } else {
-                                "System default"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings.huddle_input_device = None;
-                                this.refresh_audio_devices_and_probe(cx);
-                                this.changed(cx);
-                            }))
-                    })
+                    .child(
+                        Self::device_choice_button(
+                            "prefs-mic-default",
+                            "System default",
+                            active_in.is_none(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings.huddle_input_device = None;
+                            this.refresh_audio_devices_and_probe(cx);
+                            this.changed(cx);
+                        })),
+                    )
                     .children(
                         self.audio_devices
                             .inputs
@@ -1950,19 +2027,18 @@ impl Preferences {
                             .map(|(ix, dev)| {
                                 let selected = active_in.as_deref() == Some(dev.name.as_str());
                                 let name = dev.name.clone();
-                                Button::new(("prefs-mic", ix))
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .label(if selected {
-                                        format!("✓ {}", dev.name)
-                                    } else {
-                                        dev.name.clone()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                Self::device_choice_button(
+                                    ("prefs-mic", ix),
+                                    dev.name.clone(),
+                                    selected,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.settings.huddle_input_device = Some(name.clone());
                                         this.refresh_audio_devices_and_probe(cx);
                                         this.changed(cx);
-                                    }))
+                                    },
+                                ))
                             }),
                     ),
             )
@@ -1979,14 +2055,30 @@ impl Preferences {
             )
             .child(
                 v_flex()
-                    .gap_1()
-                    .child(div().text_xs().text_color(muted).child("Input level"))
+                    .gap_1p5()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(card_bg)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(7.)).rounded_full().bg(if mic_active {
+                                success
+                            } else {
+                                muted
+                            }))
+                            .child(div().text_xs().text_color(muted).child("Input level")),
+                    )
                     .child(
                         div()
-                            .w(px(320.))
-                            .h(px(8.))
+                            .w_full()
+                            .h(px(6.))
                             .rounded_full()
-                            .bg(border.opacity(0.5))
+                            .bg(border.opacity(0.6))
                             .overflow_hidden()
                             .child(
                                 div()
@@ -2000,42 +2092,37 @@ impl Preferences {
 
         let speaker_picker =
             v_flex()
-                .gap_2()
+                .gap_2p5()
                 .child(
                     h_flex()
                         .flex_wrap()
                         .gap_1p5()
-                        .child({
-                            let is_def = active_out.is_none();
-                            Button::new("prefs-spk-default")
-                                .outline()
-                                .with_size(Size::Small)
-                                .label(if is_def {
-                                    "✓ System default"
-                                } else {
-                                    "System default"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings.huddle_output_device = None;
-                                    this.changed(cx);
-                                }))
-                        })
+                        .child(
+                            Self::device_choice_button(
+                                "prefs-spk-default",
+                                "System default",
+                                active_out.is_none(),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings.huddle_output_device = None;
+                                this.changed(cx);
+                            })),
+                        )
                         .children(self.audio_devices.outputs.iter().enumerate().map(
                             |(ix, dev)| {
                                 let selected = active_out.as_deref() == Some(dev.name.as_str());
                                 let name = dev.name.clone();
-                                Button::new(("prefs-spk", ix))
-                                    .outline()
-                                    .with_size(Size::Small)
-                                    .label(if selected {
-                                        format!("✓ {}", dev.name)
-                                    } else {
-                                        dev.name.clone()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                Self::device_choice_button(
+                                    ("prefs-spk", ix),
+                                    dev.name.clone(),
+                                    selected,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.settings.huddle_output_device = Some(name.clone());
                                         this.changed(cx);
-                                    }))
+                                    },
+                                ))
                             },
                         )),
                 )
@@ -2139,7 +2226,7 @@ impl Preferences {
             .child(camera_group)
             .child(self.group(
                 "Microphone",
-                Some("Choose which microphone slackless uses for native huddles."),
+                Some("Choose which microphone Slackless uses for native huddles."),
                 mic_picker,
                 cx,
             ))
@@ -2172,35 +2259,24 @@ impl Preferences {
                 h_flex()
                     .flex_wrap()
                     .gap_1p5()
-                    .child({
-                        let is_def = active_cam.is_none();
-                        Button::new("prefs-cam-default")
-                            .outline()
-                            .with_size(Size::Small)
-                            .label(if is_def {
-                                "✓ System default"
-                            } else {
-                                "System default"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings.huddle_camera_device = None;
-                                if this.camera_preview_on {
-                                    this.start_camera_preview(cx);
-                                }
-                                this.changed(cx);
-                            }))
-                    })
+                    .child(
+                        Self::device_choice_button(
+                            "prefs-cam-default",
+                            "System default",
+                            active_cam.is_none(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.settings.huddle_camera_device = None;
+                            if this.camera_preview_on {
+                                this.start_camera_preview(cx);
+                            }
+                            this.changed(cx);
+                        })),
+                    )
                     .children(self.cameras.iter().enumerate().map(|(ix, cam)| {
                         let selected = active_cam == Some(cam.index);
                         let cam_idx = cam.index;
-                        Button::new(("prefs-cam", ix))
-                            .outline()
-                            .with_size(Size::Small)
-                            .label(if selected {
-                                format!("✓ {}", cam.name)
-                            } else {
-                                cam.name.clone()
-                            })
+                        Self::device_choice_button(("prefs-cam", ix), cam.name.clone(), selected)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.settings.huddle_camera_device = Some(cam_idx);
                                 if this.camera_preview_on {
