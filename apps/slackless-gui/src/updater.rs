@@ -189,8 +189,20 @@ pub fn bundled_cli_path() -> Option<PathBuf> {
     cli.is_file().then_some(cli)
 }
 
-/// Returns `true` if `dir` is present in `$PATH`.
+/// Returns `true` if `dir` is present in `$PATH` (or on macOS `/etc/paths`, which LaunchServices
+/// omits from a GUI app's own `PATH` even though every interactive shell includes it).
 pub fn dir_in_path(dir: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if dir == Path::new("/usr/local/bin") {
+            return true;
+        }
+        if let Ok(etc_paths) = std::fs::read_to_string("/etc/paths") {
+            if etc_paths.lines().any(|line| Path::new(line.trim()) == dir) {
+                return true;
+            }
+        }
+    }
     let Some(path_var) = std::env::var_os("PATH") else {
         return false;
     };
