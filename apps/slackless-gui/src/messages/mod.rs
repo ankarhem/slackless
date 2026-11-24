@@ -1753,7 +1753,7 @@ fn transcript_row(
     let is_ephemeral = message.is_ephemeral;
     let thread_bg = crate::theme::thread_root(cx);
     let editing_bg = crate::theme::editing_row(cx);
-    let quick = fixtures.quick_reactions.clone();
+    let quick = crate::preferences::active_quick_reactions(&fixtures.quick_reactions, cx);
     let menu_handler = handler.clone();
     let row_key = key.clone();
     let card = actions::HoverOverlay::new(SharedString::from(key.clone()), move |hover, _, cx| {

@@ -105,3 +105,19 @@ fn spellcheck_language_timezone_and_schedule_helpers() {
     s.urgent_dm_override = false;
     assert!(!s.is_urgent_dm_breakthrough(true, "[URGENT] prod DB down"));
 }
+
+#[test]
+fn quick_reactions_setting_normalizes_and_toggles() {
+    let mut s = Settings::default();
+    assert!(s.show_quick_reactions);
+    assert_eq!(
+        s.resolved_quick_reactions(),
+        vec!["white_check_mark", "eyes", "raised_hands"]
+    );
+
+    s.quick_reaction_emojis = [":rocket:".into(), " fire ".into(), String::new()];
+    assert_eq!(s.resolved_quick_reactions(), vec!["rocket", "fire"]);
+
+    s.show_quick_reactions = false;
+    assert!(s.resolved_quick_reactions().is_empty());
+}

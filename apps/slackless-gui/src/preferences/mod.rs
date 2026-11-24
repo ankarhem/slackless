@@ -344,6 +344,10 @@ pub struct Settings {
     pub large_files: bool,
     pub enter_sends: bool,
     pub format_markup: bool,
+    /// Show the three one-click reaction emojis on the message hover bar (`show_quick_reactions`).
+    pub show_quick_reactions: bool,
+    /// Up to three one-click reaction shortcodes (without colons) shown on message hover.
+    pub quick_reaction_emojis: [String; 3],
     // Language & region
     pub language: usize,
     pub timezone_auto: bool,
@@ -471,6 +475,19 @@ pub struct KeywordPrefs(pub Vec<String>);
 
 impl Global for KeywordPrefs {}
 
+pub struct QuickReactionPrefs(pub Vec<String>);
+
+impl Global for QuickReactionPrefs {}
+
+/// Active one-click reaction shortcodes for message hover toolbars. Reads the live global
+/// `QuickReactionPrefs` when installed, falling back to `fallback` (e.g. in isolated tests).
+pub fn active_quick_reactions(fallback: &[String], cx: &App) -> Vec<String> {
+    match cx.try_global::<QuickReactionPrefs>() {
+        Some(prefs) => prefs.0.clone(),
+        None => fallback.to_vec(),
+    }
+}
+
 pub fn matches_highlight_keyword(text: &str, cx: &App) -> bool {
     let Some(prefs) = cx.try_global::<KeywordPrefs>() else {
         return false;
@@ -504,6 +521,7 @@ pub fn set_display_prefs(settings: &Settings, cx: &mut App) {
         .filter(|k| k.len() >= 2)
         .collect();
     cx.set_global(KeywordPrefs(keywords));
+    cx.set_global(QuickReactionPrefs(settings.resolved_quick_reactions()));
 }
 
 impl Settings {
@@ -630,6 +648,8 @@ impl Default for Settings {
             large_files: true,
             enter_sends: true,
             format_markup: true,
+            show_quick_reactions: true,
+            quick_reaction_emojis: crate::actions::DEFAULT_QUICK_REACTIONS.map(String::from),
             language: 0,
             timezone_auto: true,
             timezone: 0,
@@ -680,6 +700,26 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Clean, normalized list of one-click reaction shortcodes (empty when disabled).
+    pub fn resolved_quick_reactions(&self) -> Vec<String> {
+        if !self.show_quick_reactions {
+            return Vec::new();
+        }
+        let custom: Vec<String> = self
+            .quick_reaction_emojis
+            .iter()
+            .map(|raw| raw.trim().trim_matches(':').to_owned())
+            .filter(|name| !name.is_empty())
+            .collect();
+        if custom.is_empty() {
+            crate::actions::DEFAULT_QUICK_REACTIONS
+                .map(String::from)
+                .to_vec()
+        } else {
+            custom
+        }
+    }
+
     /// Apple / BCP-47 language tag for the chosen language preference (`F-SHELL-099`).
     pub fn spellcheck_language(&self) -> Option<&'static str> {
         const CODES: [&str; 7] = ["en_US", "en_GB", "sv", "de", "fr", "es", "ja"];
@@ -759,6 +799,7 @@ pub struct Preferences {
     excluded_channels: Entity<TextareaState>,
     protocol_allowlist_input: Entity<TextareaState>,
     proxy_input: Entity<TextareaState>,
+    quick_reaction_inputs: [Entity<TextareaState>; 3],
     custom_sidebar_hex: Entity<TextareaState>,
     custom_accent_hex: Entity<TextareaState>,
     slack_theme_import: Entity<TextareaState>,
@@ -819,6 +860,17 @@ impl Preferences {
                     .auto_grow(1, 1);
                 state.set_value(settings.proxy_url.clone(), window, cx);
                 state
+            });
+            let quick_reaction_inputs: [Entity<TextareaState>; 3] = std::array::from_fn(|ix| {
+                let initial = settings.quick_reaction_emojis[ix].clone();
+                let placeholder = crate::actions::DEFAULT_QUICK_REACTIONS[ix];
+                cx.new(|cx| {
+                    let mut state = TextareaState::new(window, cx)
+                        .placeholder(placeholder)
+                        .auto_grow(1, 1);
+                    state.set_value(initial, window, cx);
+                    state
+                })
             });
             let custom_sidebar_hex = cx.new(|cx| {
                 let mut state = TextareaState::new(window, cx)
@@ -891,6 +943,23 @@ impl Preferences {
                     },
                 ),
             ];
+            let mut subscriptions = subscriptions;
+            for (ix, input) in quick_reaction_inputs.iter().enumerate() {
+                subscriptions.push(cx.subscribe_in(
+                    input,
+                    window,
+                    move |this: &mut Preferences, field, event: &InputEvent, _, cx| {
+                        if let InputEvent::Change = event {
+                            let val = field.read(cx).value().trim().trim_matches(':').to_owned();
+                            if this.settings.quick_reaction_emojis[ix] != val {
+                                this.settings.quick_reaction_emojis[ix] = val;
+                                cx.emit(PreferencesEvent::Changed);
+                                cx.notify();
+                            }
+                        }
+                    },
+                ));
+            }
             Preferences {
                 section: Section::Notifications,
                 settings,
@@ -900,6 +969,7 @@ impl Preferences {
                 excluded_channels,
                 protocol_allowlist_input,
                 proxy_input,
+                quick_reaction_inputs,
                 custom_sidebar_hex,
                 custom_accent_hex,
                 slack_theme_import,
@@ -956,6 +1026,7 @@ impl Preferences {
         let excluded = settings.excluded_channels.clone();
         let protocols = settings.protocol_allowlist.clone();
         let proxy = settings.proxy_url.clone();
+        let quick_emojis = settings.quick_reaction_emojis.clone();
         slackless_core::api::set_proxy_url(Some(proxy.clone()));
         slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
         let rgb_pair = settings.palette.rgb_pair();
@@ -970,6 +1041,9 @@ impl Preferences {
             .update(cx, |state, cx| state.set_value(protocols, window, cx));
         self.proxy_input
             .update(cx, |state, cx| state.set_value(proxy, window, cx));
+        for (ix, val) in quick_emojis.into_iter().enumerate() {
+            self.quick_reaction_inputs[ix].update(cx, |state, cx| state.set_value(val, window, cx));
+        }
         if let Some((sb, ac)) = rgb_pair {
             self.custom_sidebar_hex.update(cx, |state, cx| {
                 state.set_value(theme::format_hex_rgb(sb), window, cx)

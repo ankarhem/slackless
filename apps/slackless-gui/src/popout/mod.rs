@@ -1435,7 +1435,10 @@ impl Render for PopoutWindow {
                     } else {
                         None
                     };
-                    let quick = self.fixtures.quick_reactions.clone();
+                    let quick = crate::preferences::active_quick_reactions(
+                        &self.fixtures.quick_reactions,
+                        cx,
+                    );
                     let menu_handler = handler.clone();
                     let row_key = key.clone();
                     let keep_inside = ix == 0;

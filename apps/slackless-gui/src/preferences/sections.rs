@@ -1049,8 +1049,82 @@ impl Preferences {
             |s| &mut s.large_files,
             cx,
         );
+        let quick_toggle = self.checkbox(
+            "msg-quick-reactions",
+            "Show one-click reactions on messages",
+            |s| &mut s.show_quick_reactions,
+            cx,
+        );
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let bg_card = cx.theme().secondary;
+        let quick_editors = self.settings.show_quick_reactions.then(|| {
+            let mut row = h_flex().flex_wrap().items_center().gap_2().pl_6().pt_1();
+            for ix in 0..3 {
+                let code = self.settings.quick_reaction_emojis[ix].trim();
+                let glyph = crate::emoji::glyph(code)
+                    .or_else(|| crate::emoji::glyph(crate::actions::DEFAULT_QUICK_REACTIONS[ix]))
+                    .unwrap_or("🙂");
+                row = row.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(bg_card)
+                        .border_1()
+                        .border_color(border)
+                        .child(div().text_sm().child(glyph))
+                        .child(
+                            div().w(px(124.)).child(
+                                Textarea::new(&self.quick_reaction_inputs[ix])
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
+                        ),
+                );
+            }
+            let reset = Button::new("msg-quick-reactions-reset")
+                .ghost()
+                .with_size(Size::XSmall)
+                .label("Reset defaults")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let defaults = crate::actions::DEFAULT_QUICK_REACTIONS.map(String::from);
+                    this.settings.quick_reaction_emojis = defaults.clone();
+                    for (ix, val) in defaults.into_iter().enumerate() {
+                        this.quick_reaction_inputs[ix]
+                            .update(cx, |state, cx| state.set_value(val, window, cx));
+                    }
+                    this.changed(cx);
+                }));
+            v_flex().gap_1p5().child(row).child(
+                h_flex()
+                    .pl_6()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Enter emoji shortcodes (e.g. white_check_mark, eyes, rocket)."),
+                    )
+                    .child(reset),
+            )
+        });
         v_flex()
             .child(self.group("Message theme", None, density, cx))
+            .child(
+                self.group(
+                    "One-click reactions",
+                    Some("Quickly react to messages from the hover toolbar."),
+                    v_flex()
+                        .gap_1p5()
+                        .child(quick_toggle)
+                        .children(quick_editors),
+                    cx,
+                ),
+            )
             .child(
                 self.group(
                     "Names & timestamps",

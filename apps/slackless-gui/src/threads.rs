@@ -1023,7 +1023,7 @@ impl ThreadPanel {
 
         // Straddling the row's top edge would cut the root's bar off at the panel's top, so
         // Slack keeps it inside the row, 3pt down.
-        let quick = self.fixtures.quick_reactions.clone();
+        let quick = crate::preferences::active_quick_reactions(&self.fixtures.quick_reactions, cx);
         let menu_handler = handler.clone();
         let row_key = key.clone();
         actions::HoverOverlay::new(SharedString::from(key), move |hover, _, cx| {

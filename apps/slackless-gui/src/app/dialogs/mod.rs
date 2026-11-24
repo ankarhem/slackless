@@ -157,6 +157,38 @@ impl App {
                     if prev.emoji_text_mode != settings.emoji_text_mode {
                         sync_pref("emoji_only_text", settings.emoji_text_mode.to_string());
                     }
+                    if prev.show_quick_reactions != settings.show_quick_reactions {
+                        sync_pref(
+                            "show_quick_reactions",
+                            settings.show_quick_reactions.to_string(),
+                        );
+                    }
+                    if prev.quick_reaction_emojis != settings.quick_reaction_emojis {
+                        let resolved = settings.resolved_quick_reactions();
+                        let defaults: Vec<&str> = crate::actions::DEFAULT_QUICK_REACTIONS.to_vec();
+                        let is_default = resolved.len() == defaults.len()
+                            && resolved.iter().zip(defaults.iter()).all(|(a, b)| a == b);
+                        sync_pref(
+                            "user_customized_quick_reactions_has_customized",
+                            (!is_default).to_string(),
+                        );
+                        for (ix, key) in [
+                            "user_customized_quick_reactions_emoji_1",
+                            "user_customized_quick_reactions_emoji_2",
+                            "user_customized_quick_reactions_emoji_3",
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            let val = settings.quick_reaction_emojis[ix]
+                                .trim()
+                                .trim_matches(':')
+                                .to_owned();
+                            if !val.is_empty() {
+                                sync_pref(key, val);
+                            }
+                        }
+                    }
                     if prev.underline_links != settings.underline_links {
                         sync_pref("underline_links", settings.underline_links.to_string());
                     }

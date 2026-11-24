@@ -87,7 +87,23 @@ impl App {
             // Restore persisted Preferences settings first, then overlay the zoom/font/color_mode
             // values `main` installed before the first frame.
             let mut restored_settings = CoreBridge::parse_settings(&local);
+            let has_local_quick_pref = local
+                .get("settings")
+                .is_some_and(|raw| raw.contains("\"show_quick_reactions\""));
+            if !has_local_quick_pref {
+                let mut base = restored_settings.unwrap_or_default();
+                base.show_quick_reactions = !fixtures.quick_reactions.is_empty();
+                if !fixtures.quick_reactions.is_empty() {
+                    let mut emojis = crate::actions::DEFAULT_QUICK_REACTIONS.map(String::from);
+                    for (ix, name) in fixtures.quick_reactions.iter().take(3).enumerate() {
+                        emojis[ix] = name.clone();
+                    }
+                    base.quick_reaction_emojis = emojis;
+                }
+                restored_settings = Some(base);
+            }
             if let Some(settings) = restored_settings.clone() {
+                crate::preferences::set_display_prefs(&settings, cx);
                 preferences.update(cx, |prefs, cx| prefs.load_settings(settings, window, cx));
             }
             let factor = cx.global::<crate::zoom::Zoom>().factor();

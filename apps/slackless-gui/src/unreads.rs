@@ -1018,7 +1018,7 @@ fn card_view(
             )
             // Align flush with `message_row_linked`'s body (36px avatar + 12px gap).
             .map(|bar| div().pl(px(48.)).child(bar));
-            let quick = fixtures.quick_reactions.clone();
+            let quick = crate::preferences::active_quick_reactions(&fixtures.quick_reactions, cx);
             let menu_handler = handler.clone();
             let row_key = key.clone();
             let keep_inside = m_ix == 0 && !date_break;

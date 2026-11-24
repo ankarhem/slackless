@@ -388,7 +388,7 @@ fn render_thread_message(
     let chips = actions::reaction_chips(&key, &reactions, fixtures, Some(&handler), cx)
         .map(|c| c.pl(px(48.)));
     let row_body = message_row_linked(fixtures, &display, Some(&handler), Some(links), grouped, cx);
-    let quick = fixtures.quick_reactions.clone();
+    let quick = crate::preferences::active_quick_reactions(&fixtures.quick_reactions, cx);
     let menu_handler = handler.clone();
     let row_key = key.clone();
 
