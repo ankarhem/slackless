@@ -29,6 +29,29 @@ pub struct ConversationRow {
     pub latest_secs: Option<i64>,
 }
 
+/// One workspace user row from the local archive.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserRow {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub real_name: Option<String>,
+    pub is_bot: bool,
+    pub deleted: bool,
+}
+
+/// One conversation's activity summary in an offline `digest`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DigestChannelRow {
+    pub channel: String,
+    pub label: String,
+    pub message_count: u64,
+    pub author_count: u64,
+    pub latest_ts: String,
+    pub latest_author: Option<String>,
+    pub latest_text: String,
+}
+
 impl ConversationRow {
     /// `#name`-style label, falling back to the id.
     pub fn label(&self) -> String {
@@ -262,6 +285,162 @@ impl Archive {
             )
             .ok()
             .map(UserId::from)
+    }
+
+    /// List archived workspace users, optionally filtered by a case-insensitive substring on
+    /// `id`, `name`, `display_name`, or `real_name`.
+    pub fn users(
+        &self,
+        workspace: &TeamId,
+        query: Option<&str>,
+        include_deleted: bool,
+    ) -> Vec<UserRow> {
+        let Ok(mut stmt) = self.conn.prepare(
+            r#"SELECT id, name, display_name, real_name, is_bot, deleted
+               FROM "user"
+               WHERE workspace_id = ?1
+               ORDER BY COALESCE(NULLIF(display_name, ''), NULLIF(real_name, ''), name) COLLATE NOCASE ASC"#,
+        ) else {
+            return Vec::new();
+        };
+        let needle = query
+            .map(|q| q.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|q| !q.is_empty());
+        let Ok(rows) = stmt.query_map(params![workspace.as_str()], |row| {
+            Ok(UserRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                display_name: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+                real_name: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
+                is_bot: row.get::<_, i64>(4)? != 0,
+                deleted: row.get::<_, i64>(5)? != 0,
+            })
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten()
+            .filter(|u| include_deleted || !u.deleted)
+            .filter(|u| match &needle {
+                None => true,
+                Some(q) => {
+                    u.id.to_ascii_lowercase().contains(q)
+                        || u.name.to_ascii_lowercase().contains(q)
+                        || u.display_name
+                            .as_deref()
+                            .is_some_and(|s| s.to_ascii_lowercase().contains(q))
+                        || u.real_name
+                            .as_deref()
+                            .is_some_and(|s| s.to_ascii_lowercase().contains(q))
+                }
+            })
+            .collect()
+    }
+
+    /// Newest stored non-deleted message `ts` in `channel`, if any.
+    pub fn latest_ts(&self, workspace: &TeamId, channel: &ChannelId) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT ts FROM message_current
+                 WHERE workspace_id = ?1 AND channel_id = ?2 AND deleted = 0
+                 ORDER BY ts_key DESC LIMIT 1",
+                params![workspace.as_str(), channel.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    /// Activity digest grouped by channel for messages at or after `cutoff_secs` (unix seconds).
+    pub fn digest_since(
+        &self,
+        workspace: &TeamId,
+        cutoff_secs: i64,
+        limit: usize,
+    ) -> Vec<DigestChannelRow> {
+        let cutoff_key = cutoff_secs.saturating_mul(1_000_000);
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT channel_id, COUNT(*), COUNT(DISTINCT COALESCE(user_id, '')), MAX(ts_key)
+             FROM message_current
+             WHERE workspace_id = ?1 AND ts_key >= ?2 AND deleted = 0
+             GROUP BY channel_id
+             ORDER BY COUNT(*) DESC, MAX(ts_key) DESC
+             LIMIT ?3",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(
+            params![workspace.as_str(), cutoff_key, limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        ) else {
+            return Vec::new();
+        };
+        let names = self.channel_names(workspace);
+        let dm_labels: std::collections::HashMap<String, String> = self
+            .dms(workspace)
+            .into_iter()
+            .filter_map(|dm| {
+                let label = dm
+                    .user
+                    .as_ref()
+                    .and_then(|u| self.user_display(workspace, u))
+                    .map(|n| format!("@{n}"))
+                    .or_else(|| dm.name.map(|n| format!("#{n}")))?;
+                Some((dm.id.as_str().to_owned(), label))
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (channel_id, msg_count, author_count, max_ts_key) in rows.flatten() {
+            let latest = self
+                .conn
+                .query_row(
+                    "SELECT ts, user_id, text FROM message_current
+                     WHERE workspace_id = ?1 AND channel_id = ?2 AND ts_key = ?3
+                     LIMIT 1",
+                    params![workspace.as_str(), &channel_id, max_ts_key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .ok();
+            let (latest_ts, latest_user, latest_text) = latest.unwrap_or_default();
+            let latest_author = latest_user.as_deref().map(|uid| {
+                self.user_display(workspace, &UserId::from(uid))
+                    .unwrap_or_else(|| uid.to_owned())
+            });
+            let label = names
+                .get(&channel_id)
+                .map(|n| format!("#{n}"))
+                .or_else(|| dm_labels.get(&channel_id).cloned())
+                .unwrap_or_else(|| channel_id.clone());
+            let snippet = latest_text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let truncated = if snippet.chars().count() > 120 {
+                let mut s: String = snippet.chars().take(119).collect();
+                s.push('…');
+                s
+            } else {
+                snippet
+            };
+            out.push(DigestChannelRow {
+                channel: channel_id,
+                label,
+                message_count: u64::try_from(msg_count.max(0)).unwrap_or(0),
+                author_count: u64::try_from(author_count.max(0)).unwrap_or(0),
+                latest_ts,
+                latest_author,
+                latest_text: truncated,
+            });
+        }
+        out
     }
 }
 

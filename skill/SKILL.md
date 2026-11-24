@@ -11,9 +11,9 @@ description: This skill should be used when an AI agent needs to search, read, s
 
 Two kinds of commands exist.
 
-Offline archive commands (`search`, `read`, `thread`, `channels`, `dms`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
+Offline archive commands (`search`, `read`, `thread`, `channels`, `dms`, `users`, `digest`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
 
-Live Slack commands (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-thread`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
+Live Slack commands (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-read`, `mark-thread`, `pins`, `pin`, `unpin`, `schedule`, `scheduled`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `send`, `reply`, `edit`, and `schedule` also accept `-` as `<TEXT>` to read multi-line bodies from stdin. `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
 
 ## Setup and auth
 
@@ -59,7 +59,7 @@ Human output is one line per message: `channel<TAB>ts<TAB>author: text`.
 ### read
 
 ```
-slackless read <CHANNEL> [--limit N]
+slackless read <CHANNEL> [--limit N] [--since 24h|7d|YYYY-MM-DD]
 ```
 
 Print recent messages from a conversation. `<CHANNEL>` accepts an id (`C0123ABC`, `D0123ABC`, `G0123ABC`), a `#name` or bare name (case-insensitive), or an `@handle` for the DM with that user. When the archive cannot resolve the argument, everything after a leading `#` is used as a raw channel id.
@@ -523,3 +523,22 @@ slackless export "#eng" --format md --limit 200 --out eng.md
 - `stats` and `vacuum` inspect and compact the local SQLite archive (compressing legacy message JSON rows and reclaiming unused pages).
 - `revisions` prints the append-only edit/deletion history of one message.
 - `export` writes archived messages to Markdown or JSON offline.
+
+### users / digest / mark-read / pins / schedule
+
+```sh
+slackless users [QUERY] [--include-deleted] --json
+slackless digest [--since 24h] [--all-workspaces] [--limit 25] --json
+slackless mark-read "#eng" [TS] --json
+slackless pins "#eng" --json
+slackless pin "#eng" "1739280000.000100" --json
+slackless unpin "#eng" "1739280000.000100" --json
+slackless schedule "#eng" "Reminder: standup" --at "+30m" [--thread-ts TS] --json
+slackless scheduled [--channel "#eng"] --json
+```
+
+- `users` searches or lists workspace members offline from the local archive.
+- `digest` builds a fast offline activity summary per active conversation over a relative window (`30m`, `24h`, `7d`), date (`YYYY-MM-DD`), or unix epoch, optionally across all archived workspaces (`--all-workspaces`).
+- `mark-read` advances the read cursor (`conversations.mark`), defaulting to the newest locally archived message ts when `[TS]` is omitted.
+- `pins`, `pin`, and `unpin` list and manage pinned items in a conversation.
+- `schedule` and `scheduled` queue future messages (`+15m`, `+2h`, `+1d`, or unix seconds) and list pending scheduled messages. Pass `-` as `<TEXT>` to `send`, `reply`, `edit`, or `schedule` to read the body from stdin.

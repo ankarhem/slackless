@@ -4,6 +4,7 @@
 //! request per invocation, no websocket session to keep alive. Without a stored session they
 //! print a clear "not signed in" message instead of failing hard.
 
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -17,6 +18,18 @@ use crate::output::{self, MessageRow};
 use crate::session::resolve_session;
 use crate::{Ctx, fail};
 
+/// Resolve a message text argument: when `text == "-"`, read the body from stdin.
+pub fn resolve_text_arg(text: String) -> Result<String> {
+    if text != "-" {
+        return Ok(text);
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("reading message text from stdin")?;
+    Ok(buf.trim_end_matches(&['\r', '\n'][..]).to_owned())
+}
+
 /// `send <channel> <text>`: posts and mirrors the echo into the local archive.
 pub async fn run_send(
     ctx: &Ctx,
@@ -24,6 +37,7 @@ pub async fn run_send(
     channel_arg: &str,
     text: String,
 ) -> Result<ExitCode> {
+    let text = resolve_text_arg(text)?;
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -57,6 +71,7 @@ pub async fn run_reply(
     thread_ts: &str,
     text: String,
 ) -> Result<ExitCode> {
+    let text = resolve_text_arg(text)?;
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -178,6 +193,7 @@ pub async fn run_edit(
     ts: &str,
     text: String,
 ) -> Result<ExitCode> {
+    let text = resolve_text_arg(text)?;
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -385,6 +401,331 @@ pub async fn run_thread_live(
             "live": true,
             "count": rows.len(),
             "messages": rows,
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `mark-read <channel> [ts]`: marks `channel` read up to `ts` (or newest locally archived message).
+pub async fn run_mark_read(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    ts_arg: Option<&str>,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let ts_str = match ts_arg {
+        Some(ts) => ts.to_owned(),
+        None => match Archive::open(&workspace).and_then(|a| a.latest_ts(&workspace, &channel)) {
+            Some(ts) => ts,
+            None => {
+                return Ok(fail(
+                    ctx,
+                    "missing_ts",
+                    "no archived messages for this channel; pass an explicit <TS> to mark read",
+                ));
+            }
+        },
+    };
+    let ts = Ts::from(ts_str.clone());
+    match api.conversations_mark(&channel, &ts).await {
+        Ok(()) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "ts": ts.as_str(),
+                }),
+                &format!(
+                    "marked {} read at {}\n",
+                    label.unwrap_or_else(|| channel.to_string()),
+                    ts
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `pins <channel>`: lists pinned messages and files in a conversation (`pins.list`).
+pub async fn run_pins(ctx: &Ctx, flag: Option<&str>, channel_arg: &str) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let pins = match api.pins_list(&channel).await {
+        Ok(pins) => pins,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let archive = Archive::open(&workspace);
+    let mut human = String::new();
+    let json_items: Vec<serde_json::Value> = pins
+        .items
+        .iter()
+        .map(|item| {
+            let kind = item.kind.as_deref().unwrap_or("message");
+            let created_by_name = item
+                .created_by
+                .as_ref()
+                .and_then(|u| archive.as_ref().and_then(|a| a.user_display(&workspace, u)));
+            if let Some(msg) = &item.message {
+                let who = msg
+                    .user
+                    .as_ref()
+                    .and_then(|u| archive.as_ref().and_then(|a| a.user_display(&workspace, u)))
+                    .or_else(|| msg.user.as_ref().map(|u| u.as_str().to_owned()))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                human.push_str(&format!(
+                    "{}\t{}\t{who}: {}\n",
+                    label.as_deref().unwrap_or(channel.as_str()),
+                    msg.ts,
+                    msg.text.replace('\n', " ")
+                ));
+                serde_json::json!({
+                    "type": kind,
+                    "created": item.created,
+                    "created_by": item.created_by.as_ref().map(|u| u.as_str()),
+                    "created_by_name": created_by_name,
+                    "ts": msg.ts.as_str(),
+                    "user": msg.user.as_ref().map(|u| u.as_str()),
+                    "text": msg.text,
+                    "permalink": msg.permalink,
+                })
+            } else {
+                let file_name = item
+                    .file
+                    .as_ref()
+                    .and_then(|f| f.name.as_deref().or(f.title.as_deref()))
+                    .unwrap_or("(file)");
+                human.push_str(&format!(
+                    "{}\t{kind}\t{file_name}\n",
+                    label.as_deref().unwrap_or(channel.as_str()),
+                ));
+                serde_json::json!({
+                    "type": kind,
+                    "created": item.created,
+                    "created_by": item.created_by.as_ref().map(|u| u.as_str()),
+                    "created_by_name": created_by_name,
+                    "file": item.file.as_ref().map(|f| serde_json::json!({
+                        "id": f.id.as_str(),
+                        "name": f.name,
+                        "title": f.title,
+                    })),
+                })
+            }
+        })
+        .collect();
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "channel": channel.as_str(),
+            "count": json_items.len(),
+            "pins": json_items,
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `pin <channel> <ts>` / `unpin <channel> <ts>`: pins or unpins one message.
+pub async fn run_pin(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    ts_arg: &str,
+    remove: bool,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let ts = Ts::from(ts_arg.to_owned());
+    let res = if remove {
+        api.pins_remove(&channel, &ts).await
+    } else {
+        api.pins_add(&channel, &ts).await
+    };
+    match res {
+        Ok(()) => {
+            let verb = if remove { "unpinned" } else { "pinned" };
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "ts": ts.as_str(),
+                    "pinned": !remove,
+                }),
+                &format!(
+                    "{verb} {} in {}\n",
+                    ts,
+                    label.unwrap_or_else(|| channel.to_string()),
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// Parse a schedule `--at` specification into unix epoch seconds:
+/// supports relative durations (`+15m`, `+2h`, `+1d`, `+90s`) or an absolute unix epoch timestamp.
+pub fn parse_schedule_at(spec: &str, now_secs: u64) -> Result<u64, String> {
+    let trimmed = spec.trim();
+    if let Some(rel) = trimmed.strip_prefix('+') {
+        let delta = parse_duration_secs(rel)?;
+        if delta == 0 {
+            return Err("schedule offset must be > 0".to_owned());
+        }
+        return Ok(now_secs.saturating_add(delta));
+    }
+    let epoch = trimmed.parse::<u64>().map_err(|_| {
+        format!("invalid --at value '{trimmed}'; use +15m, +2h, +1d, or a unix timestamp")
+    })?;
+    if epoch <= now_secs {
+        return Err("scheduled time must be in the future".to_owned());
+    }
+    Ok(epoch)
+}
+
+/// Parse a compact duration string like `30s`, `15m`, `24h`, `7d`, `2w` into seconds.
+pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    if s.len() < 2 {
+        return Err(format!(
+            "invalid duration '{raw}'; expected e.g. 30m, 24h, 7d"
+        ));
+    }
+    let (num_part, unit) = s.split_at(s.len() - 1);
+    let value: u64 = num_part
+        .parse()
+        .map_err(|_| format!("invalid duration '{raw}'; expected e.g. 30m, 24h, 7d"))?;
+    let mult: u64 = match unit {
+        "s" | "S" => 1,
+        "m" | "M" => 60,
+        "h" | "H" => 3600,
+        "d" | "D" => 86_400,
+        "w" | "W" => 604_800,
+        _ => {
+            return Err(format!(
+                "unknown duration unit '{unit}' in '{raw}'; use s, m, h, d, or w"
+            ));
+        }
+    };
+    Ok(value.saturating_mul(mult))
+}
+
+/// `schedule <channel> <text> --at <WHEN> [--thread-ts TS]`: schedules a message via `chat.scheduleMessage`.
+pub async fn run_schedule(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    text: String,
+    at: &str,
+    thread_ts: Option<&str>,
+) -> Result<ExitCode> {
+    let text = resolve_text_arg(text)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let post_at = match parse_schedule_at(at, now) {
+        Ok(ts) => ts,
+        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+    };
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let thread_ts = thread_ts.map(|t| Ts::from(t.to_owned()));
+    match api
+        .chat_schedule_message(
+            &channel,
+            post_at,
+            &MessageContent::plain(text),
+            thread_ts.as_ref(),
+        )
+        .await
+    {
+        Ok(created) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "scheduled_message_id": created.scheduled_message_id,
+                    "channel": created.channel.as_str(),
+                    "post_at": created.post_at,
+                }),
+                &format!(
+                    "scheduled {} in {} for {}\n",
+                    created.scheduled_message_id,
+                    label.unwrap_or_else(|| created.channel.to_string()),
+                    created.post_at
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `scheduled [--channel CHANNEL]`: lists pending scheduled messages (`chat.scheduledMessages.list`).
+pub async fn run_scheduled(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: Option<&str>,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let channel = channel_arg.map(|arg| resolve_channel_arg(&workspace, arg).0);
+    let items = match api.chat_scheduled_messages_list(channel.as_ref()).await {
+        Ok(items) => items,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let archive = Archive::open(&workspace);
+    let names = archive
+        .as_ref()
+        .map_or_else(Default::default, |a| a.channel_names(&workspace));
+    let mut human = String::new();
+    let json_items: Vec<serde_json::Value> = items
+        .iter()
+        .map(|m| {
+            let ch_label = names
+                .get(m.channel_id.as_str())
+                .map(|n| format!("#{n}"))
+                .unwrap_or_else(|| m.channel_id.to_string());
+            human.push_str(&format!(
+                "{}\t{ch_label}\t{}\t{}\n",
+                m.id,
+                m.post_at,
+                m.text.replace('\n', " ")
+            ));
+            serde_json::json!({
+                "id": m.id,
+                "channel": m.channel_id.as_str(),
+                "post_at": m.post_at,
+                "date_created": m.date_created,
+                "text": m.text,
+            })
+        })
+        .collect();
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "count": json_items.len(),
+            "scheduled_messages": json_items,
         }),
         &human,
     );

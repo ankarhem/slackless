@@ -29,7 +29,8 @@ use crate::archive::Archive;
 use crate::output::{ChannelView, DmView, MessageRow};
 use crate::session::resolve_workspace;
 use crate::write::{
-    run_delete, run_edit, run_react, run_reply, run_send, run_thread_live, run_unreact, run_upload,
+    parse_duration_secs, run_delete, run_edit, run_mark_read, run_pin, run_pins, run_react,
+    run_reply, run_schedule, run_scheduled, run_send, run_thread_live, run_unreact, run_upload,
 };
 
 /// Default page size of `read`.
@@ -85,6 +86,9 @@ enum Commands {
         /// Maximum number of messages (newest page, printed oldest first).
         #[arg(long, value_name = "N", default_value_t = READ_LIMIT)]
         limit: usize,
+        /// Only include messages at or after this cutoff (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix secs).
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
     },
     /// Read a thread's root message and replies (offline archive by default, or `--live` from Slack).
     Thread {
@@ -156,6 +160,71 @@ enum Commands {
     Channels,
     /// List direct messages and group DMs known to the local archive.
     Dms,
+    /// List or search workspace users in the local archive (offline).
+    Users {
+        /// Optional case-insensitive filter matching user id, handle, display name, or real name.
+        query: Option<String>,
+        /// Include deactivated/deleted accounts.
+        #[arg(long)]
+        include_deleted: bool,
+    },
+    /// Summarize recent archived activity per conversation (offline).
+    Digest {
+        /// Time window (`30m`, `24h`, `7d`, `YYYY-MM-DD`, or unix timestamp).
+        #[arg(long, value_name = "WHEN", default_value = "24h")]
+        since: String,
+        /// Summarize across every locally archived workspace at once.
+        #[arg(long)]
+        all_workspaces: bool,
+        /// Maximum conversations to show per workspace.
+        #[arg(long, value_name = "N", default_value_t = 25)]
+        limit: usize,
+    },
+    /// Mark a conversation read (`conversations.mark`; defaults to newest archived message ts).
+    MarkRead {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Message ts to mark as read cursor (defaults to newest archived message in channel).
+        ts: Option<String>,
+    },
+    /// List pinned messages and files in a conversation (`pins.list`, needs a stored session).
+    Pins {
+        /// Channel id, #name, or @handle.
+        channel: String,
+    },
+    /// Pin a message in a conversation (`pins.add`, needs a stored session).
+    Pin {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Message ts to pin.
+        ts: String,
+    },
+    /// Unpin a message in a conversation (`pins.remove`, needs a stored session).
+    Unpin {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Message ts to unpin.
+        ts: String,
+    },
+    /// Schedule a message for future delivery (`chat.scheduleMessage`, needs a stored session).
+    Schedule {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Message text (pass `-` to read from stdin).
+        text: String,
+        /// When to deliver: relative (`+15m`, `+2h`, `+1d`) or unix epoch seconds.
+        #[arg(long, value_name = "WHEN")]
+        at: String,
+        /// Optional thread root ts.
+        #[arg(long, value_name = "TS")]
+        thread_ts: Option<String>,
+    },
+    /// List pending scheduled messages (`chat.scheduledMessages.list`, needs a stored session).
+    Scheduled {
+        /// Optional channel id, #name, or @handle to filter by.
+        #[arg(long, value_name = "CHANNEL")]
+        channel: Option<String>,
+    },
     /// Show local SQLite archive statistics (offline).
     Stats {
         /// Include per-table row counts and the top 10 largest channels.
@@ -512,7 +581,11 @@ async fn dispatch(
                 )
             }
         }
-        Commands::Read { channel, limit } => cmd_read(ctx, workspace.as_ref(), &channel, limit),
+        Commands::Read {
+            channel,
+            limit,
+            since,
+        } => cmd_read(ctx, workspace.as_ref(), &channel, limit, since.as_deref()),
         Commands::Thread {
             channel,
             thread_ts,
@@ -545,6 +618,28 @@ async fn dispatch(
         } => run_upload(ctx, flag, &channel, &files, comment, thread_ts.as_deref()).await,
         Commands::Channels => cmd_channels(ctx, workspace.as_ref()),
         Commands::Dms => cmd_dms(ctx, workspace.as_ref()),
+        Commands::Users {
+            query,
+            include_deleted,
+        } => cmd_users(ctx, workspace.as_ref(), query.as_deref(), include_deleted),
+        Commands::Digest {
+            since,
+            all_workspaces,
+            limit,
+        } => cmd_digest(ctx, workspace.as_ref(), &since, all_workspaces, limit),
+        Commands::MarkRead { channel, ts } => {
+            run_mark_read(ctx, flag, &channel, ts.as_deref()).await
+        }
+        Commands::Pins { channel } => run_pins(ctx, flag, &channel).await,
+        Commands::Pin { channel, ts } => run_pin(ctx, flag, &channel, &ts, false).await,
+        Commands::Unpin { channel, ts } => run_pin(ctx, flag, &channel, &ts, true).await,
+        Commands::Schedule {
+            channel,
+            text,
+            at,
+            thread_ts,
+        } => run_schedule(ctx, flag, &channel, text, &at, thread_ts.as_deref()).await,
+        Commands::Scheduled { channel } => run_scheduled(ctx, flag, channel.as_deref()).await,
         Commands::Stats { breakdown } => cmd_stats(ctx, workspace.as_ref(), breakdown),
         Commands::Vacuum => cmd_vacuum(ctx, workspace.as_ref()),
         Commands::Threads { channel, limit } => {
@@ -856,7 +951,15 @@ fn cmd_read(
     workspace: Option<&TeamId>,
     channel_arg: &str,
     limit: usize,
+    since: Option<&str>,
 ) -> Result<ExitCode> {
+    let cutoff_secs = match since {
+        Some(spec) => match parse_since_cutoff(spec, now_epoch_secs()) {
+            Ok(secs) => Some(secs),
+            Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+        },
+        None => None,
+    };
     let Some(workspace) = workspace else {
         return Ok(empty_local(
             ctx,
@@ -875,12 +978,15 @@ fn cmd_read(
         .as_ref()
         .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
     let label = resolved.as_ref().map(|row| row.label());
-    let messages = match open_archive_store(workspace) {
+    let mut messages = match open_archive_store(workspace) {
         Some(store) => store
             .channel_history(workspace, &channel_id, None, limit)
             .with_context(|| format!("reading the history of {channel_id}"))?,
         None => Vec::new(),
     };
+    if let Some(cutoff) = cutoff_secs {
+        messages.retain(|m| m.message.ts.secs().is_some_and(|s| s >= cutoff));
+    }
     let rows: Vec<MessageRow> = messages
         .iter()
         .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
@@ -1479,6 +1585,187 @@ fn fail(ctx: &Ctx, code: &str, message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Parse a `--since` cutoff (`30m`, `24h`, `7d`, `2w`, `YYYY-MM-DD`, or unix seconds) into
+/// unix epoch seconds.
+fn parse_since_cutoff(spec: &str, now_secs: i64) -> Result<i64, String> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err("empty --since value".to_owned());
+    }
+    if let Ok(epoch) = trimmed.parse::<i64>() {
+        return Ok(epoch);
+    }
+    if let Some((y, rest)) = trimmed.split_once('-') {
+        if let Some((m, d)) = rest.split_once('-') {
+            if let (Ok(year), Ok(month), Ok(day)) =
+                (y.parse::<i64>(), m.parse::<u32>(), d.parse::<u32>())
+            {
+                if (1..=12).contains(&month) && (1..=31).contains(&day) {
+                    return Ok(days_from_civil(year, month, day).saturating_mul(86_400));
+                }
+            }
+        }
+    }
+    let delta = parse_duration_secs(trimmed)?;
+    let delta_i64 = i64::try_from(delta).unwrap_or(i64::MAX);
+    Ok(now_secs.saturating_sub(delta_i64))
+}
+
+/// Howard Hinnant's civil-from-days inverse: UTC `YYYY-MM-DD` -> days since `1970-01-01`.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(month);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn cmd_users(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    query: Option<&str>,
+    include_deleted: bool,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({"count": 0, "users": []}),
+            "listing users",
+        ));
+    };
+    let archive = Archive::open(workspace);
+    if archive.is_none() {
+        archive_hint(workspace);
+    }
+    let users = archive
+        .as_ref()
+        .map_or_else(Vec::new, |a| a.users(workspace, query, include_deleted));
+    let mut human = String::new();
+    for u in &users {
+        let display = u
+            .display_name
+            .as_deref()
+            .or(u.real_name.as_deref())
+            .unwrap_or(&u.name);
+        let mut flags = Vec::new();
+        if u.is_bot {
+            flags.push("bot");
+        }
+        if u.deleted {
+            flags.push("deleted");
+        }
+        let flag_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flags.join(", "))
+        };
+        human.push_str(&format!("{}\t@{}\t{}{flag_str}\n", u.id, u.name, display));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({"count": users.len(), "users": users}),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_digest(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    since: &str,
+    all_workspaces: bool,
+    limit: usize,
+) -> Result<ExitCode> {
+    let cutoff_secs = match parse_since_cutoff(since, now_epoch_secs()) {
+        Ok(secs) => secs,
+        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+    };
+    let team_ids: Vec<TeamId> = if all_workspaces {
+        let mut ids = Vec::new();
+        if let Ok(sessions) = SessionStore::new().and_then(|s| s.load()) {
+            for s in sessions {
+                if !ids.contains(&s.team_id) {
+                    ids.push(s.team_id);
+                }
+            }
+        }
+        for tid in archive::stored_team_ids() {
+            if !ids.contains(&tid) {
+                ids.push(tid);
+            }
+        }
+        ids
+    } else {
+        workspace.into_iter().cloned().collect()
+    };
+    if team_ids.is_empty() {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({
+                "since": since,
+                "cutoff_secs": cutoff_secs,
+                "total_messages": 0,
+                "conversations": [],
+            }),
+            "building digest",
+        ));
+    }
+    let mut total_messages: u64 = 0;
+    let mut rows_json = Vec::new();
+    let mut human = String::new();
+    for ws in &team_ids {
+        let Some(archive) = Archive::open(ws) else {
+            continue;
+        };
+        let rows = archive.digest_since(ws, cutoff_secs, limit);
+        for row in rows {
+            total_messages = total_messages.saturating_add(row.message_count);
+            let who = row.latest_author.as_deref().unwrap_or("unknown");
+            if all_workspaces {
+                human.push_str(&format!(
+                    "{}\t{}\t{} msg ({} people)\t{who}: {}\n",
+                    ws.as_str(),
+                    row.label,
+                    row.message_count,
+                    row.author_count,
+                    row.latest_text
+                ));
+            } else {
+                human.push_str(&format!(
+                    "{}\t{} msg ({} people)\t{who}: {}\n",
+                    row.label, row.message_count, row.author_count, row.latest_text
+                ));
+            }
+            let mut val = serde_json::to_value(&row).unwrap_or_default();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("workspace".to_owned(), serde_json::json!(ws.as_str()));
+            }
+            rows_json.push(val);
+        }
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "since": since,
+            "cutoff_secs": cutoff_secs,
+            "all_workspaces": all_workspaces,
+            "total_messages": total_messages,
+            "count": rows_json.len(),
+            "conversations": rows_json,
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,5 +1812,33 @@ mod tests {
         assert!(stats.contains("2.0 MiB"));
         assert!(stats.contains("42 (50 revisions)"));
         assert!(stats.contains("Offline queue:\t1"));
+    }
+
+    #[test]
+    fn parses_since_cutoffs_and_schedule_offsets() {
+        let now = 1_764_000_000;
+        assert_eq!(parse_since_cutoff("30m", now), Ok(now - 1800));
+        assert_eq!(parse_since_cutoff("24h", now), Ok(now - 86_400));
+        assert_eq!(parse_since_cutoff("7d", now), Ok(now - 7 * 86_400));
+        assert_eq!(parse_since_cutoff("2w", now), Ok(now - 14 * 86_400));
+        assert_eq!(parse_since_cutoff("1700000000", now), Ok(1_700_000_000));
+        assert_eq!(parse_since_cutoff("1970-01-02", now), Ok(86_400));
+        assert_eq!(parse_since_cutoff("2026-01-01", now), Ok(1_767_225_600));
+        assert!(parse_since_cutoff("bogus", now).is_err());
+
+        assert_eq!(
+            crate::write::parse_schedule_at("+15m", 1_700_000_000),
+            Ok(1_700_000_900)
+        );
+        assert_eq!(
+            crate::write::parse_schedule_at("+2h", 1_700_000_000),
+            Ok(1_700_007_200)
+        );
+        assert_eq!(
+            crate::write::parse_schedule_at("1700005000", 1_700_000_000),
+            Ok(1_700_005_000)
+        );
+        assert!(crate::write::parse_schedule_at("1699999999", 1_700_000_000).is_err());
+        assert!(crate::write::parse_schedule_at("+0m", 1_700_000_000).is_err());
     }
 }
