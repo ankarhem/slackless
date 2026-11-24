@@ -347,7 +347,7 @@ impl PopoutWindow {
         let mut stage = v_flex()
             .id("popout-huddle-stage-container")
             .relative()
-            .flex_1()
+            .size_full()
             .min_w_0()
             .min_h_0()
             .bg(pal.stage_bg)
@@ -534,19 +534,46 @@ impl PopoutWindow {
             );
         }
 
-        let body = h_flex().flex_1().min_h_0().w_full().child(stage).when_some(
-            self.huddle_drawer,
-            |row, drawer| {
-                row.child(self.render_huddle_drawer(
-                    drawer,
-                    &state,
-                    &pal,
-                    on_jump.clone(),
-                    on_open_canvas.clone(),
-                    cx,
-                ))
-            },
-        );
+        let body: gpui_kit::gpui::AnyElement = if let Some(drawer) = self.huddle_drawer {
+            let drawer_el = self.render_huddle_drawer(
+                drawer,
+                &state,
+                &pal,
+                on_jump.clone(),
+                on_open_canvas.clone(),
+                cx,
+            );
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(
+                    h_resizable("huddle-popout-drawer")
+                        .with_handle_appearance(Rc::new(
+                            |_: &gpui_kit::base::ResizeHandleContext,
+                             _: &mut Window,
+                             _: &mut App| {
+                                Some(div().into_any_element())
+                            },
+                        ))
+                        .child(resizable_panel().child(stage))
+                        .child(
+                            resizable_panel()
+                                .size(px(340.))
+                                .size_range(px(260.)..px(720.))
+                                .fixed()
+                                .child(drawer_el),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(stage)
+                .into_any_element()
+        };
 
         v_flex()
             .id("popout-huddle-root")
@@ -597,9 +624,8 @@ impl PopoutWindow {
                 .into_any_element(),
         };
         v_flex()
-            .flex_none()
-            .w(px(316.))
-            .h_full()
+            .size_full()
+            .min_w_0()
             .bg(pal.drawer_bg)
             .border_l_1()
             .border_color(pal.drawer_border)
@@ -891,7 +917,7 @@ impl PopoutWindow {
             .child(
                 div()
                     .flex_none()
-                    .p_2()
+                    .py_2()
                     .border_t_1()
                     .border_color(pal.drawer_border)
                     .child(self.composer.clone()),

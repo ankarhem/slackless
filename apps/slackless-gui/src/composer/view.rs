@@ -14,7 +14,6 @@ use gpui_kit::gpui::{
 };
 
 use super::tokens::{self, Palette};
-use super::toolbar::TOOLBAR;
 use super::{BAR_TUCK, Composer, Placeholder};
 
 impl Composer {
@@ -349,63 +348,9 @@ impl Render for Composer {
         // A context bar takes the frame's top edge, and the formatting bar squares off under it.
         let context_bar = self.context_bar.clone().map(|bar| bar(window, cx));
         let has_bar = context_bar.is_some();
-        let toolbar = self.show_toolbar.then(|| {
-            let markup_active = !self.format_markup;
-            let theme = cx.theme();
-            let md_fg = if markup_active {
-                theme.primary
-            } else {
-                theme.muted_foreground.opacity(0.32)
-            };
-            let md_bg = if markup_active {
-                theme.primary.opacity(0.14)
-            } else {
-                theme.secondary.opacity(0.)
-            };
-            let md_hover = theme.secondary_hover;
-            h_flex()
-                .items_center()
-                .justify_between()
-                .px_1p5()
-                // Slack's band: 4px around 28px buttons.
-                .py(px(5.))
-                .rounded_t_lg()
-                .bg(band)
-                .child(
-                    h_flex().items_center().gap_0p5().children(
-                        TOOLBAR
-                            .iter()
-                            .map(|slot| self.tool_button(slot, focused, cx)),
-                    ),
-                )
-                .child(
-                    div()
-                        .id("fmt-markup-mode")
-                        .cursor_pointer()
-                        .h(px(22.))
-                        .px_1p5()
-                        .rounded(px(4.))
-                        .bg(md_bg)
-                        .hover(move |el| el.bg(md_hover))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(md_fg)
-                        .tooltip(|window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(
-                                "Toggle raw markup mode (show formatting characters)",
-                            )
-                            .build(window, cx)
-                        })
-                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.set_format_markup(!this.format_markup, cx);
-                        }))
-                        .child("MD"),
-                )
-        });
+        let toolbar = self
+            .show_toolbar
+            .then(|| self.formatting_toolbar(focused, band, cx));
         let clip_bar = self.clip_recording_bar(cx);
         let attachments = self.attachments_strip(cx);
         let upload_warning = self.upload_warning.clone().map(|msg| {
@@ -548,6 +493,28 @@ impl Render for Composer {
                     )
             });
         let code_backdrop = self.code_block_backdrop(editor_focused, cx);
+        let known_width = self.box_width;
+        let width_entity = cx.entity().downgrade();
+        let measure = canvas(
+            move |bounds, _, cx| {
+                let laid_out = f32::from(bounds.size.width);
+                if laid_out > 0. && known_width.is_none_or(|prev| (prev - laid_out).abs() >= 1.0) {
+                    let entity = width_entity.clone();
+                    cx.defer(move |cx| {
+                        let _ = entity.update(cx, |composer, cx| {
+                            composer.box_width = Some(laid_out);
+                            cx.notify();
+                        });
+                    });
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w_full()
+        .h(px(0.));
         let theme = cx.theme();
         div()
             .key_context("Composer")
@@ -568,8 +535,10 @@ impl Render for Composer {
             .children(context_bar)
             .child(
                 v_flex()
+                    .relative()
                     .w_full()
                     .rounded_lg()
+                    .child(measure)
                     // Slack's box sits over the context bar's lower edge: the bar runs on
                     // under the box, showing behind its rounded top corners.
                     .when(has_bar, |frame| frame.mt(px(-BAR_TUCK)))

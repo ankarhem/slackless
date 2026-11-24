@@ -251,6 +251,9 @@ pub struct Composer {
     pub(super) clip_review: Option<ClipReview>,
     pub(super) clip_stopping: bool,
     clip_ticker: Option<Task<()>>,
+    /// Measured outer width of the composer frame in logical pixels, used to collapse
+    /// overflowing toolbar and action-row controls into a `"More options"` menu.
+    pub(super) box_width: Option<f32>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -356,6 +359,7 @@ impl Composer {
                 clip_review: None,
                 clip_stopping: false,
                 clip_ticker: None,
+                box_width: None,
                 _subscriptions: subscriptions,
             }
         })

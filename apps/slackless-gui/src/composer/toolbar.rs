@@ -11,7 +11,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, AnyElement, AnyView, App, ClickEvent, Context, Div, FontWeight, ImageSource,
+    Anchor, AnyElement, AnyView, App, ClickEvent, Context, Div, FontWeight, Hsla, ImageSource,
     InteractiveElement as _, IntoElement, MouseButton, ObjectFit, ParentElement as _, Stateful,
     StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
 };
@@ -163,6 +163,83 @@ fn tip_sub(
     .build(window, cx)
 }
 
+/// Conservative logical width (px) of a single formatting-toolbar slot.
+fn slot_width(slot: &Slot) -> f32 {
+    match slot {
+        Slot::Tool(..) => 26.0,
+        Slot::Styles => 40.0,
+        Slot::Divider => 9.0,
+    }
+}
+
+/// Computes `(visible_slot_count, show_md_inline)` for a formatting toolbar inside a composer
+/// box of `avail_width` logical pixels. When not all controls fit, trailing slots collapse
+/// behind a `⋯` `"More options"` menu and any dangling trailing divider is omitted.
+pub(super) fn visible_toolbar_layout(avail_width: f32) -> (usize, bool) {
+    const GAP: f32 = 2.0;
+    const OVERHEAD: f32 = 14.0; // 2px border + 12px horizontal padding (px_1p5)
+    const MD_RESERVE: f32 = 38.0; // MD pill (~32px) + breathing gap (6px)
+    const MORE_RESERVE: f32 = 28.0; // 26px ellipsis button + 2px gap
+
+    let full_slots_width: f32 = TOOLBAR.iter().map(slot_width).sum::<f32>()
+        + GAP * (TOOLBAR.len().saturating_sub(1) as f32);
+    if OVERHEAD + full_slots_width + MD_RESERVE <= avail_width {
+        return (TOOLBAR.len(), true);
+    }
+
+    // Keep the MD pill inline while there's comfortable width; on narrow drawers move it into
+    // the "More options" menu so more primary formatting buttons stay directly clickable.
+    let show_md = avail_width >= 340.0;
+    let budget =
+        (avail_width - OVERHEAD - MORE_RESERVE - if show_md { MD_RESERVE } else { 0.0 }).max(0.0);
+
+    let mut used = 0.0_f32;
+    let mut visible = 0usize;
+    for slot in &TOOLBAR {
+        let step = if visible == 0 {
+            slot_width(slot)
+        } else {
+            GAP + slot_width(slot)
+        };
+        if used + step > budget {
+            break;
+        }
+        used += step;
+        visible += 1;
+    }
+
+    // Never leave a trailing group divider directly before the `⋯` overflow button.
+    while visible > 0 && matches!(TOOLBAR[visible - 1], Slot::Divider) {
+        visible -= 1;
+    }
+
+    (visible, show_md)
+}
+
+/// Returns `true` when the bottom action row does not have room for the clip & shortcut tail
+/// buttons alongside `+ Aa 😊 @` and the right-hand Send control, so those tail buttons
+/// collapse behind a `⋯` `"More options"` button (matching Slack's narrow thread composer).
+pub(super) fn action_row_collapses_tail(avail_width: f32, scheduling: bool) -> bool {
+    const OVERHEAD: f32 = 18.0; // 2px border + 16px horizontal padding (px_2)
+    const CORE_LEFT: f32 = 110.0; // + (26) + Aa (26) + emoji (26) + @ (26) + 3*2px gaps
+    const TAIL_LEFT: f32 = 92.0; // | (1) + video (28) + mic (26) + | (1) + / (26) + 5*2px gaps
+    const BREATHING_GAP: f32 = 16.0;
+    let right = if scheduling { 59.0 } else { 32.0 };
+    avail_width < OVERHEAD + CORE_LEFT + TAIL_LEFT + BREATHING_GAP + right
+}
+
+enum HiddenToolbarEntry {
+    Separator,
+    Styles(u8),
+    Tool {
+        icon: IconName,
+        label: &'static str,
+        keys: &'static [&'static str],
+        tool: Tool,
+        active: bool,
+    },
+}
+
 /// The square a toolbar or action-row control sits in.
 fn control(id: &'static str) -> Stateful<Div> {
     div()
@@ -176,6 +253,391 @@ fn control(id: &'static str) -> Stateful<Div> {
 }
 
 impl Composer {
+    /// The top formatting toolbar, responsively truncating overflowing tools behind a `⋯`
+    /// `"More options"` dropdown when the composer box is narrow (e.g. thread or huddle drawers).
+    pub(super) fn formatting_toolbar(
+        &self,
+        focused: bool,
+        band: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (visible, show_md) = self
+            .box_width
+            .map(visible_toolbar_layout)
+            .unwrap_or((TOOLBAR.len(), true));
+        let has_overflow = visible < TOOLBAR.len() || !show_md;
+
+        let markup_active = !self.format_markup;
+        let theme = cx.theme();
+        let md_fg = if markup_active {
+            theme.primary
+        } else {
+            theme.muted_foreground.opacity(0.32)
+        };
+        let md_bg = if markup_active {
+            theme.primary.opacity(0.14)
+        } else {
+            theme.secondary.opacity(0.)
+        };
+        let md_hover = theme.secondary_hover;
+
+        h_flex()
+            .items_center()
+            .justify_between()
+            .min_w_0()
+            .px_1p5()
+            // Slack's band: 4px around 28px buttons.
+            .py(px(5.))
+            .rounded_t_lg()
+            .bg(band)
+            .child(
+                h_flex()
+                    .items_center()
+                    .min_w_0()
+                    .gap_0p5()
+                    .children(
+                        TOOLBAR[..visible]
+                            .iter()
+                            .map(|slot| self.tool_button(slot, focused, cx)),
+                    )
+                    .when(has_overflow, |row| {
+                        row.child(self.formatting_more_button(visible, show_md, focused, cx))
+                    }),
+            )
+            .when(show_md, |bar| {
+                bar.child(
+                    div()
+                        .id("fmt-markup-mode")
+                        .flex_none()
+                        .cursor_pointer()
+                        .h(px(22.))
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .bg(md_bg)
+                        .hover(move |el| el.bg(md_hover))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(md_fg)
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Toggle raw markup mode (show formatting characters)")
+                                .build(window, cx)
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_format_markup(!this.format_markup, cx);
+                        }))
+                        .child("MD"),
+                )
+            })
+    }
+
+    /// The `⋯` `"More options"` overflow dropdown on the top formatting toolbar.
+    fn formatting_more_button(
+        &self,
+        visible: usize,
+        show_md: bool,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let idle = cx.theme().foreground.opacity(0.9);
+        let color = if focused { idle } else { idle.opacity(0.3) };
+        let active_heading = match self.editor.active_block() {
+            Some(LineKind::Heading(level)) => level,
+            _ => 0,
+        };
+        let markup_active = !self.format_markup;
+
+        let mut entries = Vec::new();
+        for slot in &TOOLBAR[visible..] {
+            match slot {
+                Slot::Divider => {
+                    if !entries.is_empty() {
+                        entries.push(HiddenToolbarEntry::Separator);
+                    }
+                }
+                Slot::Styles => entries.push(HiddenToolbarEntry::Styles(active_heading)),
+                Slot::Tool(_, icon, tool) => {
+                    let (label, keys) = slot_tip(*tool).unwrap_or(("Format", &[]));
+                    entries.push(HiddenToolbarEntry::Tool {
+                        icon: *icon,
+                        label,
+                        keys,
+                        tool: *tool,
+                        active: self.is_active(*tool),
+                    });
+                }
+            }
+        }
+        let entries = std::rc::Rc::new(entries);
+        let this = cx.entity().downgrade();
+
+        let trigger = Button::new("fmt-more")
+            .ghost()
+            .with_size(Size::XSmall)
+            .size(px(26.))
+            .p_0()
+            .child(
+                Icon::new(IconName::Ellipsis)
+                    .text_color(color)
+                    .size(px(15.)),
+            )
+            .dropdown_menu_with_anchor(Anchor::BottomRight, move |mut menu, _, _| {
+                let mut had_items = false;
+                for entry in entries.iter() {
+                    match entry {
+                        HiddenToolbarEntry::Separator => {
+                            if had_items {
+                                menu = menu.separator();
+                            }
+                        }
+                        HiddenToolbarEntry::Styles(active_level) => {
+                            for (level, icon, choice, tool) in [
+                                (0u8, IconName::Pilcrow, "Paragraph", Tool::Paragraph),
+                                (1, IconName::Heading1, "Big heading", Tool::Heading(1)),
+                                (2, IconName::Heading2, "Medium heading", Tool::Heading(2)),
+                                (3, IconName::Heading3, "Small heading", Tool::Heading(3)),
+                            ] {
+                                let this = this.clone();
+                                let checked = *active_level == level;
+                                menu = menu.item(
+                                    PopupMenuItem::element(move |_, cx| {
+                                        let theme = cx.theme();
+                                        let fg = if checked {
+                                            theme.link
+                                        } else {
+                                            theme.popover_foreground
+                                        };
+                                        h_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .w(px(14.))
+                                                    .flex_none()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .children(checked.then(|| {
+                                                        Icon::new(IconName::Check)
+                                                            .size(px(14.))
+                                                            .text_color(fg)
+                                                    })),
+                                            )
+                                            .child(Icon::new(icon).size(px(15.)).text_color(fg))
+                                            .child(div().text_color(fg).child(choice))
+                                    })
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            if let Some(this) = this.upgrade() {
+                                                this.update(cx, |composer, cx| {
+                                                    composer.run(tool, window, cx);
+                                                });
+                                            }
+                                        },
+                                    ),
+                                );
+                                had_items = true;
+                            }
+                        }
+                        HiddenToolbarEntry::Tool {
+                            icon,
+                            label,
+                            keys,
+                            tool,
+                            active,
+                        } => {
+                            let this = this.clone();
+                            let icon = *icon;
+                            let label = *label;
+                            let shortcut = (!keys.is_empty()).then(|| keys.join(" "));
+                            let tool = *tool;
+                            let checked = *active;
+                            menu = menu.item(
+                                PopupMenuItem::element(move |_, cx| {
+                                    let theme = cx.theme();
+                                    let fg = if checked {
+                                        theme.link
+                                    } else {
+                                        theme.popover_foreground
+                                    };
+                                    let muted = theme.muted_foreground;
+                                    let shortcut = shortcut.clone();
+                                    h_flex()
+                                        .w(px(210.))
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .w(px(14.))
+                                                        .flex_none()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .children(checked.then(|| {
+                                                            Icon::new(IconName::Check)
+                                                                .size(px(14.))
+                                                                .text_color(fg)
+                                                        })),
+                                                )
+                                                .child(Icon::new(icon).size(px(15.)).text_color(fg))
+                                                .child(div().text_color(fg).child(label)),
+                                        )
+                                        .when_some(shortcut, |row, text| {
+                                            row.child(div().text_xs().text_color(muted).child(text))
+                                        })
+                                })
+                                .on_click(move |_, window, cx| {
+                                    if let Some(this) = this.upgrade() {
+                                        this.update(cx, |composer, cx| {
+                                            composer.run(tool, window, cx);
+                                        });
+                                    }
+                                }),
+                            );
+                            had_items = true;
+                        }
+                    }
+                }
+                if !show_md {
+                    if had_items {
+                        menu = menu.separator();
+                    }
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, cx| {
+                            let theme = cx.theme();
+                            let fg = if markup_active {
+                                theme.link
+                            } else {
+                                theme.popover_foreground
+                            };
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .children(markup_active.then(|| {
+                                            Icon::new(IconName::Check).size(px(14.)).text_color(fg)
+                                        })),
+                                )
+                                .child(div().text_color(fg).child("Raw markup mode (MD)"))
+                        })
+                        .on_click(move |_, _, cx| {
+                            if let Some(this) = this.upgrade() {
+                                this.update(cx, |composer, cx| {
+                                    composer.set_format_markup(!composer.format_markup, cx);
+                                });
+                            }
+                        }),
+                    );
+                }
+                menu
+            });
+
+        div()
+            .id("fmt-more-tip")
+            .flex_none()
+            .tooltip(|window, cx| tip_view("More options", &[], window, cx))
+            .child(trigger)
+            .into_any_element()
+    }
+
+    /// The `⋯` `"More options"` overflow dropdown on the bottom action row when the composer is
+    /// too narrow to show clips and shortcut buttons inline.
+    fn action_more_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let this = cx.entity().downgrade();
+        let trigger = Button::new("act-more")
+            .ghost()
+            .with_size(Size::XSmall)
+            .size(px(26.))
+            .p_0()
+            .child(
+                Icon::new(IconName::Ellipsis)
+                    .text_color(muted)
+                    .size(px(15.)),
+            )
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                let cam_this = this.clone();
+                let scr_this = this.clone();
+                let aud_this = this.clone();
+                let slash_this = this.clone();
+                menu.item(
+                    PopupMenuItem::new("Record camera clip")
+                        .icon(IconName::Video)
+                        .on_click(move |_, _, cx| {
+                            if let Some(c) = cam_this.upgrade() {
+                                c.update(cx, |composer, cx| {
+                                    composer.start_video_clip(
+                                        slackless_core::huddle::ClipVideoSource::Camera(None),
+                                        cx,
+                                    );
+                                });
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Record screen clip")
+                        .icon(IconName::Monitor)
+                        .on_click(move |_, _, cx| {
+                            if let Some(c) = scr_this.upgrade() {
+                                c.update(cx, |composer, cx| {
+                                    composer.start_video_clip(
+                                        slackless_core::huddle::ClipVideoSource::Screen(
+                                            "monitor:primary".to_owned(),
+                                        ),
+                                        cx,
+                                    );
+                                });
+                            }
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Record audio clip")
+                        .icon(IconName::Mic)
+                        .on_click(move |_, _, cx| {
+                            if let Some(c) = aud_this.upgrade() {
+                                c.update(cx, |composer, cx| {
+                                    composer.start_audio_clip(cx);
+                                });
+                            }
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Run shortcut")
+                        .icon(IconName::SquareSlash)
+                        .on_click(move |_, window, cx| {
+                            if let Some(c) = slash_this.upgrade() {
+                                c.update(cx, |composer, cx| {
+                                    composer.run(Tool::Slash, window, cx);
+                                });
+                            }
+                        }),
+                )
+            });
+
+        div()
+            .id("act-more-tip")
+            .flex_none()
+            .tooltip(|window, cx| tip_view("More options", &[], window, cx))
+            .child(trigger)
+            .into_any_element()
+    }
+
     /// A button that runs `tool`, lit while the tool is in effect at the caret. Like Slack's,
     /// the toolbar's icons are faint until the draft has focus.
     pub(super) fn tool_button(
@@ -768,6 +1230,10 @@ impl Composer {
                     })),
             )
             .when(!self.edit_mode, |row| {
+                let collapse_tail = self.clip_recorder.is_none()
+                    && self
+                        .box_width
+                        .is_some_and(|w| action_row_collapses_tail(w, self.scheduling));
                 row.child(
                     button("act-mention", icon(IconName::AtSign).into_any_element())
                         .tooltip(|window, cx| tip_view("Mention someone", &[], window, cx))
@@ -775,142 +1241,156 @@ impl Composer {
                             cx.listener(|this, _, window, cx| this.run(Tool::Mention, window, cx)),
                         ),
                 )
-                .child(separator())
-                .child({
-                    let recording_video = matches!(
-                        self.clip_recorder,
-                        Some(super::ActiveClipRecorder::Video { .. })
-                    );
-                    let danger = cx.theme().danger;
-                    let this = cx.entity().downgrade();
-                    if recording_video {
-                        button(
-                            "act-video",
-                            Icon::new(IconName::Square)
-                                .text_color(danger)
-                                .size(px(14.))
-                                .into_any_element(),
-                        )
-                        .bg(danger.opacity(0.14))
-                        .tooltip(|window, cx| tip_view("Stop video clip", &[], window, cx))
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_and_attach_clip(cx)))
-                        .into_any_element()
-                    } else {
-                        Button::new("act-video")
-                            .ghost()
-                            .with_size(Size::XSmall)
-                            .size(px(28.))
-                            .p_0()
-                            .tooltip("Record video clip")
-                            .child(icon(IconName::Video))
-                            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
-                                let cam_this = this.clone();
-                                let scr_this = this.clone();
-                                menu = menu
-                                    .item(
-                                        PopupMenuItem::new("Record camera clip")
-                                            .icon(IconName::Video)
-                                            .on_click(move |_, _, cx| {
-                                                if let Some(c) = cam_this.upgrade() {
-                                                    c.update(cx, |composer, cx| {
-                                                        composer.start_video_clip(
-                                                            slackless_core::huddle::ClipVideoSource::Camera(None),
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                            }),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new("Record screen clip (primary display)")
-                                            .icon(IconName::Monitor)
-                                            .on_click(move |_, _, cx| {
-                                                if let Some(c) = scr_this.upgrade() {
-                                                    c.update(cx, |composer, cx| {
-                                                        composer.start_video_clip(
-                                                            slackless_core::huddle::ClipVideoSource::Screen(
-                                                                "monitor:primary".to_owned(),
-                                                            ),
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                            }),
-                                    );
-                                let sources = slackless_core::huddle::list_screen_sources();
-                                if sources.len() > 1 {
-                                    menu = menu.separator().label("Record display or window");
-                                    for src in sources.into_iter().take(6) {
-                                        let src_this = this.clone();
-                                        let src_id = src.id;
-                                        let icon = if src.is_monitor {
-                                            IconName::Monitor
-                                        } else {
-                                            IconName::AppWindow
-                                        };
-                                        menu = menu.item(
-                                            PopupMenuItem::new(src.name).icon(icon).on_click(
-                                                move |_, _, cx| {
-                                                    if let Some(c) = src_this.upgrade() {
-                                                        c.update(cx, |composer, cx| {
-                                                            composer.start_video_clip(
-                                                                slackless_core::huddle::ClipVideoSource::Screen(
-                                                                    src_id.clone(),
-                                                                ),
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }
-                                                },
-                                            ),
-                                        );
-                                    }
-                                }
-                                menu
-                            })
-                            .into_any_element()
-                    }
-                })
-                .child({
-                    let recording_audio = matches!(
-                        self.clip_recorder,
-                        Some(super::ActiveClipRecorder::Audio(_))
-                    );
-                    let danger = cx.theme().danger;
-                    button(
-                        "act-mic",
-                        if recording_audio {
-                            Icon::new(IconName::Square)
-                                .text_color(danger)
-                                .size(px(14.))
+                .when(collapse_tail, |row| row.child(self.action_more_button(cx)))
+                .when(!collapse_tail, |row| {
+                    row.child(separator())
+                        .child({
+                            let recording_video = matches!(
+                                self.clip_recorder,
+                                Some(super::ActiveClipRecorder::Video { .. })
+                            );
+                            let danger = cx.theme().danger;
+                            let this = cx.entity().downgrade();
+                            if recording_video {
+                                button(
+                                    "act-video",
+                                    Icon::new(IconName::Square)
+                                        .text_color(danger)
+                                        .size(px(14.))
+                                        .into_any_element(),
+                                )
+                                .bg(danger.opacity(0.14))
+                                .tooltip(|window, cx| tip_view("Stop video clip", &[], window, cx))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.stop_and_attach_clip(cx)),
+                                )
                                 .into_any_element()
-                        } else {
-                            icon(IconName::Mic).into_any_element()
-                        },
-                    )
-                    .when(recording_audio, |el| el.bg(danger.opacity(0.14)))
-                    .tooltip(move |window, cx| {
-                        tip_view(
-                            if recording_audio {
-                                "Stop audio clip"
                             } else {
-                                "Record audio clip"
-                            },
-                            &[],
-                            window,
-                            cx,
+                                Button::new("act-video")
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .size(px(28.))
+                                    .p_0()
+                                    .tooltip("Record video clip")
+                                    .child(icon(IconName::Video))
+                                    .dropdown_menu_with_anchor(
+                                        Anchor::BottomLeft,
+                                        move |mut menu, _, _| {
+                                            let cam_this = this.clone();
+                                            let scr_this = this.clone();
+                                            menu = menu
+                                                .item(
+                                                    PopupMenuItem::new("Record camera clip")
+                                                        .icon(IconName::Video)
+                                                        .on_click(move |_, _, cx| {
+                                                            if let Some(c) = cam_this.upgrade() {
+                                                                c.update(cx, |composer, cx| {
+                                                                    composer.start_video_clip(
+                                                                        slackless_core::huddle::ClipVideoSource::Camera(None),
+                                                                        cx,
+                                                                    );
+                                                                });
+                                                            }
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new(
+                                                        "Record screen clip (primary display)",
+                                                    )
+                                                    .icon(IconName::Monitor)
+                                                    .on_click(move |_, _, cx| {
+                                                        if let Some(c) = scr_this.upgrade() {
+                                                            c.update(cx, |composer, cx| {
+                                                                composer.start_video_clip(
+                                                                    slackless_core::huddle::ClipVideoSource::Screen(
+                                                                        "monitor:primary".to_owned(),
+                                                                    ),
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    }),
+                                                );
+                                            let sources =
+                                                slackless_core::huddle::list_screen_sources();
+                                            if sources.len() > 1 {
+                                                menu = menu
+                                                    .separator()
+                                                    .label("Record display or window");
+                                                for src in sources.into_iter().take(6) {
+                                                    let src_this = this.clone();
+                                                    let src_id = src.id;
+                                                    let icon = if src.is_monitor {
+                                                        IconName::Monitor
+                                                    } else {
+                                                        IconName::AppWindow
+                                                    };
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(src.name)
+                                                            .icon(icon)
+                                                            .on_click(move |_, _, cx| {
+                                                                if let Some(c) = src_this.upgrade()
+                                                                {
+                                                                    c.update(cx, |composer, cx| {
+                                                                        composer.start_video_clip(
+                                                                            slackless_core::huddle::ClipVideoSource::Screen(
+                                                                                src_id.clone(),
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                    });
+                                                                }
+                                                            }),
+                                                    );
+                                                }
+                                            }
+                                            menu
+                                        },
+                                    )
+                                    .into_any_element()
+                            }
+                        })
+                        .child({
+                            let recording_audio = matches!(
+                                self.clip_recorder,
+                                Some(super::ActiveClipRecorder::Audio(_))
+                            );
+                            let danger = cx.theme().danger;
+                            button(
+                                "act-mic",
+                                if recording_audio {
+                                    Icon::new(IconName::Square)
+                                        .text_color(danger)
+                                        .size(px(14.))
+                                        .into_any_element()
+                                } else {
+                                    icon(IconName::Mic).into_any_element()
+                                },
+                            )
+                            .when(recording_audio, |el| el.bg(danger.opacity(0.14)))
+                            .tooltip(move |window, cx| {
+                                tip_view(
+                                    if recording_audio {
+                                        "Stop audio clip"
+                                    } else {
+                                        "Record audio clip"
+                                    },
+                                    &[],
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.start_audio_clip(cx)))
+                        })
+                        .child(separator())
+                        .child(
+                            button("act-slash", icon(IconName::SquareSlash).into_any_element())
+                                .tooltip(|window, cx| tip_view("Run shortcut", &[], window, cx))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.run(Tool::Slash, window, cx)
+                                })),
                         )
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.start_audio_clip(cx)))
                 })
-                .child(separator())
-                .child(
-                    button("act-slash", icon(IconName::SquareSlash).into_any_element())
-                        .tooltip(|window, cx| tip_view("Run shortcut", &[], window, cx))
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.run(Tool::Slash, window, cx)),
-                        ),
-                )
             });
         let right = if self.edit_mode {
             h_flex()
@@ -1033,5 +1513,43 @@ mod tests {
                 ("Divider", &[][..]),
             ]
         );
+    }
+
+    #[test]
+    fn toolbar_truncates_cleanly_without_dangling_dividers() {
+        // Wide composer fits every slot plus the inline MD toggle with no overflow.
+        assert_eq!(visible_toolbar_layout(600.0), (TOOLBAR.len(), true));
+
+        // Medium composer (~360px) keeps MD inline and collapses trailing slots behind `⋯`.
+        let (mid_count, mid_md) = visible_toolbar_layout(360.0);
+        assert!(mid_md);
+        assert!(mid_count > 5 && mid_count < TOOLBAR.len());
+        assert!(!matches!(TOOLBAR[mid_count - 1], Slot::Divider));
+
+        // Narrow drawer composer (~284px) moves MD into the overflow menu and keeps ~7-8 tools.
+        let (narrow_count, narrow_md) = visible_toolbar_layout(284.0);
+        assert!(!narrow_md);
+        assert!((7..=9).contains(&narrow_count));
+        assert!(!matches!(TOOLBAR[narrow_count - 1], Slot::Divider));
+
+        // Sweep widths to guarantee we never leave a trailing divider before `⋯`.
+        for width in (100..=500).step_by(5) {
+            let (count, _) = visible_toolbar_layout(width as f32);
+            if count > 0 && count < TOOLBAR.len() {
+                assert!(
+                    !matches!(TOOLBAR[count - 1], Slot::Divider),
+                    "dangling trailing divider at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn action_row_collapses_tail_at_narrow_widths() {
+        assert!(action_row_collapses_tail(280.0, true));
+        assert!(!action_row_collapses_tail(420.0, true));
+        // Without the schedule chevron, the row fits slightly narrower boxes.
+        assert!(!action_row_collapses_tail(280.0, false));
+        assert!(action_row_collapses_tail(250.0, false));
     }
 }
