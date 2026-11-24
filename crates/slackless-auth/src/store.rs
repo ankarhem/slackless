@@ -118,11 +118,36 @@ impl SessionStore {
 
         let json = serde_json::to_vec_pretty(&on_disk)?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
+        write_private_file(&tmp, &json)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
+}
 
+/// Write `bytes` to `path` with owner-only (`0600`) permissions on Unix so plaintext session tokens
+/// are never world-readable when Keychain mirroring is disabled.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+impl SessionStore {
     /// Inserts or replaces the session for its `team_id`.
     pub fn upsert(&self, session: Session) -> Result<()> {
         let mut sessions = self.load()?;

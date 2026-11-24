@@ -195,6 +195,13 @@ fn download_and_install(
     std::fs::create_dir_all(&stage_dir).context("creating update staging directory")?;
 
     let install_result = (|| -> Result<(PathBuf, Option<PathBuf>)> {
+        if !is_safe_asset_name(&release.tarball_name) {
+            anyhow::bail!("invalid release asset name: {}", release.tarball_name);
+        }
+        let sums_url = release.checksums_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("release is missing SHA256SUMS.txt; refusing unverified update")
+        })?;
+
         let tarball_path = stage_dir.join(&release.tarball_name);
         let dl = Command::new("curl")
             .args(["-fsSL", "--max-time", "300", "-o"])
@@ -209,39 +216,41 @@ fn download_and_install(
             );
         }
 
-        if let Some(sums_url) = &release.checksums_url {
-            let sums_path = stage_dir.join("SHA256SUMS.txt");
-            let sums_dl = Command::new("curl")
-                .args(["-fsSL", "--max-time", "30", "-o"])
-                .arg(&sums_path)
-                .arg(sums_url)
-                .output()
-                .context("downloading SHA256SUMS.txt")?;
-            if sums_dl.status.success() {
-                let sums_text = std::fs::read_to_string(&sums_path).unwrap_or_default();
-                if let Some(expected) = sums_text.lines().find_map(|line| {
-                    let mut parts = line.split_whitespace();
-                    let hash = parts.next()?;
-                    let name = parts.next()?.trim_start_matches('*');
-                    (name == release.tarball_name).then(|| hash.to_ascii_lowercase())
-                }) {
-                    let actual_out = Command::new("shasum")
-                        .args(["-a", "256"])
-                        .arg(&tarball_path)
-                        .output()
-                        .context("computing SHA-256 checksum")?;
-                    let actual = String::from_utf8_lossy(&actual_out.stdout)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    if actual != expected {
-                        anyhow::bail!(
-                            "SHA-256 checksum mismatch (expected {expected}, got {actual})"
-                        );
-                    }
-                }
-            }
+        let sums_path = stage_dir.join("SHA256SUMS.txt");
+        let sums_dl = Command::new("curl")
+            .args(["-fsSL", "--max-time", "30", "-o"])
+            .arg(&sums_path)
+            .arg(sums_url)
+            .output()
+            .context("downloading SHA256SUMS.txt")?;
+        if !sums_dl.status.success() {
+            anyhow::bail!(
+                "failed to download SHA256SUMS.txt: {}",
+                String::from_utf8_lossy(&sums_dl.stderr).trim()
+            );
+        }
+        let sums_text = std::fs::read_to_string(&sums_path).context("reading SHA256SUMS.txt")?;
+        let expected = find_sha256_entry(&sums_text, &release.tarball_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SHA256SUMS.txt has no checksum entry for {}",
+                release.tarball_name
+            )
+        })?;
+        let actual_out = Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(&tarball_path)
+            .output()
+            .context("computing SHA-256 checksum")?;
+        if !actual_out.status.success() {
+            anyhow::bail!("shasum exited with {}", actual_out.status);
+        }
+        let actual = String::from_utf8_lossy(&actual_out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if actual != expected {
+            anyhow::bail!("SHA-256 checksum mismatch (expected {expected}, got {actual})");
         }
 
         let unpack = Command::new("tar")
@@ -420,6 +429,28 @@ pub fn run_update(ctx: &Ctx, check_only: bool, force: bool, restart: bool) -> Re
     Ok(ExitCode::SUCCESS)
 }
 
+pub fn is_safe_asset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
+}
+
+pub fn find_sha256_entry(sums_text: &str, asset_name: &str) -> Option<String> {
+    sums_text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == asset_name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(hash.to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +463,24 @@ mod tests {
         assert!(is_newer_version("2026.11.24-01", "0.1.0"));
         assert!(!is_newer_version("2026.11.24-02", "2026.11.24-02"));
         assert!(!is_newer_version("2026.11.24-01", "2026.11.24-02"));
+    }
+
+    #[test]
+    fn rejects_unsafe_asset_names_and_bad_checksums() {
+        assert!(is_safe_asset_name(
+            "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"
+        ));
+        assert!(!is_safe_asset_name("../escape.tar.gz"));
+        assert!(!is_safe_asset_name("dir/file.tar.gz"));
+        assert!(!is_safe_asset_name(""));
+
+        let hash = "0123456789abcdef".repeat(4);
+        let sums = format!("{hash} *Slackless-2026.11.24-03-macos-arm64.app.tar.gz\n");
+        assert_eq!(
+            find_sha256_entry(&sums, "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"),
+            Some(hash)
+        );
+        assert_eq!(find_sha256_entry(&sums, "missing.tar.gz"), None);
+        assert_eq!(find_sha256_entry("deadbeef  a.tar.gz\n", "a.tar.gz"), None);
     }
 }

@@ -2572,11 +2572,13 @@ fn launch_external_url(url: &str, browser_choice: usize, cx: &mut gpui::App) {
             _ => None,
         };
         if let Some(app_name) = app_name {
-            if std::process::Command::new("open")
-                .args(["-a", app_name, url])
+            if let Ok(mut child) = std::process::Command::new("open")
+                .args(["-a", app_name, "--", url])
                 .spawn()
-                .is_ok()
             {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
                 return;
             }
         }

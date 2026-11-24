@@ -437,6 +437,15 @@ pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
     })?;
 
     let result = (|| -> Result<PathBuf, String> {
+        if !is_safe_asset_name(&release.asset_name) {
+            return Err(format!(
+                "invalid release asset name: {}",
+                release.asset_name
+            ));
+        }
+        let sums_url = release.sha256_url.as_deref().ok_or_else(|| {
+            "release is missing SHA256SUMS.txt; refusing unverified update".to_owned()
+        })?;
         let archive = stage_dir.join(&release.asset_name);
         let dl = Command::new("/usr/bin/curl")
             .args(["-fsSL", "--max-time", "180", "-o"])
@@ -448,24 +457,21 @@ pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
             return Err(format!("download failed (curl exited {})", dl));
         }
 
-        if let Some(sums_url) = &release.sha256_url {
-            let sums_out = Command::new("/usr/bin/curl")
-                .args(["-fsSL", "--max-time", "15", sums_url])
-                .output()
-                .map_err(|e| format!("failed to fetch SHA256SUMS.txt: {e}"))?;
-            if !sums_out.status.success() {
-                return Err("failed to fetch SHA256SUMS.txt".to_owned());
-            }
-            let sums_text = String::from_utf8_lossy(&sums_out.stdout);
-            if let Some(expected) = sums_text.lines().find_map(|line| {
-                let mut parts = line.split_whitespace();
-                let hash = parts.next()?;
-                let name = parts.next()?.trim_start_matches('*');
-                (name == release.asset_name).then_some(hash)
-            }) {
-                verify_sha256(&archive, expected)?;
-            }
+        let sums_out = Command::new("/usr/bin/curl")
+            .args(["-fsSL", "--max-time", "15", sums_url])
+            .output()
+            .map_err(|e| format!("failed to fetch SHA256SUMS.txt: {e}"))?;
+        if !sums_out.status.success() {
+            return Err("failed to fetch SHA256SUMS.txt".to_owned());
         }
+        let sums_text = String::from_utf8_lossy(&sums_out.stdout);
+        let expected = find_sha256_entry(&sums_text, &release.asset_name).ok_or_else(|| {
+            format!(
+                "SHA256SUMS.txt has no checksum entry for {}",
+                release.asset_name
+            )
+        })?;
+        verify_sha256(&archive, expected)?;
 
         let extract = Command::new("/usr/bin/tar")
             .args(["-xzf"])
@@ -560,6 +566,30 @@ pub fn download_and_schedule_swap(_release: &ReleaseInfo) -> Result<(), String> 
     Err("in-app updates are currently supported on macOS only".to_owned())
 }
 
+/// Returns `true` when `name` is a single safe filename component (no path separators or `..`).
+pub fn is_safe_asset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
+}
+
+/// Extract the lowercase hex SHA-256 hash matching `asset_name` from a `SHA256SUMS.txt` body.
+pub fn find_sha256_entry<'a>(sums_text: &'a str, asset_name: &str) -> Option<&'a str> {
+    sums_text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == asset_name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(hash)
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +606,29 @@ mod tests {
         assert!(is_newer_version("2026.11.25-01", "2026.11.24-99"));
         assert!(!is_newer_version("2026.11.24-01", "2026.11.24-01"));
         assert!(!is_newer_version("2026.11.24-01", "2026.11.24-02"));
+    }
+
+    #[test]
+    fn validates_asset_names_and_sha256_entries() {
+        assert!(is_safe_asset_name(
+            "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"
+        ));
+        assert!(!is_safe_asset_name(""));
+        assert!(!is_safe_asset_name(".."));
+        assert!(!is_safe_asset_name("../evil.tar.gz"));
+        assert!(!is_safe_asset_name("sub/evil.tar.gz"));
+        assert!(!is_safe_asset_name("sub\\evil.tar.gz"));
+
+        let good_hash = "a".repeat(64);
+        let sums = format!("{good_hash}  Slackless-2026.11.24-03-macos-arm64.app.tar.gz\n");
+        assert_eq!(
+            find_sha256_entry(&sums, "Slackless-2026.11.24-03-macos-arm64.app.tar.gz"),
+            Some(good_hash.as_str())
+        );
+        assert_eq!(find_sha256_entry(&sums, "other.tar.gz"), None);
+        assert_eq!(
+            find_sha256_entry("notahash  Slackless.tar.gz\n", "Slackless.tar.gz"),
+            None
+        );
     }
 }

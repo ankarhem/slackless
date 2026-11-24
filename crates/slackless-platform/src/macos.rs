@@ -75,7 +75,7 @@ impl Notifier for MacPlatform {
             return;
         }
         let spawned = Command::new("/usr/bin/osascript")
-            .args(["-e", NOTIFY_SCRIPT, title, body])
+            .args(["-e", NOTIFY_SCRIPT, "--", title, body])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

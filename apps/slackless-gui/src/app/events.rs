@@ -2113,9 +2113,14 @@ impl App {
             #[cfg(target_os = "macos")]
             {
                 let announcement: String = format!("{title}. {body}").chars().take(160).collect();
-                let _ = std::process::Command::new("say")
-                    .args(["-r", "210", &announcement])
-                    .spawn();
+                if let Ok(mut child) = std::process::Command::new("say")
+                    .args(["-r", "210", "--", &announcement])
+                    .spawn()
+                {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
             }
         }
     }

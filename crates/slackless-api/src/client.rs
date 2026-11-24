@@ -355,7 +355,7 @@ impl SlackApi {
         let url = self.base.join(api_method)?;
         let boundary = "----SlacklessMultipartBoundary7MA4YWxkTrZu0gW";
         let mut body = Vec::with_capacity(bytes.len() + 512);
-        let safe_name = filename.replace('"', "_");
+        let safe_name = filename.replace(['"', '\r', '\n'], "_");
         body.extend_from_slice(
             format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n{}\r\n\
