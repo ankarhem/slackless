@@ -7,10 +7,13 @@
 //! `--json` for machines and a tab-separated human default. Nothing here needs a live Slack
 //! connection to start.
 
+#![allow(clippy::large_unopt_stack_frames)]
+
 mod archive;
 mod live;
 mod output;
 mod session;
+mod update;
 mod write;
 
 use std::path::PathBuf;
@@ -20,12 +23,14 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slackless_core::auth::SessionStore;
 use slackless_core::store::{SearchQuery, Store};
-use slackless_core::types::{ChannelId, TeamId};
+use slackless_core::types::{ChannelId, TeamId, Ts};
 
 use crate::archive::Archive;
 use crate::output::{ChannelView, DmView, MessageRow};
 use crate::session::resolve_workspace;
-use crate::write::{run_react, run_reply, run_send};
+use crate::write::{
+    run_delete, run_edit, run_react, run_reply, run_send, run_thread_live, run_unreact, run_upload,
+};
 
 /// Default page size of `read`.
 const READ_LIMIT: usize = 50;
@@ -78,6 +83,19 @@ enum Commands {
         #[arg(long, value_name = "N", default_value_t = READ_LIMIT)]
         limit: usize,
     },
+    /// Read a thread's root message and replies (offline archive by default, or `--live` from Slack).
+    Thread {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// The ts of the thread root (first column of `slackless read` or `slackless threads`).
+        thread_ts: String,
+        /// Fetch fresh replies live via `conversations.replies` and mirror them locally.
+        #[arg(long)]
+        live: bool,
+        /// Maximum number of messages when using `--live` (Slack max 999).
+        #[arg(long, value_name = "N", default_value_t = 200)]
+        limit: u32,
+    },
     /// Post a message to a conversation (needs a stored session).
     Send { channel: String, text: String },
     /// Reply in a thread (needs a stored session).
@@ -87,6 +105,20 @@ enum Commands {
         thread_ts: String,
         text: String,
     },
+    /// Edit an existing message (`chat.update`, needs a stored session).
+    Edit {
+        channel: String,
+        /// The ts of the message to edit.
+        ts: String,
+        /// New message text.
+        text: String,
+    },
+    /// Delete a message (`chat.delete`, needs a stored session).
+    Delete {
+        channel: String,
+        /// The ts of the message to delete.
+        ts: String,
+    },
     /// Add an emoji reaction to a message (needs a stored session).
     React {
         channel: String,
@@ -94,6 +126,28 @@ enum Commands {
         ts: String,
         /// Emoji shortcode, with or without colons ("tada" or ":tada:").
         emoji: String,
+    },
+    /// Remove an emoji reaction from a message (`reactions.remove`, needs a stored session).
+    Unreact {
+        channel: String,
+        /// The ts of the message.
+        ts: String,
+        /// Emoji shortcode, with or without colons ("tada" or ":tada:").
+        emoji: String,
+    },
+    /// Upload one or more local files to a conversation or thread (needs a stored session).
+    Upload {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// File path(s) to upload.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Optional initial message accompanying the uploaded file(s).
+        #[arg(short, long)]
+        comment: Option<String>,
+        /// Optional thread root ts to upload into a thread.
+        #[arg(long, value_name = "TS")]
+        thread_ts: Option<String>,
     },
     /// List channels and private groups known to the local archive.
     Channels,
@@ -215,6 +269,18 @@ enum Commands {
         /// Messages per page (Slack max 200).
         #[arg(long, value_name = "N", default_value_t = 200)]
         page_size: u32,
+    },
+    /// Check for and install Slackless updates from GitHub Releases (updates Slackless.app + CLI).
+    Update {
+        /// Only check whether a newer release is available without installing.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall the latest release even if the current version matches.
+        #[arg(long)]
+        force: bool,
+        /// Quit and relaunch Slackless.app automatically after installing an update.
+        #[arg(long)]
+        restart: bool,
     },
     /// Account and session management.
     Auth {
@@ -437,13 +503,36 @@ async fn dispatch(
             out.as_deref(),
         ),
         Commands::Read { channel, limit } => cmd_read(ctx, workspace.as_ref(), &channel, limit),
+        Commands::Thread {
+            channel,
+            thread_ts,
+            live,
+            limit,
+        } => {
+            if live {
+                run_thread_live(ctx, flag, &channel, &thread_ts, limit).await
+            } else {
+                cmd_thread(ctx, workspace.as_ref(), &channel, &thread_ts)
+            }
+        }
         Commands::Send { channel, text } => run_send(ctx, flag, &channel, text).await,
         Commands::Reply {
             channel,
             thread_ts,
             text,
         } => run_reply(ctx, flag, &channel, &thread_ts, text).await,
+        Commands::Edit { channel, ts, text } => run_edit(ctx, flag, &channel, &ts, text).await,
+        Commands::Delete { channel, ts } => run_delete(ctx, flag, &channel, &ts).await,
         Commands::React { channel, ts, emoji } => run_react(ctx, flag, &channel, &ts, &emoji).await,
+        Commands::Unreact { channel, ts, emoji } => {
+            run_unreact(ctx, flag, &channel, &ts, &emoji).await
+        }
+        Commands::Upload {
+            channel,
+            files,
+            comment,
+            thread_ts,
+        } => run_upload(ctx, flag, &channel, &files, comment, thread_ts.as_deref()).await,
         Commands::Channels => cmd_channels(ctx, workspace.as_ref()),
         Commands::Dms => cmd_dms(ctx, workspace.as_ref()),
         Commands::Stats { breakdown } => cmd_stats(ctx, workspace.as_ref(), breakdown),
@@ -578,6 +667,11 @@ async fn dispatch(
             pages,
             page_size,
         } => live::run_backfill(ctx, flag, &channel, pages, page_size).await,
+        Commands::Update {
+            check,
+            force,
+            restart,
+        } => update::run_update(ctx, check, force, restart),
         Commands::Auth { command } => match command {
             AuthCommand::Status => cmd_auth_status(ctx),
             AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),
@@ -720,6 +814,65 @@ fn cmd_read(
     output::emit(
         ctx.json,
         &serde_json::json!({"channel": channel, "count": rows.len(), "messages": rows}),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_thread(
+    ctx: &Ctx,
+    workspace: Option<&TeamId>,
+    channel_arg: &str,
+    thread_ts_arg: &str,
+) -> Result<ExitCode> {
+    let Some(workspace) = workspace else {
+        return Ok(empty_local(
+            ctx,
+            serde_json::json!({
+                "channel": channel_arg,
+                "thread_ts": thread_ts_arg,
+                "live": false,
+                "count": 0,
+                "messages": [],
+            }),
+            "reading thread",
+        ));
+    };
+    let archive = Archive::open(workspace);
+    if archive.is_none() {
+        archive_hint(workspace);
+    }
+    let resolved = archive
+        .as_ref()
+        .and_then(|a| a.resolve_channel(workspace, channel_arg));
+    let channel_id = resolved
+        .as_ref()
+        .map_or_else(|| raw_channel_id(channel_arg), |row| row.id.clone());
+    let label = resolved.as_ref().map(|row| row.label());
+    let thread_ts = Ts::from(thread_ts_arg.to_owned());
+    let messages = match open_archive_store(workspace) {
+        Some(store) => store
+            .thread_replies(workspace, &channel_id, &thread_ts)
+            .with_context(|| format!("reading thread {thread_ts} in {channel_id}"))?,
+        None => Vec::new(),
+    };
+    let rows: Vec<MessageRow> = messages
+        .iter()
+        .map(|message| MessageRow::from_stored(message, archive.as_ref(), workspace))
+        .collect();
+    let mut human = String::new();
+    for row in &rows {
+        human.push_str(&row.human_line(label.as_deref()));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "channel": channel_id.as_str(),
+            "thread_ts": thread_ts.as_str(),
+            "live": false,
+            "count": rows.len(),
+            "messages": rows,
+        }),
         &human,
     );
     Ok(ExitCode::SUCCESS)

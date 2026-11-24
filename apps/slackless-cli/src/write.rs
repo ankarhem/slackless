@@ -4,15 +4,16 @@
 //! request per invocation, no websocket session to keep alive. Without a stored session they
 //! print a clear "not signed in" message instead of failing hard.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::api::{ApiError, MessageContent, SlackApi};
-use slackless_core::store::Store;
+use slackless_core::api::{ApiError, HistoryOpts, MessageContent, SlackApi, UploadFile};
+use slackless_core::store::{Store, StoredMessage};
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
 
 use crate::archive::{self, Archive};
-use crate::output;
+use crate::output::{self, MessageRow};
 use crate::session::resolve_session;
 use crate::{Ctx, fail};
 
@@ -129,6 +130,265 @@ pub async fn run_react(
         }
         Err(err) => Ok(api_fail(ctx, &err)),
     }
+}
+
+/// `unreact <channel> <ts> <emoji>`: removes an emoji reaction from a message.
+pub async fn run_unreact(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    ts: &str,
+    emoji: &str,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let name = emoji.trim_matches(':').to_owned();
+    let ts = Ts::from(ts.to_owned());
+    match api.reactions_remove(&channel, &ts, &name).await {
+        Ok(()) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "ts": ts.as_str(),
+                    "name": name,
+                    "removed": true,
+                }),
+                &format!(
+                    "removed :{name}: from {} at {}\n",
+                    label.unwrap_or_else(|| channel.to_string()),
+                    ts
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `edit <channel> <ts> <text>`: updates an existing message (`chat.update`).
+pub async fn run_edit(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    ts: &str,
+    text: String,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let ts = Ts::from(ts.to_owned());
+    let updated = match api
+        .chat_update(&channel, &ts, &MessageContent::plain(text))
+        .await
+    {
+        Ok(msg) => msg,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    record_echo(&workspace, &channel, updated.message.as_ref());
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "ok": true,
+            "channel": channel.as_str(),
+            "ts": updated.ts.as_str(),
+        }),
+        &format!(
+            "updated {} in {}\n",
+            updated.ts,
+            label.unwrap_or_else(|| channel.to_string()),
+        ),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `delete <channel> <ts>`: deletes a message (`chat.delete`).
+pub async fn run_delete(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    ts: &str,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let ts = Ts::from(ts.to_owned());
+    match api.chat_delete(&channel, &ts).await {
+        Ok(()) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "ts": ts.as_str(),
+                    "deleted": true,
+                }),
+                &format!(
+                    "deleted {} in {}\n",
+                    ts,
+                    label.unwrap_or_else(|| channel.to_string()),
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
+/// `upload <channel> <files...> [--comment TEXT] [--thread-ts TS]`: uploads local files via v2.
+pub async fn run_upload(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    paths: &[PathBuf],
+    comment: Option<String>,
+    thread_ts: Option<&str>,
+) -> Result<ExitCode> {
+    if paths.is_empty() {
+        return Ok(fail(ctx, "invalid_args", "provide at least one file path"));
+    }
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let mut uploads = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading file {}", path.display()))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", path.display()))?
+            .to_owned();
+        uploads.push(UploadFile { filename, bytes });
+    }
+    let thread_ts = thread_ts.map(|t| Ts::from(t.to_owned()));
+    let content = comment.map(MessageContent::plain);
+    let files = match api
+        .upload_files(&channel, thread_ts.as_ref(), content.as_ref(), &uploads)
+        .await
+    {
+        Ok(files) => files,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+    let file_views: Vec<serde_json::Value> = files
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id.as_str(),
+                "name": f.name,
+                "title": f.title,
+                "mimetype": f.mimetype,
+                "size": f.size,
+                "permalink": f.permalink,
+            })
+        })
+        .collect();
+    let names = files
+        .iter()
+        .map(|f| {
+            f.name
+                .as_deref()
+                .or(f.title.as_deref())
+                .unwrap_or(f.id.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "ok": true,
+            "channel": channel.as_str(),
+            "thread_ts": thread_ts.as_ref().map(Ts::as_str),
+            "count": files.len(),
+            "files": file_views,
+        }),
+        &format!(
+            "uploaded {} file(s) to {}: {}\n",
+            files.len(),
+            label.unwrap_or_else(|| channel.to_string()),
+            names
+        ),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `thread <channel> <thread_ts> --live`: fetches live thread replies via `conversations.replies`,
+/// mirrors them into the local SQLite archive, and prints them oldest first.
+pub async fn run_thread_live(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    thread_ts_arg: &str,
+    limit: u32,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let thread_ts = Ts::from(thread_ts_arg.to_owned());
+    let opts = HistoryOpts {
+        limit: Some(limit.clamp(1, 999)),
+        ..HistoryOpts::default()
+    };
+    let page = match api
+        .conversations_replies(&channel, &thread_ts, &opts, None)
+        .await
+    {
+        Ok(page) => page,
+        Err(err) => return Ok(api_fail(ctx, &err)),
+    };
+
+    if let Some(path) = archive::store_path(&workspace) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut store) = Store::open(&path) {
+            for msg in &page.items {
+                let _ = store.upsert_message(&workspace, &channel, msg);
+            }
+        }
+    }
+
+    let archive = Archive::open(&workspace);
+    let rows: Vec<MessageRow> = page
+        .items
+        .into_iter()
+        .map(|message| {
+            let stored = StoredMessage {
+                channel: channel.clone(),
+                message,
+                deleted: false,
+            };
+            MessageRow::from_stored(&stored, archive.as_ref(), &workspace)
+        })
+        .collect();
+    let mut human = String::new();
+    for row in &rows {
+        human.push_str(&row.human_line(label.as_deref()));
+    }
+    output::emit(
+        ctx.json,
+        &serde_json::json!({
+            "channel": channel.as_str(),
+            "thread_ts": thread_ts.as_str(),
+            "live": true,
+            "count": rows.len(),
+            "messages": rows,
+        }),
+        &human,
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The API client + workspace for a write; `Err` is the already-printed failure.

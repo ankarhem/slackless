@@ -11,9 +11,9 @@ description: This skill should be used when an AI agent needs to search, read, s
 
 Two kinds of commands exist.
 
-Offline archive commands (`search`, `read`, `channels`, `dms`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
+Offline archive commands (`search`, `read`, `thread`, `channels`, `dms`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `auth status`) work offline against the local SQLite archive, the same file the desktop app fills while it syncs. They always exit 0. With no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
 
-Live Slack commands (`send`, `reply`, `react`, `mark-thread`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`.
+Live Slack commands (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-thread`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
 
 ## Setup and auth
 
@@ -481,6 +481,31 @@ slackless download F0123ABC --out ./report.pdf --json
 ```
 
 Downloads any Slack file by ID via `files.info` and the authenticated session cookie.
+
+### thread / edit / delete / unreact / upload
+
+```sh
+slackless thread "#eng" "1739280000.000100" [--live] [--limit 200] --json
+slackless edit "#eng" "1739280456.000300" "updated message text" --json
+slackless delete "#eng" "1739280456.000300" --json
+slackless unreact "#eng" "1739280000.000100" tada --json
+slackless upload "#eng" ./report.pdf --comment "Q4 report" [--thread-ts "1739280000.000100"] --json
+```
+
+- `thread` prints a thread root and all its replies oldest first from the local archive (offline), or passes `--live` to fetch fresh replies via `conversations.replies` and mirror them into the local SQLite archive.
+- `edit` updates an existing message (`chat.update`) and mirrors the change locally.
+- `delete` deletes a message (`chat.delete`).
+- `unreact` removes an emoji reaction (`reactions.remove`).
+- `upload` uploads one or more local files via Slack's v2 external upload flow into a channel or thread.
+
+### update
+
+```sh
+slackless update --check --json
+slackless update [--force] [--restart] --json
+```
+
+Checks GitHub Releases for a newer Slackless release. Without `--check`, downloads and SHA-256-verifies the macOS `.app.tar.gz`, atomically replaces `Slackless.app` (with `.prev` rollback), refreshes the CLI symlink, and optionally relaunches `Slackless.app` (`--restart`).
 
 ### watch / backfill / stats / vacuum / revisions / export
 
