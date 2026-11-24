@@ -177,6 +177,13 @@ enum HuddleDrawer {
     Diagnostics,
 }
 
+/// Active tab inside the Screen Sharing picker modal (`Share entire screen` vs `Window`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HuddleShareTab {
+    Screen,
+    Window,
+}
+
 pub struct PopoutWindow {
     kind: PopoutKind,
     title: String,
@@ -193,7 +200,11 @@ pub struct PopoutWindow {
     huddle_state: Option<crate::huddle_dock::HuddleViewState>,
     huddle_invite_open: bool,
     huddle_devices_open: bool,
+    huddle_camera_open: bool,
     huddle_share_open: bool,
+    huddle_share_tab: HuddleShareTab,
+    huddle_share_selected: Option<String>,
+    huddle_share_audio: bool,
     huddle_reactions_open: bool,
     huddle_theme_open: bool,
     huddle_more_open: bool,
@@ -209,7 +220,10 @@ pub struct PopoutWindow {
     huddle_thread_fetched: Option<Ts>,
     huddle_thread_local: Vec<Message>,
     huddle_devices: slackless_core::huddle::AudioDevices,
+    huddle_cameras: Vec<slackless_core::huddle::CameraDeviceInfo>,
+    huddle_selected_camera: Option<usize>,
     huddle_screens: Vec<slackless_core::huddle::ScreenSource>,
+    huddle_screen_thumbs: std::collections::HashMap<String, Arc<gpui_kit::gpui::RenderImage>>,
     composer: Entity<Composer>,
     emoji_picker: Entity<EmojiPicker>,
     picker: Option<(PopoutPickerTarget, Point<Pixels>)>,
@@ -429,7 +443,11 @@ impl PopoutWindow {
             huddle_state,
             huddle_invite_open: false,
             huddle_devices_open: false,
+            huddle_camera_open: false,
             huddle_share_open: false,
+            huddle_share_tab: HuddleShareTab::Screen,
+            huddle_share_selected: None,
+            huddle_share_audio: false,
             huddle_reactions_open: false,
             huddle_theme_open: false,
             huddle_more_open: false,
@@ -445,7 +463,10 @@ impl PopoutWindow {
             huddle_thread_fetched: None,
             huddle_thread_local: Vec::new(),
             huddle_devices: slackless_core::huddle::AudioDevices::default(),
+            huddle_cameras: Vec::new(),
+            huddle_selected_camera: None,
             huddle_screens: Vec::new(),
+            huddle_screen_thumbs: std::collections::HashMap::new(),
             composer,
             emoji_picker,
             picker: None,

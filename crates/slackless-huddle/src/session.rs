@@ -913,7 +913,10 @@ async fn run_connected_loop(
                         }
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
-                    Some(HuddleControl::SetScreenShare { source_id }) => {
+                    Some(HuddleControl::SetScreenShare {
+                        source_id,
+                        share_audio,
+                    }) => {
                         if let Some(mut prev) = content_share.take() {
                             prev.stop_and_wait().await;
                         }
@@ -922,6 +925,7 @@ async fn run_connected_loop(
                             match ContentShareSession::start(
                                 creds.clone(),
                                 src_id.clone(),
+                                share_audio,
                                 local_screen_tx.clone(),
                                 Arc::clone(&perf),
                             )

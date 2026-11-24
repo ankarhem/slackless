@@ -76,10 +76,12 @@ impl ContentShareSession {
         self.loopback_device.as_deref()
     }
     /// Start a native `#content` attendee sharing `source_id`, forwarding local preview frames
-    /// onto `preview_tx`.
+    /// onto `preview_tx`. When `share_audio` is `true`, captures system audio via macOS CoreAudio
+    /// Process Tap (14.2+) or a virtual loopback device.
     pub async fn start(
         base_creds: HuddleCredentials,
         source_id: String,
+        share_audio: bool,
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
@@ -175,7 +177,9 @@ impl ContentShareSession {
 
         // Priority 1 (macOS 14.2+): Zero-driver CoreAudio Process Tap (`F-COLLAB-022`).
         #[cfg(target_os = "macos")]
-        let native_tap = if crate::macos_audio_tap::supports_native_system_audio_tap() {
+        let native_tap = if share_audio
+            && crate::macos_audio_tap::supports_native_system_audio_tap()
+        {
             match crate::macos_audio_tap::SystemAudioTap::start(Arc::clone(&loopback_pcm)) {
                 Ok(tap) => Some(tap),
                 Err(err) => {
@@ -192,7 +196,9 @@ impl ContentShareSession {
         #[cfg(not(target_os = "macos"))]
         let native_tap: Option<()> = None;
 
-        let loopback_device = if native_tap.is_some() {
+        let loopback_device = if !share_audio {
+            None
+        } else if native_tap.is_some() {
             Some("macOS Native System Audio".to_owned())
         } else {
             detect_system_audio_loopback()

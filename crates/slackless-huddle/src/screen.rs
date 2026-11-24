@@ -85,6 +85,9 @@ pub fn list_screen_sources() -> Vec<ScreenSource> {
             if title.trim().is_empty() && app.trim().is_empty() {
                 continue;
             }
+            if is_system_chrome_window(&app, &title) {
+                continue;
+            }
             let name = if title.trim().is_empty() {
                 app
             } else if app.trim().is_empty() || title == app {
@@ -102,6 +105,134 @@ pub fn list_screen_sources() -> Vec<ScreenSource> {
         }
     }
     out
+}
+
+fn is_system_chrome_window(app: &str, title: &str) -> bool {
+    let app_l = app.trim().to_ascii_lowercase();
+    let title_l = title.trim().to_ascii_lowercase();
+    matches!(
+        app_l.as_str(),
+        "dock"
+            | "notificationcenter"
+            | "notiscenter"
+            | "window server"
+            | "control center"
+            | "kontrollcenter"
+            | "systemuiserver"
+            | "spotlight"
+    ) || matches!(title_l.as_str(), "dock" | "menubar" | "statusindicator")
+}
+
+/// Capture live downscaled BGRA preview thumbnails for monitors (`monitors_only == true`) or
+/// visible windows (`monitors_only == false`) for the Screen Sharing picker modal.
+pub fn capture_screen_thumbnails(
+    monitors_only: bool,
+    max_w: u32,
+    max_h: u32,
+) -> Vec<(String, VideoFrame)> {
+    let mut out = Vec::new();
+    if monitors_only {
+        if let Ok(monitors) = xcap::Monitor::all() {
+            for m in monitors {
+                let Ok(id) = m.id() else { continue };
+                let img = with_autorelease_pool(|| m.capture_image().ok());
+                if let Some(rgba) = img {
+                    if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
+                        out.push((format!("monitor:{id}"), frame));
+                    }
+                }
+            }
+        }
+    } else if let Ok(windows) = xcap::Window::all() {
+        for w in windows {
+            if out.len() >= 18 {
+                break;
+            }
+            if w.is_minimized().unwrap_or(false) {
+                continue;
+            }
+            let Ok(id) = w.id() else { continue };
+            let width = w.width().unwrap_or(0);
+            let height = w.height().unwrap_or(0);
+            if width < 120 || height < 120 {
+                continue;
+            }
+            let title = w.title().unwrap_or_default();
+            let app = w.app_name().unwrap_or_default();
+            if (title.trim().is_empty() && app.trim().is_empty())
+                || is_system_chrome_window(&app, &title)
+            {
+                continue;
+            }
+            let img = with_autorelease_pool(|| w.capture_image().ok());
+            if let Some(rgba) = img {
+                if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
+                    out.push((format!("window:{id}"), frame));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fast box/area-averaged RGBA -> BGRA thumbnail downscaler.
+fn downscale_rgba_thumbnail(
+    src: &xcap::image::RgbaImage,
+    max_w: u32,
+    max_h: u32,
+) -> Option<VideoFrame> {
+    let sw = src.width();
+    let sh = src.height();
+    if sw == 0 || sh == 0 || max_w == 0 || max_h == 0 {
+        return None;
+    }
+    let scale = (max_w as f64 / sw as f64)
+        .min(max_h as f64 / sh as f64)
+        .min(1.0);
+    let dw = ((sw as f64 * scale).round() as u32).max(2);
+    let dh = ((sh as f64 * scale).round() as u32).max(2);
+    let raw = src.as_raw();
+    let mut bgra = vec![0u8; (dw * dh * 4) as usize];
+    for dy in 0..dh {
+        let sy0 = ((dy as u64 * sh as u64) / dh as u64) as u32;
+        let sy1 = (((dy + 1) as u64 * sh as u64) / dh as u64)
+            .max(sy0 as u64 + 1)
+            .min(sh as u64) as u32;
+        for dx in 0..dw {
+            let sx0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
+            let sx1 = (((dx + 1) as u64 * sw as u64) / dw as u64)
+                .max(sx0 as u64 + 1)
+                .min(sw as u64) as u32;
+            let step_y = ((sy1 - sy0) / 4).max(1);
+            let step_x = ((sx1 - sx0) / 4).max(1);
+            let (mut r, mut g, mut b, mut count) = (0u32, 0u32, 0u32, 0u32);
+            let mut sy = sy0;
+            while sy < sy1 {
+                let row = (sy * sw) as usize;
+                let mut sx = sx0;
+                while sx < sx1 {
+                    let off = (row + sx as usize) * 4;
+                    r += raw[off] as u32;
+                    g += raw[off + 1] as u32;
+                    b += raw[off + 2] as u32;
+                    count += 1;
+                    sx += step_x;
+                }
+                sy += step_y;
+            }
+            let c = count.max(1);
+            let dst = ((dy * dw + dx) * 4) as usize;
+            bgra[dst] = (b / c) as u8;
+            bgra[dst + 1] = (g / c) as u8;
+            bgra[dst + 2] = (r / c) as u8;
+            bgra[dst + 3] = 255;
+        }
+    }
+    Some(VideoFrame {
+        width: dw,
+        height: dh,
+        bgra: Arc::new(bgra),
+    })
 }
 
 enum ScreenCaptureBackend {

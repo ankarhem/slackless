@@ -1466,8 +1466,10 @@ impl App {
                 dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
             }
             if !self.fixtures.sample {
-                self.bridge
-                    .send(Command::SetHuddleScreenShare { source_id: None });
+                self.bridge.send(Command::SetHuddleScreenShare {
+                    source_id: None,
+                    share_audio: false,
+                });
             }
             cx.notify();
         } else {

@@ -2420,14 +2420,20 @@ impl<B: Backend> Core<B> {
                     handle.send(crate::huddle::HuddleControl::SetBlurBackground(blur));
                 }
             }
-            Command::SetHuddleScreenShare { source_id } => {
+            Command::SetHuddleScreenShare {
+                source_id,
+                share_audio,
+            } => {
                 if let Some(handle) = self
                     .active_huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .as_ref()
                 {
-                    handle.send(crate::huddle::HuddleControl::SetScreenShare { source_id });
+                    handle.send(crate::huddle::HuddleControl::SetScreenShare {
+                        source_id,
+                        share_audio,
+                    });
                 }
             }
             Command::SendHuddleReaction {

@@ -42,7 +42,7 @@ pub use clips::{
 };
 pub use content_share::{detect_system_audio_loopback, system_audio_source_label};
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
-pub use screen::{ScreenCapture, ScreenSource, list_screen_sources};
+pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
 pub use video::{CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoTileKey, list_cameras};
 
@@ -327,6 +327,7 @@ pub enum HuddleControl {
     SetBlurBackground(bool),
     SetScreenShare {
         source_id: Option<String>,
+        share_audio: bool,
     },
     SendReaction {
         emoji: String,

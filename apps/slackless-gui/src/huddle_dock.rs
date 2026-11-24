@@ -520,6 +520,11 @@ impl HuddleDock {
         cx.notify();
     }
 
+    /// Ask the main window to open Preferences directly on the Audio & video section.
+    pub fn open_audio_settings(&mut self, cx: &mut Context<Self>) {
+        cx.emit(HuddleDockEvent::OpenAudioSettings);
+    }
+
     pub fn set_captions_local(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.session.captions_enabled != enabled {
             self.session.captions_enabled = enabled;

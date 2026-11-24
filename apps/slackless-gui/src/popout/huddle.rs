@@ -5,7 +5,7 @@
 //! camera, share, hand, reactions, background/theme, thread, more; right: red Leave button),
 //! luminous rounded-square participant cards on the stage, and a crisp theme-matched side drawer.
 
-use gpui_kit::gpui::{Background, Hsla, linear_color_stop, linear_gradient};
+use gpui_kit::gpui::{Background, ClickEvent, Hsla, linear_color_stop, linear_gradient};
 
 use super::*;
 
@@ -247,10 +247,65 @@ impl PopoutWindow {
     fn close_huddle_popovers(&mut self) {
         self.huddle_invite_open = false;
         self.huddle_devices_open = false;
+        self.huddle_camera_open = false;
         self.huddle_share_open = false;
         self.huddle_reactions_open = false;
         self.huddle_theme_open = false;
         self.huddle_more_open = false;
+    }
+
+    fn close_share_modal(&mut self, cx: &mut Context<Self>) {
+        self.huddle_share_open = false;
+        for (_, img) in self.huddle_screen_thumbs.drain() {
+            cx.drop_image(img, None);
+        }
+    }
+
+    fn open_audio_video_preferences(&mut self, cx: &mut Context<Self>) {
+        self.close_huddle_popovers();
+        if let Some(dock) = self.huddle_dock_entity() {
+            dock.update(cx, |d, cx| d.open_audio_settings(cx));
+        }
+        cx.notify();
+    }
+
+    fn refresh_share_thumbnails(&self, monitors_only: bool, cx: &mut Context<Self>) {
+        use slackless_core::huddle::capture_screen_thumbnails;
+        cx.spawn(async move |win, cx| {
+            let frames = cx
+                .background_executor()
+                .spawn(async move { capture_screen_thumbnails(monitors_only, 360, 224) })
+                .await;
+            let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
+                if !win.huddle_share_open {
+                    return;
+                }
+                for (id, frame) in frames {
+                    if let Some(img) = crate::huddle_dock::frame_to_render_image(&frame) {
+                        if let Some(old) = win.huddle_screen_thumbs.insert(id, img) {
+                            cx.drop_image(old, None);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_selected_screen_share(&mut self, source_id: String, cx: &mut Context<Self>) {
+        let share_audio = self.huddle_share_audio;
+        (self.send)(Command::SetHuddleScreenShare {
+            source_id: Some(source_id.clone()),
+            share_audio,
+        });
+        if self.fixtures.sample {
+            if let Some(dock) = self.huddle_dock_entity() {
+                dock.update(cx, |d, cx| d.set_sharing_local(Some(source_id), cx));
+            }
+        }
+        self.close_share_modal(cx);
+        cx.notify();
     }
 
     pub(super) fn render_huddle_window(
@@ -590,6 +645,7 @@ impl PopoutWindow {
                     if event.keystroke.key == "escape"
                         && (this.huddle_topic_editing.take().is_some()
                             || this.huddle_share_open
+                            || this.huddle_camera_open
                             || this.huddle_reactions_open
                             || this.huddle_theme_open
                             || this.huddle_more_open
@@ -597,6 +653,7 @@ impl PopoutWindow {
                             || this.huddle_devices_open
                             || this.huddle_drawer.take().is_some())
                     {
+                        this.close_share_modal(cx);
                         this.close_huddle_popovers();
                         cx.notify();
                     }
@@ -605,6 +662,13 @@ impl PopoutWindow {
             .child(header)
             .child(body)
             .child(self.render_huddle_controls(&snap, status_color, &pal, cx))
+            .when(self.huddle_share_open, |root| {
+                root.child(self.render_huddle_share_modal(
+                    snap.share_source_id.as_deref(),
+                    &pal,
+                    cx,
+                ))
+            })
     }
 
     fn render_huddle_drawer(
@@ -2627,8 +2691,13 @@ impl PopoutWindow {
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
-        if self.huddle_share_open {
-            return Some(self.render_huddle_share_panel(snap.share_source_id.as_deref(), pal, cx));
+        if self.huddle_camera_open {
+            return Some(self.render_huddle_camera_panel(
+                snap.video,
+                snap.blur_background,
+                pal,
+                cx,
+            ));
         }
         if self.huddle_reactions_open {
             return Some(self.render_huddle_reactions_panel(snap, pal, cx));
@@ -2838,12 +2907,169 @@ impl PopoutWindow {
             )
     }
 
-    fn render_huddle_share_panel(
+    fn render_huddle_camera_panel(
+        &self,
+        video_now: bool,
+        blur_now: bool,
+        pal: &HuddlePalette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Div {
+        let hover = pal.popover_hover;
+        let primary = pal.primary;
+        let border = pal.popover_border;
+        let selected_idx = self
+            .huddle_selected_camera
+            .or_else(|| self.huddle_cameras.first().map(|c| c.index));
+        let send_cam = self.send.clone();
+        let send_blur = self.send.clone();
+
+        v_flex()
+            .w(px(248.))
+            .py_1p5()
+            .rounded_xl()
+            .border_1()
+            .border_color(border)
+            .bg(pal.popover_bg)
+            .shadow_2xl()
+            .text_color(pal.popover_fg)
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(pal.popover_muted)
+                    .child("Video"),
+            )
+            .child(if self.huddle_cameras.is_empty() {
+                div()
+                    .px_3()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(pal.popover_muted)
+                    .child("No cameras detected")
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .children(self.huddle_cameras.iter().enumerate().map(|(ix, cam)| {
+                        let is_selected = selected_idx == Some(cam.index);
+                        let cam_idx = cam.index;
+                        let send = send_cam.clone();
+                        h_flex()
+                            .id(("popout-huddle-cam-opt", ix))
+                            .px_3()
+                            .py_1p5()
+                            .gap_2()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(move |el| el.bg(hover))
+                            .text_sm()
+                            .text_color(if is_selected { primary } else { pal.popover_fg })
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(primary)
+                                    .child(if is_selected { "✓" } else { "" }),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(cam.name.clone()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.huddle_selected_camera = Some(cam_idx);
+                                if video_now {
+                                    (send)(Command::SetHuddleCamera {
+                                        enabled: true,
+                                        device_index: Some(cam_idx),
+                                        blur: blur_now,
+                                    });
+                                }
+                                this.huddle_camera_open = false;
+                                cx.notify();
+                            }))
+                    }))
+                    .into_any_element()
+            })
+            .child(div().my_1().h(px(1.)).bg(border))
+            .child(
+                h_flex()
+                    .id("popout-huddle-cam-blur")
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(hover))
+                    .text_sm()
+                    .text_color(pal.popover_fg)
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(primary)
+                            .child(if blur_now { "✓" } else { "" }),
+                    )
+                    .child("Blur background")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let next_blur = !blur_now;
+                        (send_blur)(Command::SetHuddleBlurBackground(next_blur));
+                        if this.fixtures.sample {
+                            if let Some(dock) = this.huddle_dock_entity() {
+                                dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
+                            }
+                        }
+                        this.huddle_camera_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .id("popout-huddle-cam-bg")
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(hover))
+                    .text_sm()
+                    .text_color(pal.popover_fg)
+                    .child(div().w(px(14.)))
+                    .child("Video background")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_huddle_popovers();
+                        this.huddle_theme_open = true;
+                        cx.notify();
+                    })),
+            )
+            .child(div().my_1().h(px(1.)).bg(border))
+            .child(
+                h_flex()
+                    .id("popout-huddle-cam-prefs")
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(hover))
+                    .text_sm()
+                    .text_color(pal.popover_fg)
+                    .child(div().w(px(14.)))
+                    .child("Audio & video preferences")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_audio_video_preferences(cx);
+                    })),
+            )
+    }
+
+    fn render_huddle_share_modal(
         &self,
         active_source: Option<&str>,
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::gpui::Div {
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        use gpui_kit::component::Icon;
+        use gpui_kit::gpui::{Corners, ObjectFit};
+
         let send = self.send.clone();
         let loopback = slackless_core::huddle::system_audio_source_label();
         let has_screen_perm = slackless_core::huddle::has_screen_capture_permission();
@@ -2851,108 +3077,415 @@ impl PopoutWindow {
         let primary = pal.primary;
         let primary_fg = pal.primary_fg;
         let surface = pal.drawer_surface;
+        let border = pal.popover_border;
+        let active_tab = self.huddle_share_tab;
+        let selected_id = self.huddle_share_selected.as_deref();
+        let share_audio = self.huddle_share_audio;
 
-        v_flex()
-            .max_w(px(560.))
-            .p_3()
-            .gap_2p5()
-            .rounded_2xl()
-            .border_1()
-            .border_color(pal.popover_border)
-            .bg(pal.popover_bg)
-            .shadow_2xl()
-            .text_color(pal.popover_fg)
-            .when(!has_screen_perm, |col| {
-                col.child(
+        let monitors: Vec<_> = self
+            .huddle_screens
+            .iter()
+            .filter(|s| s.is_monitor)
+            .cloned()
+            .collect();
+        let windows: Vec<_> = self
+            .huddle_screens
+            .iter()
+            .filter(|s| !s.is_monitor)
+            .cloned()
+            .collect();
+
+        let render_thumb = |thumb: Option<Arc<gpui_kit::gpui::RenderImage>>,
+                            is_monitor: bool,
+                            res_label: String,
+                            w: Pixels,
+                            h: Pixels| {
+            div()
+                .w(w)
+                .h(h)
+                .rounded_lg()
+                .overflow_hidden()
+                .border_1()
+                .border_color(border)
+                .bg(rgb(0x14171C))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(if let Some(frame) = thumb {
+                    let frame_layout = Arc::clone(&frame);
+                    canvas(
+                        move |bounds, _, _| {
+                            ObjectFit::Contain.get_bounds(bounds, frame_layout.size(0))
+                        },
+                        move |bounds, img_bounds, window, _| {
+                            if frame.frame_count() > 0 {
+                                let _ = window.paint_image(
+                                    bounds,
+                                    img_bounds,
+                                    Corners::default(),
+                                    Arc::clone(&frame),
+                                    0,
+                                    false,
+                                );
+                            }
+                        },
+                    )
+                    .size_full()
+                    .into_any_element()
+                } else {
                     v_flex()
-                        .p_2p5()
-                        .gap_1p5()
-                        .rounded_lg()
-                        .bg(pal.warning.opacity(0.14))
-                        .border_1()
-                        .border_color(pal.warning.opacity(0.55))
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
                         .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(pal.popover_fg)
-                                .child("Screen Recording permission required"),
+                            Icon::new(if is_monitor {
+                                IconName::ScreenShare
+                            } else {
+                                IconName::AppWindow
+                            })
+                            .size(px(22.))
+                            .text_color(pal.scrim_muted),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(pal.popover_muted)
-                                .child("macOS hides other apps and disables hardware capture until Slackless is enabled in Screen & System Audio Recording (re-toggle if rebuilt with ad-hoc signing, then restart)."),
-                        )
-                        .child(
-                            h_flex().pt_0p5().child(
-                                div()
-                                    .id("popout-huddle-open-screen-perm")
-                                    .px_2p5()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(primary)
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(primary_fg)
-                                    .child("Open Screen Recording Settings")
-                                    .on_click(|_, _, _| {
-                                        slackless_core::huddle::request_screen_capture_permission();
-                                        slackless_core::huddle::open_screen_capture_settings();
-                                    }),
-                            ),
-                        ),
-                )
-            })
+                        .child(div().text_xs().text_color(pal.scrim_muted).child(res_label))
+                        .into_any_element()
+                })
+        };
+
+        let header = h_flex()
+            .relative()
+            .w_full()
+            .px_5()
+            .pt_4()
+            .pb_3()
+            .items_center()
+            .justify_center()
             .child(
                 h_flex()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
+                    .p(px(3.))
+                    .rounded_xl()
                     .bg(surface)
+                    .border_1()
+                    .border_color(border)
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("popout-share-tab-screen")
+                            .px_4()
+                            .py_1p5()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_xs()
+                            .font_weight(if active_tab == HuddleShareTab::Screen {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .bg(if active_tab == HuddleShareTab::Screen {
+                                pal.popover_bg
+                            } else {
+                                Hsla::from(rgba(0x00000000))
+                            })
+                            .border_1()
+                            .border_color(if active_tab == HuddleShareTab::Screen {
+                                border
+                            } else {
+                                Hsla::from(rgba(0x00000000))
+                            })
+                            .text_color(if active_tab == HuddleShareTab::Screen {
+                                pal.popover_fg
+                            } else {
+                                pal.popover_muted
+                            })
+                            .child("Share entire screen")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.huddle_share_tab = HuddleShareTab::Screen;
+                                this.refresh_share_thumbnails(true, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("popout-share-tab-window")
+                            .px_5()
+                            .py_1p5()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_xs()
+                            .font_weight(if active_tab == HuddleShareTab::Window {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .bg(if active_tab == HuddleShareTab::Window {
+                                pal.popover_bg
+                            } else {
+                                Hsla::from(rgba(0x00000000))
+                            })
+                            .border_1()
+                            .border_color(if active_tab == HuddleShareTab::Window {
+                                border
+                            } else {
+                                Hsla::from(rgba(0x00000000))
+                            })
+                            .text_color(if active_tab == HuddleShareTab::Window {
+                                pal.popover_fg
+                            } else {
+                                pal.popover_muted
+                            })
+                            .child("Window")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.huddle_share_tab = HuddleShareTab::Window;
+                                this.refresh_share_thumbnails(false, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("popout-share-modal-close")
+                    .absolute()
+                    .right_4()
+                    .top_4()
+                    .size(px(28.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .flex()
                     .items_center()
+                    .justify_center()
+                    .hover(move |el| el.bg(hover))
+                    .child(
+                        Icon::new(IconName::X)
+                            .size(px(15.))
+                            .text_color(pal.popover_muted),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_share_modal(cx);
+                        cx.notify();
+                    })),
+            );
+
+        let body: gpui_kit::gpui::AnyElement = match active_tab {
+            HuddleShareTab::Screen => {
+                if monitors.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(pal.popover_muted)
+                        .child("Scanning screens…")
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .flex_1()
+                        .w_full()
+                        .px_6()
+                        .py_4()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_center()
+                        .gap_6()
+                        .children(monitors.iter().enumerate().map(|(ix, src)| {
+                            let is_selected = selected_id == Some(src.id.as_str());
+                            let src_id = src.id.clone();
+                            let label = if monitors.len() > 1 {
+                                format!("Screen {} — {}", ix + 1, src.name)
+                            } else {
+                                format!("Screen 1 — {}", src.name)
+                            };
+                            let thumb = self.huddle_screen_thumbs.get(&src.id).cloned();
+                            let res = format!("{}×{}", src.width, src.height);
+                            v_flex()
+                                .id(("popout-share-screen-card", ix))
+                                .w(px(268.))
+                                .p_2p5()
+                                .gap_2()
+                                .items_center()
+                                .rounded_xl()
+                                .cursor_pointer()
+                                .border_2()
+                                .border_color(if is_selected {
+                                    primary
+                                } else {
+                                    Hsla::from(rgba(0x00000000))
+                                })
+                                .bg(if is_selected {
+                                    primary.opacity(0.08)
+                                } else {
+                                    Hsla::from(rgba(0x00000000))
+                                })
+                                .hover(move |el| if is_selected { el } else { el.bg(hover) })
+                                .child(render_thumb(thumb, true, res, px(244.), px(148.)))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_center()
+                                        .truncate()
+                                        .text_xs()
+                                        .font_weight(if is_selected {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::MEDIUM
+                                        })
+                                        .text_color(if is_selected {
+                                            primary
+                                        } else {
+                                            pal.popover_fg
+                                        })
+                                        .child(label),
+                                )
+                                .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                                    if ev.click_count() >= 2 {
+                                        this.start_selected_screen_share(src_id.clone(), cx);
+                                    } else {
+                                        this.huddle_share_selected = Some(src_id.clone());
+                                        cx.notify();
+                                    }
+                                }))
+                        }))
+                        .into_any_element()
+                }
+            }
+            HuddleShareTab::Window => {
+                if windows.is_empty() {
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(pal.popover_muted)
+                        .child("No shareable windows found (check Screen Recording permission)")
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("popout-share-windows-scroll")
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_y_scroll()
+                        .px_5()
+                        .py_3()
+                        .child(h_flex().flex_wrap().justify_start().gap_3().children(
+                            windows.iter().enumerate().map(|(ix, src)| {
+                                let is_selected = selected_id == Some(src.id.as_str());
+                                let src_id = src.id.clone();
+                                let thumb = self.huddle_screen_thumbs.get(&src.id).cloned();
+                                let res = format!("{}×{}", src.width, src.height);
+                                v_flex()
+                                    .id(("popout-share-window-card", ix))
+                                    .w(px(200.))
+                                    .p_2()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .rounded_xl()
+                                    .cursor_pointer()
+                                    .border_2()
+                                    .border_color(if is_selected {
+                                        primary
+                                    } else {
+                                        Hsla::from(rgba(0x00000000))
+                                    })
+                                    .bg(if is_selected {
+                                        primary.opacity(0.08)
+                                    } else {
+                                        Hsla::from(rgba(0x00000000))
+                                    })
+                                    .hover(move |el| if is_selected { el } else { el.bg(hover) })
+                                    .child(render_thumb(thumb, false, res, px(180.), px(112.)))
+                                    .child(
+                                        div()
+                                            .w(px(180.))
+                                            .text_center()
+                                            .truncate()
+                                            .text_xs()
+                                            .font_weight(if is_selected {
+                                                FontWeight::SEMIBOLD
+                                            } else {
+                                                FontWeight::MEDIUM
+                                            })
+                                            .text_color(if is_selected {
+                                                primary
+                                            } else {
+                                                pal.popover_fg
+                                            })
+                                            .child(src.name.clone()),
+                                    )
+                                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                                        if ev.click_count() >= 2 {
+                                            this.start_selected_screen_share(src_id.clone(), cx);
+                                        } else {
+                                            this.huddle_share_selected = Some(src_id.clone());
+                                            cx.notify();
+                                        }
+                                    }))
+                            }),
+                        ))
+                        .into_any_element()
+                }
+            }
+        };
+
+        let can_share = self.huddle_share_selected.is_some();
+        let selected_to_share = self.huddle_share_selected.clone();
+        let success = pal.success;
+
+        let footer = h_flex()
+            .flex_none()
+            .w_full()
+            .px_5()
+            .py_3p5()
+            .border_t_1()
+            .border_color(border)
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .child(
+                h_flex()
+                    .id("popout-share-audio-toggle")
                     .gap_2()
-                    .text_xs()
-                    .text_color(if loopback.is_some() && has_screen_perm {
-                        pal.success
-                    } else {
-                        pal.popover_muted
-                    })
-                    .child(match (has_screen_perm, loopback) {
-                        (true, Some(dev)) => {
-                            format!("Hardware capture ready · System audio via {dev}")
-                        }
-                        (true, None) => {
-                            "Hardware capture ready · Install BlackHole 2ch for system audio"
-                                .to_owned()
-                        }
-                        (false, Some(dev)) => format!("System audio via {dev}"),
-                        (false, None) => {
-                            "System audio: install BlackHole 2ch to share app audio".to_owned()
-                        }
-                    }),
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .size(px(16.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if share_audio { primary } else { border })
+                            .bg(if share_audio { primary } else { pal.popover_bg })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(primary_fg)
+                            .child(if share_audio { "✓" } else { "" }),
+                    )
+                    .child(div().text_xs().text_color(pal.popover_fg).child(
+                        if loopback.is_some() {
+                            "Share system audio"
+                        } else {
+                            "Share system audio (requires BlackHole 2ch)"
+                        },
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.huddle_share_audio = !this.huddle_share_audio;
+                        cx.notify();
+                    })),
             )
             .child(
                 h_flex()
                     .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(pal.popover_muted)
-                            .child("Share a screen or window"),
-                    )
+                    .gap_2()
                     .when(active_source.is_some(), |row| {
                         let send_stop = send.clone();
                         row.child(
                             div()
                                 .id("popout-huddle-share-stop")
-                                .px_2p5()
-                                .py_1()
-                                .rounded_full()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_lg()
                                 .bg(pal.danger)
                                 .cursor_pointer()
                                 .text_xs()
@@ -2960,68 +3493,141 @@ impl PopoutWindow {
                                 .text_color(pal.danger_fg)
                                 .child("Stop sharing")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    (send_stop)(Command::SetHuddleScreenShare { source_id: None });
+                                    (send_stop)(Command::SetHuddleScreenShare {
+                                        source_id: None,
+                                        share_audio: false,
+                                    });
                                     if this.fixtures.sample {
                                         if let Some(dock) = this.huddle_dock_entity() {
                                             dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
                                         }
                                     }
-                                    this.huddle_share_open = false;
+                                    this.close_share_modal(cx);
                                     cx.notify();
                                 })),
                         )
-                    }),
-            )
-            .child(if self.huddle_screens.is_empty() {
-                div()
-                    .text_xs()
-                    .text_color(pal.popover_muted)
-                    .child("Scanning screens & windows… (grant Screen Recording permission in macOS System Settings if none appear)")
-                    .into_any_element()
-            } else {
-                h_flex()
-                    .flex_wrap()
-                    .gap_1p5()
-                    .children(self.huddle_screens.iter().enumerate().map(|(ix, src)| {
-                        let selected = active_source == Some(src.id.as_str());
-                        let src_id = src.id.clone();
-                        let send_pick = send.clone();
-                        let prefix = if src.is_monitor { "🖥 " } else { "🪟 " };
+                    })
+                    .child(
                         div()
-                            .id(("popout-huddle-src", ix))
-                            .max_w(px(520.))
-                            .min_w_0()
-                            .truncate()
-                            .px_2p5()
-                            .py_1()
+                            .id("popout-share-modal-cancel")
+                            .px_4()
+                            .py_1p5()
                             .rounded_lg()
+                            .border_1()
+                            .border_color(border)
+                            .bg(pal.popover_bg)
+                            .hover(move |el| el.bg(hover))
                             .cursor_pointer()
-                            .bg(if selected { primary } else { surface })
-                            .hover(move |el| el.bg(if selected { primary } else { hover }))
                             .text_xs()
-                            .text_color(if selected { primary_fg } else { pal.popover_fg })
-                            .child(if selected {
-                                format!("✓ {prefix}{}", src.name)
-                            } else {
-                                format!("{prefix}{}", src.name)
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                (send_pick)(Command::SetHuddleScreenShare {
-                                    source_id: Some(src_id.clone()),
-                                });
-                                if this.fixtures.sample {
-                                    if let Some(dock) = this.huddle_dock_entity() {
-                                        dock.update(cx, |d, cx| {
-                                            d.set_sharing_local(Some(src_id.clone()), cx);
-                                        });
-                                    }
-                                }
-                                this.huddle_share_open = false;
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(pal.popover_fg)
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_share_modal(cx);
                                 cx.notify();
-                            }))
-                    }))
-                    .into_any_element()
-            })
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("popout-share-modal-confirm")
+                            .px_4()
+                            .py_1p5()
+                            .rounded_lg()
+                            .bg(if can_share { success } else { surface })
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(if can_share {
+                                rgb(0xFFFFFF).into()
+                            } else {
+                                pal.popover_muted
+                            })
+                            .when(can_share, |btn| btn.cursor_pointer())
+                            .child("Share")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(src_id) = selected_to_share.clone() {
+                                    this.start_selected_screen_share(src_id, cx);
+                                }
+                            })),
+                    ),
+            );
+
+        div()
+            .id("popout-huddle-share-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(rgba(0x00000078))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_share_modal(cx);
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .id("popout-huddle-share-card")
+                    .w(px(680.))
+                    .max_w_full()
+                    .h(px(470.))
+                    .max_h_full()
+                    .rounded_2xl()
+                    .border_1()
+                    .border_color(border)
+                    .bg(pal.popover_bg)
+                    .shadow_2xl()
+                    .text_color(pal.popover_fg)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(header)
+                    .when(!has_screen_perm, |col| {
+                        col.child(
+                            h_flex()
+                                .mx_5()
+                                .mb_2()
+                                .px_3()
+                                .py_2()
+                                .gap_3()
+                                .items_center()
+                                .justify_between()
+                                .rounded_lg()
+                                .bg(pal.warning.opacity(0.14))
+                                .border_1()
+                                .border_color(pal.warning.opacity(0.55))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_xs()
+                                        .text_color(pal.popover_fg)
+                                        .child("Grant Screen Recording permission in macOS System Settings for full window previews & hardware capture."),
+                                )
+                                .child(
+                                    div()
+                                        .id("popout-huddle-open-screen-perm")
+                                        .flex_none()
+                                        .px_2p5()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(primary)
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(primary_fg)
+                                        .child("Open Settings")
+                                        .on_click(|_, _, _| {
+                                            slackless_core::huddle::request_screen_capture_permission();
+                                            slackless_core::huddle::open_screen_capture_settings();
+                                        }),
+                                ),
+                        )
+                    })
+                    .child(body)
+                    .child(footer),
+            )
     }
 
     fn render_huddle_reactions_panel(
@@ -3405,7 +4011,7 @@ impl PopoutWindow {
         cur_in: Option<String>,
         cur_out: Option<String>,
         pal: &HuddlePalette,
-        _cx: &Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         let send_in = self.send.clone();
         let send_out = self.send.clone();
@@ -3511,6 +4117,23 @@ impl PopoutWindow {
                         }),
                 ),
             )
+            .child(div().my_1().h(px(1.)).bg(pal.popover_border))
+            .child(
+                div()
+                    .id("popout-audio-prefs")
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(hover))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(pal.popover_fg)
+                    .child("Audio & video preferences")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_audio_video_preferences(cx);
+                    })),
+            )
     }
 
     fn render_huddle_controls(
@@ -3521,7 +4144,7 @@ impl PopoutWindow {
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
-        use slackless_core::huddle::{list_audio_devices, list_screen_sources};
+        use slackless_core::huddle::{list_audio_devices, list_cameras, list_screen_sources};
 
         let (muted_now, video_now, blur_now, sharing_now, hand_now) = (
             snap.muted,
@@ -3679,37 +4302,109 @@ impl PopoutWindow {
 
         let send_cam = self.send.clone();
         let next_cam = !video_now;
-        let cam_btn = div()
-            .id("popout-huddle-video")
-            .size(px(36.))
+        let selected_cam_idx = self.huddle_selected_camera;
+        let cam_open = self.huddle_camera_open;
+        let cam_btn = h_flex()
+            .h(px(36.))
             .rounded_lg()
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
+            .overflow_hidden()
             .bg(if video_now { active_bg } else { ctrl_bg })
-            .hover(move |el| el.bg(if video_now { active_bg } else { ctrl_hover }))
             .child(
-                Icon::new(if video_now {
-                    IconName::Video
-                } else {
-                    IconName::VideoOff
-                })
-                .size(px(16.))
-                .text_color(if video_now { active_fg } else { ctrl_fg }),
+                div()
+                    .id("popout-huddle-video")
+                    .h_full()
+                    .px_2p5()
+                    .cursor_pointer()
+                    .hover(move |el| el.bg(if video_now { active_bg } else { ctrl_hover }))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(if video_now {
+                            IconName::Video
+                        } else {
+                            IconName::VideoOff
+                        })
+                        .size(px(16.))
+                        .text_color(if video_now {
+                            active_fg
+                        } else {
+                            ctrl_fg
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        (send_cam)(Command::SetHuddleCamera {
+                            enabled: next_cam,
+                            device_index: selected_cam_idx,
+                            blur: blur_now,
+                        });
+                        if this.fixtures.sample {
+                            if let Some(dock) = this.huddle_dock_entity() {
+                                dock.update(cx, |d, cx| d.set_camera_local(next_cam, cx));
+                            }
+                        }
+                    })),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                (send_cam)(Command::SetHuddleCamera {
-                    enabled: next_cam,
-                    device_index: None,
-                    blur: blur_now,
-                });
-                if this.fixtures.sample {
-                    if let Some(dock) = this.huddle_dock_entity() {
-                        dock.update(cx, |d, cx| d.set_camera_local(next_cam, cx));
-                    }
-                }
-            }));
+            .child(
+                div()
+                    .id("popout-huddle-camera-btn")
+                    .h_full()
+                    .px_1p5()
+                    .cursor_pointer()
+                    .bg(if cam_open || video_now {
+                        active_bg
+                    } else {
+                        ctrl_bg
+                    })
+                    .hover(move |el| {
+                        el.bg(if video_now || cam_open {
+                            active_bg
+                        } else {
+                            ctrl_hover
+                        })
+                    })
+                    .border_l_1()
+                    .border_color(if video_now || cam_open {
+                        active_fg.opacity(0.18)
+                    } else {
+                        pal.chrome_border
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(if cam_open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronUp
+                        })
+                        .size(px(12.))
+                        .text_color(if video_now || cam_open {
+                            active_fg
+                        } else {
+                            ctrl_fg
+                        }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = !this.huddle_camera_open;
+                        this.close_huddle_popovers();
+                        this.huddle_camera_open = next;
+                        if this.huddle_camera_open {
+                            cx.spawn(async move |win, cx| {
+                                let cameras = cx
+                                    .background_executor()
+                                    .spawn(async move { list_cameras() })
+                                    .await;
+                                let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
+                                    win.huddle_cameras = cameras;
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                        }
+                        cx.notify();
+                    })),
+            );
 
         let send_blur = self.send.clone();
         let next_blur = !blur_now;
@@ -3740,6 +4435,7 @@ impl PopoutWindow {
         let primary = pal.primary;
         let primary_hover = pal.primary_hover;
         let primary_fg = pal.primary_fg;
+        let active_share_id = snap.share_source_id.clone();
         let share_btn = div()
             .id("popout-huddle-share")
             .size(px(36.))
@@ -3761,14 +4457,26 @@ impl PopoutWindow {
                     .size(px(16.))
                     .text_color(if sharing_now { primary_fg } else { ctrl_fg }),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
                 let next = !this.huddle_share_open;
+                this.close_share_modal(cx);
                 this.close_huddle_popovers();
                 this.huddle_share_open = next;
                 if this.huddle_share_open {
+                    this.huddle_share_selected = active_share_id.clone();
+                    this.huddle_share_tab = if active_share_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("window:"))
+                    {
+                        HuddleShareTab::Window
+                    } else {
+                        HuddleShareTab::Screen
+                    };
                     if !slackless_core::huddle::has_screen_capture_permission() {
                         slackless_core::huddle::request_screen_capture_permission();
                     }
+                    let monitors_first = this.huddle_share_tab == HuddleShareTab::Screen;
+                    this.refresh_share_thumbnails(monitors_first, cx);
                     cx.spawn(async move |win, cx| {
                         let screens = cx
                             .background_executor()

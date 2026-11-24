@@ -633,6 +633,7 @@ pub enum Command {
     /// Share a local monitor/window (`Some(source_id)`) or stop screen sharing (`None`) (Phase 3).
     SetHuddleScreenShare {
         source_id: Option<String>,
+        share_audio: bool,
     },
     /// Broadcast a floating emoji reaction, burst effect, or GIF sticker over official Slack
     /// `PeerMessage.Reacji` (`data-channel`).
