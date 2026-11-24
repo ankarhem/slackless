@@ -151,7 +151,7 @@ else
   SIGN_ID="${SLACKLESS_SIGN_IDENTITY:--}"
 fi
 if command -v codesign >/dev/null; then
-  codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || true
+  codesign --force --deep --sign "$SIGN_ID" "$APP"
   if [[ -n "$SIGN_LABEL" ]]; then
     echo "Signed $APP with identity: $SIGN_LABEL ($SIGN_ID)"
   else

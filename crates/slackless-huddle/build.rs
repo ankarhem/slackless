@@ -36,5 +36,26 @@ fn main() {
         ] {
             println!("cargo:rustc-link-lib=framework={fw}");
         }
+        // Objective-C `@available(macOS 14.0, *)` emits calls to `___isPlatformVersionAtLeast`
+        // when `MACOSX_DEPLOYMENT_TARGET < 14.0`. Because `rustc` passes `-nodefaultlibs`, link
+        // Apple's `libclang_rt.osx.a` explicitly when present so release builds with deployment
+        // target 13.0 link cleanly on Xcode toolchains.
+        let cc_bin = std::env::var("CC").unwrap_or_else(|_| "clang".to_owned());
+        if let Ok(out) = std::process::Command::new(&cc_bin)
+            .arg("--print-resource-dir")
+            .output()
+        {
+            if out.status.success() {
+                let res_dir = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                let darwin_lib_dir = std::path::Path::new(&res_dir).join("lib/darwin");
+                if darwin_lib_dir.join("libclang_rt.osx.a").is_file() {
+                    println!(
+                        "cargo:rustc-link-search=native={}",
+                        darwin_lib_dir.display()
+                    );
+                    println!("cargo:rustc-link-lib=static=clang_rt.osx");
+                }
+            }
+        }
     }
 }
