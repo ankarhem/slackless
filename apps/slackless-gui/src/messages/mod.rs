@@ -316,7 +316,7 @@ fn collect_channel_media_urls(messages: &[Message]) -> Vec<String> {
 /// Maximum number of recently visited channels kept warm in [`MessageList`] so switching
 /// back to a recent channel renders on frame 0 without flashing an empty transcript while
 /// SQLite refreshes in the background.
-const HISTORY_CACHE_CHANNELS: usize = 10;
+const HISTORY_CACHE_CHANNELS: usize = 4;
 
 pub struct MessageList {
     fixtures: Arc<Fixtures>,

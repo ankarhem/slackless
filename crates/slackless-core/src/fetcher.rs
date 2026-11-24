@@ -16,10 +16,10 @@ use crate::api::{AssetClient, SlackApi};
 /// Where Slack serves workspace files and their thumbnails; these need the session cookie and are
 /// kept in memory only (never written to the public asset disk cache).
 const SLACK_FILES: &str = "https://files.slack.com/";
-/// Maximum total bytes kept in the in-memory asset cache (24 MiB).
-const MAX_CACHE_BYTES: usize = 24 * 1024 * 1024;
+/// Maximum total bytes kept in the in-memory asset cache (12 MiB).
+const MAX_CACHE_BYTES: usize = 12 * 1024 * 1024;
 /// Maximum number of cached URLs in the in-memory asset cache.
-const MAX_CACHE_ENTRIES: usize = 512;
+const MAX_CACHE_ENTRIES: usize = 384;
 /// Skip caching single assets larger than 4 MiB so large file downloads never evict avatars.
 const MAX_SINGLE_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum total size of the persistent disk cache for public avatars and custom emoji (128 MiB).
@@ -155,6 +155,10 @@ impl ByteLru {
     }
 }
 
+type InFlightMap = HashMap<String, tokio::sync::broadcast::Sender<Result<Vec<u8>, String>>>;
+type FetchFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'static>>;
+
 /// Cheap to clone; hand one to whatever loads remote images.
 #[derive(Clone)]
 pub struct Fetcher {
@@ -164,6 +168,8 @@ pub struct Fetcher {
     files: Option<SlackApi>,
     /// Bounded LRU cache of fetched asset bytes shared across clones.
     cache: Arc<Mutex<ByteLru>>,
+    /// Coalesces concurrent misses for the same URL into a single in-flight fetch.
+    in_flight: Arc<Mutex<InFlightMap>>,
     /// Persistent on-disk cache directory for public avatars and custom emoji.
     disk_dir: Option<PathBuf>,
 }
@@ -189,6 +195,7 @@ impl Fetcher {
             assets: shared_asset_client(),
             files,
             cache: Arc::new(Mutex::new(ByteLru::new(MAX_CACHE_BYTES, MAX_CACHE_ENTRIES))),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             disk_dir,
         }
     }
@@ -211,51 +218,84 @@ impl Fetcher {
                 return futures::future::Either::Left(async move { Ok(hit) });
             }
         }
+        let mut follower_rx = None;
+        let mut leader_tx = None;
+        if let Ok(mut flights) = self.in_flight.lock() {
+            if let Some(tx) = flights.get(&url) {
+                follower_rx = Some(tx.subscribe());
+            } else {
+                let (tx, _) = tokio::sync::broadcast::channel(1);
+                flights.insert(url.clone(), tx.clone());
+                leader_tx = Some(tx);
+            }
+        }
+        if let Some(mut rx) = follower_rx {
+            return futures::future::Either::Right(Box::pin(async move {
+                match rx.recv().await {
+                    Ok(res) => res,
+                    Err(_) => Err("in-flight asset fetch cancelled".to_owned()),
+                }
+            }) as FetchFuture);
+        }
         let assets = self.assets.clone();
         let is_private_file = url.starts_with(SLACK_FILES);
         let files = self.files.clone().filter(|_| is_private_file);
         let cache = Arc::clone(&self.cache);
+        let in_flight = Arc::clone(&self.in_flight);
         let disk_dir = (!is_private_file).then(|| self.disk_dir.clone()).flatten();
         let task = self.runtime.spawn(async move {
-            if let Some(ref dir) = disk_dir {
-                let dir_r = dir.clone();
-                let url_r = url.clone();
-                if let Ok(Some(bytes)) =
-                    tokio::task::spawn_blocking(move || read_disk_cache(&dir_r, &url_r)).await
-                {
+            let outcome = async {
+                if let Some(ref dir) = disk_dir {
+                    let dir_r = dir.clone();
+                    let url_r = url.clone();
+                    if let Ok(Some(bytes)) =
+                        tokio::task::spawn_blocking(move || read_disk_cache(&dir_r, &url_r)).await
+                    {
+                        if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
+                            if let Ok(mut guard) = cache.lock() {
+                                guard.insert(url.clone(), bytes.clone());
+                            }
+                        }
+                        return Ok(bytes);
+                    }
+                }
+                let result = match files {
+                    Some(api) => api
+                        .download_file(&url)
+                        .await
+                        .map(|bytes| bytes.to_vec())
+                        .map_err(|e| e.to_string()),
+                    None => assets.get(&url).await.map_err(|e| e.to_string()),
+                };
+                if let Ok(ref bytes) = result {
                     if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
                         if let Ok(mut guard) = cache.lock() {
-                            guard.insert(url, bytes.clone());
+                            guard.insert(url.clone(), bytes.clone());
+                        }
+                        if let Some(dir) = disk_dir {
+                            let data = bytes.clone();
+                            let url_w = url.clone();
+                            // Persist asynchronously so disk I/O never stalls the image decode path.
+                            tokio::task::spawn_blocking(move || {
+                                write_disk_cache(&dir, &url_w, &data);
+                            });
                         }
                     }
-                    return Ok(bytes);
                 }
+                result
             }
-            let result = match files {
-                Some(api) => api
-                    .download_file(&url)
-                    .await
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|e| e.to_string()),
-                None => assets.get(&url).await.map_err(|e| e.to_string()),
-            };
-            if let Ok(ref bytes) = result {
-                if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
-                    if let Ok(mut guard) = cache.lock() {
-                        guard.insert(url.clone(), bytes.clone());
-                    }
-                    if let Some(dir) = disk_dir {
-                        let data = bytes.clone();
-                        // Persist asynchronously so disk I/O never stalls the image decode path.
-                        tokio::task::spawn_blocking(move || {
-                            write_disk_cache(&dir, &url, &data);
-                        });
-                    }
-                }
+            .await;
+            if let Ok(mut flights) = in_flight.lock() {
+                flights.remove(&url);
             }
-            result
+            if let Some(tx) = leader_tx {
+                let _ = tx.send(outcome.clone());
+            }
+            outcome
         });
-        futures::future::Either::Right(async move { task.await.map_err(|e| e.to_string())? })
+        futures::future::Either::Right(Box::pin(
+            async move { task.await.map_err(|e| e.to_string())? },
+        ) as FetchFuture)
     }
 }
 

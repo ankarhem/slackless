@@ -66,8 +66,9 @@ pub struct SectionPrefs {
     pub sorts: HashMap<String, crate::sidebar_menu::SectionSort>,
 }
 
-/// Newest messages of a conversation the message list loads on scroll-back / live refresh.
-const HISTORY_LIMIT: usize = 500;
+/// Newest messages of a conversation the message list loads on scroll-back / live refresh
+/// (older pages load seamlessly on scroll-up via `prepend_history`).
+const HISTORY_LIMIT: usize = 200;
 
 /// Newest messages loaded synchronously for frame-0 cold launch (enough to fill any viewport
 /// while avoiding deserializing 500 messages before the first frame paints).
