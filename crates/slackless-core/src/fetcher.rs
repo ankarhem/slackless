@@ -168,15 +168,25 @@ pub struct Fetcher {
     disk_dir: Option<PathBuf>,
 }
 
+fn shared_asset_client() -> AssetClient {
+    static CLIENT: std::sync::OnceLock<AssetClient> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(AssetClient::new).clone()
+}
+
 impl Fetcher {
     pub(crate) fn new(runtime: Handle, files: Option<SlackApi>) -> Self {
         let disk_dir = disk_cache_dir();
         if let Some(dir) = disk_dir.clone() {
-            runtime.spawn_blocking(move || prune_disk_cache_if_needed(&dir, MAX_DISK_CACHE_BYTES));
+            static PRUNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !PRUNED.swap(true, Ordering::Relaxed) {
+                runtime
+                    .spawn_blocking(move || prune_disk_cache_if_needed(&dir, MAX_DISK_CACHE_BYTES));
+            }
         }
         Self {
             runtime,
-            assets: AssetClient::new(),
+            assets: shared_asset_client(),
             files,
             cache: Arc::new(Mutex::new(ByteLru::new(MAX_CACHE_BYTES, MAX_CACHE_ENTRIES))),
             disk_dir,

@@ -165,56 +165,23 @@ impl Store {
         channel: &ChannelId,
         message: &Message,
     ) -> Result<()> {
-        let edit_ts = message.edited.as_ref().map_or("", |e| e.ts.as_str());
-        let json = serde_json::to_string(message)?;
-        let ephemeral = is_ephemeral_message(message);
-        let stored_json = encode_json_value(&json, ephemeral);
-        let tx = self.conn.transaction()?;
-        let current: Option<(String, bool)> = tx
-            .query_row(
-                "SELECT edit_ts, deleted FROM message_current
-                 WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
-                params![workspace.as_str(), channel.as_str(), message.ts.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let newest = match &current {
-            None => true,
-            Some((_, true)) => false,
-            Some((current_edit, false)) => Ts::from(edit_ts) >= Ts::from(current_edit.as_str()),
-        };
-        // Avoid duplicating untouched originals in `message_revision` (cuts archive size ~65%):
-        // whenever a message is edited, tombstoned, or re-observed with a different revision key,
-        // archive the existing `message_current` row first and append the incoming revision.
-        let needs_revision = match &current {
-            None => false,
-            Some((_, true)) => true,
-            Some((current_edit, false)) => current_edit.as_str() != edit_ts,
-        };
-        if needs_revision {
-            if current.is_some() {
-                archive_current_as_revision(&tx, workspace, channel, &message.ts)?;
-            }
-            insert_revision(
-                &tx,
-                workspace,
-                channel,
-                message,
-                edit_ts,
-                false,
-                &stored_json,
-            )?;
+        self.upsert_messages(workspace, channel, std::slice::from_ref(message))
+    }
+
+    /// Records a batch of messages for `channel` in a single SQLite transaction (one WAL commit and
+    /// one revision bump for the whole page).
+    pub fn upsert_messages(
+        &mut self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+        messages: &[Message],
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
         }
-        if newest {
-            write_current(
-                &tx,
-                workspace,
-                channel,
-                message,
-                edit_ts,
-                false,
-                &stored_json,
-            )?;
+        let tx = self.conn.transaction()?;
+        for message in messages {
+            upsert_message_in_tx(&tx, workspace, channel, message)?;
         }
         tx.commit()?;
         Self::bump_message_revision();
@@ -296,59 +263,93 @@ impl Store {
     }
 
     pub fn upsert_conversation(&mut self, workspace: &TeamId, conv: &Conversation) -> Result<()> {
-        let kind = match conv.kind() {
-            ConversationKind::PublicChannel => "public_channel",
-            ConversationKind::PrivateChannel => "private_channel",
-            ConversationKind::Im => "im",
-            ConversationKind::Mpim => "mpim",
-        };
-        self.conn.execute(
-            "INSERT INTO conversation
-                 (workspace_id, id, name, kind, is_archived, is_member, json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT (workspace_id, id) DO UPDATE SET
-                 name = excluded.name, kind = excluded.kind, is_archived = excluded.is_archived,
-                 is_member = excluded.is_member, json = excluded.json,
-                 updated_at = excluded.updated_at",
-            params![
-                workspace.as_str(),
-                conv.id.as_str(),
-                conv.name,
-                kind,
-                conv.is_archived,
-                conv.is_member,
-                serde_json::to_string(conv)?,
-                now_secs(),
-            ],
-        )?;
+        self.upsert_conversations(workspace, std::slice::from_ref(conv))
+    }
+
+    /// Upsert a batch of conversations in a single SQLite transaction.
+    pub fn upsert_conversations(
+        &mut self,
+        workspace: &TeamId,
+        conversations: &[Conversation],
+    ) -> Result<()> {
+        if conversations.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let ts = now_secs();
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO conversation
+                     (workspace_id, id, name, kind, is_archived, is_member, json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (workspace_id, id) DO UPDATE SET
+                     name = excluded.name, kind = excluded.kind, is_archived = excluded.is_archived,
+                     is_member = excluded.is_member, json = excluded.json,
+                     updated_at = excluded.updated_at",
+            )?;
+            for conv in conversations {
+                let kind = match conv.kind() {
+                    ConversationKind::PublicChannel => "public_channel",
+                    ConversationKind::PrivateChannel => "private_channel",
+                    ConversationKind::Im => "im",
+                    ConversationKind::Mpim => "mpim",
+                };
+                stmt.execute(params![
+                    workspace.as_str(),
+                    conv.id.as_str(),
+                    conv.name,
+                    kind,
+                    conv.is_archived,
+                    conv.is_member,
+                    serde_json::to_string(conv)?,
+                    ts,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn upsert_user(&mut self, workspace: &TeamId, user: &User) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO "user"
-                   (workspace_id, id, name, real_name, display_name, is_bot, deleted, json,
-                    updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-               ON CONFLICT (workspace_id, id) DO UPDATE SET
-                   name = excluded.name, real_name = excluded.real_name,
-                   display_name = excluded.display_name, is_bot = excluded.is_bot,
-                   deleted = excluded.deleted, json = excluded.json,
-                   updated_at = excluded.updated_at"#,
-            params![
-                workspace.as_str(),
-                user.id.as_str(),
-                user.name,
-                user.real_name
-                    .as_deref()
-                    .or(user.profile.real_name.as_deref()),
-                user.profile.display_name,
-                user.is_bot,
-                user.deleted,
-                serde_json::to_string(user)?,
-                now_secs(),
-            ],
-        )?;
+        self.upsert_users(workspace, std::slice::from_ref(user))
+    }
+
+    /// Upsert a batch of users in a single SQLite transaction.
+    pub fn upsert_users(&mut self, workspace: &TeamId, users: &[User]) -> Result<()> {
+        if users.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let ts = now_secs();
+        {
+            let mut stmt = tx.prepare_cached(
+                r#"INSERT INTO "user"
+                       (workspace_id, id, name, real_name, display_name, is_bot, deleted, json,
+                        updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                   ON CONFLICT (workspace_id, id) DO UPDATE SET
+                       name = excluded.name, real_name = excluded.real_name,
+                       display_name = excluded.display_name, is_bot = excluded.is_bot,
+                       deleted = excluded.deleted, json = excluded.json,
+                       updated_at = excluded.updated_at"#,
+            )?;
+            for user in users {
+                stmt.execute(params![
+                    workspace.as_str(),
+                    user.id.as_str(),
+                    user.name,
+                    user.real_name
+                        .as_deref()
+                        .or(user.profile.real_name.as_deref()),
+                    user.profile.display_name,
+                    user.is_bot,
+                    user.deleted,
+                    serde_json::to_string(user)?,
+                    ts,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -494,23 +495,30 @@ impl Store {
         }
         // `team_id` lives in the stored JSON blob, not a column, so the rows parse here;
         // unreadable profiles read as own-team (a missing profile never invents an org).
-        let sql = format!(
-            r#"SELECT json FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
-            vec!["?"; ask.len()].join(", ")
-        );
-        let mut args = Vec::with_capacity(ask.len() + 1);
-        args.push(SqlValue::Text(workspace.as_str().to_owned()));
-        args.extend(ask.iter().map(|id| SqlValue::Text(id.as_str().to_owned())));
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+        // Chunk IN lists to stay well below SQLITE_MAX_VARIABLE_NUMBER on large workspaces.
         let mut teams: Vec<TeamId> = Vec::new();
-        for row in rows {
-            let Ok(user) = serde_json::from_str::<User>(&row?) else {
-                continue;
-            };
-            if let Some(team) = user.team_id {
-                if team != *workspace && !teams.contains(&team) {
-                    teams.push(team);
+        for chunk in ask.chunks(SQL_IN_CHUNK) {
+            let sql = format!(
+                r#"SELECT json FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
+                vec!["?"; chunk.len()].join(", ")
+            );
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlValue::Text(workspace.as_str().to_owned()));
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|id| SqlValue::Text(id.as_str().to_owned())),
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                let Ok(user) = serde_json::from_str::<User>(&row?) else {
+                    continue;
+                };
+                if let Some(team) = user.team_id {
+                    if team != *workspace && !teams.contains(&team) {
+                        teams.push(team);
+                    }
                 }
             }
         }
@@ -783,25 +791,27 @@ impl Store {
         if channels.is_empty() {
             return Ok(HashSet::new());
         }
-        let sql = format!(
-            "SELECT DISTINCT channel_id FROM message_current
-             WHERE workspace_id = ?1 AND channel_id IN ({})",
-            vec!["?"; channels.len()].join(", ")
-        );
-        let mut args = Vec::with_capacity(channels.len() + 1);
-        args.push(SqlValue::Text(workspace.as_str().to_owned()));
-        args.extend(
-            channels
-                .iter()
-                .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
-        Ok(rows
-            .collect::<rusqlite::Result<HashSet<_>>>()?
-            .into_iter()
-            .map(ChannelId::from)
-            .collect())
+        let mut out = HashSet::new();
+        for chunk in channels.chunks(SQL_IN_CHUNK) {
+            let sql = format!(
+                "SELECT DISTINCT channel_id FROM message_current
+                 WHERE workspace_id = ?1 AND channel_id IN ({})",
+                vec!["?"; chunk.len()].join(", ")
+            );
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlValue::Text(workspace.as_str().to_owned()));
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                out.insert(ChannelId::from(row?));
+            }
+        }
+        Ok(out)
     }
 
     /// Splits `members` into Slack's header counts (see [`MemberCounts`]). The workspace's
@@ -822,34 +832,40 @@ impl Store {
         }
         // Everyone starts as a human (unknown identities included); the stored profiles then
         // re-classify the bots and drop the deactivated.
-        let sql = format!(
-            r#"SELECT id, is_bot, deleted FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
-            vec!["?"; ask.len()].join(", ")
-        );
-        let mut args = Vec::with_capacity(ask.len() + 1);
-        args.push(SqlValue::Text(workspace.as_str().to_owned()));
-        args.extend(ask.iter().map(|id| SqlValue::Text(id.as_str().to_owned())));
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, bool>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (_, is_bot, deleted) = row?;
-            if deleted {
-                counts.humans -= 1;
-            } else if is_bot {
-                counts.humans -= 1;
-                counts.apps += 1;
+        for chunk in ask.chunks(SQL_IN_CHUNK) {
+            let sql = format!(
+                r#"SELECT id, is_bot, deleted FROM "user" WHERE workspace_id = ?1 AND id IN ({})"#,
+                vec!["?"; chunk.len()].join(", ")
+            );
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlValue::Text(workspace.as_str().to_owned()));
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|id| SqlValue::Text(id.as_str().to_owned())),
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (_, is_bot, deleted) = row?;
+                if deleted {
+                    counts.humans -= 1;
+                } else if is_bot {
+                    counts.humans -= 1;
+                    counts.apps += 1;
+                }
             }
         }
         Ok(counts)
     }
 
-    /// Which of `channels` are stored with `is_member = 1` (one query): the boot hydrate
+    /// Which of `channels` are stored with `is_member = 1` (one query per chunk): the boot hydrate
     /// preserves these flags, because `client.userBoot` objects omit `is_member` and the
     /// membership sync (`users.conversations`) only runs after them.
     pub fn member_flags(
@@ -860,25 +876,27 @@ impl Store {
         if channels.is_empty() {
             return Ok(HashSet::new());
         }
-        let sql = format!(
-            "SELECT id FROM conversation
-             WHERE workspace_id = ?1 AND is_member = 1 AND id IN ({})",
-            vec!["?"; channels.len()].join(", ")
-        );
-        let mut args = Vec::with_capacity(channels.len() + 1);
-        args.push(SqlValue::Text(workspace.as_str().to_owned()));
-        args.extend(
-            channels
-                .iter()
-                .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
-        Ok(rows
-            .collect::<rusqlite::Result<HashSet<_>>>()?
-            .into_iter()
-            .map(ChannelId::from)
-            .collect())
+        let mut out = HashSet::new();
+        for chunk in channels.chunks(SQL_IN_CHUNK) {
+            let sql = format!(
+                "SELECT id FROM conversation
+                 WHERE workspace_id = ?1 AND is_member = 1 AND id IN ({})",
+                vec!["?"; chunk.len()].join(", ")
+            );
+            let mut args = Vec::with_capacity(chunk.len() + 1);
+            args.push(SqlValue::Text(workspace.as_str().to_owned()));
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|channel| SqlValue::Text(channel.as_str().to_owned())),
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                out.insert(ChannelId::from(row?));
+            }
+        }
+        Ok(out)
     }
 
     /// Records the signed-in user's channel memberships (`users.conversations`): the ids in
@@ -896,17 +914,42 @@ impl Store {
         const CHANNEL_KINDS: &str = "('public_channel', 'private_channel')";
         let mut flipped = Vec::new();
         let tx = self.conn.transaction()?;
-        if !members.is_empty() {
+        let now = now_secs();
+        if members.len() <= SQL_IN_CHUNK {
+            if !members.is_empty() {
+                let sql = format!(
+                    "UPDATE conversation
+                     SET is_member = 1, json = json_set(json, '$.is_member', json('true')),
+                         updated_at = ?1
+                     WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 0
+                       AND id IN ({}) RETURNING id",
+                    vec!["?"; members.len()].join(", ")
+                );
+                let mut args = vec![
+                    SqlValue::Integer(now),
+                    SqlValue::Text(workspace.as_str().to_owned()),
+                ];
+                args.extend(
+                    members
+                        .iter()
+                        .map(|id| SqlValue::Text(id.as_str().to_owned())),
+                );
+                flipped.extend(flipping(&tx, &sql, args)?);
+            }
+            let left_out = if !members.is_empty() {
+                format!(" AND id NOT IN ({})", vec!["?"; members.len()].join(", "))
+            } else {
+                String::new()
+            };
             let sql = format!(
                 "UPDATE conversation
-                 SET is_member = 1, json = json_set(json, '$.is_member', json('true')),
+                 SET is_member = 0, json = json_set(json, '$.is_member', json('false')),
                      updated_at = ?1
-                 WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 0
-                   AND id IN ({}) RETURNING id",
-                vec!["?"; members.len()].join(", ")
+                 WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 1{left_out}
+                 RETURNING id"
             );
             let mut args = vec![
-                SqlValue::Integer(now_secs()),
+                SqlValue::Integer(now),
                 SqlValue::Text(workspace.as_str().to_owned()),
             ];
             args.extend(
@@ -915,29 +958,52 @@ impl Store {
                     .map(|id| SqlValue::Text(id.as_str().to_owned())),
             );
             flipped.extend(flipping(&tx, &sql, args)?);
-        }
-        let left_out = if !members.is_empty() {
-            format!(" AND id NOT IN ({})", vec!["?"; members.len()].join(", "))
         } else {
-            String::new()
-        };
-        let sql = format!(
-            "UPDATE conversation
-             SET is_member = 0, json = json_set(json, '$.is_member', json('false')),
-                 updated_at = ?1
-             WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 1{left_out}
-             RETURNING id"
-        );
-        let mut args = vec![
-            SqlValue::Integer(now_secs()),
-            SqlValue::Text(workspace.as_str().to_owned()),
-        ];
-        args.extend(
-            members
-                .iter()
-                .map(|id| SqlValue::Text(id.as_str().to_owned())),
-        );
-        flipped.extend(flipping(&tx, &sql, args)?);
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _slackless_member_ids (id TEXT PRIMARY KEY) WITHOUT ROWID;
+                 DELETE FROM _slackless_member_ids;",
+            )?;
+            {
+                let mut ins =
+                    tx.prepare("INSERT OR IGNORE INTO _slackless_member_ids (id) VALUES (?1)")?;
+                for id in members {
+                    ins.execute(params![id.as_str()])?;
+                }
+            }
+            let sql_join = format!(
+                "UPDATE conversation
+                 SET is_member = 1, json = json_set(json, '$.is_member', json('true')),
+                     updated_at = ?1
+                 WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 0
+                   AND id IN (SELECT id FROM _slackless_member_ids)
+                 RETURNING id"
+            );
+            flipped.extend(flipping(
+                &tx,
+                &sql_join,
+                vec![
+                    SqlValue::Integer(now),
+                    SqlValue::Text(workspace.as_str().to_owned()),
+                ],
+            )?);
+            let sql_leave = format!(
+                "UPDATE conversation
+                 SET is_member = 0, json = json_set(json, '$.is_member', json('false')),
+                     updated_at = ?1
+                 WHERE workspace_id = ?2 AND kind IN {CHANNEL_KINDS} AND is_member = 1
+                   AND id NOT IN (SELECT id FROM _slackless_member_ids)
+                 RETURNING id"
+            );
+            flipped.extend(flipping(
+                &tx,
+                &sql_leave,
+                vec![
+                    SqlValue::Integer(now),
+                    SqlValue::Text(workspace.as_str().to_owned()),
+                ],
+            )?);
+            tx.execute("DELETE FROM _slackless_member_ids", [])?;
+        }
         tx.commit()?;
         Ok(flipped)
     }
@@ -1697,6 +1763,68 @@ fn write_current(
                 reaction.count,
                 serde_json::to_string(&reaction.users)?,
             ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Maximum number of bind parameters per SQL `IN (?, ...)` chunk (well below SQLite's limit).
+const SQL_IN_CHUNK: usize = 500;
+
+fn upsert_message_in_tx(
+    tx: &Transaction<'_>,
+    workspace: &TeamId,
+    channel: &ChannelId,
+    message: &Message,
+) -> Result<()> {
+    let edit_ts = message.edited.as_ref().map_or("", |e| e.ts.as_str());
+    let json = serde_json::to_string(message)?;
+    let ephemeral = is_ephemeral_message(message);
+    let stored_json = encode_json_value(&json, ephemeral);
+    let current: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT edit_ts, deleted FROM message_current
+             WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+            params![workspace.as_str(), channel.as_str(), message.ts.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let newest = match &current {
+        None => true,
+        Some((_, true)) => false,
+        Some((current_edit, false)) => Ts::from(edit_ts) >= Ts::from(current_edit.as_str()),
+    };
+    // Avoid duplicating untouched originals in `message_revision` (cuts archive size ~65%):
+    // whenever a message is edited, tombstoned, or re-observed with a different revision key,
+    // archive the existing `message_current` row first and append the incoming revision.
+    let needs_revision = match &current {
+        None => false,
+        Some((_, true)) => true,
+        Some((current_edit, false)) => current_edit.as_str() != edit_ts,
+    };
+    if needs_revision {
+        if current.is_some() {
+            archive_current_as_revision(tx, workspace, channel, &message.ts)?;
+        }
+        insert_revision(
+            tx,
+            workspace,
+            channel,
+            message,
+            edit_ts,
+            false,
+            &stored_json,
+        )?;
+    }
+    if newest {
+        write_current(
+            tx,
+            workspace,
+            channel,
+            message,
+            edit_ts,
+            false,
+            &stored_json,
         )?;
     }
     Ok(())

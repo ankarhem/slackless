@@ -178,9 +178,7 @@ impl<B: Backend> Backfill<B> {
             self.unfurls.resolve(page.items.iter());
             let (ws, target) = (self.workspace.clone(), channel.clone());
             with_store(&self.store, move |store| {
-                page.items
-                    .iter()
-                    .try_for_each(|message| store.upsert_message(&ws, &target, message))
+                store.upsert_messages(&ws, &target, &page.items)
             })
             .await?;
             if !self.events.emit(Event::StoreChanged {
@@ -199,9 +197,7 @@ impl<B: Backend> Backfill<B> {
         self.unfurls.resolve(items.iter());
         let (ws, channel) = (self.workspace.clone(), channel.clone());
         with_store(&self.store, move |store| {
-            items
-                .iter()
-                .try_for_each(|m| store.upsert_message(&ws, &channel, m))
+            store.upsert_messages(&ws, &channel, &items)
         })
         .await?;
         Ok(())

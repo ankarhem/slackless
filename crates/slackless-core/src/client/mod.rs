@@ -113,36 +113,44 @@ const SEARCH_LIMIT: usize = 200;
 /// The orchestrator entry point.
 pub struct Client;
 
+fn shared_runtime() -> std::io::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("slackless-tokio")
+        .enable_all()
+        .build()?;
+    Ok(RUNTIME.get_or_init(|| rt))
+}
+
 impl Client {
-    /// Starts the core for one signed-in workspace on a dedicated OS thread running a
-    /// multi-thread tokio runtime.
+    /// Starts the core for one signed-in workspace on a shared multi-thread tokio runtime.
     ///
-    /// The thread hydrates the store (`client.userBoot`, `client.counts`), connects the
-    /// websocket and feeds every inbound event into `store`, then serves [`Command`]s until
-    /// [`Command::Shutdown`] or until every command sender is dropped. The caller opens `store`
-    /// (on disk for real sessions) so the location stays a front-end decision.
+    /// Hydrates the store (`client.userBoot`, `client.counts`), connects the websocket and feeds
+    /// every inbound event into `store`, then serves [`Command`]s until [`Command::Shutdown`] or
+    /// until every command sender is dropped. The caller opens `store` (on disk for real sessions)
+    /// so the location stays a front-end decision.
     pub fn start(session: Session, store: Store) -> std::io::Result<ClientHandle> {
         let store: SharedStore = Arc::new(Mutex::new(store));
         let (command_tx, command_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded();
         let events = Emitter(event_tx);
         let thread_store = Arc::clone(&store);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("slackless-tokio")
-            .enable_all()
-            .build()?;
+        let handle = shared_runtime()?.handle().clone();
         let files = SlackApi::new(
             &session.api_base(),
             session.xoxc_token.clone(),
             &session.d_cookie,
         )
         .ok();
-        let fetcher = Fetcher::new(runtime.handle().clone(), files);
+        let fetcher = Fetcher::new(handle.clone(), files);
         let thread = std::thread::Builder::new()
             .name("slackless-core".into())
             .spawn(move || {
-                runtime.block_on(run_session(session, thread_store, command_rx, events));
+                handle.block_on(run_session(session, thread_store, command_rx, events));
             })?;
         Ok(ClientHandle {
             commands: command_tx,
@@ -435,16 +443,39 @@ impl<B: Backend> Core<B> {
         }
     }
 
-    /// Startup hydrate: conversations, self, team and prefs from `client.userBoot`, the user
-    /// directory, unread counts, then sidebar sections and custom emoji (one
-    /// [`Event::SidebarChanged`] at the end). Every step reports its own failure without
-    /// aborting the rest. Ephemeral messages left from a past session are dropped first.
+    /// Startup hydrate: runs independent Slack API fetches concurrently (`tokio::join!`), then
+    /// persists and emits their results in deterministic order (`client.userBoot`, `client.dms`,
+    /// `users.conversations`, `users.list`, `client.counts`, `users.channelSections.list`,
+    /// `emoji.list`, usergroups, app commands, and one [`Event::SidebarChanged`] at the end).
+    /// Every step reports its own failure without aborting the rest. Ephemeral messages left from
+    /// a past session are dropped first.
     pub async fn hydrate(&self) {
         let ws = self.workspace.clone();
         if let Err(e) = with_store(&self.store, move |s| s.drop_ephemeral(&ws)).await {
             self.events.report("store", e.into());
         }
-        match self.backend.user_boot().await {
+        let (
+            boot_res,
+            dms_res,
+            members_res,
+            users_res,
+            counts_res,
+            sections_res,
+            emoji_res,
+            groups_res,
+            commands_res,
+        ) = tokio::join!(
+            self.backend.user_boot(),
+            self.backend.dm_list(),
+            self.backend.channel_memberships(),
+            self.backend.users(),
+            self.backend.counts(),
+            self.backend.channel_sections(),
+            self.backend.custom_emoji(),
+            self.backend.usergroups(),
+            self.backend.app_commands(),
+        );
+        match boot_res {
             Ok(boot) => {
                 let team = boot.team.clone();
                 let prefs = boot.prefs.clone();
@@ -453,19 +484,13 @@ impl<B: Backend> Core<B> {
                     // `client.userBoot` objects omit `is_member`, so a row the membership
                     // sync already marked must keep its flag: the front-end rebuilds its
                     // snapshot on this step's event, before `users.conversations` runs.
-                    let ids: Vec<ChannelId> = boot
-                        .channels
-                        .iter()
-                        .chain(&boot.ims)
-                        .map(|conversation| conversation.id.clone())
-                        .collect();
+                    let mut convs: Vec<_> = boot.channels.into_iter().chain(boot.ims).collect();
+                    let ids: Vec<ChannelId> = convs.iter().map(|c| c.id.clone()).collect();
                     let member = store.member_flags(&ws, &ids)?;
-                    let mut ids = Vec::new();
-                    for mut conversation in boot.channels.into_iter().chain(boot.ims) {
+                    for conversation in &mut convs {
                         conversation.is_member |= member.contains(&conversation.id);
-                        store.upsert_conversation(&ws, &conversation)?;
-                        ids.push(conversation.id.clone());
                     }
+                    store.upsert_conversations(&ws, &convs)?;
                     if let Some(me) = &boot.self_user {
                         store.upsert_user(&ws, me)?;
                     }
@@ -502,7 +527,7 @@ impl<B: Backend> Core<B> {
             }
             Err(e) => self.events.report("client.userBoot", e.into()),
         }
-        match self.backend.dm_list().await {
+        match dms_res {
             Ok(dms) => {
                 let ws = self.workspace.clone();
                 let stored = with_store(&self.store, move |store| {
@@ -526,7 +551,7 @@ impl<B: Backend> Core<B> {
             }
             Err(e) => self.events.report("client.dms", e.into()),
         }
-        match self.backend.channel_memberships().await {
+        match members_res {
             Ok(members) => {
                 let ws = self.workspace.clone();
                 let ids = members.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
@@ -545,13 +570,11 @@ impl<B: Backend> Core<B> {
             // flags (usually `false`) in place until the next hydrate.
             Err(e) => self.events.report("users.conversations", e.into()),
         }
-        match self.backend.users().await {
+        match users_res {
             Ok(users) => {
                 let ws = self.workspace.clone();
                 let stored = with_store(&self.store, move |store| {
-                    for user in &users {
-                        store.upsert_user(&ws, user)?;
-                    }
+                    store.upsert_users(&ws, &users)?;
                     Ok::<_, StoreError>(users.into_iter().map(|user| user.id).collect())
                 })
                 .await;
@@ -564,14 +587,14 @@ impl<B: Backend> Core<B> {
             }
             Err(e) => self.events.report("users.list", e.into()),
         }
-        match self.backend.counts().await {
+        match counts_res {
             Ok(counts) => {
                 self.prefetch_unreads(&counts);
                 self.events.emit(Event::Counts(Box::new(counts)));
             }
             Err(e) => self.events.report("client.counts", e.into()),
         }
-        match self.backend.channel_sections().await {
+        match sections_res {
             Ok(sections) => {
                 let ws = self.workspace.clone();
                 let stored =
@@ -582,7 +605,7 @@ impl<B: Backend> Core<B> {
             }
             Err(e) => self.events.report("users.channelSections.list", e.into()),
         }
-        match self.backend.custom_emoji().await {
+        match emoji_res {
             Ok(emoji) => {
                 let ws = self.workspace.clone();
                 let emoji: Vec<(String, String)> = emoji.into_iter().collect();
@@ -594,7 +617,7 @@ impl<B: Backend> Core<B> {
             }
             Err(e) => self.events.report("emoji.list", e.into()),
         }
-        if let Ok(groups) = self.backend.usergroups().await {
+        if let Ok(groups) = groups_res {
             let active: Vec<_> = groups
                 .into_iter()
                 .filter(|g| !g.is_deleted() && !g.handle.is_empty())
@@ -603,7 +626,7 @@ impl<B: Backend> Core<B> {
                 self.events.emit(Event::Usergroups(active));
             }
         }
-        if let Ok(commands) = self.backend.app_commands().await {
+        if let Ok(commands) = commands_res {
             if !commands.is_empty() {
                 self.events.emit(Event::AppCommands(commands));
             }
@@ -750,12 +773,7 @@ impl<B: Backend> Core<B> {
                 }
                 unfurls.resolve(items.iter());
                 let (ws_put, target) = (ws.clone(), channel.clone());
-                with_store(&store, move |s| {
-                    items
-                        .iter()
-                        .try_for_each(|message| s.upsert_message(&ws_put, &target, message))
-                })
-                .await?;
+                with_store(&store, move |s| s.upsert_messages(&ws_put, &target, &items)).await?;
                 events.emit(Event::StoreChanged { channel });
             }
             Ok(())
@@ -849,12 +867,7 @@ impl<B: Backend> Core<B> {
                     .await?;
                     unfurls.resolve(items.iter());
                     let target = channel.clone();
-                    with_store(&store, move |s| {
-                        items
-                            .iter()
-                            .try_for_each(|message| s.upsert_message(&ws, &target, message))
-                    })
-                    .await?;
+                    with_store(&store, move |s| s.upsert_messages(&ws, &target, &items)).await?;
                     events.emit(Event::StoreChanged { channel });
                     Ok(())
                 });
@@ -2791,9 +2804,7 @@ impl<B: Backend> Core<B> {
                                             unfurls.resolve(items.iter());
                                             let (ws_p, target) = (ws.clone(), channel.clone());
                                             let _ = with_store(&store, move |s| {
-                                                items.iter().try_for_each(|m| {
-                                                    s.upsert_message(&ws_p, &target, m)
-                                                })
+                                                s.upsert_messages(&ws_p, &target, &items)
                                             })
                                             .await;
                                             events.emit(Event::StoreChanged { channel });
