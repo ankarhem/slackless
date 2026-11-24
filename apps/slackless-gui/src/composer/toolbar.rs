@@ -1065,7 +1065,7 @@ impl Composer {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .occlude()
+                                .block_mouse_except_scroll()
                                 .on_hover(hover.overlay_on_hover())
                                 .tooltip(|window, cx| tip_view("Remove GIF", &[], window, cx))
                                 .child(Icon::new(IconName::X).size(px(12.)).text_color(popover_fg))

@@ -293,8 +293,9 @@ impl HoverHandle {
 
 /// Wraps a host element and its overhanging floating interaction panel so moving the pointer
 /// off the host onto the overhanging portion of the overlay keeps the panel open, keeps the
-/// host highlighted, and `.occlude()`s whatever sits beneath the overlay; while hidden, the
-/// overlay is omitted completely so it never steals hover or clicks from neighboring rows.
+/// host highlighted, and blocks non-scroll mouse events (`.block_mouse_except_scroll()`) on
+/// whatever sits beneath the overlay; while hidden, the overlay is omitted completely so it
+/// never steals hover or clicks from neighboring rows.
 #[derive(IntoElement)]
 pub struct HoverOverlay {
     id: ElementId,
@@ -347,8 +348,9 @@ pub fn hover_toolbar(
     cx: &App,
 ) -> Stateful<Div> {
     let theme = cx.theme();
-    // Like Slack's, the bar straddles the row's top edge. Occluding prevents the row or
-    // divider underneath the top half from stealing hover/clicks while the bar is active.
+    // Like Slack's, the bar straddles the row's top edge. Blocking non-scroll mouse events
+    // prevents the row or divider underneath the top half from stealing hover/clicks while
+    // keeping wheel/trackpad scrolling over the toolbar smooth and uninterrupted.
     let mut bar = h_flex()
         .id(SharedString::from(format!("{key}-toolbar")))
         .gap_0p5()
@@ -361,7 +363,7 @@ pub fn hover_toolbar(
         .absolute()
         .top(px(-16.))
         .right_2()
-        .occlude()
+        .block_mouse_except_scroll()
         .on_hover(hover.overlay_on_hover());
     for name in quick {
         let Some(glyph) = emoji::glyph(name) else {
@@ -1241,6 +1243,7 @@ mod tests {
         struct Harness {
             above_clicks: Rc<Cell<u32>>,
             picked: Rc<Cell<u32>>,
+            scroll_events: Rc<Cell<u32>>,
             revealed_now: Rc<Cell<bool>>,
             row_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
             bar_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
@@ -1250,6 +1253,7 @@ mod tests {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let above_clicks = self.above_clicks.clone();
                 let picked = self.picked.clone();
+                let scroll_events = self.scroll_events.clone();
                 let revealed_now = self.revealed_now.clone();
                 let row_bounds = self.row_bounds.clone();
                 let bar_bounds = self.bar_bounds.clone();
@@ -1266,8 +1270,13 @@ mod tests {
                     in_thread: false,
                 };
                 v_flex()
+                    .id("scroll-host")
                     .w(px(500.))
                     .h(px(200.))
+                    .overflow_y_scroll()
+                    .on_scroll(move |_, _, _| {
+                        scroll_events.set(scroll_events.get() + 1);
+                    })
                     .child(
                         // Upper row / divider right above the target message.
                         div()
@@ -1316,14 +1325,16 @@ mod tests {
 
         let above_clicks = Rc::new(Cell::new(0));
         let picked = Rc::new(Cell::new(0));
+        let scroll_events = Rc::new(Cell::new(0));
         let revealed_now = Rc::new(Cell::new(false));
         let row_bounds = Rc::new(RefCell::new(None));
         let bar_bounds = Rc::new(RefCell::new(None));
 
         let (_view, cx) = cx.add_window_view({
-            let (above_clicks, picked, revealed_now, row_bounds, bar_bounds) = (
+            let (above_clicks, picked, scroll_events, revealed_now, row_bounds, bar_bounds) = (
                 above_clicks.clone(),
                 picked.clone(),
+                scroll_events.clone(),
                 revealed_now.clone(),
                 row_bounds.clone(),
                 bar_bounds.clone(),
@@ -1331,6 +1342,7 @@ mod tests {
             move |_, _| Harness {
                 above_clicks,
                 picked,
+                scroll_events,
                 revealed_now,
                 row_bounds,
                 bar_bounds,
@@ -1393,6 +1405,21 @@ mod tests {
             above_clicks.get(),
             1,
             "occluded upper row must not receive clicks through toolbar"
+        );
+
+        // 3b. Scrolling while the pointer intersects the hover toolbar must still reach the
+        //     underlying scroll container instead of aborting scroll.
+        cx.simulate_event(gpui::ScrollEvent {
+            position: smile_top_half,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            scroll_events.get(),
+            1,
+            "scroll wheel over hover toolbar must pass through to the scrollable list"
         );
 
         // 4. Move pointer completely outside both msg-b and its toolbar -> toolbar closes.

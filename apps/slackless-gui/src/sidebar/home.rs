@@ -1162,8 +1162,9 @@ impl Sidebar {
             } else {
                 "More unreads"
             })
-            // The pill floats over sidebar rows: a click must not also open the row beneath.
-            .occlude()
+            // The pill floats over sidebar rows: block clicks/hover from reaching the row
+            // beneath while letting scroll events pass through to the sidebar list.
+            .block_mouse_except_scroll()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.reveal_unread(target);
                 cx.notify();
