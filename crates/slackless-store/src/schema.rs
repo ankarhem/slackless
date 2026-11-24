@@ -253,7 +253,19 @@ CREATE TRIGGER message_revision_no_delete BEFORE DELETE ON message_revision
 BEGIN SELECT RAISE(ABORT, 'message_revision is append-only'); END;
 "#;
 
-const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7];
+/// Version 8: covering/partial indexes eliminating full-table scans & filesorts in
+/// `recent_messages_by_user`, `recent_threads`, and non-FTS `search_sorted`.
+const V8: &str = r#"
+CREATE INDEX IF NOT EXISTS message_current_user_ts
+    ON message_current (workspace_id, user_id, ts_key DESC);
+CREATE INDEX IF NOT EXISTS message_current_ws_ts
+    ON message_current (workspace_id, ts_key DESC);
+CREATE INDEX IF NOT EXISTS message_current_threads
+    ON message_current (workspace_id, ts_key DESC)
+    WHERE reply_count > 0 AND deleted = 0;
+"#;
+
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4, V5, V6, V7, V8];
 
 /// The schema version this build migrates to.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

@@ -102,10 +102,7 @@ fn apply_reaction(
     let (Some(channel), Some(ts)) = (&ev.item.channel, &ev.item.ts) else {
         return Ok(None);
     };
-    let current = store
-        .thread_replies(ws, channel, ts)?
-        .into_iter()
-        .find(|m| m.message.ts == *ts);
+    let current = store.message(ws, channel, ts)?;
     let Some(current) = current.filter(|m| !m.deleted) else {
         return Ok(None);
     };

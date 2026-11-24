@@ -1463,7 +1463,6 @@ fn transcript_row(
     let saved = store.saved.contains(&message.ts);
 
     let author_key = author_key(message);
-    let author = author_name(message, fixtures);
     // Every link in this row's text routes out as one event; the root resolves it.
     let links: LinkHandler = {
         let this = this.clone();
@@ -1491,6 +1490,7 @@ fn transcript_row(
         row = row.child(new_messages_divider(cx));
     }
     if is_membership(message) {
+        let author = author_name(message, fixtures);
         let others = messages[ix + 1..]
             .iter()
             .take_while(|next| membership_run(message, next))
@@ -1541,7 +1541,13 @@ fn transcript_row(
             .root
             .as_deref()
             .filter(|_| message.subtype == Some(MessageSubtype::ThreadBroadcast))
-            .map(|root| messages.iter().find(|m| m.ts == root.ts).unwrap_or(root));
+            .map(|root| {
+                messages
+                    .binary_search_by(|m| m.ts.cmp(&root.ts))
+                    .ok()
+                    .and_then(|idx| messages.get(idx))
+                    .unwrap_or(root)
+            });
         if let Some(root) = broadcast_root.filter(|_| !grouped) {
             // Slack's broadcast reference opens the thread.
             let (open, channel, thread_ts) =

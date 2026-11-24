@@ -390,6 +390,39 @@ impl Store {
         .collect()
     }
 
+    /// One stored user by id, as last written (single primary-key lookup).
+    pub fn user(&self, workspace: &TeamId, id: &UserId) -> Result<Option<User>> {
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                r#"SELECT json FROM "user" WHERE workspace_id = ?1 AND id = ?2"#,
+                params![workspace.as_str(), id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(json.map(|j| serde_json::from_str(&j)).transpose()?)
+    }
+
+    /// One stored message by `(workspace, channel, ts)` (single primary-key lookup).
+    pub fn message(
+        &self,
+        workspace: &TeamId,
+        channel: &ChannelId,
+        ts: &Ts,
+    ) -> Result<Option<StoredMessage>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT channel_id, json, deleted FROM message_current
+             WHERE workspace_id = ?1 AND channel_id = ?2 AND ts = ?3",
+        )?;
+        let row = stmt
+            .query_row(
+                params![workspace.as_str(), channel.as_str(), ts.as_str()],
+                raw_row,
+            )
+            .optional()?;
+        Ok(collect(row.into_iter().map(Ok))?.into_iter().next())
+    }
+
     /// Every stored user of `workspace`, as last upserted.
     pub fn users(&self, workspace: &TeamId) -> Result<Vec<User>> {
         self.json_column(

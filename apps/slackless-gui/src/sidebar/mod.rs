@@ -406,6 +406,10 @@ pub struct Sidebar {
     /// Tracks the sidebar list's scroll state; the "More unreads" pills read which unread
     /// rows the scroll offset carries out of view.
     pub(super) scroll: ScrollHandle,
+    /// Last rendered unread row indices & hidden-unread pill pair, so scroll events only
+    /// trigger a full sidebar re-render when a pill actually appears, changes, or disappears.
+    pub(super) last_unread_rows: Vec<(usize, bool)>,
+    pub(super) last_hidden_pills: (Option<HiddenUnreads>, Option<HiddenUnreads>),
     /// The "More unreads" scroll in flight, eased one frame per render.
     pub(super) scroll_anim: Option<ScrollAnim>,
     /// The Slack Connect row whose organizations tooltip is showing, and the row whose
@@ -530,6 +534,8 @@ impl Sidebar {
                 section_form_mode: SectionFormMode::Create,
                 section_form,
                 scroll: ScrollHandle::new(),
+                last_unread_rows: Vec::new(),
+                last_hidden_pills: (None, None),
                 scroll_anim: None,
                 org_tip: None,
                 org_tip_delay: None,
@@ -1857,8 +1863,7 @@ pub(super) const PILL_CLEARANCE: f32 = 44.;
 /// One edge of the list's hidden unreads: the unread row the pill scrolls to next, and
 /// whether any unread row hidden past that edge carries mentions. `below` picks the pill's
 /// arrow and the list edge it rides.
-#[derive(Clone, Copy)]
-
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct HiddenUnreads {
     pub(super) row: usize,
     /// The hidden unread row farthest past the edge.
@@ -2031,7 +2036,14 @@ impl Render for Sidebar {
             .h_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
+            .on_scroll(cx.listener(|this, _, _, cx| {
+                if !this.last_unread_rows.is_empty() {
+                    let next = hidden_unreads(&this.scroll, &this.last_unread_rows);
+                    if next != this.last_hidden_pills {
+                        cx.notify();
+                    }
+                }
+            }))
             .pb_2();
         let (mut below, mut above) = (None, None);
         let list = match self.active_nav {
@@ -2164,6 +2176,8 @@ impl Render for Sidebar {
                     cx.notify();
                 }
                 (below, above) = hidden_unreads(&self.scroll, &unread_rows);
+                self.last_unread_rows = unread_rows;
+                self.last_hidden_pills = (below, above);
                 list.children(children)
             }
         };

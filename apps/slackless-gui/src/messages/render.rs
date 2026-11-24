@@ -809,18 +809,8 @@ impl SelectableParagraph {
     /// Slack's inline-code pill: a single rounded quad carrying both the fill and the 1px 13%
     /// foreground ring with 3px corners, slightly wider than the glyphs and inset 1px from the
     /// line box so the fill never pokes outside the border.
-    fn paint_code_box(
-        &self,
-        layout: &TextLayout,
-        range: Range<usize>,
-        wash: Hsla,
-        window: &mut Window,
-    ) {
-        for bounds in self.range_quads(layout, range) {
-            let pill = Bounds::from_corners(
-                Point::new(bounds.left() - px(2.), bounds.top() + px(1.)),
-                Point::new(bounds.right() + px(2.), bounds.bottom() - px(1.)),
-            );
+    fn paint_code_box(&self, pills: &[Bounds<Pixels>], wash: Hsla, window: &mut Window) {
+        for &pill in pills {
             window.paint_quad(PaintQuad {
                 bounds: pill,
                 background: wash.into(),
@@ -1111,27 +1101,11 @@ impl SelectableParagraph {
         &self,
         handle: &TextSelectionHandle,
         local_range: Rc<RefCell<Option<Range<usize>>>>,
+        code_pills: Vec<(Range<usize>, Vec<Bounds<Pixels>>)>,
         layout: &TextLayout,
         hitbox: &Hitbox,
         window: &mut Window,
     ) {
-        let code_pills: Vec<(Range<usize>, Vec<Bounds<Pixels>>)> = self
-            .code
-            .iter()
-            .map(|(range, _)| {
-                let quads = self
-                    .range_quads(layout, range.clone())
-                    .into_iter()
-                    .map(|b| {
-                        Bounds::from_corners(
-                            Point::new(b.left() - px(2.), b.top() + px(1.)),
-                            Point::new(b.right() + px(2.), b.bottom() - px(1.)),
-                        )
-                    })
-                    .collect();
-                (range.clone(), quads)
-            })
-            .collect();
         let is_code_block = self.is_code_block;
         let text = self.text.clone();
         let layout = layout.clone();
@@ -1397,8 +1371,21 @@ impl Element for SelectableParagraph {
         for (range, wash) in &self.washes {
             self.paint_wash(&layout, range.clone(), *wash, window);
         }
+        let mut code_pills: Vec<(Range<usize>, Vec<Bounds<Pixels>>)> =
+            Vec::with_capacity(self.code.len());
         for (range, wash) in &self.code {
-            self.paint_code_box(&layout, range.clone(), *wash, window);
+            let pills: Vec<Bounds<Pixels>> = self
+                .range_quads(&layout, range.clone())
+                .into_iter()
+                .map(|b| {
+                    Bounds::from_corners(
+                        Point::new(b.left() - px(2.), b.top() + px(1.)),
+                        Point::new(b.right() + px(2.), b.bottom() - px(1.)),
+                    )
+                })
+                .collect();
+            self.paint_code_box(&pills, *wash, window);
+            code_pills.push((range.clone(), pills));
         }
         if let Some(range) = local_range.borrow().clone() {
             self.paint_selection(&layout, range, window);
@@ -1427,8 +1414,8 @@ impl Element for SelectableParagraph {
         if !over_link {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
         }
-        if self.is_code_block || !self.code.is_empty() {
-            self.paint_code_clicks(handle, local_range, &layout, hitbox, window);
+        if self.is_code_block || !code_pills.is_empty() {
+            self.paint_code_clicks(handle, local_range, code_pills, &layout, hitbox, window);
         }
         if !self.links.is_empty() {
             self.paint_links(global_id, &layout, hitbox, window);
@@ -3180,11 +3167,26 @@ pub fn set_timezone_override(offset_secs: Option<i64>) {
 }
 
 /// Offset from UTC in seconds at `unix_secs`, honoring manual override or platform `localtime`.
+/// Cached per UTC hour in thread-local storage to avoid locking libc's global timezone mutex on
+/// every visible message row per frame.
 #[cfg(unix)]
 pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
     let manual = TIMEZONE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if manual != i64::MIN {
         return manual;
+    }
+    let hour_bucket = unix_secs.div_euclid(3600);
+    thread_local! {
+        static OFFSET_CACHE: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
+    }
+    if let Some(cached) = OFFSET_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(h, _)| *h == hour_bucket)
+            .map(|(_, off)| *off)
+    }) {
+        return cached;
     }
     /// `struct tm` as laid out by glibc and Darwin: nine `int` fields then
     /// `tm_gmtoff`/`tm_zone`.
@@ -3221,7 +3223,7 @@ pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
     // SAFETY: `tm` is a valid, fully initialized `struct tm` owned by this call, and `unix_secs`
     // outlives it.
     let ok = unsafe { !localtime_r(&unix_secs, &mut tm).is_null() };
-    if ok {
+    let offset = if ok {
         tm.tm_gmtoff
     } else {
         // The rest of `struct tm` exists for the C ABI; reading it keeps every field live.
@@ -3230,7 +3232,15 @@ pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
         );
         let _ = (tm.tm_wday, tm.tm_yday, tm.tm_isdst, tm.tm_zone);
         0
-    }
+    };
+    OFFSET_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 64 {
+            cache.remove(0);
+        }
+        cache.push((hour_bucket, offset));
+    });
+    offset
 }
 
 #[cfg(not(unix))]
