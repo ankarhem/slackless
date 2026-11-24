@@ -217,6 +217,14 @@ pub fn uninstall_cli_symlink() -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `true` when running a local development build (`0.1.0` or `*-dev`) rather than a
+/// stamped CalVer release (`YYYY.MM.DD-xx`). Startup auto-update checks are skipped on dev builds
+/// so local development bundles never nag or overwrite themselves with older releases.
+pub fn is_dev_build() -> bool {
+    let v = installed_version();
+    v == "0.1.0" || v.ends_with("-dev") || v.contains("-dev.")
+}
+
 /// Return the installed app's version string (prefers `SLACKLESS_VERSION` compiled into the binary;
 /// falls back to reading `CFBundleShortVersionString` from `Info.plist` when running bundled).
 pub fn installed_version() -> String {

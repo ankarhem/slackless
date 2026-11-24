@@ -760,6 +760,9 @@ pub struct App {
     focus: FocusHandle,
     /// In-app GitHub Releases auto-updater state (`F-SHELL-163`).
     update_state: crate::updater::UpdateState,
+    /// Latest detected update kept available for the menu bar (`Download Update (<ver>)…`) even
+    /// if the user dismisses the top banner.
+    available_update: Option<crate::updater::ReleaseInfo>,
     /// Version tag dismissed by the user for the current session.
     update_dismissed: Option<String>,
     /// Subscriptions to the shown workspace's views (parked with them on a switch).

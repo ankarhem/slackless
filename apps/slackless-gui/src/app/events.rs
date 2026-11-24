@@ -8,6 +8,19 @@ impl App {
     pub(super) fn update_menus(&mut self, cx: &mut Context<Self>) {
         /// Slack's History menu lists this many places.
         const PLACES: usize = 15;
+        let update_label: SharedString = match &self.update_state {
+            crate::updater::UpdateState::Checking => "Checking for Updates\u{2026}".into(),
+            crate::updater::UpdateState::Downloading(ver) => {
+                format!("Downloading Update ({ver})\u{2026}").into()
+            }
+            crate::updater::UpdateState::Available(rel) => {
+                format!("Download Update ({})\u{2026}", rel.version).into()
+            }
+            _ => match &self.available_update {
+                Some(rel) => format!("Download Update ({})\u{2026}", rel.version).into(),
+                None => "Check for Updates\u{2026}".into(),
+            },
+        };
         let bar = MenuBar {
             workspaces: (self.fixtures.workspaces.iter())
                 .map(|team| team.name.clone().into())
@@ -22,6 +35,7 @@ impl App {
                     (label, id)
                 })
                 .collect(),
+            update_label,
         };
         if self.menu_bar.as_ref() != Some(&bar) {
             menu_bar::set(&bar, cx);

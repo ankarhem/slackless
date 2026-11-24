@@ -461,6 +461,7 @@ impl App {
         if manual {
             self.update_dismissed = None;
             self.update_state = UpdateState::Checking;
+            self.update_menus(cx);
             cx.notify();
         }
         cx.spawn(async move |this, cx| {
@@ -471,12 +472,15 @@ impl App {
             let _ = this.update(cx, |app, cx| {
                 match result {
                     Ok(Some(release)) => {
+                        app.available_update = Some(release.clone());
                         if !manual && app.update_dismissed.as_deref() == Some(&release.version) {
+                            app.update_menus(cx);
                             return;
                         }
                         app.update_state = UpdateState::Available(release);
                     }
                     Ok(None) => {
+                        app.available_update = None;
                         app.update_state = if manual {
                             UpdateState::UpToDate
                         } else {
@@ -488,6 +492,7 @@ impl App {
                                 let _ = this.update(cx, |app, cx| {
                                     if matches!(app.update_state, UpdateState::UpToDate) {
                                         app.update_state = UpdateState::Idle;
+                                        app.update_menus(cx);
                                         cx.notify();
                                     }
                                 });
@@ -504,6 +509,7 @@ impl App {
                         };
                     }
                 }
+                app.update_menus(cx);
                 cx.notify();
             });
         })
@@ -513,11 +519,15 @@ impl App {
     /// Download, verify SHA-256, atomically swap the running `.app`, and relaunch (`F-SHELL-163`).
     pub(super) fn install_available_update(&mut self, cx: &mut Context<Self>) {
         use crate::updater::UpdateState;
-        let UpdateState::Available(release) = self.update_state.clone() else {
+        let Some(release) = (match &self.update_state {
+            UpdateState::Available(r) => Some(r.clone()),
+            _ => self.available_update.clone(),
+        }) else {
             return;
         };
         let version = release.version.clone();
         self.update_state = UpdateState::Downloading(version);
+        self.update_menus(cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = cx
@@ -531,6 +541,7 @@ impl App {
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to install update");
                     app.update_state = UpdateState::Error(err);
+                    app.update_menus(cx);
                     cx.notify();
                 }
             });

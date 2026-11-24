@@ -54,7 +54,10 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 
 if [[ -z "$INSTALL_DIR" ]]; then
-  if [[ -w "/Applications" ]]; then
+  # Reuse an existing ~/Applications install instead of creating a duplicate in /Applications.
+  if [[ -d "$HOME/Applications/Slackless.app" && ! -d "/Applications/Slackless.app" ]]; then
+    INSTALL_DIR="$HOME/Applications"
+  elif [[ -w "/Applications" ]]; then
     INSTALL_DIR="/Applications"
   else
     INSTALL_DIR="$HOME/Applications"

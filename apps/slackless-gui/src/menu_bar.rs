@@ -52,6 +52,8 @@ pub struct MenuBar {
     pub workspaces: Vec<SharedString>,
     /// The History menu's places, newest first: Slack's label and the conversation.
     pub recent: Vec<(SharedString, ChannelId)>,
+    /// Label of the update item (`Check for Updates…` -> `Download Update (<ver>)…`).
+    pub update_label: SharedString,
 }
 
 pub fn init(cx: &mut App) {
@@ -92,7 +94,7 @@ pub fn set(bar: &MenuBar, cx: &mut App) {
     cx.set_menus([
         Menu::new("Slackless").items([
             MenuItem::action("About Slackless", About),
-            MenuItem::action("Check for Updates\u{2026}", CheckForUpdates),
+            MenuItem::action(bar.update_label.clone(), CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Preferences\u{2026}", OpenPreferences),
             MenuItem::separator(),

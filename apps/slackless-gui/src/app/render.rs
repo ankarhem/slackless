@@ -540,7 +540,11 @@ impl Render for App {
             }))
             .on_action(
                 cx.listener(|this, _: &crate::menu_bar::CheckForUpdates, _, cx| {
-                    this.check_for_updates(true, cx);
+                    if this.available_update.is_some() {
+                        this.install_available_update(cx);
+                    } else {
+                        this.check_for_updates(true, cx);
+                    }
                 }),
             )
             .on_action(
