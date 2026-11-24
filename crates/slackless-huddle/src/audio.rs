@@ -1,9 +1,9 @@
 //! Pure-Rust audio pipeline: `cpal` capture/playback + `sonora` (AEC3 / NS / AGC2) + `opus` 48kHz.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
@@ -14,6 +14,7 @@ use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 use tokio::sync::mpsc;
 
 use crate::backend::{AudioDeviceChangeKind, HwAudioDuplexHandle, platform_backend};
+use crate::rtc::InboundAudioPacket;
 use crate::{HuddleAudioConfig, HuddleError, Result};
 
 /// Chime / Opus native sample rate (48 kHz).
@@ -70,94 +71,195 @@ pub fn list_audio_devices() -> AudioDevices {
     AudioDevices { inputs, outputs }
 }
 
-/// Distinct acoustic chimes for huddle lifecycle events (`F-COLLAB-060`).
+const SLACK_CDN_AUDIO_BASE: &str = "https://a.slack-edge.com/bv1-13";
+
+/// Official Slack huddle lifecycle sound effects (`https://a.slack-edge.com/bv1-13/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HuddleChime {
-    /// Warm ascending triad when joining a huddle.
+    /// You joined / connected to a huddle (`you_joined_call_v2-7029418.mp3`).
     Join,
-    /// Gentle descending two-tone when leaving a huddle.
+    /// You left / disconnected from a huddle (`you_left_call_v2-1bc1290.mp3`).
     Leave,
-    /// Two-pulse ring chime for an incoming DM huddle invite.
+    /// Another participant joined the huddle (`they_joined_call_v2-570b169.mp3`).
+    PeerJoin,
+    /// Another participant left the huddle (`they_left_call_v2-95d3260.mp3`).
+    PeerLeave,
+    /// Outgoing / incoming DM huddle invite ring (`outgoing_ring_v2-6b3697e.mp3`).
     InviteRing,
 }
 
-/// Play a short synthesized huddle chime on `output_device` (or the default speaker) without
-/// blocking the caller.
+impl HuddleChime {
+    /// Official Slack CDN filename for this huddle lifecycle sound.
+    pub const fn slack_asset_filename(self) -> &'static str {
+        match self {
+            Self::Join => "you_joined_call_v2-7029418.mp3",
+            Self::Leave => "you_left_call_v2-1bc1290.mp3",
+            Self::PeerJoin => "they_joined_call_v2-570b169.mp3",
+            Self::PeerLeave => "they_left_call_v2-95d3260.mp3",
+            Self::InviteRing => "outgoing_ring_v2-6b3697e.mp3",
+        }
+    }
+
+    /// Full official Slack CDN URL for this huddle lifecycle sound.
+    pub fn slack_cdn_url(self) -> String {
+        format!("{SLACK_CDN_AUDIO_BASE}/{}", self.slack_asset_filename())
+    }
+}
+
+/// Official Slack huddle lounge / idle music track filename on `a.slack-edge.com/bv1-13/`.
+/// Defaults to Official Slack's iconic Smooth Jazz (`waiting_muzak-9187b04.mp3`).
+pub fn slack_lounge_music_filename(song_key: Option<&str>) -> &'static str {
+    match song_key.unwrap_or("jazz") {
+        "waiting" => "waiting_room-d5f7069.mp3",
+        "subway" => "subway_music-ff03dfb.mp3",
+        "whistle" => "whistle_tune-894c024.mp3",
+        "focus" => "focus_beats-ee1e4a9.mp3",
+        "lofi" => "huddles_focus_lofihaus_music_mixdown_stereo-07cf114.mp3",
+        "disco" => "disco_party-6f29a34.mp3",
+        "zen" => "moment_of_zen-7047c77.mp3",
+        "nature" => "nature_meditation-495e2c5.mp3",
+        "piano" => "piano_concerto-d00d84e.mp3",
+        _ => "waiting_muzak-9187b04.mp3",
+    }
+}
+
+fn slack_sound_cache_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home)
+                .join("Library")
+                .join("Caches")
+                .join("Slackless")
+                .join("sounds");
+        }
+    }
+    std::env::temp_dir().join("slackless-sounds")
+}
+
+/// Ensure official Slack MP3 `filename` is cached on disk, downloading it once from Slack's
+/// public CDN (`a.slack-edge.com/bv1-13/`). Returns `None` if offline or download fails.
+fn ensure_cached_slack_audio(filename: &str) -> Option<std::path::PathBuf> {
+    let dir = slack_sound_cache_dir();
+    let dest = dir.join(filename);
+    if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 256) {
+        return Some(dest);
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let url = format!("{SLACK_CDN_AUDIO_BASE}/{filename}");
+    let tmp = dir.join(format!(".{filename}.{}.tmp", std::process::id()));
+    let ok = std::process::Command::new("/usr/bin/curl")
+        .args(["-fsSL", "--max-time", "8", "-o"])
+        .arg(&tmp)
+        .arg(&url)
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok && std::fs::metadata(&tmp).is_ok_and(|m| m.len() > 256) {
+        let _ = std::fs::rename(&tmp, &dest);
+        if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 256) {
+            return Some(dest);
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    None
+}
+
+/// Play an official Slack huddle lifecycle sound (`you_joined_call_v2`, `you_left_call_v2`,
+/// `they_joined_call_v2`, `they_left_call_v2`, `outgoing_ring_v2`) without blocking the caller.
+/// Uses the cached official MP3 via native macOS `afplay` (zero `cpal` contention), falling back
+/// to a short synthesized chime only if offline or on non-macOS hosts.
 pub fn play_huddle_chime(chime: HuddleChime, output_device: Option<&str>) -> Result<()> {
     let device_name = output_device.map(ToOwned::to_owned);
     std::thread::Builder::new()
         .name("slackless-huddle-chime".to_owned())
         .spawn(move || {
-            let Ok(device) = select_output_device(device_name.as_deref()) else {
-                return;
-            };
-            let Ok(supported) = device.default_output_config() else {
-                return;
-            };
-            let rate = supported.sample_rate().0 as f32;
-            let channels = supported.channels() as usize;
-            let duration_secs: f32 = match chime {
-                HuddleChime::Join => 0.34,
-                HuddleChime::Leave => 0.28,
-                HuddleChime::InviteRing => 0.44,
-            };
-            let total_frames = (rate * duration_secs) as usize;
-            let frame_ix = Arc::new(AtomicU32::new(0));
-            let ix_cb = Arc::clone(&frame_ix);
-
-            let config: StreamConfig = supported.into();
-            let Ok(stream) = device.build_output_stream(
-                &config,
-                move |data: &mut [f32], _| {
-                    let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
-                    for frame in data.chunks_mut(channels) {
-                        let sample = if ix < total_frames {
-                            let t = ix as f32 / rate;
-                            let (freq, gain) = match chime {
-                                HuddleChime::Join => {
-                                    let f = if t < 0.11 {
-                                        523.25 // C5
-                                    } else if t < 0.22 {
-                                        659.25 // E5
-                                    } else {
-                                        783.99 // G5
-                                    };
-                                    (f, 0.18)
-                                }
-                                HuddleChime::Leave => {
-                                    let f = if t < 0.13 { 587.33 } else { 440.0 }; // D5 -> A4
-                                    (f, 0.16)
-                                }
-                                HuddleChime::InviteRing => {
-                                    let pulse = (t < 0.18) || (t > 0.24 && t < 0.42);
-                                    let f = if t < 0.18 { 783.99 } else { 987.77 }; // G5 -> B5
-                                    (f, if pulse { 0.20 } else { 0.0 })
-                                }
-                            };
-                            let env = (1.0 - (t / duration_secs)).clamp(0.0, 1.0) * gain;
-                            (2.0 * std::f32::consts::PI * freq * t).sin() * env
-                        } else {
-                            0.0
-                        };
-                        for ch in frame.iter_mut() {
-                            *ch = sample;
-                        }
-                        ix += 1;
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(path) = ensure_cached_slack_audio(chime.slack_asset_filename()) {
+                    if std::process::Command::new("/usr/bin/afplay")
+                        .args(["-v", "0.85"])
+                        .arg(&path)
+                        .status()
+                        .is_ok_and(|s| s.success())
+                    {
+                        return;
                     }
-                    ix_cb.store(ix as u32, Ordering::Relaxed);
-                },
-                |_| {},
-                None,
-            ) else {
-                return;
-            };
-            if stream.play().is_ok() {
-                std::thread::sleep(Duration::from_millis((duration_secs * 1000.0) as u64 + 80));
+                }
             }
-            drop(stream);
+            play_synthesized_huddle_chime(chime, device_name.as_deref());
         })
         .map_err(|e| HuddleError::Audio(e.to_string()))?;
     Ok(())
+}
+
+fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>) {
+    let Ok(device) = select_output_device(output_device) else {
+        return;
+    };
+    let Ok(supported) = device.default_output_config() else {
+        return;
+    };
+    let rate = supported.sample_rate().0 as f32;
+    let channels = supported.channels() as usize;
+    let duration_secs: f32 = match chime {
+        HuddleChime::Join | HuddleChime::PeerJoin => 0.34,
+        HuddleChime::Leave | HuddleChime::PeerLeave => 0.28,
+        HuddleChime::InviteRing => 0.44,
+    };
+    let total_frames = (rate * duration_secs) as usize;
+    let frame_ix = Arc::new(AtomicU32::new(0));
+    let ix_cb = Arc::clone(&frame_ix);
+
+    let config: StreamConfig = supported.into();
+    let Ok(stream) = device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _| {
+            let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
+            for frame in data.chunks_mut(channels) {
+                let sample = if ix < total_frames {
+                    let t = ix as f32 / rate;
+                    let (freq, gain) = match chime {
+                        HuddleChime::Join | HuddleChime::PeerJoin => {
+                            let f = if t < 0.11 {
+                                523.25 // C5
+                            } else if t < 0.22 {
+                                659.25 // E5
+                            } else {
+                                783.99 // G5
+                            };
+                            (f, 0.18)
+                        }
+                        HuddleChime::Leave | HuddleChime::PeerLeave => {
+                            let f = if t < 0.13 { 587.33 } else { 440.0 }; // D5 -> A4
+                            (f, 0.16)
+                        }
+                        HuddleChime::InviteRing => {
+                            let pulse = (t < 0.18) || (t > 0.24 && t < 0.42);
+                            let f = if t < 0.18 { 783.99 } else { 987.77 }; // G5 -> B5
+                            (f, if pulse { 0.20 } else { 0.0 })
+                        }
+                    };
+                    let env = (1.0 - (t / duration_secs)).clamp(0.0, 1.0) * gain;
+                    (2.0 * std::f32::consts::PI * freq * t).sin() * env
+                } else {
+                    0.0
+                };
+                for ch in frame.iter_mut() {
+                    *ch = sample;
+                }
+                ix += 1;
+            }
+            ix_cb.store(ix as u32, Ordering::Relaxed);
+        },
+        |_| {},
+        None,
+    ) else {
+        return;
+    };
+    if stream.play().is_ok() {
+        std::thread::sleep(Duration::from_millis((duration_secs * 1000.0) as u64 + 80));
+    }
+    drop(stream);
 }
 
 /// Play a short two-note harmonic chime on `output_device` (or the default speaker) for `F-COLLAB-040`.
@@ -353,10 +455,229 @@ type CaptureSignal = Arc<(Mutex<VecDeque<f32>>, Condvar)>;
 ///
 /// Both `cpal::Stream`s live on the dedicated audio worker OS thread so `AudioEngine` stays `Send`
 /// on macOS CoreAudio (where `cpal::Stream` is `!Send`).
+/// Target playback jitter-buffer pre-fill before releasing audio after startup or underrun
+/// (60 ms = 3 × 20 ms Opus frames). Eliminates 512-sample CoreAudio vs 960-sample Opus beat
+/// underruns and absorbs normal internet UDP jitter cleanly.
+const PLAYBACK_PRIME_SAMPLES: usize = FRAME_20MS * 3;
+/// High-water mark above which excess queued playback audio is trimmed down cleanly (240 ms).
+const PLAYBACK_MAX_SAMPLES: usize = FRAME_20MS * 12;
+/// Target sample depth after an overflow trim (80 ms).
+const PLAYBACK_TRIM_TARGET: usize = FRAME_20MS * 4;
+
+/// Smooth, glitch-free playback ring buffer shared between the dedicated inbound Opus decoder
+/// thread (`push`) and the real-time CoreAudio / `cpal` render callback (`pull_into`).
+pub(crate) struct PlaybackBuffer {
+    samples: VecDeque<f32>,
+    primed: bool,
+    last_sample: f32,
+}
+
+impl PlaybackBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(PLAYBACK_MAX_SAMPLES),
+            primed: false,
+            last_sample: 0.0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, pcm: &[f32]) {
+        if self.samples.len() + pcm.len() > PLAYBACK_MAX_SAMPLES {
+            let keep = PLAYBACK_TRIM_TARGET.min(self.samples.len());
+            let drop_n = self.samples.len().saturating_sub(keep);
+            if drop_n > 0 {
+                let prev_end = self.samples.front().copied().unwrap_or(self.last_sample);
+                self.samples.drain(..drop_n);
+                // Short 32-sample crossfade at the splice boundary avoids an audible pop.
+                let fade = 32.min(self.samples.len());
+                for i in 0..fade {
+                    let t = (i + 1) as f32 / (fade + 1) as f32;
+                    if let Some(s) = self.samples.get_mut(i) {
+                        *s = prev_end * (1.0 - t) + *s * t;
+                    }
+                }
+            }
+        }
+        self.samples.extend(pcm.iter().copied());
+        if !self.primed && self.samples.len() >= PLAYBACK_PRIME_SAMPLES {
+            self.primed = true;
+        }
+    }
+
+    pub(crate) fn pull_into(&mut self, out: &mut [f32]) {
+        if !self.primed {
+            self.fade_to_silence(out);
+            return;
+        }
+        let avail = self.samples.len().min(out.len());
+        for dst in out.iter_mut().take(avail) {
+            let s = self.samples.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
+            *dst = s;
+            self.last_sample = s;
+        }
+        if avail < out.len() {
+            // Genuine network underrun: ramp smoothly to zero and re-prime before resuming so
+            // playback never sputters 1 frame at a time.
+            self.primed = false;
+            self.fade_to_silence(&mut out[avail..]);
+        }
+    }
+
+    fn fade_to_silence(&mut self, out: &mut [f32]) {
+        let mut s = self.last_sample;
+        for dst in out.iter_mut() {
+            s *= 0.85;
+            if s.abs() < 1e-5 {
+                s = 0.0;
+            }
+            *dst = s;
+        }
+        self.last_sample = s;
+    }
+}
+
+/// Signed modular difference `a - b` in 16-bit RTP sequence space (positive means `a` is newer).
+#[inline]
+fn seq_diff(a: u16, b: u16) -> i32 {
+    a.wrapping_sub(b) as i16 as i32
+}
+
+/// Sequence-ordered Opus RTP jitter buffer supporting out-of-order UDP delivery, Opus in-band FEC
+/// recovery for single lost packets, and Opus PLC fallback for multi-packet loss.
+pub(crate) struct AudioJitterBuffer {
+    queue: BTreeMap<i64, Bytes>,
+    /// Extended 64-bit sequence number of the next expected packet.
+    next_seq: Option<i64>,
+    /// Highest extended 64-bit sequence number observed so far (for wraparound unwrapping).
+    base_seq: Option<i64>,
+    missing_since: Option<Instant>,
+    consecutive_plc: u8,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JitterStep {
+    /// Decode this normal Opus packet.
+    Packet(Bytes),
+    /// Missing packet whose immediate successor is already buffered: decode successor with
+    /// Opus in-band FEC (`decode_fec = true`) to recover the lost frame cleanly.
+    FecFromNext(Bytes),
+    /// Missing packet with no immediate successor available: invoke Opus PLC.
+    Plc,
+}
+
+impl AudioJitterBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: BTreeMap::new(),
+            next_seq: None,
+            base_seq: None,
+            missing_since: None,
+            consecutive_plc: 0,
+        }
+    }
+
+    fn unwrap_seq(&mut self, seq16: u16) -> i64 {
+        match self.base_seq {
+            None => {
+                let s = seq16 as i64;
+                self.base_seq = Some(s);
+                s
+            }
+            Some(base) => {
+                let diff = seq_diff(seq16, (base & 0xFFFF) as u16) as i64;
+                let ext = base + diff;
+                if ext > base {
+                    self.base_seq = Some(ext);
+                }
+                ext
+            }
+        }
+    }
+
+    pub(crate) fn push(&mut self, seq16: u16, payload: Bytes, now: Instant) {
+        let ext = self.unwrap_seq(seq16);
+        let next = match self.next_seq {
+            Some(n) => n,
+            None => {
+                self.next_seq = Some(ext);
+                ext
+            }
+        };
+        // Ignore stale packets already played out.
+        if ext < next {
+            return;
+        }
+        // Large jump (e.g. speaker resumed after DTX silence or SSRC switch): resync cleanly.
+        if ext - next > 20 {
+            self.queue.clear();
+            self.next_seq = Some(ext);
+            self.missing_since = None;
+            self.consecutive_plc = 0;
+        }
+        if ext > next && self.missing_since.is_none() {
+            self.missing_since = Some(now);
+        }
+        self.queue.insert(ext, payload);
+        // Cap queue depth to prevent unbounded growth during stalls.
+        while self.queue.len() > 24 {
+            if let Some((&oldest, _)) = self.queue.iter().next() {
+                self.queue.remove(&oldest);
+                if self.next_seq.is_some_and(|n| oldest >= n) {
+                    self.next_seq = Some(oldest + 1);
+                }
+            }
+        }
+    }
+
+    /// Pop the next ready packet/FEC/PLC step if available at `now`.
+    pub(crate) fn pop_ready(&mut self, now: Instant) -> Option<JitterStep> {
+        let next = self.next_seq?;
+        if let Some(pkt) = self.queue.remove(&next) {
+            self.next_seq = Some(next + 1);
+            self.missing_since = if self.queue.is_empty() || self.queue.contains_key(&(next + 1)) {
+                None
+            } else {
+                Some(now)
+            };
+            self.consecutive_plc = 0;
+            return Some(JitterStep::Packet(pkt));
+        }
+
+        // Next expected sequence number is missing — wait up to 35ms (or 2 newer packets) so
+        // slightly reordered UDP packets can arrive before triggering FEC/PLC.
+        let (&first_avail, _) = self.queue.iter().next()?;
+        let wait_elapsed = self
+            .missing_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_millis(35));
+        let enough_newer = self.queue.len() >= 2 && first_avail - next <= 4;
+        if !wait_elapsed && !enough_newer {
+            return None;
+        }
+
+        // If gap is large (> 4 frames), jump directly to the next available packet (likely DTX).
+        if first_avail - next > 4 || self.consecutive_plc >= 4 {
+            self.next_seq = Some(first_avail);
+            self.missing_since = None;
+            self.consecutive_plc = 0;
+            return self.pop_ready(now);
+        }
+
+        self.next_seq = Some(next + 1);
+        self.consecutive_plc = self.consecutive_plc.saturating_add(1);
+        if let Some(next_pkt) = self.queue.get(&(next + 1)).cloned() {
+            Some(JitterStep::FecFromNext(next_pkt))
+        } else {
+            Some(JitterStep::Plc)
+        }
+    }
+}
+
 pub struct AudioEngine {
     shared: AudioSharedState,
     capture_signal: CaptureSignal,
-    worker: Option<std::thread::JoinHandle<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    rx_wake: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    rx_worker: Option<std::thread::JoinHandle<mpsc::UnboundedReceiver<InboundAudioPacket>>>,
 }
 
 enum AudioIoBackend {
@@ -378,10 +699,10 @@ fn open_hw_duplex(
     ns: bool,
     agc: bool,
     capture_signal: &CaptureSignal,
-    playback_ring: &Arc<Mutex<VecDeque<f32>>>,
+    playback_buf: &Arc<Mutex<PlaybackBuffer>>,
 ) -> Option<Box<dyn HwAudioDuplexHandle>> {
     let cap_sig = Arc::clone(capture_signal);
-    let play_ring = Arc::clone(playback_ring);
+    let play_buf = Arc::clone(playback_buf);
     let on_capture = Arc::new(move |samples: &[f32]| {
         let (lock, cvar) = &*cap_sig;
         if let Ok(mut q) = lock.lock() {
@@ -396,14 +717,10 @@ fn open_hw_duplex(
         }
     });
     let on_render = Arc::new(move |out: &mut [f32]| {
-        if let Ok(mut q) = play_ring.lock() {
-            let avail = q.len().min(out.len());
-            for dst in out.iter_mut().take(avail) {
-                *dst = q.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
-            }
-            for dst in out.iter_mut().skip(avail) {
-                *dst = 0.0;
-            }
+        // Real-time CoreAudio callback: use `try_lock` so we never priority-invert on the
+        // decoder thread; lock hold time on `push` is a few hundred nanoseconds.
+        if let Ok(mut pb) = play_buf.try_lock() {
+            pb.pull_into(out);
         } else {
             out.fill(0.0);
         }
@@ -430,15 +747,20 @@ impl AudioEngine {
         cfg: &HuddleAudioConfig,
         shared: AudioSharedState,
         outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
-        mut inbound_opus_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut inbound_opus_rx: mpsc::UnboundedReceiver<InboundAudioPacket>,
     ) -> Result<Self> {
         shared.running.store(true, Ordering::Relaxed);
         let capture_signal: CaptureSignal = Arc::new((
             Mutex::new(VecDeque::with_capacity(FRAME_20MS * 8)),
             Condvar::new(),
         ));
-        let playback_ring: Arc<Mutex<VecDeque<f32>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_20MS * 10)));
+        let playback_buf: Arc<Mutex<PlaybackBuffer>> = Arc::new(Mutex::new(PlaybackBuffer::new()));
+        // Optional render tap used only when software `cpal + sonora` fallback is active
+        // (macOS CoreAudio `VoiceProcessingIO` taps its own render bus in hardware).
+        let aec_render_tap: Arc<Mutex<VecDeque<f32>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_20MS * 6)));
+        let needs_sw_aec_ref = Arc::new(AtomicBool::new(false));
+        let rx_wake = Arc::new(AtomicBool::new(true));
 
         let in_name = cfg.input_device.clone();
         let out_name = cfg.output_device.clone();
@@ -450,6 +772,9 @@ impl AudioEngine {
 
         let worker_shared = shared.clone();
         let worker_capture = Arc::clone(&capture_signal);
+        let worker_playback = Arc::clone(&playback_buf);
+        let worker_aec_tap = Arc::clone(&aec_render_tap);
+        let worker_needs_aec = Arc::clone(&needs_sw_aec_ref);
         let worker = std::thread::Builder::new()
             .name("slackless-huddle-audio".to_owned())
             .spawn(move || {
@@ -460,15 +785,17 @@ impl AudioEngine {
                     !init_muted && init_ns,
                     !init_muted && init_agc,
                     &worker_capture,
-                    &playback_ring,
+                    &worker_playback,
                 ) {
+                    worker_needs_aec.store(false, Ordering::Release);
                     Ok(AudioIoBackend::Hardware(hw))
                 } else {
                     (|| -> Result<AudioIoBackend> {
                         let in_stream =
                             open_input_stream(in_name.as_deref(), Arc::clone(&worker_capture))?;
                         let out_stream =
-                            open_output_stream(out_name.as_deref(), Arc::clone(&playback_ring))?;
+                            open_output_stream(out_name.as_deref(), Arc::clone(&worker_playback))?;
+                        worker_needs_aec.store(true, Ordering::Release);
                         Ok(AudioIoBackend::Cpal {
                             in_stream,
                             out_stream,
@@ -483,9 +810,9 @@ impl AudioEngine {
                         run_audio_dsp_loop(
                             worker_shared,
                             worker_capture,
-                            playback_ring,
+                            worker_playback,
+                            worker_aec_tap,
                             outbound_opus_tx,
-                            &mut inbound_opus_rx,
                             in_name,
                             out_name,
                             io,
@@ -495,7 +822,6 @@ impl AudioEngine {
                         let _ = ready_tx.send(Err(err));
                     }
                 }
-                inbound_opus_rx
             })
             .map_err(|e| HuddleError::Audio(e.to_string()))?;
 
@@ -510,19 +836,45 @@ impl AudioEngine {
             return Err(err);
         }
 
+        // Dedicated inbound Opus jitter-buffer + decoder thread: completely decoupled from the
+        // microphone capture loop so remote speech is decoded within microseconds of UDP arrival!
+        let rx_shared = shared.clone();
+        let rx_playback = Arc::clone(&playback_buf);
+        let rx_aec_tap = Arc::clone(&aec_render_tap);
+        let rx_needs_aec = Arc::clone(&needs_sw_aec_ref);
+        let rx_worker = std::thread::Builder::new()
+            .name("slackless-huddle-audio-rx".to_owned())
+            .spawn(move || {
+                run_inbound_audio_rx_loop(
+                    rx_shared,
+                    &mut inbound_opus_rx,
+                    rx_playback,
+                    rx_aec_tap,
+                    rx_needs_aec,
+                );
+                inbound_opus_rx
+            })
+            .map_err(|e| HuddleError::Audio(e.to_string()))?;
+
         Ok(Self {
             shared,
             capture_signal,
+            rx_wake,
             worker: Some(worker),
+            rx_worker: Some(rx_worker),
         })
     }
 
-    /// Stop streams & DSP thread, returning the inbound Opus receiver so a hot-swapped device
+    /// Stop streams & DSP threads, returning the inbound Opus receiver so a hot-swapped device
     /// restart keeps receiving remote audio seamlessly.
-    pub fn stop(&mut self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+    pub fn stop(&mut self) -> Option<mpsc::UnboundedReceiver<InboundAudioPacket>> {
         self.shared.running.store(false, Ordering::Relaxed);
+        self.rx_wake.store(false, Ordering::Relaxed);
         self.capture_signal.1.notify_all();
-        self.worker.take().and_then(|handle| handle.join().ok())
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+        self.rx_worker.take().and_then(|handle| handle.join().ok())
     }
 }
 
@@ -577,13 +929,72 @@ fn current_default_output_name() -> Option<String> {
         .and_then(|d| d.name().ok())
 }
 
+fn run_inbound_audio_rx_loop(
+    shared: AudioSharedState,
+    inbound_opus_rx: &mut mpsc::UnboundedReceiver<InboundAudioPacket>,
+    playback_buf: Arc<Mutex<PlaybackBuffer>>,
+    aec_render_tap: Arc<Mutex<VecDeque<f32>>>,
+    needs_sw_aec_ref: Arc<AtomicBool>,
+) {
+    let Ok(mut decoder) = Decoder::new(SAMPLE_RATE, Channels::Mono) else {
+        return;
+    };
+    let mut jitter = AudioJitterBuffer::new();
+    let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
+
+    while shared.running.load(Ordering::Relaxed) {
+        let mut received_any = false;
+        while let Ok(pkt) = inbound_opus_rx.try_recv() {
+            jitter.push(pkt.seq, pkt.payload, Instant::now());
+            received_any = true;
+        }
+
+        let now = Instant::now();
+        let mut decoded_any = false;
+        while let Some(step) = jitter.pop_ready(now) {
+            let decoded_res = match step {
+                JitterStep::Packet(pkt) => decoder.decode_float(&pkt, &mut decoded_pcm, false),
+                JitterStep::FecFromNext(next_pkt) => {
+                    decoder.decode_float(&next_pkt, &mut decoded_pcm[..FRAME_20MS], true)
+                }
+                JitterStep::Plc => decode_opus_or_plc(&mut decoder, &[], &mut decoded_pcm),
+            };
+            if let Ok(samples) = decoded_res {
+                let pcm = &decoded_pcm[..samples];
+                if let Ok(mut pb) = playback_buf.lock() {
+                    pb.push(pcm);
+                }
+                if needs_sw_aec_ref.load(Ordering::Relaxed)
+                    && !shared.muted.load(Ordering::Relaxed)
+                    && shared.aec.load(Ordering::Relaxed)
+                {
+                    if let Ok(mut tap) = aec_render_tap.lock() {
+                        if tap.len() > FRAME_20MS * 6 {
+                            let drop_n = tap.len() - FRAME_20MS * 3;
+                            tap.drain(..drop_n);
+                        }
+                        tap.extend(pcm.iter().copied());
+                    }
+                }
+                decoded_any = true;
+            }
+        }
+
+        if !received_any && !decoded_any {
+            // Short 5ms poll sleep when idle: wakes immediately enough for 20ms RTP cadence
+            // while still checking `shared.running` cleanly on shutdown/device-swap.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_audio_dsp_loop(
     shared: AudioSharedState,
     capture_signal: CaptureSignal,
-    playback_ring: Arc<Mutex<VecDeque<f32>>>,
+    playback_buf: Arc<Mutex<PlaybackBuffer>>,
+    aec_render_tap: Arc<Mutex<VecDeque<f32>>>,
     outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
-    inbound_opus_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     configured_in: Option<String>,
     configured_out: Option<String>,
     mut io: AudioIoBackend,
@@ -598,16 +1009,11 @@ fn run_audio_dsp_loop(
     let _ = encoder.set_packet_loss_perc(5);
     let _ = encoder.set_dtx(true);
 
-    let Ok(mut decoder) = Decoder::new(SAMPLE_RATE, Channels::Mono) else {
-        return;
-    };
-
     let mut cur_aec = shared.aec.load(Ordering::Relaxed);
     let mut cur_ns = shared.ns.load(Ordering::Relaxed);
     let mut cur_agc = shared.agc.load(Ordering::Relaxed);
     let mut cur_muted = shared.muted.load(Ordering::Relaxed);
 
-    let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
     let mut opus_out = vec![0u8; 4000];
     // Chunked arena for outbound Opus packets: amortizes heap allocation to ~1 alloc/sec instead
     // of 50 Vec<u8> allocs/sec, and `cached_silence_opus.clone()` is a zero-alloc refcount bump.
@@ -619,6 +1025,7 @@ fn run_audio_dsp_loop(
         .unwrap_or_else(|_| Bytes::from_static(&[0xF8, 0xFF, 0xFE]));
     let mut mic_frame = Vec::with_capacity(FRAME_20MS);
     let mut processed_capture = Vec::with_capacity(FRAME_20MS);
+    let mut aec_ref_chunk = [0.0f32; FRAME_10MS];
 
     // Event-driven OS audio device hot-plug monitor (CoreAudio listener on macOS; falls back to
     // 1.5s polling only on platforms without a native listener).
@@ -675,7 +1082,7 @@ fn run_audio_dsp_loop(
                             !cur_muted && cur_ns,
                             !cur_muted && cur_agc,
                             &capture_signal,
-                            &playback_ring,
+                            &playback_buf,
                         ) {
                             io = AudioIoBackend::Hardware(next_hw);
                         }
@@ -701,7 +1108,7 @@ fn run_audio_dsp_loop(
                         let now_out = current_default_output_name();
                         if now_out.is_some() && now_out != last_default_out {
                             if let Ok(next_stream) =
-                                open_output_stream(None, Arc::clone(&playback_ring))
+                                open_output_stream(None, Arc::clone(&playback_buf))
                             {
                                 *out_stream = next_stream;
                                 last_default_out = now_out;
@@ -734,30 +1141,23 @@ fn run_audio_dsp_loop(
             }
         }
 
-        // 1. Drain inbound Opus packets (or empty PLC sentinels) -> decode -> AEC ref -> playback.
-        let muted = shared.muted.load(Ordering::Relaxed);
-        while let Ok(pkt) = inbound_opus_rx.try_recv() {
-            if let Ok(samples) = decode_opus_or_plc(&mut decoder, &pkt, &mut decoded_pcm) {
-                let pcm = &decoded_pcm[..samples];
-                // Hardware VoiceProcessingIO automatically taps its own render bus for AEC;
-                // only feed Sonora's render reference when running software DSP while unmuted.
-                if let AudioIoBackend::Cpal { apm, .. } = &mut io {
-                    if !muted && cur_aec {
-                        for chunk in pcm.chunks(FRAME_10MS) {
-                            if chunk.len() == FRAME_10MS {
-                                let mut out_ref = [0.0f32; FRAME_10MS];
-                                let _ = apm.process_render_f32(&[chunk], &mut [&mut out_ref[..]]);
-                            }
+        // 1. Feed Sonora's AEC render reference only when running the software `cpal` fallback.
+        // (Hardware `VoiceProcessingIO` taps its own render bus internally, and inbound Opus
+        // decoding runs on the dedicated `slackless-huddle-audio-rx` thread without mic-loop lag.)
+        if let AudioIoBackend::Cpal { apm, .. } = &mut io {
+            if !cur_muted && cur_aec {
+                if let Ok(mut tap) = aec_render_tap.lock() {
+                    while tap.len() >= FRAME_10MS {
+                        for dst in &mut aec_ref_chunk {
+                            *dst = tap.pop_front().unwrap_or(0.0);
                         }
+                        let mut out_ref = [0.0f32; FRAME_10MS];
+                        let _ =
+                            apm.process_render_f32(&[&aec_ref_chunk[..]], &mut [&mut out_ref[..]]);
                     }
                 }
-                if let Ok(mut ring) = playback_ring.lock() {
-                    if ring.len() > FRAME_20MS * 8 {
-                        let drop_n = ring.len() - FRAME_20MS * 4;
-                        ring.drain(..drop_n);
-                    }
-                    ring.extend(pcm.iter().copied());
-                }
+            } else if let Ok(mut tap) = aec_render_tap.lock() {
+                tap.clear();
             }
         }
 
@@ -942,7 +1342,10 @@ fn open_input_stream(name: Option<&str>, signal: CaptureSignal) -> Result<Stream
     Ok(stream)
 }
 
-fn open_output_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Result<Stream> {
+fn open_output_stream(
+    name: Option<&str>,
+    playback_buf: Arc<Mutex<PlaybackBuffer>>,
+) -> Result<Stream> {
     let device = select_output_device(name)?;
     let supported = device
         .default_output_config()
@@ -961,13 +1364,11 @@ fn open_output_stream(name: Option<&str>, ring: Arc<Mutex<VecDeque<f32>>>) -> Re
                 let out_frames = data.len() / channels.max(1);
                 let needed_48k = ((out_frames as u64 * SAMPLE_RATE as u64)
                     .div_ceil(dst_rate.max(1) as u64)) as usize;
-                src_scratch.clear();
-                if let Ok(mut q) = ring.lock() {
-                    let avail = q.len().min(needed_48k);
-                    src_scratch.extend(q.drain(..avail));
-                }
-                if src_scratch.len() < needed_48k {
-                    src_scratch.resize(needed_48k, 0.0);
+                src_scratch.resize(needed_48k, 0.0);
+                if let Ok(mut pb) = playback_buf.try_lock() {
+                    pb.pull_into(&mut src_scratch[..needed_48k]);
+                } else {
+                    src_scratch[..needed_48k].fill(0.0);
                 }
                 let samples: &[f32] = if dst_rate == SAMPLE_RATE {
                     &src_scratch
@@ -1059,20 +1460,56 @@ fn compute_rms_interleaved(samples: &[f32], channels: usize) -> f32 {
     compute_rms_mono(&mono)
 }
 
-/// Pure-Rust gentle ambient lo-fi chord player for huddle jukebox / "music when alone"
-/// (`F-COLLAB-036`, `F-COLLAB-058`). Runs on its own OS thread so `cpal::Stream` stays off UI.
+/// Official Slack huddle lounge / idle music player (`F-COLLAB-036`, `F-COLLAB-058`).
+///
+/// Plays Official Slack's cached lounge tracks (`waiting_muzak` Smooth Jazz by default, plus
+/// `waiting`, `subway`, `whistle`, `focus`, `lofi`, `disco`, `zen`, `nature`, `piano`) via native
+/// macOS `afplay` with gentle background volume and instant teardown on `stop()`/`Drop`. Falls
+/// back to a soft synthesized lo-fi chord progression only when offline or on non-macOS hosts.
 pub struct AmbientMusicPlayer {
     running: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AmbientMusicPlayer {
-    pub fn start(output_device: Option<String>) -> Result<Self> {
+    pub fn start(output_device: Option<String>, song_key: Option<&str>) -> Result<Self> {
         let running = Arc::new(AtomicBool::new(true));
         let run_flag = Arc::clone(&running);
+        let filename = slack_lounge_music_filename(song_key).to_owned();
         let worker = std::thread::Builder::new()
             .name("slackless-huddle-music".to_owned())
             .spawn(move || {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(path) = ensure_cached_slack_audio(&filename) {
+                        while run_flag.load(Ordering::Relaxed) {
+                            let Ok(mut child) = std::process::Command::new("/usr/bin/afplay")
+                                .args(["-v", "0.32"])
+                                .arg(&path)
+                                .spawn()
+                            else {
+                                break;
+                            };
+                            while run_flag.load(Ordering::Relaxed) {
+                                match child.try_wait() {
+                                    Ok(Some(_)) => break,
+                                    Ok(None) => std::thread::sleep(Duration::from_millis(80)),
+                                    Err(_) => break,
+                                }
+                            }
+                            if !run_flag.load(Ordering::Relaxed) {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return;
+                            }
+                        }
+                        if !run_flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                }
+                let _ = &filename;
+                // Offline / non-macOS fallback: warm lo-fi 4-chord progression.
                 let Ok(device) = select_output_device(output_device.as_deref()) else {
                     return;
                 };
@@ -1082,7 +1519,6 @@ impl AmbientMusicPlayer {
                 let rate = supported.sample_rate().0 as f32;
                 let channels = supported.channels() as usize;
                 let config: StreamConfig = supported.into();
-                // Warm lo-fi 4-chord progression (Cmaj7 -> Am7 -> Fmaj7 -> G6)
                 const CHORDS: [[f32; 4]; 4] = [
                     [261.63, 329.63, 392.00, 493.88],
                     [220.00, 261.63, 329.63, 392.00],
@@ -1211,5 +1647,116 @@ mod tests {
         let out = resample_linear(&input, 44_100, 48_000);
         assert_eq!(out.len(), 480);
         assert!((out[240] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn playback_buffer_prebuffers_and_fades_smoothly_on_underrun() {
+        let mut pb = PlaybackBuffer::new();
+        let mut out = vec![1.0f32; 512];
+
+        // Below 60ms prime threshold: outputs silence so 512-sample CoreAudio pulls never sputter.
+        pb.push(&vec![0.4f32; FRAME_20MS]);
+        pb.pull_into(&mut out);
+        assert!(out.iter().all(|&s| s == 0.0));
+
+        // Pushing 2 more 20ms frames reaches 60ms -> primed and plays cleanly!
+        pb.push(&vec![0.4f32; FRAME_20MS]);
+        pb.push(&vec![0.4f32; FRAME_20MS]);
+        pb.pull_into(&mut out);
+        assert!(out.iter().all(|&s| (s - 0.4).abs() < 1e-5));
+
+        // Draining past available samples fades smoothly toward zero (no hard step click) and unprimes.
+        let mut big = vec![0.0f32; FRAME_20MS * 4];
+        pb.pull_into(&mut big);
+        let tail_start = PLAYBACK_PRIME_SAMPLES - 512;
+        assert!(big[tail_start] > 0.2 && big[tail_start] < 0.4);
+        assert!(big[tail_start + 64].abs() < 1e-4);
+        assert!(!pb.primed);
+    }
+
+    #[test]
+    fn jitter_buffer_reorders_out_of_order_packets_and_recovers_loss_with_fec() {
+        let mut jb = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+
+        // Out-of-order UDP delivery: 100, 102, 101 arrives 5ms later -> played strictly 100, 101, 102.
+        jb.push(100, Bytes::from_static(b"p100"), t0);
+        assert_eq!(
+            jb.pop_ready(t0),
+            Some(JitterStep::Packet(Bytes::from_static(b"p100")))
+        );
+
+        jb.push(
+            102,
+            Bytes::from_static(b"p102"),
+            t0 + Duration::from_millis(20),
+        );
+        // Only 1 newer packet and <35ms waited -> holds briefly for reordered 101.
+        assert_eq!(jb.pop_ready(t0 + Duration::from_millis(25)), None);
+
+        jb.push(
+            101,
+            Bytes::from_static(b"p101"),
+            t0 + Duration::from_millis(26),
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(26)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p101")))
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(26)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p102")))
+        );
+
+        // Genuine single-packet loss: 103 never arrives, 104 arrives -> after 35ms triggers Opus FEC from 104!
+        jb.push(
+            104,
+            Bytes::from_static(b"p104"),
+            t0 + Duration::from_millis(80),
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(120)),
+            Some(JitterStep::FecFromNext(Bytes::from_static(b"p104")))
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(120)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p104")))
+        );
+    }
+
+    #[test]
+    fn official_slack_huddle_sounds_and_lounge_music_resolve_to_slack_cdn() {
+        assert_eq!(
+            HuddleChime::Join.slack_cdn_url(),
+            "https://a.slack-edge.com/bv1-13/you_joined_call_v2-7029418.mp3"
+        );
+        assert_eq!(
+            HuddleChime::Leave.slack_cdn_url(),
+            "https://a.slack-edge.com/bv1-13/you_left_call_v2-1bc1290.mp3"
+        );
+        assert_eq!(
+            HuddleChime::PeerJoin.slack_cdn_url(),
+            "https://a.slack-edge.com/bv1-13/they_joined_call_v2-570b169.mp3"
+        );
+        assert_eq!(
+            HuddleChime::PeerLeave.slack_cdn_url(),
+            "https://a.slack-edge.com/bv1-13/they_left_call_v2-95d3260.mp3"
+        );
+        assert_eq!(
+            HuddleChime::InviteRing.slack_cdn_url(),
+            "https://a.slack-edge.com/bv1-13/outgoing_ring_v2-6b3697e.mp3"
+        );
+        assert_eq!(
+            slack_lounge_music_filename(None),
+            "waiting_muzak-9187b04.mp3"
+        );
+        assert_eq!(
+            slack_lounge_music_filename(Some("jazz")),
+            "waiting_muzak-9187b04.mp3"
+        );
+        assert_eq!(
+            slack_lounge_music_filename(Some("lofi")),
+            "huddles_focus_lofihaus_music_mixdown_stereo-07cf114.mp3"
+        );
     }
 }

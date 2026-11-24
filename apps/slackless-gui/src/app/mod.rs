@@ -593,6 +593,8 @@ pub struct App {
     /// Floating incoming DM huddle ring banner (`huddle_invite`).
     huddle_invite: Option<Entity<HuddleInviteBanner>>,
     _huddle_invite_sub: Option<Subscription>,
+    /// Official Slack 60-second solo-huddle idle music timer (`huddles_play_music_timeout` = 60s).
+    huddle_alone_music_task: Option<gpui::Task<()>>,
     /// The Preferences window body, mounted in a dialog on demand; owns the settings.
     preferences: Entity<Preferences>,
     /// Standalone native Preferences OS window handle (`F-CORE-011`) so Cmd+, focuses it if open.
@@ -2120,6 +2122,7 @@ impl App {
                 _huddle_dock_sub: None,
                 huddle_invite: None,
                 _huddle_invite_sub: None,
+                huddle_alone_music_task: None,
                 preferences,
                 prefs_window: None,
                 applied_theme,

@@ -1078,6 +1078,12 @@ impl App {
                 background_id,
                 thread_root_ts,
             } => {
+                let prev_participants = self
+                    .ws
+                    .active_huddles
+                    .get(channel)
+                    .cloned()
+                    .unwrap_or_default();
                 if *ended {
                     self.ws.active_huddles.remove(channel);
                 } else {
@@ -1088,13 +1094,46 @@ impl App {
                 let huddles = self.ws.active_huddles.clone();
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
-                if let Some(dock) = &self.huddle_dock {
+                if let Some(dock) = self.huddle_dock.clone() {
                     if dock.read(cx).session().channel == *channel {
+                        let self_uid = &self.fixtures.self_user;
+                        let new_peers = if *ended {
+                            &[][..]
+                        } else {
+                            participants.as_slice()
+                        };
+                        let remote_joined = new_peers
+                            .iter()
+                            .any(|u| u != self_uid && !prev_participants.contains(u));
+                        let remote_left = prev_participants
+                            .iter()
+                            .any(|u| u != self_uid && !new_peers.contains(u));
+                        if remote_joined {
+                            self.play_huddle_chime(
+                                slackless_core::huddle::HuddleChime::PeerJoin,
+                                cx,
+                            );
+                        } else if remote_left {
+                            self.play_huddle_chime(
+                                slackless_core::huddle::HuddleChime::PeerLeave,
+                                cx,
+                            );
+                        }
+
                         let alone_music =
                             self.preferences.read(cx).settings().huddle_music_when_alone;
                         let playing_jukebox = dock.read(cx).session().jukebox_song.is_some();
-                        if !*ended && participants.len() > 1 && alone_music && playing_jukebox {
-                            self.bridge.send(Command::SetHuddleJukebox(None));
+                        if !*ended && participants.len() > 1 {
+                            self.huddle_alone_music_task = None;
+                            if alone_music && playing_jukebox {
+                                self.bridge.send(Command::SetHuddleJukebox(None));
+                            }
+                        } else if !*ended
+                            && participants.len() <= 1
+                            && dock.read(cx).session().phase
+                                == slackless_core::huddle::HuddlePhase::Connected
+                        {
+                            self.arm_huddle_alone_music(channel.clone(), cx);
                         }
                         dock.update(cx, |d, cx| {
                             d.set_participants(
@@ -1134,7 +1173,7 @@ impl App {
                         == slackless_core::huddle::HuddlePhase::Connected
                         && prev_phase != Some(slackless_core::huddle::HuddlePhase::Connected);
                     self.huddle_session = Some(snap.clone());
-                    if let Some(dock) = &self.huddle_dock {
+                    if let Some(dock) = self.huddle_dock.clone() {
                         dock.update(cx, |d, cx| d.update_session(snap.clone(), cx));
                     } else {
                         self.mount_huddle_dock(snap.clone(), window, cx);
@@ -1163,15 +1202,14 @@ impl App {
                             && snap.jukebox_song.is_none()
                             && !self.fixtures.sample
                         {
-                            self.bridge
-                                .send(Command::SetHuddleJukebox(Some("lofi".to_owned())));
+                            self.arm_huddle_alone_music(snap.channel.clone(), cx);
                         }
                     }
                 }
                 cx.notify();
             }
             Event::HuddleAudioLevels(levels) => {
-                if let Some(dock) = &self.huddle_dock {
+                if let Some(dock) = self.huddle_dock.clone() {
                     dock.update(cx, |d, cx| d.update_levels(levels.clone(), cx));
                 }
                 if let Some((_, bar)) = &self.huddle {
@@ -1179,17 +1217,17 @@ impl App {
                 }
             }
             Event::HuddleVideoFrame { tile, frame } => {
-                if let Some(dock) = &self.huddle_dock {
+                if let Some(dock) = self.huddle_dock.clone() {
                     dock.update(cx, |d, cx| d.update_video_frame(tile.clone(), frame, cx));
                 }
             }
             Event::HuddleVideoTileClosed(tile) => {
-                if let Some(dock) = &self.huddle_dock {
+                if let Some(dock) = self.huddle_dock.clone() {
                     dock.update(cx, |d, cx| d.close_video_tile(tile, cx));
                 }
             }
             Event::HuddleDataEvent(ev) => {
-                if let Some(dock) = &self.huddle_dock {
+                if let Some(dock) = self.huddle_dock.clone() {
                     let show_reactions = self
                         .preferences
                         .read(cx)

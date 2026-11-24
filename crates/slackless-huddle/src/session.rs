@@ -741,6 +741,16 @@ async fn run_connected_loop(
                                             let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                                         }
                                         HuddleDataEvent::Jukebox { song_key, .. } => {
+                                            if let Some(mut prev) = music_player.take() {
+                                                prev.stop();
+                                            }
+                                            if song_key.is_some() {
+                                                music_player = AmbientMusicPlayer::start(
+                                                    config.output_device.clone(),
+                                                    song_key.as_deref(),
+                                                )
+                                                .ok();
+                                            }
                                             snap.jukebox_song = song_key.clone();
                                             let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                                         }
@@ -751,6 +761,7 @@ async fn run_connected_loop(
                             }
                         }
                         if let Some(info) = frame.audio_stream_id_info {
+                            let mut new_peer_joined = false;
                             for stream in info.streams {
                                 let Some(sid) = stream.audio_stream_id else {
                                     continue;
@@ -770,12 +781,43 @@ async fn run_connected_loop(
                                         let base = att.strip_suffix("#content").unwrap_or(att);
                                         attendee_to_user.insert(base.to_owned(), uid.clone());
                                     }
-                                    stream_users.insert(sid, uid.clone());
+                                    if stream_users.insert(sid, uid.clone()).is_none()
+                                        && uid != self_user
+                                    {
+                                        new_peer_joined = true;
+                                    }
                                     if stream.muted == Some(true) {
                                         muted_peers.insert(uid);
                                     } else {
                                         muted_peers.remove(&uid);
                                     }
+                                }
+                            }
+                            // Re-announce desktop draw capabilities + content source details when
+                            // a new peer joins while we are already sharing so late joiners can
+                            // immediately draw on our screen share.
+                            if new_peer_joined && snap.sharing {
+                                if let Some(src_id) = snap.share_source_id.as_deref() {
+                                    let cap_bytes =
+                                        build_capabilities_message(&creds.attendee_id, true);
+                                    let _ = signal
+                                        .send_frame(&build_data_message_frame(
+                                            SLACK_DATA_CHANNEL_TOPIC,
+                                            cap_bytes,
+                                            300_000,
+                                        ))
+                                        .await;
+                                    let det_bytes = build_content_share_details_message(
+                                        &creds.attendee_id,
+                                        content_share_source_type(src_id),
+                                    );
+                                    let _ = signal
+                                        .send_frame(&build_data_message_frame(
+                                            SLACK_DATA_CHANNEL_TOPIC,
+                                            det_bytes,
+                                            300_000,
+                                        ))
+                                        .await;
                                 }
                             }
                         }
@@ -1031,30 +1073,27 @@ async fn run_connected_loop(
                                     if let Some(cap) = &camera_capture {
                                         cap.set_compact(true);
                                     }
-                                    // Announce draw capability + content source details on official `"data-channel"`.
+                                    // Announce desktop draw capability + content source details on
+                                    // official `"data-channel"` (`desktop:screen` / `desktop:window`
+                                    // is required by Official Slack to enable remote drawing!).
                                     let cap_bytes =
                                         build_capabilities_message(&creds.attendee_id, true);
                                     let _ = signal
                                         .send_frame(&build_data_message_frame(
                                             SLACK_DATA_CHANNEL_TOPIC,
                                             cap_bytes,
-                                            30_000,
+                                            300_000,
                                         ))
                                         .await;
-                                    let src_kind = if src_id.starts_with("monitor:") {
-                                        "screen"
-                                    } else {
-                                        "window"
-                                    };
                                     let det_bytes = build_content_share_details_message(
                                         &creds.attendee_id,
-                                        src_kind,
+                                        content_share_source_type(&src_id),
                                     );
                                     let _ = signal
                                         .send_frame(&build_data_message_frame(
                                             SLACK_DATA_CHANNEL_TOPIC,
                                             det_bytes,
-                                            30_000,
+                                            300_000,
                                         ))
                                         .await;
                                 }
@@ -1075,6 +1114,14 @@ async fn run_connected_loop(
                             if let Some(cap) = &camera_capture {
                                 cap.set_compact(false);
                             }
+                            let cap_bytes = build_capabilities_message(&creds.attendee_id, false);
+                            let _ = signal
+                                .send_frame(&build_data_message_frame(
+                                    SLACK_DATA_CHANNEL_TOPIC,
+                                    cap_bytes,
+                                    30_000,
+                                ))
+                                .await;
                             let _ = updates.send(HuddleUpdate::VideoTileClosed(VideoTileKey::LocalScreen));
                         }
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
@@ -1154,8 +1201,11 @@ async fn run_connected_loop(
                             prev.stop();
                         }
                         if song_key.is_some() {
-                            music_player =
-                                AmbientMusicPlayer::start(config.output_device.clone()).ok();
+                            music_player = AmbientMusicPlayer::start(
+                                config.output_device.clone(),
+                                song_key.as_deref(),
+                            )
+                            .ok();
                         }
                         snap.jukebox_song = song_key.clone();
                         let bytes = build_jukebox_message(&creds.attendee_id, song_key.as_deref());
@@ -1466,8 +1516,7 @@ async fn apply_index_frame(
     }
 
     let cur_raw: Vec<&RemoteVideoSource> = remote_sources.iter().map(|(_, s)| s).collect();
-    let same_sources =
-        cur_raw.len() == next_raw.len() && cur_raw.iter().zip(&next_raw).all(|(a, b)| *a == b);
+    let same_sources = same_remote_video_sources(&cur_raw, &next_raw);
 
     if !same_sources {
         tracing::info!(
@@ -1592,4 +1641,61 @@ fn parse_incoming_data_message(
     }
 
     Vec::new()
+}
+
+/// Official Slack `ContentShareDetails.source_type` string expected by Slack desktop/web clients
+/// to unlock remote drawing (`["desktop:screen", "desktop:window"]`).
+fn content_share_source_type(source_id: &str) -> &'static str {
+    if source_id.starts_with("monitor:") {
+        "desktop:screen"
+    } else {
+        "desktop:window"
+    }
+}
+
+/// Compare two remote video source lists by stream identity, ignoring transient
+/// `max_bitrate_kbps` updates from Chime's `INDEX` frames so bitrate fluctuations never trigger
+/// disruptive WebRTC SDP renegotiations.
+fn same_remote_video_sources(cur: &[&RemoteVideoSource], next: &[RemoteVideoSource]) -> bool {
+    cur.len() == next.len()
+        && cur.iter().zip(next).all(|(a, b)| {
+            a.stream_id == b.stream_id
+                && a.group_id == b.group_id
+                && a.attendee_id == b.attendee_id
+                && a.user_id == b.user_id
+                && a.is_content == b.is_content
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_share_source_type_matches_official_slack_desktop_values() {
+        assert_eq!(content_share_source_type("monitor:2"), "desktop:screen");
+        assert_eq!(content_share_source_type("window:12345"), "desktop:window");
+    }
+
+    #[test]
+    fn same_remote_video_sources_ignores_bitrate_fluctuations() {
+        let a = RemoteVideoSource {
+            stream_id: 21,
+            group_id: 2,
+            attendee_id: "att-1".to_owned(),
+            user_id: UserId::from("U1"),
+            is_content: false,
+            max_bitrate_kbps: 1400,
+        };
+        let b_same_diff_bps = RemoteVideoSource {
+            max_bitrate_kbps: 888,
+            ..a.clone()
+        };
+        let b_diff_stream = RemoteVideoSource {
+            stream_id: 22,
+            ..a.clone()
+        };
+        assert!(same_remote_video_sources(&[&a], &[b_same_diff_bps]));
+        assert!(!same_remote_video_sources(&[&a], &[b_diff_stream]));
+    }
 }

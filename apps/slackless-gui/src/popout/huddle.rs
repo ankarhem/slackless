@@ -252,6 +252,7 @@ impl PopoutWindow {
         self.huddle_reactions_open = false;
         self.huddle_theme_open = false;
         self.huddle_more_open = false;
+        self.huddle_music_open = false;
     }
 
     fn close_share_modal(&mut self, cx: &mut Context<Self>) {
@@ -417,7 +418,16 @@ impl PopoutWindow {
             .bg(pal.stage_bg)
             .px_5()
             .py_4()
-            .gap_3();
+            .gap_3()
+            .when(self.huddle_music_open, |el| {
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.huddle_music_open = false;
+                        cx.notify();
+                    }),
+                )
+            });
 
         // Top-left compact floating status + topic pill (matches official Slack's top-left chip).
         stage = stage.child(
@@ -444,6 +454,12 @@ impl PopoutWindow {
                 )
                 .child(self.render_huddle_topic_bar(snap.topic.as_deref(), &pal, cx)),
         );
+
+        // Top-right floating Lounge Music player pill + song-selector dropdown (matches Official
+        // Slack's solo/lounge music banner that lets you switch between all 10 Slack tracks or stop).
+        if let Some(active_song_key) = snap.jukebox_song.clone() {
+            stage = stage.child(self.render_huddle_music_pill(&active_song_key, &pal, cx));
+        }
 
         if snap.audio_only {
             let send_resume = self.send.clone();
@@ -641,6 +657,7 @@ impl PopoutWindow {
                             || this.huddle_reactions_open
                             || this.huddle_theme_open
                             || this.huddle_more_open
+                            || this.huddle_music_open
                             || this.huddle_invite_open
                             || this.huddle_devices_open
                             || this.huddle_drawer.take().is_some())
@@ -1778,6 +1795,173 @@ impl PopoutWindow {
                             }),
                     ),
             )
+    }
+
+    fn render_huddle_music_pill(
+        &self,
+        active_key: &str,
+        pal: &HuddlePalette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::AnyElement {
+        use gpui_kit::component::Icon;
+
+        const SONGS: [(&str, &str); 10] = [
+            ("jazz", "Smooth Jazz"),
+            ("waiting", "Waiting Room"),
+            ("subway", "Subway Music"),
+            ("whistle", "Whistle Tune"),
+            ("focus", "Focus Beats"),
+            ("lofi", "Lo-fi Haus"),
+            ("disco", "Happy Bass"),
+            ("zen", "Sound Bath"),
+            ("nature", "Nature Meditation"),
+            ("piano", "Piano Concerto"),
+        ];
+
+        let active_label = SONGS
+            .iter()
+            .find(|(k, _)| *k == active_key)
+            .map_or("Smooth Jazz", |(_, name)| *name);
+
+        let send_stop = self.send.clone();
+        let pill_bg = pal.tile_pill_bg;
+        let pill_fg = pal.tile_pill_fg;
+        let border = pal.drawer_border;
+        let hover_bg = pal.drawer_hover;
+        let muted = pal.drawer_muted;
+        let primary = pal.primary;
+        let pop_bg = pal.popover_bg;
+        let pop_fg = pal.popover_fg;
+        let pop_border = pal.popover_border;
+        let pop_hover = pal.popover_hover;
+
+        let mut wrapper = v_flex()
+            .absolute()
+            .right(px(14.))
+            .top(px(12.))
+            .items_end()
+            .gap_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+
+        wrapper = wrapper.child(
+            h_flex()
+                .px_2p5()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .rounded_lg()
+                .bg(pill_bg)
+                .border_1()
+                .border_color(border)
+                .shadow_sm()
+                .child(
+                    h_flex()
+                        .id("popout-huddle-music-picker-btn")
+                        .cursor_pointer()
+                        .items_center()
+                        .gap_1p5()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_md()
+                        .hover(move |el| el.bg(hover_bg))
+                        .child(Icon::new(IconName::Music).size(px(13.)).text_color(primary))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(pill_fg)
+                                .child(active_label),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronDown)
+                                .size(px(12.))
+                                .text_color(muted),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = !this.huddle_music_open;
+                            this.close_huddle_popovers();
+                            this.huddle_music_open = next;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("popout-huddle-music-stop-btn")
+                        .cursor_pointer()
+                        .size(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .hover(move |el| el.bg(hover_bg))
+                        .child(Icon::new(IconName::X).size(px(12.)).text_color(muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.huddle_music_open = false;
+                            (send_stop)(Command::SetHuddleJukebox(None));
+                            if this.fixtures.sample {
+                                if let Some(dock) = this.huddle_dock_entity() {
+                                    dock.update(cx, |d, cx| d.set_jukebox_local(None, cx));
+                                }
+                            }
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        if self.huddle_music_open {
+            let mut menu = v_flex()
+                .w(px(200.))
+                .p_1p5()
+                .gap_0p5()
+                .rounded_xl()
+                .bg(pop_bg)
+                .border_1()
+                .border_color(pop_border)
+                .shadow_xl();
+
+            for (key, name) in SONGS {
+                let is_active = key == active_key;
+                let send_pick = self.send.clone();
+                let key_owned = key.to_owned();
+                menu = menu.child(
+                    h_flex()
+                        .id(SharedString::from(format!("popout-huddle-song-{key}")))
+                        .cursor_pointer()
+                        .px_2p5()
+                        .py_1p5()
+                        .rounded_md()
+                        .items_center()
+                        .justify_between()
+                        .text_xs()
+                        .text_color(if is_active { primary } else { pop_fg })
+                        .font_weight(if is_active {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .hover(move |el| el.bg(pop_hover))
+                        .child(name)
+                        .when(is_active, |el| {
+                            el.child(Icon::new(IconName::Check).size(px(12.)).text_color(primary))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.huddle_music_open = false;
+                            (send_pick)(Command::SetHuddleJukebox(Some(key_owned.clone())));
+                            if this.fixtures.sample {
+                                if let Some(dock) = this.huddle_dock_entity() {
+                                    dock.update(cx, |d, cx| {
+                                        d.set_jukebox_local(Some(key_owned.clone()), cx)
+                                    });
+                                }
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            wrapper = wrapper.child(menu);
+        }
+
+        wrapper.into_any_element()
     }
 
     fn render_huddle_topic_bar(
@@ -3096,12 +3280,12 @@ impl PopoutWindow {
                     if music_on {
                         "Stop background music".to_owned()
                     } else {
-                        "Play lo-fi background music".to_owned()
+                        "Play Smooth Jazz".to_owned()
                     },
                     music_on,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let next_song = (!music_on).then(|| "lofi".to_owned());
+                    let next_song = (!music_on).then(|| "jazz".to_owned());
                     (send_music)(Command::SetHuddleJukebox(next_song.clone()));
                     if this.fixtures.sample {
                         if let Some(dock) = this.huddle_dock_entity() {

@@ -288,6 +288,8 @@ impl ParagraphBuilder {
     /// Like Slack, a URL posted bare shows as itself, scheme and all, while a link labelled
     /// with its own address minus the scheme (`github.com/…`) gets the tinted chip look.
     /// `run` is the label's styling (Slack bolds `<url|*Error*>` and links inside `*…*`).
+    /// Expands `:shortcode:` unicode emojis inside link labels (`<url|:bar_chart: Panel>`) so
+    /// Slack alert/bot links render crisp glyphs instead of raw `:shortcode:` text.
     fn push_link(&mut self, url: String, label: String, run: RunFlags, theme: &RunTheme) {
         let address = |s: &str| {
             s.split_once("://")
@@ -299,13 +301,18 @@ impl ParagraphBuilder {
             self.push_chip(url.into(), label, IconName::Link, 12.);
             return;
         }
+        let expanded = if theme.emoji_text_mode {
+            label
+        } else {
+            expand_shortcodes_in_text(&label)
+        };
         let target = LinkTarget::Url(url.into());
         let start = self.text.len();
         let mut link_run = run;
         if theme.underline_links {
             link_run.underline = true;
         }
-        self.push_text(&label, theme, link_run, Some(theme.link), None);
+        self.push_text(&expanded, theme, link_run, Some(theme.link), None);
         self.links.push((start..self.text.len(), target));
     }
 
@@ -2775,6 +2782,49 @@ pub(super) fn styled_label(mut label: &str, mut run: RunFlags) -> (&str, RunFlag
         label = &label[1..label.len() - 1];
     }
     (label, run)
+}
+
+/// Expand standard unicode `:shortcode:` tokens inside a link label (`<url|:bar_chart: Panel>`).
+fn expand_shortcodes_in_text(text: &str) -> String {
+    if !text.contains(':') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with(':') {
+            if let Some((len, code)) = emoji::parse_shortcode(rest) {
+                if let Some(glyph) = emoji::display_glyph(&code) {
+                    out.push_str(&glyph);
+                    rest = &rest[len..];
+                    continue;
+                }
+            }
+        }
+        let next_colon = rest[1..].find(':').map(|i| i + 1).unwrap_or(rest.len());
+        out.push_str(&rest[..next_colon]);
+        rest = &rest[next_colon..];
+    }
+    out
+}
+
+#[cfg(test)]
+mod link_emoji_tests {
+    use super::expand_shortcodes_in_text;
+
+    #[test]
+    fn expands_standard_emoji_shortcodes_inside_link_labels() {
+        assert_eq!(
+            expand_shortcodes_in_text(":chart_with_upwards_trend: Dashboard"),
+            "📈 Dashboard"
+        );
+        assert_eq!(expand_shortcodes_in_text(":bar_chart: Panel"), "📊 Panel");
+        assert_eq!(expand_shortcodes_in_text(":mute: Silence"), "🔇 Silence");
+        assert_eq!(
+            expand_shortcodes_in_text("https://example.com:8080/path"),
+            "https://example.com:8080/path"
+        );
+    }
 }
 
 /// A `:shortcode:` at the start of `rest`: a glyph run, or a custom emoji image.

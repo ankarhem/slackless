@@ -216,6 +216,13 @@ pub enum VideoSenderFeedback {
     TargetBitrateBps(u32),
 }
 
+/// One inbound RTP Opus audio packet read from Chime's mixed remote audio track.
+#[derive(Debug, Clone)]
+pub struct InboundAudioPacket {
+    pub seq: u16,
+    pub payload: Bytes,
+}
+
 /// One inbound RTP video packet read from a remote Chime video/content track.
 #[derive(Debug, Clone)]
 pub struct InboundVideoPacket {
@@ -247,7 +254,7 @@ impl ChimeRtcPeer {
     /// Create the PeerConnection with relay-only UDP TURN credentials from `JOIN_ACK`.
     pub async fn new(
         turn: &SdkTurnCredentials,
-        inbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
+        inbound_opus_tx: mpsc::UnboundedSender<InboundAudioPacket>,
         inbound_video_tx: mpsc::UnboundedSender<InboundVideoPacket>,
         state_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
     ) -> Result<Self> {
@@ -336,28 +343,22 @@ impl ChimeRtcPeer {
             Box::pin(async move {
                 match track.kind() {
                     RTPCodecType::Audio => {
-                        let mut last_seq: Option<u16> = None;
                         while let Ok((rtp, _)) = track.read_rtp().await {
                             if rtp.payload.is_empty() {
                                 continue;
                             }
-                            let seq = rtp.header.sequence_number;
-                            if let Some(prev) = last_seq {
-                                let gap = seq.wrapping_sub(prev).saturating_sub(1);
-                                // Conceal 1..=4 consecutive dropped 20ms Opus frames via Opus PLC.
-                                if (1..=4).contains(&gap) {
-                                    for _ in 0..gap {
-                                        let _ = audio_tx.send(Vec::new());
-                                    }
-                                }
-                            }
-                            last_seq = Some(seq);
                             rx_pkts.fetch_add(1, Ordering::Relaxed);
                             rx_total.fetch_add(1, Ordering::Relaxed);
                             let len = rtp.payload.len() as u64;
                             rx_bytes.fetch_add(len, Ordering::Relaxed);
                             rx_total_bytes.fetch_add(len, Ordering::Relaxed);
-                            if audio_tx.send(rtp.payload.to_vec()).is_err() {
+                            if audio_tx
+                                .send(InboundAudioPacket {
+                                    seq: rtp.header.sequence_number,
+                                    payload: rtp.payload,
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -445,7 +446,7 @@ impl ChimeRtcPeer {
     /// mid 0 and H.264 content video on mid 1).
     pub async fn new_content_sender(
         turn: &SdkTurnCredentials,
-        inbound_opus_tx: mpsc::UnboundedSender<Vec<u8>>,
+        inbound_opus_tx: mpsc::UnboundedSender<InboundAudioPacket>,
         inbound_video_tx: mpsc::UnboundedSender<InboundVideoPacket>,
         state_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
     ) -> Result<Self> {

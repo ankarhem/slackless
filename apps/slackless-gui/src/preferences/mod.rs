@@ -670,7 +670,7 @@ impl Default for Settings {
             huddle_sounds: true,
             huddle_reaction_animations: true,
             huddle_auto_captions: false,
-            huddle_music_when_alone: false,
+            huddle_music_when_alone: true,
         }
     }
 }

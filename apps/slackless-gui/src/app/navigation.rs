@@ -1376,7 +1376,47 @@ impl App {
         });
     }
 
+    /// Arm Official Slack's 60-second solo-huddle lounge music timer (`huddles_play_music_timeout`).
+    /// Starts Smooth Jazz (`waiting_muzak-9187b04.mp3`) if the user stays alone for 60 seconds,
+    /// and cancels automatically if another participant joins or the user leaves the huddle.
+    pub(super) fn arm_huddle_alone_music(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        if self.fixtures.sample || !self.preferences.read(cx).settings().huddle_music_when_alone {
+            self.huddle_alone_music_task = None;
+            return;
+        }
+        if self.huddle_alone_music_task.is_some() {
+            return;
+        }
+        self.huddle_alone_music_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(60))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                app.huddle_alone_music_task = None;
+                let settings = app.preferences.read(cx).settings();
+                if !settings.huddle_music_when_alone || settings.mute_sounds {
+                    return;
+                }
+                let Some(snap) = app.huddle_session.as_ref() else {
+                    return;
+                };
+                if snap.channel != channel
+                    || snap.phase != slackless_core::huddle::HuddlePhase::Connected
+                    || snap.jukebox_song.is_some()
+                {
+                    return;
+                }
+                let peer_count = app.ws.active_huddles.get(&channel).map_or(0, Vec::len);
+                if peer_count <= 1 {
+                    app.bridge
+                        .send(Command::SetHuddleJukebox(Some("jazz".to_owned())));
+                }
+            });
+        }));
+    }
+
     pub(super) fn clear_huddle_dock(&mut self, cx: &mut Context<Self>) {
+        self.huddle_alone_music_task = None;
         if let Some(dock) = &self.huddle_dock {
             dock.update(cx, |d, cx| d.clear_video_frames(cx));
         }
