@@ -129,20 +129,32 @@ cat >"$APP/Contents/Info.plist" <<EOF
 EOF
 
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
+SIGN_LABEL=""
 if [[ -z "${SLACKLESS_SIGN_IDENTITY:-}" ]] && command -v security >/dev/null; then
   # Prefer a persistent local Code Signing certificate (e.g. "Slackless Dev") so macOS TCC
   # remembers Screen Recording / Microphone / Camera permissions across rebuilds.
-  AUTO_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Slackless Dev\)".*/\1/p' | head -n 1 || true)"
-  if [[ -z "$AUTO_ID" ]]; then
-    AUTO_ID="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\([^"]*\)".*/\1/p' | head -n 1 || true)"
+  # Sign by 40-hex SHA-1 hash to avoid case-insensitive ambiguity and allow local self-signed
+  # certs (which `codesign` accepts and turns into a stable `certificate leaf = H"..."` DR).
+  AUTO_LINE="$(security find-identity -v -p codesigning 2>/dev/null | grep -F '"Slackless Dev"' | head -n 1 || true)"
+  if [[ -z "$AUTO_LINE" ]]; then
+    AUTO_LINE="$(security find-identity -p codesigning 2>/dev/null | grep -F '"Slackless Dev"' | head -n 1 || true)"
   fi
-  SIGN_ID="${AUTO_ID:--}"
+  if [[ -z "$AUTO_LINE" ]]; then
+    AUTO_LINE="$(security find-identity -v -p codesigning 2>/dev/null | awk '/[0-9]+\) [0-9A-F]{40} "/ { print; exit }' || true)"
+  fi
+  AUTO_HASH="$(printf '%s\n' "$AUTO_LINE" | sed -n 's/.*) \([0-9A-F]\{40\}\) .*/\1/p')"
+  SIGN_LABEL="$(printf '%s\n' "$AUTO_LINE" | sed -n 's/.*"\([^"]*\)".*/\1/p')"
+  SIGN_ID="${AUTO_HASH:--}"
 else
   SIGN_ID="${SLACKLESS_SIGN_IDENTITY:--}"
 fi
 if command -v codesign >/dev/null; then
   codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || true
-  echo "Signed $APP with identity: $SIGN_ID"
+  if [[ -n "$SIGN_LABEL" ]]; then
+    echo "Signed $APP with identity: $SIGN_LABEL ($SIGN_ID)"
+  else
+    echo "Signed $APP with identity: $SIGN_ID"
+  fi
 fi
 
 echo "Bundled $APP (version $VERSION)"
