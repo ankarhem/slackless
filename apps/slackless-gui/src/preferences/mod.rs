@@ -988,7 +988,7 @@ impl Preferences {
         if section == Section::AudioVideo {
             self.refresh_audio_devices_and_probe(cx);
         } else {
-            self.stop_mic_probe();
+            self.stop_mic_probe(cx);
         }
         cx.notify();
     }
@@ -1003,27 +1003,29 @@ impl Preferences {
 
     /// Release the live microphone & camera preview probes off the UI thread (called when leaving
     /// Audio & video or closing Preferences so hardware teardown never stalls the main thread).
-    pub fn stop_mic_probe(&mut self) {
+    pub fn stop_mic_probe(&mut self, cx: &mut Context<Self>) {
         self.audio_probe_gen = self.audio_probe_gen.wrapping_add(1);
         self.audio_loading = false;
         if let Some(old) = self.mic_probe.take() {
             std::thread::spawn(move || drop(old));
         }
         self.mic_level = 0.0;
-        self.stop_camera_preview();
+        self.stop_camera_preview(cx);
     }
 
-    fn stop_camera_preview(&mut self) {
+    fn stop_camera_preview(&mut self, cx: &mut Context<Self>) {
         self.camera_probe_gen = self.camera_probe_gen.wrapping_add(1);
         self.camera_preview_on = false;
         if let Some(old) = self.camera_probe.take() {
             std::thread::spawn(move || drop(old));
         }
-        self.camera_frame = None;
+        if let Some(old) = self.camera_frame.take() {
+            cx.drop_image(old, None);
+        }
     }
 
     fn start_camera_preview(&mut self, cx: &mut Context<Self>) {
-        self.stop_camera_preview();
+        self.stop_camera_preview(cx);
         self.camera_preview_on = true;
         let probe_gen = self.camera_probe_gen;
         let device_index = self.settings.huddle_camera_device;
@@ -1285,7 +1287,7 @@ pub fn open_preferences_window(
         window.activate_window();
         let prefs_close = preferences.clone();
         window.on_window_should_close(cx, move |_, cx| {
-            prefs_close.update(cx, |p, _| p.stop_mic_probe());
+            prefs_close.update(cx, |p, cx| p.stop_mic_probe(cx));
             true
         });
         cx.new(|_| PreferencesWindow { preferences })

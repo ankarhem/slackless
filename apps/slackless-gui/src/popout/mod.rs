@@ -667,9 +667,9 @@ impl PopoutWindow {
         self._viewer_sub = Some(cx.subscribe_in(
             &viewer,
             window,
-            |this: &mut Self, _, event: &ViewerEvent, _, cx| {
+            |this: &mut Self, _, event: &ViewerEvent, window, cx| {
                 if matches!(event, ViewerEvent::Close) {
-                    this.close_image_viewer(cx);
+                    this.close_image_viewer(window, cx);
                 }
             },
         ));
@@ -677,8 +677,9 @@ impl PopoutWindow {
         cx.notify();
     }
 
-    fn close_image_viewer(&mut self, cx: &mut Context<Self>) {
-        if self.image_viewer.take().is_some() {
+    fn close_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(viewer) = self.image_viewer.take() {
+            viewer.update(cx, |v, cx| v.evict_assets(window, cx));
             self._viewer_sub = None;
             cx.notify();
         }
@@ -1689,10 +1690,10 @@ impl Render for PopoutWindow {
                 window.remove_window();
             })
             .on_key_down(
-                cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, _, cx| {
+                cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         if this.image_viewer.is_some() {
-                            this.close_image_viewer(cx);
+                            this.close_image_viewer(window, cx);
                         } else if this.picker.take().is_some() || this.editing.take().is_some() {
                             cx.notify();
                         }

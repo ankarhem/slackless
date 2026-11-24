@@ -1463,8 +1463,8 @@ impl App {
         let subscription = cx.subscribe_in(
             &viewer,
             window,
-            |this: &mut App, _, event: &ViewerEvent, _, cx| match event {
-                ViewerEvent::Close => this.close_image_viewer(cx),
+            |this: &mut App, _, event: &ViewerEvent, window, cx| match event {
+                ViewerEvent::Close => this.close_image_viewer(window, cx),
             },
         );
         // A replaced viewer drops its subscription with it.
@@ -1473,9 +1473,10 @@ impl App {
         cx.notify();
     }
 
-    /// Closes the image viewer, dropping the large rendition it holds.
-    pub(super) fn close_image_viewer(&mut self, cx: &mut Context<Self>) {
-        if self.image_viewer.take().is_some() {
+    /// Closes the image viewer, evicting decoded full-res textures from GPUI's cache.
+    pub(super) fn close_image_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(viewer) = self.image_viewer.take() {
+            viewer.update(cx, |v, cx| v.evict_assets(window, cx));
             cx.notify();
         }
     }

@@ -337,7 +337,7 @@ impl App {
                             };
                             match event.keystroke.key.as_str() {
                                 "escape" => {
-                                    app.close_image_viewer(cx);
+                                    app.close_image_viewer(window, cx);
                                     cx.stop_propagation();
                                 }
                                 "left" => {

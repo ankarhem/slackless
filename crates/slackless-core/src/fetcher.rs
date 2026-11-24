@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
@@ -52,13 +53,16 @@ fn read_disk_cache(dir: &Path, url: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.join(cache_key(url))).ok()
 }
 
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn write_disk_cache(dir: &Path, url: &str, bytes: &[u8]) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let key = cache_key(url);
     let final_path = dir.join(&key);
-    let tmp_path = dir.join(format!("{key}.tmp.{}", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!("{key}.tmp.{}.{seq}", std::process::id()));
     if std::fs::write(&tmp_path, bytes).is_ok() {
         let _ = std::fs::rename(&tmp_path, &final_path);
     }
@@ -232,10 +236,10 @@ impl Fetcher {
                     }
                     if let Some(dir) = disk_dir {
                         let data = bytes.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
+                        // Persist asynchronously so disk I/O never stalls the image decode path.
+                        tokio::task::spawn_blocking(move || {
                             write_disk_cache(&dir, &url, &data);
-                        })
-                        .await;
+                        });
                     }
                 }
             }

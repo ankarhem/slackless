@@ -413,13 +413,12 @@ impl App {
             }
             Event::Conversations(_) | Event::SidebarChanged => {
                 // Refresh this background workspace's team name/icon in `live_teams` if hydrate
-                // just stored a richer `team.info` record.
+                // just stored a richer `team.info` record (O(1) single-row team lookup).
                 let fresh_team = self
                     .parked_bridges
                     .get(ws_index)
                     .and_then(Option::as_ref)
-                    .and_then(|b| b.snapshot(&HashMap::new()))
-                    .and_then(|snap| snap.workspaces.into_iter().next());
+                    .and_then(CoreBridge::team_summary);
                 if let (Some(team), Some(slot)) = (fresh_team, self.live_teams.get_mut(ws_index)) {
                     if *slot != team {
                         *slot = team;
@@ -522,11 +521,11 @@ impl App {
             }
             Event::MessagePosted { channel, message } => {
                 let settings = self.preferences.read(cx).settings().clone();
-                let snap = self
+                let bg_ctx = self
                     .parked_bridges
                     .get(ws_index)
                     .and_then(Option::as_ref)
-                    .and_then(|b| b.snapshot(&HashMap::new()));
+                    .and_then(|b| b.bg_message_context(channel, message.user.as_ref()));
                 let reply = message
                     .thread_ts
                     .as_ref()
@@ -536,21 +535,21 @@ impl App {
                 let counts_in_channel =
                     !message.hidden && !message.is_ephemeral && (!reply || broadcast);
                 if counts_in_channel {
-                    let from_self = snap
+                    let from_self = bg_ctx
                         .as_ref()
                         .is_some_and(|s| message.user.as_ref() == Some(&s.self_user));
                     if !from_self {
-                        let is_dm = snap
+                        let is_dm = bg_ctx
                             .as_ref()
-                            .and_then(|s| s.conversation(channel))
+                            .and_then(|s| s.conversation.as_ref())
                             .is_some_and(|c| {
                                 matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim)
                             });
-                        let is_im = snap
+                        let is_im = bg_ctx
                             .as_ref()
-                            .and_then(|s| s.conversation(channel))
+                            .and_then(|s| s.conversation.as_ref())
                             .is_some_and(|c| c.kind() == ConversationKind::Im);
-                        let mentioned = snap.as_ref().is_some_and(|s| {
+                        let mentioned = bg_ctx.as_ref().is_some_and(|s| {
                             mentions_me(&message.text, &s.self_user, &settings.keywords)
                         });
                         let bump = |counts: &mut HashMap<ChannelId, ConversationCounts>| {
@@ -588,24 +587,31 @@ impl App {
                 if !settings.desktop_notifications {
                     return;
                 }
-                let Some(snap) = snap else {
+                let Some(bg_ctx) = bg_ctx else {
                     return;
                 };
-                if message.user.as_ref() == Some(&snap.self_user) {
+                if message.user.as_ref() == Some(&bg_ctx.self_user) {
                     return;
                 }
-                let level = snap.notify_levels.get(channel).copied();
+                let level = bg_ctx.notify_level;
                 if level == Some(NotifyLevel::Muted) {
                     return;
                 }
-                let Some(conv) = snap.conversation(channel) else {
+                let Some(conv) = bg_ctx.conversation.as_ref() else {
                     return;
                 };
                 let dm = matches!(conv.kind(), ConversationKind::Im | ConversationKind::Mpim);
                 let sender_is_vip = message.user.as_ref().is_some_and(|u| {
-                    let user_obj = snap.user(u);
-                    let handle = user_obj.map(|x| x.name.as_str()).unwrap_or("");
-                    let display = user_obj.map(|x| x.display_name()).unwrap_or("");
+                    let handle = bg_ctx
+                        .sender
+                        .as_ref()
+                        .map(|x| x.name.as_str())
+                        .unwrap_or("");
+                    let display = bg_ctx
+                        .sender
+                        .as_ref()
+                        .map(slackless_core::types::User::display_name)
+                        .unwrap_or("");
                     settings.is_vip(u.as_str(), handle, display)
                 });
                 let breakthrough =
@@ -617,7 +623,7 @@ impl App {
                 {
                     return;
                 }
-                let mentioned = mentions_me(&message.text, &snap.self_user, &settings.keywords);
+                let mentioned = mentions_me(&message.text, &bg_ctx.self_user, &settings.keywords);
                 let wanted = match (level, settings.notify_level) {
                     (Some(NotifyLevel::Mentions), _) | (_, 1) => dm || mentioned,
                     (_, 0) => true,
@@ -632,20 +638,30 @@ impl App {
                     .map(|t| t.name.clone())
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| "Slack".to_owned());
-                let sender = message
-                    .user
+                let sender = bg_ctx
+                    .sender
                     .as_ref()
-                    .map(|u| snap.user_name(u).to_owned())
+                    .map(|u| u.display_name().to_owned())
+                    .or_else(|| message.user.as_ref().map(|u| u.as_str().to_owned()))
                     .unwrap_or_default();
                 let text = if settings.show_preview {
-                    snap.plain_text(message)
+                    if !message.text.trim().is_empty() {
+                        message.text.trim().to_owned()
+                    } else if let Some(file) = message.files.first() {
+                        file.title
+                            .clone()
+                            .or_else(|| file.name.clone())
+                            .unwrap_or_else(|| "Shared a file".to_owned())
+                    } else {
+                        "New message".to_owned()
+                    }
                 } else {
                     "New message".to_owned()
                 };
                 let (title, body) = match conv.kind() {
                     ConversationKind::Im => (format!("{ws_name} — {sender}"), text),
                     ConversationKind::Mpim => (
-                        format!("{ws_name} — {}", snap.conversation_label(conv)),
+                        format!("{ws_name} — {}", conv.name.as_deref().unwrap_or("Group DM")),
                         format!("{sender}: {text}"),
                     ),
                     _ => (

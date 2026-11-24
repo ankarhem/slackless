@@ -414,6 +414,20 @@ impl Composer {
         }
     }
 
+    fn clear_clip_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(old) = self.clip_preview.take() {
+            cx.drop_image(old, None);
+        }
+    }
+
+    fn clear_clip_review(&mut self, cx: &mut Context<Self>) -> Option<ClipReview> {
+        let review = self.clip_review.take()?;
+        for thumb in &review.thumbs {
+            cx.drop_image(Arc::clone(thumb), None);
+        }
+        Some(review)
+    }
+
     /// Start recording a native microphone audio clip (`F-CORE-127`, `F-CORE-131`).
     pub fn start_audio_clip(&mut self, cx: &mut Context<Self>) {
         if self.clip_stopping {
@@ -427,7 +441,7 @@ impl Composer {
         match AudioClipRecorder::start() {
             Ok(recorder) => {
                 self.clip_recorder = Some(ActiveClipRecorder::Audio(recorder));
-                self.clip_preview = None;
+                self.clear_clip_preview(cx);
                 self.spawn_clip_ticker(cx);
                 cx.notify();
             }
@@ -455,7 +469,7 @@ impl Composer {
                     recorder,
                     is_screen,
                 });
-                self.clip_preview = None;
+                self.clear_clip_preview(cx);
                 self.spawn_clip_ticker(cx);
                 cx.notify();
             }
@@ -469,7 +483,7 @@ impl Composer {
     /// Discard an active clip recording without attaching it.
     pub fn cancel_clip(&mut self, cx: &mut Context<Self>) {
         self.clip_ticker = None;
-        self.clip_preview = None;
+        self.clear_clip_preview(cx);
         self.clip_stopping = false;
         if let Some(active) = self.clip_recorder.take() {
             match active {
@@ -486,7 +500,7 @@ impl Composer {
             return;
         };
         self.clip_ticker = None;
-        self.clip_preview = None;
+        self.clear_clip_preview(cx);
         self.clip_stopping = true;
         cx.notify();
 
@@ -546,6 +560,7 @@ impl Composer {
                                         preview: None,
                                     });
                                 } else {
+                                    let _ = composer.clear_clip_review(cx);
                                     composer.clip_review = Some(ClipReview {
                                         filename: clip.filename,
                                         bytes: clip.bytes,
@@ -570,7 +585,7 @@ impl Composer {
 
     /// Confirm the reviewed video clip (keeping the chosen thumbnail) and attach it (`F-COLLAB-099`).
     pub fn confirm_clip_review(&mut self, cx: &mut Context<Self>) {
-        if let Some(review) = self.clip_review.take() {
+        if let Some(review) = self.clear_clip_review(cx) {
             self.attachments.push(PendingAttachment {
                 filename: review.filename,
                 bytes: review.bytes,
@@ -582,7 +597,7 @@ impl Composer {
 
     /// Discard the pending video clip review without attaching.
     pub fn discard_clip_review(&mut self, cx: &mut Context<Self>) {
-        self.clip_review = None;
+        let _ = self.clear_clip_review(cx);
         cx.notify();
     }
 
@@ -609,7 +624,9 @@ impl Composer {
                         if let ActiveClipRecorder::Video { recorder, .. } = active {
                             if let Some(vf) = recorder.latest_preview() {
                                 if let Some(img) = crate::huddle_dock::frame_into_render_image(vf) {
-                                    composer.clip_preview = Some(img);
+                                    if let Some(old) = composer.clip_preview.replace(img) {
+                                        cx.drop_image(old, None);
+                                    }
                                 }
                             }
                         }

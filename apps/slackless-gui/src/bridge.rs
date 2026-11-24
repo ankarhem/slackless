@@ -28,7 +28,7 @@ use gpui_kit::gpui::{self, AppContext as _, Context, Entity, EventEmitter, Subsc
 use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
 use slackless_core::store::Store;
-use slackless_core::types::{ChannelId, Message, Team, TeamId, Ts};
+use slackless_core::types::{ChannelId, Conversation, Message, Team, TeamId, Ts, User, UserId};
 use slackless_core::{Client, Command, Event, SharedStore};
 
 use crate::fixtures::{self, Fixtures};
@@ -38,6 +38,15 @@ use crate::media::CoreHttp;
 use crate::blockkit::serde_json;
 use crate::preferences::{AppearanceMode, Settings};
 use crate::theme;
+
+/// Minimal context for processing a background workspace's `Event::MessagePosted` (unread bump +
+/// desktop notification) in O(1) SQLite PK reads rather than rebuilding a full `Fixtures` snapshot.
+pub struct BgMessageContext {
+    pub self_user: UserId,
+    pub conversation: Option<Conversation>,
+    pub sender: Option<User>,
+    pub notify_level: Option<slackless_core::NotifyLevel>,
+}
 
 /// One persisted composer draft in the workspace's local store.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -263,6 +272,31 @@ impl CoreBridge {
             cx.set_http_client(Arc::new(CoreHttp(fetcher.clone())));
             crate::media::enable_downloads(fetcher.clone(), cx);
         }
+    }
+
+    /// Lightweight O(1) lookup for handling a single `Event::MessagePosted` in a background
+    /// (parked) workspace without deserializing the entire workspace snapshot on the UI thread.
+    pub fn bg_message_context(
+        &self,
+        channel: &ChannelId,
+        sender_id: Option<&UserId>,
+    ) -> Option<BgMessageContext> {
+        let session = self.session.as_ref()?;
+        let team = &session.team_id;
+        let store = self.read_store()?.lock().ok()?;
+        let conversation = store.conversation(team, channel).ok().flatten();
+        let sender = sender_id.and_then(|u| store.user(team, u).ok().flatten());
+        let notify_level = store
+            .prefs(team)
+            .ok()
+            .flatten()
+            .and_then(|prefs| slackless_core::notify_levels(&prefs).get(channel).copied());
+        Some(BgMessageContext {
+            self_user: session.user_id.clone(),
+            conversation,
+            sender,
+            notify_level,
+        })
     }
 
     /// Live mode: the signed-in workspace as the store has it now, with Slack's latest read

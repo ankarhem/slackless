@@ -368,6 +368,21 @@ pub struct ImageViewer {
 impl EventEmitter<ViewerEvent> for ImageViewer {}
 
 impl ImageViewer {
+    /// Evict decoded full-resolution image textures loaded by this viewer from GPUI's window &
+    /// asset caches so closing the lightbox releases RAM and Metal atlas memory immediately.
+    pub fn evict_assets(&self, window: &mut Window, cx: &mut Context<Self>) {
+        for entry in self.images.iter() {
+            if let ImageSource::Resource(ref resource) = entry.source {
+                if let Some(Ok(data)) =
+                    window.get_asset::<gpui_kit::gpui::ImgResourceLoader>(resource, cx)
+                {
+                    let _ = window.drop_image(data);
+                }
+                entry.source.remove_asset(cx);
+            }
+        }
+    }
+
     pub fn new(
         fixtures: Arc<Fixtures>,
         channel: String,

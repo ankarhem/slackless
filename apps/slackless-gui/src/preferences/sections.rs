@@ -2233,7 +2233,7 @@ impl Preferences {
                         })
                         .on_click(cx.listener(|this, _, _, cx| {
                             if this.camera_preview_on {
-                                this.stop_camera_preview();
+                                this.stop_camera_preview(cx);
                                 cx.notify();
                             } else {
                                 this.start_camera_preview(cx);
