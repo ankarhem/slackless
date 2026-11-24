@@ -50,8 +50,10 @@ use crate::hover_card::{self, Trigger};
 use crate::image_viewer::{self, ImageClick, ImageOrigin};
 use crate::later::SaveRequest;
 
+mod code_block;
 mod render;
-pub use render::set_timezone_override;
+mod selectable;
+mod time;
 use render::{
     CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with, message_body,
 };
@@ -60,6 +62,7 @@ pub(crate) use render::{
     mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, render_block, selectable_code,
     short_date, unescape,
 };
+pub use time::set_timezone_override;
 #[cfg(test)]
 mod tests;
 

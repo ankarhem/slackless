@@ -40,6 +40,7 @@ mod hover_card;
 mod huddle;
 mod huddle_dock;
 mod huddle_invite;
+mod huddle_video;
 mod huddles;
 mod image_viewer;
 mod later;

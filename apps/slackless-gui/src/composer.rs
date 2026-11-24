@@ -1183,13 +1183,7 @@ fn image_format_for_ext(path: &std::path::Path) -> Option<ImageFormat> {
 }
 
 pub(super) fn format_bytes(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    }
+    crate::preferences::format_bytes(bytes as u64)
 }
 
 #[cfg(test)]
