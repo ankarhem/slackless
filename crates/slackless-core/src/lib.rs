@@ -836,6 +836,7 @@ pub enum Event {
         ended: bool,
         topic: Option<String>,
         background_id: Option<String>,
+        thread_root_ts: Option<Ts>,
     },
     /// Active native huddle session lifecycle snapshot (`Connecting`, `Connected`, `Reconnecting`, `Failed`, `Idle`).
     HuddleSessionChanged(Box<huddle::HuddleSessionSnapshot>),

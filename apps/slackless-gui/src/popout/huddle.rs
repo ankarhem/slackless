@@ -607,43 +607,97 @@ impl PopoutWindow {
             .child(content)
     }
 
-    fn huddle_thread_messages(
+    pub(super) fn resolve_huddle_thread_root(
+        &self,
+        snap: &slackless_core::huddle::HuddleSessionSnapshot,
+    ) -> Option<Ts> {
+        if let Some(root) = snap
+            .thread_root_ts
+            .as_ref()
+            .filter(|ts| !ts.as_str().trim().is_empty())
+        {
+            return Some(root.clone());
+        }
+        // If `rooms.join` didn't include `thread_root_ts` yet, look up the active live
+        // `huddle_thread` trail message for this channel in SQLite so we never post to the
+        // parent channel or leak unrelated channel history.
+        let (Some(store), Some(team)) = (&self.store, &self.team) else {
+            return None;
+        };
+        let guard = store.lock().ok()?;
+        let rows = guard.channel_history(team, &snap.channel, None, 20).ok()?;
+        rows.into_iter().rev().find_map(|row| {
+            if row.deleted
+                || row.message.subtype != Some(slackless_core::types::MessageSubtype::HuddleThread)
+            {
+                return None;
+            }
+            let has_ended = row
+                .message
+                .extra
+                .get("room")
+                .and_then(|r| r.get("has_ended"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (!has_ended).then_some(row.message.ts)
+        })
+    }
+
+    pub(super) fn huddle_thread_messages(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
     ) -> Vec<Message> {
-        let mut out = if let (Some(store), Some(team)) = (&self.store, &self.team) {
-            store
-                .lock()
-                .ok()
-                .and_then(|guard| {
-                    let rows = if let Some(root_ts) = &snap.thread_root_ts {
-                        guard.thread_replies(team, &snap.channel, root_ts)
-                    } else {
-                        guard.channel_history(team, &snap.channel, None, 20)
-                    };
-                    rows.ok().map(|list| {
-                        list.into_iter()
-                            .filter(|r| !r.deleted)
-                            .map(|r| r.message)
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .unwrap_or_default()
-        } else if let Some(root_ts) = &snap.thread_root_ts {
-            self.fixtures
-                .threads
-                .get(&(snap.channel.clone(), root_ts.clone()))
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            self.fixtures
-                .messages
-                .get(&snap.channel)
-                .map(|list| list.iter().rev().take(12).rev().cloned().collect())
-                .unwrap_or_default()
+        let root_ts = self.resolve_huddle_thread_root(snap);
+        let mut out: Vec<Message> = match root_ts.as_ref() {
+            Some(root) => {
+                if let (Some(store), Some(team)) = (&self.store, &self.team) {
+                    store
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.thread_replies(team, &snap.channel, root).ok())
+                        .map(|list| {
+                            list.into_iter()
+                                .filter(|r| {
+                                    !r.deleted
+                                        && r.message.ts != *root
+                                        && r.message.subtype
+                                            != Some(
+                                                slackless_core::types::MessageSubtype::HuddleThread,
+                                            )
+                                })
+                                .map(|r| r.message)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    self.fixtures
+                        .threads
+                        .get(&(snap.channel.clone(), root.clone()))
+                        .map(|list| {
+                            list.iter()
+                                .filter(|m| {
+                                    m.ts != *root
+                                        && m.subtype
+                                            != Some(
+                                                slackless_core::types::MessageSubtype::HuddleThread,
+                                            )
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+            }
+            // Brand-new huddle with no thread root yet: always start empty (never pull parent
+            // channel chat!).
+            None => Vec::new(),
         };
         for local in &self.huddle_thread_local {
-            if !out.iter().any(|m| m.ts == local.ts) {
+            let echoed = out.iter().any(|m| {
+                m.ts == local.ts
+                    || (m.user == local.user && !local.text.is_empty() && m.text == local.text)
+            });
+            if !echoed {
                 out.push(local.clone());
             }
         }
@@ -665,14 +719,66 @@ impl PopoutWindow {
             .conversation(&channel)
             .map(|c| self.fixtures.conversation_label(c))
             .unwrap_or_else(|| self.title.clone());
-        let thread_ts = snap.thread_root_ts.clone();
+        let thread_ts = self.resolve_huddle_thread_root(snap);
         let jump_ch = channel.clone();
         let jump_ts = thread_ts.clone();
         let messages = self.huddle_thread_messages(snap);
-        let send = self.send.clone();
-        let reply_ch = channel.clone();
-        let reply_ts = thread_ts.clone();
         let hover = pal.drawer_hover;
+
+        let jump_for_links = on_jump.clone();
+        let links: LinkHandler = Rc::new(move |target, _, cx| match target {
+            LinkTarget::Url(url) => cx.open_url(url.as_ref()),
+            LinkTarget::Channel(ch) => jump_for_links(ch.clone(), None, false, cx),
+            LinkTarget::Thread { channel, thread_ts } => {
+                jump_for_links(channel.clone(), Some(thread_ts.clone()), true, cx)
+            }
+            LinkTarget::Profile(_) => {}
+        });
+
+        let view = cx.entity();
+        let mut rows: Vec<gpui_kit::gpui::AnyElement> = Vec::with_capacity(messages.len());
+        let mut prev_msg: Option<&Message> = None;
+        for (ix, msg) in messages.iter().enumerate() {
+            let msg_group = SharedString::from(format!("huddle-thread-msg-{ix}"));
+            let grouped = prev_msg
+                .filter(|prev| same_group(prev, msg))
+                .map(|_| msg_group.clone());
+            let view_for_action = view.clone();
+            let ch_for_action = channel.clone();
+            let msg_for_action = msg.clone();
+            let handler: ActionHandler = Rc::new(move |action, window, cx| {
+                let ch = ch_for_action.clone();
+                let m = msg_for_action.clone();
+                view_for_action.update(cx, |this, cx| {
+                    this.handle_message_action(ch, m, action, window, cx);
+                });
+            });
+            let mut display = msg.clone();
+            let reactions = std::mem::take(&mut display.reactions);
+            let key = format!("huddle-thread-row-{}", msg.ts.as_str());
+            let chips =
+                actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
+                    .map(|c| c.pl(px(48.)));
+            let row_body = message_row_linked(
+                &self.fixtures,
+                &display,
+                Some(&handler),
+                Some(&links),
+                grouped,
+                cx,
+            );
+            rows.push(
+                v_flex()
+                    .id(SharedString::from(key))
+                    .group(msg_group)
+                    .px_3()
+                    .py_0p5()
+                    .child(row_body)
+                    .children(chips)
+                    .into_any_element(),
+            );
+            prev_msg = Some(msg);
+        }
 
         v_flex()
             .flex_1()
@@ -748,12 +854,12 @@ impl PopoutWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px_4()
                     .py_3()
-                    .gap_2p5()
-                    .when(messages.is_empty(), |col| {
+                    .gap_1()
+                    .when(rows.is_empty(), |col| {
                         col.child(
                             v_flex()
+                                .px_4()
                                 .gap_1p5()
                                 .py_2()
                                 .child(
@@ -780,98 +886,15 @@ impl PopoutWindow {
                                 )),
                         )
                     })
-                    .children(messages.into_iter().map(|msg| {
-                        let author = msg
-                            .user
-                            .as_ref()
-                            .map(|u| self.fixtures.user_name(u).to_owned())
-                            .or_else(|| msg.username.clone())
-                            .unwrap_or_else(|| "Slack".to_owned());
-                        v_flex()
-                            .p_2p5()
-                            .gap_1()
-                            .rounded_lg()
-                            .bg(pal.drawer_surface)
-                            .border_1()
-                            .border_color(pal.drawer_border)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(pal.drawer_fg)
-                                    .child(author),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(pal.drawer_fg.opacity(0.9))
-                                    .child(msg.text),
-                            )
-                    })),
+                    .children(rows),
             )
             .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
+                div()
+                    .flex_none()
+                    .p_2()
                     .border_t_1()
                     .border_color(pal.drawer_border)
-                    .child(
-                        div()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(pal.drawer_border)
-                            .bg(pal.drawer_bg)
-                            .px_2p5()
-                            .py_1p5()
-                            .child(Textarea::new(&self.huddle_thread_input).appearance(false)),
-                    )
-                    .child(
-                        h_flex().justify_end().child(
-                            div()
-                                .id("huddle-drawer-thread-send")
-                                .cursor_pointer()
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .bg(pal.primary)
-                                .hover({
-                                    let h = pal.primary_hover;
-                                    move |el| el.bg(h)
-                                })
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(pal.primary_fg)
-                                .child("Send")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let raw = this.huddle_thread_input.read(cx).value().to_string();
-                                    let trimmed = raw.trim();
-                                    if trimmed.is_empty() {
-                                        return;
-                                    }
-                                    let content =
-                                        crate::composer::content_of(trimmed, &this.fixtures);
-                                    (send)(Command::SendMessage {
-                                        channel: reply_ch.clone(),
-                                        content,
-                                        thread_ts: reply_ts.clone(),
-                                        broadcast: false,
-                                    });
-                                    this.huddle_thread_local.push(Message {
-                                        ts: Ts::from(format!(
-                                            "{}.000001",
-                                            crate::drafts::now_secs()
-                                        )),
-                                        user: Some(this.fixtures.self_user.clone()),
-                                        text: trimmed.to_owned(),
-                                        ..Default::default()
-                                    });
-                                    this.huddle_thread_input.update(cx, |s, cx| {
-                                        s.set_value("", window, cx);
-                                    });
-                                    cx.notify();
-                                })),
-                        ),
-                    ),
+                    .child(self.composer.clone()),
             )
     }
 
@@ -2203,6 +2226,8 @@ impl PopoutWindow {
             } else if full_bleed_avatar {
                 div()
                     .size_full()
+                    .rounded(px(14.))
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -3618,6 +3643,7 @@ impl PopoutWindow {
                 } else {
                     Some(HuddleDrawer::Thread)
                 };
+                this.maybe_fetch_huddle_thread();
                 cx.notify();
             }));
 

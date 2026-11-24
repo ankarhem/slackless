@@ -292,6 +292,7 @@ impl HuddleDock {
         &mut self,
         topic: Option<String>,
         background_id: Option<String>,
+        thread_root_ts: Option<slackless_core::types::Ts>,
         cx: &mut Context<Self>,
     ) {
         let mut dirty = false;
@@ -306,6 +307,12 @@ impl HuddleDock {
             let next = (!bg.trim().is_empty()).then_some(bg);
             if self.session.background_id != next {
                 self.session.background_id = next;
+                dirty = true;
+            }
+        }
+        if let Some(root_ts) = thread_root_ts.filter(|ts| !ts.as_str().trim().is_empty()) {
+            if self.session.thread_root_ts.as_ref() != Some(&root_ts) {
+                self.session.thread_root_ts = Some(root_ts);
                 dirty = true;
             }
         }

@@ -204,7 +204,7 @@ pub struct PopoutWindow {
     huddle_focused_screen: Option<usize>,
     huddle_topic_editing: Option<Entity<TextareaState>>,
     huddle_drawer: Option<HuddleDrawer>,
-    huddle_thread_input: Entity<TextareaState>,
+    huddle_thread_fetched: Option<Ts>,
     huddle_thread_local: Vec<Message>,
     huddle_devices: slackless_core::huddle::AudioDevices,
     huddle_screens: Vec<slackless_core::huddle::ScreenSource>,
@@ -234,16 +234,17 @@ impl PopoutWindow {
         let placeholder = match &kind {
             PopoutKind::Conversation { .. } => format!("Message {title}"),
             PopoutKind::Thread { .. } => "Reply in thread…".to_owned(),
+            PopoutKind::Huddle { .. } => "Reply…".to_owned(),
             PopoutKind::Activity { .. }
             | PopoutKind::Later { .. }
             | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. }
-            | PopoutKind::Huddle { .. } => String::new(),
+            | PopoutKind::Files { .. } => String::new(),
         };
         let has_composer = matches!(
             &kind,
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
         );
+        let is_huddle = matches!(&kind, PopoutKind::Huddle { .. });
         let composer = Composer::new(placeholder.into(), fixtures.clone(), window, cx);
         let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
         let initial = load_messages(&kind, &fixtures, store.as_ref(), team.as_ref());
@@ -253,6 +254,9 @@ impl PopoutWindow {
                 window,
                 |this: &mut Self, _, event: &ComposerEvent, window, cx| match event {
                     ComposerEvent::Submit(content) => this.send_content(content.clone(), cx),
+                    ComposerEvent::SubmitWithFiles { content, files } => {
+                        this.send_files(content.clone(), files.clone(), cx);
+                    }
                     ComposerEvent::OpenEmojiPicker(pos) => {
                         this.open_picker(PopoutPickerTarget::Composer, *pos, window, cx);
                     }
@@ -360,9 +364,25 @@ impl PopoutWindow {
             }
             PopoutKind::Huddle { source, .. } => {
                 if let Some(dock) = source.upgrade() {
-                    huddle_state = Some(dock.read(cx).view_state());
+                    let st = dock.read(cx).view_state();
+                    let target = also_send_target(&fixtures, &st.session.channel);
+                    composer.update(cx, |c, cx| c.set_also_send(target, cx));
+                    huddle_state = Some(st);
                     subscriptions.push(cx.observe(&dock, |this, dock, cx| {
-                        this.huddle_state = Some(dock.read(cx).view_state());
+                        let st = dock.read(cx).view_state();
+                        let prev_ch = this
+                            .huddle_state
+                            .as_ref()
+                            .map(|s| s.session.channel.clone());
+                        if prev_ch.as_ref() != Some(&st.session.channel) {
+                            let target = also_send_target(&this.fixtures, &st.session.channel);
+                            this.composer
+                                .update(cx, |c, cx| c.set_also_send(target, cx));
+                            this.huddle_thread_fetched = None;
+                            this.huddle_thread_local.clear();
+                        }
+                        this.huddle_state = Some(st);
+                        this.maybe_fetch_huddle_thread();
                         cx.notify();
                     }));
                 }
@@ -370,8 +390,8 @@ impl PopoutWindow {
             PopoutKind::Canvas { .. } => {}
         }
         // Fallback periodic refresh from the shared SQLite store for conversations that are not
-        // currently selected in the main window's `MessageList`.
-        if store.is_some() && has_composer {
+        // currently selected in the main window's `MessageList` (and live huddle threads).
+        if store.is_some() && (has_composer || is_huddle) {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -387,11 +407,6 @@ impl PopoutWindow {
             })
             .detach();
         }
-        let huddle_thread_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .placeholder("Reply in huddle thread…")
-                .auto_grow(1, 4)
-        });
         let scroll = ScrollHandle::new();
         if !initial.is_empty() {
             scroll.scroll_to_bottom();
@@ -425,7 +440,7 @@ impl PopoutWindow {
             huddle_focused_screen: None,
             huddle_topic_editing: None,
             huddle_drawer: None,
-            huddle_thread_input,
+            huddle_thread_fetched: None,
             huddle_thread_local: Vec::new(),
             huddle_devices: slackless_core::huddle::AudioDevices::default(),
             huddle_screens: Vec::new(),
@@ -869,6 +884,9 @@ impl PopoutWindow {
             PopoutKind::Huddle { source, .. } => {
                 if let Some(dock) = source.upgrade() {
                     self.huddle_state = Some(dock.read(cx).view_state());
+                }
+                if self.huddle_drawer == Some(HuddleDrawer::Thread) {
+                    self.maybe_fetch_huddle_thread();
                     cx.notify();
                 }
                 return;
@@ -891,7 +909,51 @@ impl PopoutWindow {
         }
     }
 
+    fn maybe_fetch_huddle_thread(&mut self) {
+        if self.huddle_drawer != Some(HuddleDrawer::Thread) {
+            return;
+        }
+        let Some(state) = &self.huddle_state else {
+            return;
+        };
+        let Some(root_ts) = self.resolve_huddle_thread_root(&state.session) else {
+            return;
+        };
+        if self.huddle_thread_fetched.as_ref() == Some(&root_ts) {
+            return;
+        }
+        self.huddle_thread_fetched = Some(root_ts.clone());
+        (self.send)(Command::OpenThread {
+            channel: state.session.channel.clone(),
+            thread_ts: root_ts,
+        });
+    }
+
     fn send_content(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+        if matches!(&self.kind, PopoutKind::Huddle { .. }) {
+            let Some(state) = &self.huddle_state else {
+                return;
+            };
+            let channel = state.session.channel.clone();
+            let thread_ts = self.resolve_huddle_thread_root(&state.session);
+            let broadcast = self
+                .composer
+                .update(cx, |composer, cx| composer.take_also_send(cx));
+            let mut local =
+                self.fixtures
+                    .local_message(&channel, content.text.clone(), thread_ts.clone());
+            local.blocks = content.blocks.clone();
+            local.attachments = content.attachments.clone();
+            self.huddle_thread_local.push(local);
+            (self.send)(Command::SendMessage {
+                channel,
+                content,
+                thread_ts,
+                broadcast,
+            });
+            cx.notify();
+            return;
+        }
         let (channel, thread_ts) = match &self.kind {
             PopoutKind::Conversation { channel, .. } => (channel.clone(), None),
             PopoutKind::Thread {
@@ -918,6 +980,70 @@ impl PopoutWindow {
         });
         cx.notify();
     }
+
+    fn send_files(
+        &mut self,
+        content: Option<MessageContent>,
+        files: Vec<crate::composer::PendingAttachment>,
+        cx: &mut Context<Self>,
+    ) {
+        let (channel, thread_ts) = match &self.kind {
+            PopoutKind::Conversation { channel, .. } => (channel.clone(), None),
+            PopoutKind::Thread {
+                channel, thread_ts, ..
+            } => (channel.clone(), Some(thread_ts.clone())),
+            PopoutKind::Huddle { .. } => {
+                let Some(state) = &self.huddle_state else {
+                    return;
+                };
+                let channel = state.session.channel.clone();
+                let thread_ts = self.resolve_huddle_thread_root(&state.session);
+                (channel, thread_ts)
+            }
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. } => return,
+        };
+        let uploads: Vec<slackless_core::api::UploadFile> = files
+            .into_iter()
+            .map(|attachment| slackless_core::api::UploadFile {
+                filename: attachment.filename,
+                bytes: attachment.bytes,
+            })
+            .collect();
+        if uploads.is_empty() {
+            if let Some(content) = content {
+                self.send_content(content, cx);
+            }
+            return;
+        }
+        (self.send)(Command::UploadFiles {
+            channel,
+            thread_ts,
+            content,
+            files: uploads,
+        });
+        cx.notify();
+    }
+}
+
+fn also_send_target(
+    fixtures: &Fixtures,
+    channel: &ChannelId,
+) -> Option<crate::composer::AlsoSendTarget> {
+    use slackless_core::types::ConversationKind;
+    fixtures
+        .conversation(channel)
+        .map(|conversation| match conversation.kind() {
+            ConversationKind::Im | ConversationKind::Mpim => {
+                crate::composer::AlsoSendTarget::DirectMessage
+            }
+            kind => crate::composer::AlsoSendTarget::Channel {
+                name: conversation.name.clone().unwrap_or_default().into(),
+                private: kind == ConversationKind::PrivateChannel,
+            },
+        })
 }
 
 fn load_messages(
@@ -987,8 +1113,63 @@ impl Render for PopoutWindow {
             ..
         } = &self.kind
         {
-            return self
-                .render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx)
+            let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);
+            let root = self.render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx);
+            return root
+                .when_some(picker_pos, |root, pos| {
+                    let viewport = _window.viewport_size();
+                    let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
+                        (true, true) => Anchor::BottomRight,
+                        (true, false) => Anchor::BottomLeft,
+                        (false, true) => Anchor::TopRight,
+                        (false, false) => Anchor::TopLeft,
+                    };
+                    root.child(
+                        div()
+                            .id("popout-picker-backdrop")
+                            .occlude()
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
+                            .absolute()
+                            .inset_0()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.picker = None;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(deferred(
+                        anchored()
+                            .position(pos)
+                            .anchor(anchor)
+                            .snap_to_window_with_margin(Edges::all(px(8.)))
+                            .child(
+                                div()
+                                    .id("popout-picker-overlay")
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                                    .child(self.emoji_picker.clone()),
+                            ),
+                    ))
+                })
+                .when_some(self.image_viewer.clone(), |root, viewer| {
+                    root.child(
+                        div()
+                            .id("popout-image-viewer-overlay")
+                            .occlude()
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
+                            .absolute()
+                            .top(px(38.))
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .child(viewer),
+                    )
+                })
                 .into_any_element();
         }
         let theme = cx.theme();

@@ -1076,6 +1076,7 @@ impl App {
                 ended,
                 topic,
                 background_id,
+                thread_root_ts,
             } => {
                 if *ended {
                     self.ws.active_huddles.remove(channel);
@@ -1104,7 +1105,12 @@ impl App {
                                 },
                                 cx,
                             );
-                            d.apply_room_meta(topic.clone(), background_id.clone(), cx);
+                            d.apply_room_meta(
+                                topic.clone(),
+                                background_id.clone(),
+                                thread_root_ts.clone(),
+                                cx,
+                            );
                         });
                     }
                 }

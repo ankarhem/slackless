@@ -248,6 +248,9 @@ impl HuddlesView {
                     .relative()
                     .w_full()
                     .h(px(78.))
+                    .rounded_tl(px(11.))
+                    .rounded_tr(px(11.))
+                    .overflow_hidden()
                     .bg(banner_bg)
                     .cursor_pointer()
                     .on_click(cx.listener(move |_, _, _, cx| {

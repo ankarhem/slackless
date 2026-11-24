@@ -2148,12 +2148,17 @@ impl<B: Backend> Core<B> {
                         signaling_url: joined.chime.meeting.media_placement.signaling_url,
                         turn_control_url: joined.chime.meeting.media_placement.turn_control_url,
                         audio_host_url: joined.chime.meeting.media_placement.audio_host_url,
-                        thread_root_ts: joined.huddle.thread_root_ts.or_else(|| {
-                            joined
-                                .canvas
-                                .as_ref()
-                                .and_then(|c| c.root_thread_ts.clone())
-                        }),
+                        thread_root_ts: joined
+                            .huddle
+                            .thread_root_ts
+                            .filter(|ts| !ts.as_str().trim().is_empty())
+                            .or_else(|| {
+                                joined
+                                    .canvas
+                                    .as_ref()
+                                    .and_then(|c| c.root_thread_ts.clone())
+                                    .filter(|ts| !ts.as_str().trim().is_empty())
+                            }),
                         canvas_file_id: joined.canvas.as_ref().and_then(|c| c.file_id.clone()),
                         huddle_link: joined.huddle.huddle_link.or_else(|| {
                             Some(format!("https://app.slack.com/huddle/{team_id}/{channel}"))
@@ -2598,6 +2603,11 @@ impl<B: Backend> Core<B> {
                         let participants = ev.room.participants.clone();
                         let topic = ev.room.name.clone();
                         let background_id = ev.room.background_id.clone();
+                        let thread_root_ts = ev
+                            .room
+                            .thread_root_ts
+                            .clone()
+                            .filter(|ts| !ts.as_str().trim().is_empty());
                         for channel in ev.target_channels() {
                             self.events.emit(Event::HuddleUpdated {
                                 channel,
@@ -2605,6 +2615,7 @@ impl<B: Backend> Core<B> {
                                 ended,
                                 topic: topic.clone(),
                                 background_id: background_id.clone(),
+                                thread_root_ts: thread_root_ts.clone(),
                             });
                         }
                     }
