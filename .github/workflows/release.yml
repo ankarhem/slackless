@@ -1,0 +1,116 @@
+name: Release macOS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release-macos:
+    name: Build & Release macOS (arm64)
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute CalVer version (YYYY.MM.DD.xx)
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATE_PREFIX="$(date -u +%Y.%m.%d)"
+          LAST_NUM="$(git tag -l "${DATE_PREFIX}.*" \
+            | awk -F. '{print $4}' \
+            | grep -E '^[0-9]+$' \
+            | sort -n \
+            | tail -n 1 || true)"
+          if [[ -z "$LAST_NUM" ]]; then
+            NEXT_NUM=1
+          else
+            NEXT_NUM=$((10#$LAST_NUM + 1))
+          fi
+          VERSION="$(printf '%s.%02d' "$DATE_PREFIX" "$NEXT_NUM")"
+          echo "Computed release version: ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ensure native build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cmake >/dev/null || brew install cmake
+          command -v pkg-config >/dev/null || brew install pkg-config
+
+      - name: Build Slackless.app & CLI
+        env:
+          SLACKLESS_VERSION: ${{ steps.ver.outputs.version }}
+          CARGO_BUILD_JOBS: "4"
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/bundle-macos.sh --release
+          cargo build --release -p slackless-cli
+
+      - name: Package DMG, tarballs & checksums
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIST="dist"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+
+          # 1. Drag-to-Applications DMG
+          DMG_STAGE="$(mktemp -d)"
+          cp -R target/bundle/Slackless.app "$DMG_STAGE/Slackless.app"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create \
+            -volname "Slackless ${VERSION}" \
+            -srcfolder "$DMG_STAGE" \
+            -ov \
+            -format UDZO \
+            "${DIST}/Slackless-${VERSION}-macos-arm64.dmg"
+          rm -rf "$DMG_STAGE"
+
+          # 2. Compressed .app tarball (for scripted installs / auto-updater)
+          tar -C target/bundle -czf "${DIST}/Slackless-${VERSION}-macos-arm64.app.tar.gz" Slackless.app
+
+          # 3. Standalone CLI tarball
+          tar -C target/release -czf "${DIST}/slackless-cli-${VERSION}-macos-arm64.tar.gz" slackless
+
+          # 4. SHA-256 checksums
+          (cd "$DIST" && shasum -a 256 * > SHA256SUMS.txt)
+          ls -lh "$DIST"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" \
+            dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Slackless ${VERSION}" \
+            --generate-notes

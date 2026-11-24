@@ -383,7 +383,7 @@ pub fn init_file_logging(app_name: &str) -> Option<PathBuf> {
 
     tracing::info!(
         app = app_name,
-        version = env!("CARGO_PKG_VERSION"),
+        version = option_env!("SLACKLESS_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
         pid = std::process::id(),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,

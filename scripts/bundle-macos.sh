@@ -46,6 +46,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
   if [[ "$DO_INSTALL_CLI" -eq 1 ]]; then
     PKGS+=(-p slackless-cli)
   fi
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
   if [[ "$PROFILE" == "release" ]]; then
     CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release "${PKGS[@]}" --manifest-path "$ROOT/Cargo.toml"
   else
@@ -59,7 +60,7 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-VERSION="$(awk -F'"' '/^version *=/{print $2; exit}' "$ROOT/Cargo.toml")"
+VERSION="${SLACKLESS_VERSION:-$(awk -F'"' '/^version *=/{print $2; exit}' "$ROOT/Cargo.toml")}"
 APP="$ROOT/target/bundle/Slackless.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
