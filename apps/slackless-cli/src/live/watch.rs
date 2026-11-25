@@ -1,4 +1,4 @@
-//! `watch`: live RTM event stream filtering and formatting.
+//! `watch`: live RTM event stream filtering, formatting, and local store mirroring.
 
 use std::process::ExitCode;
 
@@ -6,17 +6,19 @@ use anyhow::Result;
 use slackless_core::rtm::{ConnectParams, ConnectionState, RtmClient, RtmConfig, RtmEvent};
 use slackless_core::types::{ChannelId, MessageEvent, SlackEvent};
 
+use crate::archive::Archive;
 use crate::output;
 use crate::session::resolve_session;
 use crate::{Ctx, fail};
 
-use super::session::resolve_channel;
+use super::session::resolve_channel_with;
 
 pub(crate) fn watch_reached_limit(count: Option<usize>, emitted: usize) -> bool {
     count.is_some_and(|max| emitted >= max)
 }
 
-/// `watch [--channel <ch>] [--count N]`: stream live Slack events over the RTM websocket.
+/// `watch [--channel <ch>] [--count N]`: stream live Slack events over the RTM websocket,
+/// mirroring incoming events into the local SQLite archive when present and exiting cleanly on Ctrl+C.
 pub async fn run_watch(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -27,7 +29,9 @@ pub async fn run_watch(
         Ok(session) => session,
         Err(not_signed_in) => return Ok(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
     };
-    let filter_ch = channel_arg.map(|ch| resolve_channel(&session.team_id, ch).0);
+    let mut archive = Archive::open_rw(&session.team_id).ok().flatten();
+    let filter_ch =
+        channel_arg.map(|ch| resolve_channel_with(archive.as_ref(), &session.team_id, ch).0);
     let mut cfg = RtmConfig::new(ConnectParams::new(session.xoxc_token.clone()));
     cfg.d_cookie = Some(session.d_cookie.clone());
     let (_rtm, mut rx, driver) = match RtmClient::new(cfg) {
@@ -37,23 +41,38 @@ pub async fn run_watch(
     let driver_task = tokio::spawn(driver);
     let mut emitted = 0usize;
 
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            RtmEvent::State(ConnectionState::Disconnected { reason }) => {
-                driver_task.abort();
-                return Ok(fail(ctx, "disconnected", &reason));
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break;
             }
-            RtmEvent::Event(slack_ev) => {
-                let maybe_out = format_watch_event(&slack_ev, filter_ch.as_ref());
-                if let Some((json_val, human_line)) = maybe_out {
-                    output::emit(ctx.json, &json_val, &human_line);
-                    emitted += 1;
-                    if watch_reached_limit(count, emitted) {
-                        break;
+            ev = rx.recv() => {
+                match ev {
+                    Some(RtmEvent::State(ConnectionState::Disconnected { reason })) => {
+                        driver_task.abort();
+                        return Ok(fail(ctx, "disconnected", &reason));
                     }
+                    Some(RtmEvent::Event(slack_ev)) => {
+                        let maybe_out = format_watch_event(&slack_ev, filter_ch.as_ref());
+                        if let Some(archive) = archive.as_mut() {
+                            let _ = slackless_core::apply_event(
+                                archive.store_mut(),
+                                &session.team_id,
+                                slack_ev,
+                            );
+                        }
+                        if let Some((json_val, human_line)) = maybe_out {
+                            output::emit(ctx.json, &json_val, &human_line);
+                            emitted += 1;
+                            if watch_reached_limit(count, emitted) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
                 }
             }
-            _ => {}
         }
     }
     driver_task.abort();
@@ -105,7 +124,7 @@ pub(crate) fn format_watch_event(
                 "reaction": rx.reaction,
             });
             let human = format!(
-                "reaction_added\t{ch}\t{ts}\t{} :{}: \n",
+                "reaction_added\t{ch}\t{ts}\t{} :{}:\n",
                 rx.user, rx.reaction
             );
             Some((json, human))

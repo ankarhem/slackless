@@ -1,12 +1,14 @@
 use clap::Parser as _;
 
+use slackless_core::types::time::days_from_civil;
+
 use crate::cli::{
     AuthCommand, CanvasAccessArg, CanvasCommand, Cli, Commands, ExportFormat, HuddleCommand,
     ListCommand, ListReadFormat, READ_LIMIT, SEARCH_LIMIT, SavedCommand, StatusCommand,
 };
-use crate::commands::maintenance::format_stats_human;
-use crate::commands::messages::format_markdown_export;
-use crate::commands::{days_from_civil, parse_since_cutoff};
+use crate::commands::maintenance::{StatsSummary, format_stats_human};
+use crate::commands::messages::{format_markdown_export, read_channel_messages};
+use crate::commands::parse_since_cutoff;
 use crate::output::{MessageRow, ReactionRow};
 
 #[test]
@@ -37,16 +39,16 @@ fn formats_markdown_export_and_stats_human() {
     assert!(md.contains("_Files:_ notes.md"));
     assert!(md.contains(":tada: 2"));
 
-    let stats = format_stats_human(
-        "T1",
-        Some(std::path::Path::new("/tmp/T1.sqlite")),
-        2 * 1024 * 1024,
-        42,
-        50,
-        7,
-        12,
-        1,
-    );
+    let stats = format_stats_human(&StatsSummary {
+        workspace: "T1",
+        db_path: Some(std::path::Path::new("/tmp/T1.sqlite")),
+        db_bytes: 2 * 1024 * 1024,
+        messages: 42,
+        revisions: 50,
+        conversations: 7,
+        users: 12,
+        offline_queued: 1,
+    });
     assert!(stats.contains("2.0 MiB"));
     assert!(stats.contains("42 (50 revisions)"));
     assert!(stats.contains("Offline queue:\t1"));
@@ -181,31 +183,40 @@ fn parse_since_cutoff_validates_calendar_dates_leap_years_and_edges() {
 
 #[test]
 fn format_stats_human_covers_b_kib_mib_and_none_path() {
-    let bytes = format_stats_human("T1", None, 512, 1, 2, 3, 4, 0);
+    let bytes = format_stats_human(&StatsSummary {
+        workspace: "T1",
+        db_path: None,
+        db_bytes: 512,
+        messages: 1,
+        revisions: 2,
+        conversations: 3,
+        users: 4,
+        offline_queued: 0,
+    });
     assert!(bytes.contains("Database:\t(unknown) (512 B)"));
 
-    let kib = format_stats_human(
-        "T1",
-        Some(std::path::Path::new("/db/T1.sqlite")),
-        1536,
-        10,
-        12,
-        2,
-        5,
-        0,
-    );
+    let kib = format_stats_human(&StatsSummary {
+        workspace: "T1",
+        db_path: Some(std::path::Path::new("/db/T1.sqlite")),
+        db_bytes: 1536,
+        messages: 10,
+        revisions: 12,
+        conversations: 2,
+        users: 5,
+        offline_queued: 0,
+    });
     assert!(kib.contains("Database:\t/db/T1.sqlite (1.5 KiB)"));
 
-    let mib = format_stats_human(
-        "T1",
-        Some(std::path::Path::new("/db/T1.sqlite")),
-        3 * 1024 * 1024,
-        100,
-        150,
-        8,
-        20,
-        2,
-    );
+    let mib = format_stats_human(&StatsSummary {
+        workspace: "T1",
+        db_path: Some(std::path::Path::new("/db/T1.sqlite")),
+        db_bytes: 3 * 1024 * 1024,
+        messages: 100,
+        revisions: 150,
+        conversations: 8,
+        users: 20,
+        offline_queued: 2,
+    });
     assert!(mib.contains("3.0 MiB"));
 }
 
@@ -276,20 +287,13 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(cli.json);
     assert_eq!(cli.workspace.as_deref(), Some("T123"));
     match cli.command {
-        Commands::Search {
-            query,
-            limit,
-            all_workspaces,
-            include_deleted,
-            format,
-            out,
-        } => {
-            assert_eq!(query, "launch in:#eng");
-            assert_eq!(limit, SEARCH_LIMIT);
-            assert!(!all_workspaces);
-            assert!(!include_deleted);
-            assert_eq!(format, None);
-            assert_eq!(out, None);
+        Commands::Search(args) => {
+            assert_eq!(args.query, "launch in:#eng");
+            assert_eq!(args.limit, SEARCH_LIMIT);
+            assert!(!args.all_workspaces);
+            assert!(!args.include_deleted);
+            assert_eq!(args.format, None);
+            assert_eq!(args.out, None);
         }
         _ => panic!("expected Search"),
     }
@@ -309,16 +313,11 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(cli.json);
     assert_eq!(cli.workspace.as_deref(), Some("T9"));
     match cli.command {
-        Commands::Read {
-            channel,
-            limit,
-            since,
-            include_deleted,
-        } => {
-            assert_eq!(channel, "#general");
-            assert_eq!(limit, READ_LIMIT);
-            assert_eq!(since.as_deref(), Some("24h"));
-            assert!(!include_deleted);
+        Commands::Read(args) => {
+            assert_eq!(args.channel, "#general");
+            assert_eq!(args.limit, READ_LIMIT);
+            assert_eq!(args.since.as_deref(), Some("24h"));
+            assert!(!args.include_deleted);
         }
         _ => panic!("expected Read"),
     }
@@ -327,28 +326,19 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         Cli::try_parse_from(["slackless", "search", "foo", "--include-deleted"])
             .unwrap()
             .command,
-        Commands::Search {
-            include_deleted: true,
-            ..
-        }
+        Commands::Search(args) if args.include_deleted
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "read", "#eng", "--include-deleted"])
             .unwrap()
             .command,
-        Commands::Read {
-            include_deleted: true,
-            ..
-        }
+        Commands::Read(args) if args.include_deleted
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "send", "#eng", "hello", "--allow-secrets"])
             .unwrap()
             .command,
-        Commands::Send {
-            allow_secrets: true,
-            ..
-        }
+        Commands::Send(args) if args.allow_secrets
     ));
 
     // Pre-send secret guard blocks API keys unless --allow-secrets is set.
@@ -376,14 +366,16 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         ])
         .unwrap()
         .command,
-        Commands::Huddle {
-            command: HuddleCommand::Transcripts {
-                channel: Some(ref ch),
-                search: Some(ref q),
-                lang: Some(ref l),
-                ..
-            }
-        } if ch == "#eng" && q == "möte" && l == "sv"
+        Commands::Huddle { command }
+            if matches!(
+                command.as_ref(),
+                HuddleCommand::Transcripts {
+                    channel: Some(ch),
+                    search: Some(q),
+                    lang: Some(l),
+                    ..
+                } if ch == "#eng" && q == "möte" && l == "sv"
+            )
     ));
     assert!(matches!(
         Cli::try_parse_from([
@@ -396,9 +388,8 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         ])
         .unwrap()
         .command,
-        Commands::Huddle {
-            command: HuddleCommand::Join { ref transcribe, .. }
-        } if transcribe == "parakeet"
+        Commands::Huddle { command }
+            if matches!(command.as_ref(), HuddleCommand::Join { transcribe, .. } if transcribe == "parakeet")
     ));
 
     // Thread live, digest defaults, upload multi-file, export defaults, nested subcommands.
@@ -406,15 +397,11 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         Cli::try_parse_from(["slackless", "thread", "#eng", "1700.1", "--live"])
             .unwrap()
             .command,
-        Commands::Thread {
-            live: true,
-            limit: 200,
-            ..
-        }
+        Commands::Thread(args) if args.live && args.limit == 200
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "digest"]).unwrap().command,
-        Commands::Digest { ref since, all_workspaces: false, limit: 25 } if since == "24h"
+        Commands::Digest(args) if args.since == "24h" && !args.all_workspaces && args.limit == 25
     ));
     assert!(matches!(
         Cli::try_parse_from([
@@ -427,35 +414,33 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
             "here",
             "--thread-ts",
             "1700.1",
+            "--allow-secrets",
         ])
         .unwrap()
         .command,
-        Commands::Upload { ref files, comment: Some(_), thread_ts: Some(_), .. } if files.len() == 2
+        Commands::Upload(args)
+            if args.files.len() == 2
+                && args.comment.is_some()
+                && args.thread_ts.is_some()
+                && args.allow_secrets
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "export", "#eng"])
             .unwrap()
             .command,
-        Commands::Export {
-            format: ExportFormat::Md,
-            limit: 10_000,
-            out: None,
-            ..
-        }
+        Commands::Export(args)
+            if args.format == ExportFormat::Md && args.limit == 10_000 && args.out.is_none()
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "mark-thread", "#eng", "1700.1", "--unread"])
             .unwrap()
             .command,
-        Commands::MarkThread {
-            unread: true,
-            ts: None,
-            ..
-        }
+        Commands::MarkThread(args) if args.unread && args.ts.is_none()
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "saved", "list"]).unwrap().command,
-        Commands::Saved { command: SavedCommand::List { ref filter, limit: 50 } } if filter == "saved"
+        Commands::Saved { command }
+            if matches!(command.as_ref(), SavedCommand::List { filter, limit: 50 } if filter == "saved")
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "unschedule", "#eng", "Dr01"]).unwrap().command,
@@ -465,20 +450,21 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         Cli::try_parse_from(["slackless", "canvas", "read", "F1", "--html"])
             .unwrap()
             .command,
-        Commands::Canvas {
-            command: CanvasCommand::Read { html: true, .. }
-        }
+        Commands::Canvas { command }
+            if matches!(command.as_ref(), CanvasCommand::Read { html: true, .. })
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "list", "read", "F2", "--format", "csv"])
             .unwrap()
             .command,
-        Commands::List {
-            command: ListCommand::Read {
-                format: ListReadFormat::Csv,
-                ..
-            }
-        }
+        Commands::List { command }
+            if matches!(
+                command.as_ref(),
+                ListCommand::Read {
+                    format: ListReadFormat::Csv,
+                    ..
+                }
+            )
     ));
     assert!(matches!(
         Cli::try_parse_from([
@@ -493,12 +479,14 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         ])
         .unwrap()
         .command,
-        Commands::Status {
-            command: StatusCommand::Set {
-                expires_in: Some(1800),
-                ..
-            }
-        }
+        Commands::Status { command }
+            if matches!(
+                command.as_ref(),
+                StatusCommand::Set {
+                    expires_in: Some(1800),
+                    ..
+                }
+            )
     ));
     assert!(matches!(
         Cli::try_parse_from([
@@ -512,21 +500,22 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         ])
         .unwrap()
         .command,
-        Commands::Huddle {
-            command: HuddleCommand::Join {
-                muted: true,
-                duration: Some(5),
-                ..
-            }
-        }
+        Commands::Huddle { command }
+            if matches!(
+                command.as_ref(),
+                HuddleCommand::Join {
+                    muted: true,
+                    duration: Some(5),
+                    ..
+                }
+            )
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "auth", "login", "acme"])
             .unwrap()
             .command,
-        Commands::Auth {
-            command: AuthCommand::Login { domain: Some(_) }
-        }
+        Commands::Auth { command }
+            if matches!(command.as_ref(), AuthCommand::Login { domain: Some(_) })
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "update", "--check"])
@@ -585,26 +574,25 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
 
 #[test]
 fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
+    let parse_canvas = |args: &[&str]| -> CanvasCommand {
+        match Cli::try_parse_from(args).unwrap().command {
+            Commands::Canvas { command } => *command,
+            _ => panic!("expected Canvas command for {args:?}"),
+        }
+    };
+
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "info", "F123"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Info { ref canvas_id }
-        } if canvas_id == "F123"
+        parse_canvas(&["slackless", "canvas", "info", "F123"]),
+        CanvasCommand::Info { ref canvas_id } if canvas_id == "F123"
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "delete", "F123", "--json"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Delete { ref canvas_id }
-        } if canvas_id == "F123"
+        parse_canvas(&["slackless", "canvas", "delete", "F123", "--json"]),
+        CanvasCommand::Delete { ref canvas_id } if canvas_id == "F123"
     ));
 
     assert!(matches!(
-        Cli::try_parse_from([
+        parse_canvas(&[
             "slackless",
             "canvas",
             "share",
@@ -616,22 +604,18 @@ fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
             "--channel",
             "C456",
             "--post",
-        ])
-        .unwrap()
-        .command,
-        Commands::Canvas {
-            command: CanvasCommand::Share {
-                ref canvas_id,
-                access: CanvasAccessArg::Write,
-                ref channels,
-                ref users,
-                post: true,
-            }
+        ]),
+        CanvasCommand::Share {
+            ref canvas_id,
+            access: CanvasAccessArg::Write,
+            ref channels,
+            ref users,
+            post: true,
         } if canvas_id == "F123" && channels == &["#eng", "C456"] && users.is_empty()
     ));
 
     assert!(matches!(
-        Cli::try_parse_from([
+        parse_canvas(&[
             "slackless",
             "canvas",
             "share",
@@ -642,94 +626,71 @@ fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
             "U1",
             "--user",
             "U2",
-        ])
-        .unwrap()
-        .command,
-        Commands::Canvas {
-            command: CanvasCommand::Share {
-                access: CanvasAccessArg::Owner,
-                ref channels,
-                ref users,
-                post: false,
-                ..
-            }
+        ]),
+        CanvasCommand::Share {
+            access: CanvasAccessArg::Owner,
+            ref channels,
+            ref users,
+            post: false,
+            ..
         } if channels.is_empty() && users == &["U1", "U2"]
     ));
 
     assert!(matches!(
-        Cli::try_parse_from([
+        parse_canvas(&[
             "slackless",
             "canvas",
             "unshare",
             "F123",
             "--channel",
             "#eng",
-        ])
-        .unwrap()
-        .command,
-        Commands::Canvas {
-            command: CanvasCommand::Unshare {
-                ref canvas_id,
-                ref channels,
-                ref users,
-            }
+        ]),
+        CanvasCommand::Unshare {
+            ref canvas_id,
+            ref channels,
+            ref users,
         } if canvas_id == "F123" && channels == &["#eng"] && users.is_empty()
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "comments", "F123"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Comments {
-                ref canvas_id,
-                resolved: false,
-                all: false,
-            }
+        parse_canvas(&["slackless", "canvas", "comments", "F123"]),
+        CanvasCommand::Comments {
+            ref canvas_id,
+            resolved: false,
+            all: false,
         } if canvas_id == "F123"
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "comments", "F123", "--resolved"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Comments {
-                resolved: true,
-                all: false,
-                ..
-            }
+        parse_canvas(&["slackless", "canvas", "comments", "F123", "--resolved"]),
+        CanvasCommand::Comments {
+            resolved: true,
+            all: false,
+            ..
         }
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "comments", "F123", "--all"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Comments {
-                resolved: false,
-                all: true,
-                ..
-            }
+        parse_canvas(&["slackless", "canvas", "comments", "F123", "--all"]),
+        CanvasCommand::Comments {
+            resolved: false,
+            all: true,
+            ..
         }
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "comment", "F123", "Looks great"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Comment {
-                ref canvas_id,
-                ref text,
-                thread: None,
-            }
+        parse_canvas(&["slackless", "canvas", "comment", "F123", "Looks great"]),
+        CanvasCommand::Comment {
+            ref canvas_id,
+            ref text,
+            thread: None,
+            allow_secrets: false,
         } if canvas_id == "F123" && text == "Looks great"
     ));
 
     assert!(matches!(
-        Cli::try_parse_from([
+        parse_canvas(&[
             "slackless",
             "canvas",
             "comment",
@@ -737,34 +698,28 @@ fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
             "Replying",
             "--thread",
             "1700.1",
-        ])
-        .unwrap()
-        .command,
-        Commands::Canvas {
-            command: CanvasCommand::Comment {
-                ref text,
-                ref thread,
-                ..
-            }
+            "--allow-secrets",
+        ]),
+        CanvasCommand::Comment {
+            ref text,
+            ref thread,
+            allow_secrets: true,
+            ..
         } if text == "Replying" && thread.as_deref() == Some("1700.1")
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "resolve", "F123", "--thread", "1700.1"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Resolve {
-                ref canvas_id,
-                ref thread,
-                all: false,
-                reopen: false,
-            }
+        parse_canvas(&["slackless", "canvas", "resolve", "F123", "--thread", "1700.1"]),
+        CanvasCommand::Resolve {
+            ref canvas_id,
+            ref thread,
+            all: false,
+            reopen: false,
         } if canvas_id == "F123" && thread.as_deref() == Some("1700.1")
     ));
 
     assert!(matches!(
-        Cli::try_parse_from([
+        parse_canvas(&[
             "slackless",
             "canvas",
             "resolve",
@@ -772,30 +727,22 @@ fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
             "--thread",
             "1700.1",
             "--reopen",
-        ])
-        .unwrap()
-        .command,
-        Commands::Canvas {
-            command: CanvasCommand::Resolve {
-                ref thread,
-                all: false,
-                reopen: true,
-                ..
-            }
+        ]),
+        CanvasCommand::Resolve {
+            ref thread,
+            all: false,
+            reopen: true,
+            ..
         } if thread.as_deref() == Some("1700.1")
     ));
 
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "canvas", "resolve", "F123", "--all"])
-            .unwrap()
-            .command,
-        Commands::Canvas {
-            command: CanvasCommand::Resolve {
-                thread: None,
-                all: true,
-                reopen: false,
-                ..
-            }
+        parse_canvas(&["slackless", "canvas", "resolve", "F123", "--all"]),
+        CanvasCommand::Resolve {
+            thread: None,
+            all: true,
+            reopen: false,
+            ..
         }
     ));
 
@@ -842,4 +789,54 @@ fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn read_channel_messages_does_not_starve_limit_on_deleted_or_since() {
+    use slackless_core::store::Store;
+    use slackless_core::types::{ChannelId, Message, TeamId, Ts};
+
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+    let mut store = Store::open_in_memory().expect("in-memory store");
+
+    // Seed 10 messages (ts 1000..=1009); mark the newest 5 (1005..=1009) as deleted.
+    let msgs: Vec<Message> = (0..10)
+        .map(|i| Message {
+            ts: Ts::from(format!("{}.000000", 1_700_001_000 + i)),
+            text: format!("msg {i}"),
+            ..Message::default()
+        })
+        .collect();
+    store.upsert_messages(&ws, &ch, &msgs).expect("seed");
+    for i in 5..10 {
+        store
+            .record_deletion(
+                &ws,
+                &ch,
+                &Ts::from(format!("{}.000000", 1_700_001_000 + i)),
+                None,
+                None,
+            )
+            .expect("delete");
+    }
+
+    // Requesting limit=3 excluding deleted must return msg 2, 3, 4 (not 0 messages!).
+    let live = read_channel_messages(&store, &ws, &ch, 3, None, false).expect("read");
+    let texts: Vec<&str> = live.iter().map(|m| m.message.text.as_str()).collect();
+    assert_eq!(texts, vec!["msg 2", "msg 3", "msg 4"]);
+
+    // With `--since` at 1003 and limit=5 excluding deleted -> returns msg 3, 4.
+    let since_only =
+        read_channel_messages(&store, &ws, &ch, 5, Some(1_700_001_003), false).expect("since");
+    let texts: Vec<&str> = since_only.iter().map(|m| m.message.text.as_str()).collect();
+    assert_eq!(texts, vec!["msg 3", "msg 4"]);
+
+    // Including deleted with limit=3 -> returns msg 7, 8, 9.
+    let with_deleted = read_channel_messages(&store, &ws, &ch, 3, None, true).expect("all");
+    let texts: Vec<&str> = with_deleted
+        .iter()
+        .map(|m| m.message.text.as_str())
+        .collect();
+    assert_eq!(texts, vec!["msg 7", "msg 8", "msg 9"]);
 }

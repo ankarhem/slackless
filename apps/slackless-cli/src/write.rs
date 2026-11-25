@@ -1,20 +1,25 @@
-//! Live write commands (`send`, `reply`, `react`).
+//! Live write & message commands (`send`, `reply`, `edit`, `delete`, `react`, `upload`,
+//! `thread --live`, `mark-read`, `pins`, `pin`, `schedule`, `scheduled`, `unschedule`).
 //!
 //! They go through `slackless-core`'s REST client with a stored session — one deterministic
 //! request per invocation, no websocket session to keep alive. Without a stored session they
 //! print a clear "not signed in" message instead of failing hard.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use slackless_core::api::{ApiError, HistoryOpts, MessageContent, SlackApi, UploadFile};
-use slackless_core::store::{Store, StoredMessage};
+use slackless_core::api::{HistoryOpts, MessageContent, UploadFile};
+use slackless_core::store::StoredMessage;
+use slackless_core::types::time::now_epoch_secs;
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
 
-use crate::archive::{self, Archive};
+use crate::archive::Archive;
+use crate::live::session::{
+    api_fail, api_for, display_channel, resolve_channel, resolve_channel_with,
+};
 use crate::output::{self, MessageRow};
-use crate::session::resolve_session;
 use crate::{Ctx, fail};
 
 /// Resolve a message text argument: when `text == "-"`, read the body from stdin.
@@ -43,7 +48,8 @@ pub(crate) fn normalize_emoji_shortcode(emoji: &str) -> String {
     emoji.trim_matches(':').to_owned()
 }
 
-/// Pre-send secret-leak guard shared across `send`, `reply`, `edit`, and `schedule`.
+/// Pre-send secret-leak guard shared across `send`, `reply`, `edit`, `schedule`, `upload`, and
+/// `canvas comment`.
 pub(crate) fn check_secrets(ctx: &Ctx, text: &str, allow_secrets: bool) -> Option<ExitCode> {
     if allow_secrets {
         return None;
@@ -78,25 +84,26 @@ pub async fn run_send(
     if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
-    let posted = match api
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
+    let posted = match session
+        .api
         .chat_post_message(&channel, &MessageContent::plain(text), None, false)
         .await
     {
         Ok(posted) => posted,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    record_echo(&workspace, &channel, posted.message.as_ref());
+    record_echo(&session.workspace, &channel, posted.message.as_ref());
     output::emit(
         ctx.json,
         &serde_json::json!({"ok": true, "channel": channel.as_str(), "ts": posted.ts.as_str()}),
         &format!(
             "posted to {} as {}\n",
-            label.unwrap_or_else(|| channel.to_string()),
+            display_channel(&channel, label.as_deref()),
             posted.ts
         ),
     );
@@ -116,13 +123,14 @@ pub async fn run_reply(
     if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let thread_ts = Ts::from(thread_ts.to_owned());
-    let posted = match api
+    let posted = match session
+        .api
         .chat_post_message(
             &channel,
             &MessageContent::plain(text),
@@ -134,7 +142,7 @@ pub async fn run_reply(
         Ok(posted) => posted,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    record_echo(&workspace, &channel, posted.message.as_ref());
+    record_echo(&session.workspace, &channel, posted.message.as_ref());
     output::emit(
         ctx.json,
         &serde_json::json!({
@@ -146,7 +154,7 @@ pub async fn run_reply(
         &format!(
             "replied to {} in {} as {}\n",
             thread_ts,
-            label.unwrap_or_else(|| channel.to_string()),
+            display_channel(&channel, label.as_deref()),
             posted.ts
         ),
     );
@@ -161,15 +169,14 @@ pub async fn run_react(
     ts: &str,
     emoji: &str,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
-    // reactions.add takes the bare shortcode; accept ":tada:" too.
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let name = normalize_emoji_shortcode(emoji);
     let ts = Ts::from(ts.to_owned());
-    match api.reactions_add(&channel, &ts, &name).await {
+    match session.api.reactions_add(&channel, &ts, &name).await {
         Ok(()) => {
             output::emit(
                 ctx.json,
@@ -181,7 +188,7 @@ pub async fn run_react(
                 }),
                 &format!(
                     "reacted :{name}: to {} at {}\n",
-                    label.unwrap_or_else(|| channel.to_string()),
+                    display_channel(&channel, label.as_deref()),
                     ts
                 ),
             );
@@ -199,14 +206,14 @@ pub async fn run_unreact(
     ts: &str,
     emoji: &str,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let name = normalize_emoji_shortcode(emoji);
     let ts = Ts::from(ts.to_owned());
-    match api.reactions_remove(&channel, &ts, &name).await {
+    match session.api.reactions_remove(&channel, &ts, &name).await {
         Ok(()) => {
             output::emit(
                 ctx.json,
@@ -219,7 +226,7 @@ pub async fn run_unreact(
                 }),
                 &format!(
                     "removed :{name}: from {} at {}\n",
-                    label.unwrap_or_else(|| channel.to_string()),
+                    display_channel(&channel, label.as_deref()),
                     ts
                 ),
             );
@@ -242,20 +249,21 @@ pub async fn run_edit(
     if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let ts = Ts::from(ts.to_owned());
-    let updated = match api
+    let updated = match session
+        .api
         .chat_update(&channel, &ts, &MessageContent::plain(text))
         .await
     {
         Ok(msg) => msg,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    record_echo(&workspace, &channel, updated.message.as_ref());
+    record_echo(&session.workspace, &channel, updated.message.as_ref());
     output::emit(
         ctx.json,
         &serde_json::json!({
@@ -266,27 +274,41 @@ pub async fn run_edit(
         &format!(
             "updated {} in {}\n",
             updated.ts,
-            label.unwrap_or_else(|| channel.to_string()),
+            display_channel(&channel, label.as_deref()),
         ),
     );
     Ok(ExitCode::SUCCESS)
 }
 
-/// `delete <channel> <ts>`: deletes a message (`chat.delete`).
+/// `delete <channel> <ts>`: deletes a message (`chat.delete`) and mirrors the tombstone locally.
 pub async fn run_delete(
     ctx: &Ctx,
     flag: Option<&str>,
     channel_arg: &str,
     ts: &str,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let mut archive = Archive::open_rw(&session.workspace).ok().flatten();
+    let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
     let ts = Ts::from(ts.to_owned());
-    match api.chat_delete(&channel, &ts).await {
+    match session.api.chat_delete(&channel, &ts).await {
         Ok(()) => {
+            if let Some(archive) = archive.as_mut()
+                && let Err(err) = archive.store_mut().record_deletion(
+                    &session.workspace,
+                    &channel,
+                    &ts,
+                    None,
+                    None,
+                )
+            {
+                eprintln!(
+                    "slackless: deleted, but could not record deletion in local archive ({err})"
+                );
+            }
             output::emit(
                 ctx.json,
                 &serde_json::json!({
@@ -298,7 +320,7 @@ pub async fn run_delete(
                 &format!(
                     "deleted {} in {}\n",
                     ts,
-                    label.unwrap_or_else(|| channel.to_string()),
+                    display_channel(&channel, label.as_deref()),
                 ),
             );
             Ok(ExitCode::SUCCESS)
@@ -307,7 +329,7 @@ pub async fn run_delete(
     }
 }
 
-/// `upload <channel> <files...> [--comment TEXT] [--thread-ts TS]`: uploads local files via v2.
+/// `upload <channel> <files...> [--comment TEXT] [--thread-ts TS] [--allow-secrets]`: uploads local files via v2.
 pub async fn run_upload(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -315,15 +337,22 @@ pub async fn run_upload(
     paths: &[PathBuf],
     comment: Option<String>,
     thread_ts: Option<&str>,
+    allow_secrets: bool,
 ) -> Result<ExitCode> {
     if paths.is_empty() {
         return Ok(fail(ctx, "invalid_args", "provide at least one file path"));
     }
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let comment = comment.map(resolve_text_arg).transpose()?;
+    if let Some(ref text) = comment
+        && let Some(exit) = check_secrets(ctx, text, allow_secrets)
+    {
+        return Ok(exit);
+    }
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let mut uploads = Vec::with_capacity(paths.len());
     for path in paths {
         let bytes =
@@ -337,7 +366,8 @@ pub async fn run_upload(
     }
     let thread_ts = thread_ts.map(|t| Ts::from(t.to_owned()));
     let content = comment.map(MessageContent::plain);
-    let files = match api
+    let files = match session
+        .api
         .upload_files(&channel, thread_ts.as_ref(), content.as_ref(), &uploads)
         .await
     {
@@ -379,7 +409,7 @@ pub async fn run_upload(
         &format!(
             "uploaded {} file(s) to {}: {}\n",
             files.len(),
-            label.unwrap_or_else(|| channel.to_string()),
+            display_channel(&channel, label.as_deref()),
             names
         ),
     );
@@ -387,7 +417,7 @@ pub async fn run_upload(
 }
 
 /// `thread <channel> <thread_ts> --live`: fetches live thread replies via `conversations.replies`,
-/// mirrors them into the local SQLite archive, and prints them oldest first.
+/// mirrors them into the local SQLite archive in one batch transaction, and prints them oldest first.
 pub async fn run_thread_live(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -395,17 +425,19 @@ pub async fn run_thread_live(
     thread_ts_arg: &str,
     limit: u32,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let mut archive = Archive::open_or_create_rw(&session.workspace).ok();
+    let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
     let thread_ts = Ts::from(thread_ts_arg.to_owned());
     let opts = HistoryOpts {
         limit: Some(limit.clamp(1, 999)),
         ..HistoryOpts::default()
     };
-    let page = match api
+    let page = match session
+        .api
         .conversations_replies(&channel, &thread_ts, &opts, None)
         .await
     {
@@ -413,18 +445,16 @@ pub async fn run_thread_live(
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
 
-    if let Some(path) = archive::store_path(&workspace) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(mut store) = Store::open(&path) {
-            for msg in &page.items {
-                let _ = store.upsert_message(&workspace, &channel, msg);
-            }
-        }
+    if let Some(archive) = archive.as_mut() {
+        let _ = archive
+            .store_mut()
+            .upsert_messages(&session.workspace, &channel, &page.items);
     }
 
-    let archive = Archive::open(&workspace);
+    let user_names = archive
+        .as_ref()
+        .and_then(|a| a.user_display_map(&session.workspace).ok())
+        .unwrap_or_default();
     let rows: Vec<MessageRow> = page
         .items
         .into_iter()
@@ -434,7 +464,7 @@ pub async fn run_thread_live(
                 message,
                 deleted: false,
             };
-            MessageRow::from_stored(&stored, archive.as_ref(), &workspace)
+            MessageRow::from_stored(&stored, &user_names)
         })
         .collect();
     let mut human = String::new();
@@ -455,21 +485,26 @@ pub async fn run_thread_live(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `mark-read <channel> [ts]`: marks `channel` read up to `ts` (or newest locally archived message).
+/// `mark-read <channel> [ts]`: marks `channel` read up to `ts` (or newest locally archived message)
+/// and updates `conv.last_read` in the local archive when present.
 pub async fn run_mark_read(
     ctx: &Ctx,
     flag: Option<&str>,
     channel_arg: &str,
     ts_arg: Option<&str>,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let mut archive = Archive::open_rw(&session.workspace).ok().flatten();
+    let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
     let ts_str = match ts_arg {
         Some(ts) => ts.to_owned(),
-        None => match Archive::open(&workspace).and_then(|a| a.latest_ts(&workspace, &channel)) {
+        None => match archive
+            .as_ref()
+            .and_then(|a| a.latest_ts(&session.workspace, &channel).ok().flatten())
+        {
             Some(ts) => ts,
             None => {
                 return Ok(fail(
@@ -480,9 +515,21 @@ pub async fn run_mark_read(
             }
         },
     };
-    let ts = Ts::from(ts_str.clone());
-    match api.conversations_mark(&channel, &ts).await {
+    let ts = Ts::from(ts_str);
+    match session.api.conversations_mark(&channel, &ts).await {
         Ok(()) => {
+            if let Some(archive) = archive.as_mut()
+                && let Ok(Some(mut conv)) =
+                    archive.store().conversation(&session.workspace, &channel)
+            {
+                conv.last_read = Some(ts.clone());
+                if let Err(err) = archive
+                    .store_mut()
+                    .upsert_conversation(&session.workspace, &conv)
+                {
+                    eprintln!("slackless: marked read, but could not update local archive ({err})");
+                }
+            }
             output::emit(
                 ctx.json,
                 &serde_json::json!({
@@ -492,7 +539,7 @@ pub async fn run_mark_read(
                 }),
                 &format!(
                     "marked {} read at {}\n",
-                    label.unwrap_or_else(|| channel.to_string()),
+                    display_channel(&channel, label.as_deref()),
                     ts
                 ),
             );
@@ -504,16 +551,20 @@ pub async fn run_mark_read(
 
 /// `pins <channel>`: lists pinned messages and files in a conversation (`pins.list`).
 pub async fn run_pins(ctx: &Ctx, flag: Option<&str>, channel_arg: &str) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
-    let pins = match api.pins_list(&channel).await {
+    let archive = Archive::open(&session.workspace).ok().flatten();
+    let (channel, label) = resolve_channel_with(archive.as_ref(), &session.workspace, channel_arg);
+    let pins = match session.api.pins_list(&channel).await {
         Ok(pins) => pins,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    let archive = Archive::open(&workspace);
+    let user_names = archive
+        .as_ref()
+        .and_then(|a| a.user_display_map(&session.workspace).ok())
+        .unwrap_or_default();
     let mut human = String::new();
     let json_items: Vec<serde_json::Value> = pins
         .items
@@ -523,12 +574,12 @@ pub async fn run_pins(ctx: &Ctx, flag: Option<&str>, channel_arg: &str) -> Resul
             let created_by_name = item
                 .created_by
                 .as_ref()
-                .and_then(|u| archive.as_ref().and_then(|a| a.user_display(&workspace, u)));
+                .and_then(|u| user_names.get(u).cloned());
             if let Some(msg) = &item.message {
                 let who = msg
                     .user
                     .as_ref()
-                    .and_then(|u| archive.as_ref().and_then(|a| a.user_display(&workspace, u)))
+                    .and_then(|u| user_names.get(u).cloned())
                     .or_else(|| msg.user.as_ref().map(|u| u.as_str().to_owned()))
                     .unwrap_or_else(|| "unknown".to_owned());
                 human.push_str(&format!(
@@ -591,16 +642,16 @@ pub async fn run_pin(
     ts_arg: &str,
     remove: bool,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let ts = Ts::from(ts_arg.to_owned());
     let res = if remove {
-        api.pins_remove(&channel, &ts).await
+        session.api.pins_remove(&channel, &ts).await
     } else {
-        api.pins_add(&channel, &ts).await
+        session.api.pins_add(&channel, &ts).await
     };
     match res {
         Ok(()) => {
@@ -616,7 +667,7 @@ pub async fn run_pin(
                 &format!(
                     "{verb} {} in {}\n",
                     ts,
-                    label.unwrap_or_else(|| channel.to_string()),
+                    display_channel(&channel, label.as_deref()),
                 ),
             );
             Ok(ExitCode::SUCCESS)
@@ -692,21 +743,19 @@ pub async fn run_schedule(
     if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
         return Ok(exit);
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = u64::try_from(now_epoch_secs()).unwrap_or(0);
     let post_at = match parse_schedule_at(at, now) {
         Ok(ts) => ts,
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let thread_ts = thread_ts.map(|t| Ts::from(t.to_owned()));
-    match api
+    match session
+        .api
         .chat_schedule_message(
             &channel,
             post_at,
@@ -727,7 +776,7 @@ pub async fn run_schedule(
                 &format!(
                     "scheduled {} in {} for {}\n",
                     created.scheduled_message_id,
-                    label.unwrap_or_else(|| created.channel.to_string()),
+                    display_channel(&created.channel, label.as_deref()),
                     created.post_at
                 ),
             );
@@ -743,26 +792,32 @@ pub async fn run_scheduled(
     flag: Option<&str>,
     channel_arg: Option<&str>,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let channel = channel_arg.map(|arg| resolve_channel_arg(&workspace, arg).0);
-    let items = match api.chat_scheduled_messages_list(channel.as_ref()).await {
+    let archive = Archive::open(&session.workspace).ok().flatten();
+    let channel =
+        channel_arg.map(|arg| resolve_channel_with(archive.as_ref(), &session.workspace, arg).0);
+    let items = match session
+        .api
+        .chat_scheduled_messages_list(channel.as_ref())
+        .await
+    {
         Ok(items) => items,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
-    let archive = Archive::open(&workspace);
-    let names = archive
+    let names: HashMap<String, String> = archive
         .as_ref()
-        .map_or_else(Default::default, |a| a.channel_names(&workspace));
+        .and_then(|a| a.channel_names(&session.workspace).ok())
+        .unwrap_or_default();
     let mut human = String::new();
     let json_items: Vec<serde_json::Value> = items
         .iter()
         .map(|m| {
             let ch_label = names
                 .get(m.channel_id.as_str())
-                .map(|n| format!("#{n}"))
+                .cloned()
                 .unwrap_or_else(|| m.channel_id.to_string());
             human.push_str(&format!(
                 "{}\t{ch_label}\t{}\t{}\n",
@@ -798,12 +853,16 @@ pub async fn run_unschedule(
     channel_arg: &str,
     id: &str,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
-    match api.chat_delete_scheduled_message(&channel, id).await {
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
+    match session
+        .api
+        .chat_delete_scheduled_message(&channel, id)
+        .await
+    {
         Ok(()) => {
             output::emit(
                 ctx.json,
@@ -815,69 +874,12 @@ pub async fn run_unschedule(
                 &format!(
                     "cancelled scheduled message {} in {}\n",
                     id,
-                    label.unwrap_or_else(|| channel.to_string()),
+                    display_channel(&channel, label.as_deref()),
                 ),
             );
             Ok(ExitCode::SUCCESS)
         }
         Err(err) => Ok(api_fail(ctx, &err)),
-    }
-}
-
-/// The API client + workspace for a write; `Err` is the already-printed failure.
-fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<(SlackApi, TeamId), ExitCode> {
-    let session = match resolve_session(flag) {
-        Ok(session) => session,
-        Err(not_signed_in) => return Err(fail(ctx, "not_signed_in", &not_signed_in.to_string())),
-    };
-    let api = SlackApi::new(
-        &session.api_base(),
-        session.xoxc_token.clone(),
-        &session.d_cookie,
-    )
-    .map_err(|err| {
-        fail(
-            ctx,
-            "client_error",
-            &format!("building the Slack client: {err}"),
-        )
-    })?;
-    Ok((api, session.team_id))
-}
-
-/// Maps an [`ApiError`] to `(error_code, user_message)`.
-pub(crate) fn api_fail_details(err: &ApiError) -> (&'static str, String) {
-    if err.is_auth_expired() {
-        (
-            "session_rejected",
-            format!(
-                "slack rejected the stored session ({err}); sign in again with `slackless auth login`"
-            ),
-        )
-    } else {
-        ("request_failed", err.to_string())
-    }
-}
-
-/// API failures become user-actionable messages; a rejected session asks for re-auth.
-fn api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
-    let (code, message) = api_fail_details(err);
-    fail(ctx, code, &message)
-}
-
-/// The channel id + human label for a user-supplied argument (`C…`, `#name`, `@handle`).
-/// Falls back to the raw argument as an id when the archive cannot resolve it.
-fn resolve_channel_arg(workspace: &TeamId, arg: &str) -> (ChannelId, Option<String>) {
-    let archive = Archive::open(workspace);
-    match archive
-        .as_ref()
-        .and_then(|archive| archive.resolve_channel(workspace, arg))
-    {
-        Some(row) => {
-            let label = row.label();
-            (row.id, Some(label))
-        }
-        None => (ChannelId::from(arg.strip_prefix('#').unwrap_or(arg)), None),
     }
 }
 
@@ -892,12 +894,9 @@ fn record_echo(workspace: &TeamId, channel: &ChannelId, message: Option<&Message
 }
 
 fn store_echo(workspace: &TeamId, channel: &ChannelId, message: &Message) -> Result<()> {
-    let path = archive::store_path(workspace).context("resolving the archive path")?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).context("creating the archive directory")?;
-    }
-    let mut store = Store::open(&path).context("opening the local archive")?;
-    store
+    let mut archive = Archive::open_or_create_rw(workspace)?;
+    archive
+        .store_mut()
         .upsert_message(workspace, channel, message)
         .context("recording the sent message")
 }
@@ -1014,25 +1013,6 @@ mod tests {
             }
         }
         assert!(resolve_text_from("-", BrokenReader).is_err());
-    }
-
-    #[test]
-    fn api_fail_classifies_auth_expired_vs_generic() {
-        let auth_err = ApiError::from_slack_error("token_revoked");
-        let (code, msg) = api_fail_details(&auth_err);
-        assert_eq!(code, "session_rejected");
-        assert!(msg.contains("slackless auth login"));
-        assert!(msg.contains("token_revoked"));
-
-        let generic_err = ApiError::from_slack_error("channel_not_found");
-        let (code, msg) = api_fail_details(&generic_err);
-        assert_eq!(code, "request_failed");
-        assert!(msg.contains("channel_not_found"));
-
-        // Ensure api_fail itself returns FAILURE without panicking.
-        let ctx = Ctx { json: false };
-        assert_eq!(api_fail(&ctx, &auth_err), ExitCode::FAILURE);
-        assert_eq!(api_fail(&ctx, &generic_err), ExitCode::FAILURE);
     }
 
     #[test]

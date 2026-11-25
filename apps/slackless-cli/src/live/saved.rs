@@ -53,15 +53,16 @@ pub async fn run_mark_thread(
     ts: Option<&str>,
     unread: bool,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let root = Ts::from(thread_ts.to_owned());
     let cursor = mark_thread_cursor(thread_ts, ts, unread);
     let read = !unread;
-    match api
+    match session
+        .api
         .subscriptions_thread_mark(&channel, &root, &cursor)
         .await
     {
@@ -119,12 +120,12 @@ pub async fn run_saved_list(
     filter: &str,
     limit: u32,
 ) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let filter = normalize_saved_filter(filter);
-    let items = match api.saved_list(filter, limit).await {
+    let items = match session.api.saved_list(filter, limit).await {
         Ok(items) => items,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
@@ -141,13 +142,13 @@ pub async fn run_saved_add(
     ts: &str,
     due: Option<u64>,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, label) = resolve_channel(&workspace, channel_arg);
+    let (channel, label) = resolve_channel(&session.workspace, channel_arg);
     let ts = Ts::from(ts.to_owned());
-    match api.saved_add(&channel, &ts, due).await {
+    match session.api.saved_add(&channel, &ts, due).await {
         Ok(()) => {
             output::emit(
                 ctx.json,
@@ -171,13 +172,14 @@ pub async fn run_saved_done(
     channel_arg: &str,
     ts: &str,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, _) = resolve_channel(&workspace, channel_arg);
+    let (channel, _) = resolve_channel(&session.workspace, channel_arg);
     let ts = Ts::from(ts.to_owned());
-    match api
+    match session
+        .api
         .saved_update(&channel, &ts, Some(SavedMark::Completed), None)
         .await
     {
@@ -200,13 +202,13 @@ pub async fn run_saved_delete(
     channel_arg: &str,
     ts: &str,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let (channel, _) = resolve_channel(&workspace, channel_arg);
+    let (channel, _) = resolve_channel(&session.workspace, channel_arg);
     let ts = Ts::from(ts.to_owned());
-    match api.saved_delete(&channel, &ts).await {
+    match session.api.saved_delete(&channel, &ts).await {
         Ok(()) => {
             output::emit(
                 ctx.json,

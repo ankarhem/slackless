@@ -1,21 +1,26 @@
-//! `canvas` and `list` live commands and table/CSV/JSON formatters.
+//! `canvas` live commands (`read`, `create`, `edit`, `info`, `delete`, `share`, `unshare`,
+//! `comments`, `comment`, `resolve`), delegating comment filtering, error formatting, and share
+//! target helpers to `slackless_core::domain::canvas`.
 
 use std::collections::HashSet;
 use std::process::ExitCode;
 
 use anyhow::Result;
 use slackless_core::api::{
-    ApiError, CanvasAccessLevel, CanvasCommentThread, CanvasEditOp, CanvasMeta, ListCellInput,
-    ListCellInputValue, MessageContent, SlackListCellValue, SlackListData,
-    canvas_comment_channel_id, format_canvas_error, parse_canvas_meta_from_file,
+    ApiError, CanvasAccessLevel, CanvasCommentThread, CanvasEditOp, CanvasMeta, MessageContent,
+    canvas_comment_channel_id, parse_canvas_meta_from_file,
+};
+use slackless_core::domain::canvas::{
+    self as domain_canvas, CanvasCommentFilter, filter_comment_threads, format_canvas_api_error,
 };
 use slackless_core::types::{ChannelId, Ts, UserId};
 
+use crate::archive::Archive;
 use crate::output;
-use crate::write::resolve_text_arg;
-use crate::{CanvasAccessArg, Ctx, ListReadFormat, fail};
+use crate::write::{check_secrets, resolve_text_arg};
+use crate::{CanvasAccessArg, Ctx, fail};
 
-use super::session::{api_fail, api_for, classify_api_error, resolve_channel};
+use super::session::{api_for, classify_api_error, resolve_channel, resolve_channel_with};
 
 impl From<CanvasAccessArg> for CanvasAccessLevel {
     fn from(arg: CanvasAccessArg) -> Self {
@@ -28,22 +33,24 @@ impl From<CanvasAccessArg> for CanvasAccessLevel {
 }
 
 /// Map a canvas [`ApiError`] to its CLI error code and human-friendly message,
-/// translating known Slack Canvas error codes via [`format_canvas_error`].
+/// translating known Slack Canvas error codes via `slackless_core::domain::canvas`.
 pub(crate) fn classify_canvas_api_error(err: &ApiError) -> (&'static str, String) {
     if err.is_auth_expired() {
         classify_api_error(err)
     } else {
-        let message = match err {
-            ApiError::Slack(code) => format_canvas_error(code),
-            other => format_canvas_error(&other.to_string()),
-        };
-        ("request_failed", message)
+        ("request_failed", format_canvas_api_error(err))
     }
 }
 
 fn canvas_api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
     let (code, message) = classify_canvas_api_error(err);
     fail(ctx, code, &message)
+}
+
+/// Returns whether a failed `canvases.getContent` call may fall back to `fetch_canvas_html`.
+/// Never swallows authentication expiry, network/HTTP errors, rate limits, or untrusted URLs.
+pub(crate) fn should_fallback_canvas_html(err: &ApiError) -> bool {
+    matches!(err, ApiError::Slack(_)) && !err.is_auth_expired()
 }
 
 pub(crate) fn format_canvas_read(
@@ -73,22 +80,43 @@ pub async fn run_canvas_read(
     file_id: &str,
     html: bool,
 ) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let (format, title, content) = if html {
-        match api.fetch_canvas_html(file_id).await {
+        match session.api.fetch_canvas_html(file_id).await {
             Ok((t, h)) => ("html", t, h),
             Err(err) => return Ok(canvas_api_fail(ctx, &err)),
         }
     } else {
-        match api.canvases_get_content(file_id, Some("markdown")).await {
-            Ok(md) => ("markdown", file_id.to_owned(), md),
-            Err(_) => match api.fetch_canvas_html(file_id).await {
-                Ok((t, h)) => ("html", t, h),
-                Err(err) => return Ok(canvas_api_fail(ctx, &err)),
-            },
+        match session
+            .api
+            .canvases_get_content(file_id, Some("markdown"))
+            .await
+        {
+            Ok(md) => {
+                let title = match session.api.files_info(file_id).await {
+                    Ok(file) => {
+                        let meta = parse_canvas_meta_from_file(&file, None);
+                        if meta.title.trim().is_empty() {
+                            file_id.to_owned()
+                        } else {
+                            meta.title
+                        }
+                    }
+                    Err(err) if err.is_auth_expired() => return Ok(canvas_api_fail(ctx, &err)),
+                    Err(_) => file_id.to_owned(),
+                };
+                ("markdown", title, md)
+            }
+            Err(err) if should_fallback_canvas_html(&err) => {
+                match session.api.fetch_canvas_html(file_id).await {
+                    Ok((t, h)) => ("html", t, h),
+                    Err(fallback_err) => return Ok(canvas_api_fail(ctx, &fallback_err)),
+                }
+            }
+            Err(err) => return Ok(canvas_api_fail(ctx, &err)),
         }
     };
     let (json, human) = format_canvas_read(file_id, format, &title, &content);
@@ -96,21 +124,23 @@ pub async fn run_canvas_read(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `canvas create <title> [--markdown <md>] [--channel <ch>]`
+/// `canvas create <title> [--markdown <md|->] [--channel <ch>]`
 pub async fn run_canvas_create(
     ctx: &Ctx,
     flag: Option<&str>,
     title: &str,
-    markdown: Option<&str>,
+    markdown: Option<String>,
     channel_arg: Option<&str>,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let markdown = markdown.map(resolve_text_arg).transpose()?;
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let channel = channel_arg.map(|ch| resolve_channel(&workspace, ch).0);
-    match api
-        .canvases_create(Some(title), markdown, channel.as_ref())
+    let channel = channel_arg.map(|ch| resolve_channel(&session.workspace, ch).0);
+    match session
+        .api
+        .canvases_create(Some(title), markdown.as_deref(), channel.as_ref())
         .await
     {
         Ok(created) => {
@@ -144,7 +174,7 @@ pub(crate) fn build_canvas_edit_op(
     }
 }
 
-/// `canvas edit <file_id> <markdown> [--section <section_id>] [--append]`
+/// `canvas edit <file_id> <markdown|-> [--section <section_id>] [--append]`
 pub async fn run_canvas_edit(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -153,12 +183,13 @@ pub async fn run_canvas_edit(
     section: Option<String>,
     append: bool,
 ) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let markdown = resolve_text_arg(markdown)?;
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let op = build_canvas_edit_op(markdown, section, append);
-    match api.canvases_edit(file_id, &op).await {
+    match session.api.canvases_edit(file_id, &op).await {
         Ok(()) => {
             output::emit(
                 ctx.json,
@@ -178,26 +209,55 @@ pub(crate) enum CanvasShareTarget {
     Users(Vec<UserId>),
 }
 
-/// Validate XOR between `--channel` and `--user`, reject blank targets, resolve channels,
-/// and deduplicate preserving input order.
-pub(crate) fn parse_canvas_share_target(
+/// Lightweight validation of share/unshare CLI arguments before touching credentials or SQLite.
+fn validate_share_inputs(
     channels: &[String],
     users: &[String],
-    mut resolve_ch: impl FnMut(&str) -> ChannelId,
-) -> std::result::Result<CanvasShareTarget, String> {
+    post: bool,
+) -> std::result::Result<(), String> {
     if !channels.is_empty() && !users.is_empty() {
         return Err("specify either --channel or --user, not both".to_owned());
     }
     if channels.is_empty() && users.is_empty() {
         return Err("specify at least one --channel or --user".to_owned());
     }
+    if post && !users.is_empty() {
+        return Err("--post can only be used with --channel".to_owned());
+    }
+    if channels.iter().any(|c| c.trim().is_empty()) {
+        return Err("--channel value cannot be empty".to_owned());
+    }
+    if users.iter().any(|u| u.trim().is_empty()) {
+        return Err("--user value cannot be empty".to_owned());
+    }
+    Ok(())
+}
+
+/// Validate XOR between `--channel` and `--user`, reject blank targets, resolve channels,
+/// and deduplicate preserving input order. Delegates comma/multi-ID parsing to
+/// `slackless_core::domain::canvas::parse_share_targets` while still supporting `#name` / `@handle`
+/// channel resolution.
+pub(crate) fn parse_canvas_share_target(
+    channels: &[String],
+    users: &[String],
+    mut resolve_ch: impl FnMut(&str) -> ChannelId,
+) -> std::result::Result<CanvasShareTarget, String> {
+    validate_share_inputs(channels, users, false)?;
     if !channels.is_empty() {
         let mut seen = HashSet::new();
         let mut resolved = Vec::with_capacity(channels.len());
         for raw in channels {
             let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Err("--channel value cannot be empty".to_owned());
+            if trimmed.contains([',', ';']) {
+                let (parsed_chs, _) = domain_canvas::parse_share_targets(trimmed);
+                if !parsed_chs.is_empty() {
+                    for id in parsed_chs {
+                        if seen.insert(id.clone()) {
+                            resolved.push(id);
+                        }
+                    }
+                    continue;
+                }
             }
             let id = resolve_ch(trimmed);
             if seen.insert(id.clone()) {
@@ -210,12 +270,18 @@ pub(crate) fn parse_canvas_share_target(
         let mut resolved = Vec::with_capacity(users.len());
         for raw in users {
             let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Err("--user value cannot be empty".to_owned());
-            }
-            let id = UserId::from(trimmed.to_owned());
-            if seen.insert(id.clone()) {
-                resolved.push(id);
+            let (_, parsed_users) = domain_canvas::parse_share_targets(trimmed);
+            if !parsed_users.is_empty() {
+                for id in parsed_users {
+                    if seen.insert(id.clone()) {
+                        resolved.push(id);
+                    }
+                }
+            } else {
+                let id = UserId::from(trimmed.trim_start_matches('@').to_owned());
+                if seen.insert(id.clone()) {
+                    resolved.push(id);
+                }
             }
         }
         Ok(CanvasShareTarget::Users(resolved))
@@ -245,11 +311,11 @@ pub(crate) fn format_canvas_delete_result(canvas_id: &str) -> (serde_json::Value
 
 /// `canvas delete <canvas_id>`
 pub async fn run_canvas_delete(ctx: &Ctx, flag: Option<&str>, canvas_id: &str) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    match api.canvases_delete(canvas_id).await {
+    match session.api.canvases_delete(canvas_id).await {
         Ok(()) => {
             let (json, human) = format_canvas_delete_result(canvas_id);
             output::emit(ctx.json, &json, &human);
@@ -312,24 +378,25 @@ pub async fn run_canvas_share(
     users: &[String],
     post: bool,
 ) -> Result<ExitCode> {
-    // Validate CLI arguments before touching credentials or the network.
-    let precheck = match parse_canvas_share_target(channels, users, |s| ChannelId::from(s)) {
-        Ok(target) => target,
-        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
-    };
-    if let Err(msg) = validate_canvas_share_post(&precheck, post) {
+    if let Err(msg) = validate_share_inputs(channels, users, post) {
         return Ok(fail(ctx, "invalid_args", &msg));
     }
 
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let target =
-        match parse_canvas_share_target(channels, users, |ch| resolve_channel(&workspace, ch).0) {
-            Ok(target) => target,
-            Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
-        };
+    let archive = if channels.is_empty() {
+        None
+    } else {
+        Archive::open(&session.workspace).ok().flatten()
+    };
+    let target = match parse_canvas_share_target(channels, users, |ch| {
+        resolve_channel_with(archive.as_ref(), &session.workspace, ch).0
+    }) {
+        Ok(target) => target,
+        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+    };
 
     let access_level = CanvasAccessLevel::from(access);
     let (channel_ids, user_ids): (&[ChannelId], &[UserId]) = match &target {
@@ -337,7 +404,8 @@ pub async fn run_canvas_share(
         CanvasShareTarget::Users(us) => (&[], us.as_slice()),
     };
 
-    if let Err(err) = api
+    if let Err(err) = session
+        .api
         .canvases_access_set(canvas_id, access_level, channel_ids, user_ids)
         .await
     {
@@ -347,7 +415,7 @@ pub async fn run_canvas_share(
     let mut posted_to = Vec::new();
     let mut permalink: Option<String> = None;
     if post && !channel_ids.is_empty() {
-        let file = match api.files_info(canvas_id).await {
+        let file = match session.api.files_info(canvas_id).await {
             Ok(f) => f,
             Err(err) => return Ok(canvas_api_fail(ctx, &err)),
         };
@@ -360,7 +428,8 @@ pub async fn run_canvas_share(
             ));
         };
         for ch in channel_ids {
-            if let Err(err) = api
+            if let Err(err) = session
+                .api
                 .chat_post_message(ch, &MessageContent::plain(url.clone()), None, false)
                 .await
             {
@@ -416,26 +485,33 @@ pub async fn run_canvas_unshare(
     channels: &[String],
     users: &[String],
 ) -> Result<ExitCode> {
-    if let Err(msg) = parse_canvas_share_target(channels, users, |s| ChannelId::from(s)) {
+    if let Err(msg) = validate_share_inputs(channels, users, false) {
         return Ok(fail(ctx, "invalid_args", &msg));
     }
 
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let target =
-        match parse_canvas_share_target(channels, users, |ch| resolve_channel(&workspace, ch).0) {
-            Ok(target) => target,
-            Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
-        };
+    let archive = if channels.is_empty() {
+        None
+    } else {
+        Archive::open(&session.workspace).ok().flatten()
+    };
+    let target = match parse_canvas_share_target(channels, users, |ch| {
+        resolve_channel_with(archive.as_ref(), &session.workspace, ch).0
+    }) {
+        Ok(target) => target,
+        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+    };
 
     let (channel_ids, user_ids): (&[ChannelId], &[UserId]) = match &target {
         CanvasShareTarget::Channels(chs) => (chs.as_slice(), &[]),
         CanvasShareTarget::Users(us) => (&[], us.as_slice()),
     };
 
-    match api
+    match session
+        .api
         .canvases_access_delete(canvas_id, channel_ids, user_ids)
         .await
     {
@@ -507,11 +583,11 @@ pub(crate) fn format_canvas_meta(meta: &CanvasMeta) -> (serde_json::Value, Strin
 
 /// `canvas info <canvas_id>`
 pub async fn run_canvas_info(ctx: &Ctx, flag: Option<&str>, canvas_id: &str) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let file = match api.files_info(canvas_id).await {
+    let file = match session.api.files_info(canvas_id).await {
         Ok(f) => f,
         Err(err) => return Ok(canvas_api_fail(ctx, &err)),
     };
@@ -525,31 +601,21 @@ pub async fn run_canvas_info(ctx: &Ctx, flag: Option<&str>, canvas_id: &str) -> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// Filter mode for `canvas comments`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CanvasCommentFilter {
-    Open,
-    Resolved,
-    All,
+pub(crate) fn comment_filter_from_flags(resolved: bool, all: bool) -> CanvasCommentFilter {
+    if all {
+        CanvasCommentFilter::All
+    } else if resolved {
+        CanvasCommentFilter::Resolved
+    } else {
+        CanvasCommentFilter::Open
+    }
 }
 
-impl CanvasCommentFilter {
-    pub(crate) fn from_flags(resolved: bool, all: bool) -> Self {
-        if all {
-            Self::All
-        } else if resolved {
-            Self::Resolved
-        } else {
-            Self::Open
-        }
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Resolved => "resolved",
-            Self::All => "all",
-        }
+pub(crate) const fn comment_filter_as_str(filter: CanvasCommentFilter) -> &'static str {
+    match filter {
+        CanvasCommentFilter::Open => "open",
+        CanvasCommentFilter::Resolved => "resolved",
+        CanvasCommentFilter::All => "all",
     }
 }
 
@@ -557,14 +623,7 @@ pub(crate) fn filter_canvas_comments(
     threads: &[CanvasCommentThread],
     filter: CanvasCommentFilter,
 ) -> Vec<&CanvasCommentThread> {
-    threads
-        .iter()
-        .filter(|t| match filter {
-            CanvasCommentFilter::Open => !t.resolved,
-            CanvasCommentFilter::Resolved => t.resolved,
-            CanvasCommentFilter::All => true,
-        })
-        .collect()
+    filter_comment_threads(threads, filter)
 }
 
 pub(crate) fn format_canvas_comments(
@@ -620,7 +679,7 @@ pub(crate) fn format_canvas_comments(
     let json = serde_json::json!({
         "canvas_id": canvas_id,
         "comment_channel_id": comment_channel.as_str(),
-        "filter": filter.as_str(),
+        "filter": comment_filter_as_str(filter),
         "count": threads.len(),
         "threads": json_threads,
     });
@@ -635,15 +694,15 @@ pub async fn run_canvas_comments(
     resolved: bool,
     all: bool,
 ) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let all_threads = match api.canvas_comments_list(canvas_id).await {
+    let all_threads = match session.api.canvas_comments_list(canvas_id).await {
         Ok(threads) => threads,
         Err(err) => return Ok(canvas_api_fail(ctx, &err)),
     };
-    let filter = CanvasCommentFilter::from_flags(resolved, all);
+    let filter = comment_filter_from_flags(resolved, all);
     let filtered = filter_canvas_comments(&all_threads, filter);
     let (json, human) = format_canvas_comments(canvas_id, filter, &filtered);
     output::emit(ctx.json, &json, &human);
@@ -690,26 +749,31 @@ pub(crate) fn format_canvas_comment_posted(
     (json, human)
 }
 
-/// `canvas comment <canvas_id> <text> [--thread <ts>]`
+/// `canvas comment <canvas_id> <text> [--thread <ts>] [--allow-secrets]`
 pub async fn run_canvas_comment(
     ctx: &Ctx,
     flag: Option<&str>,
     canvas_id: &str,
     text: String,
     thread: Option<String>,
+    allow_secrets: bool,
 ) -> Result<ExitCode> {
     let text = resolve_text_arg(text)?;
     let thread_ts = match validate_canvas_comment_args(&text, thread.as_deref()) {
         Ok(ts) => ts,
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
+    if let Some(exit) = check_secrets(ctx, &text, allow_secrets) {
+        return Ok(exit);
+    }
 
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let comment_channel = canvas_comment_channel_id(canvas_id);
-    match api
+    match session
+        .api
         .canvas_comment_post(canvas_id, &text, thread_ts.as_ref())
         .await
     {
@@ -818,15 +882,24 @@ pub async fn run_canvas_resolve(
         Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
     };
 
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
     let comment_channel = canvas_comment_channel_id(canvas_id);
     let res = match &action {
-        CanvasResolveAction::ResolveOne(ts) => api.quip_thread_archive(&comment_channel, ts).await,
-        CanvasResolveAction::ReopenOne(ts) => api.quip_thread_unarchive(&comment_channel, ts).await,
-        CanvasResolveAction::ResolveAll => api.quip_thread_archive_all(&comment_channel).await,
+        CanvasResolveAction::ResolveOne(ts) => {
+            session.api.quip_thread_archive(&comment_channel, ts).await
+        }
+        CanvasResolveAction::ReopenOne(ts) => {
+            session
+                .api
+                .quip_thread_unarchive(&comment_channel, ts)
+                .await
+        }
+        CanvasResolveAction::ResolveAll => {
+            session.api.quip_thread_archive_all(&comment_channel).await
+        }
     };
     match res {
         Ok(()) => {
@@ -836,266 +909,4 @@ pub async fn run_canvas_resolve(
         }
         Err(err) => Ok(canvas_api_fail(ctx, &err)),
     }
-}
-
-pub(crate) fn effective_list_format(ctx_json: bool, format: ListReadFormat) -> ListReadFormat {
-    if ctx_json {
-        ListReadFormat::Json
-    } else {
-        format
-    }
-}
-
-/// `list read <list_id> [--format table|csv|json]`
-pub async fn run_list_read(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    list_id: &str,
-    format: ListReadFormat,
-) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
-        Err(exit) => return Ok(exit),
-    };
-    let data = match api.fetch_list(list_id).await {
-        Ok(data) => data,
-        Err(err) => return Ok(api_fail(ctx, &err)),
-    };
-    match effective_list_format(ctx.json, format) {
-        ListReadFormat::Json => {
-            let val = list_to_json_value(&data);
-            output::emit_json(&val);
-        }
-        ListReadFormat::Csv => print!("{}", list_to_csv(&data)),
-        ListReadFormat::Table => print!("{}", list_to_tsv(&data)),
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `list create <name> [--description <desc>] [--channel <ch>]`
-pub async fn run_list_create(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    name: &str,
-    description: Option<&str>,
-    channel_arg: Option<&str>,
-) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
-        Err(exit) => return Ok(exit),
-    };
-    let channel = channel_arg.map(|ch| resolve_channel(&workspace, ch).0);
-    match api.lists_create(name, description, channel.as_ref()).await {
-        Ok(file_id) => {
-            output::emit(
-                ctx.json,
-                &serde_json::json!({ "ok": true, "list_id": file_id, "name": name }),
-                &format!("created list {file_id} ({name})\n"),
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(err) => Ok(api_fail(ctx, &err)),
-    }
-}
-
-pub(crate) fn select_list_primary_column(data: &SlackListData) -> String {
-    data.columns
-        .iter()
-        .find(|c| c.is_primary)
-        .or_else(|| data.columns.first())
-        .map(|c| c.id.clone())
-        .unwrap_or_else(|| "name".to_owned())
-}
-
-/// `list add-item <list_id> <title> [--column <col_id>]`
-pub async fn run_list_add_item(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    list_id: &str,
-    title: String,
-    column: Option<String>,
-) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
-        Err(exit) => return Ok(exit),
-    };
-    let col_id = match column {
-        Some(c) => c,
-        None => match api.fetch_list(list_id).await {
-            Ok(data) => select_list_primary_column(&data),
-            Err(err) => return Ok(api_fail(ctx, &err)),
-        },
-    };
-    let fields = vec![ListCellInput {
-        column_id: col_id,
-        value: ListCellInputValue::Text(title.clone()),
-    }];
-    match api.lists_records_create(list_id, &fields, None).await {
-        Ok(row) => {
-            output::emit(
-                ctx.json,
-                &serde_json::json!({ "ok": true, "list_id": list_id, "row_id": row.id, "title": title }),
-                &format!("added item {} to {list_id}\n", row.id),
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(err) => Ok(api_fail(ctx, &err)),
-    }
-}
-
-/// `list delete-item <list_id> <row_id>`
-pub async fn run_list_delete_item(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    list_id: &str,
-    row_id: &str,
-) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
-        Err(exit) => return Ok(exit),
-    };
-    match api.lists_records_delete(list_id, row_id).await {
-        Ok(()) => {
-            output::emit(
-                ctx.json,
-                &serde_json::json!({ "ok": true, "list_id": list_id, "row_id": row_id }),
-                &format!("deleted item {row_id} from {list_id}\n"),
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(err) => Ok(api_fail(ctx, &err)),
-    }
-}
-
-/// `list add-message <list_id> <channel> <ts>`
-pub async fn run_list_add_message(
-    ctx: &Ctx,
-    flag: Option<&str>,
-    list_id: &str,
-    channel_arg: &str,
-    ts: &str,
-) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
-        Err(exit) => return Ok(exit),
-    };
-    let (channel, _) = resolve_channel(&workspace, channel_arg);
-    let ts = Ts::from(ts.to_owned());
-    match api.lists_add_to_list(list_id, &channel, &ts).await {
-        Ok(record_id) => {
-            output::emit(
-                ctx.json,
-                &serde_json::json!({
-                    "ok": true,
-                    "list_id": list_id,
-                    "channel": channel.as_str(),
-                    "ts": ts.as_str(),
-                    "record_id": record_id,
-                }),
-                &format!("added message {ts} to list {list_id} (record {record_id})\n"),
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(err) => Ok(api_fail(ctx, &err)),
-    }
-}
-
-pub(crate) fn cell_to_text(cell: Option<&SlackListCellValue>) -> String {
-    match cell {
-        None | Some(SlackListCellValue::Empty) => String::new(),
-        Some(SlackListCellValue::Text(s))
-        | Some(SlackListCellValue::Date(s))
-        | Some(SlackListCellValue::Number(s)) => s.clone(),
-        Some(SlackListCellValue::Users(u)) => u
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", "),
-        Some(SlackListCellValue::Select(opts)) => opts.join(", "),
-        Some(SlackListCellValue::Checkbox(b)) => b.to_string(),
-        Some(SlackListCellValue::Link { label, url }) => {
-            if label.is_empty() {
-                url.clone()
-            } else {
-                label.clone()
-            }
-        }
-    }
-}
-
-pub(crate) fn list_to_json_value(data: &SlackListData) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = data
-        .rows
-        .iter()
-        .map(|row| {
-            let mut fields = serde_json::Map::new();
-            for col in &data.columns {
-                let cell = row.cells.get(&col.id).or_else(|| row.cells.get(&col.key));
-                fields.insert(
-                    col.name.clone(),
-                    serde_json::Value::String(cell_to_text(cell)),
-                );
-            }
-            serde_json::json!({ "id": row.id, "fields": fields })
-        })
-        .collect();
-    serde_json::json!({
-        "file_id": data.file_id,
-        "title": data.title,
-        "description": data.description,
-        "columns": data.columns.iter().map(|c| serde_json::json!({
-            "id": c.id,
-            "name": c.name,
-            "kind": c.kind,
-            "is_primary": c.is_primary,
-        })).collect::<Vec<_>>(),
-        "count": rows.len(),
-        "items": rows,
-    })
-}
-
-pub(crate) fn list_to_csv(data: &SlackListData) -> String {
-    let escape = |s: &str| {
-        if s.contains(',') || s.contains('"') || s.contains('\n') {
-            format!("\"{}\"", s.replace('"', "\"\""))
-        } else {
-            s.to_owned()
-        }
-    };
-    let mut out = String::new();
-    let header: Vec<String> = data.columns.iter().map(|c| escape(&c.name)).collect();
-    out.push_str(&header.join(","));
-    out.push('\n');
-    for row in &data.rows {
-        let cells: Vec<String> = data
-            .columns
-            .iter()
-            .map(|c| {
-                let cell = row.cells.get(&c.id).or_else(|| row.cells.get(&c.key));
-                escape(&cell_to_text(cell))
-            })
-            .collect();
-        out.push_str(&cells.join(","));
-        out.push('\n');
-    }
-    out
-}
-
-pub(crate) fn list_to_tsv(data: &SlackListData) -> String {
-    let mut out = String::new();
-    let header: Vec<&str> = std::iter::once("id")
-        .chain(data.columns.iter().map(|c| c.name.as_str()))
-        .collect();
-    out.push_str(&header.join("\t"));
-    out.push('\n');
-    for row in &data.rows {
-        let mut cols = vec![row.id.clone()];
-        for c in &data.columns {
-            let cell = row.cells.get(&c.id).or_else(|| row.cells.get(&c.key));
-            cols.push(cell_to_text(cell).replace(['\t', '\n'], " "));
-        }
-        out.push_str(&cols.join("\t"));
-        out.push('\n');
-    }
-    out
 }

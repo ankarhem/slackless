@@ -54,17 +54,21 @@ pub async fn run_files(
     types: Option<String>,
     limit: u32,
 ) -> Result<ExitCode> {
-    let (api, workspace) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let channel = channel_arg.map(|ch| resolve_channel(&workspace, ch).0);
+    let channel = channel_arg.map(|ch| resolve_channel(&session.workspace, ch).0);
     let filter = FilesFilter {
         channel,
         types,
         ..FilesFilter::workspace()
     };
-    let page = match api.files_list(&filter, clamp_files_limit(limit), 1).await {
+    let page = match session
+        .api
+        .files_list(&filter, clamp_files_limit(limit), 1)
+        .await
+    {
         Ok(page) => page,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
@@ -113,11 +117,11 @@ pub async fn run_download(
     file_id: &str,
     out: Option<&Path>,
 ) -> Result<ExitCode> {
-    let (api, _) = match api_for(ctx, flag) {
-        Ok(pair) => pair,
+    let session = match api_for(ctx, flag) {
+        Ok(s) => s,
         Err(exit) => return Ok(exit),
     };
-    let file = match api.files_info(file_id).await {
+    let file = match session.api.files_info(file_id).await {
         Ok(f) => f,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };
@@ -128,7 +132,7 @@ pub async fn run_download(
             "file has no downloadable private URL",
         ));
     };
-    let bytes = match api.download_file(url).await {
+    let bytes = match session.api.download_file(url).await {
         Ok(b) => b,
         Err(err) => return Ok(api_fail(ctx, &err)),
     };

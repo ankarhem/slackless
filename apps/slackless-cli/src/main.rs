@@ -37,6 +37,7 @@ use crate::commands::maintenance::{cmd_stats, cmd_vacuum};
 use crate::commands::messages::{
     cmd_export, cmd_read, cmd_search, cmd_search_all_workspaces, cmd_thread,
 };
+use crate::live::{HuddleJoinArgs, HuddleTranscriptsArgs};
 use crate::session::resolve_workspace;
 use crate::write::{
     run_delete, run_edit, run_mark_read, run_pin, run_pins, run_react, run_reply, run_schedule,
@@ -68,7 +69,7 @@ fn main() -> ExitCode {
         .enable_all()
         .build();
     let result = match runtime {
-        Ok(rt) => rt.block_on(dispatch(cli, &ctx, flag, workspace)),
+        Ok(rt) => rt.block_on(dispatch(cli, &ctx, flag.as_deref(), workspace.as_ref())),
         Err(err) => Err(anyhow::anyhow!("starting the async runtime: {err}")),
     };
     result.unwrap_or_else(|err| fail(&ctx, "command_failed", &format!("{err:#}")))
@@ -77,332 +78,340 @@ fn main() -> ExitCode {
 async fn dispatch(
     cli: Cli,
     ctx: &Ctx,
-    flag: Option<String>,
-    workspace: Option<TeamId>,
+    flag: Option<&str>,
+    workspace: Option<&TeamId>,
 ) -> Result<ExitCode> {
-    let flag = flag.as_deref();
     match cli.command {
-        Commands::Search {
-            query,
-            limit,
-            all_workspaces,
-            format,
-            out,
-            include_deleted,
-        } => {
-            if all_workspaces {
-                cmd_search_all_workspaces(ctx, &query, limit, include_deleted)
-            } else {
-                cmd_search(
-                    ctx,
-                    workspace.as_ref(),
-                    &query,
-                    limit,
-                    format,
-                    out.as_deref(),
-                    include_deleted,
-                )
-            }
+        Commands::Search(args) if args.all_workspaces => {
+            cmd_search_all_workspaces(ctx, &args.query, args.limit, args.include_deleted)
         }
-        Commands::Read {
-            channel,
-            limit,
-            since,
-            include_deleted,
-        } => cmd_read(
+        Commands::Search(args) => cmd_search(
             ctx,
-            workspace.as_ref(),
-            &channel,
-            limit,
-            since.as_deref(),
-            include_deleted,
+            workspace,
+            &args.query,
+            args.limit,
+            args.format,
+            args.out.as_deref(),
+            args.include_deleted,
         ),
-        Commands::Thread {
-            channel,
-            thread_ts,
-            live,
-            limit,
-        } => {
-            if live {
-                run_thread_live(ctx, flag, &channel, &thread_ts, limit).await
-            } else {
-                cmd_thread(ctx, workspace.as_ref(), &channel, &thread_ts)
-            }
+        Commands::Read(args) => cmd_read(
+            ctx,
+            workspace,
+            &args.channel,
+            args.limit,
+            args.since.as_deref(),
+            args.include_deleted,
+        ),
+        Commands::Thread(args) if args.live => {
+            run_thread_live(ctx, flag, &args.channel, &args.thread_ts, args.limit).await
         }
-        Commands::Send {
-            channel,
-            text,
-            allow_secrets,
-        } => run_send(ctx, flag, &channel, text, allow_secrets).await,
-        Commands::Reply {
-            channel,
-            thread_ts,
-            text,
-            allow_secrets,
-        } => run_reply(ctx, flag, &channel, &thread_ts, text, allow_secrets).await,
-        Commands::Edit {
-            channel,
-            ts,
-            text,
-            allow_secrets,
-        } => run_edit(ctx, flag, &channel, &ts, text, allow_secrets).await,
+        Commands::Thread(args) => cmd_thread(ctx, workspace, &args.channel, &args.thread_ts),
+        Commands::Send(args) => {
+            run_send(ctx, flag, &args.channel, args.text, args.allow_secrets).await
+        }
+        Commands::Reply(args) => {
+            run_reply(
+                ctx,
+                flag,
+                &args.channel,
+                &args.thread_ts,
+                args.text,
+                args.allow_secrets,
+            )
+            .await
+        }
+        Commands::Edit(args) => {
+            run_edit(
+                ctx,
+                flag,
+                &args.channel,
+                &args.ts,
+                args.text,
+                args.allow_secrets,
+            )
+            .await
+        }
         Commands::Delete { channel, ts } => run_delete(ctx, flag, &channel, &ts).await,
-        Commands::React { channel, ts, emoji } => run_react(ctx, flag, &channel, &ts, &emoji).await,
-        Commands::Unreact { channel, ts, emoji } => {
-            run_unreact(ctx, flag, &channel, &ts, &emoji).await
+        Commands::React(args) => run_react(ctx, flag, &args.channel, &args.ts, &args.emoji).await,
+        Commands::Unreact(args) => {
+            run_unreact(ctx, flag, &args.channel, &args.ts, &args.emoji).await
         }
-        Commands::Upload {
-            channel,
-            files,
-            comment,
-            thread_ts,
-        } => run_upload(ctx, flag, &channel, &files, comment, thread_ts.as_deref()).await,
-        Commands::Channels => cmd_channels(ctx, workspace.as_ref()),
-        Commands::Dms => cmd_dms(ctx, workspace.as_ref()),
+        Commands::Upload(args) => {
+            run_upload(
+                ctx,
+                flag,
+                &args.channel,
+                &args.files,
+                args.comment,
+                args.thread_ts.as_deref(),
+                args.allow_secrets,
+            )
+            .await
+        }
+        Commands::Channels => cmd_channels(ctx, workspace),
+        Commands::Dms => cmd_dms(ctx, workspace),
         Commands::Users {
             query,
             include_deleted,
-        } => cmd_users(ctx, workspace.as_ref(), query.as_deref(), include_deleted),
-        Commands::Digest {
-            since,
-            all_workspaces,
-            limit,
-        } => cmd_digest(ctx, workspace.as_ref(), &since, all_workspaces, limit),
+        } => cmd_users(ctx, workspace, query.as_deref(), include_deleted),
+        Commands::Digest(args) => {
+            cmd_digest(ctx, workspace, &args.since, args.all_workspaces, args.limit)
+        }
         Commands::MarkRead { channel, ts } => {
             run_mark_read(ctx, flag, &channel, ts.as_deref()).await
         }
         Commands::Pins { channel } => run_pins(ctx, flag, &channel).await,
         Commands::Pin { channel, ts } => run_pin(ctx, flag, &channel, &ts, false).await,
         Commands::Unpin { channel, ts } => run_pin(ctx, flag, &channel, &ts, true).await,
-        Commands::Schedule {
-            channel,
-            text,
-            at,
-            thread_ts,
-            allow_secrets,
-        } => {
+        Commands::Schedule(args) => {
             run_schedule(
                 ctx,
                 flag,
-                &channel,
-                text,
-                &at,
-                thread_ts.as_deref(),
-                allow_secrets,
+                &args.channel,
+                args.text,
+                &args.at,
+                args.thread_ts.as_deref(),
+                args.allow_secrets,
             )
             .await
         }
         Commands::Scheduled { channel } => run_scheduled(ctx, flag, channel.as_deref()).await,
         Commands::Unschedule { channel, id } => run_unschedule(ctx, flag, &channel, &id).await,
-        Commands::Stats { breakdown } => cmd_stats(ctx, workspace.as_ref(), breakdown),
-        Commands::Vacuum => cmd_vacuum(ctx, workspace.as_ref()),
+        Commands::Stats { breakdown } => cmd_stats(ctx, workspace, breakdown),
+        Commands::Vacuum => cmd_vacuum(ctx, workspace),
         Commands::Threads { channel, limit } => {
-            cmd_threads(ctx, workspace.as_ref(), channel.as_deref(), limit)
+            cmd_threads(ctx, workspace, channel.as_deref(), limit)
         }
-        Commands::Revisions { channel, ts } => {
-            cmd_revisions(ctx, workspace.as_ref(), &channel, &ts)
-        }
-        Commands::Export {
-            channel,
-            format,
-            limit,
-            out,
-        } => cmd_export(
+        Commands::Revisions { channel, ts } => cmd_revisions(ctx, workspace, &channel, &ts),
+        Commands::Export(args) => cmd_export(
             ctx,
-            workspace.as_ref(),
-            &channel,
-            format,
-            limit,
-            out.as_deref(),
+            workspace,
+            &args.channel,
+            args.format,
+            args.limit,
+            args.out.as_deref(),
         ),
-        Commands::MarkThread {
-            channel,
-            thread_ts,
-            ts,
-            unread,
-        } => live::run_mark_thread(ctx, flag, &channel, &thread_ts, ts.as_deref(), unread).await,
-        Commands::Saved { command } => match command {
-            SavedCommand::List { filter, limit } => {
-                live::run_saved_list(ctx, flag, &filter, limit).await
-            }
-            SavedCommand::Add { channel, ts, due } => {
-                live::run_saved_add(ctx, flag, &channel, &ts, due).await
-            }
-            SavedCommand::Done { channel, ts } => {
-                live::run_saved_done(ctx, flag, &channel, &ts).await
-            }
-            SavedCommand::Delete { channel, ts } => {
-                live::run_saved_delete(ctx, flag, &channel, &ts).await
-            }
-        },
-        Commands::Files {
-            channel,
-            types,
-            limit,
-        } => live::run_files(ctx, flag, channel.as_deref(), types, limit).await,
-        Commands::Canvas { command } => match command {
-            CanvasCommand::Read { file_id, html } => {
-                live::run_canvas_read(ctx, flag, &file_id, html).await
-            }
-            CanvasCommand::Create {
-                title,
-                markdown,
-                channel,
-            } => {
-                live::run_canvas_create(ctx, flag, &title, markdown.as_deref(), channel.as_deref())
-                    .await
-            }
-            CanvasCommand::Edit {
-                file_id,
-                markdown,
-                section,
-                append,
-            } => live::run_canvas_edit(ctx, flag, &file_id, markdown, section, append).await,
-            CanvasCommand::Info { canvas_id } => live::run_canvas_info(ctx, flag, &canvas_id).await,
-            CanvasCommand::Delete { canvas_id } => {
-                live::run_canvas_delete(ctx, flag, &canvas_id).await
-            }
-            CanvasCommand::Share {
-                canvas_id,
-                access,
-                channels,
-                users,
-                post,
-            } => {
-                live::run_canvas_share(ctx, flag, &canvas_id, access, &channels, &users, post).await
-            }
-            CanvasCommand::Unshare {
-                canvas_id,
-                channels,
-                users,
-            } => live::run_canvas_unshare(ctx, flag, &canvas_id, &channels, &users).await,
-            CanvasCommand::Comments {
-                canvas_id,
-                resolved,
-                all,
-            } => live::run_canvas_comments(ctx, flag, &canvas_id, resolved, all).await,
-            CanvasCommand::Comment {
-                canvas_id,
-                text,
-                thread,
-            } => live::run_canvas_comment(ctx, flag, &canvas_id, text, thread).await,
-            CanvasCommand::Resolve {
-                canvas_id,
-                thread,
-                all,
-                reopen,
-            } => live::run_canvas_resolve(ctx, flag, &canvas_id, thread, all, reopen).await,
-        },
-        Commands::List { command } => match command {
-            ListCommand::Read { list_id, format } => {
-                live::run_list_read(ctx, flag, &list_id, format).await
-            }
-            ListCommand::Create {
-                name,
-                description,
-                channel,
-            } => {
-                live::run_list_create(ctx, flag, &name, description.as_deref(), channel.as_deref())
-                    .await
-            }
-            ListCommand::AddItem {
-                list_id,
-                title,
-                column,
-            } => live::run_list_add_item(ctx, flag, &list_id, title, column).await,
-            ListCommand::DeleteItem { list_id, row_id } => {
-                live::run_list_delete_item(ctx, flag, &list_id, &row_id).await
-            }
-            ListCommand::AddMessage {
-                list_id,
-                channel,
-                ts,
-            } => live::run_list_add_message(ctx, flag, &list_id, &channel, &ts).await,
-        },
+        Commands::MarkThread(args) => {
+            live::run_mark_thread(
+                ctx,
+                flag,
+                &args.channel,
+                &args.thread_ts,
+                args.ts.as_deref(),
+                args.unread,
+            )
+            .await
+        }
+        Commands::Saved { command } => dispatch_saved(ctx, flag, *command).await,
+        Commands::Files(args) => {
+            live::run_files(ctx, flag, args.channel.as_deref(), args.types, args.limit).await
+        }
+        Commands::Canvas { command } => dispatch_canvas(ctx, flag, *command).await,
+        Commands::List { command } => dispatch_list(ctx, flag, *command).await,
         Commands::Watch { channel, count } => {
             live::run_watch(ctx, flag, channel.as_deref(), count).await
         }
-        Commands::Huddle { command } => match command {
-            HuddleCommand::Devices => live::run_huddle_devices(ctx),
-            HuddleCommand::Cameras => live::run_huddle_cameras(ctx),
-            HuddleCommand::Screens => live::run_huddle_screens(ctx),
-            HuddleCommand::Join {
-                channel,
-                muted,
-                duration,
-                input,
-                output,
-                react,
-                camera,
-                blur,
-                screen,
-                transcribe,
-            } => {
-                live::run_huddle_join(
-                    ctx,
-                    flag,
-                    &channel,
+        Commands::Huddle { command } => dispatch_huddle(ctx, flag, *command).await,
+        Commands::Status { command } => dispatch_status(ctx, flag, *command).await,
+        Commands::Unread => live::run_unread(ctx, flag).await,
+        Commands::Download { file_id, out } => {
+            live::run_download(ctx, flag, &file_id, out.as_deref()).await
+        }
+        Commands::Backfill(args) => {
+            live::run_backfill(ctx, flag, &args.channel, args.pages, args.page_size).await
+        }
+        Commands::Update {
+            check,
+            force,
+            restart,
+        } => update::run_update(ctx, check, force, restart).await,
+        Commands::Auth { command } => dispatch_auth(ctx, flag, *command),
+    }
+}
+
+async fn dispatch_saved(ctx: &Ctx, flag: Option<&str>, command: SavedCommand) -> Result<ExitCode> {
+    match command {
+        SavedCommand::List { filter, limit } => {
+            live::run_saved_list(ctx, flag, &filter, limit).await
+        }
+        SavedCommand::Add { channel, ts, due } => {
+            live::run_saved_add(ctx, flag, &channel, &ts, due).await
+        }
+        SavedCommand::Done { channel, ts } => live::run_saved_done(ctx, flag, &channel, &ts).await,
+        SavedCommand::Delete { channel, ts } => {
+            live::run_saved_delete(ctx, flag, &channel, &ts).await
+        }
+    }
+}
+
+async fn dispatch_canvas(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    command: CanvasCommand,
+) -> Result<ExitCode> {
+    match command {
+        CanvasCommand::Read { file_id, html } => {
+            live::run_canvas_read(ctx, flag, &file_id, html).await
+        }
+        CanvasCommand::Create {
+            title,
+            markdown,
+            channel,
+        } => live::run_canvas_create(ctx, flag, &title, markdown, channel.as_deref()).await,
+        CanvasCommand::Edit {
+            file_id,
+            markdown,
+            section,
+            append,
+        } => live::run_canvas_edit(ctx, flag, &file_id, markdown, section, append).await,
+        CanvasCommand::Info { canvas_id } => live::run_canvas_info(ctx, flag, &canvas_id).await,
+        CanvasCommand::Delete { canvas_id } => live::run_canvas_delete(ctx, flag, &canvas_id).await,
+        CanvasCommand::Share {
+            canvas_id,
+            access,
+            channels,
+            users,
+            post,
+        } => live::run_canvas_share(ctx, flag, &canvas_id, access, &channels, &users, post).await,
+        CanvasCommand::Unshare {
+            canvas_id,
+            channels,
+            users,
+        } => live::run_canvas_unshare(ctx, flag, &canvas_id, &channels, &users).await,
+        CanvasCommand::Comments {
+            canvas_id,
+            resolved,
+            all,
+        } => live::run_canvas_comments(ctx, flag, &canvas_id, resolved, all).await,
+        CanvasCommand::Comment {
+            canvas_id,
+            text,
+            thread,
+            allow_secrets,
+        } => live::run_canvas_comment(ctx, flag, &canvas_id, text, thread, allow_secrets).await,
+        CanvasCommand::Resolve {
+            canvas_id,
+            thread,
+            all,
+            reopen,
+        } => live::run_canvas_resolve(ctx, flag, &canvas_id, thread, all, reopen).await,
+    }
+}
+
+async fn dispatch_list(ctx: &Ctx, flag: Option<&str>, command: ListCommand) -> Result<ExitCode> {
+    match command {
+        ListCommand::Read { list_id, format } => {
+            live::run_list_read(ctx, flag, &list_id, format).await
+        }
+        ListCommand::Create {
+            name,
+            description,
+            channel,
+        } => {
+            live::run_list_create(ctx, flag, &name, description.as_deref(), channel.as_deref())
+                .await
+        }
+        ListCommand::AddItem {
+            list_id,
+            title,
+            column,
+        } => live::run_list_add_item(ctx, flag, &list_id, title, column).await,
+        ListCommand::DeleteItem { list_id, row_id } => {
+            live::run_list_delete_item(ctx, flag, &list_id, &row_id).await
+        }
+        ListCommand::AddMessage {
+            list_id,
+            channel,
+            ts,
+        } => live::run_list_add_message(ctx, flag, &list_id, &channel, &ts).await,
+    }
+}
+
+async fn dispatch_huddle(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    command: HuddleCommand,
+) -> Result<ExitCode> {
+    match command {
+        HuddleCommand::Devices => live::run_huddle_devices(ctx),
+        HuddleCommand::Cameras => live::run_huddle_cameras(ctx),
+        HuddleCommand::Screens => live::run_huddle_screens(ctx),
+        HuddleCommand::Join {
+            channel,
+            muted,
+            duration,
+            input,
+            output,
+            react,
+            camera,
+            blur,
+            screen,
+            transcribe,
+        } => {
+            live::run_huddle_join(
+                ctx,
+                flag,
+                HuddleJoinArgs {
+                    channel,
                     muted,
                     duration,
                     input,
-                    output,
+                    output_dev: output,
                     react,
                     camera,
                     blur,
                     screen,
-                    &transcribe,
-                )
-                .await
-            }
-            HuddleCommand::Transcripts {
+                    transcribe,
+                },
+            )
+            .await
+        }
+        HuddleCommand::Transcripts {
+            channel,
+            search,
+            lang,
+            call_id,
+            format,
+            limit,
+        } => live::run_huddle_transcripts(
+            ctx,
+            flag,
+            HuddleTranscriptsArgs {
                 channel,
                 search,
                 lang,
                 call_id,
                 format,
                 limit,
-            } => Ok(live::run_huddle_transcripts(
-                ctx,
-                flag,
-                channel.as_deref(),
-                search.as_deref(),
-                lang.as_deref(),
-                call_id.as_deref(),
-                format,
-                limit,
-            )),
-            HuddleCommand::Link { channel } => live::run_huddle_link(ctx, flag, &channel).await,
-            HuddleCommand::Invite { channel, user } => {
-                live::run_huddle_invite(ctx, flag, &channel, &user).await
-            }
-        },
-        Commands::Status { command } => match command {
-            StatusCommand::Show => live::run_status_show(ctx, flag).await,
-            StatusCommand::Set {
-                text,
-                emoji,
-                expires_in,
-            } => live::run_status_set(ctx, flag, text, emoji, expires_in).await,
-            StatusCommand::Clear => live::run_status_clear(ctx, flag).await,
-        },
-        Commands::Unread => live::run_unread(ctx, flag).await,
-        Commands::Download { file_id, out } => {
-            live::run_download(ctx, flag, &file_id, out.as_deref()).await
+            },
+        ),
+        HuddleCommand::Link { channel } => live::run_huddle_link(ctx, flag, &channel).await,
+        HuddleCommand::Invite { channel, user } => {
+            live::run_huddle_invite(ctx, flag, &channel, &user).await
         }
-        Commands::Backfill {
-            channel,
-            pages,
-            page_size,
-        } => live::run_backfill(ctx, flag, &channel, pages, page_size).await,
-        Commands::Update {
-            check,
-            force,
-            restart,
-        } => update::run_update(ctx, check, force, restart),
-        Commands::Auth { command } => match command {
-            AuthCommand::Status => cmd_auth_status(ctx),
-            AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),
-            AuthCommand::Logout => cmd_auth_logout(ctx, flag),
-        },
+    }
+}
+
+async fn dispatch_status(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    command: StatusCommand,
+) -> Result<ExitCode> {
+    match command {
+        StatusCommand::Show => live::run_status_show(ctx, flag).await,
+        StatusCommand::Set {
+            text,
+            emoji,
+            expires_in,
+        } => live::run_status_set(ctx, flag, text, emoji, expires_in).await,
+        StatusCommand::Clear => live::run_status_clear(ctx, flag).await,
+    }
+}
+
+fn dispatch_auth(ctx: &Ctx, flag: Option<&str>, command: AuthCommand) -> Result<ExitCode> {
+    match command {
+        AuthCommand::Status => cmd_auth_status(ctx),
+        AuthCommand::Login { domain } => cmd_auth_login(ctx, domain),
+        AuthCommand::Logout => cmd_auth_logout(ctx, flag),
     }
 }
