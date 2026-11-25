@@ -342,7 +342,7 @@ impl Platform for ZoomPlatform {
     fn show_system_notification(&self, a0: SystemNotification) {
         self.inner.show_system_notification(a0)
     }
-    fn dismiss_system_notification(&self, a0: &str) {
+    fn dismiss_system_notification(&self, a0: &str) -> gpui::Task<()> {
         self.inner.dismiss_system_notification(a0)
     }
     fn on_system_notification_response(&self, a0: Box<dyn FnMut(SystemNotificationResponse)>) {
@@ -353,6 +353,9 @@ impl Platform for ZoomPlatform {
     }
     fn graphical_environment(&self) -> Option<GraphicalEnvironment> {
         self.inner.graphical_environment()
+    }
+    fn debug_state(&self) -> crate::blockkit::serde_json::Value {
+        self.inner.debug_state()
     }
     fn app_path(&self) -> Result<PathBuf> {
         self.inner.app_path()
@@ -749,5 +752,34 @@ impl PlatformWindow for ZoomWindow {
     }
     fn a11y_update_window_bounds(&self) {
         self.inner.a11y_update_window_bounds()
+    }
+    fn debug_state(&self) -> crate::blockkit::serde_json::Value {
+        self.inner.debug_state()
+    }
+    unsafe fn attach_native_view(
+        &self,
+        id: gpui::NativeViewId,
+        view: std::ptr::NonNull<std::ffi::c_void>,
+    ) -> Option<Box<dyn std::any::Any>> {
+        // SAFETY: forwarded directly to the wrapped `PlatformWindow` under the caller's contract.
+        unsafe { self.inner.attach_native_view(id, view) }
+    }
+    fn set_focused_native_view(&self, id: Option<gpui::NativeViewId>) {
+        self.inner.set_focused_native_view(id)
+    }
+    fn on_hit_test_native_view(
+        &self,
+        callback: Box<dyn FnMut(Point<Pixels>) -> Option<gpui::NativeViewId>>,
+    ) {
+        self.inner.on_hit_test_native_view(callback)
+    }
+    fn on_native_view_focused(&self, callback: Box<dyn FnMut(gpui::NativeViewId)>) {
+        self.inner.on_native_view_focused(callback)
+    }
+    fn on_key_down_before_native_view(&self, callback: Box<dyn FnMut(gpui::KeyDownEvent) -> bool>) {
+        self.inner.on_key_down_before_native_view(callback)
+    }
+    fn set_native_titlebar_visibility(&self, visible: bool) {
+        self.inner.set_native_titlebar_visibility(visible)
     }
 }

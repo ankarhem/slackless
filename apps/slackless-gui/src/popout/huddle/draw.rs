@@ -127,10 +127,11 @@ pub(super) fn paint_smooth_stroke(
         // Use Lyon's `StrokeTessellator` on the true cubic Bézier curve (never punches holes on
         // self-crossing loops like cursive letters or figure-8s!) with clamped miter limit and
         // clean outward semicircular end caps.
-        let opts = StrokeOptions::default()
-            .with_line_width(stroke_w)
-            .with_miter_limit(1.5)
-            .with_tolerance(0.15);
+        let opts = StrokeOptions {
+            line_width: stroke_w,
+            miter_limit: 1.5,
+            ..StrokeOptions::default()
+        };
         let mut pb = PathBuilder::default().with_style(PathStyle::Stroke(opts));
         for (ix, seg) in chain.iter().enumerate() {
             let a = to_xy(seg.a);

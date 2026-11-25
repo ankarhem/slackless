@@ -84,7 +84,7 @@ impl AudioClipRecorder {
             .default_input_config()
             .map_err(|e| HuddleError::Audio(e.to_string()))?;
         let sample_format = supported.sample_format();
-        let in_rate = supported.sample_rate().0;
+        let in_rate = supported.sample_rate();
         let in_channels = supported.channels() as usize;
         let config: cpal::StreamConfig = supported.into();
 
@@ -171,7 +171,7 @@ impl AudioClipRecorder {
         let stream = match sample_format {
             SampleFormat::F32 => device
                 .build_input_stream(
-                    &config,
+                    config,
                     move |data: &[f32], _| {
                         let mono: Vec<f32> = data
                             .chunks(in_channels.max(1))
@@ -185,7 +185,7 @@ impl AudioClipRecorder {
                 .map_err(|e| HuddleError::Audio(e.to_string()))?,
             SampleFormat::I16 => device
                 .build_input_stream(
-                    &config,
+                    config,
                     move |data: &[i16], _| {
                         let mono: Vec<f32> = data
                             .chunks(in_channels.max(1))
@@ -201,7 +201,7 @@ impl AudioClipRecorder {
                 .map_err(|e| HuddleError::Audio(e.to_string()))?,
             SampleFormat::U16 => device
                 .build_input_stream(
-                    &config,
+                    config,
                     move |data: &[u16], _| {
                         let mono: Vec<f32> = data
                             .chunks(in_channels.max(1))

@@ -130,7 +130,9 @@ pub fn detect_system_audio_loopback() -> Option<String> {
     let host = cpal::default_host();
     let inputs = host.input_devices().ok()?;
     for dev in inputs {
-        let Ok(name) = dev.name() else { continue };
+        let Some(name) = crate::audio::cpal_device_name(&dev) else {
+            continue;
+        };
         if is_loopback_device_name(&name) {
             return Some(name);
         }
@@ -263,7 +265,9 @@ impl ContentShareSession {
                 .spawn(move || {
                     let host = cpal::default_host();
                     let Some(dev) = host.input_devices().ok().and_then(|mut it| {
-                        it.find(|d| d.name().ok().as_deref() == Some(dev_name.as_str()))
+                        it.find(|d| {
+                            crate::audio::cpal_device_name(d).as_deref() == Some(dev_name.as_str())
+                        })
                     }) else {
                         return;
                     };
@@ -281,7 +285,7 @@ impl ContentShareSession {
                     let stream = match fmt {
                         SampleFormat::F32 => dev
                             .build_input_stream(
-                                &cfg,
+                                cfg,
                                 move |data: &[f32], _| {
                                     let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
                                     for frame in data.chunks(ch.max(1)) {
@@ -304,7 +308,7 @@ impl ContentShareSession {
                             .ok(),
                         SampleFormat::I16 => dev
                             .build_input_stream(
-                                &cfg,
+                                cfg,
                                 move |data: &[i16], _| {
                                     let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
                                     for frame in data.chunks(ch.max(1)) {

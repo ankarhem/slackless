@@ -578,14 +578,6 @@ fn word_range_bounded(text: &str, bounds: Range<usize>, offset: usize) -> Option
     Some((bounds.start + start)..(bounds.start + end))
 }
 
-impl gpui_kit::gpui::IntoElement for SelectableParagraph {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for SelectableParagraph {
     type RequestLayoutState = TextSelectionHandle;
     type PrepaintState = Hitbox;

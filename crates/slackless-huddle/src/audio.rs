@@ -38,18 +38,27 @@ pub struct AudioDevices {
     pub outputs: Vec<AudioDeviceInfo>,
 }
 
+/// Human-readable device name via `cpal 0.18` `DeviceTrait::description`.
+pub(crate) fn cpal_device_name(device: &cpal::Device) -> Option<String> {
+    device.description().ok().map(|d| d.name().to_owned())
+}
+
 /// Enumerate all host microphones and speakers.
 pub fn list_audio_devices() -> AudioDevices {
     let host = cpal::default_host();
-    let default_in = host.default_input_device().and_then(|d| d.name().ok());
-    let default_out = host.default_output_device().and_then(|d| d.name().ok());
+    let default_in = host
+        .default_input_device()
+        .and_then(|d| cpal_device_name(&d));
+    let default_out = host
+        .default_output_device()
+        .and_then(|d| cpal_device_name(&d));
 
     let inputs = host
         .input_devices()
         .ok()
         .into_iter()
         .flatten()
-        .filter_map(|d| d.name().ok())
+        .filter_map(|d| cpal_device_name(&d))
         .map(|name| AudioDeviceInfo {
             is_default: default_in.as_deref() == Some(name.as_str()),
             name,
@@ -61,7 +70,7 @@ pub fn list_audio_devices() -> AudioDevices {
         .ok()
         .into_iter()
         .flatten()
-        .filter_map(|d| d.name().ok())
+        .filter_map(|d| cpal_device_name(&d))
         .map(|name| AudioDeviceInfo {
             is_default: default_out.as_deref() == Some(name.as_str()),
             name,
@@ -346,7 +355,7 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
     let Ok(supported) = device.default_output_config() else {
         return;
     };
-    let rate = supported.sample_rate().0 as f32;
+    let rate = supported.sample_rate() as f32;
     let channels = supported.channels() as usize;
     let duration_secs: f32 = match chime {
         HuddleChime::Join | HuddleChime::PeerJoin => 0.34,
@@ -359,7 +368,7 @@ fn play_synthesized_huddle_chime(chime: HuddleChime, output_device: Option<&str>
 
     let config: StreamConfig = supported.into();
     let Ok(stream) = device.build_output_stream(
-        &config,
+        config,
         move |data: &mut [f32], _| {
             let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
             for frame in data.chunks_mut(channels) {
@@ -422,7 +431,7 @@ pub fn play_speaker_test_tone(output_device: Option<&str>) -> Result<()> {
                 let supported = device
                     .default_output_config()
                     .map_err(|e| HuddleError::Audio(e.to_string()))?;
-                let rate = supported.sample_rate().0 as f32;
+                let rate = supported.sample_rate() as f32;
                 let channels = supported.channels() as usize;
                 let total_frames = (rate * 0.45) as usize;
                 let frame_ix = Arc::new(AtomicU32::new(0));
@@ -431,7 +440,7 @@ pub fn play_speaker_test_tone(output_device: Option<&str>) -> Result<()> {
                 let config: StreamConfig = supported.into();
                 let stream = device
                     .build_output_stream(
-                        &config,
+                        config,
                         move |data: &mut [f32], _| {
                             let mut ix = ix_cb.load(Ordering::Relaxed) as usize;
                             for frame in data.chunks_mut(channels) {
@@ -508,7 +517,7 @@ impl MicLevelProbe {
 
                     let stream = device
                         .build_input_stream(
-                            &config,
+                            config,
                             move |data: &[f32], _| {
                                 let rms = compute_rms_interleaved(data, channels);
                                 rms_cb.store(rms.to_bits(), Ordering::Relaxed);
@@ -1067,13 +1076,13 @@ pub(crate) fn decode_opus_or_plc(
 fn current_default_input_name() -> Option<String> {
     cpal::default_host()
         .default_input_device()
-        .and_then(|d| d.name().ok())
+        .and_then(|d| cpal_device_name(&d))
 }
 
 fn current_default_output_name() -> Option<String> {
     cpal::default_host()
         .default_output_device()
-        .and_then(|d| d.name().ok())
+        .and_then(|d| cpal_device_name(&d))
 }
 
 fn run_inbound_audio_rx_loop(
@@ -1383,7 +1392,7 @@ fn select_input_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
     if let Some(target) = name.filter(|s| !s.is_empty())
         && let Ok(mut devices) = host.input_devices()
-        && let Some(found) = devices.find(|d| d.name().ok().as_deref() == Some(target))
+        && let Some(found) = devices.find(|d| cpal_device_name(d).as_deref() == Some(target))
     {
         return Ok(found);
     }
@@ -1395,7 +1404,7 @@ fn select_output_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
     if let Some(target) = name.filter(|s| !s.is_empty())
         && let Ok(mut devices) = host.output_devices()
-        && let Some(found) = devices.find(|d| d.name().ok().as_deref() == Some(target))
+        && let Some(found) = devices.find(|d| cpal_device_name(d).as_deref() == Some(target))
     {
         return Ok(found);
     }
@@ -1408,7 +1417,7 @@ fn open_input_stream(name: Option<&str>, signal: CaptureSignal) -> Result<Stream
     let supported = device
         .default_input_config()
         .map_err(|e| HuddleError::Audio(e.to_string()))?;
-    let src_rate = supported.sample_rate().0;
+    let src_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     let fmt = supported.sample_format();
     let config: StreamConfig = supported.into();
@@ -1418,7 +1427,7 @@ fn open_input_stream(name: Option<&str>, signal: CaptureSignal) -> Result<Stream
 
     let stream = match fmt {
         SampleFormat::F32 => device.build_input_stream(
-            &config,
+            config,
             move |data: &[f32], _| {
                 downmix_to_mono_f32_into(data, channels, &mut mono_scratch);
                 let samples: &[f32] = if src_rate == SAMPLE_RATE {
@@ -1448,7 +1457,7 @@ fn open_input_stream(name: Option<&str>, signal: CaptureSignal) -> Result<Stream
             None,
         ),
         SampleFormat::I16 => device.build_input_stream(
-            &config,
+            config,
             move |data: &[i16], _| {
                 mono_scratch.clear();
                 let ch_div = channels.max(1) as f32;
@@ -1504,7 +1513,7 @@ fn open_output_stream(
     let supported = device
         .default_output_config()
         .map_err(|e| HuddleError::Audio(e.to_string()))?;
-    let dst_rate = supported.sample_rate().0;
+    let dst_rate = supported.sample_rate();
     let channels = supported.channels() as usize;
     let config: StreamConfig = supported.into();
 
@@ -1513,7 +1522,7 @@ fn open_output_stream(
 
     let stream = device
         .build_output_stream(
-            &config,
+            config,
             move |data: &mut [f32], _| {
                 let out_frames = data.len() / channels.max(1);
                 let needed_48k = ((out_frames as u64 * SAMPLE_RATE as u64)
@@ -1690,7 +1699,7 @@ impl AmbientMusicPlayer {
                 let Ok(supported) = device.default_output_config() else {
                     return;
                 };
-                let rate = supported.sample_rate().0 as f32;
+                let rate = supported.sample_rate() as f32;
                 let channels = supported.channels() as usize;
                 let config: StreamConfig = supported.into();
                 const CHORDS: [[f32; 4]; 4] = [
@@ -1702,7 +1711,7 @@ impl AmbientMusicPlayer {
                 let mut sample_idx: u64 = 0;
                 let chord_samples = (rate * 3.5) as u64;
                 let stream = device.build_output_stream(
-                    &config,
+                    config,
                     move |out: &mut [f32], _| {
                         for frame in out.chunks_mut(channels) {
                             let chord_ix = ((sample_idx / chord_samples) % 4) as usize;
