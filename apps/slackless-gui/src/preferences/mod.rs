@@ -22,10 +22,10 @@ use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, FontWeight, Global,
+    App, AppContext as _, Context, Div, Edges, ElementId, Entity, EventEmitter, FontWeight, Global,
     InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    WindowAppearance, div, px,
+    WindowAppearance, anchored, deferred, div, px,
 };
 
 use crate::theme::{self, CUSTOM_ACCENTS, CUSTOM_SIDEBARS, Palette, SlackTheme};

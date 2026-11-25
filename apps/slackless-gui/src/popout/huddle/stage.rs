@@ -1032,54 +1032,150 @@ impl PopoutWindow {
         if !show_captions {
             return None;
         }
+        let latest_lang = state
+            .captions
+            .iter()
+            .rev()
+            .find_map(|(_, _, _, lang)| lang.as_deref())
+            .map(|l| l.to_ascii_uppercase());
+
+        let header = h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .pb_1()
+            .border_b_1()
+            .border_color(rgba(0xFFFFFF12))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().size(px(6.)).rounded_full().bg(rgb(0x2BAC76)))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(pal.scrim_muted)
+                            .child("Live captions"),
+                    ),
+            )
+            .when_some(latest_lang, |row, code| {
+                row.child(
+                    div()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded(px(4.))
+                        .bg(rgba(0xFFFFFF14))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(pal.scrim_fg)
+                        .child(code),
+                )
+            });
+
         let mut cap_box = v_flex()
-            .max_w(px(620.))
+            .w_full()
+            .max_w(px(680.))
+            .min_w_0()
+            .overflow_hidden()
             .px_4()
-            .py_2()
-            .gap_0p5()
-            .rounded_xl()
+            .py_3()
+            .gap_2()
+            .rounded_2xl()
             .bg(pal.scrim_bg)
             .border_1()
-            .border_color(rgba(0xFFFFFF18))
+            .border_color(rgba(0xFFFFFF1E))
             .shadow_xl()
-            .text_xs()
-            .text_color(pal.scrim_fg);
+            .child(header);
+
         if state.captions.is_empty() {
             cap_box = cap_box.child(
                 div()
+                    .w_full()
+                    .min_w_0()
+                    .text_sm()
                     .text_color(pal.scrim_muted)
-                    .child("CC · Listening for live speech transcripts…"),
+                    .child("Listening for live speech transcripts…"),
             );
         } else {
-            cap_box = cap_box.children(state.captions.iter().map(|(uid, text, is_partial)| {
+            // Group consecutive utterances from the same speaker so their name & avatar appear
+            // once per turn instead of repeating on every line, and fade older lines subtly.
+            struct CaptionTurn<'a> {
+                uid: &'a slackless_core::types::UserId,
+                lines: Vec<(usize, &'a str, bool)>,
+            }
+            let total = state.captions.len();
+            let mut groups: Vec<CaptionTurn<'_>> = Vec::new();
+            for (idx, (uid, text, is_partial, _lang)) in state.captions.iter().enumerate() {
+                if let Some(prev) = groups.last_mut()
+                    && prev.uid == uid
+                {
+                    prev.lines.push((idx, text.as_str(), *is_partial));
+                } else {
+                    groups.push(CaptionTurn {
+                        uid,
+                        lines: vec![(idx, text.as_str(), *is_partial)],
+                    });
+                }
+            }
+
+            let mut turns = v_flex().w_full().min_w_0().gap_2();
+            for CaptionTurn { uid, lines } in groups {
                 let who = self.fixtures.user_name(uid).to_owned();
-                h_flex()
-                    .gap_1p5()
-                    .child(
+                let mut turn_body = v_flex().flex_1().min_w_0().gap_0p5().child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(pal.scrim_muted)
+                        .child(who),
+                );
+                for (idx, text, is_partial) in lines {
+                    let is_latest = idx + 1 == total;
+                    let text_color = if is_partial {
+                        pal.scrim_muted
+                    } else if is_latest {
+                        pal.scrim_fg
+                    } else {
+                        pal.scrim_fg.opacity(0.72)
+                    };
+                    turn_body = turn_body.child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(pal.scrim_muted)
-                            .child(format!("{who}:")),
-                    )
-                    .child(
-                        div()
-                            .text_color(if *is_partial {
-                                pal.scrim_muted
-                            } else {
-                                pal.scrim_fg
-                            })
-                            .child(text.clone()),
-                    )
-            }));
+                            .w_full()
+                            .min_w_0()
+                            .text_sm()
+                            .line_height(px(20.))
+                            .text_color(text_color)
+                            .when(is_partial, |el| el.italic())
+                            .child(text.to_owned()),
+                    );
+                }
+                turns = turns.child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_start()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .flex_none()
+                                .mt(px(2.))
+                                .child(crate::avatars::user_chip(&self.fixtures, uid, 22.)),
+                        )
+                        .child(turn_body),
+                );
+            }
+            cap_box = cap_box.child(turns);
         }
+
         Some(
             h_flex()
                 .absolute()
-                .bottom(px(14.))
+                .bottom(px(16.))
                 .left_0()
                 .right_0()
                 .justify_center()
-                .px_4()
+                .px_6()
                 .child(cap_box),
         )
     }

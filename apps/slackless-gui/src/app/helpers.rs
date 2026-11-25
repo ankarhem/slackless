@@ -325,18 +325,32 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                                 channel: ch.clone(),
                                 call_id: "R0DEMO123".to_owned(),
                                 thread_root_ts: None,
-                                speaker_id: Some(u_alice),
+                                speaker_id: Some(u_alice.clone()),
                                 lang: Some("sv".to_owned()),
                                 source: "parakeet-v3".to_owned(),
                                 text: "Perfekt, jag tar ett snabbt möte med teamet och pingar i kanalen."
                                     .to_owned(),
                                 at_ms: 1_764_082_225_000,
                             },
+                            slackless_core::store::HuddleTranscriptSegment {
+                                id: 4,
+                                channel: ch.clone(),
+                                call_id: "R0DEMO123".to_owned(),
+                                thread_root_ts: None,
+                                speaker_id: Some(u_alice),
+                                lang: Some("en".to_owned()),
+                                source: "parakeet-v3".to_owned(),
+                                text: "Also let's make sure the deploy pipeline stays green after the release."
+                                    .to_owned(),
+                                at_ms: 1_764_082_240_000,
+                            },
                         ];
                         app.open_huddle_transcript_with(
                             "R0DEMO123".to_owned(),
                             ch,
                             segs,
+                            Some(2),
+                            Some("metrics".to_owned()),
                             window,
                             cx,
                         );
@@ -344,6 +358,54 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                     "huddle:popout" => {
                         let ch = app.channel.clone();
                         app.join_huddle_in(ch, window, cx);
+                        app.pop_out_huddle(window, cx);
+                    }
+                    "huddle:captions" => {
+                        app.select("C0GENERAL".into(), cx);
+                        app.start_huddle(window, cx);
+                        let u_self = app.fixtures.self_user.clone();
+                        let u_peer = app
+                            .fixtures
+                            .users
+                            .iter()
+                            .find(|u| u.id != u_self)
+                            .map(|u| u.id.clone())
+                            .unwrap_or_else(|| u_self.clone());
+                        if let Some(dock) = app.huddle_dock.clone() {
+                            dock.update(cx, |d, cx| {
+                                d.set_captions_local(true, cx);
+                                d.apply_data_event(
+                                    &slackless_core::huddle::HuddleDataEvent::Caption {
+                                        user: u_self.clone(),
+                                        text: "Texten verkar vara lite utanför...".to_owned(),
+                                        is_partial: false,
+                                        at_ms: 1_764_082_200_000,
+                                        lang: Some("sv".to_owned()),
+                                    },
+                                    cx,
+                                );
+                                d.apply_data_event(
+                                    &slackless_core::huddle::HuddleDataEvent::Caption {
+                                        user: u_self.clone(),
+                                        text: "Hej, hej, hej, hej, hej. Vad ska du göra åt den UI-buggen för det kommer ju att gå utanför och bli en väldigt lång overflowing line in this box som måste wrappa snyggt.".to_owned(),
+                                        is_partial: false,
+                                        at_ms: 1_764_082_205_000,
+                                        lang: Some("sv".to_owned()),
+                                    },
+                                    cx,
+                                );
+                                d.apply_data_event(
+                                    &slackless_core::huddle::HuddleDataEvent::Caption {
+                                        user: u_peer,
+                                        text: "Modellen verkar ju vara riktigt bra i alla fall, och nu wrappar allt innanför kortet.".to_owned(),
+                                        is_partial: false,
+                                        at_ms: 1_764_082_210_000,
+                                        lang: Some("sv".to_owned()),
+                                    },
+                                    cx,
+                                );
+                            });
+                        }
                         app.pop_out_huddle(window, cx);
                     }
                     "profile" => {

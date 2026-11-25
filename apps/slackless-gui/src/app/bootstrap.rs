@@ -1162,6 +1162,8 @@ impl App {
                             this.open_huddle_transcript(
                                 call_id.clone(),
                                 channel.clone(),
+                                None,
+                                None,
                                 window,
                                 cx,
                             );

@@ -194,8 +194,20 @@ pub(super) fn subscribe_workspace(
                 SearchEvent::OpenProfile(user) => {
                     this.open_profile(user.clone(), cx);
                 }
-                SearchEvent::OpenTranscript { call_id, channel } => {
-                    this.open_huddle_transcript(call_id.clone(), channel.clone(), window, cx);
+                SearchEvent::OpenTranscript {
+                    call_id,
+                    channel,
+                    highlight_segment_id,
+                    highlight_query,
+                } => {
+                    this.open_huddle_transcript(
+                        call_id.clone(),
+                        channel.clone(),
+                        *highlight_segment_id,
+                        highlight_query.clone(),
+                        window,
+                        cx,
+                    );
                 }
                 SearchEvent::RemoteMessages { query, sort, page } => {
                     this.bridge.send(Command::SearchRemoteMessages {

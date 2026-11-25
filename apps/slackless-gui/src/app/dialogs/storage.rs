@@ -657,11 +657,14 @@ impl App {
     }
 
     /// Open a modal viewer for one locally archived text-only huddle transcript (with speaker
-    /// attribution, per-line EN/SV language badges, Copy Markdown, and Delete).
+    /// avatars, grouped turns, search-hit spotlighting, language badges, Copy Markdown, Go to
+    /// channel, and Delete).
     pub(in crate::app) fn open_huddle_transcript(
         &self,
         call_id: String,
         channel: ChannelId,
+        highlight_segment_id: Option<i64>,
+        highlight_query: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -675,23 +678,72 @@ impl App {
             } else {
                 Vec::new()
             };
-        self.open_huddle_transcript_with(call_id, channel, segments, window, cx);
+        self.open_huddle_transcript_with(
+            call_id,
+            channel,
+            segments,
+            highlight_segment_id,
+            highlight_query,
+            window,
+            cx,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::app) fn open_huddle_transcript_with(
         &self,
         call_id: String,
         channel: ChannelId,
         segments: Vec<slackless_core::store::HuddleTranscriptSegment>,
+        highlight_segment_id: Option<i64>,
+        highlight_query: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let fixtures = self.fixtures.clone();
         let ch_label = self.label(&channel);
-        let subtitle = format!(
-            "{ch_label} \u{b7} {call_id} \u{b7} {} lines",
-            segments.len()
-        );
+
+        // Compute summary metadata: duration, unique speakers, unique languages, and provider.
+        let mut unique_speakers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut unique_langs: Vec<String> = Vec::new();
+        for seg in &segments {
+            let key = seg
+                .speaker_id
+                .as_ref()
+                .map(|u| u.as_str().to_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            unique_speakers.insert(key);
+            if let Some(lang) = seg.lang.as_deref() {
+                let code = lang.to_ascii_uppercase();
+                if !unique_langs.contains(&code) {
+                    unique_langs.push(code);
+                }
+            }
+        }
+        let duration_label = match (segments.first(), segments.last()) {
+            (Some(first), Some(last)) if last.at_ms > first.at_ms => {
+                let secs = ((last.at_ms - first.at_ms) / 1_000).max(1);
+                if secs >= 3600 {
+                    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+                } else if secs >= 60 {
+                    format!("{}m {}s", secs / 60, secs % 60)
+                } else {
+                    format!("{secs}s")
+                }
+            }
+            _ => String::new(),
+        };
+        let started_stamp = segments.first().map(|s| {
+            let ts = Ts::from(format!("{}.000000", s.at_ms.div_euclid(1_000)));
+            crate::messages::list_stamp(&ts)
+        });
+        let engine_label = segments.first().map(|s| match s.source.as_str() {
+            "parakeet-v3" => "Parakeet v3",
+            "whisper-turbo" | "local-whisper" => "Whisper Turbo",
+            _ => "Slack AWS",
+        });
+
         let markdown_export = {
             let mut md = format!("# Huddle Transcript \u{2014} {ch_label} (`{call_id}`)\n\n");
             for seg in &segments {
@@ -714,96 +766,165 @@ impl App {
             }
             md
         };
+
+        // Parse search query terms (excluding filter tokens like `in:#ch` / `from:@user`) so we
+        // can highlight matched words inside the transcript with Swedish åäö diacritic folding.
+        let query_terms: Vec<Vec<char>> = highlight_query
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .filter(|tok| !tok.contains(':') && !tok.starts_with('-'))
+            .map(|tok| {
+                tok.trim_matches(|c: char| !c.is_alphanumeric())
+                    .chars()
+                    .map(fold_search_char)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| v.len() >= 2)
+            .collect();
+
+        // Group consecutive segments from the same speaker within 90 seconds into conversation
+        // turns so the transcript reads cleanly like a dialogue rather than stacked boxes.
+        struct TurnGroup<'a> {
+            speaker_id: Option<UserId>,
+            first_at_ms: i64,
+            primary_lang: Option<String>,
+            items: Vec<&'a slackless_core::store::HuddleTranscriptSegment>,
+        }
         let store_for_del = self.bridge.store().cloned();
         let team_for_del = self.bridge.team_id().cloned();
         let del_call_id = call_id.clone();
+        let jump_channel = channel.clone();
         let this = cx.weak_entity();
+        let speaker_count = unique_speakers.len();
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
-            let (border, muted, fg, accent, danger, card_bg) = (
+            let (border, muted, fg, accent, warn, card_bg, pill_bg, font_family) = (
                 theme.border,
                 theme.muted_foreground,
                 theme.foreground,
                 theme.link,
-                theme.danger,
-                theme.secondary.opacity(0.35),
+                theme.warning,
+                theme.secondary.opacity(0.32),
+                theme.secondary.opacity(0.65),
+                theme.font_family.clone(),
             );
             let copy_md = markdown_export.clone();
             let del_store = store_for_del.clone();
             let del_team = team_for_del.clone();
             let del_id = del_call_id.clone();
             let del_this = this.clone();
-            let mut list = v_flex()
-                .id("huddle-transcript-lines")
-                .max_h(px(420.))
-                .overflow_y_scroll()
-                .gap_1p5();
-            if segments.is_empty() {
-                list = list.child(
-                    div()
-                        .py_6()
-                        .text_sm()
-                        .text_color(muted)
-                        .child("No archived transcript lines found for this huddle."),
-                );
-            } else {
-                for seg in &segments {
-                    let speaker = seg
-                        .speaker_id
-                        .as_ref()
-                        .map(|u| fixtures.user_name(u).to_owned())
-                        .unwrap_or_else(|| "Speaker".to_owned());
-                    let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
-                    let clock = crate::messages::list_stamp(&ts);
-                    let lang_badge = seg.lang.as_deref().map(|l| l.to_ascii_uppercase());
-                    list = list.child(
-                        v_flex()
-                            .gap_0p5()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .bg(card_bg)
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(fg)
-                                            .child(speaker),
-                                    )
-                                    .child(div().text_xs().text_color(muted).child(clock))
-                                    .when_some(lang_badge, |row, code| {
-                                        row.child(
-                                            div()
-                                                .px_1p5()
-                                                .py(px(1.))
-                                                .rounded(px(4.))
-                                                .bg(accent.opacity(0.14))
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(accent)
-                                                .child(code),
-                                        )
-                                    }),
-                            )
-                            .child(div().text_sm().text_color(fg).child(seg.text.clone())),
-                    );
+            let jump_this = this.clone();
+            let jump_ch = jump_channel.clone();
+
+            let mut groups: Vec<TurnGroup<'_>> = Vec::new();
+            for seg in &segments {
+                let merge = groups.last().is_some_and(|g| {
+                    g.speaker_id == seg.speaker_id
+                        && seg.at_ms.saturating_sub(g.first_at_ms) <= 90_000
+                });
+                if merge && let Some(g) = groups.last_mut() {
+                    g.items.push(seg);
+                } else {
+                    groups.push(TurnGroup {
+                        speaker_id: seg.speaker_id.clone(),
+                        first_at_ms: seg.at_ms,
+                        primary_lang: seg.lang.as_deref().map(|l| l.to_ascii_uppercase()),
+                        items: vec![seg],
+                    });
                 }
             }
-            let actions = h_flex()
+
+            // Summary header bar: metadata chips + primary actions.
+            let mut meta_pills = h_flex().items_center().flex_wrap().gap_1p5();
+            if let Some(started) = &started_stamp {
+                let time_text = if duration_label.is_empty() {
+                    started.clone()
+                } else {
+                    format!("{started} \u{b7} {duration_label}")
+                };
+                meta_pills = meta_pills.child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .bg(pill_bg)
+                        .text_xs()
+                        .text_color(fg)
+                        .child(time_text),
+                );
+            }
+            if !segments.is_empty() {
+                let spk_label = if speaker_count == 1 {
+                    "1 speaker".to_owned()
+                } else {
+                    format!("{speaker_count} speakers")
+                };
+                meta_pills = meta_pills.child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .bg(pill_bg)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("{spk_label} \u{b7} {} lines", segments.len())),
+                );
+            }
+            for code in &unique_langs {
+                meta_pills = meta_pills.child(
+                    div()
+                        .px_1p5()
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .bg(accent.opacity(0.14))
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(accent)
+                        .child(code.clone()),
+                );
+            }
+            if let Some(engine) = engine_label {
+                meta_pills = meta_pills.child(
+                    div()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(border)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(engine),
+                );
+            }
+
+            let toolbar = h_flex()
+                .w_full()
                 .items_center()
                 .justify_between()
-                .gap_2()
-                .child(div().text_xs().text_color(muted).child(subtitle.clone()))
+                .gap_3()
+                .pb_3()
+                .border_b_1()
+                .border_color(border)
+                .child(div().flex_1().min_w_0().child(meta_pills))
                 .child(
                     h_flex()
+                        .flex_none()
                         .items_center()
                         .gap_1p5()
+                        .child(
+                            Button::new("transcript-go-channel")
+                                .outline()
+                                .with_size(Size::Small)
+                                .icon(IconName::Hash)
+                                .label("Channel")
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = jump_this.update(cx, |app, cx| {
+                                        app.select(jump_ch.clone(), cx);
+                                    });
+                                }),
+                        )
                         .child(
                             Button::new("transcript-copy-md")
                                 .outline()
@@ -852,11 +973,184 @@ impl App {
                             )
                         }),
                 );
-            let _ = danger;
+
+            let mut list = v_flex()
+                .id("huddle-transcript-lines")
+                .w_full()
+                .max_h(px(460.))
+                .overflow_y_scroll()
+                .gap_3()
+                .py_1();
+
+            if groups.is_empty() {
+                list = list.child(
+                    v_flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1p5()
+                        .py_8()
+                        .child(
+                            Icon::new(IconName::Headphones)
+                                .size(px(22.))
+                                .text_color(muted),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child("No archived transcript lines found for this huddle."),
+                        ),
+                );
+            } else {
+                for (g_ix, group) in groups.into_iter().enumerate() {
+                    let speaker = group
+                        .speaker_id
+                        .as_ref()
+                        .map(|u| fixtures.user_name(u).to_owned())
+                        .unwrap_or_else(|| "Speaker".to_owned());
+                    let avatar = match &group.speaker_id {
+                        Some(uid) => crate::avatars::user_chip(&fixtures, uid, 30.),
+                        None => div()
+                            .size(px(30.))
+                            .rounded_md()
+                            .bg(pill_bg)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::Headphones)
+                                    .size(px(15.))
+                                    .text_color(muted),
+                            ),
+                    };
+                    let ts = Ts::from(format!("{}.000000", group.first_at_ms.div_euclid(1_000)));
+                    let clock = crate::messages::list_stamp(&ts);
+                    let turn_lang = group.primary_lang.clone();
+
+                    let mut turn_col = v_flex().flex_1().min_w_0().gap_1().child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child(speaker),
+                            )
+                            .child(div().text_xs().text_color(muted).child(clock))
+                            .when_some(turn_lang.clone(), |row, code| {
+                                row.child(
+                                    div()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .bg(accent.opacity(0.14))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(accent)
+                                        .child(code),
+                                )
+                            }),
+                    );
+
+                    for (u_ix, seg) in group.items.into_iter().enumerate() {
+                        let is_hit = highlight_segment_id == Some(seg.id);
+                        let seg_lang = seg.lang.as_deref().map(|l| l.to_ascii_uppercase());
+                        let switched_lang = u_ix > 0 && seg_lang.is_some() && seg_lang != turn_lang;
+                        let styled_text = render_highlighted_transcript_line(
+                            &seg.text,
+                            &query_terms,
+                            fg,
+                            warn.opacity(0.28),
+                            &font_family,
+                        );
+                        let line_row = h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .items_start()
+                            .gap_2()
+                            .when(is_hit, |row| {
+                                row.px_2p5()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(accent.opacity(0.12))
+                                    .border_l_2()
+                                    .border_color(accent)
+                            })
+                            .when(!is_hit, |row| row.px_1().py(px(1.)))
+                            .when(switched_lang, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .mt(px(3.))
+                                        .px_1()
+                                        .py(px(1.))
+                                        .rounded(px(3.))
+                                        .bg(accent.opacity(0.14))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(accent)
+                                        .child(seg_lang.clone().unwrap_or_default()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .line_height(px(21.))
+                                    .text_color(fg)
+                                    .child(styled_text),
+                            )
+                            .when(is_hit, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .mt(px(3.))
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .bg(accent.opacity(0.20))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(accent)
+                                        .child("Match"),
+                                )
+                            });
+                        turn_col = turn_col.child(line_row);
+                    }
+
+                    list = list.child(
+                        h_flex()
+                            .id(("transcript-turn", g_ix))
+                            .w_full()
+                            .min_w_0()
+                            .items_start()
+                            .gap_3()
+                            .px_3()
+                            .py_2p5()
+                            .rounded_lg()
+                            .bg(card_bg)
+                            .border_1()
+                            .border_color(border.opacity(0.6))
+                            .child(div().flex_none().mt(px(2.)).child(avatar))
+                            .child(turn_col),
+                    );
+                }
+            }
+
             dialog
                 .title(format!("Huddle transcript \u{b7} {ch_label}"))
-                .w(px(620.))
-                .child(v_flex().gap_3().child(actions).child(list))
+                .w(px(680.))
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_3()
+                        .child(toolbar)
+                        .child(list),
+                )
         });
     }
 
@@ -992,4 +1286,91 @@ impl App {
         })
         .detach();
     }
+}
+
+/// Fold accented Latin characters (including Swedish `å`/`ä`/`ö`) to ASCII lowercase for
+/// diacritic-insensitive search-term highlighting inside transcript lines.
+fn fold_search_char(c: char) -> char {
+    match c.to_lowercase().next().unwrap_or(c) {
+        'å' | 'ä' | 'à' | 'á' | 'â' | 'ã' => 'a',
+        'ö' | 'ø' | 'ó' | 'ò' | 'ô' | 'õ' => 'o',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'ü' | 'ú' | 'ù' | 'û' => 'u',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        other => other,
+    }
+}
+
+/// Render one transcript line as `StyledText`, highlighting any `query_terms` matches with a
+/// subtle background tint while keeping every UTF-8 byte range strictly on char boundaries.
+fn render_highlighted_transcript_line(
+    text: &str,
+    query_terms: &[Vec<char>],
+    fg: gpui::Hsla,
+    hl_bg: gpui::Hsla,
+    font_family: &SharedString,
+) -> gpui::StyledText {
+    if query_terms.is_empty() || text.is_empty() {
+        return gpui::StyledText::new(text.to_owned());
+    }
+    let chars: Vec<(usize, usize, char)> = text
+        .char_indices()
+        .map(|(byte_ix, ch)| (byte_ix, byte_ix + ch.len_utf8(), fold_search_char(ch)))
+        .collect();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for term in query_terms {
+        let tlen = term.len();
+        if tlen == 0 || tlen > chars.len() {
+            continue;
+        }
+        for i in 0..=(chars.len() - tlen) {
+            if chars[i..i + tlen]
+                .iter()
+                .zip(term.iter())
+                .all(|((_, _, c), q)| c == q)
+            {
+                ranges.push((chars[i].0, chars[i + tlen - 1].1));
+            }
+        }
+    }
+    if ranges.is_empty() {
+        return gpui::StyledText::new(text.to_owned());
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+        } else {
+            merged.push((s, e));
+        }
+    }
+    let mut runs = Vec::with_capacity(merged.len() * 2 + 1);
+    let mut cursor = 0usize;
+    let make_run = |len: usize, bg: Option<gpui::Hsla>| gpui::TextRun {
+        len,
+        font: gpui::Font {
+            family: font_family.clone(),
+            ..Default::default()
+        },
+        color: fg,
+        background_color: bg,
+        underline: None,
+        strikethrough: None,
+    };
+    for (s, e) in merged {
+        if s > cursor {
+            runs.push(make_run(s - cursor, None));
+        }
+        if e > s {
+            runs.push(make_run(e - s, Some(hl_bg)));
+        }
+        cursor = e;
+    }
+    if cursor < text.len() {
+        runs.push(make_run(text.len() - cursor, None));
+    }
+    gpui::StyledText::new(text.to_owned()).with_runs(runs)
 }

@@ -181,8 +181,8 @@ impl Preferences {
             }))
     }
 
-    /// A select: the current option in a bordered box; clicking expands the option list
-    /// beneath it.
+    /// A select: the current option in a bordered box; clicking opens a floating dropdown menu
+    /// anchored directly below the trigger without shifting content beneath it.
     fn select(
         &mut self,
         id: &'static str,
@@ -190,34 +190,49 @@ impl Preferences {
         choice: Choice,
         cx: &mut Context<Self>,
     ) -> Div {
-        let selected = *choice(&mut self.settings);
+        let selected = (*choice(&mut self.settings)).min(options.len().saturating_sub(1));
         let open = self.open_select == Some(id);
         let theme = cx.theme();
-        let (border, muted, popover, hover, active) = (
+        let (border, focus_border, muted, popover, hover, active, active_fg, fg) = (
             theme.input,
+            theme.ring,
             theme.muted_foreground,
             theme.popover,
             theme.accent,
             theme.sidebar_accent,
+            theme.sidebar_accent_foreground,
+            theme.foreground,
         );
-        let active_fg = theme.sidebar_accent_foreground;
         let trigger = h_flex()
             .id(id)
             .w(px(300.))
             .items_center()
             .justify_between()
+            .gap_2()
             .px_3()
             .py_1p5()
             .rounded_md()
             .border_1()
-            .border_color(border)
+            .border_color(if open { focus_border } else { border })
             .cursor_pointer()
             .text_sm()
-            .child(options[selected])
+            .text_color(fg)
             .child(
-                Icon::new(IconName::ChevronDown)
-                    .text_color(muted)
-                    .size(px(14.)),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(options.get(selected).copied().unwrap_or("")),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .flex_none()
+                .text_color(muted)
+                .size(px(14.)),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_select = if this.open_select == Some(id) {
@@ -227,37 +242,69 @@ impl Preferences {
                 };
                 cx.notify();
             }));
-        let list = open.then(|| {
-            v_flex()
+        let menu_overlay = open.then(|| {
+            let menu = v_flex()
+                .id(SharedString::from(format!("{id}-menu")))
                 .w(px(300.))
                 .p_1()
+                .gap_0p5()
                 .rounded_md()
                 .border_1()
                 .border_color(border)
                 .bg(popover)
+                .shadow_lg()
+                .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                    if this.open_select == Some(id) {
+                        this.open_select = None;
+                        cx.notify();
+                    }
+                }))
                 .children(options.iter().enumerate().map(|(ix, label)| {
                     let on = ix == selected;
-                    div()
+                    h_flex()
                         .id(ElementId::NamedInteger(
                             SharedString::from(format!("{id}-opt")),
                             ix as u64,
                         ))
-                        .px_2()
-                        .py_1()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2p5()
+                        .py_1p5()
                         .rounded_sm()
                         .cursor_pointer()
                         .text_sm()
                         .when(on, |row| row.bg(active).text_color(active_fg))
-                        .when(!on, |row| row.hover(|el| el.bg(hover)))
-                        .child(*label)
+                        .when(!on, |row| row.text_color(fg).hover(|el| el.bg(hover)))
+                        .child(div().flex_1().min_w_0().truncate().child(*label))
+                        .when(on, |row| {
+                            row.child(
+                                Icon::new(IconName::Check)
+                                    .flex_none()
+                                    .size(px(13.))
+                                    .text_color(active_fg),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             *choice(&mut this.settings) = ix;
                             this.open_select = None;
                             this.changed(cx);
                         }))
-                }))
+                }));
+            div().absolute().top_full().left_0().mt_1().child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(Edges::all(px(8.)))
+                        .child(menu),
+                )
+                .with_priority(2),
+            )
         });
-        v_flex().gap_1().child(trigger).children(list)
+        div()
+            .relative()
+            .w(px(300.))
+            .child(trigger)
+            .children(menu_overlay)
     }
 
     fn labeled(&self, label: &'static str, control: impl IntoElement) -> Div {

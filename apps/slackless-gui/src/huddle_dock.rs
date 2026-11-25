@@ -63,7 +63,7 @@ pub struct HuddleViewState {
     pub draw_cursors: HashMap<UserId, DrawCursorEntry>,
     pub draw_mode: bool,
     pub draw_hue: i32,
-    pub captions: Vec<(UserId, String, bool)>,
+    pub captions: Vec<(UserId, String, bool, Option<String>)>,
 }
 
 pub enum HuddleDockEvent {
@@ -102,7 +102,7 @@ pub struct HuddleDock {
     draw_mode: bool,
     draw_hue: i32,
     user_hues: HashMap<UserId, i32>,
-    captions: Vec<(UserId, String, bool)>,
+    captions: Vec<(UserId, String, bool, Option<String>)>,
     menu_open: bool,
     devices: AudioDevices,
     #[cfg(target_os = "macos")]
@@ -838,6 +838,7 @@ impl HuddleDock {
                 user,
                 text,
                 is_partial,
+                lang,
                 ..
             } => {
                 if !text.trim().is_empty() {
@@ -847,11 +848,14 @@ impl HuddleDock {
                     {
                         last.1 = text.clone();
                         last.2 = *is_partial;
+                        if lang.is_some() {
+                            last.3 = lang.clone();
+                        }
                         cx.notify();
                         return;
                     }
                     self.captions
-                        .push((user.clone(), text.clone(), *is_partial));
+                        .push((user.clone(), text.clone(), *is_partial, lang.clone()));
                     if self.captions.len() > 4 {
                         let excess = self.captions.len() - 4;
                         self.captions.drain(0..excess);

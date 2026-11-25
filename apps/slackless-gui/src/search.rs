@@ -64,6 +64,8 @@ pub enum SearchEvent {
     OpenTranscript {
         call_id: String,
         channel: ChannelId,
+        highlight_segment_id: Option<i64>,
+        highlight_query: Option<String>,
     },
     /// User opted into remote Slack message search (`search.modules.messages`).
     RemoteMessages {
@@ -1210,7 +1212,14 @@ impl Render for SearchView {
                     self.empty_state(cx).into_any_element()
                 } else {
                     let theme = cx.theme();
-                    let (fg, link_color, hover) = (theme.foreground, theme.link, theme.accent);
+                    let (fg, link_color, hover, pill_bg) = (
+                        theme.foreground,
+                        theme.link,
+                        theme.accent,
+                        theme.secondary.opacity(0.6),
+                    );
+                    let query_for_click =
+                        (!self.query.trim().is_empty()).then(|| self.query.clone());
                     let rows: Vec<_> = self
                         .transcript_results
                         .iter()
@@ -1226,57 +1235,93 @@ impl Render for SearchView {
                                 .as_ref()
                                 .map(|u| self.fixtures.user_name(u).to_owned())
                                 .unwrap_or_else(|| "Speaker".to_owned());
+                            let avatar = match &seg.speaker_id {
+                                Some(uid) => crate::avatars::user_chip(&self.fixtures, uid, 28.),
+                                None => div()
+                                    .size(px(28.))
+                                    .rounded_md()
+                                    .bg(pill_bg)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(IconName::Headphones)
+                                            .size(px(14.))
+                                            .text_color(muted),
+                                    ),
+                            };
                             let ts = Ts::from(format!("{}.000000", seg.at_ms.div_euclid(1_000)));
                             let stamp = list_stamp(&ts);
                             let lang_badge = seg.lang.as_deref().map(|l| l.to_ascii_uppercase());
                             let call_id = seg.call_id.clone();
                             let channel = seg.channel.clone();
-                            v_flex()
+                            let seg_id = seg.id;
+                            let hl_query = query_for_click.clone();
+                            h_flex()
                                 .id(("search-transcript", ix))
-                                .gap_1()
+                                .w_full()
+                                .min_w_0()
+                                .items_start()
+                                .gap_3()
                                 .px_4()
-                                .py_2p5()
+                                .py_3()
                                 .border_b_1()
                                 .border_color(border)
                                 .cursor_pointer()
                                 .hover(move |el| el.bg(hover))
+                                .child(div().flex_none().mt(px(2.)).child(avatar))
                                 .child(
-                                    h_flex()
-                                        .items_center()
-                                        .gap_2()
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
                                         .child(
-                                            Icon::new(IconName::Headphones)
-                                                .size(px(13.))
-                                                .text_color(muted),
+                                            h_flex()
+                                                .items_center()
+                                                .flex_wrap()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(fg)
+                                                        .child(speaker),
+                                                )
+                                                .child(
+                                                    div().text_xs().text_color(muted).child(
+                                                        format!("in {ch_label} \u{b7} {stamp}"),
+                                                    ),
+                                                )
+                                                .when_some(lang_badge, |row, code| {
+                                                    row.child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py(px(1.))
+                                                            .rounded(px(4.))
+                                                            .bg(link_color.opacity(0.14))
+                                                            .text_xs()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(link_color)
+                                                            .child(code),
+                                                    )
+                                                }),
                                         )
                                         .child(
                                             div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(muted)
-                                                .child(format!(
-                                                    "{ch_label} \u{b7} {speaker} \u{b7} {stamp}"
-                                                )),
-                                        )
-                                        .when_some(lang_badge, |row, code| {
-                                            row.child(
-                                                div()
-                                                    .px_1p5()
-                                                    .py(px(1.))
-                                                    .rounded(px(4.))
-                                                    .bg(link_color.opacity(0.14))
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(link_color)
-                                                    .child(code),
-                                            )
-                                        }),
+                                                .w_full()
+                                                .min_w_0()
+                                                .text_sm()
+                                                .line_height(px(20.))
+                                                .text_color(fg)
+                                                .child(seg.text.clone()),
+                                        ),
                                 )
-                                .child(div().text_sm().text_color(fg).child(seg.text.clone()))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.emit(SearchEvent::OpenTranscript {
                                         call_id: call_id.clone(),
                                         channel: channel.clone(),
+                                        highlight_segment_id: Some(seg_id),
+                                        highlight_query: hl_query.clone(),
                                     });
                                 }))
                         })
