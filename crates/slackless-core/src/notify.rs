@@ -128,4 +128,52 @@ mod tests {
             NotifyLevel::Mentions
         );
     }
+
+    #[test]
+    fn malformed_json_and_non_object_prefs_are_handled_safely() {
+        for bad in [
+            Value::Null,
+            json!("not-an-object"),
+            json!({ KEY: "{not-valid-json" }),
+            json!({ KEY: "[]" }),
+            json!({ KEY: 42 }),
+            json!({ KEY: "{\"channels\": 42}" }),
+        ] {
+            assert!(notify_levels(&bad).is_empty());
+        }
+
+        for mut bad in [
+            json!("not-an-object"),
+            json!({ KEY: "{broken" }),
+            json!({ KEY: "[]" }),
+            json!({ KEY: "{\"channels\": [1, 2]}" }),
+        ] {
+            set_notify_level(&mut bad, &ChannelId::from("C7"), NotifyLevel::Muted);
+            assert_eq!(
+                notify_levels(&bad)[&ChannelId::from("C7")],
+                NotifyLevel::Muted
+            );
+        }
+    }
+
+    #[test]
+    fn muted_to_mentions_clears_muted_flag() {
+        let mut prefs = prefs(json!({}));
+        set_notify_level(&mut prefs, &ChannelId::from("C1"), NotifyLevel::Muted);
+        assert_eq!(
+            notify_levels(&prefs)[&ChannelId::from("C1")],
+            NotifyLevel::Muted
+        );
+        let all = parsed(&prefs).unwrap();
+        assert_eq!(all["channels"]["C1"]["muted"], json!(true));
+
+        set_notify_level(&mut prefs, &ChannelId::from("C1"), NotifyLevel::Mentions);
+        assert_eq!(
+            notify_levels(&prefs)[&ChannelId::from("C1")],
+            NotifyLevel::Mentions
+        );
+        let all = parsed(&prefs).unwrap();
+        assert_eq!(all["channels"]["C1"]["muted"], json!(false));
+        assert_eq!(all["channels"]["C1"]["desktop"], json!("mention"));
+    }
 }

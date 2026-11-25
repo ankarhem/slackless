@@ -347,6 +347,14 @@ async fn next_rtm(rtm: &mut Option<tokio::sync::mpsc::Receiver<RtmEvent>>) -> Rt
     std::future::pending().await
 }
 
+#[derive(Default)]
+pub(super) struct HuddleSlot {
+    pub generation: u64,
+    pub joining: bool,
+    pub handle: Option<crate::huddle::HuddleHandle>,
+    pub call_id: Option<String>,
+}
+
 pub(crate) struct Core<B: Backend> {
     backend: B,
     store: SharedStore,
@@ -366,14 +374,17 @@ pub(crate) struct Core<B: Backend> {
     /// Team ids already sent to `team.info` this session (found or not): each is asked
     /// once. Shared with spawned tasks, which compute the ids off the `&self` borrow.
     teams_asked: Arc<Mutex<HashSet<TeamId>>>,
-    /// Bot profiles read through `bots.info` this session (see `attach_bot_profile`).
-    bots: HashMap<BotId, BotProfile>,
+    /// Bot profiles read through `bots.info` or SQLite cache this session (shared between
+    /// `attach_bot_profile` and `Command::ResolveBots`).
+    bots: Arc<Mutex<HashMap<BotId, BotProfile>>>,
     /// Bot ids already requested via `bots.info` this session (found or not): each is asked once.
     bots_asked: HashSet<BotId>,
     /// Signed-in user id learned from `client.userBoot` (used to mirror self profile/presence).
     self_user_id: Arc<Mutex<Option<UserId>>>,
     /// Cloud-synced draft ids per channel (`drafts.list` / `drafts.create` / `drafts.update` / `drafts.delete`).
     cloud_draft_ids: Arc<Mutex<HashMap<ChannelId, String>>>,
+    /// Per-channel async mutexes serializing `SyncDraft` so concurrent edits never double-create.
+    draft_locks: Arc<Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>>>,
     /// Whether the RTM websocket is currently disconnected or reconnecting.
     is_offline: bool,
     /// Becomes `true` after the first RTM `Connected` transition so subsequent reconnects refresh
@@ -381,11 +392,9 @@ pub(crate) struct Core<B: Backend> {
     has_connected_once: bool,
     /// Outgoing mutations persisted in SQLite `offline_queue`, flushed FIFO on reconnect.
     offline_queue: VecDeque<(i64, QueuedMutation)>,
-    /// Active native Chime audio huddle session handle (at most one per workspace).
-    active_huddle: Arc<Mutex<Option<crate::huddle::HuddleHandle>>>,
-    /// Active Slack huddle `call_id` (`R0...`) for REST APIs (`screenhero.rooms.rename`,
-    /// `rooms.startTranscription` / `rooms.stopTranscription`, `huddles.update`).
-    active_huddle_call_id: Arc<Mutex<Option<String>>>,
+    /// Active native Chime audio huddle session slot (at most one per workspace, guarded by
+    /// generation counter so stale joins/watchers never clobber a newer session).
+    huddle: Arc<Mutex<HuddleSlot>>,
 }
 
 impl<B: Backend> Core<B> {
@@ -437,15 +446,15 @@ impl<B: Backend> Core<B> {
             presence_peers: Arc::new(Mutex::new(Vec::new())),
             users_asked: HashSet::new(),
             teams_asked: Arc::new(Mutex::new(HashSet::new())),
-            bots: cached_bots,
+            bots: Arc::new(Mutex::new(cached_bots)),
             bots_asked: HashSet::new(),
             self_user_id: Arc::new(Mutex::new(None)),
             cloud_draft_ids: Arc::new(Mutex::new(HashMap::new())),
+            draft_locks: Arc::new(Mutex::new(HashMap::new())),
             is_offline: false,
             has_connected_once: false,
             offline_queue: persisted,
-            active_huddle: Arc::new(Mutex::new(None)),
-            active_huddle_call_id: Arc::new(Mutex::new(None)),
+            huddle: Arc::new(Mutex::new(HuddleSlot::default())),
         }
     }
 
@@ -462,16 +471,13 @@ impl<B: Backend> Core<B> {
     }
 
     async fn shutdown(&mut self) {
-        let _ = self
-            .active_huddle_call_id
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let active = self
-            .active_huddle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let active = {
+            let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.joining = false;
+            slot.call_id = None;
+            slot.handle.take()
+        };
         if let Some(handle) = active {
             handle
                 .leave_and_wait(std::time::Duration::from_millis(1200))

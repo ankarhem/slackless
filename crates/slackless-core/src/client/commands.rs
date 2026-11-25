@@ -53,7 +53,13 @@ impl<B: Backend> Core<B> {
             Command::ResolveUsers(ids) => self.resolve_users(ids),
             Command::ResolveBots(ids) => {
                 for bot in ids {
-                    if let Some(profile) = self.bots.get(&bot).cloned() {
+                    if let Some(profile) = self
+                        .bots
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&bot)
+                        .cloned()
+                    {
                         self.events.emit(Event::BotProfileLoaded {
                             bot_id: bot,
                             profile,
@@ -65,10 +71,14 @@ impl<B: Backend> Core<B> {
                     }
                     let backend = self.backend.clone();
                     let store = Arc::clone(&self.store);
+                    let bots = Arc::clone(&self.bots);
                     let ws = self.workspace.clone();
                     let events = self.events.clone();
                     self.spawn("bots.info", async move {
                         let profile = backend.bot_info(bot.clone()).await?;
+                        bots.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(bot.clone(), profile.clone());
                         let bot_store = bot.clone();
                         let profile_store = profile.clone();
                         let _ = with_store(&store, move |s| {
@@ -799,6 +809,7 @@ impl<B: Backend> Core<B> {
                 self.spawn("drafts.list", async move {
                     let drafts = backend.drafts_list().await?;
                     if let Ok(mut guard) = draft_ids.lock() {
+                        guard.clear();
                         for d in &drafts {
                             guard.insert(d.channel.clone(), d.id.clone());
                         }
@@ -809,13 +820,26 @@ impl<B: Backend> Core<B> {
             }
             Command::SyncDraft { channel, text } => {
                 let draft_ids = Arc::clone(&self.cloud_draft_ids);
+                let channel_lock = {
+                    let mut locks = self
+                        .draft_locks
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    Arc::clone(
+                        locks
+                            .entry(channel.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                    )
+                };
                 self.spawn("drafts.sync", async move {
+                    let _permit = channel_lock.lock().await;
                     let existing = draft_ids.lock().ok().and_then(|g| g.get(&channel).cloned());
                     if text.trim().is_empty() {
                         if let Some(id) = existing {
-                            let _ = backend.drafts_delete(id).await;
-                            if let Ok(mut guard) = draft_ids.lock() {
-                                guard.remove(&channel);
+                            if backend.drafts_delete(id).await.is_ok() {
+                                if let Ok(mut guard) = draft_ids.lock() {
+                                    guard.remove(&channel);
+                                }
                             }
                         }
                     } else if let Some(id) = existing {
@@ -1000,7 +1024,15 @@ impl<B: Backend> Core<B> {
                     .find(|(row_id, _)| *row_id == id)
                     .and_then(|(_, payload)| serde_json::from_str::<QueuedMutation>(&payload).ok());
                 if let Some(mutation) = found {
-                    self.flush_queued_mutation(id, mutation);
+                    if self.is_offline {
+                        if !self.offline_queue.iter().any(|(row_id, _)| *row_id == id) {
+                            self.offline_queue.push_back((id, mutation));
+                            self.events
+                                .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
+                        }
+                    } else {
+                        self.flush_queued_mutation(id, mutation);
+                    }
                 }
             }
             Command::DiscardOfflineMutation(id) => {
@@ -1421,26 +1453,52 @@ impl<B: Backend> Core<B> {
                 });
             }
             Command::JoinHuddle { channel, audio } => {
-                // Leave any currently running huddle first so only one audio session runs.
-                if let Some(prev) = self
-                    .active_huddle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                {
-                    prev.leave();
-                }
-                let active_huddle = Arc::clone(&self.active_huddle);
-                let active_huddle_call_id = Arc::clone(&self.active_huddle_call_id);
+                // Reject duplicate concurrent join while `rooms.join` is already in-flight;
+                // otherwise leave any active huddle and claim a fresh generation id.
+                let my_gen = {
+                    let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                    if slot.joining {
+                        return;
+                    }
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.joining = true;
+                    slot.call_id = None;
+                    if let Some(prev) = slot.handle.take() {
+                        prev.leave();
+                    }
+                    slot.generation
+                };
+                let huddle = Arc::clone(&self.huddle);
                 let team_id = self.workspace.clone();
                 self.spawn("rooms.join", async move {
+                    struct JoinGuard {
+                        huddle: Arc<Mutex<HuddleSlot>>,
+                        generation: u64,
+                    }
+                    impl Drop for JoinGuard {
+                        fn drop(&mut self) {
+                            let mut slot =
+                                self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                            if slot.generation == self.generation {
+                                slot.joining = false;
+                            }
+                        }
+                    }
+                    let _join_guard = JoinGuard {
+                        huddle: Arc::clone(&huddle),
+                        generation: my_gen,
+                    };
                     let joined = backend.rooms_join(channel.clone()).await?;
-                    *active_huddle_call_id
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Some(joined.call_id.clone());
+                    {
+                        let slot = huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                        if slot.generation != my_gen {
+                            return Ok(());
+                        }
+                    }
+                    let call_id = joined.call_id.clone();
                     let creds = crate::huddle::HuddleCredentials {
                         channel: channel.clone(),
-                        call_id: joined.call_id.clone(),
+                        call_id: joined.call_id,
                         meeting_id: joined.chime.meeting.meeting_id,
                         attendee_id: joined.chime.attendee.attendee_id,
                         external_user_id: joined.chime.attendee.external_user_id,
@@ -1464,70 +1522,45 @@ impl<B: Backend> Core<B> {
                             Some(format!("https://app.slack.com/huddle/{team_id}/{channel}"))
                         }),
                     };
-                    let (upd_tx, mut upd_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
                     let handle = crate::huddle::spawn_huddle_session(creds, audio, upd_tx);
-                    *active_huddle.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
-                    let active_for_clear = Arc::clone(&active_huddle);
-                    let call_id_for_clear = Arc::clone(&active_huddle_call_id);
-                    tokio::spawn(async move {
-                        while let Some(upd) = upd_rx.recv().await {
-                            match upd {
-                                crate::huddle::HuddleUpdate::State(snap) => {
-                                    let done = matches!(
-                                        snap.phase,
-                                        crate::huddle::HuddlePhase::Idle
-                                            | crate::huddle::HuddlePhase::Failed
-                                    );
-                                    events.emit(Event::HuddleSessionChanged(snap));
-                                    if done {
-                                        let _ = active_for_clear
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner)
-                                            .take();
-                                        let _ = call_id_for_clear
-                                            .lock()
-                                            .unwrap_or_else(PoisonError::into_inner)
-                                            .take();
-                                    }
-                                }
-                                crate::huddle::HuddleUpdate::AudioLevels(levels) => {
-                                    events.emit(Event::HuddleAudioLevels(levels));
-                                }
-                                crate::huddle::HuddleUpdate::VideoFrame { tile, frame } => {
-                                    events.emit(Event::HuddleVideoFrame { tile, frame });
-                                }
-                                crate::huddle::HuddleUpdate::VideoTileClosed(tile) => {
-                                    events.emit(Event::HuddleVideoTileClosed(tile));
-                                }
-                                crate::huddle::HuddleUpdate::DataEvent(ev) => {
-                                    events.emit(Event::HuddleDataEvent(ev));
-                                }
-                            }
+                    let rejected = {
+                        let mut slot = huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                        if slot.generation == my_gen {
+                            slot.joining = false;
+                            slot.call_id = Some(call_id);
+                            slot.handle = Some(handle);
+                            None
+                        } else {
+                            Some(handle)
                         }
-                    });
+                    };
+                    if let Some(handle) = rejected {
+                        handle.leave();
+                        return Ok(());
+                    }
+                    spawn_huddle_watcher(Arc::clone(&huddle), my_gen, upd_rx, events);
                     Ok(())
                 });
             }
             Command::LeaveHuddle => {
-                let _ = self
-                    .active_huddle_call_id
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take();
-                if let Some(handle) = self
-                    .active_huddle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                {
+                let prev = {
+                    let mut slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                    slot.generation = slot.generation.wrapping_add(1);
+                    slot.joining = false;
+                    slot.call_id = None;
+                    slot.handle.take()
+                };
+                if let Some(handle) = prev {
                     handle.leave();
                 }
             }
             Command::SetHuddleMuted(muted) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetMuted(muted));
@@ -1535,9 +1568,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleAudioDevices { input, output } => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetAudioDevices { input, output });
@@ -1545,9 +1579,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleAudioProcessing { aec, ns, agc } => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetAudioProcessing { aec, ns, agc });
@@ -1584,9 +1619,10 @@ impl<B: Backend> Core<B> {
                 blur,
             } => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetCamera {
@@ -1598,9 +1634,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleBlurBackground(blur) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetBlurBackground(blur));
@@ -1611,9 +1648,10 @@ impl<B: Backend> Core<B> {
                 share_audio,
             } => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetScreenShare {
@@ -1628,9 +1666,10 @@ impl<B: Backend> Core<B> {
                 emoji_url,
             } => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SendReaction {
@@ -1642,9 +1681,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleHandRaised(raised) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetHandRaised(raised));
@@ -1652,9 +1692,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleStickyEmoji(emoji) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetStickyEmoji(emoji));
@@ -1662,9 +1703,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SendHuddleDraw(draw) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SendDraw(draw));
@@ -1672,9 +1714,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleJukebox(song) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetJukebox(song));
@@ -1682,29 +1725,24 @@ impl<B: Backend> Core<B> {
             }
             Command::MuteHuddlePeer(peer_id) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::MutePeer(peer_id));
                 }
             }
             Command::SetHuddleTopic(topic) => {
-                if let Some(handle) = self
-                    .active_huddle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                {
-                    handle.send(crate::huddle::HuddleControl::SetTopic(topic.clone()));
-                }
-                if let Some(call_id) = self
-                    .active_huddle_call_id
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone()
-                {
+                let call_id = {
+                    let slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(handle) = slot.handle.as_ref() {
+                        handle.send(crate::huddle::HuddleControl::SetTopic(topic.clone()));
+                    }
+                    slot.call_id.clone()
+                };
+                if let Some(call_id) = call_id {
                     self.spawn("screenhero.rooms.rename", async move {
                         backend.rooms_rename(call_id, topic).await?;
                         Ok(())
@@ -1712,23 +1750,17 @@ impl<B: Backend> Core<B> {
                 }
             }
             Command::SetHuddleBackground(background_id) => {
-                if let Some(handle) = self
-                    .active_huddle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                {
-                    handle.send(crate::huddle::HuddleControl::SetBackground(
-                        (!background_id.is_empty() && background_id != "default")
-                            .then(|| background_id.clone()),
-                    ));
-                }
-                if let Some(call_id) = self
-                    .active_huddle_call_id
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone()
-                {
+                let call_id = {
+                    let slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(handle) = slot.handle.as_ref() {
+                        handle.send(crate::huddle::HuddleControl::SetBackground(
+                            (!background_id.is_empty() && background_id != "default")
+                                .then(|| background_id.clone()),
+                        ));
+                    }
+                    slot.call_id.clone()
+                };
+                if let Some(call_id) = call_id {
                     self.spawn("huddles.update", async move {
                         backend
                             .huddles_update_background(call_id, background_id)
@@ -1738,20 +1770,14 @@ impl<B: Backend> Core<B> {
                 }
             }
             Command::SetHuddleCaptions(enabled) => {
-                if let Some(handle) = self
-                    .active_huddle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                {
-                    handle.send(crate::huddle::HuddleControl::SetCaptionsEnabled(enabled));
-                }
-                if let Some(call_id) = self
-                    .active_huddle_call_id
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone()
-                {
+                let call_id = {
+                    let slot = self.huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(handle) = slot.handle.as_ref() {
+                        handle.send(crate::huddle::HuddleControl::SetCaptionsEnabled(enabled));
+                    }
+                    slot.call_id.clone()
+                };
+                if let Some(call_id) = call_id {
                     self.spawn(
                         if enabled {
                             "rooms.startTranscription"
@@ -1771,9 +1797,10 @@ impl<B: Backend> Core<B> {
             }
             Command::SetHuddleAudioOnly(enabled) => {
                 if let Some(handle) = self
-                    .active_huddle
+                    .huddle
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .handle
                     .as_ref()
                 {
                     handle.send(crate::huddle::HuddleControl::SetAudioOnly(enabled));
@@ -1813,6 +1840,10 @@ impl<B: Backend> Core<B> {
                             let _ = with_store(&store, move |s| s.delete_offline(id)).await;
                         }
                     }
+                    Err(CoreError::Api(ApiError::AuthExpired(code))) => {
+                        events.emit(Event::AuthExpired(code));
+                        break;
+                    }
                     Err(err) => {
                         events.emit(Event::OfflineMutationFailed(FailedMutation {
                             id,
@@ -1843,6 +1874,9 @@ impl<B: Backend> Core<B> {
                     if id > 0 {
                         let _ = with_store(&store, move |s| s.delete_offline(id)).await;
                     }
+                }
+                Err(CoreError::Api(ApiError::AuthExpired(code))) => {
+                    events.emit(Event::AuthExpired(code));
                 }
                 Err(err) => {
                     events.emit(Event::OfflineMutationFailed(FailedMutation {
@@ -1888,9 +1922,92 @@ impl<B: Backend> Core<B> {
                 backend.remove_reaction(channel, ts, name).await?;
             }
             QueuedMutation::MarkRead { channel, ts } => {
-                backend.mark_read(channel, ts).await?;
+                backend.mark_read(channel.clone(), ts.clone()).await?;
+                let ws = ws.clone();
+                let _ = with_store(store, move |s| {
+                    if let Some(mut conv) = s.conversation(&ws, &channel)? {
+                        conv.last_read = Some(ts);
+                        s.upsert_conversation(&ws, &conv)?;
+                    }
+                    Ok::<_, StoreError>(())
+                })
+                .await;
             }
         }
         Ok(())
     }
+}
+
+/// Forward huddle session updates from `upd_rx` to `events`, tagged with `my_gen` so an older
+/// session transitioning to `Idle`/`Failed` can never clobber a newer active session's state.
+pub(super) fn spawn_huddle_watcher(
+    huddle: Arc<Mutex<HuddleSlot>>,
+    my_gen: u64,
+    mut upd_rx: tokio::sync::mpsc::UnboundedReceiver<crate::huddle::HuddleUpdate>,
+    events: Emitter,
+) {
+    tokio::spawn(async move {
+        while let Some(upd) = upd_rx.recv().await {
+            match upd {
+                crate::huddle::HuddleUpdate::State(snap) => {
+                    let done = matches!(
+                        snap.phase,
+                        crate::huddle::HuddlePhase::Idle | crate::huddle::HuddlePhase::Failed
+                    );
+                    let should_emit = {
+                        let mut slot = huddle.lock().unwrap_or_else(PoisonError::into_inner);
+                        let is_current = slot.generation == my_gen;
+                        if is_current && done {
+                            slot.handle = None;
+                            slot.call_id = None;
+                        }
+                        is_current || (done && slot.handle.is_none() && !slot.joining)
+                    };
+                    if should_emit {
+                        events.emit(Event::HuddleSessionChanged(snap));
+                    }
+                }
+                crate::huddle::HuddleUpdate::AudioLevels(levels) => {
+                    if huddle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .generation
+                        == my_gen
+                    {
+                        events.emit(Event::HuddleAudioLevels(levels));
+                    }
+                }
+                crate::huddle::HuddleUpdate::VideoFrame { tile, frame } => {
+                    if huddle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .generation
+                        == my_gen
+                    {
+                        events.emit(Event::HuddleVideoFrame { tile, frame });
+                    }
+                }
+                crate::huddle::HuddleUpdate::VideoTileClosed(tile) => {
+                    if huddle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .generation
+                        == my_gen
+                    {
+                        events.emit(Event::HuddleVideoTileClosed(tile));
+                    }
+                }
+                crate::huddle::HuddleUpdate::DataEvent(ev) => {
+                    if huddle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .generation
+                        == my_gen
+                    {
+                        events.emit(Event::HuddleDataEvent(ev));
+                    }
+                }
+            }
+        }
+    });
 }

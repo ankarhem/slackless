@@ -95,15 +95,39 @@ impl<B: Backend> Unfurls<B> {
     /// One `conversations.info` per id not yet in the store, paced at the Tier-3 rate; the
     /// result is stored as a non-member conversation so it can be named but never joins the
     /// sidebar. Slack-level failures (`channel_not_found`, ...) are final and silent: no name
-    /// exists, and the claim already remembers that.
+    /// exists, and the claim already remembers that. Transient errors or cancellation release
+    /// any unattempted/transiently-failed ids from `asked` so they are never permanently poisoned.
     async fn walk(&self, ids: Vec<ChannelId>) -> Result<(), CoreError> {
-        for (n, id) in ids.iter().enumerate() {
+        struct UnfinishedGuard {
+            asked: Arc<Mutex<HashSet<ChannelId>>>,
+            ids: Vec<ChannelId>,
+            completed: usize,
+        }
+        impl Drop for UnfinishedGuard {
+            fn drop(&mut self) {
+                if self.completed < self.ids.len() {
+                    let mut asked = self.asked.lock().unwrap_or_else(PoisonError::into_inner);
+                    for id in &self.ids[self.completed..] {
+                        asked.remove(id);
+                    }
+                }
+            }
+        }
+
+        let mut guard = UnfinishedGuard {
+            asked: Arc::clone(&self.asked),
+            ids,
+            completed: 0,
+        };
+        for n in 0..guard.ids.len() {
             if n > 0 {
                 tokio::time::sleep(PAGE_DELAY).await;
             }
+            let id = guard.ids[n].clone();
             let (ws, target) = (self.workspace.clone(), id.clone());
             let stored = with_store(&self.store, move |s| s.conversation(&ws, &target)).await?;
             if stored.is_some() {
+                guard.completed = n + 1;
                 continue;
             }
             match self.backend.conversation_info(id.clone()).await {
@@ -114,9 +138,12 @@ impl<B: Backend> Unfurls<B> {
                         s.upsert_conversation(&ws, &conversation)
                     })
                     .await?;
-                    self.events.emit(Event::Conversations(vec![id.clone()]));
+                    self.events.emit(Event::Conversations(vec![id]));
+                    guard.completed = n + 1;
                 }
-                Err(ApiError::Slack(_)) => {}
+                Err(ApiError::Slack(_)) => {
+                    guard.completed = n + 1;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -276,8 +303,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event_messages(&changed).len(), 1);
+        let replied: SlackEvent = serde_json::from_str(
+            r#"{"type":"message","subtype":"message_replied","channel":"C1",
+                "message":{"ts":"5.0","text":"root"}}"#,
+        )
+        .unwrap();
+        assert_eq!(event_messages(&replied).len(), 1);
+        let replied_empty: SlackEvent = serde_json::from_str(
+            r#"{"type":"message","subtype":"message_replied","channel":"C1"}"#,
+        )
+        .unwrap();
+        assert!(event_messages(&replied_empty).is_empty());
+        let deleted: SlackEvent = serde_json::from_str(
+            r#"{"type":"message","subtype":"message_deleted","channel":"C1","deleted_ts":"5.0"}"#,
+        )
+        .unwrap();
+        assert!(event_messages(&deleted).is_empty());
         let other: SlackEvent =
             serde_json::from_str(r#"{"type":"channel_rename","channel":{"id":"C1"}}"#).unwrap();
         assert!(event_messages(&other).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_partial_failure_does_not_poison_unattempted_ids() {
+        let fake = FakeBackend::default();
+        fake.set_info(Conversation {
+            name: Some("foreign".into()),
+            ..Default::default()
+        });
+        fake.fail_info_transient_for(ChannelId::from("CEXT1"));
+        let (store, events, _rx) = fake_core_parts();
+        let (unfurls, store) = unfurls(&fake, store, events);
+
+        let m1 = unfurling("5.0", "CEXT1");
+        let m2 = unfurling("6.0", "CEXT2");
+        assert!(unfurls.resolve_now([&m1, &m2]).await.is_err());
+        assert_eq!(
+            fake.info_calls(),
+            vec![ChannelId::from("CEXT1")],
+            "early exit before attempting CEXT2"
+        );
+
+        // Once the transient outage clears, retrying resolves BOTH CEXT1 and CEXT2.
+        fake.clear_fail_info_transient();
+        unfurls.resolve_now([&m1, &m2]).await.unwrap();
+        let ws = TeamId::from("T1");
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .conversation(&ws, &ChannelId::from("CEXT1"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .conversation(&ws, &ChannelId::from("CEXT2"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_non_msg_unfurls_and_deduplicates_within_batch() {
+        let fake = FakeBackend::default();
+        let (store, events, _rx) = fake_core_parts();
+        let (unfurls, _store) = unfurls(&fake, store, events);
+
+        let non_unfurl = Message {
+            ts: Ts::from("1.0"),
+            attachments: vec![Attachment {
+                is_msg_unfurl: false,
+                channel_id: Some(ChannelId::from("CIGNORED")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dup1 = unfurling("2.0", "CDUP");
+        let dup2 = unfurling("3.0", "CDUP");
+        unfurls
+            .resolve_now([&non_unfurl, &dup1, &dup2])
+            .await
+            .unwrap();
+        assert_eq!(fake.info_calls(), vec![ChannelId::from("CDUP")]);
     }
 }

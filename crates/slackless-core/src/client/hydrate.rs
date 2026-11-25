@@ -253,42 +253,10 @@ impl<B: Backend> Core<B> {
     /// `client.counts` whose local SQLite cache is behind `latest`, so clicking an unread channel
     /// or DM renders the new messages on frame 0 without waiting for an HTTP round-trip.
     pub(super) fn prefetch_unreads(&self, counts: &crate::api::ClientCounts) {
-        /// Cap per hydrate/reconnect pass so workspaces with hundreds of muted unread channels
-        /// stay well within Slack's Tier-3 rate limits.
-        const MAX_PREFETCH: usize = 25;
-
-        let mut targets: Vec<(ChannelId, Option<Ts>, u32, bool)> = Vec::new();
-        for entry in counts.ims.iter().chain(&counts.mpims) {
-            if entry.is_unread() {
-                targets.push((
-                    entry.id.clone(),
-                    entry.latest.clone(),
-                    entry.effective_mentions(),
-                    true,
-                ));
-            }
-        }
-        for entry in &counts.channels {
-            if entry.is_unread() {
-                targets.push((
-                    entry.id.clone(),
-                    entry.latest.clone(),
-                    entry.effective_mentions(),
-                    false,
-                ));
-            }
-        }
+        let targets = select_prefetch_targets(counts);
         if targets.is_empty() {
             return;
         }
-        // Prioritize DMs and mentions first, then newest activity first.
-        targets.sort_by(|a, b| {
-            b.3.cmp(&a.3)
-                .then_with(|| b.2.cmp(&a.2))
-                .then_with(|| b.1.cmp(&a.1))
-        });
-        targets.truncate(MAX_PREFETCH);
-
         let (backend, store, ws, events, unfurls) = (
             self.backend.clone(),
             Arc::clone(&self.store),
@@ -297,46 +265,7 @@ impl<B: Backend> Core<B> {
             self.unfurls.clone(),
         );
         self.spawn("unread prefetch", async move {
-            let mut fetched = 0usize;
-            for (channel, latest, _, _) in targets {
-                // Skip channels whose local archive already contains `latest`.
-                if let Some(ref latest_ts) = latest {
-                    if !latest_ts.as_str().is_empty() {
-                        let (ws_check, ch_check) = (ws.clone(), channel.clone());
-                        let local_newest = with_store(&store, move |s| {
-                            s.channel_history(&ws_check, &ch_check, None, 1)
-                                .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
-                        })
-                        .await?;
-                        if local_newest
-                            .as_ref()
-                            .is_some_and(|local| local >= latest_ts)
-                        {
-                            continue;
-                        }
-                    }
-                }
-                if fetched >= 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                }
-                let items = match wait_out_rate_limits(|| {
-                    backend.recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
-                })
-                .await
-                {
-                    Ok(items) => items,
-                    Err(_) => continue,
-                };
-                fetched += 1;
-                if items.is_empty() {
-                    continue;
-                }
-                unfurls.resolve(items.iter());
-                let (ws_put, target) = (ws.clone(), channel.clone());
-                with_store(&store, move |s| s.upsert_messages(&ws_put, &target, &items)).await?;
-                events.emit(Event::StoreChanged { channel });
-            }
-            Ok(())
+            prefetch_targets(backend, store, ws, events, unfurls, targets).await
         });
     }
 
@@ -389,6 +318,100 @@ impl<B: Backend> Core<B> {
             Ok(())
         });
     }
+}
+
+/// Select up to 25 unread conversations to prefetch, prioritizing DMs, then mentions, then
+/// newest activity.
+pub(super) fn select_prefetch_targets(
+    counts: &crate::api::ClientCounts,
+) -> Vec<(ChannelId, Option<Ts>)> {
+    /// Cap per hydrate/reconnect pass so workspaces with hundreds of muted unread channels
+    /// stay well within Slack's Tier-3 rate limits.
+    const MAX_PREFETCH: usize = 25;
+
+    let mut targets: Vec<(ChannelId, Option<Ts>, u32, bool)> = Vec::new();
+    for entry in counts.ims.iter().chain(&counts.mpims) {
+        if entry.is_unread() {
+            targets.push((
+                entry.id.clone(),
+                entry.latest.clone(),
+                entry.effective_mentions(),
+                true,
+            ));
+        }
+    }
+    for entry in &counts.channels {
+        if entry.is_unread() {
+            targets.push((
+                entry.id.clone(),
+                entry.latest.clone(),
+                entry.effective_mentions(),
+                false,
+            ));
+        }
+    }
+    // Prioritize DMs and mentions first, then newest activity first.
+    targets.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+    targets.truncate(MAX_PREFETCH);
+    targets
+        .into_iter()
+        .map(|(id, latest, _, _)| (id, latest))
+        .collect()
+}
+
+/// Prefetch recent history for unread `targets` whose local SQLite archive is behind `latest`.
+pub(super) async fn prefetch_targets<B: Backend>(
+    backend: B,
+    store: SharedStore,
+    ws: TeamId,
+    events: Emitter,
+    unfurls: Unfurls<B>,
+    targets: Vec<(ChannelId, Option<Ts>)>,
+) -> Result<(), CoreError> {
+    let mut fetched = 0usize;
+    for (channel, latest) in targets {
+        // Skip channels whose local archive already contains `latest`.
+        if let Some(ref latest_ts) = latest {
+            if !latest_ts.as_str().is_empty() {
+                let (ws_check, ch_check) = (ws.clone(), channel.clone());
+                let local_newest = with_store(&store, move |s| {
+                    s.channel_history(&ws_check, &ch_check, None, 1)
+                        .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
+                })
+                .await?;
+                if local_newest
+                    .as_ref()
+                    .is_some_and(|local| local >= latest_ts)
+                {
+                    continue;
+                }
+            }
+        }
+        if fetched >= 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        let items = match wait_out_rate_limits(|| {
+            backend.recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
+        })
+        .await
+        {
+            Ok(items) => items,
+            Err(_) => continue,
+        };
+        fetched += 1;
+        if items.is_empty() {
+            continue;
+        }
+        unfurls.resolve(items.iter());
+        let (ws_put, target) = (ws.clone(), channel.clone());
+        with_store(&store, move |s| s.upsert_messages(&ws_put, &target, &items)).await?;
+        events.emit(Event::StoreChanged { channel });
+    }
+    Ok(())
 }
 
 /// Fills each Activity row's body through `messages.list`, one batched call per

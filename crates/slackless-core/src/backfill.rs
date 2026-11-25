@@ -426,4 +426,141 @@ mod tests {
             "a named reference never joins the sidebar"
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn stuck_cursor_guard_terminates_walk_and_thread_fetch() {
+        let fake = FakeBackend::with_history(1..=6);
+        fake.push_thread("6.0", 1..=6);
+        fake.set_stuck_cursor(true);
+        let (bf, mut rx) = backfill(&fake);
+
+        bf.clone().run(ChannelId::from("C1")).await;
+        // Call 1: cursor None -> returns Some("stuck"). Call 2: cursor Some("stuck") -> returns Some("stuck") -> stops!
+        assert_eq!(fake.calls().len(), 2);
+        assert_eq!(
+            drain(&mut rx).last(),
+            Some(&Event::HistoryComplete {
+                channel: ChannelId::from("C1")
+            })
+        );
+
+        bf.fetch_thread(ChannelId::from("C1"), Ts::from("6.0"))
+            .await
+            .unwrap();
+        assert_eq!(fake.reply_calls().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_exhaustion_after_five_waits_reports_error() {
+        let fake = FakeBackend::with_history(1..=3);
+        fake.rate_limit_next(6);
+        let (bf, mut rx) = backfill(&fake);
+
+        bf.clone().run(ChannelId::from("C1")).await;
+        assert_eq!(fake.calls().len(), 6, "initial try + 5 waits");
+        assert!(stored_ts(&bf.store).is_empty());
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, Event::Error(msg) if msg.contains("backfill C1")))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_page_catchup_over_incomplete_span_bridges_gap_and_finishes() {
+        let fake = FakeBackend::with_history(1..=12);
+        let (bf, mut rx) = backfill(&fake);
+        // Pre-seed incomplete middle span 5..=6.
+        {
+            let mut store = bf.store.lock().unwrap();
+            for m in fake
+                .messages()
+                .iter()
+                .filter(|m| m.ts >= Ts::from("5.0") && m.ts <= Ts::from("6.0"))
+            {
+                store
+                    .upsert_message(&bf.workspace, &ChannelId::from("C1"), m)
+                    .unwrap();
+            }
+        }
+        bf.synced.lock().unwrap().insert(
+            ChannelId::from("C1"),
+            Synced {
+                newest: Ts::from("6.0"),
+                oldest: Ts::from("5.0"),
+                complete: false,
+            },
+        );
+
+        bf.clone().run(ChannelId::from("C1")).await;
+        assert_eq!(stored_ts(&bf.store).len(), 12);
+        let calls = fake.calls();
+        // Catch-up spans 4 pages before overlapping 6.0 (12-11, 10-9, 8-7, 6-5), then jumps below 5.0.
+        assert!(
+            calls
+                .iter()
+                .any(|(latest, _)| *latest == Some(Ts::from("5.0")))
+        );
+        let span = bf.synced.lock().unwrap()[&ChannelId::from("C1")].clone();
+        assert_eq!(
+            span,
+            Synced {
+                newest: Ts::from("12.0"),
+                oldest: Ts::from("1.0"),
+                complete: true,
+            }
+        );
+        assert_eq!(
+            drain(&mut rx).last(),
+            Some(&Event::HistoryComplete {
+                channel: ChannelId::from("C1")
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_first_page_completes_cleanly() {
+        let fake = FakeBackend::default();
+        let (bf, mut rx) = backfill(&fake);
+
+        bf.clone().run(ChannelId::from("C1")).await;
+        assert_eq!(fake.calls().len(), 1);
+        assert!(stored_ts(&bf.store).is_empty());
+        let events = drain(&mut rx);
+        assert_eq!(
+            events,
+            vec![
+                Event::StoreChanged {
+                    channel: ChannelId::from("C1")
+                },
+                Event::HistoryComplete {
+                    channel: ChannelId::from("C1")
+                },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiver_drop_exits_walk_and_thread_fetch_early() {
+        let fake = FakeBackend::with_history(1..=10);
+        fake.push_thread("10.0", 1..=10);
+        let (bf, rx) = backfill(&fake);
+        drop(rx);
+
+        bf.clone().run(ChannelId::from("C1")).await;
+        assert_eq!(
+            fake.calls().len(),
+            1,
+            "walk stops after first page once receiver drops"
+        );
+
+        bf.fetch_thread(ChannelId::from("C1"), Ts::from("10.0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.reply_calls().len(),
+            1,
+            "thread fetch stops after first page once receiver drops"
+        );
+    }
 }

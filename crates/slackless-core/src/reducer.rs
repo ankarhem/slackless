@@ -337,4 +337,237 @@ mod tests {
         assert_eq!(stored.last_read, Some(Ts::from("1.5")));
         assert_eq!(stored.unread_count_display, Some(0));
     }
+
+    #[test]
+    fn replied_and_missing_channel_message_events() {
+        let mut store = Store::open_in_memory().unwrap();
+        // Missing channel is ignored.
+        let orphan = apply_event(
+            &mut store,
+            &ws(),
+            event(r#"{"type":"message","user":"U1","text":"orphan","ts":"1.0"}"#),
+        );
+        assert_eq!(orphan, None);
+
+        // `message_replied` with `message` upserts the thread root.
+        let replied = apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"message","subtype":"message_replied","channel":"C1",
+                    "message":{"user":"U1","text":"thread root","ts":"10.0","reply_count":2}}"#,
+            ),
+        );
+        assert_eq!(replied, Some(Event::StoreChanged { channel: c1() }));
+        assert_eq!(history(&store)[0].message.text, "thread root");
+        assert_eq!(history(&store)[0].message.reply_count, Some(2));
+
+        // `message_replied` without `message` payload is a no-op.
+        let empty_replied = apply_event(
+            &mut store,
+            &ws(),
+            event(r#"{"type":"message","subtype":"message_replied","channel":"C1"}"#),
+        );
+        assert_eq!(empty_replied, None);
+    }
+
+    #[test]
+    fn deleted_with_previous_message_on_unseen_row_preserves_text() {
+        let mut store = Store::open_in_memory().unwrap();
+        let out = apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"message","subtype":"message_deleted","channel":"C1",
+                    "deleted_ts":"20.0","event_ts":"21.0",
+                    "previous_message":{"user":"U1","text":"vanished before sync","ts":"20.0"}}"#,
+            ),
+        );
+        assert_eq!(out, Some(Event::StoreChanged { channel: c1() }));
+        let stored = history(&store);
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].deleted);
+        assert_eq!(stored[0].message.text, "vanished before sync");
+    }
+
+    #[test]
+    fn reaction_edge_cases_deleted_duplicate_and_truncated_users() {
+        let mut store = Store::open_in_memory().unwrap();
+        // Seed a message with a reaction whose `users` list is truncated (count 3, only U1 listed).
+        store
+            .upsert_message(
+                &ws(),
+                &c1(),
+                &crate::types::Message {
+                    ts: Ts::from("30.0"),
+                    text: "popular".into(),
+                    reactions: vec![Reaction {
+                        name: "fire".into(),
+                        count: 3,
+                        users: vec![UserId::from("U1")],
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Duplicate `reaction_added` from U1 does not bump count or duplicate user.
+        apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"reaction_added","user":"U1","reaction":"fire",
+                    "item":{"type":"message","channel":"C1","ts":"30.0"}}"#,
+            ),
+        );
+        let r = &history(&store)[0].message.reactions[0];
+        assert_eq!((r.count, r.users.len()), (3, 1));
+
+        // `reaction_removed` for U99 (absent from truncated `users`) still decrements count.
+        apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"reaction_removed","user":"U99","reaction":"fire",
+                    "item":{"type":"message","channel":"C1","ts":"30.0"}}"#,
+            ),
+        );
+        let r = &history(&store)[0].message.reactions[0];
+        assert_eq!((r.count, r.users.len()), (2, 1));
+
+        // Delete the message; subsequent reactions on a deleted message return None.
+        apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"message","subtype":"message_deleted","channel":"C1",
+                    "deleted_ts":"30.0","ts":"31.0"}"#,
+            ),
+        );
+        let on_deleted = apply_event(
+            &mut store,
+            &ws(),
+            event(
+                r#"{"type":"reaction_added","user":"U2","reaction":"eyes",
+                    "item":{"type":"message","channel":"C1","ts":"30.0"}}"#,
+            ),
+        );
+        assert_eq!(on_deleted, None);
+    }
+
+    #[test]
+    fn channel_user_marked_typing_and_presence_events_reduce_cleanly() {
+        let mut store = Store::open_in_memory().unwrap();
+
+        for json in [
+            r#"{"type":"channel_joined","channel":{"id":"C2","name":"ops","is_channel":true,"is_member":true}}"#,
+            r#"{"type":"channel_rename","channel":{"id":"C2","name":"ops-renamed","is_channel":true}}"#,
+            r#"{"type":"group_rename","channel":{"id":"G2","name":"secret-renamed","is_group":true}}"#,
+        ] {
+            let ev = apply_event(&mut store, &ws(), event(json));
+            assert!(matches!(ev, Some(Event::Conversations(ref ids)) if ids.len() == 1));
+        }
+        assert_eq!(
+            store
+                .conversation(&ws(), &ChannelId::from("C2"))
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("ops-renamed")
+        );
+
+        let user_ev = apply_event(
+            &mut store,
+            &ws(),
+            event(r#"{"type":"user_change","user":{"id":"U7","name":"alice"}}"#),
+        );
+        assert_eq!(user_ev, Some(Event::UsersChanged(vec![UserId::from("U7")])));
+        assert!(
+            store
+                .users(&ws())
+                .unwrap()
+                .iter()
+                .any(|u| u.id == UserId::from("U7"))
+        );
+
+        // Seed G2 and MPIM G3 so group_marked / mpim_marked update last_read & unread_count_display.
+        for id in ["G2", "G3"] {
+            store
+                .upsert_conversation(
+                    &ws(),
+                    &crate::types::Conversation {
+                        id: ChannelId::from(id),
+                        is_group: id == "G2",
+                        is_mpim: id == "G3",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(
+                    r#"{"type":"group_marked","channel":"G2","ts":"5.5","unread_count_display":1}"#
+                )
+            ),
+            Some(Event::ReadMarker {
+                channel: ChannelId::from("G2"),
+                ts: Ts::from("5.5"),
+            })
+        );
+        assert_eq!(
+            store
+                .conversation(&ws(), &ChannelId::from("G2"))
+                .unwrap()
+                .unwrap()
+                .unread_count_display,
+            Some(1)
+        );
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(r#"{"type":"mpim_marked","channel":"G3","ts":"6.6","dm_count":0}"#)
+            ),
+            Some(Event::ReadMarker {
+                channel: ChannelId::from("G3"),
+                ts: Ts::from("6.6"),
+            })
+        );
+        assert_eq!(
+            store
+                .conversation(&ws(), &ChannelId::from("G3"))
+                .unwrap()
+                .unwrap()
+                .unread_count_display,
+            Some(0)
+        );
+
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(r#"{"type":"user_typing","channel":"C1","user":"U2","thread_ts":"1.0"}"#)
+            ),
+            Some(Event::Typing {
+                channel: c1(),
+                user: UserId::from("U2"),
+                thread_ts: Some(Ts::from("1.0")),
+            })
+        );
+        assert_eq!(
+            apply_event(
+                &mut store,
+                &ws(),
+                event(r#"{"type":"presence_change","users":["U2","U3"],"presence":"active"}"#)
+            ),
+            Some(Event::Presence {
+                users: vec![UserId::from("U2"), UserId::from("U3")],
+                presence: crate::types::Presence::Active,
+            })
+        );
+    }
 }

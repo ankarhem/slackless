@@ -116,10 +116,91 @@ struct FakeState {
     section_deletes: Vec<String>,
     /// `users.channelSections.channels.bulkUpdate` asks: (insert, remove).
     section_moves: Vec<SectionMove>,
+    /// `client.counts` answer and call count.
+    counts: ClientCounts,
+    counts_calls: usize,
+    /// Per-channel `recent_history` override; falls back to `history`.
+    recent_by_channel: HashMap<ChannelId, Vec<Message>>,
+    /// When true, `history_page` and `replies_page` always return the same cursor `"stuck"`.
+    stuck_cursor: bool,
+    /// Transient `conversations.info` failures (`ApiError::AuthExpired`) per channel.
+    fail_info_transient: HashSet<ChannelId>,
+    /// `bots.info` responses and call log.
+    bots: HashMap<BotId, BotProfile>,
+    bot_info_calls: Vec<BotId>,
+    fail_bots: HashSet<BotId>,
+    /// When true, `mark_read` succeeds instead of returning `AuthExpired`.
+    mark_read_ok: bool,
+    /// When true, `mark_all_read` succeeds instead of returning `AuthExpired`.
+    mark_all_read_ok: bool,
+    mark_all_read_calls: usize,
+    /// `reactions.remove` asks, in order.
+    reaction_removes: Vec<(ChannelId, Ts, String)>,
+    /// Huddle backend hooks & call logs.
+    rooms_join_calls: Vec<ChannelId>,
+    rooms_join_gate: Option<Arc<tokio::sync::Notify>>,
+    rooms_join_response: Option<api::RoomJoinResponse>,
+    rooms_get_link_override: Option<String>,
+    rooms_notify_calls: Vec<(ChannelId, UserId)>,
+    rooms_invite_responses: Vec<(ChannelId, String, String)>,
+    rooms_rename_calls: Vec<(String, String)>,
+    huddles_bg_calls: Vec<(String, String)>,
+    transcription_calls: Vec<(String, bool)>,
+    /// Cloud draft hooks & call logs.
+    cloud_drafts: Vec<api::CloudDraft>,
+    draft_creates: Vec<(ChannelId, String)>,
+    draft_updates: Vec<(String, ChannelId, String)>,
+    draft_deletes: Vec<String>,
+    fail_draft_delete: bool,
+    draft_create_gate: Option<Arc<tokio::sync::Notify>>,
+    /// Saved / Later hooks & call logs.
+    saved_by_filter: HashMap<&'static str, Vec<api::SavedItem>>,
+    fail_saved_filters: HashSet<&'static str>,
+    saved_add_error: Option<String>,
+    saved_add_calls: Vec<(ChannelId, Ts, Option<u64>)>,
+    saved_update_calls: Vec<SavedUpdateCall>,
+    saved_delete_calls: Vec<(ChannelId, Ts)>,
+    saved_clear_completed_calls: usize,
+    save_file_calls: Vec<(String, Option<u64>)>,
+    save_file_error: Option<String>,
+    /// Hydrate overrides & partial failure flags.
+    user_boot_override: Option<UserBoot>,
+    fail_dms: bool,
+    fail_emoji: bool,
+    custom_emoji_override: Option<HashMap<String, String>>,
+    usergroups: Vec<crate::types::Usergroup>,
+    app_commands: Vec<api::AppCommand>,
+    fail_activity_feed: bool,
+    fail_messages_list: bool,
+    /// Additional command group hooks & call logs.
+    run_command_error: Option<String>,
+    block_action_calls: Vec<(BotId, String, TeamId)>,
+    rename_channel_calls: Vec<(ChannelId, String)>,
+    archive_calls: Vec<ChannelId>,
+    unarchive_calls: Vec<ChannelId>,
+    delete_channel_calls: Vec<ChannelId>,
+    convert_private_calls: Vec<ChannelId>,
+    invite_calls: Vec<(ChannelId, Vec<UserId>)>,
+    profile_update_response: Option<crate::types::Profile>,
+    user_profile_response: Option<crate::types::Profile>,
+    team_profile_fields_response: HashMap<String, String>,
+    gif_featured_calls: usize,
+    gif_search_calls: Vec<String>,
+    edge_search_calls: Vec<(TeamId, String)>,
+    canvases_create_calls: Vec<(Option<String>, Option<String>, Option<ChannelId>)>,
+    canvases_edit_calls: Vec<String>,
+    fail_canvas_html: bool,
+    list_data: api::SlackListData,
+    list_create_item_calls: Vec<String>,
+    files_favorites: Vec<String>,
+    files_collections: Vec<api::FileCollection>,
+    files_deleted: Vec<api::DeletedFile>,
 }
 
 /// One `users.channelSections.channels.bulkUpdate` ask: its insert and remove sides.
 type SectionMove = (Option<(String, ChannelId)>, Option<(String, ChannelId)>);
+/// One `saved.update` ask: channel, ts, mark, and date_due.
+type SavedUpdateCall = (ChannelId, Ts, Option<api::SavedMark>, Option<Option<u64>>);
 
 /// The fake's canned sections: stored order is deliberately not display order (L2
 /// points at L1), and "Priority" already holds C1.
@@ -419,10 +500,37 @@ impl FakeBackend {
     pub fn rate_limit_next(&self, n: u32) {
         self.state.lock().unwrap().rate_limited = n;
     }
+
+    pub fn set_stuck_cursor(&self, stuck: bool) {
+        self.state.lock().unwrap().stuck_cursor = stuck;
+    }
+
+    pub fn fail_info_transient_for(&self, channel: ChannelId) {
+        self.state
+            .lock()
+            .unwrap()
+            .fail_info_transient
+            .insert(channel);
+    }
+
+    pub fn clear_fail_info_transient(&self) {
+        self.state.lock().unwrap().fail_info_transient.clear();
+    }
+
+    pub fn set_counts(&self, counts: ClientCounts) {
+        self.state.lock().unwrap().counts = counts;
+    }
+
+    pub fn counts_calls(&self) -> usize {
+        self.state.lock().unwrap().counts_calls
+    }
 }
 
 impl Backend for FakeBackend {
     async fn user_boot(&self) -> api::Result<UserBoot> {
+        if let Some(boot) = self.state.lock().unwrap().user_boot_override.clone() {
+            return Ok(boot);
+        }
         Ok(UserBoot {
             channels: vec![Conversation {
                 id: ChannelId::from("C1"),
@@ -440,7 +548,9 @@ impl Backend for FakeBackend {
     }
 
     async fn counts(&self) -> api::Result<ClientCounts> {
-        Ok(ClientCounts::default())
+        let mut state = self.state.lock().unwrap();
+        state.counts_calls += 1;
+        Ok(state.counts.clone())
     }
 
     async fn users(&self) -> api::Result<Vec<User>> {
@@ -460,6 +570,13 @@ impl Backend for FakeBackend {
     }
 
     async fn custom_emoji(&self) -> api::Result<HashMap<String, String>> {
+        let state = self.state.lock().unwrap();
+        if state.fail_emoji {
+            return Err(ApiError::Slack("emoji_unavailable".into()));
+        }
+        if let Some(ref map) = state.custom_emoji_override {
+            return Ok(map.clone());
+        }
         Ok(HashMap::from([(
             "party".to_owned(),
             "https://emoji.example/party.png".to_owned(),
@@ -469,6 +586,9 @@ impl Backend for FakeBackend {
     async fn dm_list(&self) -> api::Result<Vec<Conversation>> {
         let mut state = self.state.lock().unwrap();
         state.dm_calls += 1;
+        if state.fail_dms {
+            return Err(ApiError::Slack("dms_unavailable".into()));
+        }
         Ok(state.dms.clone())
     }
 
@@ -506,6 +626,13 @@ impl Backend for FakeBackend {
             .cloned()
             .collect();
         messages.sort_by(|a, b| b.ts.cmp(&a.ts));
+        if state.stuck_cursor {
+            let end = PAGE.min(messages.len());
+            return Ok(Page {
+                items: messages[..end].to_vec(),
+                next_cursor: Some("stuck".to_owned()),
+            });
+        }
         let start: usize = cursor.map_or(0, |c| c.parse().unwrap());
         let end = (start + PAGE).min(messages.len());
         Ok(Page {
@@ -525,6 +652,13 @@ impl Backend for FakeBackend {
         if state.fail_replies {
             return Err(ApiError::AuthExpired("invalid_auth".into()));
         }
+        if state.stuck_cursor {
+            let end = PAGE.min(state.thread.len());
+            return Ok(Page {
+                items: state.thread[..end].to_vec(),
+                next_cursor: Some("stuck".to_owned()),
+            });
+        }
         let start: usize = cursor.map_or(0, |c| c.parse().unwrap());
         let end = (start + PAGE).min(state.thread.len());
         Ok(Page {
@@ -536,6 +670,11 @@ impl Backend for FakeBackend {
     async fn conversation_info(&self, channel: ChannelId) -> api::Result<Conversation> {
         let mut state = self.state.lock().unwrap();
         state.info_calls.push(channel.clone());
+        if state.fail_info_transient.contains(&channel) {
+            return Err(ApiError::RateLimited {
+                retry_after: Duration::from_secs(1),
+            });
+        }
         if state.fail_info {
             return Err(ApiError::Slack("channel_not_found".into()));
         }
@@ -570,8 +709,12 @@ impl Backend for FakeBackend {
 
     async fn recent_history(&self, channel: ChannelId, limit: u32) -> api::Result<Vec<Message>> {
         let mut state = self.state.lock().unwrap();
-        state.recent_calls.push((channel, limit));
-        let mut items = state.history.clone();
+        state.recent_calls.push((channel.clone(), limit));
+        let mut items = state
+            .recent_by_channel
+            .get(&channel)
+            .cloned()
+            .unwrap_or_else(|| state.history.clone());
         items.sort_by(|a, b| b.ts.cmp(&a.ts));
         items.truncate(limit as usize);
         Ok(items)
@@ -714,6 +857,58 @@ impl Backend for FakeBackend {
         Ok(())
     }
 
+    async fn remove_reaction(&self, ch: ChannelId, ts: Ts, name: String) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .reaction_removes
+            .push((ch, ts, name));
+        Ok(())
+    }
+
+    async fn run_command(
+        &self,
+        _channel: ChannelId,
+        _command: String,
+        _args: String,
+        _thread_ts: Option<Ts>,
+        _team: TeamId,
+    ) -> api::Result<()> {
+        if let Some(err) = self.state.lock().unwrap().run_command_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn block_action(
+        &self,
+        bot: BotId,
+        app_id: String,
+        team: TeamId,
+        _action: serde_json::Value,
+        _container: api::ActionContainer,
+    ) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .block_action_calls
+            .push((bot, app_id, team));
+        Ok(())
+    }
+
+    async fn bot_info(&self, bot: BotId) -> api::Result<BotProfile> {
+        let mut state = self.state.lock().unwrap();
+        state.bot_info_calls.push(bot.clone());
+        if state.fail_bots.contains(&bot) {
+            return Err(ApiError::Slack("bot_not_found".into()));
+        }
+        Ok(state.bots.get(&bot).cloned().unwrap_or(BotProfile {
+            id: bot.clone(),
+            name: format!("bot-{}", bot.as_str()),
+            ..Default::default()
+        }))
+    }
+
     async fn search(&self, _: String) -> api::Result<SearchMessages> {
         Ok(SearchMessages {
             total: 7,
@@ -726,7 +921,11 @@ impl Backend for FakeBackend {
     }
 
     async fn activity_feed(&self) -> api::Result<api::ActivityFeed> {
-        Ok(self.state.lock().unwrap().activity.clone())
+        let state = self.state.lock().unwrap();
+        if state.fail_activity_feed {
+            return Err(ApiError::Slack("activity_unavailable".into()));
+        }
+        Ok(state.activity.clone())
     }
 
     async fn messages_list(
@@ -734,6 +933,9 @@ impl Backend for FakeBackend {
         ids: Vec<(ChannelId, Vec<Ts>)>,
     ) -> api::Result<HashMap<ChannelId, Vec<Message>>> {
         let state = self.state.lock().unwrap();
+        if state.fail_messages_list {
+            return Err(ApiError::Slack("messages_list_failed".into()));
+        }
         Ok(ids
             .into_iter()
             .map(|(channel, _)| {
@@ -848,8 +1050,13 @@ impl Backend for FakeBackend {
     }
 
     async fn mark_read(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
-        self.state.lock().unwrap().mark_calls.push((channel, ts));
-        Err(ApiError::AuthExpired("invalid_auth".into()))
+        let mut state = self.state.lock().unwrap();
+        state.mark_calls.push((channel, ts));
+        if state.mark_read_ok {
+            Ok(())
+        } else {
+            Err(ApiError::AuthExpired("invalid_auth".into()))
+        }
     }
 
     async fn mark_thread_read(&self, channel: ChannelId, thread_ts: Ts, ts: Ts) -> api::Result<()> {
@@ -862,7 +1069,13 @@ impl Backend for FakeBackend {
     }
 
     async fn mark_all_read(&self) -> api::Result<()> {
-        Err(ApiError::AuthExpired("invalid_auth".into()))
+        let mut state = self.state.lock().unwrap();
+        state.mark_all_read_calls += 1;
+        if state.mark_all_read_ok {
+            Ok(())
+        } else {
+            Err(ApiError::AuthExpired("invalid_auth".into()))
+        }
     }
 
     async fn set_thread_subscribed(
@@ -1017,19 +1230,397 @@ impl Backend for FakeBackend {
         })
     }
 
-    async fn drafts_create(
+    async fn rename_channel(&self, channel: ChannelId, name: String) -> api::Result<Conversation> {
+        self.state
+            .lock()
+            .unwrap()
+            .rename_channel_calls
+            .push((channel.clone(), name.clone()));
+        Ok(Conversation {
+            id: channel,
+            name: Some(name),
+            ..Default::default()
+        })
+    }
+
+    async fn archive_channel(&self, channel: ChannelId) -> api::Result<()> {
+        self.state.lock().unwrap().archive_calls.push(channel);
+        Ok(())
+    }
+
+    async fn unarchive_channel(&self, channel: ChannelId) -> api::Result<()> {
+        self.state.lock().unwrap().unarchive_calls.push(channel);
+        Ok(())
+    }
+
+    async fn delete_channel(&self, channel: ChannelId) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .delete_channel_calls
+            .push(channel);
+        Ok(())
+    }
+
+    async fn convert_channel_to_private(&self, channel: ChannelId) -> api::Result<Conversation> {
+        self.state
+            .lock()
+            .unwrap()
+            .convert_private_calls
+            .push(channel.clone());
+        Ok(Conversation {
+            id: channel,
+            is_private: true,
+            is_group: true,
+            ..Default::default()
+        })
+    }
+
+    async fn invite_to_channel(
         &self,
-        _channel: ChannelId,
-        _text: String,
-    ) -> api::Result<Option<String>> {
-        Ok(Some("Dr01".to_owned()))
+        channel: ChannelId,
+        users: Vec<UserId>,
+    ) -> api::Result<Conversation> {
+        self.state
+            .lock()
+            .unwrap()
+            .invite_calls
+            .push((channel.clone(), users));
+        Ok(Conversation {
+            id: channel,
+            ..Default::default()
+        })
+    }
+
+    async fn usergroups(&self) -> api::Result<Vec<crate::types::Usergroup>> {
+        Ok(self.state.lock().unwrap().usergroups.clone())
+    }
+
+    async fn app_commands(&self) -> api::Result<Vec<api::AppCommand>> {
+        Ok(self.state.lock().unwrap().app_commands.clone())
+    }
+
+    async fn gif_featured(&self, _limit: u32) -> api::Result<Vec<api::GifItem>> {
+        self.state.lock().unwrap().gif_featured_calls += 1;
+        Ok(vec![api::GifItem {
+            id: "g1".into(),
+            title: "featured".into(),
+            still_url: "https://gif.example/1s.gif".into(),
+            preview_url: "https://gif.example/1p.gif".into(),
+            url: "https://gif.example/1".into(),
+        }])
+    }
+
+    async fn gif_search(&self, query: String, _limit: u32) -> api::Result<Vec<api::GifItem>> {
+        self.state.lock().unwrap().gif_search_calls.push(query);
+        Ok(vec![api::GifItem {
+            id: "g2".into(),
+            title: "cats".into(),
+            still_url: "https://gif.example/2s.gif".into(),
+            preview_url: "https://gif.example/2p.gif".into(),
+            url: "https://gif.example/2".into(),
+        }])
+    }
+
+    async fn saved_list(&self, filter: &'static str) -> api::Result<Vec<api::SavedItem>> {
+        let state = self.state.lock().unwrap();
+        if state.fail_saved_filters.contains(filter) {
+            return Err(ApiError::Slack(format!("saved_{filter}_failed")));
+        }
+        Ok(state
+            .saved_by_filter
+            .get(filter)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn saved_add(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        date_due: Option<u64>,
+    ) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.saved_add_calls.push((channel, ts, date_due));
+        if let Some(err) = state.saved_add_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn saved_update(
+        &self,
+        channel: ChannelId,
+        ts: Ts,
+        mark: Option<api::SavedMark>,
+        date_due: Option<Option<u64>>,
+    ) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .saved_update_calls
+            .push((channel, ts, mark, date_due));
+        Ok(())
+    }
+
+    async fn saved_delete(&self, channel: ChannelId, ts: Ts) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .saved_delete_calls
+            .push((channel, ts));
+        Ok(())
+    }
+
+    async fn saved_clear_completed(&self) -> api::Result<()> {
+        self.state.lock().unwrap().saved_clear_completed_calls += 1;
+        Ok(())
+    }
+
+    async fn save_file(&self, file_id: String, date_due: Option<u64>) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.save_file_calls.push((file_id, date_due));
+        if let Some(err) = state.save_file_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn edge_search(
+        &self,
+        team_id: TeamId,
+        query: String,
+    ) -> api::Result<api::EdgeSearchResults> {
+        self.state
+            .lock()
+            .unwrap()
+            .edge_search_calls
+            .push((team_id, query));
+        Ok(api::EdgeSearchResults {
+            users: vec![User {
+                id: UserId::from("U9"),
+                name: "bob".into(),
+                ..Default::default()
+            }],
+            channels: Vec::new(),
+        })
+    }
+
+    async fn update_profile(
+        &self,
+        _update: api::ProfileUpdate,
+    ) -> api::Result<slackless_types::Profile> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .profile_update_response
+            .clone()
+            .unwrap_or_default())
+    }
+
+    async fn user_profile(&self, _user: UserId) -> api::Result<slackless_types::Profile> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .user_profile_response
+            .clone()
+            .unwrap_or_default())
+    }
+
+    async fn team_profile_fields(&self) -> api::Result<HashMap<String, String>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .team_profile_fields_response
+            .clone())
+    }
+
+    async fn drafts_list(&self) -> api::Result<Vec<api::CloudDraft>> {
+        Ok(self.state.lock().unwrap().cloud_drafts.clone())
+    }
+
+    async fn drafts_create(&self, channel: ChannelId, text: String) -> api::Result<Option<String>> {
+        let gate = {
+            let mut state = self.state.lock().unwrap();
+            state.draft_creates.push((channel, text));
+            state.draft_create_gate.clone()
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        let n = self.state.lock().unwrap().draft_creates.len();
+        Ok(Some(format!("Dr{n:02}")))
+    }
+
+    async fn drafts_update(
+        &self,
+        draft_id: String,
+        channel: ChannelId,
+        text: String,
+    ) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .draft_updates
+            .push((draft_id, channel, text));
+        Ok(())
+    }
+
+    async fn drafts_delete(&self, draft_id: String) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.draft_deletes.push(draft_id);
+        if state.fail_draft_delete {
+            return Err(ApiError::Slack("draft_delete_failed".into()));
+        }
+        Ok(())
     }
 
     async fn fetch_canvas_html(&self, _file_id: String) -> api::Result<(String, String)> {
+        if self.state.lock().unwrap().fail_canvas_html {
+            return Err(ApiError::Slack("canvas_not_found".into()));
+        }
         Ok((
             "Sample canvas".to_owned(),
             "<h1>Sample canvas</h1><p>Hello</p>".to_owned(),
         ))
+    }
+
+    async fn canvases_create(
+        &self,
+        title: Option<String>,
+        markdown: Option<String>,
+        channel: Option<ChannelId>,
+    ) -> api::Result<api::CanvasCreated> {
+        self.state
+            .lock()
+            .unwrap()
+            .canvases_create_calls
+            .push((title, markdown, channel));
+        Ok(api::CanvasCreated {
+            canvas_id: "FCANVAS1".to_owned(),
+        })
+    }
+
+    async fn canvases_edit(&self, file_id: String, _op: api::CanvasEditOp) -> api::Result<()> {
+        self.state.lock().unwrap().canvases_edit_calls.push(file_id);
+        Ok(())
+    }
+
+    async fn fetch_list(&self, _file_id: String) -> api::Result<api::SlackListData> {
+        Ok(self.state.lock().unwrap().list_data.clone())
+    }
+
+    async fn lists_records_create(
+        &self,
+        list_id: String,
+        _initial_fields: Vec<api::ListCellInput>,
+    ) -> api::Result<api::SlackListRow> {
+        self.state
+            .lock()
+            .unwrap()
+            .list_create_item_calls
+            .push(list_id);
+        Ok(api::SlackListRow::default())
+    }
+
+    async fn files_favorites_list(&self) -> api::Result<Vec<String>> {
+        Ok(self.state.lock().unwrap().files_favorites.clone())
+    }
+
+    async fn files_collections_list(&self) -> api::Result<Vec<api::FileCollection>> {
+        Ok(self.state.lock().unwrap().files_collections.clone())
+    }
+
+    async fn files_recently_deleted(&self) -> api::Result<Vec<api::DeletedFile>> {
+        Ok(self.state.lock().unwrap().files_deleted.clone())
+    }
+
+    async fn rooms_join(&self, channel: ChannelId) -> api::Result<api::RoomJoinResponse> {
+        let (gate, response) = {
+            let mut state = self.state.lock().unwrap();
+            state.rooms_join_calls.push(channel);
+            (
+                state.rooms_join_gate.clone(),
+                state.rooms_join_response.clone(),
+            )
+        };
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
+        response.ok_or_else(|| ApiError::UnsupportedHuddleBackend("huddles unavailable".to_owned()))
+    }
+
+    async fn rooms_notify_member(&self, channel: ChannelId, user: UserId) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms_notify_calls
+            .push((channel, user));
+        Ok(())
+    }
+
+    async fn rooms_get_link(&self, channel: ChannelId) -> api::Result<String> {
+        if let Some(url) = self.state.lock().unwrap().rooms_get_link_override.clone() {
+            return Ok(url);
+        }
+        Ok(format!("https://app.slack.com/huddle/{channel}"))
+    }
+
+    async fn rooms_rename(&self, room_id: String, name: String) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms_rename_calls
+            .push((room_id, name));
+        Ok(())
+    }
+
+    async fn rooms_start_transcription(&self, call_id: String) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .transcription_calls
+            .push((call_id, true));
+        Ok(())
+    }
+
+    async fn rooms_stop_transcription(&self, call_id: String) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .transcription_calls
+            .push((call_id, false));
+        Ok(())
+    }
+
+    async fn rooms_invite_response(
+        &self,
+        channel: ChannelId,
+        room_id: String,
+        response: String,
+    ) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .rooms_invite_responses
+            .push((channel, room_id, response));
+        Ok(())
+    }
+
+    async fn huddles_update_background(
+        &self,
+        huddle_id: String,
+        background_id: String,
+    ) -> api::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .huddles_bg_calls
+            .push((huddle_id, background_id));
+        Ok(())
     }
 }
 
@@ -2840,21 +3431,25 @@ async fn offline_queue_buffers_and_flushes_on_reconnect() {
     core.on_rtm(RtmEvent::State(connected.clone())).await;
     assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
     assert_eq!(next(&mut rx).await, Event::Connection(connected));
-    // Wait for the spawned SendMessage (`StoreChanged`) and failed MarkRead (`OfflineMutationFailed`).
+    // Wait for the spawned SendMessage (`StoreChanged`) and `MarkRead` (`AuthExpired`).
     let mut saw_store_changed = false;
-    let mut failed_id = None;
+    let mut saw_auth_expired = false;
     for _ in 0..2 {
         match next(&mut rx).await {
             Event::StoreChanged { channel } if channel == c1() => saw_store_changed = true,
-            Event::OfflineMutationFailed(failed) => failed_id = Some(failed.id),
+            Event::AuthExpired(code) if code == "invalid_auth" => saw_auth_expired = true,
             _ => {}
         }
     }
     assert!(saw_store_changed);
-    assert!(failed_id.is_some());
-    // Yield briefly so the reaction task finishes too.
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(saw_auth_expired);
+    wait_until("offline flush tasks complete", || {
+        let state = fake.state.lock().unwrap();
+        state.posted_messages.len() == 1
+            && state.reaction_adds.len() == 1
+            && state.mark_calls.len() == 1
+    })
+    .await;
 
     let state = fake.state.lock().unwrap();
     assert_eq!(
@@ -2927,13 +3522,1593 @@ async fn offline_queue_persists_across_restart_and_retries_or_discards() {
     fake.state.lock().unwrap().fail_post_message = false;
     core2.handle(Command::RetryOfflineMutation(failed.id));
     assert_eq!(next(&mut rx2).await, Event::StoreChanged { channel: c1() });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(
+    wait_until("offline queue row removed after retry", || {
         store
             .lock()
             .unwrap()
             .list_offline(&TeamId::from("T1"))
             .unwrap()
             .is_empty()
+    })
+    .await;
+}
+
+/// Poll `pred` until true (5ms cadence, 2s ceiling) to avoid flaky fixed sleeps on busy CI runners.
+async fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if pred() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hydrate_prefetches_unread_dms_before_channels_and_skips_up_to_date_store() {
+    use crate::api::ConversationCounts;
+    use crate::types::Attachment;
+
+    let fake = FakeBackend::default();
+    let ims = vec![
+        // DM1 is already up-to-date in local SQLite (`latest == 50.0`).
+        ConversationCounts {
+            id: ChannelId::from("D_UPTODATE"),
+            latest: Some(Ts::from("50.0")),
+            dm_count: 1,
+            has_unreads: true,
+            ..Default::default()
+        },
+        // DM2 has 2 mentions (highest priority DM).
+        ConversationCounts {
+            id: ChannelId::from("D_HOT"),
+            latest: Some(Ts::from("40.0")),
+            dm_count: 2,
+            has_unreads: true,
+            ..Default::default()
+        },
+        // DM3 has 1 mention (second priority DM).
+        ConversationCounts {
+            id: ChannelId::from("D_WARM"),
+            latest: Some(Ts::from("30.0")),
+            dm_count: 1,
+            has_unreads: true,
+            ..Default::default()
+        },
+    ];
+
+    let mut channels = Vec::new();
+    // Mentioned channel must precede plain channels.
+    channels.push(ConversationCounts {
+        id: ChannelId::from("C_MENTION"),
+        latest: Some(Ts::from("10.0")),
+        mention_count: 3,
+        has_unreads: true,
+        ..Default::default()
+    });
+    // 25 plain unread channels with ascending timestamps -> total unread = 29 (>25 cap).
+    // Plain channels C_PLAIN_25 down to C_PLAIN_05 should be in the top 25, while the oldest 4
+    // (C_PLAIN_01..=04) are truncated by the 25-item cap.
+    for i in 1..=25u32 {
+        channels.push(ConversationCounts {
+            id: ChannelId::from(format!("C_PLAIN_{i:02}")),
+            latest: Some(Ts::from(format!("{:04}.0", i))),
+            has_unreads: true,
+            ..Default::default()
+        });
+    }
+    fake.set_counts(ClientCounts {
+        ims,
+        channels,
+        ..Default::default()
+    });
+    // Put a message with an unfurl in D_HOT so prefetch also triggers unfurl resolution.
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.history.push(Message {
+            ts: Ts::from("99.0"),
+            text: "fresh unread".into(),
+            ..Default::default()
+        });
+        state.recent_by_channel.insert(
+            ChannelId::from("D_HOT"),
+            vec![Message {
+                ts: Ts::from("40.0"),
+                text: "dm with unfurl".into(),
+                attachments: vec![Attachment {
+                    is_msg_unfurl: true,
+                    channel_id: Some(ChannelId::from("CEXT_PREF")),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        );
+        state.info = Some(Conversation {
+            name: Some("foreign-prefetched".into()),
+            ..Default::default()
+        });
+    }
+
+    let (store, events, mut rx) = fake_core_parts();
+    // Pre-seed D_UPTODATE with ts 50.0 so it is skipped.
+    store
+        .lock()
+        .unwrap()
+        .upsert_message(
+            &TeamId::from("T1"),
+            &ChannelId::from("D_UPTODATE"),
+            &Message {
+                ts: Ts::from("50.0"),
+                text: "already stored".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+    core.hydrate().await;
+
+    // Wait until all 24 prefetched channels (25 cap minus 1 skipped up-to-date DM) emit
+    // StoreChanged AND the unfurl conversation CEXT_PREF is announced.
+    let mut store_changed = Vec::new();
+    let mut saw_unfurl = false;
+    while store_changed.len() < 24 || !saw_unfurl {
+        match next(&mut rx).await {
+            Event::StoreChanged { channel } => store_changed.push(channel),
+            Event::Conversations(ids) if ids.contains(&ChannelId::from("CEXT_PREF")) => {
+                saw_unfurl = true;
+            }
+            _ => {}
+        }
+    }
+
+    let fetched: Vec<ChannelId> = fake
+        .state
+        .lock()
+        .unwrap()
+        .recent_calls
+        .iter()
+        .map(|(ch, _)| ch.clone())
+        .collect();
+    assert_eq!(fetched.len(), 24, "25-cap minus 1 already up-to-date DM");
+    assert!(
+        !fetched.contains(&ChannelId::from("D_UPTODATE")),
+        "up-to-date DM skipped"
     );
+    assert_eq!(fetched[0], ChannelId::from("D_HOT"));
+    assert_eq!(fetched[1], ChannelId::from("D_WARM"));
+    assert_eq!(fetched[2], ChannelId::from("C_MENTION"));
+    assert_eq!(fetched[3], ChannelId::from("C_PLAIN_25"));
+    assert!(!fetched.contains(&ChannelId::from("C_PLAIN_01")));
+    assert!(!fetched.contains(&ChannelId::from("C_PLAIN_04")));
+    assert!(saw_unfurl);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_refreshes_counts_and_prefetches_missed_messages() {
+    use crate::api::ConversationCounts;
+
+    let fake = FakeBackend::with_history(1..=2);
+    fake.set_counts(ClientCounts {
+        ims: vec![ConversationCounts {
+            id: ChannelId::from("D_LAG"),
+            latest: Some(Ts::from("20.0")),
+            dm_count: 1,
+            has_unreads: true,
+            ..Default::default()
+        }],
+        channels: vec![
+            ConversationCounts {
+                id: ChannelId::from("C_SYNCED"),
+                latest: Some(Ts::from("10.0")),
+                has_unreads: true,
+                ..Default::default()
+            },
+            ConversationCounts {
+                id: ChannelId::from("C_LAG"),
+                latest: Some(Ts::from("15.0")),
+                has_unreads: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    let (store, events, mut rx) = fake_core_parts();
+    // C_SYNCED already has ts 10.0 stored.
+    store
+        .lock()
+        .unwrap()
+        .upsert_message(
+            &TeamId::from("T1"),
+            &ChannelId::from("C_SYNCED"),
+            &Message {
+                ts: Ts::from("10.0"),
+                text: "caught up".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // 1st Connected: no reconnect counts refresh yet.
+    core.on_rtm(RtmEvent::State(ConnectionState::Connected {
+        fast_reconnect: false,
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+    tokio::task::yield_now().await;
+    assert_eq!(fake.counts_calls(), 0);
+
+    // Disconnected -> 2nd Connected: triggers counts() and prefetches lagging channels only.
+    core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
+        reason: "sleep".into(),
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+
+    core.on_rtm(RtmEvent::State(ConnectionState::Connected {
+        fast_reconnect: true,
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+
+    let mut saw_counts = false;
+    let mut changed = Vec::new();
+    while !saw_counts || changed.len() < 2 {
+        match next(&mut rx).await {
+            Event::Counts(_) => saw_counts = true,
+            Event::StoreChanged { channel } => changed.push(channel),
+            _ => {}
+        }
+    }
+    assert_eq!(fake.counts_calls(), 1);
+    assert_eq!(
+        changed,
+        vec![ChannelId::from("D_LAG"), ChannelId::from("C_LAG")]
+    );
+    let fetched: Vec<ChannelId> = fake
+        .state
+        .lock()
+        .unwrap()
+        .recent_calls
+        .iter()
+        .map(|(ch, _)| ch.clone())
+        .collect();
+    assert!(!fetched.contains(&ChannelId::from("C_SYNCED")));
+}
+
+#[tokio::test]
+async fn bot_profile_caching_shares_cache_dedups_and_persists_across_paths() {
+    let fake = FakeBackend::default();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.bots.insert(
+            BotId::from("B1"),
+            BotProfile {
+                id: BotId::from("B1"),
+                name: "Giphy".into(),
+                ..Default::default()
+            },
+        );
+        state.bots.insert(
+            BotId::from("B2"),
+            BotProfile {
+                id: BotId::from("B2"),
+                name: "DeployBot".into(),
+                ..Default::default()
+            },
+        );
+        state.fail_bots.insert(BotId::from("BFAIL"));
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // 1. RTM Message attaches B1 profile, persists to SQLite, and caches in memory.
+    let ev1: SlackEvent = serde_json::from_str(
+        r#"{"type":"message","channel":"C1","ts":"1.0","text":"hi","bot_id":"B1"}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(ev1)).await;
+    assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+    let Event::MessagePosted { message, .. } = next(&mut rx).await else {
+        panic!("expected MessagePosted");
+    };
+    assert_eq!(
+        message.bot_profile.as_ref().map(|p| p.name.as_str()),
+        Some("Giphy")
+    );
+    // Persisted in SQLite!
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .bot_profiles(&TeamId::from("T1"))
+            .unwrap()
+            .get(&BotId::from("B1"))
+            .map(|p| p.name.as_str()),
+        Some("Giphy")
+    );
+
+    // 2. ResolveBots(B1) hits memory cache immediately with 0 extra `bots.info` calls.
+    core.handle(Command::ResolveBots(vec![BotId::from("B1")]));
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::BotProfileLoaded { bot_id, profile }
+            if bot_id == BotId::from("B1") && profile.name == "Giphy"
+    ));
+    assert_eq!(
+        fake.state.lock().unwrap().bot_info_calls,
+        vec![BotId::from("B1")]
+    );
+
+    // 3. ResolveBots(B2) fetches B2 AND populates `core.bots`, so subsequent RTM Changed
+    //    attaches B2 from cache without another `bots.info` call.
+    core.handle(Command::ResolveBots(vec![BotId::from("B2")]));
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::BotProfileLoaded { bot_id, profile }
+            if bot_id == BotId::from("B2") && profile.name == "DeployBot"
+    ));
+    let ev_changed: SlackEvent = serde_json::from_str(
+        r#"{"type":"message","subtype":"message_changed","channel":"C1","event_ts":"2.0",
+            "message":{"ts":"1.0","text":"edited","bot_id":"B2"}}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(ev_changed)).await;
+    assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+    let stored_msg = store
+        .lock()
+        .unwrap()
+        .message(&TeamId::from("T1"), &c1(), &Ts::from("1.0"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored_msg
+            .message
+            .bot_profile
+            .as_ref()
+            .map(|p| p.name.as_str()),
+        Some("DeployBot")
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().bot_info_calls,
+        vec![BotId::from("B1"), BotId::from("B2")]
+    );
+
+    // 4. Failed `bots.info` for BFAIL is recorded in `bots_asked` so a second RTM message does NOT retry.
+    let ev_fail1: SlackEvent = serde_json::from_str(
+        r#"{"type":"message","channel":"C1","ts":"3.0","text":"f1","bot_id":"BFAIL"}"#,
+    )
+    .unwrap();
+    let ev_fail2: SlackEvent = serde_json::from_str(
+        r#"{"type":"message","channel":"C1","ts":"4.0","text":"f2","bot_id":"BFAIL"}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(ev_fail1)).await;
+    assert!(matches!(next(&mut rx).await, Event::Error(e) if e.contains("bots.info")));
+    assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+    assert!(matches!(next(&mut rx).await, Event::MessagePosted { .. }));
+
+    core.on_rtm(RtmEvent::Event(ev_fail2)).await;
+    // No second Event::Error for BFAIL!
+    assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+    assert!(matches!(next(&mut rx).await, Event::MessagePosted { .. }));
+    assert_eq!(
+        fake.state
+            .lock()
+            .unwrap()
+            .bot_info_calls
+            .iter()
+            .filter(|id| **id == BotId::from("BFAIL"))
+            .count(),
+        1
+    );
+
+    // 5. Restarting Core on the same SQLite store preloads B1 & B2 so ResolveBots makes 0 API calls.
+    let calls_before = fake.state.lock().unwrap().bot_info_calls.len();
+    let (tx2, mut rx2) = mpsc::unbounded();
+    let mut core2 = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        Emitter(tx2),
+    );
+    core2.handle(Command::ResolveBots(vec![
+        BotId::from("B1"),
+        BotId::from("B2"),
+    ]));
+    assert!(
+        matches!(next(&mut rx2).await, Event::BotProfileLoaded { bot_id, .. } if bot_id == BotId::from("B1"))
+    );
+    assert!(
+        matches!(next(&mut rx2).await, Event::BotProfileLoaded { bot_id, .. } if bot_id == BotId::from("B2"))
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().bot_info_calls.len(),
+        calls_before
+    );
+}
+
+#[tokio::test]
+async fn huddle_commands_and_lifecycle_races() {
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // 1. JoinHuddle error (UnsupportedHuddleBackend) emits Event::Error and resets `joining`.
+    core.handle(Command::JoinHuddle {
+        channel: c1(),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    });
+    assert!(matches!(next(&mut rx).await, Event::Error(e) if e.contains("rooms.join")));
+    assert!(!core.huddle.lock().unwrap().joining);
+
+    // 2. Concurrent duplicate JoinHuddle while rooms_join is in-flight only calls rooms_join once,
+    //    and LeaveHuddle during in-flight rooms_join prevents activating the session.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.rooms_join_calls.clear();
+        state.rooms_join_gate = Some(Arc::clone(&gate));
+        state.rooms_join_response = Some(api::RoomJoinResponse {
+            call_id: "R01".into(),
+            ..Default::default()
+        });
+    }
+    core.handle(Command::JoinHuddle {
+        channel: c1(),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    });
+    // Second concurrent JoinHuddle is ignored while `joining == true`.
+    core.handle(Command::JoinHuddle {
+        channel: ChannelId::from("C2"),
+        audio: crate::huddle::HuddleAudioConfig::default(),
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(fake.state.lock().unwrap().rooms_join_calls, vec![c1()]);
+
+    // LeaveHuddle cancels the in-flight join before rooms_join returns.
+    core.handle(Command::LeaveHuddle);
+    gate.notify_waiters();
+    wait_until("cancelled join clears joining flag", || {
+        !core.huddle.lock().unwrap().joining
+    })
+    .await;
+    {
+        let slot = core.huddle.lock().unwrap();
+        assert!(
+            slot.handle.is_none(),
+            "cancelled join must not install handle"
+        );
+        assert!(
+            slot.call_id.is_none(),
+            "cancelled join must not install call_id"
+        );
+    }
+
+    // 3. CopyHuddleLink (fallback default & custom API URL), InviteToHuddle, DeclineHuddleInvite.
+    core.handle(Command::CopyHuddleLink { channel: c1() });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::HuddleLinkLoaded {
+            channel: c1(),
+            url: "https://app.slack.com/huddle/C1".into(),
+        }
+    );
+    fake.state.lock().unwrap().rooms_get_link_override =
+        Some("https://app.slack.com/huddle/T1/C1/custom".into());
+    core.handle(Command::CopyHuddleLink { channel: c1() });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::HuddleLinkLoaded {
+            channel: c1(),
+            url: "https://app.slack.com/huddle/T1/C1/custom".into(),
+        }
+    );
+
+    core.handle(Command::InviteToHuddle {
+        channel: c1(),
+        users: vec![UserId::from("U2"), UserId::from("U3")],
+    });
+    core.handle(Command::DeclineHuddleInvite {
+        channel: c1(),
+        call_id: "R99".into(),
+    });
+
+    // 4. SetHuddleTopic / Background / Captions are no-ops when no active call_id.
+    core.handle(Command::SetHuddleTopic("No-op".into()));
+    core.handle(Command::SetHuddleBackground("aurora".into()));
+    core.handle(Command::SetHuddleCaptions(true));
+    wait_until("huddle invite and decline calls recorded", || {
+        let state = fake.state.lock().unwrap();
+        state.rooms_notify_calls.len() == 2 && state.rooms_invite_responses.len() == 1
+    })
+    .await;
+    {
+        let state = fake.state.lock().unwrap();
+        assert_eq!(
+            state.rooms_notify_calls,
+            vec![(c1(), UserId::from("U2")), (c1(), UserId::from("U3"))]
+        );
+        assert_eq!(
+            state.rooms_invite_responses,
+            vec![(c1(), "R99".into(), "decline".into())]
+        );
+        assert!(state.rooms_rename_calls.is_empty());
+        assert!(state.huddles_bg_calls.is_empty());
+        assert!(state.transcription_calls.is_empty());
+    }
+
+    // With an active call_id, SetHuddleTopic / Background / Captions invoke REST endpoints.
+    core.huddle.lock().unwrap().call_id = Some("RACTIVE".into());
+    core.handle(Command::SetHuddleTopic("Sprint sync".into()));
+    core.handle(Command::SetHuddleBackground("aurora".into()));
+    core.handle(Command::SetHuddleCaptions(true));
+    core.handle(Command::SetHuddleCaptions(false));
+    wait_until("active huddle control calls recorded", || {
+        let state = fake.state.lock().unwrap();
+        state.rooms_rename_calls.len() == 1
+            && state.huddles_bg_calls.len() == 1
+            && state.transcription_calls.len() == 2
+    })
+    .await;
+    {
+        let state = fake.state.lock().unwrap();
+        assert_eq!(
+            state.rooms_rename_calls,
+            vec![("RACTIVE".into(), "Sprint sync".into())]
+        );
+        assert_eq!(
+            state.huddles_bg_calls,
+            vec![("RACTIVE".into(), "aurora".into())]
+        );
+        assert_eq!(
+            state.transcription_calls,
+            vec![("RACTIVE".into(), true), ("RACTIVE".into(), false)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn drafts_sync_lifecycle_concurrency_delete_failure_and_fetch_reconciliation() {
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // 1. Concurrent SyncDraft calls on C1 serialize so drafts_create runs ONCE, then drafts_update.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    fake.state.lock().unwrap().draft_create_gate = Some(Arc::clone(&gate));
+    core.handle(Command::SyncDraft {
+        channel: c1(),
+        text: "first".into(),
+    });
+    wait_until("first SyncDraft entered drafts_create", || {
+        fake.state.lock().unwrap().draft_creates.len() == 1
+    })
+    .await;
+    core.handle(Command::SyncDraft {
+        channel: c1(),
+        text: "second".into(),
+    });
+    tokio::task::yield_now().await;
+    gate.notify_waiters();
+    wait_until("second SyncDraft completed as drafts_update", || {
+        fake.state.lock().unwrap().draft_updates.len() == 1
+    })
+    .await;
+    fake.state.lock().unwrap().draft_create_gate = None;
+    {
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.draft_creates.len(), 1, "no double create");
+        assert_eq!(state.draft_updates.len(), 1);
+        assert_eq!(state.draft_updates[0].0, "Dr01");
+        assert_eq!(state.draft_updates[0].2, "second");
+    }
+
+    // 2. Delete failure retains the channel in cloud_draft_ids; subsequent delete succeeds and removes it.
+    fake.state.lock().unwrap().fail_draft_delete = true;
+    core.handle(Command::SyncDraft {
+        channel: c1(),
+        text: "   ".into(),
+    });
+    wait_until("failed drafts_delete recorded", || {
+        fake.state.lock().unwrap().draft_deletes.len() == 1
+    })
+    .await;
+    // Allow post-delete cache update to run before asserting retention.
+    tokio::task::yield_now().await;
+    assert_eq!(
+        core.cloud_draft_ids
+            .lock()
+            .unwrap()
+            .get(&c1())
+            .map(String::as_str),
+        Some("Dr01"),
+        "failed delete must keep draft id cached"
+    );
+
+    fake.state.lock().unwrap().fail_draft_delete = false;
+    core.handle(Command::SyncDraft {
+        channel: c1(),
+        text: "".into(),
+    });
+    wait_until("successful drafts_delete removes cached draft id", || {
+        !core.cloud_draft_ids.lock().unwrap().contains_key(&c1())
+    })
+    .await;
+
+    // 3. FetchCloudDrafts seeds cloud_draft_ids and reconciles/removes stale entries.
+    core.cloud_draft_ids
+        .lock()
+        .unwrap()
+        .insert(ChannelId::from("CSTALE"), "DrStale".into());
+    fake.state.lock().unwrap().cloud_drafts = vec![api::CloudDraft {
+        id: "DrFresh".into(),
+        channel: ChannelId::from("C2"),
+        text: "remote draft".into(),
+        updated_secs: Some(100),
+    }];
+    core.handle(Command::FetchCloudDrafts);
+    let Event::CloudDrafts(drafts) = next(&mut rx).await else {
+        panic!("expected CloudDrafts");
+    };
+    assert_eq!(drafts.len(), 1);
+    let map = core.cloud_draft_ids.lock().unwrap();
+    assert!(
+        !map.contains_key(&ChannelId::from("CSTALE")),
+        "stale entry cleared"
+    );
+    assert_eq!(
+        map.get(&ChannelId::from("C2")).map(String::as_str),
+        Some("DrFresh")
+    );
+}
+
+#[tokio::test]
+async fn offline_queue_edge_cases_discard_remove_reaction_mark_read_summary_and_corrupt_row() {
+    // 1. QueuedMutation::summary UTF-8 truncation and variants.
+    let long_utf8 = "🎉".repeat(55);
+    let m_long = QueuedMutation::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain(long_utf8),
+        thread_ts: None,
+        broadcast: false,
+    };
+    let s_long = m_long.summary();
+    assert!(s_long.ends_with("…\""));
+    assert_eq!(s_long.chars().filter(|&c| c == '🎉').count(), 48);
+
+    let m_empty = QueuedMutation::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("   "),
+        thread_ts: None,
+        broadcast: false,
+    };
+    assert_eq!(m_empty.summary(), "Message");
+    assert_eq!(
+        QueuedMutation::RemoveReaction {
+            channel: c1(),
+            ts: Ts::from("1.0"),
+            name: "wave".into(),
+        }
+        .summary(),
+        "Remove reaction :wave:"
+    );
+    assert_eq!(
+        QueuedMutation::MarkRead {
+            channel: c1(),
+            ts: Ts::from("1.0"),
+        }
+        .summary(),
+        "Mark read (C1)"
+    );
+
+    // 2. Corrupt JSON row in SQLite `offline_queue` is skipped cleanly on Core::new while valid rows load.
+    let fake = FakeBackend::default();
+    fake.state.lock().unwrap().mark_read_ok = true;
+    let (store, events, mut rx) = fake_core_parts();
+    {
+        let mut s = store.lock().unwrap();
+        s.upsert_conversation(
+            &TeamId::from("T1"),
+            &Conversation {
+                id: c1(),
+                last_read: Some(Ts::from("1.0")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.enqueue_offline(&TeamId::from("T1"), "{not-valid-json")
+            .unwrap();
+        let valid_payload = serde_json::to_string(&QueuedMutation::RemoveReaction {
+            channel: c1(),
+            ts: Ts::from("5.0"),
+            name: "eyes".into(),
+        })
+        .unwrap();
+        s.enqueue_offline(&TeamId::from("T1"), &valid_payload)
+            .unwrap();
+    }
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+
+    // Go offline: queue MarkRead and a SendMessage, then discard the SendMessage while offline.
+    core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
+        reason: "down".into(),
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+
+    core.handle(Command::MarkRead {
+        channel: c1(),
+        ts: Ts::from("99.0"),
+    });
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
+
+    core.handle(Command::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("discard me"),
+        thread_ts: None,
+        broadcast: false,
+    });
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(3));
+    let discard_id = core.offline_queue.back().unwrap().0;
+    core.handle(Command::DiscardOfflineMutation(discard_id));
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(2));
+
+    // RetryOfflineMutation while offline does NOT fire a network call immediately.
+    let mark_id = core.offline_queue.back().unwrap().0;
+    core.handle(Command::RetryOfflineMutation(mark_id));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(fake.state.lock().unwrap().mark_calls.is_empty());
+
+    // Reconnect: flushes RemoveReaction + MarkRead (and updates SQLite conv.last_read to 99.0!).
+    core.on_rtm(RtmEvent::State(ConnectionState::Connected {
+        fast_reconnect: false,
+    }))
+    .await;
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
+    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+    wait_until("offline queue flush updates store last_read", || {
+        store
+            .lock()
+            .unwrap()
+            .conversation(&TeamId::from("T1"), &c1())
+            .unwrap()
+            .and_then(|c| c.last_read)
+            .as_ref()
+            .map(Ts::as_str)
+            == Some("99.0")
+    })
+    .await;
+    {
+        let state = fake.state.lock().unwrap();
+        assert_eq!(
+            state.reaction_removes,
+            vec![(c1(), Ts::from("5.0"), "eyes".into())]
+        );
+        assert_eq!(state.mark_calls, vec![(c1(), Ts::from("99.0"))]);
+        assert!(state.posted_messages.is_empty());
+    }
+    let stored_conv = store
+        .lock()
+        .unwrap()
+        .conversation(&TeamId::from("T1"), &c1())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_conv.last_read, Some(Ts::from("99.0")));
+
+    // 3. DiscardOfflineMutation after a failed flush deletes the SQLite row.
+    fake.state.lock().unwrap().fail_post_message = true;
+    core.on_rtm(RtmEvent::State(ConnectionState::Disconnected {
+        reason: "down2".into(),
+    }))
+    .await;
+    assert!(matches!(next(&mut rx).await, Event::Connection(_)));
+    core.handle(Command::SendMessage {
+        channel: c1(),
+        content: MessageContent::plain("will fail"),
+        thread_ts: None,
+        broadcast: false,
+    });
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(1));
+    core.on_rtm(RtmEvent::State(ConnectionState::Connected {
+        fast_reconnect: false,
+    }))
+    .await;
+    let mut failed_id = None;
+    for _ in 0..4 {
+        if let Event::OfflineMutationFailed(f) = next(&mut rx).await {
+            failed_id = Some(f.id);
+            break;
+        }
+    }
+    let failed_id = failed_id.expect("expected OfflineMutationFailed");
+    core.handle(Command::DiscardOfflineMutation(failed_id));
+    assert_eq!(next(&mut rx).await, Event::OfflineQueueChanged(0));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .list_offline(&TeamId::from("T1"))
+            .unwrap()
+            .iter()
+            .all(|(id, _)| *id != failed_id)
+    );
+}
+
+#[tokio::test]
+async fn saved_later_workflows_merge_dedup_hydrate_and_mutate() {
+    use crate::api::{SavedItem, SavedItemState, SavedMark};
+
+    let fake = FakeBackend::default();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.saved_by_filter.insert(
+            "saved",
+            vec![SavedItem {
+                channel: c1(),
+                ts: Ts::from("1.0"),
+                state: SavedItemState::InProgress,
+                date_due: None,
+                date_created: Some(10),
+                message: None,
+            }],
+        );
+        // Completed has a duplicate of (C1, 1.0) plus a unique item (C1, 2.0).
+        state.saved_by_filter.insert(
+            "completed",
+            vec![
+                SavedItem {
+                    channel: c1(),
+                    ts: Ts::from("1.0"),
+                    state: SavedItemState::Completed,
+                    date_due: None,
+                    date_created: Some(10),
+                    message: None,
+                },
+                SavedItem {
+                    channel: c1(),
+                    ts: Ts::from("2.0"),
+                    state: SavedItemState::Completed,
+                    date_due: None,
+                    date_created: Some(20),
+                    message: None,
+                },
+            ],
+        );
+        // Archived fails; load_saved_items tolerates errors on completed/archived.
+        state.fail_saved_filters.insert("archived");
+        state.activity_bodies.insert(
+            c1(),
+            vec![
+                Message {
+                    ts: Ts::from("1.0"),
+                    text: "saved body 1".into(),
+                    ..Default::default()
+                },
+                Message {
+                    ts: Ts::from("2.0"),
+                    text: "saved body 2".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // 1. LoadSaved merges, deduplicates, tolerates archived failure, and hydrates bodies.
+    core.handle(Command::LoadSaved);
+    let Event::SavedLoaded(Ok(items)) = next(&mut rx).await else {
+        panic!("expected SavedLoaded(Ok)");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].message.as_ref().map(|m| m.text.as_str()),
+        Some("saved body 1")
+    );
+    assert_eq!(
+        items[1].message.as_ref().map(|m| m.text.as_str()),
+        Some("saved body 2")
+    );
+
+    // 2. SaveItem with "already_saved" + Some(date_due) falls back to saved_update.
+    fake.state.lock().unwrap().saved_add_error = Some("already_saved".into());
+    core.handle(Command::SaveItem {
+        channel: c1(),
+        ts: Ts::from("1.0"),
+        date_due: Some(500),
+    });
+    assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
+    assert_eq!(
+        fake.state.lock().unwrap().saved_update_calls,
+        vec![(c1(), Ts::from("1.0"), None, Some(Some(500)))]
+    );
+
+    // 3. SaveItem with "already_saved" + None does NOT call saved_update again.
+    core.handle(Command::SaveItem {
+        channel: c1(),
+        ts: Ts::from("1.0"),
+        date_due: None,
+    });
+    assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
+    assert_eq!(fake.state.lock().unwrap().saved_update_calls.len(), 1);
+
+    // 4. SaveFile (normal & "already_exists"), UpdateSavedItem, DeleteSavedItem, ClearCompletedSaved.
+    fake.state.lock().unwrap().save_file_error = Some("already_exists".into());
+    core.handle(Command::SaveFile {
+        file_id: "F99".into(),
+        date_due: Some(700),
+    });
+    assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
+
+    core.handle(Command::UpdateSavedItem {
+        channel: c1(),
+        ts: Ts::from("1.0"),
+        mark: Some(SavedMark::Completed),
+        date_due: Some(None),
+    });
+    assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
+
+    core.handle(Command::DeleteSavedItem {
+        channel: c1(),
+        ts: Ts::from("2.0"),
+    });
+    assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
+
+    core.handle(Command::ClearCompletedSaved);
+    assert!(matches!(next(&mut rx).await, Event::SavedLoaded(Ok(_))));
+
+    let state = fake.state.lock().unwrap();
+    assert_eq!(state.save_file_calls, vec![("F99".into(), Some(700))]);
+    assert_eq!(state.saved_delete_calls, vec![(c1(), Ts::from("2.0"))]);
+    assert_eq!(state.saved_clear_completed_calls, 1);
+}
+
+#[tokio::test]
+async fn rtm_handlers_dnd_huddles_emoji_unknown_and_posted_subtypes() {
+    let fake = FakeBackend::default();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.custom_emoji_override = Some(HashMap::from([(
+            "shipit".to_owned(),
+            "https://emoji.example/shipit.png".to_owned(),
+        )]));
+        state.app_commands = vec![api::AppCommand {
+            name: "deploy".into(),
+            usage: "[env]".into(),
+            description: "Deploy app".into(),
+            app_name: Some("Deployer".into()),
+            app_id: Some("A1".into()),
+        }];
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // DndUpdated & DndUpdatedUser
+    let dnd_self: SlackEvent = serde_json::from_str(
+        r#"{"type":"dnd_updated","dnd_status":{"snooze_enabled":true,"snooze_endtime":9999999999}}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(dnd_self)).await;
+    assert!(matches!(next(&mut rx).await, Event::SelfDndUpdated(s) if s.snooze_enabled));
+
+    let dnd_user: SlackEvent = serde_json::from_str(
+        r#"{"type":"dnd_updated_user","user":"U2","dnd_status":{"snooze_enabled":true,"snooze_endtime":9999999999}}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(dnd_user)).await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::DndPaused {
+            user: UserId::from("U2"),
+            paused: true,
+        }
+    );
+
+    // ShRoomJoin / ShRoomUpdate / ShRoomLeave
+    let room_join: SlackEvent = serde_json::from_str(
+        r#"{"type":"sh_room_join","room":{"id":"R1","channels":["C1"],"participants":["U1","U2"],"name":"Design","background_id":"bg1","thread_root_ts":"10.0","has_ended":false}}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(room_join)).await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::HuddleUpdated {
+            channel: c1(),
+            participants: vec![UserId::from("U1"), UserId::from("U2")],
+            ended: false,
+            topic: Some("Design".into()),
+            background_id: Some("bg1".into()),
+            thread_root_ts: Some(Ts::from("10.0")),
+        }
+    );
+
+    let room_leave: SlackEvent = serde_json::from_str(
+        r#"{"type":"sh_room_leave","room":{"id":"R1","channels":["C1"],"participants":[],"has_ended":true}}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(room_leave)).await;
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::HuddleUpdated { channel, ended: true, .. } if channel == c1()
+    ));
+
+    // HuddleInvite & HuddleInviteCancel
+    let inv: SlackEvent = serde_json::from_str(
+        r#"{"type":"huddle_invite","channel_id":"D1","sender_user_id":"U2","call_id":"R2"}"#,
+    )
+    .unwrap();
+    core.on_rtm(RtmEvent::Event(inv)).await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::HuddleInvite {
+            channel: ChannelId::from("D1"),
+            inviter: UserId::from("U2"),
+            call_id: "R2".into(),
+        }
+    );
+
+    let cancel: SlackEvent =
+        serde_json::from_str(r#"{"type":"huddle_invite_cancel","channel_id":"D1"}"#).unwrap();
+    core.on_rtm(RtmEvent::Event(cancel)).await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::HuddleInviteCancelled {
+            channel: Some(ChannelId::from("D1")),
+            call_id: None,
+        }
+    );
+
+    // EmojiChanged refreshes custom emoji in store and emits SidebarChanged.
+    let emoji_ev: SlackEvent =
+        serde_json::from_str(r#"{"type":"emoji_changed","subtype":"add","name":"shipit"}"#)
+            .unwrap();
+    core.on_rtm(RtmEvent::Event(emoji_ev)).await;
+    assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+    let emoji = store
+        .lock()
+        .unwrap()
+        .custom_emoji(&TeamId::from("T1"))
+        .unwrap();
+    assert!(emoji.iter().any(|(name, _)| name == "shipit"));
+
+    // Unknown: saved_added, commands_changed, user_status_changed, view_opened/updated/closed.
+    for ev_json in [
+        r#"{"type":"saved_added"}"#,
+        r#"{"type":"commands_changed"}"#,
+        r#"{"type":"user_status_changed","user":{"id":"U5","name":"eve"}}"#,
+        r#"{"type":"view_opened","view":{"id":"V1","type":"modal"}}"#,
+        r#"{"type":"view_updated","view":{"id":"V2","type":"home"}}"#,
+        r#"{"type":"view_closed","view":{"id":"V1"}}"#,
+    ] {
+        let ev: SlackEvent = serde_json::from_str(ev_json).unwrap();
+        core.on_rtm(RtmEvent::Event(ev)).await;
+    }
+    let mut saw_saved = false;
+    let mut saw_cmds = false;
+    let mut saw_user = false;
+    let mut saw_modal_open = false;
+    let mut saw_home = false;
+    let mut saw_modal_close = false;
+    for _ in 0..6 {
+        match next(&mut rx).await {
+            Event::SavedLoaded(Ok(_)) => saw_saved = true,
+            Event::AppCommands(cmds) if cmds.len() == 1 && cmds[0].name == "deploy" => {
+                saw_cmds = true;
+            }
+            Event::UsersChanged(ids) if ids == vec![UserId::from("U5")] => saw_user = true,
+            Event::ModalOpened(v) if v["id"] == "V1" => saw_modal_open = true,
+            Event::AppHomeUpdated(v) if v["id"] == "V2" => saw_home = true,
+            Event::ModalClosed(id) if id == "V1" => saw_modal_close = true,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert!(saw_saved && saw_cmds && saw_user && saw_modal_open && saw_home && saw_modal_close);
+
+    // posted_message subtypes: allowed subtypes emit MessagePosted, channel_join does NOT.
+    for (ts, subtype, expect_posted) in [
+        ("10.0", "bot_message", true),
+        ("11.0", "me_message", true),
+        ("12.0", "file_share", true),
+        ("13.0", "thread_broadcast", true),
+        ("14.0", "channel_join", false),
+    ] {
+        let ev: SlackEvent = serde_json::from_str(&format!(
+            r#"{{"type":"message","subtype":"{subtype}","channel":"C1","ts":"{ts}","text":"hi"}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            rtm::posted_message(&ev).is_some(),
+            expect_posted,
+            "{subtype}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hydrate_partial_failures_self_user_dnd_and_activity_errors() {
+    let fake = FakeBackend::default();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.fail_dms = true;
+        state.fail_emoji = true;
+        state.user_boot_override = Some(UserBoot {
+            channels: vec![Conversation {
+                id: c1(),
+                ..Default::default()
+            }],
+            self_user: Some(User {
+                id: UserId::from("UME"),
+                name: "me".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        state.dnd.insert(
+            UserId::from("UME"),
+            DndStatus {
+                snooze_enabled: true,
+                snooze_endtime: Some(9_999_999_999),
+                ..Default::default()
+            },
+        );
+        state.fail_activity_feed = true;
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    core.hydrate().await;
+    let mut errors = Vec::new();
+    let mut saw_self_user = false;
+    let mut saw_self_dnd = false;
+    let mut saw_activity_err = false;
+    let mut saw_sidebar = false;
+    while !saw_self_dnd || !saw_activity_err || !saw_sidebar || errors.len() < 3 {
+        match next(&mut rx).await {
+            Event::Error(e) => errors.push(e),
+            Event::UsersChanged(ids) if ids.contains(&UserId::from("UME")) => {
+                saw_self_user = true;
+            }
+            Event::SelfDndUpdated(s) if s.snooze_enabled => saw_self_dnd = true,
+            Event::ActivityView { feed: Err(_) } => saw_activity_err = true,
+            Event::SidebarChanged => saw_sidebar = true,
+            _ => {}
+        }
+    }
+    assert!(saw_self_user);
+    assert!(errors.iter().any(|e| e.contains("client.dms")));
+    assert!(errors.iter().any(|e| e.contains("emoji.list")));
+    assert!(errors.iter().any(|e| e.contains("activity.feed")));
+    assert_eq!(
+        *core.self_user_id.lock().unwrap(),
+        Some(UserId::from("UME"))
+    );
+
+    // hydrate_activity when activity_feed succeeds but messages_list fails: reports error and still emits feed.
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.fail_activity_feed = false;
+        state.fail_messages_list = true;
+        state.activity = api::ActivityFeed {
+            items: vec![api::ActivityItem {
+                kind: api::ActivityKind::Mention,
+                unread: true,
+                feed_ts: Ts::from("5.0"),
+                key: "at_user-C1-5.0".into(),
+                channel: c1(),
+                ts: Ts::from("5.0"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+    }
+    core.handle(Command::FetchActivity { with_bodies: true });
+    assert!(matches!(next(&mut rx).await, Event::Error(e) if e.contains("messages.list")));
+    let Event::ActivityView { feed: Ok(feed) } = next(&mut rx).await else {
+        panic!("expected ActivityView(Ok)");
+    };
+    assert!(feed.items[0].message.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_groups_slash_block_mark_all_close_and_channel_admin() {
+    let fake = FakeBackend::with_history(1..=20);
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.run_command_error = Some("unknown_command".into());
+        state.mark_all_read_ok = true;
+        state.members = vec![UserId::from("U1"), UserId::from("U2")];
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    store
+        .lock()
+        .unwrap()
+        .upsert_conversation(
+            &TeamId::from("T1"),
+            &Conversation {
+                id: c1(),
+                name: Some("general".into()),
+                is_channel: true,
+                is_member: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+
+    // RunCommand -> Slack error becomes CommandFailed.
+    core.handle(Command::RunCommand {
+        channel: c1(),
+        command: "/nope".into(),
+        args: "".into(),
+        thread_ts: None,
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CommandFailed {
+            command: "/nope".into(),
+            error: "unknown_command".into(),
+        }
+    );
+
+    // BlockAction with team: None defaults to workspace TeamId("T1").
+    core.handle(Command::BlockAction {
+        bot: BotId::from("B1"),
+        app_id: "A1".into(),
+        team: None,
+        action: serde_json::json!({"action_id": "btn"}),
+        container: api::ActionContainer {
+            channel: c1(),
+            message_ts: Ts::from("1.0"),
+            attachment_id: None,
+            is_ephemeral: false,
+            view_id: None,
+        },
+    });
+    // MarkAllRead calls mark_all_read + emits Counts.
+    core.handle(Command::MarkAllRead);
+    assert!(matches!(next(&mut rx).await, Event::Counts(_)));
+    assert_eq!(
+        fake.state.lock().unwrap().block_action_calls,
+        vec![(BotId::from("B1"), "A1".into(), TeamId::from("T1"))]
+    );
+    assert_eq!(fake.state.lock().unwrap().mark_all_read_calls, 1);
+
+    // CloseConversation aborts active backfill and allows re-opening later.
+    core.open(c1());
+    assert_eq!(next(&mut rx).await, Event::StoreChanged { channel: c1() });
+    core.handle(Command::CloseConversation(c1()));
+    assert!(!core.backfills.contains_key(&c1()));
+    core.open(c1());
+    assert!(core.backfills.contains_key(&c1()));
+    core.handle(Command::CloseConversation(c1()));
+
+    // CreateChannel (with purpose), RenameChannel, Archive/Unarchive, Delete, ConvertPrivate, Invite.
+    core.handle(Command::CreateChannel {
+        name: "launch".into(),
+        is_private: true,
+        purpose: Some("Launch coordination".into()),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::Conversations(vec![ChannelId::from("CNEW1")])
+    );
+    assert_eq!(
+        next(&mut rx).await,
+        Event::ConversationOpened(ChannelId::from("CNEW1"))
+    );
+
+    core.handle(Command::RenameChannel {
+        channel: c1(),
+        name: "general-v2".into(),
+    });
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+
+    core.handle(Command::ArchiveChannel(c1()));
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+    assert!(
+        store
+            .lock()
+            .unwrap()
+            .conversation(&TeamId::from("T1"), &c1())
+            .unwrap()
+            .unwrap()
+            .is_archived
+    );
+
+    core.handle(Command::UnarchiveChannel(c1()));
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+    assert!(
+        !store
+            .lock()
+            .unwrap()
+            .conversation(&TeamId::from("T1"), &c1())
+            .unwrap()
+            .unwrap()
+            .is_archived
+    );
+
+    core.handle(Command::DeleteChannel(c1()));
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+    let deleted = store
+        .lock()
+        .unwrap()
+        .conversation(&TeamId::from("T1"), &c1())
+        .unwrap()
+        .unwrap();
+    assert!(deleted.is_archived && !deleted.is_member);
+
+    core.handle(Command::ConvertChannelToPrivate(c1()));
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+    assert_eq!(next(&mut rx).await, Event::SidebarChanged);
+
+    core.handle(Command::InviteToChannel {
+        channel: c1(),
+        users: vec![UserId::from("U2")],
+    });
+    assert!(
+        matches!(next(&mut rx).await, Event::ConversationInfo { channel, .. } if channel == c1())
+    );
+    assert_eq!(next(&mut rx).await, Event::Conversations(vec![c1()]));
+}
+
+#[tokio::test]
+async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_drop_shutdown() {
+    let fake = FakeBackend::default();
+    {
+        let mut state = fake.state.lock().unwrap();
+        state.profile_update_response = Some(crate::types::Profile {
+            display_name: Some("Updated Me".into()),
+            ..Default::default()
+        });
+        state.user_profile_response = Some(crate::types::Profile {
+            pronouns: Some("   ".into()),
+            fields: Some(serde_json::json!({
+                "Xf1": { "label": "Inline Label", "value": "  Val1  " },
+                "Xf2": { "value": "Val2" },
+                "Xf3": { "value": "Val3" },
+                "XfEmpty": { "label": "Skip", "value": "   " }
+            })),
+            ..Default::default()
+        });
+        state.team_profile_fields_response =
+            HashMap::from([("Xf2".to_owned(), "Team Label".to_owned())]);
+        state.list_data = api::SlackListData {
+            file_id: "FLIST1".into(),
+            title: "Tasks".into(),
+            ..Default::default()
+        };
+        state.files_favorites = vec!["F1".into()];
+        state.files_collections = vec![api::FileCollection {
+            id: "COL1".into(),
+            name: "Specs".into(),
+            emoji: "book".into(),
+            file_ids: vec!["F1".into()],
+        }];
+        state.files_deleted = vec![api::DeletedFile {
+            id: "FDEL1".into(),
+            title: "Old Canvas".into(),
+            date_delete: 123,
+            file_type: "quip".into(),
+        }];
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    store
+        .lock()
+        .unwrap()
+        .upsert_user(
+            &TeamId::from("T1"),
+            &User {
+                id: UserId::from("UME"),
+                name: "me".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut core = Core::new(fake.clone(), Arc::clone(&store), TeamId::from("T1"), events);
+    *core.self_user_id.lock().unwrap() = Some(UserId::from("UME"));
+
+    // UpdateProfile updates stored self user & emits UsersChanged.
+    core.handle(Command::UpdateProfile {
+        update: api::ProfileUpdate {
+            display_name: Some("Updated Me".into()),
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::UsersChanged(vec![UserId::from("UME")])
+    );
+    let me = store
+        .lock()
+        .unwrap()
+        .users(&TeamId::from("T1"))
+        .unwrap()
+        .into_iter()
+        .find(|u| u.id == UserId::from("UME"))
+        .unwrap();
+    assert_eq!(me.profile.display_name.as_deref(), Some("Updated Me"));
+
+    // FetchUserProfile: inline label > team label > field id; blank value skipped; blank pronouns -> None.
+    core.handle(Command::FetchUserProfile(UserId::from("U2")));
+    let Event::UserProfileLoaded {
+        user,
+        pronouns,
+        mut fields,
+    } = next(&mut rx).await
+    else {
+        panic!("expected UserProfileLoaded");
+    };
+    assert_eq!(user, UserId::from("U2"));
+    assert_eq!(pronouns, None);
+    fields.sort();
+    assert_eq!(
+        fields,
+        vec![
+            ("Inline Label".into(), "Val1".into()),
+            ("Team Label".into(), "Val2".into()),
+            ("Xf3".into(), "Val3".into()),
+        ]
+    );
+
+    // SearchGifs: blank -> gif_featured, non-blank -> gif_search.
+    core.handle(Command::SearchGifs {
+        query: "   ".into(),
+    });
+    assert!(matches!(next(&mut rx).await, Event::GifResults { gifs, .. } if gifs[0].id == "g1"));
+    core.handle(Command::SearchGifs {
+        query: "cats".into(),
+    });
+    assert!(matches!(next(&mut rx).await, Event::GifResults { gifs, .. } if gifs[0].id == "g2"));
+    assert_eq!(fake.state.lock().unwrap().gif_featured_calls, 1);
+    assert_eq!(
+        fake.state.lock().unwrap().gif_search_calls,
+        vec!["cats".to_owned()]
+    );
+
+    // QuickSwitchSearch: blank is no-op, non-blank calls edge_search.
+    core.handle(Command::QuickSwitchSearch { query: "  ".into() });
+    core.handle(Command::QuickSwitchSearch {
+        query: "bob".into(),
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::QuickSwitchResults { query, results } if query == "bob" && results.users.len() == 1
+    ));
+    assert_eq!(
+        fake.state.lock().unwrap().edge_search_calls,
+        vec![(TeamId::from("T1"), "bob".to_owned())]
+    );
+
+    // LoadCanvas (ok + err), CreateCanvas, EditCanvas.
+    core.handle(Command::LoadCanvas {
+        file_id: "FC1".into(),
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasLoaded { file_id, html: Ok(_), .. } if file_id == "FC1"
+    ));
+    fake.state.lock().unwrap().fail_canvas_html = true;
+    core.handle(Command::LoadCanvas {
+        file_id: "FC_BAD".into(),
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasLoaded { file_id, title, html: Err(_) } if file_id == "FC_BAD" && title == "Canvas"
+    ));
+    fake.state.lock().unwrap().fail_canvas_html = false;
+
+    core.handle(Command::CreateCanvas {
+        title: "Doc".into(),
+        markdown: "# Hi".into(),
+        channel: Some(c1()),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasCreated {
+            file_id: "FCANVAS1".into(),
+            title: "Doc".into(),
+            channel: Some(c1()),
+        }
+    );
+
+    core.handle(Command::EditCanvas {
+        file_id: "FCANVAS1".into(),
+        op: api::CanvasEditOp::InsertAtEnd {
+            markdown: "More".into(),
+        },
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasLoaded { file_id, html: Ok(_), .. } if file_id == "FCANVAS1"
+    ));
+
+    // LoadList & CreateListItem.
+    core.handle(Command::LoadList {
+        file_id: "FLIST1".into(),
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::ListLoaded { file_id, list: Ok(ref l) } if file_id == "FLIST1" && l.title == "Tasks"
+    ));
+    core.handle(Command::CreateListItem {
+        list_id: "FLIST1".into(),
+        initial_fields: vec![],
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::ListLoaded { file_id, list: Ok(_) } if file_id == "FLIST1"
+    ));
+
+    // LoadFilesExtras.
+    core.handle(Command::LoadFilesExtras);
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::FilesExtrasLoaded { favorites, collections, deleted }
+            if favorites == vec!["F1".to_owned()] && collections.len() == 1 && deleted.len() == 1
+    ));
+
+    // Dropping the command sender shuts down `run` loop cleanly.
+    let (cmd_tx, cmd_rx) = mpsc::unbounded();
+    let run_task = tokio::spawn(run(core, cmd_rx, None));
+    drop(cmd_tx);
+    tokio::time::timeout(Duration::from_secs(2), run_task)
+        .await
+        .expect("run loop must exit when command sender drops")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session() {
+    let (_store, events, mut rx) = fake_core_parts();
+    let huddle = Arc::new(Mutex::new(HuddleSlot {
+        generation: 2,
+        joining: true,
+        handle: None,
+        call_id: Some("R_NEW".into()),
+    }));
+
+    // Old watcher (gen 1) emits Idle after gen 2 has started: must NOT clobber call_id or emit Idle.
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 1, rx1, events.clone());
+    tx1.send(crate::huddle::HuddleUpdate::State(Box::new(
+        crate::huddle::HuddleSessionSnapshot {
+            phase: crate::huddle::HuddlePhase::Idle,
+            ..Default::default()
+        },
+    )))
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        huddle.lock().unwrap().call_id.as_deref(),
+        Some("R_NEW"),
+        "stale watcher must never clobber newer session call_id"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "stale watcher must not emit Idle over active gen"
+    );
+
+    // Current watcher (gen 2) emits Idle: clears call_id and emits HuddleSessionChanged(Idle).
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
+    commands::spawn_huddle_watcher(Arc::clone(&huddle), 2, rx2, events);
+    tx2.send(crate::huddle::HuddleUpdate::State(Box::new(
+        crate::huddle::HuddleSessionSnapshot {
+            phase: crate::huddle::HuddlePhase::Idle,
+            ..Default::default()
+        },
+    )))
+    .unwrap();
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::HuddleSessionChanged(s) if s.phase == crate::huddle::HuddlePhase::Idle
+    ));
+    assert!(huddle.lock().unwrap().call_id.is_none());
 }

@@ -36,64 +36,9 @@ impl<B: Backend> Core<B> {
                             );
                             self.spawn("reconnect counts", async move {
                                 let counts = backend.counts().await?;
-                                let unread_channels: Vec<(ChannelId, Option<Ts>)> = counts
-                                    .ims
-                                    .iter()
-                                    .chain(&counts.mpims)
-                                    .chain(&counts.channels)
-                                    .filter(|c| c.is_unread())
-                                    .take(25)
-                                    .map(|c| (c.id.clone(), c.latest.clone()))
-                                    .collect();
+                                let targets = select_prefetch_targets(&counts);
                                 events.emit(Event::Counts(Box::new(counts)));
-                                for (idx, (channel, latest)) in
-                                    unread_channels.into_iter().enumerate()
-                                {
-                                    if let Some(ref latest_ts) = latest {
-                                        if !latest_ts.as_str().is_empty() {
-                                            let (ws_c, ch_c) = (ws.clone(), channel.clone());
-                                            let local_newest = with_store(&store, move |s| {
-                                                s.channel_history(&ws_c, &ch_c, None, 1).map(
-                                                    |rows| {
-                                                        rows.into_iter()
-                                                            .last()
-                                                            .map(|r| r.message.ts)
-                                                    },
-                                                )
-                                            })
-                                            .await?;
-                                            if local_newest
-                                                .as_ref()
-                                                .is_some_and(|local| local >= latest_ts)
-                                            {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    if idx >= 3 {
-                                        tokio::time::sleep(std::time::Duration::from_millis(150))
-                                            .await;
-                                    }
-                                    if let Ok(items) = wait_out_rate_limits(|| {
-                                        backend.recent_history(
-                                            channel.clone(),
-                                            crate::backend::UNREADS_HISTORY_LIMIT,
-                                        )
-                                    })
-                                    .await
-                                    {
-                                        if !items.is_empty() {
-                                            unfurls.resolve(items.iter());
-                                            let (ws_p, target) = (ws.clone(), channel.clone());
-                                            let _ = with_store(&store, move |s| {
-                                                s.upsert_messages(&ws_p, &target, &items)
-                                            })
-                                            .await;
-                                            events.emit(Event::StoreChanged { channel });
-                                        }
-                                    }
-                                }
-                                Ok(())
+                                prefetch_targets(backend, store, ws, events, unfurls, targets).await
                             });
                         }
                         if !self.offline_queue.is_empty() {
@@ -270,15 +215,36 @@ impl<B: Backend> Core<B> {
         else {
             return;
         };
-        if !self.bots.contains_key(&bot) {
-            match self.backend.bot_info(bot.clone()).await {
-                Ok(profile) => {
-                    self.bots.insert(bot.clone(), profile);
-                }
-                Err(e) => return self.events.report("bots.info", e.into()),
-            }
+        if let Some(profile) = self
+            .bots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&bot)
+            .cloned()
+        {
+            message.bot_profile = Some(profile);
+            return;
         }
-        message.bot_profile = self.bots.get(&bot).cloned();
+        if !self.bots_asked.insert(bot.clone()) {
+            return;
+        }
+        match self.backend.bot_info(bot.clone()).await {
+            Ok(profile) => {
+                self.bots
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(bot.clone(), profile.clone());
+                let ws = self.workspace.clone();
+                let bot_store = bot;
+                let profile_store = profile.clone();
+                let _ = with_store(&self.store, move |s| {
+                    s.upsert_bot_profile(&ws, &bot_store, &profile_store)
+                })
+                .await;
+                message.bot_profile = Some(profile);
+            }
+            Err(e) => self.events.report("bots.info", e.into()),
+        }
     }
 
     /// Re-fetches a conversation whose event carries only its id.
