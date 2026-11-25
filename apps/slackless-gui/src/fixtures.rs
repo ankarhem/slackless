@@ -480,10 +480,10 @@ impl Fixtures {
 
     pub fn user(&self, id: &UserId) -> Option<&User> {
         let map = self.user_map();
-        if let Some(&ix) = map.get(id) {
-            if let Some(user) = self.users.get(ix).filter(|u| u.id == *id) {
-                return Some(user);
-            }
+        if let Some(&ix) = map.get(id)
+            && let Some(user) = self.users.get(ix).filter(|u| u.id == *id)
+        {
+            return Some(user);
         }
         if map.len() != self.users.len() {
             return self.users.iter().find(|u| u.id == *id);
@@ -578,10 +578,10 @@ impl Fixtures {
     /// One-line plain preview of a message: [`Self::plain_text`] on one line, file-only
     /// messages described by their first file.
     pub fn preview(&self, message: &Message) -> String {
-        if message.text.trim().is_empty() {
-            if let Some(file) = message.files.first() {
-                return format!("Shared a file: {}", file.name.as_deref().unwrap_or("file"));
-            }
+        if message.text.trim().is_empty()
+            && let Some(file) = message.files.first()
+        {
+            return format!("Shared a file: {}", file.name.as_deref().unwrap_or("file"));
         }
         self.plain_text(message).replace('\n', " ")
     }

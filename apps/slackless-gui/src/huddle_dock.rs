@@ -357,13 +357,13 @@ impl HuddleDock {
         self.desktop_draw_down = false;
         let segs = std::mem::take(&mut self.desktop_draw_segs);
         let item_id = self.local_draw_item_id();
-        if self.desktop_draw_pts.len() == 1 {
-            if let Some(&seg) = segs.first() {
-                cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::New {
-                    item_id: item_id.clone(),
-                    segment: seg,
-                }));
-            }
+        if self.desktop_draw_pts.len() == 1
+            && let Some(&seg) = segs.first()
+        {
+            cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::New {
+                item_id: item_id.clone(),
+                segment: seg,
+            }));
         }
         self.desktop_draw_pts.clear();
         cx.emit(HuddleDockEvent::SendDraw(HuddleDrawMessage::End {
@@ -758,11 +758,11 @@ impl HuddleDock {
                 dirty = true;
             }
         }
-        if let Some(root_ts) = thread_root_ts.filter(|ts| !ts.as_str().trim().is_empty()) {
-            if self.session.thread_root_ts.as_ref() != Some(&root_ts) {
-                self.session.thread_root_ts = Some(root_ts);
-                dirty = true;
-            }
+        if let Some(root_ts) = thread_root_ts.filter(|ts| !ts.as_str().trim().is_empty())
+            && self.session.thread_root_ts.as_ref() != Some(&root_ts)
+        {
+            self.session.thread_root_ts = Some(root_ts);
+            dirty = true;
         }
         if dirty {
             cx.notify();
@@ -841,13 +841,14 @@ impl HuddleDock {
                 ..
             } => {
                 if !text.trim().is_empty() {
-                    if let Some(last) = self.captions.last_mut() {
-                        if last.0 == *user && last.2 {
-                            last.1 = text.clone();
-                            last.2 = *is_partial;
-                            cx.notify();
-                            return;
-                        }
+                    if let Some(last) = self.captions.last_mut()
+                        && last.0 == *user
+                        && last.2
+                    {
+                        last.1 = text.clone();
+                        last.2 = *is_partial;
+                        cx.notify();
+                        return;
                     }
                     self.captions
                         .push((user.clone(), text.clone(), *is_partial));

@@ -26,10 +26,11 @@ impl SlackApi {
         let call = wire.call.ok_or_else(|| {
             ApiError::UnsupportedHuddleBackend("rooms.join response missing call block".to_owned())
         })?;
-        if let Some(ref backend) = call.huddle.media_backend_type {
-            if !backend.is_empty() && backend != "free_willy" {
-                return Err(ApiError::UnsupportedHuddleBackend(backend.clone()));
-            }
+        if let Some(ref backend) = call.huddle.media_backend_type
+            && !backend.is_empty()
+            && backend != "free_willy"
+        {
+            return Err(ApiError::UnsupportedHuddleBackend(backend.clone()));
         }
         let chime = call.free_willy.ok_or_else(|| {
             ApiError::UnsupportedHuddleBackend(

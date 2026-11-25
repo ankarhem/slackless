@@ -503,15 +503,14 @@ impl HuddleRoomEvent {
     /// `huddle.channel_id` or top-level `channel_id`).
     pub fn target_channels(&self) -> Vec<ChannelId> {
         let mut out = self.room.channels.clone();
-        if out.is_empty() {
-            if let Some(ch) = self
+        if out.is_empty()
+            && let Some(ch) = self
                 .huddle
                 .as_ref()
                 .and_then(|h| h.channel_id.clone())
                 .or_else(|| self.channel_id.clone())
-            {
-                out.push(ch);
-            }
+        {
+            out.push(ch);
         }
         out
     }

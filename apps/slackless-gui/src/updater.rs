@@ -241,10 +241,10 @@ pub fn dir_in_path(dir: &Path) -> bool {
         if dir == Path::new("/usr/local/bin") {
             return true;
         }
-        if let Ok(etc_paths) = std::fs::read_to_string("/etc/paths") {
-            if etc_paths.lines().any(|line| Path::new(line.trim()) == dir) {
-                return true;
-            }
+        if let Ok(etc_paths) = std::fs::read_to_string("/etc/paths")
+            && etc_paths.lines().any(|line| Path::new(line.trim()) == dir)
+        {
+            return true;
         }
     }
     let Some(path_var) = std::env::var_os("PATH") else {
@@ -349,12 +349,11 @@ pub fn installed_version() -> String {
             .args(["-c", "Print :CFBundleShortVersionString"])
             .arg(&plist)
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                if !v.is_empty() {
-                    return v;
-                }
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !v.is_empty() {
+                return v;
             }
         }
     }

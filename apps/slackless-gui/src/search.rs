@@ -517,7 +517,7 @@ impl SearchView {
             .collect()
     }
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (muted, border, hover, foreground, link, secondary) = (
             theme.muted_foreground,
@@ -887,7 +887,7 @@ impl SearchView {
         channel_name: Option<&str>,
         message: &slackless_core::types::Message,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (muted, border, hover) = (theme.muted_foreground, theme.border, theme.accent);
         let label = self
@@ -924,7 +924,12 @@ impl SearchView {
             }))
     }
 
-    fn file_hit_row(&self, ix: usize, file: &File, cx: &mut Context<Self>) -> impl IntoElement {
+    fn file_hit_row(
+        &self,
+        ix: usize,
+        file: &File,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (muted, border, hover, foreground) = (
             theme.muted_foreground,

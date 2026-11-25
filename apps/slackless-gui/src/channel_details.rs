@@ -1168,7 +1168,7 @@ impl ChannelDetails {
     /// organization; a click opens their profile.
     /// Slack's member filter beside "Find people": a 36pt select whose menu lists each
     /// choice with its count at the right, the organizations under "People from".
-    fn filter_select(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn filter_select(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let this = cx.entity().downgrade();
         let choices = Arc::clone(&self.filter_choices);
         let current = self.member_filter.clone();

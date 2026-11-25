@@ -147,10 +147,10 @@ pub(crate) fn capture_screen_thumbnails_xcap(
                 s.spawn(move || {
                     let Ok(id) = m.id() else { return };
                     let img = with_autorelease_pool(|| m.capture_image().ok());
-                    if let Some(rgba) = img {
-                        if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
-                            *slot = Some((format!("monitor:{id}"), frame));
-                        }
+                    if let Some(rgba) = img
+                        && let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h)
+                    {
+                        *slot = Some((format!("monitor:{id}"), frame));
                     }
                 });
             }
@@ -196,10 +196,10 @@ pub(crate) fn capture_screen_thumbnails_xcap(
             s.spawn(move || {
                 for (id, w) in chunk {
                     let img = with_autorelease_pool(|| w.capture_image().ok());
-                    if let Some(rgba) = img {
-                        if let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h) {
-                            bucket.push((format!("window:{id}"), frame));
-                        }
+                    if let Some(rgba) = img
+                        && let Some(frame) = downscale_rgba_thumbnail(&rgba, max_w, max_h)
+                    {
+                        bucket.push((format!("window:{id}"), frame));
                     }
                 }
             });

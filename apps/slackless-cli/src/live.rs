@@ -627,10 +627,10 @@ fn format_watch_event(
 ) -> Option<(serde_json::Value, String)> {
     match ev {
         SlackEvent::Message(slackless_core::types::MessageEvent::Message(msg)) => {
-            if let Some(target) = filter_ch {
-                if msg.channel.as_ref() != Some(target) {
-                    return None;
-                }
+            if let Some(target) = filter_ch
+                && msg.channel.as_ref() != Some(target)
+            {
+                return None;
             }
             let ch = msg.channel.as_ref().map(|c| c.as_str()).unwrap_or("");
             let who = msg
@@ -651,10 +651,10 @@ fn format_watch_event(
             Some((json, human))
         }
         SlackEvent::ReactionAdded(rx) => {
-            if let Some(target) = filter_ch {
-                if rx.item.channel.as_ref() != Some(target) {
-                    return None;
-                }
+            if let Some(target) = filter_ch
+                && rx.item.channel.as_ref() != Some(target)
+            {
+                return None;
             }
             let ch = rx.item.channel.as_ref().map(|c| c.as_str()).unwrap_or("");
             let ts = rx.item.ts.as_ref().map(|t| t.as_str()).unwrap_or("");
@@ -673,10 +673,10 @@ fn format_watch_event(
         }
         SlackEvent::ThreadMarked(tm) => {
             let sub = &tm.subscription;
-            if let Some(target) = filter_ch {
-                if &sub.channel != target {
-                    return None;
-                }
+            if let Some(target) = filter_ch
+                && &sub.channel != target
+            {
+                return None;
             }
             let last_read = sub.last_read.as_ref().map(|t| t.as_str());
             let json = serde_json::json!({
@@ -1037,8 +1037,7 @@ pub async fn run_huddle_join(
                         );
                         if snap.phase == slackless_core::huddle::HuddlePhase::Connected
                             && !sent_react
-                        {
-                            if let Some(emoji) = &react {
+                            && let Some(emoji) = &react {
                                 sent_react = true;
                                 handle.send(slackless_core::huddle::HuddleControl::SendReaction {
                                     emoji: emoji.clone(),
@@ -1046,7 +1045,6 @@ pub async fn run_huddle_join(
                                     emoji_url: None,
                                 });
                             }
-                        }
                         if snap.phase == slackless_core::huddle::HuddlePhase::Failed {
                             exit_code = ExitCode::FAILURE;
                             break;

@@ -266,29 +266,24 @@ impl SoftwareCamera {
                 };
 
                 while run_flag.load(Ordering::Relaxed) {
-                    if let Ok(frame) = cam.frame() {
-                        if let Ok(img) = frame.decode_image::<RgbFormat>() {
-                            let (mut rgb, w, h) = resize_rgb_even(
-                                img.as_raw(),
-                                img.width(),
-                                img.height(),
-                                max_w,
-                                max_h,
-                            );
-                            if w >= 2 && h >= 2 {
-                                if blur_flag.load(Ordering::Relaxed) {
-                                    apply_portrait_blur(&mut rgb, w as usize, h as usize);
-                                }
-                                let bgra = rgb_to_bgra(&rgb);
-                                let _ = preview_tx.send(VideoFrame::from_bgra(w, h, bgra));
-                                if kf_flag.swap(false, Ordering::Relaxed) {
-                                    enc.force_keyframe();
-                                }
-                                if let Ok(h264) = enc.encode_rgb(&rgb, w as usize, h as usize) {
-                                    if !h264.is_empty() {
-                                        let _ = outbound_h264_tx.send(h264);
-                                    }
-                                }
+                    if let Ok(frame) = cam.frame()
+                        && let Ok(img) = frame.decode_image::<RgbFormat>()
+                    {
+                        let (mut rgb, w, h) =
+                            resize_rgb_even(img.as_raw(), img.width(), img.height(), max_w, max_h);
+                        if w >= 2 && h >= 2 {
+                            if blur_flag.load(Ordering::Relaxed) {
+                                apply_portrait_blur(&mut rgb, w as usize, h as usize);
+                            }
+                            let bgra = rgb_to_bgra(&rgb);
+                            let _ = preview_tx.send(VideoFrame::from_bgra(w, h, bgra));
+                            if kf_flag.swap(false, Ordering::Relaxed) {
+                                enc.force_keyframe();
+                            }
+                            if let Ok(h264) = enc.encode_rgb(&rgb, w as usize, h as usize)
+                                && !h264.is_empty()
+                            {
+                                let _ = outbound_h264_tx.send(h264);
                             }
                         }
                     }

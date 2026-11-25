@@ -75,12 +75,11 @@ impl<B: Backend> Unfurls<B> {
         let mut targets: Vec<ChannelId> = Vec::new();
         for message in messages {
             for attachment in &message.attachments {
-                if attachment.is_msg_unfurl {
-                    if let Some(id) = &attachment.channel_id {
-                        if !targets.contains(id) {
-                            targets.push(id.clone());
-                        }
-                    }
+                if attachment.is_msg_unfurl
+                    && let Some(id) = &attachment.channel_id
+                    && !targets.contains(id)
+                {
+                    targets.push(id.clone());
                 }
             }
         }

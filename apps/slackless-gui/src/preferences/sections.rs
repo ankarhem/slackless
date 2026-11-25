@@ -1451,14 +1451,14 @@ impl Preferences {
                             prompt: Some("Choose download folder".into()),
                         });
                         cx.spawn(async move |this, cx| {
-                            if let Ok(Ok(Some(paths))) = rx.await {
-                                if let Some(path) = paths.into_iter().next() {
-                                    let _ = this.update(cx, |prefs, cx| {
-                                        prefs.settings.download_dir =
-                                            path.to_string_lossy().into_owned();
-                                        prefs.changed(cx);
-                                    });
-                                }
+                            if let Ok(Ok(Some(paths))) = rx.await
+                                && let Some(path) = paths.into_iter().next()
+                            {
+                                let _ = this.update(cx, |prefs, cx| {
+                                    prefs.settings.download_dir =
+                                        path.to_string_lossy().into_owned();
+                                    prefs.changed(cx);
+                                });
                             }
                         })
                         .detach();
@@ -1943,53 +1943,51 @@ impl Preferences {
         let card = self.status_card(dot_color, title, chip, detail, false, actions, cx);
         let mut body = v_flex().gap_2().child(card);
 
-        if !in_path {
-            if let Some(dir) = effective_dir {
-                let export_cmd = format!("export PATH=\"{}:$PATH\"", dir.display());
-                let copy_cmd = export_cmd.clone();
-                body = body.child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(border)
-                        .bg(card_bg)
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .flex_wrap()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("Add to your shell profile:"),
-                                )
-                                .child(self.mono_chip(export_cmd, cx)),
-                        )
-                        .child(
-                            Button::new("adv-cli-copy-path")
-                                .ghost()
-                                .with_size(Size::Small)
-                                .icon(IconName::Copy)
-                                .label("Copy")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(
-                                        gpui_kit::gpui::ClipboardItem::new_string(copy_cmd.clone()),
-                                    );
-                                    this.cli_status_note =
-                                        Some("Copied PATH export command.".to_owned());
-                                    cx.notify();
-                                })),
-                        ),
-                );
-            }
+        if !in_path && let Some(dir) = effective_dir {
+            let export_cmd = format!("export PATH=\"{}:$PATH\"", dir.display());
+            let copy_cmd = export_cmd.clone();
+            body = body.child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(card_bg)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_wrap()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("Add to your shell profile:"),
+                            )
+                            .child(self.mono_chip(export_cmd, cx)),
+                    )
+                    .child(
+                        Button::new("adv-cli-copy-path")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::Copy)
+                            .label("Copy")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(
+                                    copy_cmd.clone(),
+                                ));
+                                this.cli_status_note =
+                                    Some("Copied PATH export command.".to_owned());
+                                cx.notify();
+                            })),
+                    ),
+            );
         }
         if let Some(note) = &self.cli_status_note {
             let note_color = if note.starts_with("Error:") {

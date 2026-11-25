@@ -9,7 +9,7 @@ impl PopoutWindow {
         people_count: usize,
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         use gpui_kit::component::Icon;
 
         let channel_name = self
@@ -228,10 +228,10 @@ impl PopoutWindow {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.huddle_music_open = false;
                             (send_stop)(Command::SetHuddleJukebox(None));
-                            if this.fixtures.sample {
-                                if let Some(dock) = this.huddle_dock_entity() {
-                                    dock.update(cx, |d, cx| d.set_jukebox_local(None, cx));
-                                }
+                            if this.fixtures.sample
+                                && let Some(dock) = this.huddle_dock_entity()
+                            {
+                                dock.update(cx, |d, cx| d.set_jukebox_local(None, cx));
                             }
                             cx.notify();
                         })),
@@ -277,12 +277,12 @@ impl PopoutWindow {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.huddle_music_open = false;
                             (send_pick)(Command::SetHuddleJukebox(Some(key_owned.clone())));
-                            if this.fixtures.sample {
-                                if let Some(dock) = this.huddle_dock_entity() {
-                                    dock.update(cx, |d, cx| {
-                                        d.set_jukebox_local(Some(key_owned.clone()), cx)
-                                    });
-                                }
+                            if this.fixtures.sample
+                                && let Some(dock) = this.huddle_dock_entity()
+                            {
+                                dock.update(cx, |d, cx| {
+                                    d.set_jukebox_local(Some(key_owned.clone()), cx)
+                                });
                             }
                             cx.notify();
                         })),
@@ -334,19 +334,19 @@ impl PopoutWindow {
                             if let Some(inp) = this.huddle_topic_editing.take() {
                                 let text = inp.read(cx).value().trim().to_owned();
                                 (this.send)(Command::SetHuddleTopic(text.clone()));
-                                if this.fixtures.sample {
-                                    if let Some(dock) = this.huddle_dock_entity() {
-                                        let me = this.fixtures.self_user.clone();
-                                        dock.update(cx, |d, cx| {
-                                            d.apply_data_event(
-                                                &slackless_core::huddle::HuddleDataEvent::Topic {
-                                                    user: me,
-                                                    topic: text,
-                                                },
-                                                cx,
-                                            );
-                                        });
-                                    }
+                                if this.fixtures.sample
+                                    && let Some(dock) = this.huddle_dock_entity()
+                                {
+                                    let me = this.fixtures.self_user.clone();
+                                    dock.update(cx, |d, cx| {
+                                        d.apply_data_event(
+                                            &slackless_core::huddle::HuddleDataEvent::Topic {
+                                                user: me,
+                                                topic: text,
+                                            },
+                                            cx,
+                                        );
+                                    });
                                 }
                                 cx.notify();
                             }

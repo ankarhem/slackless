@@ -419,11 +419,11 @@ impl App {
                     .get(ws_index)
                     .and_then(Option::as_ref)
                     .and_then(CoreBridge::team_summary);
-                if let (Some(team), Some(slot)) = (fresh_team, self.live_teams.get_mut(ws_index)) {
-                    if *slot != team {
-                        *slot = team;
-                        self.reload_live(window, cx);
-                    }
+                if let (Some(team), Some(slot)) = (fresh_team, self.live_teams.get_mut(ws_index))
+                    && *slot != team
+                {
+                    *slot = team;
+                    self.reload_live(window, cx);
                 }
             }
             Event::Usergroups(groups) => {
@@ -447,15 +447,14 @@ impl App {
                 }
             }
             Event::OfflineMutationFailed(failed) => {
-                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
-                    if !parked
+                if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut)
+                    && !parked
                         .state
                         .failed_mutations
                         .iter()
                         .any(|m| m.id == failed.id)
-                    {
-                        parked.state.failed_mutations.push(failed.clone());
-                    }
+                {
+                    parked.state.failed_mutations.push(failed.clone());
                 }
             }
             Event::BotProfileLoaded { bot_id, profile } => {
@@ -803,10 +802,10 @@ impl App {
                 // The open thread: a fetched replies page landed, or a live reply arrived.
                 if self.thread_open {
                     let open = self.thread.read(cx).open_thread();
-                    if let Some((thread_channel, thread_ts)) = open {
-                        if thread_channel == *channel {
-                            self.load_thread(&thread_channel, &thread_ts, cx);
-                        }
+                    if let Some((thread_channel, thread_ts)) = open
+                        && thread_channel == *channel
+                    {
+                        self.load_thread(&thread_channel, &thread_ts, cx);
                     }
                 }
                 // Any expanded card in the Threads view refreshes when its replies land.
@@ -954,13 +953,12 @@ impl App {
                 if let Some(apps) = num_apps {
                     self.ws.app_counts.insert(channel.clone(), *apps);
                 }
-                if num_members.is_some() || num_apps.is_some() {
-                    if let Some(write) = self
+                if (num_members.is_some() || num_apps.is_some())
+                    && let Some(write) = self
                         .bridge
                         .remember_channel_counts(&self.ws.member_counts, &self.ws.app_counts)
-                    {
-                        cx.background_executor().spawn(write).detach();
-                    }
+                {
+                    cx.background_executor().spawn(write).detach();
                 }
                 if !members.is_empty() {
                     self.ws
@@ -1127,69 +1125,62 @@ impl App {
                 let huddles = self.ws.active_huddles.clone();
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
-                if let Some(dock) = self.huddle_dock.clone() {
-                    if dock.read(cx).session().channel == *channel {
-                        let self_uid = &self.fixtures.self_user;
-                        let new_peers = if *ended {
-                            &[][..]
-                        } else {
-                            participants.as_slice()
-                        };
-                        let remote_joined = new_peers
-                            .iter()
-                            .any(|u| u != self_uid && !prev_participants.contains(u));
-                        let remote_left = prev_participants
-                            .iter()
-                            .any(|u| u != self_uid && !new_peers.contains(u));
-                        if remote_joined {
-                            self.play_huddle_chime(
-                                slackless_core::huddle::HuddleChime::PeerJoin,
-                                cx,
-                            );
-                        } else if remote_left {
-                            self.play_huddle_chime(
-                                slackless_core::huddle::HuddleChime::PeerLeave,
-                                cx,
-                            );
-                        }
+                if let Some(dock) = self.huddle_dock.clone()
+                    && dock.read(cx).session().channel == *channel
+                {
+                    let self_uid = &self.fixtures.self_user;
+                    let new_peers = if *ended {
+                        &[][..]
+                    } else {
+                        participants.as_slice()
+                    };
+                    let remote_joined = new_peers
+                        .iter()
+                        .any(|u| u != self_uid && !prev_participants.contains(u));
+                    let remote_left = prev_participants
+                        .iter()
+                        .any(|u| u != self_uid && !new_peers.contains(u));
+                    if remote_joined {
+                        self.play_huddle_chime(slackless_core::huddle::HuddleChime::PeerJoin, cx);
+                    } else if remote_left {
+                        self.play_huddle_chime(slackless_core::huddle::HuddleChime::PeerLeave, cx);
+                    }
 
-                        let alone_music =
-                            self.preferences.read(cx).settings().huddle_music_when_alone;
-                        let playing_jukebox = dock.read(cx).session().jukebox_song.is_some();
-                        if !*ended && participants.len() > 1 {
-                            self.huddle_alone_music_task = None;
-                            if alone_music && playing_jukebox {
-                                self.bridge.send(Command::SetHuddleJukebox(None));
-                            }
-                        } else if !*ended
-                            && participants.len() <= 1
-                            && dock.read(cx).session().phase
-                                == slackless_core::huddle::HuddlePhase::Connected
-                        {
-                            self.arm_huddle_alone_music(channel.clone(), cx);
+                    let alone_music = self.preferences.read(cx).settings().huddle_music_when_alone;
+                    let playing_jukebox = dock.read(cx).session().jukebox_song.is_some();
+                    if !*ended && participants.len() > 1 {
+                        self.huddle_alone_music_task = None;
+                        if alone_music && playing_jukebox {
+                            self.bridge.send(Command::SetHuddleJukebox(None));
                         }
-                        dock.update(cx, |d, cx| {
-                            d.set_participants(
-                                if *ended {
-                                    Vec::new()
-                                } else {
-                                    participants.clone()
-                                },
-                                cx,
-                            );
-                            d.apply_room_meta(
-                                topic.clone(),
-                                background_id.clone(),
-                                thread_root_ts.clone(),
-                                cx,
-                            );
-                        });
+                    } else if !*ended
+                        && participants.len() <= 1
+                        && dock.read(cx).session().phase
+                            == slackless_core::huddle::HuddlePhase::Connected
+                    {
+                        self.arm_huddle_alone_music(channel.clone(), cx);
                     }
+                    dock.update(cx, |d, cx| {
+                        d.set_participants(
+                            if *ended {
+                                Vec::new()
+                            } else {
+                                participants.clone()
+                            },
+                            cx,
+                        );
+                        d.apply_room_meta(
+                            topic.clone(),
+                            background_id.clone(),
+                            thread_root_ts.clone(),
+                            cx,
+                        );
+                    });
                 }
-                if let Some((bar_ch, bar)) = &self.huddle {
-                    if bar_ch == channel {
-                        bar.update(cx, |b, cx| b.set_participants(participants.clone(), cx));
-                    }
+                if let Some((bar_ch, bar)) = &self.huddle
+                    && bar_ch == channel
+                {
+                    bar.update(cx, |b, cx| b.set_participants(participants.clone(), cx));
                 }
                 cx.notify();
             }
@@ -1211,10 +1202,10 @@ impl App {
                     } else {
                         self.mount_huddle_dock(snap.clone(), window, cx);
                     }
-                    if let Some((bar_ch, bar)) = &self.huddle {
-                        if *bar_ch == snap.channel {
-                            bar.update(cx, |b, cx| b.update_session(Some(snap.clone()), cx));
-                        }
+                    if let Some((bar_ch, bar)) = &self.huddle
+                        && *bar_ch == snap.channel
+                    {
+                        bar.update(cx, |b, cx| b.update_session(Some(snap.clone()), cx));
                     }
                     if newly_connected {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
@@ -1537,10 +1528,10 @@ impl App {
                     return;
                 }
                 // Keep the full multi-workspace rail intact while updating this workspace's team info.
-                if let Some(own) = snapshot.workspaces.first().cloned() {
-                    if let Some(slot) = app.live_teams.get_mut(app.workspace) {
-                        *slot = own;
-                    }
+                if let Some(own) = snapshot.workspaces.first().cloned()
+                    && let Some(slot) = app.live_teams.get_mut(app.workspace)
+                {
+                    *slot = own;
                 }
                 if !app.live_teams.is_empty() {
                     snapshot.workspaces = app.live_teams.clone();
@@ -1679,12 +1670,12 @@ impl App {
         let keep = self.ws.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
         // Hydrate custom status from Slack's live self profile (preserving active focus mode).
-        if !self.self_state.focused() {
-            if let Some(me) = self.fixtures.user(&self.fixtures.self_user) {
-                let remote = crate::status::UserStatus::from_profile(&me.profile);
-                if self.self_state.status != remote {
-                    self.self_state.set_status(remote);
-                }
+        if !self.self_state.focused()
+            && let Some(me) = self.fixtures.user(&self.fixtures.self_user)
+        {
+            let remote = crate::status::UserStatus::from_profile(&me.profile);
+            if self.self_state.status != remote {
+                self.self_state.set_status(remote);
             }
         }
         self.sync_connect_orgs(cx);
@@ -1759,10 +1750,8 @@ impl App {
                     let allow_mark = app.transcript_visible(cx)
                         && mark_read_mode != 2
                         && (!settings.no_bg_mark_read || app.window_active);
-                    if allow_mark {
-                        if let Some(newest) = newest {
-                            app.mark_read(&channel, newest, cx);
-                        }
+                    if allow_mark && let Some(newest) = newest {
+                        app.mark_read(&channel, newest, cx);
                     }
                 }
             })
@@ -1891,14 +1880,12 @@ impl App {
                         let settings = app.preferences.read(cx).settings().clone();
                         let allow_mark = settings.mark_read != 2
                             && (!settings.no_bg_mark_read || app.window_active);
-                        if allow_mark {
-                            if let Some(newest) = newest {
-                                let should_mark = root_has_unread
-                                    || app.threads.read(cx).is_thread_unread(&channel, &thread_ts)
-                                    || app.sidebar.read(cx).has_thread_unreads();
-                                if should_mark {
-                                    app.mark_thread_read(channel, thread_ts, newest, false, cx);
-                                }
+                        if allow_mark && let Some(newest) = newest {
+                            let should_mark = root_has_unread
+                                || app.threads.read(cx).is_thread_unread(&channel, &thread_ts)
+                                || app.sidebar.read(cx).has_thread_unreads();
+                            if should_mark {
+                                app.mark_thread_read(channel, thread_ts, newest, false, cx);
                             }
                         }
                     }
@@ -2266,11 +2253,11 @@ impl App {
         else {
             return;
         };
-        if let Some((cached, data)) = &self.sound {
-            if *cached == choice {
-                self.os.play_sound(data);
-                return;
-            }
+        if let Some((cached, data)) = &self.sound
+            && *cached == choice
+        {
+            self.os.play_sound(data);
+            return;
         }
         let Some(fetch) = crate::media::fetch(url.to_owned(), cx) else {
             return;

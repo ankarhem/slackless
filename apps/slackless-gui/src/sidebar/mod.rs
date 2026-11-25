@@ -268,10 +268,10 @@ impl NavPrefs {
     pub(super) fn ordered_items(self) -> Vec<NavItem> {
         let mut items = Vec::with_capacity(7);
         for &idx in &self.order {
-            if let Some(&item) = Self::CONFIGURABLE.get(idx) {
-                if !items.contains(&item) {
-                    items.push(item);
-                }
+            if let Some(&item) = Self::CONFIGURABLE.get(idx)
+                && !items.contains(&item)
+            {
+                items.push(item);
             }
         }
         for item in Self::CONFIGURABLE {
@@ -1567,21 +1567,20 @@ impl Sidebar {
                 .channel_ids
                 .iter()
                 .find(|id| self.fixtures.conversation(id).is_some())
+                && !heads.contains(first)
             {
-                if !heads.contains(first) {
-                    heads.push(first.clone());
-                }
+                heads.push(first.clone());
             }
         }
-        if let Some(first_ch) = self.fixtures.channels.first() {
-            if !heads.contains(&first_ch.id) {
-                heads.push(first_ch.id.clone());
-            }
+        if let Some(first_ch) = self.fixtures.channels.first()
+            && !heads.contains(&first_ch.id)
+        {
+            heads.push(first_ch.id.clone());
         }
-        if let Some(first_dm) = self.fixtures.dms.first() {
-            if !heads.contains(&first_dm.id) {
-                heads.push(first_dm.id.clone());
-            }
+        if let Some(first_dm) = self.fixtures.dms.first()
+            && !heads.contains(&first_dm.id)
+        {
+            heads.push(first_dm.id.clone());
         }
         if heads.is_empty() {
             return None;

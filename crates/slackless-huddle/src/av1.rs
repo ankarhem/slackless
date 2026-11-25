@@ -360,49 +360,48 @@ unsafe fn picture_to_bgra(pic: &Dav1dPicture) -> Option<VideoFrame> {
     }
 
     // Hot path: 8-bit 4:2:0 processed in 2x2 blocks sharing chroma loads (zero float math).
-    if bpc == 8 && layout == DAV1D_PIXEL_LAYOUT_I420 {
-        if let (Some(up), Some(vp)) = (u_ptr, v_ptr) {
-            let pairs_h = h & !1;
-            let pairs_w = w & !1;
-            for row in (0..pairs_h).step_by(2) {
-                let y_row0 = (row as isize) * y_stride;
-                let y_row1 = ((row + 1) as isize) * y_stride;
-                let c_row = ((row >> 1) as isize) * c_stride;
-                let out_row0 = row * w * 4;
-                let out_row1 = (row + 1) * w * 4;
-                for col in (0..pairs_w).step_by(2) {
-                    let cx = (col >> 1) as isize;
-                    let u = unsafe { *up.offset(c_row + cx) } as i32;
-                    let v = unsafe { *vp.offset(c_row + cx) } as i32;
-                    let d = u - 128;
-                    let e = v - 128;
-                    let r_add = 409 * e + 128;
-                    let g_add = -100 * d - 208 * e + 128;
-                    let b_add = 516 * d + 128;
+    if bpc == 8
+        && layout == DAV1D_PIXEL_LAYOUT_I420
+        && let (Some(up), Some(vp)) = (u_ptr, v_ptr)
+    {
+        let pairs_h = h & !1;
+        let pairs_w = w & !1;
+        for row in (0..pairs_h).step_by(2) {
+            let y_row0 = (row as isize) * y_stride;
+            let y_row1 = ((row + 1) as isize) * y_stride;
+            let c_row = ((row >> 1) as isize) * c_stride;
+            let out_row0 = row * w * 4;
+            let out_row1 = (row + 1) * w * 4;
+            for col in (0..pairs_w).step_by(2) {
+                let cx = (col >> 1) as isize;
+                let u = unsafe { *up.offset(c_row + cx) } as i32;
+                let v = unsafe { *vp.offset(c_row + cx) } as i32;
+                let d = u - 128;
+                let e = v - 128;
+                let r_add = 409 * e + 128;
+                let g_add = -100 * d - 208 * e + 128;
+                let b_add = 516 * d + 128;
 
-                    let c00 = (unsafe { *y_ptr.offset(y_row0 + col as isize) } as i32 - 16) * 298;
-                    let c01 =
-                        (unsafe { *y_ptr.offset(y_row0 + (col + 1) as isize) } as i32 - 16) * 298;
-                    let c10 = (unsafe { *y_ptr.offset(y_row1 + col as isize) } as i32 - 16) * 298;
-                    let c11 =
-                        (unsafe { *y_ptr.offset(y_row1 + (col + 1) as isize) } as i32 - 16) * 298;
+                let c00 = (unsafe { *y_ptr.offset(y_row0 + col as isize) } as i32 - 16) * 298;
+                let c01 = (unsafe { *y_ptr.offset(y_row0 + (col + 1) as isize) } as i32 - 16) * 298;
+                let c10 = (unsafe { *y_ptr.offset(y_row1 + col as isize) } as i32 - 16) * 298;
+                let c11 = (unsafe { *y_ptr.offset(y_row1 + (col + 1) as isize) } as i32 - 16) * 298;
 
-                    let o00 = out_row0 + col * 4;
-                    let o01 = o00 + 4;
-                    let o10 = out_row1 + col * 4;
-                    let o11 = o10 + 4;
+                let o00 = out_row0 + col * 4;
+                let o01 = o00 + 4;
+                let o10 = out_row1 + col * 4;
+                let o11 = o10 + 4;
 
-                    for (o, cy) in [(o00, c00), (o01, c01), (o10, c10), (o11, c11)] {
-                        bgra[o] = ((cy + b_add) >> 8).clamp(0, 255) as u8;
-                        bgra[o + 1] = ((cy + g_add) >> 8).clamp(0, 255) as u8;
-                        bgra[o + 2] = ((cy + r_add) >> 8).clamp(0, 255) as u8;
-                        bgra[o + 3] = 255;
-                    }
+                for (o, cy) in [(o00, c00), (o01, c01), (o10, c10), (o11, c11)] {
+                    bgra[o] = ((cy + b_add) >> 8).clamp(0, 255) as u8;
+                    bgra[o + 1] = ((cy + g_add) >> 8).clamp(0, 255) as u8;
+                    bgra[o + 2] = ((cy + r_add) >> 8).clamp(0, 255) as u8;
+                    bgra[o + 3] = 255;
                 }
             }
-            if pairs_h == h && pairs_w == w {
-                return Some(VideoFrame::from_bgra(w as u32, h as u32, bgra));
-            }
+        }
+        if pairs_h == h && pairs_w == w {
+            return Some(VideoFrame::from_bgra(w as u32, h as u32, bgra));
         }
     }
 

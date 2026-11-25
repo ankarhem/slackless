@@ -474,13 +474,13 @@ pub(super) fn subscribe_workspace(
                 }
                 SwitcherEvent::OpenRemoteChannel(conv) => {
                     window.close_dialog(cx);
-                    if this.fixtures.conversation(&conv.id).is_none() {
-                        if let Some((store, ws)) = this.bridge.store().zip(this.bridge.team_id()) {
-                            if let Ok(mut guard) = store.lock() {
-                                let _ = guard.upsert_conversation(ws, conv);
-                            }
-                            this.reload_live(window, cx);
+                    if this.fixtures.conversation(&conv.id).is_none()
+                        && let Some((store, ws)) = this.bridge.store().zip(this.bridge.team_id())
+                    {
+                        if let Ok(mut guard) = store.lock() {
+                            let _ = guard.upsert_conversation(ws, conv);
                         }
+                        this.reload_live(window, cx);
                     }
                     this.select(conv.id.clone(), cx);
                     this.focus.focus(window, cx);

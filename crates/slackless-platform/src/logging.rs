@@ -171,10 +171,10 @@ impl RollingWriter {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if let Ok(meta) = fs::metadata(&path) {
-            if meta.len() >= MAX_LOG_BYTES {
-                let _ = fs::rename(&path, backup_path(&path));
-            }
+        if let Ok(meta) = fs::metadata(&path)
+            && meta.len() >= MAX_LOG_BYTES
+        {
+            let _ = fs::rename(&path, backup_path(&path));
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);

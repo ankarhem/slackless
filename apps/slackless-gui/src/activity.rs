@@ -259,10 +259,10 @@ impl ActivityFeed {
     /// Open the currently keyboard-selected Activity item (`Enter`).
     pub fn open_selected(&mut self, cx: &mut Context<Self>) {
         let vis = self.visible();
-        if let Some(pos) = self.selected {
-            if let Some(&ix) = vis.get(pos) {
-                self.open(ix, cx);
-            }
+        if let Some(pos) = self.selected
+            && let Some(&ix) = vis.get(pos)
+        {
+            self.open(ix, cx);
         }
     }
 
@@ -355,13 +355,11 @@ impl ActivityFeed {
         let item = &mut self.items[ix];
         let was_unread = item.unread;
         item.unread = false;
-        if was_unread {
-            if let Some(entry) = item.entry.clone() {
-                cx.emit(ActivityEvent::Mark {
-                    entries: vec![entry],
-                    read: true,
-                });
-            }
+        if was_unread && let Some(entry) = item.entry.clone() {
+            cx.emit(ActivityEvent::Mark {
+                entries: vec![entry],
+                read: true,
+            });
         }
         cx.emit(ActivityEvent::Open {
             channel: item.channel.clone(),
@@ -373,10 +371,10 @@ impl ActivityFeed {
     /// The row's display name: the bot's label, the author's profile, the actor, or the
     /// fixture-provided label.
     fn actor_name<'a>(&'a self, item: &'a Item) -> SharedString {
-        if let Some(name) = item.message.as_ref().and_then(|m| m.username.as_deref()) {
-            if !name.is_empty() {
-                return SharedString::from(name.to_owned());
-            }
+        if let Some(name) = item.message.as_ref().and_then(|m| m.username.as_deref())
+            && !name.is_empty()
+        {
+            return SharedString::from(name.to_owned());
         }
         if let Some(user) = item
             .message
@@ -389,7 +387,7 @@ impl ActivityFeed {
         SharedString::from(item.actor_label.clone())
     }
 
-    fn row(&self, ix: usize, item: &Item, cx: &mut Context<Self>) -> impl IntoElement {
+    fn row(&self, ix: usize, item: &Item, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (dim, hover, fg, border) = (
             theme.muted_foreground,

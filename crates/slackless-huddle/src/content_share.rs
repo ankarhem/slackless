@@ -255,78 +255,76 @@ impl ContentShareSession {
             detect_system_audio_loopback()
         };
 
-        if native_tap.is_none() {
-            if let Some(dev_name) = loopback_device.clone() {
-                let _ = std::thread::Builder::new()
-                    .name("slackless-screen-audio".to_owned())
-                    .spawn(move || {
-                        let host = cpal::default_host();
-                        let Some(dev) = host.input_devices().ok().and_then(|mut it| {
-                            it.find(|d| d.name().ok().as_deref() == Some(dev_name.as_str()))
-                        }) else {
-                            return;
-                        };
-                        let Ok(supported) = dev.default_input_config() else {
-                            return;
-                        };
-                        let fmt = supported.sample_format();
-                        let ch = supported.channels() as usize;
-                        let cfg: cpal::StreamConfig = supported.into();
-                        let push = move |stereo: Vec<i16>| {
-                            if let Ok(mut q) = loopback_pcm_tx.lock() {
-                                push_stereo_pcm_with_overflow(&mut q, stereo);
-                            }
-                        };
-                        let stream = match fmt {
-                            SampleFormat::F32 => dev
-                                .build_input_stream(
-                                    &cfg,
-                                    move |data: &[f32], _| {
-                                        let mut out =
-                                            Vec::with_capacity((data.len() / ch.max(1)) * 2);
-                                        for frame in data.chunks(ch.max(1)) {
-                                            let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
-                                            let r = (frame
-                                                .get(1)
-                                                .copied()
-                                                .unwrap_or(frame[0])
-                                                .clamp(-1.0, 1.0)
-                                                * 32767.0)
-                                                as i16;
-                                            out.push(l);
-                                            out.push(r);
-                                        }
-                                        push(out);
-                                    },
-                                    |_| {},
-                                    None,
-                                )
-                                .ok(),
-                            SampleFormat::I16 => dev
-                                .build_input_stream(
-                                    &cfg,
-                                    move |data: &[i16], _| {
-                                        let mut out =
-                                            Vec::with_capacity((data.len() / ch.max(1)) * 2);
-                                        for frame in data.chunks(ch.max(1)) {
-                                            out.push(frame[0]);
-                                            out.push(*frame.get(1).unwrap_or(&frame[0]));
-                                        }
-                                        push(out);
-                                    },
-                                    |_| {},
-                                    None,
-                                )
-                                .ok(),
-                            _ => None,
-                        };
-                        let Some(stream) = stream else { return };
-                        let _ = stream.play();
-                        while loopback_capture_running.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(50));
+        if native_tap.is_none()
+            && let Some(dev_name) = loopback_device.clone()
+        {
+            let _ = std::thread::Builder::new()
+                .name("slackless-screen-audio".to_owned())
+                .spawn(move || {
+                    let host = cpal::default_host();
+                    let Some(dev) = host.input_devices().ok().and_then(|mut it| {
+                        it.find(|d| d.name().ok().as_deref() == Some(dev_name.as_str()))
+                    }) else {
+                        return;
+                    };
+                    let Ok(supported) = dev.default_input_config() else {
+                        return;
+                    };
+                    let fmt = supported.sample_format();
+                    let ch = supported.channels() as usize;
+                    let cfg: cpal::StreamConfig = supported.into();
+                    let push = move |stereo: Vec<i16>| {
+                        if let Ok(mut q) = loopback_pcm_tx.lock() {
+                            push_stereo_pcm_with_overflow(&mut q, stereo);
                         }
-                    });
-            }
+                    };
+                    let stream = match fmt {
+                        SampleFormat::F32 => dev
+                            .build_input_stream(
+                                &cfg,
+                                move |data: &[f32], _| {
+                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
+                                    for frame in data.chunks(ch.max(1)) {
+                                        let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
+                                        let r = (frame
+                                            .get(1)
+                                            .copied()
+                                            .unwrap_or(frame[0])
+                                            .clamp(-1.0, 1.0)
+                                            * 32767.0)
+                                            as i16;
+                                        out.push(l);
+                                        out.push(r);
+                                    }
+                                    push(out);
+                                },
+                                |_| {},
+                                None,
+                            )
+                            .ok(),
+                        SampleFormat::I16 => dev
+                            .build_input_stream(
+                                &cfg,
+                                move |data: &[i16], _| {
+                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
+                                    for frame in data.chunks(ch.max(1)) {
+                                        out.push(frame[0]);
+                                        out.push(*frame.get(1).unwrap_or(&frame[0]));
+                                    }
+                                    push(out);
+                                },
+                                |_| {},
+                                None,
+                            )
+                            .ok(),
+                        _ => None,
+                    };
+                    let Some(stream) = stream else { return };
+                    let _ = stream.play();
+                    while loopback_capture_running.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
         }
         // Feed live system audio (CoreAudio tap or loopback, `F-COLLAB-022`) or a cached 20ms
         // stereo Opus silence packet (skipping 50 Hz Opus encode when `share_audio == false`).
@@ -437,11 +435,10 @@ impl ContentShareSession {
                         match res {
                             Ok(Some(frame)) => {
                                 if frame.r#type == Some(sdk_signal_frame::Type::PingPong as i32) {
-                                    if let Some(pp) = frame.ping_pong {
-                                        if pp.r#type == Some(SdkPingPongType::Ping as i32) {
+                                    if let Some(pp) = frame.ping_pong
+                                        && pp.r#type == Some(SdkPingPongType::Ping as i32) {
                                             let _ = sig.send_frame(&build_pong_frame(pp.ping_id.unwrap_or(0))).await;
                                         }
-                                    }
                                 } else if frame.r#type == Some(sdk_signal_frame::Type::Leave as i32) {
                                     break;
                                 }

@@ -42,10 +42,10 @@ impl Lang {
         if let Some(lang) = hint.and_then(Self::from_hint) {
             return lang;
         }
-        if let Some(ext) = filename.and_then(|name| name.rsplit_once('.').map(|(_, e)| e)) {
-            if let Some(lang) = Self::from_hint(ext) {
-                return lang;
-            }
+        if let Some(ext) = filename.and_then(|name| name.rsplit_once('.').map(|(_, e)| e))
+            && let Some(lang) = Self::from_hint(ext)
+        {
+            return lang;
         }
         Self::from_content(sample)
     }
@@ -86,14 +86,14 @@ impl Lang {
         {
             return Self::Diff;
         }
-        if let Some(first_line) = trimmed.lines().next() {
-            if let Some(rest) = first_line.strip_prefix("#!") {
-                if rest.contains("python") {
-                    return Self::Python;
-                }
-                if rest.contains("sh") || rest.contains("bash") || rest.contains("zsh") {
-                    return Self::Shell;
-                }
+        if let Some(first_line) = trimmed.lines().next()
+            && let Some(rest) = first_line.strip_prefix("#!")
+        {
+            if rest.contains("python") {
+                return Self::Python;
+            }
+            if rest.contains("sh") || rest.contains("bash") || rest.contains("zsh") {
+                return Self::Shell;
             }
         }
         if (trimmed.starts_with('{') || trimmed.starts_with('[')) && trimmed.contains("\":") {
@@ -192,11 +192,11 @@ fn push(out: &mut Vec<(usize, TokenKind)>, len: usize, kind: TokenKind) {
     if len == 0 {
         return;
     }
-    if let Some((last_len, last_kind)) = out.last_mut() {
-        if *last_kind == kind {
-            *last_len += len;
-            return;
-        }
+    if let Some((last_len, last_kind)) = out.last_mut()
+        && *last_kind == kind
+    {
+        *last_len += len;
+        return;
     }
     out.push((len, kind));
 }

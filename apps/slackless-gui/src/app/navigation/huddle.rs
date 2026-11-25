@@ -264,10 +264,10 @@ impl App {
         self._huddle_dock_sub = Some(sub);
         self.sidebar
             .update(cx, |s, cx| s.set_self_in_huddle(true, cx));
-        if let Some((ch, bar)) = &self.huddle {
-            if *ch == snap.channel {
-                bar.update(cx, |b, cx| b.update_session(Some(snap), cx));
-            }
+        if let Some((ch, bar)) = &self.huddle
+            && *ch == snap.channel
+        {
+            bar.update(cx, |b, cx| b.update_session(Some(snap), cx));
         }
     }
 
@@ -395,11 +395,11 @@ impl App {
         if let Some(dock) = &self.huddle_dock {
             dock.update(cx, |d, cx| d.set_muted_local(next, cx));
         }
-        if let Some((ch, bar)) = &self.huddle {
-            if *ch == snap.channel {
-                let s = snap.clone();
-                bar.update(cx, |b, cx| b.update_session(Some(s), cx));
-            }
+        if let Some((ch, bar)) = &self.huddle
+            && *ch == snap.channel
+        {
+            let s = snap.clone();
+            bar.update(cx, |b, cx| b.update_session(Some(s), cx));
         }
         if !self.fixtures.sample {
             self.bridge.send(Command::SetHuddleMuted(next));
@@ -418,11 +418,11 @@ impl App {
         if let Some(dock) = &self.huddle_dock {
             dock.update(cx, |d, cx| d.set_camera_local(next, cx));
         }
-        if let Some((ch, bar)) = &self.huddle {
-            if *ch == snap.channel {
-                let s = snap.clone();
-                bar.update(cx, |b, cx| b.update_session(Some(s), cx));
-            }
+        if let Some((ch, bar)) = &self.huddle
+            && *ch == snap.channel
+        {
+            let s = snap.clone();
+            bar.update(cx, |b, cx| b.update_session(Some(s), cx));
         }
         if !self.fixtures.sample {
             self.bridge.send(Command::SetHuddleCamera {

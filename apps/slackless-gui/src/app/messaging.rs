@@ -297,10 +297,10 @@ impl App {
             if let Some(counts) = self.ws.counts.get_mut(channel) {
                 // If local SQLite history lags behind `client.counts.latest`, mark up to `latest`
                 // so a cached pre-fetch read never sends a stale cursor and leaves the DM unread.
-                if let Some(latest) = counts.latest.as_ref() {
-                    if *latest > target_ts {
-                        target_ts = latest.clone();
-                    }
+                if let Some(latest) = counts.latest.as_ref()
+                    && *latest > target_ts
+                {
+                    target_ts = latest.clone();
                 }
                 let advances_cursor = counts
                     .last_read

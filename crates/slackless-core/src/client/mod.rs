@@ -338,10 +338,10 @@ pub(crate) async fn run<B: Backend>(
 
 /// The next websocket event; pends forever once the socket stream has ended.
 async fn next_rtm(rtm: &mut Option<tokio::sync::mpsc::Receiver<RtmEvent>>) -> RtmEvent {
-    if let Some(rx) = rtm {
-        if let Some(event) = rx.recv().await {
-            return event;
-        }
+    if let Some(rx) = rtm
+        && let Some(event) = rx.recv().await
+    {
+        return event;
     }
     *rtm = None;
     std::future::pending().await

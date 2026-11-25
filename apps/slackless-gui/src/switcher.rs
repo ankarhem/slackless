@@ -255,17 +255,17 @@ impl QuickSwitcher {
                 continue;
             }
             let label = self.fixtures.conversation_label(c);
-            if !q.is_empty() {
-                if let Some(tier) = match_tier(&label) {
-                    scored.push((
-                        tier,
-                        u32::MAX,
-                        2,
-                        label.to_lowercase(),
-                        Target::RemoteChannel(Box::new(c.clone())),
-                        label,
-                    ));
-                }
+            if !q.is_empty()
+                && let Some(tier) = match_tier(&label)
+            {
+                scored.push((
+                    tier,
+                    u32::MAX,
+                    2,
+                    label.to_lowercase(),
+                    Target::RemoteChannel(Box::new(c.clone())),
+                    label,
+                ));
             }
         }
         for u in &self.fixtures.users {

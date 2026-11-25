@@ -489,12 +489,11 @@ impl ThreadsView {
             .cards
             .iter_mut()
             .find(|c| &c.channel == channel && &c.thread_ts == thread_ts)
+            && !replies.is_empty()
         {
-            if !replies.is_empty() {
-                card.reply_total = card.reply_total.max(replies.len() as u32);
-                card.replies = replies;
-                cx.notify();
-            }
+            card.reply_total = card.reply_total.max(replies.len() as u32);
+            card.replies = replies;
+            cx.notify();
         }
     }
 

@@ -103,7 +103,7 @@ impl ChannelBrowser {
         channels
     }
 
-    fn row(&self, conversation: &Conversation, cx: &mut Context<Self>) -> impl IntoElement {
+    fn row(&self, conversation: &Conversation, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (foreground, muted, success, border, hover) = (
             theme.foreground,

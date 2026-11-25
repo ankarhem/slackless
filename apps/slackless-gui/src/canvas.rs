@@ -1486,21 +1486,21 @@ pub fn parse_canvas_html_with_ids(html: &str) -> (Vec<CanvasBlock>, Vec<Option<S
             continue;
         }
         if tag_name == "img" {
-            if let Some(src) = extract_attr(trimmed, "src") {
-                if src.starts_with("https://") || src.starts_with("http://") {
-                    let alt = extract_attr(trimmed, "alt").unwrap_or_default();
-                    let width = extract_attr(trimmed, "width")
-                        .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
-                    let height = extract_attr(trimmed, "height")
-                        .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
-                    blocks.push(CanvasBlock::Image {
-                        url: decode_entities(&src),
-                        alt: clean_text(&alt),
-                        width,
-                        height,
-                    });
-                    ids.push(section_id);
-                }
+            if let Some(src) = extract_attr(trimmed, "src")
+                && (src.starts_with("https://") || src.starts_with("http://"))
+            {
+                let alt = extract_attr(trimmed, "alt").unwrap_or_default();
+                let width = extract_attr(trimmed, "width")
+                    .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
+                let height = extract_attr(trimmed, "height")
+                    .and_then(|v| v.trim_end_matches("px").parse::<u32>().ok());
+                blocks.push(CanvasBlock::Image {
+                    url: decode_entities(&src),
+                    alt: clean_text(&alt),
+                    width,
+                    height,
+                });
+                ids.push(section_id);
             }
             continue;
         }

@@ -144,10 +144,10 @@ impl ByteLru {
             || self.entries.len() >= self.max_entries)
             && !self.order.is_empty()
         {
-            if let Some(oldest) = self.order.pop_front() {
-                if let Some(evicted) = self.entries.remove(&oldest) {
-                    self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
-                }
+            if let Some(oldest) = self.order.pop_front()
+                && let Some(evicted) = self.entries.remove(&oldest)
+            {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted.len());
             }
         }
         self.total_bytes += data.len();
@@ -249,11 +249,11 @@ impl Fetcher {
     pub fn get(
         &self,
         url: String,
-    ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'static {
-        if let Ok(mut guard) = self.cache.lock() {
-            if let Some(hit) = guard.get(&url) {
-                return futures::future::Either::Left(async move { Ok(hit) });
-            }
+    ) -> impl Future<Output = Result<Vec<u8>, String>> + Send + 'static + use<> {
+        if let Ok(mut guard) = self.cache.lock()
+            && let Some(hit) = guard.get(&url)
+        {
+            return futures::future::Either::Left(async move { Ok(hit) });
         }
         let mut follower_rx = None;
         let mut leader_tx = None;
@@ -292,10 +292,10 @@ impl Fetcher {
                     if let Ok(Some(bytes)) =
                         tokio::task::spawn_blocking(move || read_disk_cache(&dir_r, &url_r)).await
                     {
-                        if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
-                            if let Ok(mut guard) = cache.lock() {
-                                guard.insert(url.clone(), bytes.clone());
-                            }
+                        if bytes.len() <= MAX_SINGLE_ENTRY_BYTES
+                            && let Ok(mut guard) = cache.lock()
+                        {
+                            guard.insert(url.clone(), bytes.clone());
                         }
                         return Ok(bytes);
                     }
@@ -308,19 +308,19 @@ impl Fetcher {
                         .map_err(|e| e.to_string()),
                     None => assets.get(&url).await.map_err(|e| e.to_string()),
                 };
-                if let Ok(ref bytes) = result {
-                    if bytes.len() <= MAX_SINGLE_ENTRY_BYTES {
-                        if let Ok(mut guard) = cache.lock() {
-                            guard.insert(url.clone(), bytes.clone());
-                        }
-                        if let Some(dir) = disk_dir {
-                            let data = bytes.clone();
-                            let url_w = url.clone();
-                            // Persist asynchronously so disk I/O never stalls the image decode path.
-                            tokio::task::spawn_blocking(move || {
-                                write_disk_cache(&dir, &url_w, &data);
-                            });
-                        }
+                if let Ok(ref bytes) = result
+                    && bytes.len() <= MAX_SINGLE_ENTRY_BYTES
+                {
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(url.clone(), bytes.clone());
+                    }
+                    if let Some(dir) = disk_dir {
+                        let data = bytes.clone();
+                        let url_w = url.clone();
+                        // Persist asynchronously so disk I/O never stalls the image decode path.
+                        tokio::task::spawn_blocking(move || {
+                            write_disk_cache(&dir, &url_w, &data);
+                        });
                     }
                 }
                 result

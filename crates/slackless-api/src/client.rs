@@ -78,10 +78,10 @@ pub fn set_proxy_url(url: Option<String>) {
 
 /// Currently configured proxy URL override, or `SLACKLESS_PROXY` env var if set.
 pub fn proxy_url() -> Option<String> {
-    if let Ok(g) = PROXY_URL.get_or_init(|| Mutex::new(None)).lock() {
-        if g.is_some() {
-            return g.clone();
-        }
+    if let Ok(g) = PROXY_URL.get_or_init(|| Mutex::new(None)).lock()
+        && g.is_some()
+    {
+        return g.clone();
     }
     std::env::var("SLACKLESS_PROXY")
         .ok()

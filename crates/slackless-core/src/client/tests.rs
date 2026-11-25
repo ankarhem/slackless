@@ -1034,17 +1034,16 @@ impl Backend for FakeBackend {
         if state.sections.is_empty() {
             state.sections = base_sections();
         }
-        if let Some((from, channel)) = remove {
-            if let Some(source) = state.sections.iter_mut().find(|s| s.id == from) {
-                source.channel_ids.retain(|id| *id != channel);
-            }
+        if let Some((from, channel)) = remove
+            && let Some(source) = state.sections.iter_mut().find(|s| s.id == from)
+        {
+            source.channel_ids.retain(|id| *id != channel);
         }
-        if let Some((to, channel)) = insert {
-            if let Some(target) = state.sections.iter_mut().find(|s| s.id == to) {
-                if !target.channel_ids.contains(&channel) {
-                    target.channel_ids.push(channel);
-                }
-            }
+        if let Some((to, channel)) = insert
+            && let Some(target) = state.sections.iter_mut().find(|s| s.id == to)
+            && !target.channel_ids.contains(&channel)
+        {
+            target.channel_ids.push(channel);
         }
         Ok(())
     }

@@ -507,10 +507,10 @@ impl MessageList {
 
     /// Look up an already-loaded message by timestamp (used to seed `ThreadPanel` on frame 0).
     pub fn message_by_ts(&self, channel: &ChannelId, ts: &Ts, cx: &App) -> Option<Message> {
-        if *channel == self.channel {
-            if let Some(m) = self.data.read(cx).messages.iter().find(|m| &m.ts == ts) {
-                return Some(m.clone());
-            }
+        if *channel == self.channel
+            && let Some(m) = self.data.read(cx).messages.iter().find(|m| &m.ts == ts)
+        {
+            return Some(m.clone());
         }
         self.messages
             .get(channel)

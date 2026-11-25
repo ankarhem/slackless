@@ -195,10 +195,10 @@ impl ParsedDoc {
         }
         // Empty pair right around the caret (e.g. `*|*`, `_|_`, `~|~`, `` `|` ``, `<u>|</u>`)
         // does not parse as a non-empty construct, yet the user just armed that format.
-        if attrs.style.is_plain() {
-            if let Some((_, style)) = empty_pair_at(doc.text(), line, offset) {
-                attrs.style = style;
-            }
+        if attrs.style.is_plain()
+            && let Some((_, style)) = empty_pair_at(doc.text(), line, offset)
+        {
+            attrs.style = style;
         }
         attrs
     }
@@ -288,11 +288,12 @@ impl ParsedDoc {
                 }
             }
             if !attrs.is_plain() {
-                if let Some(last) = runs.last_mut() {
-                    if last.range.end == seg.start && last.attrs == attrs {
-                        last.range.end = seg.end;
-                        continue;
-                    }
+                if let Some(last) = runs.last_mut()
+                    && last.range.end == seg.start
+                    && last.attrs == attrs
+                {
+                    last.range.end = seg.end;
+                    continue;
                 }
                 runs.push(StyledRun { range: seg, attrs });
             }
@@ -455,14 +456,13 @@ fn detect_block(
     if digits > 0
         && raw[digits..].starts_with(". ")
         && !overlaps_atom(atoms, start..start + digits + 2)
+        && let Ok(num) = raw[..digits].parse::<u32>()
     {
-        if let Ok(num) = raw[..digits].parse::<u32>() {
-            // An ordered list opens at `1. ` (so `3. not a list` stays a paragraph), and once
-            // open continues for any positive number (so deleting `2. b` keeps `3. c` in the
-            // list).
-            if (list.ordered_num > 0 && num >= 1) || num == 1 {
-                return (Some(LineKind::Ordered), digits + 2);
-            }
+        // An ordered list opens at `1. ` (so `3. not a list` stays a paragraph), and once
+        // open continues for any positive number (so deleting `2. b` keeps `3. c` in the
+        // list).
+        if (list.ordered_num > 0 && num >= 1) || num == 1 {
+            return (Some(LineKind::Ordered), digits + 2);
         }
     }
     (None, 0)

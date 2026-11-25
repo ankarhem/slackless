@@ -1019,10 +1019,10 @@ pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
         });
     let edited = message.edited.is_some();
     let inline_edited = edited && body_ends_in_text(message);
-    if message.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread) {
-        if let Some(card) = render_huddle_thread_card(message, kcx, cx) {
-            return column.child(card);
-        }
+    if message.subtype == Some(slackless_core::types::MessageSubtype::HuddleThread)
+        && let Some(card) = render_huddle_thread_card(message, kcx, cx)
+    {
+        return column.child(card);
     }
     let attachments = blockkit::attachments(message, kcx, cx);
     // Jumbomoji: when enabled (and not in plain-text emoji mode) and the message is 1..=5 emoji only, render them large (32px).
@@ -1032,15 +1032,14 @@ pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
         && !has_kit
         && message.attachments.is_empty()
         && message.files.is_empty()
+        && let Some(jumbos) = jumbomoji_elements(&message.text, kcx.fixtures)
     {
-        if let Some(jumbos) = jumbomoji_elements(&message.text, kcx.fixtures) {
-            column = column.child(h_flex().items_center().gap_1p5().children(jumbos));
-            if edited {
-                let muted = cx.theme().muted_foreground;
-                column = column.child(div().text_xs().text_color(muted).child("(edited)"));
-            }
-            return column;
+        column = column.child(h_flex().items_center().gap_1p5().children(jumbos));
+        if edited {
+            let muted = cx.theme().muted_foreground;
+            column = column.child(div().text_xs().text_color(muted).child("(edited)"));
         }
+        return column;
     }
     let mut rendered = 0;
     let last_block = message.blocks.len().saturating_sub(1);
@@ -1760,14 +1759,13 @@ fn expand_shortcodes_in_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {
-        if rest.starts_with(':') {
-            if let Some((len, code)) = emoji::parse_shortcode(rest) {
-                if let Some(glyph) = emoji::display_glyph(&code) {
-                    out.push_str(&glyph);
-                    rest = &rest[len..];
-                    continue;
-                }
-            }
+        if rest.starts_with(':')
+            && let Some((len, code)) = emoji::parse_shortcode(rest)
+            && let Some(glyph) = emoji::display_glyph(&code)
+        {
+            out.push_str(&glyph);
+            rest = &rest[len..];
+            continue;
         }
         let next_colon = rest[1..].find(':').map(|i| i + 1).unwrap_or(rest.len());
         out.push_str(&rest[..next_colon]);

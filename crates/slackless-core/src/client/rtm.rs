@@ -149,16 +149,15 @@ impl<B: Backend> Core<B> {
                             Ok(())
                         });
                     } else if r#type == "user_status_changed" {
-                        if let Some(user_val) = raw.get("user") {
-                            if let Ok(user) =
+                        if let Some(user_val) = raw.get("user")
+                            && let Ok(user) =
                                 serde_json::from_value::<crate::types::User>(user_val.clone())
-                            {
-                                let id = user.id.clone();
-                                let ws = self.workspace.clone();
-                                let _ = with_store(&self.store, move |s| s.upsert_user(&ws, &user))
-                                    .await;
-                                self.events.emit(Event::UsersChanged(vec![id]));
-                            }
+                        {
+                            let id = user.id.clone();
+                            let ws = self.workspace.clone();
+                            let _ =
+                                with_store(&self.store, move |s| s.upsert_user(&ws, &user)).await;
+                            self.events.emit(Event::UsersChanged(vec![id]));
                         }
                     } else if matches!(
                         r#type.as_str(),

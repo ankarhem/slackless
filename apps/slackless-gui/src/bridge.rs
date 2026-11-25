@@ -312,7 +312,7 @@ impl CoreBridge {
     pub fn snapshot_async(
         &self,
         counts: HashMap<ChannelId, ConversationCounts>,
-    ) -> Option<impl Future<Output = Option<Fixtures>> + Send + 'static> {
+    ) -> Option<impl Future<Output = Option<Fixtures>> + Send + 'static + use<>> {
         let session = self.session.clone()?;
         let store = self.read_store()?.clone();
         Some(async move {
@@ -347,7 +347,7 @@ impl CoreBridge {
         &self,
         channel: ChannelId,
         before: Option<Ts>,
-    ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static> {
+    ) -> Option<impl Future<Output = Vec<Message>> + Send + 'static + use<>> {
         let team = self.session.as_ref()?.team_id.clone();
         let store = self.read_store()?.clone();
         Some(async move {

@@ -318,10 +318,10 @@ impl SelectableParagraph {
         if hovered_now.is_some() {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
-        if let Some(ix) = hovered_now {
-            if let Some((range, LinkTarget::Url(_))) = self.links.get(ix) {
-                self.paint_hover_underline(layout, range.clone(), window);
-            }
+        if let Some(ix) = hovered_now
+            && let Some((range, LinkTarget::Url(_))) = self.links.get(ix)
+        {
+            self.paint_hover_underline(layout, range.clone(), window);
         }
         let (mouse_down, hovered_link, hover_key) = window.with_element_state::<ParagraphState, _>(
             global_id.expect("SelectableParagraph must have a stable element id"),
@@ -340,10 +340,11 @@ impl SelectableParagraph {
             let mouse_down = mouse_down.clone();
             let hitbox = hitbox.clone();
             move |event: &MouseDownEvent, phase, window: &mut Window, _: &mut App| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                    if let Ok(ix) = layout.index_for_position(event.position) {
-                        mouse_down.set(Some(ix));
-                    }
+                if phase == DispatchPhase::Bubble
+                    && hitbox.is_hovered(window)
+                    && let Ok(ix) = layout.index_for_position(event.position)
+                {
+                    mouse_down.set(Some(ix));
                 }
             }
         };

@@ -499,24 +499,24 @@ fn convert_inline_markdown(line: &str) -> String {
             continue;
         }
         // `[label](url)` -> `<url|label>`
-        if bytes[i] == b'[' {
-            if let Some(close_bracket) = line[i + 1..].find("](") {
-                let label_end = i + 1 + close_bracket;
-                let url_start = label_end + 2;
-                if let Some(close_paren) = line[url_start..].find(')') {
-                    let label = &line[i + 1..label_end];
-                    let url = &line[url_start..url_start + close_paren];
-                    if !url.is_empty() && !url.contains(char::is_whitespace) {
-                        out.push('<');
-                        out.push_str(url);
-                        if !label.is_empty() {
-                            out.push('|');
-                            out.push_str(label);
-                        }
-                        out.push('>');
-                        i = url_start + close_paren + 1;
-                        continue;
+        if bytes[i] == b'['
+            && let Some(close_bracket) = line[i + 1..].find("](")
+        {
+            let label_end = i + 1 + close_bracket;
+            let url_start = label_end + 2;
+            if let Some(close_paren) = line[url_start..].find(')') {
+                let label = &line[i + 1..label_end];
+                let url = &line[url_start..url_start + close_paren];
+                if !url.is_empty() && !url.contains(char::is_whitespace) {
+                    out.push('<');
+                    out.push_str(url);
+                    if !label.is_empty() {
+                        out.push('|');
+                        out.push_str(label);
                     }
+                    out.push('>');
+                    i = url_start + close_paren + 1;
+                    continue;
                 }
             }
         }

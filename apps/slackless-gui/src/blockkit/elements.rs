@@ -1333,33 +1333,31 @@ pub(super) fn validate_text_input(element: &Json, value: &str) -> Option<String>
                 .as_str()
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| element["min_value"].as_f64())
+                && num < min
             {
-                if num < min {
-                    return Some(format!("Must be at least {min}."));
-                }
+                return Some(format!("Must be at least {min}."));
             }
             if let Some(max) = element["max_value"]
                 .as_str()
                 .and_then(|s| s.parse::<f64>().ok())
                 .or_else(|| element["max_value"].as_f64())
+                && num > max
             {
-                if num > max {
-                    return Some(format!("Must be at most {max}."));
-                }
+                return Some(format!("Must be at most {max}."));
             }
             None
         }
         "plain_text_input" => {
             let len = value.chars().count();
-            if let Some(min) = element["min_length"].as_u64() {
-                if (len as u64) < min {
-                    return Some(format!("Must be at least {min} characters."));
-                }
+            if let Some(min) = element["min_length"].as_u64()
+                && (len as u64) < min
+            {
+                return Some(format!("Must be at least {min} characters."));
             }
-            if let Some(max) = element["max_length"].as_u64() {
-                if (len as u64) > max {
-                    return Some(format!("Must be at most {max} characters."));
-                }
+            if let Some(max) = element["max_length"].as_u64()
+                && (len as u64) > max
+            {
+                return Some(format!("Must be at most {max} characters."));
             }
             None
         }
@@ -1396,30 +1394,29 @@ pub(super) fn filtered_conversations(
             if exclude_ext && (ch.is_ext_shared || ch.is_shared) {
                 return false;
             }
-            if exclude_bots && ch.is_im {
-                if let Some(uid) = ch.user.as_ref() {
-                    if fixtures
-                        .user(uid)
-                        .is_some_and(|u| u.is_bot || u.is_app_user)
-                    {
-                        return false;
-                    }
-                }
+            if exclude_bots
+                && ch.is_im
+                && let Some(uid) = ch.user.as_ref()
+                && fixtures
+                    .user(uid)
+                    .is_some_and(|u| u.is_bot || u.is_app_user)
+            {
+                return false;
             }
-            if let Some(inc) = &include {
-                if !inc.is_empty() {
-                    let tag = if ch.is_im {
-                        "im"
-                    } else if ch.is_mpim {
-                        "mpim"
-                    } else if ch.is_private || ch.is_group {
-                        "private"
-                    } else {
-                        "public"
-                    };
-                    if !inc.contains(&tag) {
-                        return false;
-                    }
+            if let Some(inc) = &include
+                && !inc.is_empty()
+            {
+                let tag = if ch.is_im {
+                    "im"
+                } else if ch.is_mpim {
+                    "mpim"
+                } else if ch.is_private || ch.is_group {
+                    "private"
+                } else {
+                    "public"
+                };
+                if !inc.contains(&tag) {
+                    return false;
                 }
             }
             true
@@ -1660,24 +1657,24 @@ pub(super) fn picture(
             .radius(px(8.))
             .fallback(placeholder),
     );
-    if let (Some(url), Some(on_open)) = (url, kcx.image_open.clone()) {
-        if width >= OPENABLE_IMAGE {
-            // Slack's `.p-file_image_thumbnail__wrapper`: 8px radius, a 1px border of the
-            // foreground at 13%, and the zoom cursor.
-            let origin = ImageOrigin::Url(url.to_owned());
-            return div()
-                .id(SharedString::from(format!("img-{}", kcx.text_key())))
-                // Hug the image: a column would stretch the frame to its width.
-                .self_start()
-                .cursor_pointer()
-                .rounded_lg()
-                .overflow_hidden()
-                .border_1()
-                .border_color(theme.foreground.opacity(0.13))
-                .on_click(move |_, window, cx| on_open(origin.clone(), window, cx))
-                .child(image)
-                .into_any_element();
-        }
+    if let (Some(url), Some(on_open)) = (url, kcx.image_open.clone())
+        && width >= OPENABLE_IMAGE
+    {
+        // Slack's `.p-file_image_thumbnail__wrapper`: 8px radius, a 1px border of the
+        // foreground at 13%, and the zoom cursor.
+        let origin = ImageOrigin::Url(url.to_owned());
+        return div()
+            .id(SharedString::from(format!("img-{}", kcx.text_key())))
+            // Hug the image: a column would stretch the frame to its width.
+            .self_start()
+            .cursor_pointer()
+            .rounded_lg()
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.foreground.opacity(0.13))
+            .on_click(move |_, window, cx| on_open(origin.clone(), window, cx))
+            .child(image)
+            .into_any_element();
     }
     image.into_any_element()
 }

@@ -273,8 +273,8 @@ impl App {
                                         .label("Clear cache")
                                         .on_click(|_, window, cx| {
                                             window.close_dialog(cx);
-                                            if let Some(dir) = crate::bridge::store_dir() {
-                                                if let Ok(entries) = std::fs::read_dir(&dir) {
+                                            if let Some(dir) = crate::bridge::store_dir()
+                                                && let Ok(entries) = std::fs::read_dir(&dir) {
                                                     for entry in entries.flatten() {
                                                         let path = entry.path();
                                                         let name = path
@@ -289,7 +289,6 @@ impl App {
                                                         }
                                                     }
                                                 }
-                                            }
                                             notify(
                                                 "Cache cleared",
                                                 "Restart slackless to re-sync from Slack.".to_owned(),
@@ -414,10 +413,11 @@ impl App {
         for dir in dirs {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() && std::fs::remove_file(entry.path()).is_ok() {
-                            removed = removed.saturating_add(meta.len());
-                        }
+                    if let Ok(meta) = entry.metadata()
+                        && meta.is_file()
+                        && std::fs::remove_file(entry.path()).is_ok()
+                    {
+                        removed = removed.saturating_add(meta.len());
                     }
                 }
             }

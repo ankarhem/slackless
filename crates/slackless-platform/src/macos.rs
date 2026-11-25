@@ -431,13 +431,12 @@ fn apply_status_bar(icon_png: Option<&[u8]>, state: &StatusBarState) {
         });
 
         if let Some(button) = live.item.button(mtm) {
-            if let Some(png) = icon_png {
-                if let Some(img) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png))
-                {
-                    img.setSize(NSSize::new(18., 18.));
-                    img.setTemplate(false);
-                    button.setImage(Some(&img));
-                }
+            if let Some(png) = icon_png
+                && let Some(img) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png))
+            {
+                img.setSize(NSSize::new(18., 18.));
+                img.setTemplate(false);
+                button.setImage(Some(&img));
             }
             let title = if state.unread_mentions > 0 {
                 format!(" {}", state.unread_mentions)
@@ -567,10 +566,9 @@ impl SpellChecker for MacPlatform {
             if let (Some(start), Some(end)) = (
                 utf16_to_utf8_offset(text, found.location),
                 utf16_to_utf8_offset(text, end_u16),
-            ) {
-                if start < end {
-                    out.push(Misspelling { range: start..end });
-                }
+            ) && start < end
+            {
+                out.push(Misspelling { range: start..end });
             }
             offset = end_u16.max(offset + 1);
             if out.len() >= 64 {

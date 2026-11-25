@@ -381,12 +381,12 @@ pub fn open_huddle_floating_panel(
         .open_window(options, move |window, cx| {
             window.set_window_title("Huddle Controls");
             #[cfg(target_os = "macos")]
-            if let Ok(wh) = raw_window_handle::HasWindowHandle::window_handle(window) {
-                if let raw_window_handle::RawWindowHandle::AppKit(appkit) = wh.as_raw() {
-                    // SAFETY: GPUI's macOS window yields a valid `NSView *` during window creation.
-                    unsafe {
-                        slackless_core::huddle::configure_floating_panel(appkit.ns_view.as_ptr());
-                    }
+            if let Ok(wh) = raw_window_handle::HasWindowHandle::window_handle(window)
+                && let raw_window_handle::RawWindowHandle::AppKit(appkit) = wh.as_raw()
+            {
+                // SAFETY: GPUI's macOS window yields a valid `NSView *` during window creation.
+                unsafe {
+                    slackless_core::huddle::configure_floating_panel(appkit.ns_view.as_ptr());
                 }
             }
             let dock_on_close = dock.clone();

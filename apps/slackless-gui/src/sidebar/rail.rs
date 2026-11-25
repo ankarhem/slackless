@@ -376,7 +376,7 @@ impl Sidebar {
         index: usize,
         team: &Team,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let active = index == self.active_workspace;
         let face = match team_icon_url(team) {

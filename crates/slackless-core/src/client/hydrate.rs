@@ -186,10 +186,10 @@ impl<B: Backend> Core<B> {
                 self.events.emit(Event::Usergroups(active));
             }
         }
-        if let Ok(commands) = commands_res {
-            if !commands.is_empty() {
-                self.events.emit(Event::AppCommands(commands));
-            }
+        if let Ok(commands) = commands_res
+            && !commands.is_empty()
+        {
+            self.events.emit(Event::AppCommands(commands));
         }
         self.events.emit(Event::SidebarChanged);
         self.fetch_dm_previews();
@@ -201,10 +201,10 @@ impl<B: Backend> Core<B> {
         if let Some(me) = self.self_user_id.lock().ok().and_then(|g| g.clone()) {
             let (backend, events) = (self.backend.clone(), self.events.clone());
             self.spawn("dnd.info (self)", async move {
-                if let Ok(status) = backend.dnd_info(me).await {
-                    if status.snooze_enabled {
-                        events.emit(Event::SelfDndUpdated(status));
-                    }
+                if let Ok(status) = backend.dnd_info(me).await
+                    && status.snooze_enabled
+                {
+                    events.emit(Event::SelfDndUpdated(status));
                 }
                 Ok(())
             });
@@ -375,20 +375,20 @@ pub(super) async fn prefetch_targets<B: Backend>(
     let mut fetched = 0usize;
     for (channel, latest) in targets {
         // Skip channels whose local archive already contains `latest`.
-        if let Some(ref latest_ts) = latest {
-            if !latest_ts.as_str().is_empty() {
-                let (ws_check, ch_check) = (ws.clone(), channel.clone());
-                let local_newest = with_store(&store, move |s| {
-                    s.channel_history(&ws_check, &ch_check, None, 1)
-                        .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
-                })
-                .await?;
-                if local_newest
-                    .as_ref()
-                    .is_some_and(|local| local >= latest_ts)
-                {
-                    continue;
-                }
+        if let Some(ref latest_ts) = latest
+            && !latest_ts.as_str().is_empty()
+        {
+            let (ws_check, ch_check) = (ws.clone(), channel.clone());
+            let local_newest = with_store(&store, move |s| {
+                s.channel_history(&ws_check, &ch_check, None, 1)
+                    .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
+            })
+            .await?;
+            if local_newest
+                .as_ref()
+                .is_some_and(|local| local >= latest_ts)
+            {
+                continue;
             }
         }
         if fetched >= 3 {

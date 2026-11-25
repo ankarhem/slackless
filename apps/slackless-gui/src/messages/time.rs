@@ -317,7 +317,7 @@ pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
         tm_gmtoff: i64,
         tm_zone: *const i8,
     }
-    extern "C" {
+    unsafe extern "C" {
         fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
     }
     let mut tm = Tm {

@@ -160,10 +160,10 @@ impl App {
                         .iter()
                         .position(|t| t.id.as_str() == team_id)
                 });
-            if let Some(ix) = idx {
-                if ix != this.workspace {
-                    this.switch_workspace(ix, window, cx);
-                }
+            if let Some(ix) = idx
+                && ix != this.workspace
+            {
+                this.switch_workspace(ix, window, cx);
             }
         };
         match link {
@@ -376,16 +376,15 @@ fn launch_external_url(url: &str, browser_choice: usize, cx: &mut gpui::App) {
             2 => Some("Firefox"),
             _ => None,
         };
-        if let Some(app_name) = app_name {
-            if let Ok(mut child) = std::process::Command::new("open")
+        if let Some(app_name) = app_name
+            && let Ok(mut child) = std::process::Command::new("open")
                 .args(["-a", app_name, "--", url])
                 .spawn()
-            {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return;
-            }
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return;
         }
     }
     #[cfg(not(target_os = "macos"))]

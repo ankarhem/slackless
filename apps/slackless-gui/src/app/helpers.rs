@@ -410,19 +410,19 @@ pub(super) fn convert_emoticons(text: &str) -> String {
                 .chars()
                 .last()
                 .is_none_or(|c| c.is_whitespace() || c == '(');
-            if at_boundary {
-                if let Some((pat, rep)) = MAP.iter().find(|(pat, _)| {
+            if at_boundary
+                && let Some((pat, rep)) = MAP.iter().find(|(pat, _)| {
                     rest.strip_prefix(*pat).is_some_and(|after| {
                         after
                             .chars()
                             .next()
                             .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?'))
                     })
-                }) {
-                    out.push_str(rep);
-                    rest = &rest[pat.len()..];
-                    continue;
-                }
+                })
+            {
+                out.push_str(rep);
+                rest = &rest[pat.len()..];
+                continue;
             }
         }
         let ch = rest.chars().next().unwrap();

@@ -327,10 +327,10 @@ impl Composer {
                 state.replace_text_in_range(Some(utf16(&shown, range)), text, window, cx);
             }
             state.set_selected_range(selection, cx);
-            if !content.tokens().is_empty() {
-                if let Err(InlineTokenError::SplitsSelection) = state.set_tokens(content, cx) {
-                    report(state.set_tokens(tokens::atoms_only(doc), cx));
-                }
+            if !content.tokens().is_empty()
+                && let Err(InlineTokenError::SplitsSelection) = state.set_tokens(content, cx)
+            {
+                report(state.set_tokens(tokens::atoms_only(doc), cx));
             }
             state.set_decorations(decorations, cx);
         });

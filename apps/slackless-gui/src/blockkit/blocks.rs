@@ -244,23 +244,21 @@ pub(super) fn call_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                         .child(status),
                 ),
         );
-    if !ended {
-        if let Some(href) = join_url {
-            let target = LinkTarget::Url(href.into());
-            let links = kcx.links.clone();
-            row = row.child(
-                Button::new(SharedString::from(format!(
-                    "bk-call-join-{}-{ix}",
-                    kcx.ts.as_str()
-                )))
-                .primary()
-                .with_size(Size::XSmall)
-                .label("Join")
-                .on_click(move |_, window, cx| {
-                    messages::route_link(links.as_ref(), target.clone(), window, cx)
-                }),
-            );
-        }
+    if !ended && let Some(href) = join_url {
+        let target = LinkTarget::Url(href.into());
+        let links = kcx.links.clone();
+        row = row.child(
+            Button::new(SharedString::from(format!(
+                "bk-call-join-{}-{ix}",
+                kcx.ts.as_str()
+            )))
+            .primary()
+            .with_size(Size::XSmall)
+            .label("Join")
+            .on_click(move |_, window, cx| {
+                messages::route_link(links.as_ref(), target.clone(), window, cx)
+            }),
+        );
     }
     row
 }
@@ -562,17 +560,17 @@ pub(super) fn task_card_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> D
         if field.is_null() {
             continue;
         }
-        if field["type"].as_str() == Some("rich_text") {
-            if let Ok(parsed) = serde_json::from_value::<Block>(field.clone()) {
-                card = card.child(
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .pl(px(28.))
-                        .children(messages::render_block(&parsed, 0, kcx, false, cx)),
-                );
-                continue;
-            }
+        if field["type"].as_str() == Some("rich_text")
+            && let Ok(parsed) = serde_json::from_value::<Block>(field.clone())
+        {
+            card = card.child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .pl(px(28.))
+                    .children(messages::render_block(&parsed, 0, kcx, false, cx)),
+            );
+            continue;
         }
         if let Some(el) = text_object(field, kcx, false, cx).or_else(|| {
             field

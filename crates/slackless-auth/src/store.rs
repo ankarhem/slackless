@@ -121,11 +121,11 @@ impl SessionStore {
         let mut sessions: Vec<Session> = serde_json::from_slice(&bytes)?;
         if self.use_keychain {
             for s in &mut sessions {
-                if !s.has_secrets() {
-                    if let Some((xoxc, d)) = self.keychain.get(&s.team_id)? {
-                        s.xoxc_token = xoxc;
-                        s.d_cookie = d;
-                    }
+                if !s.has_secrets()
+                    && let Some((xoxc, d)) = self.keychain.get(&s.team_id)?
+                {
+                    s.xoxc_token = xoxc;
+                    s.d_cookie = d;
                 }
             }
         }

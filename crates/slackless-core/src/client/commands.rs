@@ -4,20 +4,20 @@ use super::*;
 
 impl<B: Backend> Core<B> {
     pub fn handle(&mut self, command: Command) {
-        if self.is_offline {
-            if let Some(mutation) = QueuedMutation::from_command(&command) {
-                let payload = serde_json::to_string(&mutation).unwrap_or_default();
-                let id = self
-                    .store
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.enqueue_offline(&self.workspace, &payload).ok())
-                    .unwrap_or(0);
-                self.offline_queue.push_back((id, mutation));
-                self.events
-                    .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
-                return;
-            }
+        if self.is_offline
+            && let Some(mutation) = QueuedMutation::from_command(&command)
+        {
+            let payload = serde_json::to_string(&mutation).unwrap_or_default();
+            let id = self
+                .store
+                .lock()
+                .ok()
+                .and_then(|s| s.enqueue_offline(&self.workspace, &payload).ok())
+                .unwrap_or(0);
+            self.offline_queue.push_back((id, mutation));
+            self.events
+                .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
+            return;
         }
         let backend = self.backend.clone();
         let store = Arc::clone(&self.store);
@@ -835,21 +835,19 @@ impl<B: Backend> Core<B> {
                     let _permit = channel_lock.lock().await;
                     let existing = draft_ids.lock().ok().and_then(|g| g.get(&channel).cloned());
                     if text.trim().is_empty() {
-                        if let Some(id) = existing {
-                            if backend.drafts_delete(id).await.is_ok() {
-                                if let Ok(mut guard) = draft_ids.lock() {
-                                    guard.remove(&channel);
-                                }
-                            }
+                        if let Some(id) = existing
+                            && backend.drafts_delete(id).await.is_ok()
+                            && let Ok(mut guard) = draft_ids.lock()
+                        {
+                            guard.remove(&channel);
                         }
                     } else if let Some(id) = existing {
                         let _ = backend.drafts_update(id, channel, text).await;
                     } else if let Ok(Some(new_id)) =
                         backend.drafts_create(channel.clone(), text).await
+                        && let Ok(mut guard) = draft_ids.lock()
                     {
-                        if let Ok(mut guard) = draft_ids.lock() {
-                            guard.insert(channel, new_id);
-                        }
+                        guard.insert(channel, new_id);
                     }
                     Ok(())
                 });
@@ -880,10 +878,10 @@ impl<B: Backend> Core<B> {
                 self.spawn("conversations.create", async move {
                     let mut created = backend.create_channel(name, is_private).await?;
                     let id = created.id.clone();
-                    if let Some(purpose) = purpose.filter(|p| !p.trim().is_empty()) {
-                        if let Ok(updated) = backend.set_purpose(id.clone(), purpose).await {
-                            created = updated;
-                        }
+                    if let Some(purpose) = purpose.filter(|p| !p.trim().is_empty())
+                        && let Ok(updated) = backend.set_purpose(id.clone(), purpose).await
+                    {
+                        created = updated;
                     }
                     created.is_member = true;
                     let for_store = created.clone();

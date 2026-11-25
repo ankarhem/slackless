@@ -140,10 +140,10 @@ impl PopoutWindow {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let next = !captions_now;
                     (send_cc)(Command::SetHuddleCaptions(next));
-                    if this.fixtures.sample {
-                        if let Some(dock) = this.huddle_dock_entity() {
-                            dock.update(cx, |d, cx| d.set_captions_local(next, cx));
-                        }
+                    if this.fixtures.sample
+                        && let Some(dock) = this.huddle_dock_entity()
+                    {
+                        dock.update(cx, |d, cx| d.set_captions_local(next, cx));
                     }
                     this.huddle_more_open = false;
                     cx.notify();
@@ -163,10 +163,10 @@ impl PopoutWindow {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let next_song = (!music_on).then(|| "jazz".to_owned());
                     (send_music)(Command::SetHuddleJukebox(next_song.clone()));
-                    if this.fixtures.sample {
-                        if let Some(dock) = this.huddle_dock_entity() {
-                            dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
-                        }
+                    if this.fixtures.sample
+                        && let Some(dock) = this.huddle_dock_entity()
+                    {
+                        dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
                     }
                     this.huddle_more_open = false;
                     cx.notify();
@@ -352,10 +352,10 @@ impl PopoutWindow {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let next_blur = !blur_now;
                         (send_blur)(Command::SetHuddleBlurBackground(next_blur));
-                        if this.fixtures.sample {
-                            if let Some(dock) = this.huddle_dock_entity() {
-                                dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
-                            }
+                        if this.fixtures.sample
+                            && let Some(dock) = this.huddle_dock_entity()
+                        {
+                            dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
                         }
                         this.huddle_camera_open = false;
                         cx.notify();
@@ -854,10 +854,10 @@ impl PopoutWindow {
                                         source_id: None,
                                         share_audio: false,
                                     });
-                                    if this.fixtures.sample {
-                                        if let Some(dock) = this.huddle_dock_entity() {
-                                            dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
-                                        }
+                                    if this.fixtures.sample
+                                        && let Some(dock) = this.huddle_dock_entity()
+                                    {
+                                        dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
                                     }
                                     this.close_share_modal(cx);
                                     cx.notify();
@@ -1068,22 +1068,22 @@ impl PopoutWindow {
                                     kind: HuddleReactionKind::Standard,
                                     emoji_url: None,
                                 });
-                                if this.fixtures.sample {
-                                    if let Some(dock) = this.huddle_dock_entity() {
-                                        let me = this.fixtures.self_user.clone();
-                                        dock.update(cx, |d, cx| {
-                                            d.apply_data_event(
-                                                &HuddleDataEvent::Reaction {
-                                                    user: me,
-                                                    emoji: em.clone(),
-                                                    kind: HuddleReactionKind::Standard,
-                                                    emoji_url: None,
-                                                    at_ms: 0,
-                                                },
-                                                cx,
-                                            );
-                                        });
-                                    }
+                                if this.fixtures.sample
+                                    && let Some(dock) = this.huddle_dock_entity()
+                                {
+                                    let me = this.fixtures.self_user.clone();
+                                    dock.update(cx, |d, cx| {
+                                        d.apply_data_event(
+                                            &HuddleDataEvent::Reaction {
+                                                user: me,
+                                                emoji: em.clone(),
+                                                kind: HuddleReactionKind::Standard,
+                                                emoji_url: None,
+                                                at_ms: 0,
+                                            },
+                                            cx,
+                                        );
+                                    });
                                 }
                                 cx.notify();
                             }))
@@ -1125,22 +1125,22 @@ impl PopoutWindow {
                                             kind: HuddleReactionKind::Effect,
                                             emoji_url: None,
                                         });
-                                        if this.fixtures.sample {
-                                            if let Some(dock) = this.huddle_dock_entity() {
-                                                let me = this.fixtures.self_user.clone();
-                                                dock.update(cx, |d, cx| {
-                                                    d.apply_data_event(
-                                                        &HuddleDataEvent::Reaction {
-                                                            user: me,
-                                                            emoji: em.clone(),
-                                                            kind: HuddleReactionKind::Effect,
-                                                            emoji_url: None,
-                                                            at_ms: 0,
-                                                        },
-                                                        cx,
-                                                    );
-                                                });
-                                            }
+                                        if this.fixtures.sample
+                                            && let Some(dock) = this.huddle_dock_entity()
+                                        {
+                                            let me = this.fixtures.self_user.clone();
+                                            dock.update(cx, |d, cx| {
+                                                d.apply_data_event(
+                                                    &HuddleDataEvent::Reaction {
+                                                        user: me,
+                                                        emoji: em.clone(),
+                                                        kind: HuddleReactionKind::Effect,
+                                                        emoji_url: None,
+                                                        at_ms: 0,
+                                                    },
+                                                    cx,
+                                                );
+                                            });
                                         }
                                         this.huddle_reactions_open = false;
                                         cx.notify();
@@ -1181,19 +1181,19 @@ impl PopoutWindow {
                                     .child(format!("{glyph} {label}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         (send_st)(Command::SetHuddleStickyEmoji(next.clone()));
-                                        if this.fixtures.sample {
-                                            if let Some(dock) = this.huddle_dock_entity() {
-                                                let me = this.fixtures.self_user.clone();
-                                                dock.update(cx, |d, cx| {
-                                                    d.apply_data_event(
-                                                        &HuddleDataEvent::StickyEmoji {
-                                                            user: me,
-                                                            emoji: next.clone(),
-                                                        },
-                                                        cx,
-                                                    );
-                                                });
-                                            }
+                                        if this.fixtures.sample
+                                            && let Some(dock) = this.huddle_dock_entity()
+                                        {
+                                            let me = this.fixtures.self_user.clone();
+                                            dock.update(cx, |d, cx| {
+                                                d.apply_data_event(
+                                                    &HuddleDataEvent::StickyEmoji {
+                                                        user: me,
+                                                        emoji: next.clone(),
+                                                    },
+                                                    cx,
+                                                );
+                                            });
                                         }
                                         cx.notify();
                                     }))

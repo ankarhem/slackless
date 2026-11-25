@@ -574,17 +574,17 @@ pub fn decode_sdp_answer_with_prev(
         let mut inflated = Vec::new();
         dec.read_to_end(&mut inflated)
             .map_err(|e| HuddleError::Signaling(format!("sdp inflate failed: {e}")))?;
-        if let Some(prev) = prev_sdp_answer {
-            if inflated.contains(&0) {
-                let prev_bytes = prev.as_bytes();
-                let mut restored = Vec::with_capacity(inflated.len());
-                for (i, &b) in inflated.iter().enumerate() {
-                    let p = prev_bytes.get(i).copied().unwrap_or(0);
-                    restored.push(b ^ p);
-                }
-                return String::from_utf8(restored)
-                    .map_err(|e| HuddleError::Signaling(format!("sdp xor-diff utf8 failed: {e}")));
+        if let Some(prev) = prev_sdp_answer
+            && inflated.contains(&0)
+        {
+            let prev_bytes = prev.as_bytes();
+            let mut restored = Vec::with_capacity(inflated.len());
+            for (i, &b) in inflated.iter().enumerate() {
+                let p = prev_bytes.get(i).copied().unwrap_or(0);
+                restored.push(b ^ p);
             }
+            return String::from_utf8(restored)
+                .map_err(|e| HuddleError::Signaling(format!("sdp xor-diff utf8 failed: {e}")));
         }
         return String::from_utf8(inflated)
             .map_err(|e| HuddleError::Signaling(format!("sdp inflate utf8 failed: {e}")));
@@ -1144,11 +1144,11 @@ mod tests {
             // Client must reply Pong("hi") before closing.
             let mut saw_pong = false;
             while let Some(Ok(msg)) = ws.next().await {
-                if let WsMessage::Pong(p) = msg {
-                    if p.as_ref() == b"hi" {
-                        saw_pong = true;
-                        break;
-                    }
+                if let WsMessage::Pong(p) = msg
+                    && p.as_ref() == b"hi"
+                {
+                    saw_pong = true;
+                    break;
                 }
             }
             assert!(saw_pong, "client must echo Pong for server Ping");

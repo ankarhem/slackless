@@ -412,10 +412,11 @@ impl Store {
                 let Ok(user) = serde_json::from_str::<User>(&row?) else {
                     continue;
                 };
-                if let Some(team) = user.team_id {
-                    if team != *workspace && !teams.contains(&team) {
-                        teams.push(team);
-                    }
+                if let Some(team) = user.team_id
+                    && team != *workspace
+                    && !teams.contains(&team)
+                {
+                    teams.push(team);
                 }
             }
         }

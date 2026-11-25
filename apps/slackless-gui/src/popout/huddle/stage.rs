@@ -422,10 +422,10 @@ impl PopoutWindow {
                         gpui_kit::gpui::DevicePixels(fh as i32),
                     ),
                 );
-                if pane_ix == 0 {
-                    if let Ok(mut guard) = bounds_cell.lock() {
-                        *guard = image_bounds;
-                    }
+                if pane_ix == 0
+                    && let Ok(mut guard) = bounds_cell.lock()
+                {
+                    *guard = image_bounds;
                 }
                 image_bounds
             },
@@ -670,13 +670,13 @@ impl PopoutWindow {
         } else {
             std::mem::take(&mut self.huddle_draw_local_item)
         };
-        if self.huddle_draw_points.len() == 1 {
-            if let Some(&dot) = segs.first() {
-                (self.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
-                    item_id: item.clone(),
-                    segment: dot,
-                }));
-            }
+        if self.huddle_draw_points.len() == 1
+            && let Some(&dot) = segs.first()
+        {
+            (self.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+                item_id: item.clone(),
+                segment: dot,
+            }));
         }
         self.huddle_draw_points.clear();
         let end_msg = HuddleDrawMessage::End {

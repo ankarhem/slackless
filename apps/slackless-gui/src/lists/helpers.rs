@@ -106,14 +106,14 @@ pub(crate) fn filter_and_sort_rows(
             })
             .map(|(ix, _)| ix)
             .collect();
-    if let Some((col_ix, asc)) = sort {
-        if let Some(col) = data.columns.get(col_ix) {
-            indices.sort_by(|&a, &b| {
-                let ka = cell_sort_key(row_cell(&data.rows[a], col), col, fixtures);
-                let kb = cell_sort_key(row_cell(&data.rows[b], col), col, fixtures);
-                if asc { ka.cmp(&kb) } else { kb.cmp(&ka) }
-            });
-        }
+    if let Some((col_ix, asc)) = sort
+        && let Some(col) = data.columns.get(col_ix)
+    {
+        indices.sort_by(|&a, &b| {
+            let ka = cell_sort_key(row_cell(&data.rows[a], col), col, fixtures);
+            let kb = cell_sort_key(row_cell(&data.rows[b], col), col, fixtures);
+            if asc { ka.cmp(&kb) } else { kb.cmp(&ka) }
+        });
     }
     indices
 }

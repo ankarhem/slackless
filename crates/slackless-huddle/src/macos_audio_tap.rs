@@ -255,10 +255,10 @@ unsafe extern "C" fn tap_io_proc(
         }
     };
 
-    if !stereo_out.is_empty() {
-        if let Ok(mut q) = ctx.queue.try_lock() {
-            push_tap_pcm_to_queue(&mut q, stereo_out);
-        }
+    if !stereo_out.is_empty()
+        && let Ok(mut q) = ctx.queue.try_lock()
+    {
+        push_tap_pcm_to_queue(&mut q, stereo_out);
     }
     0
 }

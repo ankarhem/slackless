@@ -97,16 +97,16 @@ impl ThreadCard {
 /// One microsecond before `ts`, matching Slack's `DDDDDDDDDD.MMMMMM` timestamp format.
 pub(crate) fn ts_just_before(ts: &Ts) -> Ts {
     let raw = ts.as_str();
-    if let Some((secs, frac)) = raw.split_once('.') {
-        if let (Ok(s), Ok(f)) = (secs.parse::<u64>(), frac.parse::<u64>()) {
-            return if f > 0 {
-                Ts::from(format!("{s}.{:06}", f - 1))
-            } else if s > 0 {
-                Ts::from(format!("{}.999999", s - 1))
-            } else {
-                Ts::from("0.000000")
-            };
-        }
+    if let Some((secs, frac)) = raw.split_once('.')
+        && let (Ok(s), Ok(f)) = (secs.parse::<u64>(), frac.parse::<u64>())
+    {
+        return if f > 0 {
+            Ts::from(format!("{s}.{:06}", f - 1))
+        } else if s > 0 {
+            Ts::from(format!("{}.999999", s - 1))
+        } else {
+            Ts::from("0.000000")
+        };
     }
     Ts::from("0.000000")
 }
@@ -322,40 +322,41 @@ fn render_thread_message(
         theme.secondary.opacity(0.5),
         theme.warning.opacity(0.08),
     );
-    if let Some((edit_ch, edit_ts, edit_input)) = editing {
-        if *edit_ch == card.channel && *edit_ts == msg.ts {
-            return v_flex()
-                .id(SharedString::from(format!("{key}-edit")))
-                .mx_4()
-                .my_1()
-                .p_2p5()
-                .gap_2()
-                .rounded_md()
-                .border_1()
-                .border_color(ring)
-                .bg(bg)
-                .child(Textarea::new(edit_input).appearance(false).bordered(false))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .justify_end()
-                        .child(
-                            Button::new(SharedString::from(format!("{key}-edit-cancel")))
-                                .outline()
-                                .with_size(Size::XSmall)
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_edit(cx))),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("{key}-edit-save")))
-                                .primary()
-                                .with_size(Size::XSmall)
-                                .label("Save Changes")
-                                .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
-                        ),
-                )
-                .into_any_element();
-        }
+    if let Some((edit_ch, edit_ts, edit_input)) = editing
+        && *edit_ch == card.channel
+        && *edit_ts == msg.ts
+    {
+        return v_flex()
+            .id(SharedString::from(format!("{key}-edit")))
+            .mx_4()
+            .my_1()
+            .p_2p5()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(ring)
+            .bg(bg)
+            .child(Textarea::new(edit_input).appearance(false).bordered(false))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new(SharedString::from(format!("{key}-edit-cancel")))
+                            .outline()
+                            .with_size(Size::XSmall)
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_edit(cx))),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("{key}-edit-save")))
+                            .primary()
+                            .with_size(Size::XSmall)
+                            .label("Save Changes")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_edit(cx))),
+                    ),
+            )
+            .into_any_element();
     }
 
     let is_saved = saved_set.contains(&msg.ts);

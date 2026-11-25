@@ -621,14 +621,12 @@ impl Composer {
                             composer.stop_and_attach_clip(cx);
                             return false;
                         }
-                        if let ActiveClipRecorder::Video { recorder, .. } = active {
-                            if let Some(vf) = recorder.latest_preview() {
-                                if let Some(img) = crate::huddle_dock::frame_into_render_image(vf) {
-                                    if let Some(old) = composer.clip_preview.replace(img) {
-                                        cx.drop_image(old, None);
-                                    }
-                                }
-                            }
+                        if let ActiveClipRecorder::Video { recorder, .. } = active
+                            && let Some(vf) = recorder.latest_preview()
+                            && let Some(img) = crate::huddle_dock::frame_into_render_image(vf)
+                            && let Some(old) = composer.clip_preview.replace(img)
+                        {
+                            cx.drop_image(old, None);
                         }
                         cx.notify();
                         true
@@ -743,14 +741,13 @@ impl Composer {
         if self.edit_mode {
             return;
         }
-        if let Some(old) = self.pending_gif.replace(gif) {
-            if self
+        if let Some(old) = self.pending_gif.replace(gif)
+            && self
                 .pending_gif
                 .as_ref()
                 .is_none_or(|cur| cur.preview_url != old.preview_url)
-            {
-                self.stale_gif_urls.push(old.preview_url);
-            }
+        {
+            self.stale_gif_urls.push(old.preview_url);
         }
         self.was_focused = true;
         self.focus_input(window, cx);
@@ -1025,11 +1022,11 @@ impl Composer {
                             .and_then(|n| n.to_str())
                             .unwrap_or("file")
                             .to_owned();
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            if meta.len() > MAX_UPLOAD_BYTES {
-                                too_big.push(filename);
-                                continue;
-                            }
+                        if let Ok(meta) = std::fs::metadata(&path)
+                            && meta.len() > MAX_UPLOAD_BYTES
+                        {
+                            too_big.push(filename);
+                            continue;
                         }
                         let Ok(bytes) = std::fs::read(&path) else {
                             continue;
@@ -1125,18 +1122,18 @@ impl Composer {
             cx.notify();
             return;
         }
-        if !self.edit_mode {
-            if let Some(gif) = self.pending_gif.take() {
-                let doc = self.take(window, cx);
-                let mut msg = match doc {
-                    Some(doc) => content(&doc),
-                    None => MessageContent::default(),
-                };
-                msg.attachments.push(gif.to_attachment());
-                cx.emit(ComposerEvent::Submit(msg));
-                cx.notify();
-                return;
-            }
+        if !self.edit_mode
+            && let Some(gif) = self.pending_gif.take()
+        {
+            let doc = self.take(window, cx);
+            let mut msg = match doc {
+                Some(doc) => content(&doc),
+                None => MessageContent::default(),
+            };
+            msg.attachments.push(gif.to_attachment());
+            cx.emit(ComposerEvent::Submit(msg));
+            cx.notify();
+            return;
         }
         let Some(doc) = self.take(window, cx) else {
             return;

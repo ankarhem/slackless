@@ -119,10 +119,10 @@ impl PopoutWindow {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         (send_mute)(Command::SetHuddleMuted(next_muted));
-                        if this.fixtures.sample {
-                            if let Some(dock) = this.huddle_dock_entity() {
-                                dock.update(cx, |d, cx| d.set_muted_local(next_muted, cx));
-                            }
+                        if this.fixtures.sample
+                            && let Some(dock) = this.huddle_dock_entity()
+                        {
+                            dock.update(cx, |d, cx| d.set_muted_local(next_muted, cx));
                         }
                     })),
             )
@@ -206,10 +206,10 @@ impl PopoutWindow {
                             device_index: selected_cam_idx,
                             blur: blur_now,
                         });
-                        if this.fixtures.sample {
-                            if let Some(dock) = this.huddle_dock_entity() {
-                                dock.update(cx, |d, cx| d.set_camera_local(next_cam, cx));
-                            }
+                        if this.fixtures.sample
+                            && let Some(dock) = this.huddle_dock_entity()
+                        {
+                            dock.update(cx, |d, cx| d.set_camera_local(next_cam, cx));
                         }
                     })),
             )
@@ -352,19 +352,19 @@ impl PopoutWindow {
             )
             .on_click(cx.listener(move |this, _, _, cx| {
                 (send_hand)(Command::SetHuddleHandRaised(next_hand));
-                if this.fixtures.sample {
-                    if let Some(dock) = this.huddle_dock_entity() {
-                        let me = this.fixtures.self_user.clone();
-                        dock.update(cx, |d, cx| {
-                            d.apply_data_event(
-                                &slackless_core::huddle::HuddleDataEvent::HandRaise {
-                                    user: me,
-                                    raised: next_hand,
-                                },
-                                cx,
-                            );
-                        });
-                    }
+                if this.fixtures.sample
+                    && let Some(dock) = this.huddle_dock_entity()
+                {
+                    let me = this.fixtures.self_user.clone();
+                    dock.update(cx, |d, cx| {
+                        d.apply_data_event(
+                            &slackless_core::huddle::HuddleDataEvent::HandRaise {
+                                user: me,
+                                raised: next_hand,
+                            },
+                            cx,
+                        );
+                    });
                 }
             }));
 

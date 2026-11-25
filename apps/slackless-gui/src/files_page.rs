@@ -355,10 +355,10 @@ impl FilesPage {
     ) {
         self.favorites = favorites.into_iter().collect();
         self.collections = collections;
-        if let Some(active) = &self.active_collection {
-            if !self.collections.iter().any(|c| &c.id == active) {
-                self.active_collection = None;
-            }
+        if let Some(active) = &self.active_collection
+            && !self.collections.iter().any(|c| &c.id == active)
+        {
+            self.active_collection = None;
         }
         self.deleted = deleted;
         self.refilter();

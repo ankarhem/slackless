@@ -121,10 +121,10 @@ impl SearchQuery {
                 continue;
             }
             if !quoted {
-                if let Some((key, value)) = token.split_once(':') {
-                    if query.filters.apply(key, value) {
-                        continue;
-                    }
+                if let Some((key, value)) = token.split_once(':')
+                    && query.filters.apply(key, value)
+                {
+                    continue;
                 }
                 if let Some(excluded) = token.strip_prefix('-').filter(|t| !t.is_empty()) {
                     query.excluded_terms.push(excluded.to_owned());

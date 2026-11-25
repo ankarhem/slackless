@@ -2107,74 +2107,72 @@ impl App {
                         this.activate_tab(action.clone(), cx);
                     })),
                 };
-                if !sample {
-                    if let Some(tid) = tab_id {
-                        let prev_after = if ix >= 2 {
-                            tab_ids.get(ix - 2).cloned().flatten()
-                        } else {
-                            None
-                        };
-                        let can_left = ix > 1 && tab_ids.get(ix - 1).is_some_and(Option::is_some);
-                        let next_after = tab_ids.get(ix + 1).cloned().flatten();
-                        let ch_menu = ch_for_tabs.clone();
-                        let app_menu = this_for_tabs.clone();
-                        return clickable
-                            .context_menu(move |mut menu, _, _| {
-                                if can_left {
-                                    let ch = ch_menu.clone();
-                                    let tid = tid.clone();
-                                    let after = prev_after.clone();
-                                    let app = app_menu.clone();
-                                    menu = menu.item(
-                                        PopupMenuItem::new("Move left")
-                                            .icon(IconName::ArrowLeft)
-                                            .on_click(move |_, _, cx| {
-                                                let _ = app.update(cx, |app, _| {
-                                                    app.bridge.send(Command::MoveConversationTab {
-                                                        channel: ch.clone(),
-                                                        tab_id: tid.clone(),
-                                                        after: after.clone(),
-                                                    });
-                                                });
-                                            }),
-                                    );
-                                }
-                                if let Some(after) = next_after.clone() {
-                                    let ch = ch_menu.clone();
-                                    let tid = tid.clone();
-                                    let app = app_menu.clone();
-                                    menu = menu.item(
-                                        PopupMenuItem::new("Move right")
-                                            .icon(IconName::ArrowRight)
-                                            .on_click(move |_, _, cx| {
-                                                let _ = app.update(cx, |app, _| {
-                                                    app.bridge.send(Command::MoveConversationTab {
-                                                        channel: ch.clone(),
-                                                        tab_id: tid.clone(),
-                                                        after: Some(after.clone()),
-                                                    });
-                                                });
-                                            }),
-                                    );
-                                }
+                if !sample && let Some(tid) = tab_id {
+                    let prev_after = if ix >= 2 {
+                        tab_ids.get(ix - 2).cloned().flatten()
+                    } else {
+                        None
+                    };
+                    let can_left = ix > 1 && tab_ids.get(ix - 1).is_some_and(Option::is_some);
+                    let next_after = tab_ids.get(ix + 1).cloned().flatten();
+                    let ch_menu = ch_for_tabs.clone();
+                    let app_menu = this_for_tabs.clone();
+                    return clickable
+                        .context_menu(move |mut menu, _, _| {
+                            if can_left {
                                 let ch = ch_menu.clone();
                                 let tid = tid.clone();
+                                let after = prev_after.clone();
                                 let app = app_menu.clone();
-                                menu.item(
-                                    PopupMenuItem::new("Remove tab")
-                                        .icon(IconName::Trash)
+                                menu = menu.item(
+                                    PopupMenuItem::new("Move left")
+                                        .icon(IconName::ArrowLeft)
                                         .on_click(move |_, _, cx| {
                                             let _ = app.update(cx, |app, _| {
-                                                app.bridge.send(Command::RemoveConversationTab {
+                                                app.bridge.send(Command::MoveConversationTab {
                                                     channel: ch.clone(),
                                                     tab_id: tid.clone(),
+                                                    after: after.clone(),
                                                 });
                                             });
                                         }),
-                                )
-                            })
-                            .into_any_element();
-                    }
+                                );
+                            }
+                            if let Some(after) = next_after.clone() {
+                                let ch = ch_menu.clone();
+                                let tid = tid.clone();
+                                let app = app_menu.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new("Move right")
+                                        .icon(IconName::ArrowRight)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = app.update(cx, |app, _| {
+                                                app.bridge.send(Command::MoveConversationTab {
+                                                    channel: ch.clone(),
+                                                    tab_id: tid.clone(),
+                                                    after: Some(after.clone()),
+                                                });
+                                            });
+                                        }),
+                                );
+                            }
+                            let ch = ch_menu.clone();
+                            let tid = tid.clone();
+                            let app = app_menu.clone();
+                            menu.item(
+                                PopupMenuItem::new("Remove tab")
+                                    .icon(IconName::Trash)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = app.update(cx, |app, _| {
+                                            app.bridge.send(Command::RemoveConversationTab {
+                                                channel: ch.clone(),
+                                                tab_id: tid.clone(),
+                                            });
+                                        });
+                                    }),
+                            )
+                        })
+                        .into_any_element();
                 }
                 clickable.into_any_element()
             }))

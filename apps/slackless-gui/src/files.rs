@@ -659,37 +659,37 @@ fn clip_transcript_section(file: &File, cx: &App) -> Option<Div> {
                             entry.error = None;
                         }
                         window.refresh();
-                        if should_fetch {
-                            if let (Some(url), Some(fut)) = (
+                        if should_fetch
+                            && let (Some(url), Some(fut)) = (
                                 click_vtt.clone(),
                                 click_vtt.clone().and_then(|u| crate::media::fetch(u, cx)),
-                            ) {
-                                let _ = url;
-                                let fid = click_id.clone();
-                                let win = window.window_handle();
-                                cx.spawn(async move |cx| {
-                                    let res = fut.await;
-                                    cx.update(|cx| {
-                                        let store = cx.default_global::<ClipTranscriptStore>();
-                                        let entry = store.entries.entry(fid).or_default();
-                                        entry.loading = false;
-                                        match res {
-                                            Ok(bytes) => {
-                                                let raw = String::from_utf8_lossy(&bytes);
-                                                let parsed = parse_webvtt(&raw);
-                                                entry.text = Some(if parsed.is_empty() {
-                                                    raw.trim().to_owned()
-                                                } else {
-                                                    parsed
-                                                });
-                                            }
-                                            Err(err) => entry.error = Some(err),
+                            )
+                        {
+                            let _ = url;
+                            let fid = click_id.clone();
+                            let win = window.window_handle();
+                            cx.spawn(async move |cx| {
+                                let res = fut.await;
+                                cx.update(|cx| {
+                                    let store = cx.default_global::<ClipTranscriptStore>();
+                                    let entry = store.entries.entry(fid).or_default();
+                                    entry.loading = false;
+                                    match res {
+                                        Ok(bytes) => {
+                                            let raw = String::from_utf8_lossy(&bytes);
+                                            let parsed = parse_webvtt(&raw);
+                                            entry.text = Some(if parsed.is_empty() {
+                                                raw.trim().to_owned()
+                                            } else {
+                                                parsed
+                                            });
                                         }
-                                        let _ = win.update(cx, |_, window, _| window.refresh());
-                                    });
-                                })
-                                .detach();
-                            }
+                                        Err(err) => entry.error = Some(err),
+                                    }
+                                    let _ = win.update(cx, |_, window, _| window.refresh());
+                                });
+                            })
+                            .detach();
                         }
                     }),
             )
@@ -1216,45 +1216,43 @@ impl RenderOnce for SnippetCard {
             .child(if copied { "Copied" } else { "Copy" })
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| {
-                if needs_copy_fetch {
-                    if let Some(fut) = copy_fetch_url
+                if needs_copy_fetch
+                    && let Some(fut) = copy_fetch_url
                         .clone()
                         .and_then(|url| crate::media::fetch(url, cx))
-                    {
-                        let fid = copy_file_id.clone();
-                        let fallback = fallback_copy.clone();
-                        window
-                            .spawn(cx, async move |cx| {
-                                let res = fut.await;
-                                let _ = cx.update(|window, cx| {
-                                    let text = match res {
-                                        Ok(bytes) => {
-                                            let decoded =
-                                                String::from_utf8_lossy(&bytes).into_owned();
-                                            let entry = cx
-                                                .default_global::<SnippetStore>()
-                                                .entries
-                                                .entry(fid.clone())
-                                                .or_default();
-                                            entry.full_text = Some(decoded.clone());
-                                            entry.loading = false;
-                                            entry.error = None;
-                                            decoded
-                                        }
-                                        Err(_) => fallback,
-                                    };
-                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                    cx.default_global::<SnippetStore>()
-                                        .entries
-                                        .entry(fid)
-                                        .or_default()
-                                        .copied = true;
-                                    window.refresh();
-                                });
-                            })
-                            .detach();
-                        return;
-                    }
+                {
+                    let fid = copy_file_id.clone();
+                    let fallback = fallback_copy.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            let res = fut.await;
+                            let _ = cx.update(|window, cx| {
+                                let text = match res {
+                                    Ok(bytes) => {
+                                        let decoded = String::from_utf8_lossy(&bytes).into_owned();
+                                        let entry = cx
+                                            .default_global::<SnippetStore>()
+                                            .entries
+                                            .entry(fid.clone())
+                                            .or_default();
+                                        entry.full_text = Some(decoded.clone());
+                                        entry.loading = false;
+                                        entry.error = None;
+                                        decoded
+                                    }
+                                    Err(_) => fallback,
+                                };
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                cx.default_global::<SnippetStore>()
+                                    .entries
+                                    .entry(fid)
+                                    .or_default()
+                                    .copied = true;
+                                window.refresh();
+                            });
+                        })
+                        .detach();
+                    return;
                 }
                 cx.write_to_clipboard(ClipboardItem::new_string(fallback_copy.clone()));
                 cx.default_global::<SnippetStore>()
@@ -1385,11 +1383,9 @@ impl RenderOnce for SnippetCard {
                     .text_color(muted)
                     .child("Loading full snippet\u{2026}"),
             );
-        } else if expanded {
-            if let Some(err) = error.as_ref() {
-                code_body =
-                    code_body.child(div().pt_1().text_xs().text_color(muted).child(err.clone()));
-            }
+        } else if expanded && let Some(err) = error.as_ref() {
+            code_body =
+                code_body.child(div().pt_1().text_xs().text_color(muted).child(err.clone()));
         }
         let truncation_notice = if expanded && !loading && omitted_lines > 0 {
             Some(

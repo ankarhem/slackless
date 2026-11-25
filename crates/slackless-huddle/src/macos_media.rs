@@ -1168,10 +1168,10 @@ pub fn set_desktop_draw_pen_mode(
 
 /// Immediately hide and clear the click-through desktop drawing overlay.
 pub fn hide_desktop_draw_overlay() {
-    if let Some(slot) = OVERLAY_MOUSE_HANDLER.get() {
-        if let Ok(mut g) = slot.lock() {
-            *g = None;
-        }
+    if let Some(slot) = OVERLAY_MOUSE_HANDLER.get()
+        && let Ok(mut g) = slot.lock()
+    {
+        *g = None;
     }
     unsafe { slackless_draw_overlay_hide() };
 }

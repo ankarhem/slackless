@@ -63,12 +63,11 @@ impl Editor {
             }
             // Toggle off an armed empty pair directly around the caret (`*|*`, `**|**`, etc.).
             if let Some((pair_range, pair_style)) = empty_pair_at(self.now.doc.text(), line, caret)
+                && pair_style == style
             {
-                if pair_style == style {
-                    self.history.checkpoint(&self.now);
-                    self.replace(pair_range, "");
-                    return;
-                }
+                self.history.checkpoint(&self.now);
+                self.replace(pair_range, "");
+                return;
             }
             // If caret is inside an existing matching construct, step out if at the end or
             // unwrap the construct.

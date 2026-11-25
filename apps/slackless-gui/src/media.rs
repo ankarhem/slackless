@@ -312,20 +312,20 @@ pub fn download_as(url: String, name: String, window: &mut Window, cx: &mut App)
                 let reg = cx.default_global::<DownloadRegistry>();
                 match saved {
                     Ok((path, len)) => {
-                        if let Some(id) = id {
-                            if let Some(item) = reg.items.iter_mut().find(|i| i.id == id) {
-                                item.bytes = Some(len);
-                                item.status = DownloadStatus::Completed(path.clone());
-                            }
+                        if let Some(id) = id
+                            && let Some(item) = reg.items.iter_mut().find(|i| i.id == id)
+                        {
+                            item.bytes = Some(len);
+                            item.status = DownloadStatus::Completed(path.clone());
                         }
                         let file = path.file_name().unwrap_or_default().to_string_lossy();
                         crate::actions::notify("Saved", file.into_owned(), window, cx);
                     }
                     Err(e) => {
-                        if let Some(id) = id {
-                            if let Some(item) = reg.items.iter_mut().find(|i| i.id == id) {
-                                item.status = DownloadStatus::Failed(e.clone());
-                            }
+                        if let Some(id) = id
+                            && let Some(item) = reg.items.iter_mut().find(|i| i.id == id)
+                        {
+                            item.status = DownloadStatus::Failed(e.clone());
                         }
                         crate::actions::notify("Save failed", e, window, cx);
                     }
@@ -365,11 +365,11 @@ struct MediaPlayer {
 
 impl Drop for MediaPlayer {
     fn drop(&mut self) {
-        if let Some(active) = self.audio.as_mut() {
-            if let Some(child) = active.child.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Some(active) = self.audio.as_mut()
+            && let Some(child) = active.child.as_mut()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -414,7 +414,7 @@ pub fn toggle_pause_audio(file_id: &str, window: &mut Window, cx: &mut App) {
     };
     #[cfg(unix)]
     {
-        extern "C" {
+        unsafe extern "C" {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         #[cfg(any(
@@ -482,11 +482,11 @@ pub fn video_loading(file_id: &str, cx: &App) -> bool {
 }
 
 fn stop_active_audio(player: &mut MediaPlayer) {
-    if let Some(mut active) = player.audio.take() {
-        if let Some(mut child) = active.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+    if let Some(mut active) = player.audio.take()
+        && let Some(mut child) = active.child.take()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

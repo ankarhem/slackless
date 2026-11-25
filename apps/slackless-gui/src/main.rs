@@ -143,19 +143,18 @@ fn main() {
             })
             .collect();
         // Restore persisted workspace rail order (`F-CORE-003`) if present.
-        if live_bridges.len() > 1 {
-            if let Some(order) = live_bridges
+        if live_bridges.len() > 1
+            && let Some(order) = live_bridges
                 .iter()
                 .find_map(|(_, b)| b.workspace_order())
                 .filter(|o| !o.is_empty())
-            {
-                live_bridges.sort_by_key(|(team, _)| {
-                    order
-                        .iter()
-                        .position(|wanted| wanted == team.id.as_str())
-                        .unwrap_or(usize::MAX)
-                });
-            }
+        {
+            live_bridges.sort_by_key(|(team, _)| {
+                order
+                    .iter()
+                    .position(|wanted| wanted == team.id.as_str())
+                    .unwrap_or(usize::MAX)
+            });
         }
         let (fixtures, bridges) = if !live_bridges.is_empty() {
             let teams: Vec<_> = live_bridges.iter().map(|(team, _)| team.clone()).collect();

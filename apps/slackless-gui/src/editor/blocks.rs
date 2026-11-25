@@ -99,12 +99,11 @@ impl Editor {
                     }
                 }
             }
-            if pair.is_none() {
-                if let Some(open) = open_fence {
-                    if first_ix >= open {
-                        pair = Some((open, None));
-                    }
-                }
+            if pair.is_none()
+                && let Some(open) = open_fence
+                && first_ix >= open
+            {
+                pair = Some((open, None));
             }
             if let Some((open_ix, close_ix)) = pair {
                 self.history.checkpoint(&self.now);
@@ -298,16 +297,16 @@ impl Editor {
                 continue;
             }
             let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
-            if digits > 0 && raw[digits..].starts_with(". ") {
-                if let Ok(existing) = raw[..digits].parse::<u32>() {
-                    if number > 0 || existing == 1 {
-                        number += 1;
-                        if existing != number {
-                            updates.push((start..start + digits + 2, format!("{number}. ")));
-                        }
-                        continue;
-                    }
+            if digits > 0
+                && raw[digits..].starts_with(". ")
+                && let Ok(existing) = raw[..digits].parse::<u32>()
+                && (number > 0 || existing == 1)
+            {
+                number += 1;
+                if existing != number {
+                    updates.push((start..start + digits + 2, format!("{number}. ")));
                 }
+                continue;
             }
             number = 0;
         }

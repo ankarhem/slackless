@@ -1143,14 +1143,13 @@ impl Preferences {
                         }
                         if let Some(probe) = &prefs.camera_probe {
                             probe.set_blur(prefs.settings.huddle_blur_background);
-                            if let Some(frame) = probe.latest_frame() {
-                                if let Some(img) = crate::huddle_dock::frame_to_render_image(&frame)
-                                {
-                                    if let Some(old) = prefs.camera_frame.replace(img) {
-                                        cx.drop_image(old, None);
-                                    }
-                                    cx.notify();
+                            if let Some(frame) = probe.latest_frame()
+                                && let Some(img) = crate::huddle_dock::frame_to_render_image(&frame)
+                            {
+                                if let Some(old) = prefs.camera_frame.replace(img) {
+                                    cx.drop_image(old, None);
                                 }
+                                cx.notify();
                             }
                             true
                         } else {

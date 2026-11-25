@@ -237,10 +237,10 @@ impl App {
                 }
                 set.extend(c.members.iter().cloned());
             }
-            if let Some((open_ch, members)) = &self.open_members {
-                if *open_ch == channel {
-                    set.extend(members.iter().cloned());
-                }
+            if let Some((open_ch, members)) = &self.open_members
+                && *open_ch == channel
+            {
+                set.extend(members.iter().cloned());
             }
             set
         } else {

@@ -205,23 +205,21 @@ pub fn decode_slack_peer_message(
     };
     let mut out = Vec::new();
 
-    if let Some(reacji) = msg.reacji {
-        if let Some(emoji) = reacji.emoji.filter(|e| !e.is_empty()) {
-            let kind = match reacji.r#type {
-                Some(x) if x == peer_message::reacji::Type::Effect as i32 => {
-                    HuddleReactionKind::Effect
-                }
-                Some(x) if x == peer_message::reacji::Type::Gif as i32 => HuddleReactionKind::Gif,
-                _ => HuddleReactionKind::Standard,
-            };
-            out.push(HuddleDataEvent::Reaction {
-                user: sender.clone(),
-                emoji,
-                kind,
-                emoji_url: reacji.emoji_url.filter(|u| !u.is_empty()),
-                at_ms: now_ms,
-            });
-        }
+    if let Some(reacji) = msg.reacji
+        && let Some(emoji) = reacji.emoji.filter(|e| !e.is_empty())
+    {
+        let kind = match reacji.r#type {
+            Some(x) if x == peer_message::reacji::Type::Effect as i32 => HuddleReactionKind::Effect,
+            Some(x) if x == peer_message::reacji::Type::Gif as i32 => HuddleReactionKind::Gif,
+            _ => HuddleReactionKind::Standard,
+        };
+        out.push(HuddleDataEvent::Reaction {
+            user: sender.clone(),
+            emoji,
+            kind,
+            emoji_url: reacji.emoji_url.filter(|u| !u.is_empty()),
+            at_ms: now_ms,
+        });
     }
 
     if let Some(draw) = msg.draw {
@@ -317,12 +315,12 @@ pub fn decode_slack_peer_message(
         });
     }
 
-    if let Some(mute) = msg.mute_request {
-        if mute.peer_id.as_deref() == Some(self_attendee_id) {
-            out.push(HuddleDataEvent::MutedByPeer {
-                actor: sender.clone(),
-            });
-        }
+    if let Some(mute) = msg.mute_request
+        && mute.peer_id.as_deref() == Some(self_attendee_id)
+    {
+        out.push(HuddleDataEvent::MutedByPeer {
+            actor: sender.clone(),
+        });
     }
 
     out

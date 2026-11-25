@@ -1267,8 +1267,8 @@ impl App {
                         }
                         NewMessageEvent::OpenDm { users, content } => {
                             // If one person was picked and an IM already exists, deliver directly.
-                            if let [user] = users.as_slice() {
-                                if let Some(dm) = this
+                            if let [user] = users.as_slice()
+                                && let Some(dm) = this
                                     .fixtures
                                     .dms
                                     .iter()
@@ -1277,12 +1277,11 @@ impl App {
                                             && dm.user.as_ref() == Some(user)
                                     })
                                     .map(|dm| dm.id.clone())
-                                {
-                                    this.compose_open = false;
-                                    this.select(dm, cx);
-                                    this.send(content.clone(), window, cx);
-                                    return;
-                                }
+                            {
+                                this.compose_open = false;
+                                this.select(dm, cx);
+                                this.send(content.clone(), window, cx);
+                                return;
                             }
                             if this.bridge.store().is_some() {
                                 this.pending_dm = Some(content.clone());
@@ -1509,10 +1508,10 @@ impl App {
             let _ = notif_window.update(cx, |_, window, cx| {
                 window.activate_window();
                 let _ = notif_app.update(cx, |app, cx| {
-                    if let Some(ws_ix) = ws_opt {
-                        if ws_ix != app.workspace {
-                            app.switch_workspace(ws_ix, window, cx);
-                        }
+                    if let Some(ws_ix) = ws_opt
+                        && ws_ix != app.workspace
+                    {
+                        app.switch_workspace(ws_ix, window, cx);
                     }
                     app.select(channel, cx);
                     app.messages.update(cx, |list, cx| list.reveal(&ts, cx));
@@ -1708,10 +1707,8 @@ impl App {
                 });
                 let allow_mark =
                     mark_read_mode != 2 && (!settings.no_bg_mark_read || app.window_active);
-                if allow_mark {
-                    if let Some(newest) = newest {
-                        app.mark_read(&channel, newest, cx);
-                    }
+                if allow_mark && let Some(newest) = newest {
+                    app.mark_read(&channel, newest, cx);
                 }
             } else {
                 app.load_history(&channel, cx);

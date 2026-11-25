@@ -43,17 +43,17 @@ impl SlackApi {
             }
         };
 
-        if columns.is_empty() {
-            if let Some(list_obj) = records_val.get("list") {
-                let (t, d, cols) = parse_list_schema(list_obj);
-                if !t.is_empty() {
-                    title = t;
-                }
-                if !d.is_empty() {
-                    description = d;
-                }
-                columns = cols;
+        if columns.is_empty()
+            && let Some(list_obj) = records_val.get("list")
+        {
+            let (t, d, cols) = parse_list_schema(list_obj);
+            if !t.is_empty() {
+                title = t;
             }
+            if !d.is_empty() {
+                description = d;
+            }
+            columns = cols;
         }
 
         let raw_records = records_val

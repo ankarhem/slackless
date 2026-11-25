@@ -257,10 +257,10 @@ impl H264VideoDecoder {
     /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit).
     pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<VideoFrame> {
         let raw = bytes::Bytes::copy_from_slice(payload);
-        if let Ok(nal) = self.depacketizer.depacketize(&raw) {
-            if !nal.is_empty() {
-                self.annex_b_buf.extend_from_slice(&nal);
-            }
+        if let Ok(nal) = self.depacketizer.depacketize(&raw)
+            && !nal.is_empty()
+        {
+            self.annex_b_buf.extend_from_slice(&nal);
         }
         if !marker || self.annex_b_buf.is_empty() {
             return None;
@@ -678,18 +678,18 @@ impl CameraPreviewProbe {
                     }
                 };
                 while run_flag.load(Ordering::Relaxed) {
-                    if let Ok(frame) = cam.frame() {
-                        if let Ok(img) = frame.decode_image::<RgbFormat>() {
-                            let (mut rgb, w, h) =
-                                resize_rgb_even(img.as_raw(), img.width(), img.height(), 320, 180);
-                            if w >= 2 && h >= 2 {
-                                if blur_flag.load(Ordering::Relaxed) {
-                                    apply_portrait_blur(&mut rgb, w as usize, h as usize);
-                                }
-                                let vf = VideoFrame::from_bgra(w, h, rgb_to_bgra(&rgb));
-                                if let Ok(mut guard) = latest_cb.lock() {
-                                    *guard = Some(vf);
-                                }
+                    if let Ok(frame) = cam.frame()
+                        && let Ok(img) = frame.decode_image::<RgbFormat>()
+                    {
+                        let (mut rgb, w, h) =
+                            resize_rgb_even(img.as_raw(), img.width(), img.height(), 320, 180);
+                        if w >= 2 && h >= 2 {
+                            if blur_flag.load(Ordering::Relaxed) {
+                                apply_portrait_blur(&mut rgb, w as usize, h as usize);
+                            }
+                            let vf = VideoFrame::from_bgra(w, h, rgb_to_bgra(&rgb));
+                            if let Ok(mut guard) = latest_cb.lock() {
+                                *guard = Some(vf);
                             }
                         }
                     }

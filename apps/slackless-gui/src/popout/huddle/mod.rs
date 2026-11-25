@@ -290,10 +290,10 @@ impl PopoutWindow {
                     return;
                 }
                 for (id, frame) in frames {
-                    if let Some(img) = crate::huddle_dock::frame_to_render_image(&frame) {
-                        if let Some(old) = win.huddle_screen_thumbs.insert(id, img) {
-                            cx.drop_image(old, None);
-                        }
+                    if let Some(img) = crate::huddle_dock::frame_to_render_image(&frame)
+                        && let Some(old) = win.huddle_screen_thumbs.insert(id, img)
+                    {
+                        cx.drop_image(old, None);
                     }
                 }
                 cx.notify();
@@ -308,10 +308,10 @@ impl PopoutWindow {
             source_id: Some(source_id.clone()),
             share_audio,
         });
-        if self.fixtures.sample {
-            if let Some(dock) = self.huddle_dock_entity() {
-                dock.update(cx, |d, cx| d.set_sharing_local(Some(source_id), cx));
-            }
+        if self.fixtures.sample
+            && let Some(dock) = self.huddle_dock_entity()
+        {
+            dock.update(cx, |d, cx| d.set_sharing_local(Some(source_id), cx));
         }
         self.close_share_modal(cx);
         cx.notify();
@@ -510,10 +510,10 @@ impl PopoutWindow {
                             .child("Resume video")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 (send_resume)(Command::SetHuddleAudioOnly(false));
-                                if this.fixtures.sample {
-                                    if let Some(dock) = this.huddle_dock_entity() {
-                                        dock.update(cx, |d, cx| d.set_audio_only_local(false, cx));
-                                    }
+                                if this.fixtures.sample
+                                    && let Some(dock) = this.huddle_dock_entity()
+                                {
+                                    dock.update(cx, |d, cx| d.set_audio_only_local(false, cx));
                                 }
                             })),
                     ),

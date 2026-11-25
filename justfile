@@ -6,7 +6,7 @@ default:
 
 # Run all checks: formatting, clippy, workspace tests, and workspace build
 validate:
-    cargo fmt --all -- --check --config style_edition=2024
+    cargo fmt --all -- --check
     cargo clippy --workspace -- -D warnings
     cargo clippy --workspace --tests -- -D warnings
     cargo test --workspace

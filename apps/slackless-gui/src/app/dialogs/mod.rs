@@ -57,10 +57,10 @@ impl App {
                 cx,
             );
         }
-        if crate::zoom::set_level(settings.zoom, cx) {
-            if let Some(write) = self.bridge.remember_zoom(settings.zoom) {
-                cx.background_executor().spawn(write).detach();
-            }
+        if crate::zoom::set_level(settings.zoom, cx)
+            && let Some(write) = self.bridge.remember_zoom(settings.zoom)
+        {
+            cx.background_executor().spawn(write).detach();
         }
         if theme::font(cx) != settings.font {
             theme::set_font(settings.font, cx);
@@ -132,241 +132,241 @@ impl App {
         self.activity.update(cx, |activity, cx| {
             activity.set_vip_users(vip_users, cx);
         });
-        if let Some(prev) = self.saved_settings.as_ref() {
-            if *prev != settings {
-                // Cloud pref write-back (`users.prefs.set`) for display, emoji, and notification prefs.
-                if !self.fixtures.sample {
-                    let sync_pref = |name: &str, value: String| {
-                        self.bridge.send(Command::SetUserPref {
-                            name: name.to_owned(),
-                            value,
-                        });
-                    };
-                    if prev.clock_24h != settings.clock_24h {
-                        sync_pref("time24", settings.clock_24h.to_string());
-                    }
-                    if prev.names != settings.names {
-                        sync_pref("display_real_names", (settings.names == 0).to_string());
-                    }
-                    if prev.jumbomoji != settings.jumbomoji {
-                        sync_pref("jumbomoji", settings.jumbomoji.to_string());
-                    }
-                    if prev.convert_emoticons != settings.convert_emoticons {
-                        sync_pref("convert_emoticons", settings.convert_emoticons.to_string());
-                    }
-                    if prev.emoji_text_mode != settings.emoji_text_mode {
-                        sync_pref("emoji_only_text", settings.emoji_text_mode.to_string());
-                    }
-                    if prev.show_quick_reactions != settings.show_quick_reactions {
-                        sync_pref(
-                            "show_quick_reactions",
-                            settings.show_quick_reactions.to_string(),
-                        );
-                    }
-                    if prev.quick_reaction_emojis != settings.quick_reaction_emojis {
-                        let resolved = settings.resolved_quick_reactions();
-                        let defaults: Vec<&str> = crate::actions::DEFAULT_QUICK_REACTIONS.to_vec();
-                        let is_default = resolved.len() == defaults.len()
-                            && resolved.iter().zip(defaults.iter()).all(|(a, b)| a == b);
-                        sync_pref(
-                            "user_customized_quick_reactions_has_customized",
-                            (!is_default).to_string(),
-                        );
-                        for (ix, key) in [
-                            "user_customized_quick_reactions_emoji_1",
-                            "user_customized_quick_reactions_emoji_2",
-                            "user_customized_quick_reactions_emoji_3",
-                        ]
-                        .iter()
-                        .enumerate()
-                        {
-                            let val = settings.quick_reaction_emojis[ix]
-                                .trim()
-                                .trim_matches(':')
-                                .to_owned();
-                            if !val.is_empty() {
-                                sync_pref(key, val);
-                            }
-                        }
-                    }
-                    if prev.underline_links != settings.underline_links {
-                        sync_pref("underline_links", settings.underline_links.to_string());
-                    }
-                    if prev.density != settings.density {
-                        sync_pref(
-                            "messages_theme",
-                            if settings.density == 1 {
-                                "compact"
-                            } else {
-                                "default"
-                            }
-                            .to_owned(),
-                        );
-                    }
-                    if prev.skin_tone != settings.skin_tone {
-                        sync_pref(
-                            "preferred_skin_tone",
-                            format!("skin-tone-{}", settings.skin_tone + 1),
-                        );
-                    }
-                    let sync_global_notif = |name: &str, value: String, sync: bool| {
-                        self.bridge.send(Command::SetGlobalNotificationPref {
-                            name: name.to_owned(),
-                            value,
-                            sync,
-                        });
-                    };
-                    if prev.notify_level != settings.notify_level
-                        || prev.mobile_different != settings.mobile_different
+        if let Some(prev) = self.saved_settings.as_ref()
+            && *prev != settings
+        {
+            // Cloud pref write-back (`users.prefs.set`) for display, emoji, and notification prefs.
+            if !self.fixtures.sample {
+                let sync_pref = |name: &str, value: String| {
+                    self.bridge.send(Command::SetUserPref {
+                        name: name.to_owned(),
+                        value,
+                    });
+                };
+                if prev.clock_24h != settings.clock_24h {
+                    sync_pref("time24", settings.clock_24h.to_string());
+                }
+                if prev.names != settings.names {
+                    sync_pref("display_real_names", (settings.names == 0).to_string());
+                }
+                if prev.jumbomoji != settings.jumbomoji {
+                    sync_pref("jumbomoji", settings.jumbomoji.to_string());
+                }
+                if prev.convert_emoticons != settings.convert_emoticons {
+                    sync_pref("convert_emoticons", settings.convert_emoticons.to_string());
+                }
+                if prev.emoji_text_mode != settings.emoji_text_mode {
+                    sync_pref("emoji_only_text", settings.emoji_text_mode.to_string());
+                }
+                if prev.show_quick_reactions != settings.show_quick_reactions {
+                    sync_pref(
+                        "show_quick_reactions",
+                        settings.show_quick_reactions.to_string(),
+                    );
+                }
+                if prev.quick_reaction_emojis != settings.quick_reaction_emojis {
+                    let resolved = settings.resolved_quick_reactions();
+                    let defaults: Vec<&str> = crate::actions::DEFAULT_QUICK_REACTIONS.to_vec();
+                    let is_default = resolved.len() == defaults.len()
+                        && resolved.iter().zip(defaults.iter()).all(|(a, b)| a == b);
+                    sync_pref(
+                        "user_customized_quick_reactions_has_customized",
+                        (!is_default).to_string(),
+                    );
+                    for (ix, key) in [
+                        "user_customized_quick_reactions_emoji_1",
+                        "user_customized_quick_reactions_emoji_2",
+                        "user_customized_quick_reactions_emoji_3",
+                    ]
+                    .iter()
+                    .enumerate()
                     {
-                        sync_global_notif(
-                            "global_desktop",
-                            settings.notify_level_wire().to_owned(),
-                            !settings.mobile_different,
-                        );
-                    }
-                    if settings.mobile_different
-                        && (prev.mobile_notify_level != settings.mobile_notify_level
-                            || !prev.mobile_different)
-                    {
-                        sync_global_notif(
-                            "global_mobile",
-                            settings.mobile_notify_level_wire().to_owned(),
-                            false,
-                        );
-                    }
-                    if prev.thread_replies != settings.thread_replies {
-                        sync_global_notif(
-                            "threads_everything",
-                            settings.thread_replies.to_string(),
-                            false,
-                        );
-                    }
-                    if prev.notify_channel_mentions != settings.notify_channel_mentions {
-                        sync_pref(
-                            "suppress_at_channel_global",
-                            (!settings.notify_channel_mentions).to_string(),
-                        );
-                    }
-                    if prev.notify_huddle_invites != settings.notify_huddle_invites {
-                        sync_pref(
-                            "huddle_invite_notifications",
-                            settings.notify_huddle_invites.to_string(),
-                        );
-                    }
-                    if prev.notify_reminders != settings.notify_reminders {
-                        sync_pref(
-                            "reminder_notifications",
-                            settings.notify_reminders.to_string(),
-                        );
-                    }
-                    if prev.show_preview != settings.show_preview {
-                        sync_global_notif(
-                            "no_text_in_notifications",
-                            (!settings.show_preview).to_string(),
-                            false,
-                        );
-                    }
-                    if prev.mobile_handoff != settings.mobile_handoff {
-                        sync_global_notif(
-                            "push_idle_wait",
-                            settings.mobile_handoff_secs().to_string(),
-                            false,
-                        );
-                    }
-                    if prev.keywords != settings.keywords {
-                        sync_pref("highlight_words", settings.keywords.clone());
-                        sync_global_notif("global_keywords", settings.keywords.clone(), false);
-                    }
-                    if prev.mute_sounds != settings.mute_sounds {
-                        sync_pref("mute_sounds", settings.mute_sounds.to_string());
-                    }
-                    if prev.badge_on_unreads != settings.badge_on_unreads {
-                        sync_pref("mac_ssb_bullet", settings.badge_on_unreads.to_string());
-                    }
-                    if prev.bounce_dock != settings.bounce_dock {
-                        sync_pref("mac_ssb_bounce", settings.bounce_dock.to_string());
-                    }
-                    if prev.schedule_enabled != settings.schedule_enabled {
-                        sync_pref("dnd_enabled", settings.schedule_enabled.to_string());
-                    }
-                    if prev.schedule_days != settings.schedule_days {
-                        sync_pref("dnd_days", settings.schedule_days_wire().to_owned());
-                    }
-                    if prev.schedule_custom_days != settings.schedule_custom_days
-                        && settings.schedule_days == 2
-                    {
-                        const DAY_KEYS: [&str; 7] = [
-                            "dnd_enabled_sunday",
-                            "dnd_enabled_monday",
-                            "dnd_enabled_tuesday",
-                            "dnd_enabled_wednesday",
-                            "dnd_enabled_thursday",
-                            "dnd_enabled_friday",
-                            "dnd_enabled_saturday",
-                        ];
-                        for (ix, key) in DAY_KEYS.iter().enumerate() {
-                            if prev.schedule_custom_days[ix] != settings.schedule_custom_days[ix] {
-                                sync_pref(key, settings.schedule_custom_days[ix].to_string());
-                            }
-                        }
-                    }
-                    if prev.schedule_start != settings.schedule_start {
-                        sync_pref(
-                            "dnd_end_hour",
-                            format!("{:02}:00", settings.schedule_start % 24),
-                        );
-                    }
-                    if prev.schedule_end != settings.schedule_end {
-                        sync_pref(
-                            "dnd_start_hour",
-                            format!("{:02}:00", settings.schedule_end % 24),
-                        );
-                    }
-                    if prev.palette != settings.palette {
-                        if let Some(theme_name) = settings.palette.slack_pref_name() {
-                            sync_pref("sidebar_theme", theme_name.to_owned());
+                        let val = settings.quick_reaction_emojis[ix]
+                            .trim()
+                            .trim_matches(':')
+                            .to_owned();
+                        if !val.is_empty() {
+                            sync_pref(key, val);
                         }
                     }
                 }
-                if prev.launch_at_login != settings.launch_at_login {
-                    sync_launch_at_login(settings.launch_at_login);
+                if prev.underline_links != settings.underline_links {
+                    sync_pref("underline_links", settings.underline_links.to_string());
                 }
-                if prev.proxy_url != settings.proxy_url {
-                    slackless_core::api::set_proxy_url(Some(settings.proxy_url.clone()));
+                if prev.density != settings.density {
+                    sync_pref(
+                        "messages_theme",
+                        if settings.density == 1 {
+                            "compact"
+                        } else {
+                            "default"
+                        }
+                        .to_owned(),
+                    );
                 }
-                if prev.net_log_enabled != settings.net_log_enabled {
-                    slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
+                if prev.skin_tone != settings.skin_tone {
+                    sync_pref(
+                        "preferred_skin_tone",
+                        format!("skin-tone-{}", settings.skin_tone + 1),
+                    );
                 }
-                if self.huddle_session.is_some() {
-                    if prev.huddle_input_device != settings.huddle_input_device
-                        || prev.huddle_output_device != settings.huddle_output_device
-                    {
-                        self.bridge.send(Command::SetHuddleAudioDevices {
-                            input: settings.huddle_input_device.clone(),
-                            output: settings.huddle_output_device.clone(),
-                        });
+                let sync_global_notif = |name: &str, value: String, sync: bool| {
+                    self.bridge.send(Command::SetGlobalNotificationPref {
+                        name: name.to_owned(),
+                        value,
+                        sync,
+                    });
+                };
+                if prev.notify_level != settings.notify_level
+                    || prev.mobile_different != settings.mobile_different
+                {
+                    sync_global_notif(
+                        "global_desktop",
+                        settings.notify_level_wire().to_owned(),
+                        !settings.mobile_different,
+                    );
+                }
+                if settings.mobile_different
+                    && (prev.mobile_notify_level != settings.mobile_notify_level
+                        || !prev.mobile_different)
+                {
+                    sync_global_notif(
+                        "global_mobile",
+                        settings.mobile_notify_level_wire().to_owned(),
+                        false,
+                    );
+                }
+                if prev.thread_replies != settings.thread_replies {
+                    sync_global_notif(
+                        "threads_everything",
+                        settings.thread_replies.to_string(),
+                        false,
+                    );
+                }
+                if prev.notify_channel_mentions != settings.notify_channel_mentions {
+                    sync_pref(
+                        "suppress_at_channel_global",
+                        (!settings.notify_channel_mentions).to_string(),
+                    );
+                }
+                if prev.notify_huddle_invites != settings.notify_huddle_invites {
+                    sync_pref(
+                        "huddle_invite_notifications",
+                        settings.notify_huddle_invites.to_string(),
+                    );
+                }
+                if prev.notify_reminders != settings.notify_reminders {
+                    sync_pref(
+                        "reminder_notifications",
+                        settings.notify_reminders.to_string(),
+                    );
+                }
+                if prev.show_preview != settings.show_preview {
+                    sync_global_notif(
+                        "no_text_in_notifications",
+                        (!settings.show_preview).to_string(),
+                        false,
+                    );
+                }
+                if prev.mobile_handoff != settings.mobile_handoff {
+                    sync_global_notif(
+                        "push_idle_wait",
+                        settings.mobile_handoff_secs().to_string(),
+                        false,
+                    );
+                }
+                if prev.keywords != settings.keywords {
+                    sync_pref("highlight_words", settings.keywords.clone());
+                    sync_global_notif("global_keywords", settings.keywords.clone(), false);
+                }
+                if prev.mute_sounds != settings.mute_sounds {
+                    sync_pref("mute_sounds", settings.mute_sounds.to_string());
+                }
+                if prev.badge_on_unreads != settings.badge_on_unreads {
+                    sync_pref("mac_ssb_bullet", settings.badge_on_unreads.to_string());
+                }
+                if prev.bounce_dock != settings.bounce_dock {
+                    sync_pref("mac_ssb_bounce", settings.bounce_dock.to_string());
+                }
+                if prev.schedule_enabled != settings.schedule_enabled {
+                    sync_pref("dnd_enabled", settings.schedule_enabled.to_string());
+                }
+                if prev.schedule_days != settings.schedule_days {
+                    sync_pref("dnd_days", settings.schedule_days_wire().to_owned());
+                }
+                if prev.schedule_custom_days != settings.schedule_custom_days
+                    && settings.schedule_days == 2
+                {
+                    const DAY_KEYS: [&str; 7] = [
+                        "dnd_enabled_sunday",
+                        "dnd_enabled_monday",
+                        "dnd_enabled_tuesday",
+                        "dnd_enabled_wednesday",
+                        "dnd_enabled_thursday",
+                        "dnd_enabled_friday",
+                        "dnd_enabled_saturday",
+                    ];
+                    for (ix, key) in DAY_KEYS.iter().enumerate() {
+                        if prev.schedule_custom_days[ix] != settings.schedule_custom_days[ix] {
+                            sync_pref(key, settings.schedule_custom_days[ix].to_string());
+                        }
                     }
-                    if prev.huddle_aec != settings.huddle_aec
-                        || prev.huddle_ns != settings.huddle_ns
-                        || prev.huddle_agc != settings.huddle_agc
-                    {
-                        self.bridge.send(Command::SetHuddleAudioProcessing {
-                            aec: settings.huddle_aec,
-                            ns: settings.huddle_ns,
-                            agc: settings.huddle_agc,
-                        });
-                    }
-                    if prev.huddle_blur_background != settings.huddle_blur_background {
-                        self.bridge.send(Command::SetHuddleBlurBackground(
-                            settings.huddle_blur_background,
-                        ));
-                    }
                 }
-                self.saved_settings = Some(settings.clone());
-                if let Some(write) = self.bridge.remember_settings(&settings) {
-                    cx.background_executor().spawn(write).detach();
+                if prev.schedule_start != settings.schedule_start {
+                    sync_pref(
+                        "dnd_end_hour",
+                        format!("{:02}:00", settings.schedule_start % 24),
+                    );
                 }
+                if prev.schedule_end != settings.schedule_end {
+                    sync_pref(
+                        "dnd_start_hour",
+                        format!("{:02}:00", settings.schedule_end % 24),
+                    );
+                }
+                if prev.palette != settings.palette
+                    && let Some(theme_name) = settings.palette.slack_pref_name()
+                {
+                    sync_pref("sidebar_theme", theme_name.to_owned());
+                }
+            }
+            if prev.launch_at_login != settings.launch_at_login {
+                sync_launch_at_login(settings.launch_at_login);
+            }
+            if prev.proxy_url != settings.proxy_url {
+                slackless_core::api::set_proxy_url(Some(settings.proxy_url.clone()));
+            }
+            if prev.net_log_enabled != settings.net_log_enabled {
+                slackless_core::api::set_net_log_enabled(settings.net_log_enabled);
+            }
+            if self.huddle_session.is_some() {
+                if prev.huddle_input_device != settings.huddle_input_device
+                    || prev.huddle_output_device != settings.huddle_output_device
+                {
+                    self.bridge.send(Command::SetHuddleAudioDevices {
+                        input: settings.huddle_input_device.clone(),
+                        output: settings.huddle_output_device.clone(),
+                    });
+                }
+                if prev.huddle_aec != settings.huddle_aec
+                    || prev.huddle_ns != settings.huddle_ns
+                    || prev.huddle_agc != settings.huddle_agc
+                {
+                    self.bridge.send(Command::SetHuddleAudioProcessing {
+                        aec: settings.huddle_aec,
+                        ns: settings.huddle_ns,
+                        agc: settings.huddle_agc,
+                    });
+                }
+                if prev.huddle_blur_background != settings.huddle_blur_background {
+                    self.bridge.send(Command::SetHuddleBlurBackground(
+                        settings.huddle_blur_background,
+                    ));
+                }
+            }
+            self.saved_settings = Some(settings.clone());
+            if let Some(write) = self.bridge.remember_settings(&settings) {
+                cx.background_executor().spawn(write).detach();
             }
         }
         window.refresh();
@@ -467,12 +467,11 @@ impl App {
         } else if let Some(Some(bridge)) = self.parked_bridges.get(index) {
             bridge.send(Command::SignOut);
         }
-        if let Some(team) = self.fixtures.workspaces.get(index) {
-            if let Err(e) =
+        if let Some(team) = self.fixtures.workspaces.get(index)
+            && let Err(e) =
                 slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
-            {
-                eprintln!("slackless: could not remove the stored session ({e})");
-            }
+        {
+            eprintln!("slackless: could not remove the stored session ({e})");
         }
         cx.quit();
     }
@@ -736,15 +735,13 @@ impl App {
                     .outline()
                     .label(close_label.clone())
                     .on_click(move |_, window, cx| {
-                        if notify_on_close {
-                            if let Some(app) = this_close.upgrade() {
-                                app.update(cx, |app, _| {
-                                    app.bridge.send(Command::CloseModal {
-                                        view_id: close_id.clone(),
-                                        hash: close_hash.clone(),
-                                    });
+                        if notify_on_close && let Some(app) = this_close.upgrade() {
+                            app.update(cx, |app, _| {
+                                app.bridge.send(Command::CloseModal {
+                                    view_id: close_id.clone(),
+                                    hash: close_hash.clone(),
                                 });
-                            }
+                            });
                         }
                         window.close_dialog(cx);
                     }),

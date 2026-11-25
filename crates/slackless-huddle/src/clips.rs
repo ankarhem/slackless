@@ -153,13 +153,13 @@ impl AudioClipRecorder {
                     bar_chunks = 0;
                 }
             }
-            if !processed_i16.is_empty() {
-                if let Ok(mut buf) = samples_cb.lock() {
-                    let remaining = MAX_AUDIO_SAMPLES.saturating_sub(buf.len());
-                    if remaining > 0 {
-                        let take = processed_i16.len().min(remaining);
-                        buf.extend_from_slice(&processed_i16[..take]);
-                    }
+            if !processed_i16.is_empty()
+                && let Ok(mut buf) = samples_cb.lock()
+            {
+                let remaining = MAX_AUDIO_SAMPLES.saturating_sub(buf.len());
+                if remaining > 0 {
+                    let take = processed_i16.len().min(remaining);
+                    buf.extend_from_slice(&processed_i16[..take]);
                 }
             }
         };
@@ -359,10 +359,10 @@ impl VideoClipRecorder {
                 while audio_run.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(40));
                 }
-                if let Ok((pcm, _)) = rec.stop_to_pcm() {
-                    if let Ok(mut dst) = audio_buf.lock() {
-                        *dst = pcm;
-                    }
+                if let Ok((pcm, _)) = rec.stop_to_pcm()
+                    && let Ok(mut dst) = audio_buf.lock()
+                {
+                    *dst = pcm;
                 }
             })
             .ok();
@@ -401,27 +401,27 @@ impl VideoClipRecorder {
                         };
                         while run_flag.load(Ordering::Relaxed) {
                             let tick = Instant::now();
-                            if let Ok(frame) = cam.frame() {
-                                if let Ok(img) = frame.decode_image::<RgbFormat>() {
-                                    let (rgb, w, h) = resize_rgb_even(
-                                        img.as_raw(),
-                                        img.width(),
-                                        img.height(),
-                                        CAMERA_MAX_W,
-                                        CAMERA_MAX_H,
+                            if let Ok(frame) = cam.frame()
+                                && let Ok(img) = frame.decode_image::<RgbFormat>()
+                            {
+                                let (rgb, w, h) = resize_rgb_even(
+                                    img.as_raw(),
+                                    img.width(),
+                                    img.height(),
+                                    CAMERA_MAX_W,
+                                    CAMERA_MAX_H,
+                                );
+                                if w >= 2 && h >= 2 {
+                                    record_encoded_frame(
+                                        &mut enc,
+                                        &rgb,
+                                        w,
+                                        h,
+                                        &dims_cb,
+                                        &preview_cb,
+                                        &thumbs_cb,
+                                        &frames_cb,
                                     );
-                                    if w >= 2 && h >= 2 {
-                                        record_encoded_frame(
-                                            &mut enc,
-                                            &rgb,
-                                            w,
-                                            h,
-                                            &dims_cb,
-                                            &preview_cb,
-                                            &thumbs_cb,
-                                            &frames_cb,
-                                        );
-                                    }
                                 }
                             }
                             if frames_cb.lock().is_ok_and(|f| f.len() >= MAX_VIDEO_FRAMES) {
@@ -613,19 +613,17 @@ fn record_encoded_frame(
         *p = Some(vf.clone());
     }
     // Sample candidate thumbnail keyframes at frame 0, ~2s, ~5s, and ~10s (`F-COLLAB-099`).
-    if matches!(frame_idx, 0 | 24 | 60 | 120) {
-        if let Ok(mut t) = thumbs_cb.lock() {
-            if t.len() < 4 {
-                t.push(vf);
-            }
-        }
+    if matches!(frame_idx, 0 | 24 | 60 | 120)
+        && let Ok(mut t) = thumbs_cb.lock()
+        && t.len() < 4
+    {
+        t.push(vf);
     }
-    if let Ok(annex_b) = enc.encode_rgb(&enc_rgb, ew as usize, eh as usize) {
-        if !annex_b.is_empty() {
-            if let Ok(mut list) = frames_cb.lock() {
-                list.push(EncodedH264Frame { annex_b });
-            }
-        }
+    if let Ok(annex_b) = enc.encode_rgb(&enc_rgb, ew as usize, eh as usize)
+        && !annex_b.is_empty()
+        && let Ok(mut list) = frames_cb.lock()
+    {
+        list.push(EncodedH264Frame { annex_b });
     }
 }
 
@@ -1129,17 +1127,15 @@ pub fn mux_h264_aac_mp4(
     let mut moov_body = Vec::new();
     moov_body.extend_from_slice(&mvhd);
     moov_body.extend_from_slice(&trak);
-    if has_audio {
-        if let Some(a) = audio {
-            let audio_trak = build_aac_mp4_trak(
-                a,
-                &audio_sizes,
-                audio_chunk_offset,
-                total_duration,
-                unity_matrix,
-            );
-            moov_body.extend_from_slice(&audio_trak);
-        }
+    if has_audio && let Some(a) = audio {
+        let audio_trak = build_aac_mp4_trak(
+            a,
+            &audio_sizes,
+            audio_chunk_offset,
+            total_duration,
+            unity_matrix,
+        );
+        moov_body.extend_from_slice(&audio_trak);
     }
     let moov = mp4_box(b"moov", &moov_body);
 

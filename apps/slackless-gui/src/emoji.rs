@@ -647,29 +647,29 @@ fn unicode_emoji(name: &str) -> Option<&'static emojis::Emoji> {
     if let Some(emoji) = emojis::get_by_shortcode(name) {
         return Some(emoji);
     }
-    if let Some(alias) = slack_alias(name) {
-        if let Some(emoji) = emojis::get_by_shortcode(alias) {
-            return Some(emoji);
-        }
+    if let Some(alias) = slack_alias(name)
+        && let Some(emoji) = emojis::get_by_shortcode(alias)
+    {
+        return Some(emoji);
     }
     let underscored = name.replace('-', "_");
     if let Some(emoji) = emojis::get_by_shortcode(&underscored) {
         return Some(emoji);
     }
-    if let Some(stripped) = underscored.strip_prefix("large_") {
-        if let Some(emoji) = emojis::get_by_shortcode(stripped) {
-            return Some(emoji);
-        }
+    if let Some(stripped) = underscored.strip_prefix("large_")
+        && let Some(emoji) = emojis::get_by_shortcode(stripped)
+    {
+        return Some(emoji);
     }
-    if let Some(rest) = underscored.strip_prefix("female_") {
-        if let Some(emoji) = emojis::get_by_shortcode(&format!("woman_{rest}")) {
-            return Some(emoji);
-        }
+    if let Some(rest) = underscored.strip_prefix("female_")
+        && let Some(emoji) = emojis::get_by_shortcode(&format!("woman_{rest}"))
+    {
+        return Some(emoji);
     }
-    if let Some(rest) = underscored.strip_prefix("male_") {
-        if let Some(emoji) = emojis::get_by_shortcode(&format!("man_{rest}")) {
-            return Some(emoji);
-        }
+    if let Some(rest) = underscored.strip_prefix("male_")
+        && let Some(emoji) = emojis::get_by_shortcode(&format!("man_{rest}"))
+    {
+        return Some(emoji);
     }
     emojis::get_by_shortcode(&format!("family_{underscored}"))
 }
@@ -916,11 +916,10 @@ impl EventEmitter<EmojiPickerEvent> for EmojiPicker {}
 /// Evict a single GIF URL's decoded frames and Metal textures from GPUI's window & asset cache.
 pub(crate) fn evict_gif_asset(url: &str, window: &mut Window, cx: &mut gpui_kit::gpui::App) {
     let source = ImageSource::from(url.to_owned());
-    if let ImageSource::Resource(ref resource) = source {
-        if let Some(Ok(data)) = window.get_asset::<gpui_kit::gpui::ImgResourceLoader>(resource, cx)
-        {
-            let _ = window.drop_image(data);
-        }
+    if let ImageSource::Resource(ref resource) = source
+        && let Some(Ok(data)) = window.get_asset::<gpui_kit::gpui::ImgResourceLoader>(resource, cx)
+    {
+        let _ = window.drop_image(data);
     }
     source.remove_asset(cx);
 }
@@ -1458,10 +1457,9 @@ impl EmojiPicker {
                                         if this.hovered_gif != Some(idx) {
                                             if let Some(prev) =
                                                 this.active_anim_url.replace(anim_url.clone())
+                                                && prev != anim_url
                                             {
-                                                if prev != anim_url {
-                                                    this.stale_gif_urls.push(prev);
-                                                }
+                                                this.stale_gif_urls.push(prev);
                                             }
                                             this.hovered_gif = Some(idx);
                                             cx.notify();

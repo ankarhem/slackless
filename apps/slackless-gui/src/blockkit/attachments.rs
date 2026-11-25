@@ -524,10 +524,10 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
                 })
         };
         let mut row = h_flex().items_start().gap_4().child(cell(field));
-        if field.short {
-            if let Some(next) = fields.next_if(|next| next.short) {
-                row = row.child(cell(next));
-            }
+        if field.short
+            && let Some(next) = fields.next_if(|next| next.short)
+        {
+            row = row.child(cell(next));
         }
         body = body.child(row);
     }
@@ -560,15 +560,14 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         && attachment.fields.is_empty()
         && attachment.blocks.is_empty()
         && attachment.image_url.is_none();
-    if empty_rich {
-        if let Some(fallback) = attachment
+    if empty_rich
+        && let Some(fallback) = attachment
             .fallback
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            body = body.child(messages::mrkdwn(fallback, kcx, false, false, cx));
-        }
+    {
+        body = body.child(messages::mrkdwn(fallback, kcx, false, false, cx));
     }
     // Slack's footer line: the footer icon, then "<footer> | Yesterday at 9:25 AM", its
     // links shown as their labels.

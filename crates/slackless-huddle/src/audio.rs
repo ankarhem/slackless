@@ -1118,14 +1118,13 @@ fn run_inbound_audio_rx_loop(
                 if needs_sw_aec_ref.load(Ordering::Relaxed)
                     && !shared.muted.load(Ordering::Relaxed)
                     && shared.aec.load(Ordering::Relaxed)
+                    && let Ok(mut tap) = aec_render_tap.lock()
                 {
-                    if let Ok(mut tap) = aec_render_tap.lock() {
-                        if tap.len() > FRAME_20MS * 6 {
-                            let drop_n = tap.len() - FRAME_20MS * 3;
-                            tap.drain(..drop_n);
-                        }
-                        tap.extend(pcm.iter().copied());
+                    if tap.len() > FRAME_20MS * 6 {
+                        let drop_n = tap.len() - FRAME_20MS * 3;
+                        tap.drain(..drop_n);
                     }
+                    tap.extend(pcm.iter().copied());
                 }
                 decoded_any = true;
             }
@@ -1247,24 +1246,24 @@ fn run_audio_dsp_loop(
                 } => {
                     if configured_in.is_none() && (check_in || poll_due) {
                         let now_in = current_default_input_name();
-                        if now_in.is_some() && now_in != last_default_in {
-                            if let Ok(next_stream) =
+                        if now_in.is_some()
+                            && now_in != last_default_in
+                            && let Ok(next_stream) =
                                 open_input_stream(None, Arc::clone(&capture_signal))
-                            {
-                                *in_stream = next_stream;
-                                last_default_in = now_in;
-                            }
+                        {
+                            *in_stream = next_stream;
+                            last_default_in = now_in;
                         }
                     }
                     if configured_out.is_none() && (check_out || poll_due) {
                         let now_out = current_default_output_name();
-                        if now_out.is_some() && now_out != last_default_out {
-                            if let Ok(next_stream) =
+                        if now_out.is_some()
+                            && now_out != last_default_out
+                            && let Ok(next_stream) =
                                 open_output_stream(None, Arc::clone(&playback_buf))
-                            {
-                                *out_stream = next_stream;
-                                last_default_out = now_out;
-                            }
+                        {
+                            *out_stream = next_stream;
+                            last_default_out = now_out;
                         }
                     }
                 }
@@ -1382,12 +1381,11 @@ fn run_audio_dsp_loop(
 
 fn select_input_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
-    if let Some(target) = name.filter(|s| !s.is_empty()) {
-        if let Ok(mut devices) = host.input_devices() {
-            if let Some(found) = devices.find(|d| d.name().ok().as_deref() == Some(target)) {
-                return Ok(found);
-            }
-        }
+    if let Some(target) = name.filter(|s| !s.is_empty())
+        && let Ok(mut devices) = host.input_devices()
+        && let Some(found) = devices.find(|d| d.name().ok().as_deref() == Some(target))
+    {
+        return Ok(found);
     }
     host.default_input_device()
         .ok_or_else(|| HuddleError::Audio("no input microphone device found".to_owned()))
@@ -1395,12 +1393,11 @@ fn select_input_device(name: Option<&str>) -> Result<cpal::Device> {
 
 fn select_output_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();
-    if let Some(target) = name.filter(|s| !s.is_empty()) {
-        if let Ok(mut devices) = host.output_devices() {
-            if let Some(found) = devices.find(|d| d.name().ok().as_deref() == Some(target)) {
-                return Ok(found);
-            }
-        }
+    if let Some(target) = name.filter(|s| !s.is_empty())
+        && let Ok(mut devices) = host.output_devices()
+        && let Some(found) = devices.find(|d| d.name().ok().as_deref() == Some(target))
+    {
+        return Ok(found);
     }
     host.default_output_device()
         .ok_or_else(|| HuddleError::Audio("no output speaker device found".to_owned()))

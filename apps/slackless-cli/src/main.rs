@@ -1601,22 +1601,20 @@ fn parse_since_cutoff(spec: &str, now_secs: i64) -> Result<i64, String> {
     if let Ok(epoch) = trimmed.parse::<i64>() {
         return Ok(epoch);
     }
-    if let Some((y, rest)) = trimmed.split_once('-') {
-        if let Some((m, d)) = rest.split_once('-') {
-            if let (Ok(year), Ok(month), Ok(day)) =
-                (y.parse::<i64>(), m.parse::<u32>(), d.parse::<u32>())
-            {
-                let Some(max_day) = days_in_month(year, month) else {
-                    return Err(format!("invalid date '{trimmed}': month must be 1..=12"));
-                };
-                if day == 0 || day > max_day {
-                    return Err(format!(
-                        "invalid date '{trimmed}': day must be 1..={max_day} for {year:04}-{month:02}"
-                    ));
-                }
-                return Ok(days_from_civil(year, month, day).saturating_mul(86_400));
-            }
+    if let Some((y, rest)) = trimmed.split_once('-')
+        && let Some((m, d)) = rest.split_once('-')
+        && let (Ok(year), Ok(month), Ok(day)) =
+            (y.parse::<i64>(), m.parse::<u32>(), d.parse::<u32>())
+    {
+        let Some(max_day) = days_in_month(year, month) else {
+            return Err(format!("invalid date '{trimmed}': month must be 1..=12"));
+        };
+        if day == 0 || day > max_day {
+            return Err(format!(
+                "invalid date '{trimmed}': day must be 1..={max_day} for {year:04}-{month:02}"
+            ));
         }
+        return Ok(days_from_civil(year, month, day).saturating_mul(86_400));
     }
     let delta = parse_duration_secs(trimmed)?;
     let delta_i64 = i64::try_from(delta).unwrap_or(i64::MAX);

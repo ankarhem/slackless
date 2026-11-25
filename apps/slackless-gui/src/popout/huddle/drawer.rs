@@ -895,12 +895,12 @@ impl PopoutWindow {
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 let next = !audio_only;
                                                 (send_ao)(Command::SetHuddleAudioOnly(next));
-                                                if this.fixtures.sample {
-                                                    if let Some(dock) = this.huddle_dock_entity() {
-                                                        dock.update(cx, |d, cx| {
-                                                            d.set_audio_only_local(next, cx)
-                                                        });
-                                                    }
+                                                if this.fixtures.sample
+                                                    && let Some(dock) = this.huddle_dock_entity()
+                                                {
+                                                    dock.update(cx, |d, cx| {
+                                                        d.set_audio_only_local(next, cx)
+                                                    });
                                                 }
                                             })),
                                     ),

@@ -366,12 +366,11 @@ pub(super) fn is_ephemeral_message(message: &Message) -> bool {
 pub(super) fn encode_json_value(json: &str, force_text: bool) -> SqlValue {
     if !force_text && json.len() >= 160 {
         let mut enc = ZlibEncoder::new(Vec::with_capacity(json.len() / 2), Compression::fast());
-        if enc.write_all(json.as_bytes()).is_ok() {
-            if let Ok(compressed) = enc.finish() {
-                if compressed.len() + 16 < json.len() {
-                    return SqlValue::Blob(compressed);
-                }
-            }
+        if enc.write_all(json.as_bytes()).is_ok()
+            && let Ok(compressed) = enc.finish()
+            && compressed.len() + 16 < json.len()
+        {
+            return SqlValue::Blob(compressed);
         }
     }
     SqlValue::Text(json.to_owned())

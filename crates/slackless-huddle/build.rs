@@ -44,17 +44,16 @@ fn main() {
         if let Ok(out) = std::process::Command::new(&cc_bin)
             .arg("--print-resource-dir")
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let res_dir = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                let darwin_lib_dir = std::path::Path::new(&res_dir).join("lib/darwin");
-                if darwin_lib_dir.join("libclang_rt.osx.a").is_file() {
-                    println!(
-                        "cargo:rustc-link-search=native={}",
-                        darwin_lib_dir.display()
-                    );
-                    println!("cargo:rustc-link-lib=static=clang_rt.osx");
-                }
+            let res_dir = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            let darwin_lib_dir = std::path::Path::new(&res_dir).join("lib/darwin");
+            if darwin_lib_dir.join("libclang_rt.osx.a").is_file() {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    darwin_lib_dir.display()
+                );
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
             }
         }
     }

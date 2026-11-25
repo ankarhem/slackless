@@ -201,7 +201,7 @@ impl HuddlesView {
         ix: usize,
         huddle: &RecentHuddle,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let dark = theme.mode.is_dark();
         let (bg, border, fg, muted) = (
@@ -334,7 +334,7 @@ impl HuddlesView {
         peer: UserId,
         count: usize,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (muted_bg, border, fg, muted, hover) = (
             theme.muted,
@@ -415,7 +415,7 @@ impl HuddlesView {
         is_last: bool,
         huddle: &RecentHuddle,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (border, muted, muted_bg, fg, link, hover, bg) = (
             theme.border,

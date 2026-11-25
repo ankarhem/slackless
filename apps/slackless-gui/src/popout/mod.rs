@@ -288,16 +288,14 @@ impl PopoutWindow {
                             PopoutKind::Conversation { channel, .. }
                             | PopoutKind::Thread { channel, .. } => Some(channel.clone()),
                             _ => None,
-                        } {
-                            if let Some(last_own) = this
-                                .messages
-                                .iter()
-                                .rev()
-                                .find(|m| m.user.as_ref() == Some(&this.fixtures.self_user))
-                                .cloned()
-                            {
-                                this.start_edit(ch, &last_own, window, cx);
-                            }
+                        } && let Some(last_own) = this
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| m.user.as_ref() == Some(&this.fixtures.self_user))
+                            .cloned()
+                        {
+                            this.start_edit(ch, &last_own, window, cx);
                         }
                     }
                     _ => {}
@@ -324,27 +322,27 @@ impl PopoutWindow {
             | PopoutKind::Files { .. }
             | PopoutKind::Huddle { .. } => None,
         };
-        if let (Some(ch), Some((weak_later, workspace))) = (active_channel.clone(), &later_sync) {
-            if let Some(later) = weak_later.upgrade() {
-                saved = later
+        if let (Some(ch), Some((weak_later, workspace))) = (active_channel.clone(), &later_sync)
+            && let Some(later) = weak_later.upgrade()
+        {
+            saved = later
+                .read(cx)
+                .saved_in(*workspace)
+                .into_iter()
+                .filter(|(c, _)| *c == ch)
+                .map(|(_, ts)| ts)
+                .collect();
+            let workspace = *workspace;
+            subscriptions.push(cx.observe(&later, move |this, later, cx| {
+                this.saved = later
                     .read(cx)
-                    .saved_in(*workspace)
+                    .saved_in(workspace)
                     .into_iter()
                     .filter(|(c, _)| *c == ch)
                     .map(|(_, ts)| ts)
                     .collect();
-                let workspace = *workspace;
-                subscriptions.push(cx.observe(&later, move |this, later, cx| {
-                    this.saved = later
-                        .read(cx)
-                        .saved_in(workspace)
-                        .into_iter()
-                        .filter(|(c, _)| *c == ch)
-                        .map(|(_, ts)| ts)
-                        .collect();
-                    cx.notify();
-                }));
-            }
+                cx.notify();
+            }));
         }
         let mut activity_rows = Vec::new();
         let mut later_items = Vec::new();
@@ -535,14 +533,14 @@ impl PopoutWindow {
                     .update(cx, |c, cx| c.insert_emoji(choice, window, cx));
             }
             PopoutPickerTarget::Message { channel, ts } => {
-                if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts) {
-                    if actions::add_reaction(msg, &self.fixtures.self_user, &choice.name) {
-                        (self.send)(Command::AddReaction {
-                            channel,
-                            ts,
-                            name: choice.name.clone(),
-                        });
-                    }
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts)
+                    && actions::add_reaction(msg, &self.fixtures.self_user, &choice.name)
+                {
+                    (self.send)(Command::AddReaction {
+                        channel,
+                        ts,
+                        name: choice.name.clone(),
+                    });
                 }
             }
         }
@@ -696,11 +694,11 @@ impl PopoutWindow {
         let ts = message.ts.clone();
         match action {
             MessageAction::React(name) => {
-                if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts) {
-                    if actions::add_reaction(msg, &self.fixtures.self_user, &name) {
-                        (self.send)(Command::AddReaction { channel, ts, name });
-                        cx.notify();
-                    }
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts)
+                    && actions::add_reaction(msg, &self.fixtures.self_user, &name)
+                {
+                    (self.send)(Command::AddReaction { channel, ts, name });
+                    cx.notify();
                 }
             }
             MessageAction::ToggleReaction(name) => {
@@ -1122,28 +1120,28 @@ fn load_messages(
     ) {
         return Vec::new();
     }
-    if let (Some(store), Some(team)) = (store, team) {
-        if let Ok(guard) = store.lock() {
-            let rows = match kind {
-                PopoutKind::Conversation { channel, .. } => {
-                    guard.channel_history(team, channel, None, 200)
-                }
-                PopoutKind::Thread {
-                    channel, thread_ts, ..
-                } => guard.thread_replies(team, channel, thread_ts),
-                PopoutKind::Activity { .. }
-                | PopoutKind::Later { .. }
-                | PopoutKind::Canvas { .. }
-                | PopoutKind::Files { .. }
-                | PopoutKind::Huddle { .. } => Ok(Vec::new()),
-            };
-            if let Ok(rows) = rows {
-                return rows
-                    .into_iter()
-                    .filter(|r| !r.deleted)
-                    .map(|r| r.message)
-                    .collect();
+    if let (Some(store), Some(team)) = (store, team)
+        && let Ok(guard) = store.lock()
+    {
+        let rows = match kind {
+            PopoutKind::Conversation { channel, .. } => {
+                guard.channel_history(team, channel, None, 200)
             }
+            PopoutKind::Thread {
+                channel, thread_ts, ..
+            } => guard.thread_replies(team, channel, thread_ts),
+            PopoutKind::Activity { .. }
+            | PopoutKind::Later { .. }
+            | PopoutKind::Canvas { .. }
+            | PopoutKind::Files { .. }
+            | PopoutKind::Huddle { .. } => Ok(Vec::new()),
+        };
+        if let Ok(rows) = rows {
+            return rows
+                .into_iter()
+                .filter(|r| !r.deleted)
+                .map(|r| r.message)
+                .collect();
         }
     }
     match kind {
@@ -1333,47 +1331,47 @@ impl Render for PopoutWindow {
                 let mut prev_msg: Option<&Message> = None;
                 let editing = self.editing.clone();
                 for (ix, msg) in self.messages.iter().enumerate() {
-                    if let Some((_, edit_ts, edit_input)) = &editing {
-                        if *edit_ts == msg.ts {
-                            let edit_row = v_flex()
-                                .id(SharedString::from(format!("popout-edit-{ix}")))
-                                .mx_4()
-                                .my_1()
-                                .p_2p5()
-                                .gap_2()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(cx.theme().ring)
-                                .bg(bg)
-                                .child(Textarea::new(edit_input).appearance(false).bordered(false))
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .justify_end()
-                                        .child(
-                                            Button::new("popout-edit-cancel")
-                                                .outline()
-                                                .with_size(Size::XSmall)
-                                                .label("Cancel")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.editing = None;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("popout-edit-save")
-                                                .primary()
-                                                .with_size(Size::XSmall)
-                                                .label("Save Changes")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.save_edit(cx);
-                                                })),
-                                        ),
-                                );
-                            rows.push(edit_row.into_any_element());
-                            prev_msg = None;
-                            continue;
-                        }
+                    if let Some((_, edit_ts, edit_input)) = &editing
+                        && *edit_ts == msg.ts
+                    {
+                        let edit_row = v_flex()
+                            .id(SharedString::from(format!("popout-edit-{ix}")))
+                            .mx_4()
+                            .my_1()
+                            .p_2p5()
+                            .gap_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().ring)
+                            .bg(bg)
+                            .child(Textarea::new(edit_input).appearance(false).bordered(false))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        Button::new("popout-edit-cancel")
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .label("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.editing = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("popout-edit-save")
+                                            .primary()
+                                            .with_size(Size::XSmall)
+                                            .label("Save Changes")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.save_edit(cx);
+                                            })),
+                                    ),
+                            );
+                        rows.push(edit_row.into_any_element());
+                        prev_msg = None;
+                        continue;
                     }
                     let msg_group = SharedString::from(format!("popout-msg-{ix}"));
                     let key = format!("popout-row-{}", msg.ts.as_str());

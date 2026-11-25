@@ -1968,10 +1968,11 @@ pub(super) fn parse_list_records(records: &[Value]) -> Vec<SlackListRow> {
                 let cell = parse_list_cell(field);
                 if cell != SlackListCellValue::Empty {
                     cells.insert(col_key.to_owned(), cell.clone());
-                    if let Some(key) = field.get("key").and_then(Value::as_str) {
-                        if !key.is_empty() && key != col_key {
-                            cells.insert(key.to_owned(), cell);
-                        }
+                    if let Some(key) = field.get("key").and_then(Value::as_str)
+                        && !key.is_empty()
+                        && key != col_key
+                    {
+                        cells.insert(key.to_owned(), cell);
                     }
                 }
             }
@@ -1985,10 +1986,10 @@ pub(super) fn parse_list_cell(field: &Value) -> SlackListCellValue {
     if let Some(b) = field.get("checkbox").and_then(Value::as_bool) {
         return SlackListCellValue::Checkbox(b);
     }
-    if let Some(arr) = field.get("checkbox").and_then(Value::as_array) {
-        if let Some(b) = arr.first().and_then(Value::as_bool) {
-            return SlackListCellValue::Checkbox(b);
-        }
+    if let Some(arr) = field.get("checkbox").and_then(Value::as_array)
+        && let Some(b) = arr.first().and_then(Value::as_bool)
+    {
+        return SlackListCellValue::Checkbox(b);
     }
     if let Some(arr) = field.get("user").and_then(Value::as_array) {
         let users: Vec<UserId> = arr
@@ -2012,57 +2013,56 @@ pub(super) fn parse_list_cell(field: &Value) -> SlackListCellValue {
             return SlackListCellValue::Select(opts);
         }
     }
-    if let Some(arr) = field.get("date").and_then(Value::as_array) {
-        if let Some(d) = arr
+    if let Some(arr) = field.get("date").and_then(Value::as_array)
+        && let Some(d) = arr
             .first()
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-        {
-            return SlackListCellValue::Date(d.to_owned());
-        }
+    {
+        return SlackListCellValue::Date(d.to_owned());
     }
-    if let Some(arr) = field.get("link").and_then(Value::as_array) {
-        if let Some(first) = arr.first() {
-            let url = first
-                .get("originalUrl")
-                .or_else(|| first.get("original_url"))
+    if let Some(arr) = field.get("link").and_then(Value::as_array)
+        && let Some(first) = arr.first()
+    {
+        let url = first
+            .get("originalUrl")
+            .or_else(|| first.get("original_url"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !url.is_empty() {
+            let label = first
+                .get("displayName")
+                .or_else(|| first.get("display_name"))
                 .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !url.is_empty() {
-                let label = first
-                    .get("displayName")
-                    .or_else(|| first.get("display_name"))
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(url);
-                return SlackListCellValue::Link {
-                    label: label.to_owned(),
-                    url: url.to_owned(),
-                };
-            }
+                .filter(|s| !s.is_empty())
+                .unwrap_or(url);
+            return SlackListCellValue::Link {
+                label: label.to_owned(),
+                url: url.to_owned(),
+            };
         }
     }
-    if let Some(arr) = field.get("number").and_then(Value::as_array) {
-        if let Some(n) = arr.first() {
-            let s = n
-                .as_f64()
-                .map(|v| {
-                    if v.fract() == 0.0 {
-                        format!("{}", v as i64)
-                    } else {
-                        v.to_string()
-                    }
-                })
-                .or_else(|| n.as_str().map(str::to_owned));
-            if let Some(s) = s {
-                return SlackListCellValue::Number(s);
-            }
+    if let Some(arr) = field.get("number").and_then(Value::as_array)
+        && let Some(n) = arr.first()
+    {
+        let s = n
+            .as_f64()
+            .map(|v| {
+                if v.fract() == 0.0 {
+                    format!("{}", v as i64)
+                } else {
+                    v.to_string()
+                }
+            })
+            .or_else(|| n.as_str().map(str::to_owned));
+        if let Some(s) = s {
+            return SlackListCellValue::Number(s);
         }
     }
-    if let Some(arr) = field.get("rating").and_then(Value::as_array) {
-        if let Some(n) = arr.first().and_then(Value::as_u64) {
-            return SlackListCellValue::Text("\u{2605}".repeat((n as usize).min(10)));
-        }
+    if let Some(arr) = field.get("rating").and_then(Value::as_array)
+        && let Some(n) = arr.first().and_then(Value::as_u64)
+    {
+        return SlackListCellValue::Text("\u{2605}".repeat((n as usize).min(10)));
     }
     if let Some(t) = field.get("text").and_then(Value::as_str) {
         let trimmed = t.trim();

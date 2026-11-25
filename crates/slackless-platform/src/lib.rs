@@ -94,7 +94,7 @@ mod unix_termination {
 
     type SigHandler = extern "C" fn(i32);
 
-    extern "C" {
+    unsafe extern "C" {
         fn pipe(fds: *mut i32) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;

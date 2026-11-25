@@ -197,11 +197,12 @@ fn retarget(open: &mut Vec<Style>, want: Style, keep_underline: bool, out: &mut 
         }
     }
     for style in [Style::BOLD, Style::ITALIC, Style::STRIKE, Style::UNDERLINE] {
-        if want.contains(style) && !open.contains(&style) {
-            if let Some(tag) = open_tag(style) {
-                open.push(style);
-                out.push_str(tag);
-            }
+        if want.contains(style)
+            && !open.contains(&style)
+            && let Some(tag) = open_tag(style)
+        {
+            open.push(style);
+            out.push_str(tag);
         }
     }
 }

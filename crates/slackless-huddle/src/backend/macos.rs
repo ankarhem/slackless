@@ -105,10 +105,10 @@ impl VideoDecoderHandle for MacH264Decoder {
     }
 
     fn decode_unit(&mut self, unit: &[u8]) -> Option<VideoFrame> {
-        if let Some(vt) = self.vt.as_mut() {
-            if let Some(frame) = vt.decode_annex_b(unit) {
-                return Some(frame);
-            }
+        if let Some(vt) = self.vt.as_mut()
+            && let Some(frame) = vt.decode_annex_b(unit)
+        {
+            return Some(frame);
         }
         self.sw.decode_annex_b(unit)
     }

@@ -288,10 +288,10 @@ impl SelfState {
     /// until status is cleared" pauses until it clears (indefinitely for "Don't clear"), and
     /// replacing or clearing such a status resumes notifications.
     pub fn set_status(&mut self, mut status: Option<UserStatus>) {
-        if let Some(new) = status.as_mut() {
-            if new.expiration.is_none() {
-                new.expiration = new.clears_at();
-            }
+        if let Some(new) = status.as_mut()
+            && new.expiration.is_none()
+        {
+            new.expiration = new.clears_at();
         }
         if let Some(new) = status.as_ref().filter(|status| status.pause) {
             self.paused_until = Some(new.clears_at().unwrap_or(i64::MAX));

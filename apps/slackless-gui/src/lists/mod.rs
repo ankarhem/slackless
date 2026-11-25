@@ -1228,10 +1228,8 @@ fn render_live_list(
                         window,
                         cx,
                     );
-                    if opened {
-                        if let Some(cb) = &load_comments_row {
-                            cb(rec_id_click.clone(), window, cx);
-                        }
+                    if opened && let Some(cb) = &load_comments_row {
+                        cb(rec_id_click.clone(), window, cx);
                     }
                 }),
             |row, &col_ix| {

@@ -125,10 +125,10 @@ impl<B: Backend> Backfill<B> {
                     }
                     _ => {}
                 }
-                if next.is_none() {
-                    if let Some(span) = synced.get_mut(channel) {
-                        span.complete = true;
-                    }
+                if next.is_none()
+                    && let Some(span) = synced.get_mut(channel)
+                {
+                    span.complete = true;
                 }
             }
             match next {

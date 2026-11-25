@@ -744,15 +744,15 @@ impl ThreadPanel {
                 }
             }
             MessageAction::SendToChannel => {
-                if let Some((channel, thread_ts)) = self.thread.clone() {
-                    if let Some(reply) = self.replies.iter().find(|m| m.ts == *ts) {
-                        let content = crate::composer::content_of(&reply.text, &self.fixtures);
-                        cx.emit(ThreadPanelEvent::SendToChannel {
-                            channel,
-                            thread_ts,
-                            content,
-                        });
-                    }
+                if let Some((channel, thread_ts)) = self.thread.clone()
+                    && let Some(reply) = self.replies.iter().find(|m| m.ts == *ts)
+                {
+                    let content = crate::composer::content_of(&reply.text, &self.fixtures);
+                    cx.emit(ThreadPanelEvent::SendToChannel {
+                        channel,
+                        thread_ts,
+                        content,
+                    });
                 }
             }
             MessageAction::JoinHuddle => {}
