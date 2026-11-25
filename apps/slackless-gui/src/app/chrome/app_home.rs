@@ -374,4 +374,138 @@ impl App {
                 ),
         )
     }
+
+    /// Compact, subtle strip right above the composer listing any messages scheduled for the
+    /// active conversation, with inline `Send now` and `Cancel` actions.
+    pub(in crate::app) fn scheduled_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let items = self
+            .drafts
+            .read(cx)
+            .scheduled_for_channel(self.workspace, &self.channel);
+        if items.is_empty() {
+            return None;
+        }
+        let now = now_secs();
+        let theme = cx.theme();
+        let (border, muted_fg, fg, bg) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.foreground,
+            theme.secondary.opacity(0.32),
+        );
+        let rows = items
+            .into_iter()
+            .enumerate()
+            .map(|(row_ix, (sched_ix, entry))| {
+                let when = crate::drafts::when_label(entry.at, now);
+                let preview = entry
+                    .text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2p5()
+                    .px_3()
+                    .py_1p5()
+                    .when(row_ix > 0, |row| {
+                        row.border_t_1().border_color(border.opacity(0.55))
+                    })
+                    .child(
+                        Icon::new(IconName::Clock)
+                            .flex_none()
+                            .size(px(13.))
+                            .text_color(muted_fg),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted_fg)
+                                    .child(format!("Scheduled \u{b7} sends {when}")),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(fg.opacity(0.88))
+                                    .child(preview),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new(("chat-sched-send", row_ix))
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .label("Send now")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let taken = this
+                                            .drafts
+                                            .update(cx, |d, cx| d.take_scheduled(sched_ix, cx));
+                                        if let Some(entry) = taken {
+                                            this.deliver(entry, window, cx);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new(("chat-sched-cancel", row_ix))
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .label("Cancel")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        let taken = this
+                                            .drafts
+                                            .update(cx, |d, cx| d.take_scheduled(sched_ix, cx));
+                                        if let Some(entry) = taken {
+                                            if let Some(id) = entry.id {
+                                                this.bridge.send(Command::DeleteScheduledMessage {
+                                                    channel: entry.channel,
+                                                    scheduled_message_id: id,
+                                                });
+                                            }
+                                            notify(
+                                                "Scheduled message cancelled",
+                                                "Removed from the send queue.",
+                                                window,
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+            });
+        Some(
+            div()
+                .flex_none()
+                .mx_4()
+                .mb_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(border.opacity(0.65))
+                .bg(bg)
+                .overflow_hidden()
+                .child(
+                    v_flex()
+                        .id("chat-scheduled-list")
+                        .max_h(px(144.))
+                        .overflow_y_scroll()
+                        .children(rows),
+                ),
+        )
+    }
 }

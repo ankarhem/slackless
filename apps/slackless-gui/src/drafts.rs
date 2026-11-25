@@ -212,6 +212,50 @@ impl DraftsView {
         cx.notify();
     }
 
+    /// Pending scheduled messages for one conversation, paired with their index in `scheduled`
+    /// (earliest first), for the inline banner above the composer.
+    pub fn scheduled_for_channel(
+        &self,
+        workspace: usize,
+        channel: &ChannelId,
+    ) -> Vec<(usize, Entry)> {
+        self.scheduled
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.workspace == workspace && e.channel == *channel)
+            .map(|(ix, e)| (ix, e.clone()))
+            .collect()
+    }
+
+    /// Attach Slack's authoritative `scheduled_message_id` to an optimistic local scheduled entry
+    /// once `Event::MessageScheduled` confirms it, so immediate Cancel / Send now reaches Slack.
+    pub fn confirm_scheduled(
+        &mut self,
+        workspace: usize,
+        channel: &ChannelId,
+        post_at: u64,
+        id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.scheduled.iter_mut().find(|e| {
+            e.workspace == workspace && e.channel == *channel && e.id.is_none() && e.at == post_at
+        }) {
+            entry.id = Some(id);
+            cx.notify();
+        }
+    }
+
+    /// Remove and return the scheduled entry at `index` (used by inline Send now / Cancel).
+    pub fn take_scheduled(&mut self, index: usize, cx: &mut Context<Self>) -> Option<Entry> {
+        if index < self.scheduled.len() {
+            let entry = self.scheduled.remove(index);
+            cx.notify();
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
     /// Remove unconfirmed local optimistic scheduled entries (`id.is_none()`) for `workspace`
     /// when Slack rejects `chat.scheduleMessage` / `drafts.create`.
     pub fn drop_pending_scheduled(&mut self, workspace: usize, cx: &mut Context<Self>) {
@@ -616,6 +660,26 @@ mod tests {
             let ats: Vec<u64> = v.scheduled.iter().map(|e| e.at).collect();
             assert_eq!(ats, vec![100, 300]);
             assert!(v.scheduled.iter().all(|e| e.text != "optimistic"));
+        });
+
+        // `scheduled_for_channel`, `confirm_scheduled`, and `take_scheduled` back the inline chat strip.
+        view.update(cx, |v, cx| {
+            v.schedule(entry(0, &c1, "confirm-me", 250), cx);
+            v.confirm_scheduled(0, &c1, 250, "Q_CONFIRMED".to_owned(), cx);
+        });
+        let taken_ix = view.read_with(cx, |v, _| {
+            let for_c1 = v.scheduled_for_channel(0, &c1);
+            assert_eq!(for_c1.len(), 2);
+            assert_eq!(for_c1[1].1.id.as_deref(), Some("Q_CONFIRMED"));
+            for_c1[1].0
+        });
+        let taken = view.update(cx, |v, cx| v.take_scheduled(taken_ix, cx));
+        assert_eq!(
+            taken.as_ref().and_then(|e| e.id.as_deref()),
+            Some("Q_CONFIRMED")
+        );
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.scheduled_for_channel(0, &c1).len(), 1);
         });
 
         // `set_stored_sent` deduplicates within 5 seconds and sorts newest-first.

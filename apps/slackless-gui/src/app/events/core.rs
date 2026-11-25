@@ -335,7 +335,17 @@ impl App {
                 cx.notify();
             }
             Event::Connection(state) => {
+                let became_connected = matches!(
+                    state,
+                    slackless_core::rtm::ConnectionState::Connected { .. }
+                ) && !matches!(
+                    self.ws.connection,
+                    Some(slackless_core::rtm::ConnectionState::Connected { .. })
+                );
                 self.ws.connection = Some(state.clone());
+                if became_connected && !self.fixtures.sample {
+                    self.bridge.send(Command::LoadScheduledMessages);
+                }
                 cx.notify();
             }
             Event::OfflineQueueChanged(count) => {
@@ -355,16 +365,28 @@ impl App {
                     .flatten();
                 self.push_self_state(cx);
             }
-            Event::MessageScheduled { post_at, .. } => {
+            Event::MessageScheduled {
+                channel,
+                scheduled_message_id,
+                post_at,
+            } => {
+                let workspace = self.workspace;
+                self.drafts.update(cx, |drafts, cx| {
+                    drafts.confirm_scheduled(
+                        workspace,
+                        channel,
+                        *post_at,
+                        scheduled_message_id.clone(),
+                        cx,
+                    );
+                });
                 notify(
                     "Message scheduled",
-                    format!(
-                        "Sends {}. See Drafts & sent.",
-                        crate::drafts::when_label(*post_at, now_secs())
-                    ),
+                    format!("Sends {}.", crate::drafts::when_label(*post_at, now_secs())),
                     window,
                     cx,
                 );
+                cx.notify();
             }
             Event::ScheduledMessagesLoaded(Ok(list)) => {
                 let workspace = self.workspace;
@@ -382,6 +404,7 @@ impl App {
                 self.drafts.update(cx, |drafts, cx| {
                     drafts.set_remote_scheduled(workspace, entries, cx)
                 });
+                cx.notify();
             }
             Event::ScheduledMessagesLoaded(Err(error)) => {
                 tracing::warn!(error = %error, "failed to load scheduled messages");

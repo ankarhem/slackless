@@ -122,6 +122,7 @@ impl Render for App {
                         Some(joinable) => column.child(self.join_card(joinable, cx)),
                         None => column
                             .children(self.dnd_banner(conversation.as_ref(), cx))
+                            .children(self.scheduled_banner(cx))
                             .child(self.composer.clone()),
                     }
                 }

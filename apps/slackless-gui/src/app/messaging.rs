@@ -671,6 +671,7 @@ impl App {
         self.drafts
             .update(cx, |drafts, cx| drafts.schedule(entry, cx));
         self.save_draft(cx);
+        cx.notify();
         // In live mode, wait for Slack's `Event::MessageScheduled` confirmation (or surface
         // `Event::Error` on rejection) instead of showing a misleading success toast up front.
         if self.fixtures.sample {

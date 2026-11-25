@@ -184,10 +184,12 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
             | "prefs:audio:parakeet"
             | "prefs:audio:whisper"
             | "stealth"
+            | "scheduled"
             | "secret-guard"
             | "revisions"
             | "transcript"
             | "huddle:popout"
+            | "huddle:captions"
             | "profile"
             | "status"
             | "switcher"
@@ -261,6 +263,39 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                             list.append(ch, ghost_expanded, cx);
                             list.toggle_deleted(&expand_ts, cx);
                         });
+                    }
+                    "scheduled" => {
+                        let ch = app.channel.clone();
+                        let label = app.label(&ch);
+                        let now = now_secs();
+                        let ws = app.workspace;
+                        app.drafts.update(cx, |d, cx| {
+                            d.schedule(
+                                Entry {
+                                    id: Some("Q0DEMO1".to_owned()),
+                                    workspace: ws,
+                                    channel: ch.clone(),
+                                    label: label.clone(),
+                                    text: "Påminnelse: synka nya checkout-releasen innan lunch!"
+                                        .to_owned(),
+                                    at: now + 7_200,
+                                },
+                                cx,
+                            );
+                            d.schedule(
+                                Entry {
+                                    id: Some("Q0DEMO2".to_owned()),
+                                    workspace: ws,
+                                    channel: ch,
+                                    label,
+                                    text: "Good morning team — metrics look green after yesterday's deploy."
+                                        .to_owned(),
+                                    at: now + 86_400,
+                                },
+                                cx,
+                            );
+                        });
+                        cx.notify();
                     }
                     "secret-guard" => {
                         let leaked = format!(
