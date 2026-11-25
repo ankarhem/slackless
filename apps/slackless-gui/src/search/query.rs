@@ -41,6 +41,14 @@ impl SearchView {
         cx.notify();
     }
 
+    /// Re-run the active local FTS5 search (for example after a file transcript finishes indexing).
+    pub fn refresh_local(&mut self, cx: &mut Context<Self>) {
+        if !self.query.is_empty() {
+            self.run_local(cx);
+            cx.notify();
+        }
+    }
+
     pub(super) fn run_local(&mut self, cx: &mut Context<Self>) {
         self.local_gen = self.local_gen.wrapping_add(1);
         let generation = self.local_gen;
@@ -302,6 +310,9 @@ pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
                 store.upsert_message(&workspace, channel, message)?;
             }
         }
+        for (file_id, text) in &fixtures.file_transcripts {
+            store.upsert_file_transcript(&workspace, file_id, "local", text)?;
+        }
         Ok(store)
     };
     match seed() {
@@ -311,4 +322,96 @@ pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
             None
         }
     }
+}
+
+/// Find the first case-insensitive match for any search term in `query` inside `transcript` and
+/// return a ~120-char word-boundary context snippet around it.
+pub(crate) fn transcript_match_excerpt(transcript: &str, query: &str) -> Option<String> {
+    const WINDOW_CHARS: usize = 120;
+    const LEAD_CHARS: usize = 40;
+    const WORD_SNAP_LIMIT: usize = 20;
+
+    let parsed = SearchQuery::parse(query);
+    let terms: Vec<String> = parsed
+        .terms
+        .into_iter()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+
+    let collapsed = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    let chars: Vec<char> = collapsed.chars().collect();
+    // Build a lowercase string paired with each lowercase char's source index in `chars` so
+    // Unicode case-folding that expands a char never causes mid-character slicing panics.
+    let mut lowered = String::with_capacity(collapsed.len());
+    let mut byte_to_char_ix: Vec<usize> = Vec::with_capacity(collapsed.len());
+    for (ci, ch) in chars.iter().enumerate() {
+        for lc in ch.to_lowercase() {
+            lowered.push(lc);
+            byte_to_char_ix.resize(lowered.len(), ci);
+        }
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+    for term in &terms {
+        if let Some(byte_pos) = lowered.find(term.as_str()) {
+            let end_byte = (byte_pos + term.len()).min(lowered.len());
+            let start_char = byte_to_char_ix[byte_pos];
+            let end_char = if end_byte == 0 {
+                start_char
+            } else {
+                (byte_to_char_ix[end_byte - 1] + 1).min(chars.len())
+            };
+            if best.is_none_or(|(prev_start, _)| start_char < prev_start) {
+                best = Some((start_char, end_char));
+            }
+        }
+    }
+
+    let (match_start, match_end) = best?;
+    let total = chars.len();
+    if total <= WINDOW_CHARS {
+        return Some(collapsed);
+    }
+
+    let mut win_start = match_start.saturating_sub(LEAD_CHARS);
+    let mut win_end = (win_start + WINDOW_CHARS).min(total);
+    if win_end == total {
+        win_start = total.saturating_sub(WINDOW_CHARS);
+    }
+
+    if win_start > 0 {
+        let search_limit = (win_start + WORD_SNAP_LIMIT).min(match_start);
+        if let Some(offset) = chars[win_start..search_limit]
+            .iter()
+            .position(|c| *c == ' ')
+        {
+            win_start += offset + 1;
+        }
+    }
+    if win_end < total {
+        let search_floor = win_end.saturating_sub(WORD_SNAP_LIMIT).max(match_end);
+        if let Some(offset) = chars[search_floor..win_end].iter().rposition(|c| *c == ' ') {
+            win_end = search_floor + offset;
+        }
+    }
+
+    let slice: String = chars[win_start..win_end].iter().collect();
+    let trimmed = slice.trim();
+    let mut out = String::with_capacity(trimmed.len() + 6);
+    if win_start > 0 {
+        out.push('\u{2026}');
+    }
+    out.push_str(trimmed);
+    if win_end < total {
+        out.push('\u{2026}');
+    }
+    Some(out)
 }

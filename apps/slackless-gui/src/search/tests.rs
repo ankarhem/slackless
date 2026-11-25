@@ -11,6 +11,7 @@ use slackless_core::types::{
 };
 
 use super::SearchView;
+use super::query::transcript_match_excerpt;
 use super::state::SearchTab;
 
 #[gpui::test]
@@ -289,4 +290,55 @@ fn search_view_local_fts_exclusions_remote_query_pagination_and_channel_dedup(
         assert_eq!(v.transcript_results[0].call_id, "R0HUDDLE1");
         assert_eq!(v.transcript_results[0].lang.as_deref(), Some("sv"));
     });
+}
+
+#[test]
+fn transcript_match_excerpt_handles_case_word_boundaries_modifiers_and_non_matches() {
+    // Short transcript matching case-insensitively returns full trimmed text without ellipses.
+    let short = "We shipped the Checkout rollout yesterday afternoon.";
+    assert_eq!(
+        transcript_match_excerpt(short, "CHECKOUT").as_deref(),
+        Some(short)
+    );
+
+    // Search modifiers are stripped before matching free-text terms.
+    assert_eq!(
+        transcript_match_excerpt(short, "in:#general from:@alice rollout").as_deref(),
+        Some(short)
+    );
+
+    // No match or empty/modifier-only query returns None.
+    assert_eq!(transcript_match_excerpt(short, "kubernetes"), None);
+    assert_eq!(transcript_match_excerpt(short, ""), None);
+    assert_eq!(
+        transcript_match_excerpt(short, "in:#general has:file"),
+        None
+    );
+
+    // Long transcript windows cleanly around the first matching term on word boundaries.
+    let long = "Welcome everyone to the weekly engineering sync. First we reviewed Q4 latency numbers across all payment adapters and confirmed p99 stayed below forty milliseconds. Next we discussed the upcoming canary deployment schedule for Stockholm and Oslo regions before wrapping up with action items for Friday.";
+    let excerpt = transcript_match_excerpt(long, "canary").expect("must match canary");
+    assert!(
+        excerpt.starts_with('\u{2026}'),
+        "expected leading ellipsis: {excerpt}"
+    );
+    assert!(
+        excerpt.ends_with('\u{2026}'),
+        "expected trailing ellipsis: {excerpt}"
+    );
+    assert!(excerpt.contains("canary deployment"));
+    assert!(
+        excerpt.chars().count() <= 130,
+        "expected ~120-char window, got {} chars: {excerpt}",
+        excerpt.chars().count()
+    );
+    // Word-boundary snap: shouldn't cut "upcoming" or "canary" mid-word.
+    let inner = excerpt.trim_matches('\u{2026}');
+    assert!(!inner.starts_with(' '), "trimmed inner start: {excerpt}");
+    assert!(!inner.ends_with(' '), "trimmed inner end: {excerpt}");
+
+    // Non-ASCII / Swedish text does not panic on Unicode char boundaries.
+    let sv = "Hej alla, vi kör en snabb genomgång av ÅÄÖ-releasen för betalflödet imorgon bitti innan kunderna vaknar och testar hela flödet i produktion tillsammans.";
+    let sv_excerpt = transcript_match_excerpt(sv, "betalflödet").expect("must match swedish term");
+    assert!(sv_excerpt.contains("betalflödet"));
 }

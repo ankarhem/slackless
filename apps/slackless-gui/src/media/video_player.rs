@@ -8,6 +8,8 @@
 //! playback position cleanly with zero duplicate audio.
 
 use std::cell::Cell;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +21,10 @@ use gpui_kit::gpui::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas, div, px, relative,
     rgb,
 };
-use slackless_core::huddle::NativeVideoPlayer;
+use slackless_core::huddle::{
+    NativeVideoPlayer, TranscriptionProvider, resolve_local_file_provider,
+};
+use slackless_core::types::FileId;
 
 use super::audio_player::fetch_cached_media;
 use super::downloads::active_fetcher;
@@ -46,9 +51,17 @@ pub struct InlineVideoSnapshot {
     pub failed: bool,
     pub position_secs: f64,
     pub duration_secs: f64,
+    pub rate: f32,
     pub width: u32,
     pub height: u32,
     pub surface: Option<Arc<VideoSurface>>,
+}
+
+/// Carried-over inline playback state when expanding a video into [`crate::image_viewer::ImageViewer`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InlineVideoHandoff {
+    pub position_secs: f64,
+    pub rate: f32,
 }
 
 struct ActiveInlineVideo {
@@ -64,9 +77,9 @@ struct ActiveInlineVideo {
 struct InlineVideoManager {
     next_generation: u64,
     active: Option<ActiveInlineVideo>,
-    /// One-shot `(file_id, position_secs)` stashed when expanding from inline playback into
-    /// [`crate::image_viewer::ImageViewer`] so the viewer resumes at the exact timestamp.
-    pending_handoff: Option<(String, f64)>,
+    /// One-shot `(file_id, handoff)` stashed when expanding from inline playback into
+    /// [`crate::image_viewer::ImageViewer`] so the viewer resumes at the exact timestamp and speed.
+    pending_handoff: Option<(String, InlineVideoHandoff)>,
 }
 
 impl InlineVideoManager {
@@ -75,7 +88,7 @@ impl InlineVideoManager {
         self.next_generation
     }
 
-    fn stop_matching(&mut self, file_id: &str) -> Option<f64> {
+    fn stop_matching(&mut self, file_id: &str) -> Option<InlineVideoHandoff> {
         let matches = self
             .active
             .as_ref()
@@ -85,31 +98,36 @@ impl InlineVideoManager {
         }
         self.next_gen();
         let active = self.active.take()?;
-        active_resume_position(&active)
+        active_resume_handoff(&active)
     }
 
-    fn stop_all(&mut self) -> Option<(String, f64)> {
+    fn stop_all(&mut self) -> Option<(String, InlineVideoHandoff)> {
         self.next_gen();
         let active = self.active.take()?;
-        let pos = active_resume_position(&active).unwrap_or(0.0);
-        Some((active.file_id, pos))
+        let handoff = active_resume_handoff(&active).unwrap_or(InlineVideoHandoff {
+            position_secs: 0.0,
+            rate: 1.0,
+        });
+        Some((active.file_id, handoff))
     }
 
-    fn stash_handoff(&mut self, file_id: String, pos_secs: f64) {
-        if pos_secs.is_finite() && pos_secs > 0.05 {
-            self.pending_handoff = Some((file_id, pos_secs));
+    fn stash_handoff(&mut self, file_id: String, handoff: InlineVideoHandoff) {
+        if (handoff.position_secs.is_finite() && handoff.position_secs > 0.05)
+            || (handoff.rate - 1.0).abs() > 0.01
+        {
+            self.pending_handoff = Some((file_id, handoff));
         } else {
             self.pending_handoff = None;
         }
     }
 
-    fn take_handoff(&mut self, file_id: &str) -> Option<f64> {
+    fn take_handoff(&mut self, file_id: &str) -> Option<InlineVideoHandoff> {
         if self
             .pending_handoff
             .as_ref()
             .is_some_and(|(id, _)| id == file_id)
         {
-            self.pending_handoff.take().map(|(_, pos)| pos)
+            self.pending_handoff.take().map(|(_, handoff)| handoff)
         } else {
             None
         }
@@ -118,11 +136,24 @@ impl InlineVideoManager {
 
 impl Global for InlineVideoManager {}
 
-fn active_resume_position(active: &ActiveInlineVideo) -> Option<f64> {
+fn active_resume_handoff(active: &ActiveInlineVideo) -> Option<InlineVideoHandoff> {
     let player = active.player.as_ref()?;
     let st = player.state();
-    if !st.ended && st.position_secs.is_finite() && st.position_secs > 0.05 {
-        Some(st.position_secs)
+    let pos = if !st.ended && st.position_secs.is_finite() && st.position_secs > 0.05 {
+        st.position_secs
+    } else {
+        0.0
+    };
+    let rate = if st.rate.is_finite() && st.rate > 0.0 {
+        st.rate
+    } else {
+        1.0
+    };
+    if pos > 0.05 || (rate - 1.0).abs() > 0.01 {
+        Some(InlineVideoHandoff {
+            position_secs: pos,
+            rate,
+        })
     } else {
         None
     }
@@ -153,6 +184,7 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
             failed: false,
             position_secs: 0.0,
             duration_secs: 0.0,
+            rate: 1.0,
             width: 0,
             height: 0,
             surface: active.last_frame.clone(),
@@ -161,6 +193,11 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
     let player = active.player.as_ref()?;
     let st = player.state();
     let surface = copy_player_surface(player).or_else(|| active.last_frame.clone());
+    let rate = if st.rate.is_finite() && st.rate > 0.0 {
+        st.rate
+    } else {
+        1.0
+    };
     Some(InlineVideoSnapshot {
         loading: false,
         playing: st.playing,
@@ -169,10 +206,29 @@ pub fn inline_video_snapshot(file_id: &str, cx: &App) -> Option<InlineVideoSnaps
         failed: st.failed,
         position_secs: sanitize_secs(st.position_secs),
         duration_secs: sanitize_secs(st.duration_secs),
+        rate,
         width: st.width,
         height: st.height,
         surface,
     })
+}
+
+/// Whether `url` points to an HLS playlist (`.m3u8`) that `AVPlayer` must stream directly via
+/// [`NativeVideoPlayer::open_url`] instead of caching locally.
+pub fn is_hls_url(url: &str) -> bool {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    base.to_ascii_lowercase().ends_with(".m3u8")
+}
+
+/// Format a playback rate (`1.0`, `1.5`, `2.0`) as a compact button label (`1x`, `1.5x`, `2x`).
+pub fn format_playback_rate(rate: f32) -> &'static str {
+    if !rate.is_finite() || rate < 1.25 {
+        "1x"
+    } else if rate < 1.75 {
+        "1.5x"
+    } else {
+        "2x"
+    }
 }
 
 /// Start native in-app video playback inline inside the chat card for `file_id`.
@@ -187,14 +243,20 @@ pub fn play_inline_video(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(fetcher) = active_fetcher(cx) else {
-        crate::actions::notify(
-            "Video playback",
-            "Playback needs a signed-in workspace.",
-            window,
-            cx,
-        );
-        return;
+    let hls = is_hls_url(&url);
+    let fetcher = if hls {
+        active_fetcher(cx)
+    } else {
+        let Some(fetcher) = active_fetcher(cx) else {
+            crate::actions::notify(
+                "Video playback",
+                "Playback needs a signed-in workspace.",
+                window,
+                cx,
+            );
+            return;
+        };
+        Some(fetcher)
     };
     let mgr = cx.default_global::<InlineVideoManager>();
     let generation = mgr.next_gen();
@@ -210,16 +272,26 @@ pub fn play_inline_video(
     window.refresh();
 
     let cache_id = file_id.clone();
+    let fetch_url = url.clone();
+    let fetch_ext = ext.clone();
     window
         .spawn(cx, async move |cx| {
             let bg = cx.background_executor().clone();
-            let path = fetch_cached_media(fetcher, cache_id, url, ext, bg.clone()).await;
-            let open_res = match path {
-                Ok(path) => bg
-                    .spawn(async move { NativeVideoPlayer::open(&path) })
+            let open_res = if hls {
+                bg.spawn(async move { NativeVideoPlayer::open_url(&fetch_url, None) })
                     .await
-                    .map_err(|e| e.to_string()),
-                Err(err) => Err(err),
+                    .map_err(|e| e.to_string())
+            } else {
+                let fetcher = fetcher.expect("fetcher validated for non-HLS media");
+                let path =
+                    fetch_cached_media(fetcher, cache_id, fetch_url, fetch_ext, bg.clone()).await;
+                match path {
+                    Ok(path) => bg
+                        .spawn(async move { NativeVideoPlayer::open(&path) })
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(err) => Err(err),
+                }
             };
             let started = cx
                 .update(|window, cx| {
@@ -250,6 +322,16 @@ pub fn play_inline_video(
                                 active.player = Some(player);
                                 active.tick_gen = active.tick_gen.wrapping_add(1);
                                 tick_gen = active.tick_gen;
+                            }
+                            if !hls && !file_id.starts_with("bk-video-") {
+                                transcribe_media(
+                                    FileId::from(file_id.clone()),
+                                    url,
+                                    ext,
+                                    true,
+                                    window,
+                                    cx,
+                                );
                             }
                             window.refresh();
                             Some(tick_gen)
@@ -307,6 +389,16 @@ pub fn toggle_inline_video_mute(file_id: &str, window: &mut Window, cx: &mut App
     window.refresh();
 }
 
+/// Cycle playback speed (`1x -> 1.5x -> 2x -> 1x`) on the active inline video matching `file_id`.
+pub fn cycle_inline_video_rate(file_id: &str, window: &mut Window, cx: &mut App) -> Option<f32> {
+    let mgr = cx.default_global::<InlineVideoManager>();
+    let active = mgr.active.as_mut().filter(|a| a.file_id == file_id)?;
+    let player = active.player.as_ref()?;
+    let rate = player.cycle_rate();
+    window.refresh();
+    Some(rate)
+}
+
 /// Seek the active inline video matching `file_id` to `secs`.
 pub fn seek_inline_video(file_id: &str, secs: f64, window: &mut Window, cx: &mut App) {
     let kick = {
@@ -338,48 +430,206 @@ pub fn seek_inline_video(file_id: &str, secs: f64, window: &mut Window, cx: &mut
 pub fn stop_inline_video(file_id: &str, window: &mut Window, cx: &mut App) -> Option<f64> {
     let pos = cx
         .default_global::<InlineVideoManager>()
-        .stop_matching(file_id);
+        .stop_matching(file_id)
+        .filter(|h| h.position_secs > 0.05)
+        .map(|h| h.position_secs);
     window.refresh();
     pos
 }
 
-/// Stop inline playback for `file_id` and stash its playback position so opening
-/// [`crate::image_viewer::ImageViewer`] immediately resumes from the same timestamp.
+/// Stop inline playback for `file_id` and stash its playback position and speed so opening
+/// [`crate::image_viewer::ImageViewer`] immediately resumes cleanly.
 pub fn stop_inline_video_for_expand(
     file_id: &str,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<f64> {
     let mgr = cx.default_global::<InlineVideoManager>();
-    let pos = mgr.stop_matching(file_id);
-    if let Some(secs) = pos {
-        mgr.stash_handoff(file_id.to_owned(), secs);
+    let handoff = mgr.stop_matching(file_id);
+    let pos = handoff
+        .as_ref()
+        .filter(|h| h.position_secs > 0.05)
+        .map(|h| h.position_secs);
+    if let Some(handoff) = handoff {
+        mgr.stash_handoff(file_id.to_owned(), handoff);
     }
     window.refresh();
     pos
 }
 
 /// Called by [`crate::image_viewer::ImageViewer`] when starting playback of `file_id`: stops any
-/// active inline video so audio never overlaps, and returns the carried-over timestamp if the
-/// same video was just playing inline (or expanded via [`stop_inline_video_for_expand`]).
+/// active inline video so audio never overlaps, and returns the carried-over timestamp & speed if
+/// the same video was just playing inline (or expanded via [`stop_inline_video_for_expand`]).
 pub(crate) fn take_inline_handoff_for_viewer(
     file_id: &str,
     window: &mut Window,
     cx: &mut App,
-) -> Option<f64> {
+) -> Option<InlineVideoHandoff> {
     let mgr = cx.default_global::<InlineVideoManager>();
     let stashed = mgr.take_handoff(file_id);
     let stopped = mgr.stop_all();
     let had_active = stopped.is_some();
     let carry = stashed.or_else(|| {
         stopped
-            .filter(|(id, pos)| id == file_id && *pos > 0.05)
-            .map(|(_, pos)| pos)
+            .filter(|(id, h)| {
+                id == file_id && (h.position_secs > 0.05 || (h.rate - 1.0).abs() > 0.01)
+            })
+            .map(|(_, h)| h)
     });
     if had_active {
         window.refresh();
     }
     carry
+}
+
+type DispatchTranscribeFn = Rc<dyn Fn(FileId, PathBuf, TranscriptionProvider, &mut App)>;
+type PreferredProviderFn = Rc<dyn Fn(&App) -> TranscriptionProvider>;
+type HasTranscriptFn = Rc<dyn Fn(&FileId, &App) -> bool>;
+
+/// Global hook bridging media playback / card UI to the active workspace's
+/// `CollabCommand::TranscribeMediaFile` pipeline without duplicating concurrent jobs.
+#[derive(Default)]
+pub struct TranscriptionDispatcher {
+    dispatch: Option<DispatchTranscribeFn>,
+    preferred_provider: Option<PreferredProviderFn>,
+    has_transcript: Option<HasTranscriptFn>,
+    in_progress: HashSet<FileId>,
+    manual_requests: HashSet<FileId>,
+}
+
+impl Global for TranscriptionDispatcher {}
+
+/// Install the active workspace transcription dispatch hooks (called once from `app/bootstrap.rs`).
+pub fn install_transcription_dispatcher(
+    dispatch: impl Fn(FileId, PathBuf, TranscriptionProvider, &mut App) + 'static,
+    preferred_provider: impl Fn(&App) -> TranscriptionProvider + 'static,
+    has_transcript: impl Fn(&FileId, &App) -> bool + 'static,
+    cx: &mut App,
+) {
+    let state = cx.default_global::<TranscriptionDispatcher>();
+    state.dispatch = Some(Rc::new(dispatch));
+    state.preferred_provider = Some(Rc::new(preferred_provider));
+    state.has_transcript = Some(Rc::new(has_transcript));
+}
+
+/// Whether `file_id` currently has an in-flight local transcription job.
+pub fn is_transcribing(file_id: &FileId, cx: &App) -> bool {
+    cx.try_global::<TranscriptionDispatcher>()
+        .is_some_and(|d| d.in_progress.contains(file_id))
+}
+
+/// Clear `file_id` from the in-progress set when core emits `FileTranscriptReady` or
+/// `FileTranscriptFailed`. Returns `true` if this transcription was explicitly triggered by the
+/// user clicking "Transcribe" (vs. silent background auto-transcription on play).
+pub fn finish_transcription(file_id: &FileId, cx: &mut App) -> bool {
+    let state = cx.default_global::<TranscriptionDispatcher>();
+    state.in_progress.remove(file_id);
+    state.manual_requests.remove(file_id)
+}
+
+/// Download/cache `url` (instant cache hit if already played) and dispatch local STT transcription
+/// for `file_id` via `CollabCommand::TranscribeMediaFile`.
+///
+/// - When `auto == true`: silent no-op if a transcript already exists, a job is already in flight,
+///   or no local transcription model (`ParakeetV3` / `WhisperTurbo`) is downloaded yet.
+/// - When `auto == false` (explicit button click): shows a toast guiding the user to download a
+///   local model in Preferences → Audio & Video if none is ready.
+pub fn transcribe_media(
+    file_id: FileId,
+    url: String,
+    ext: String,
+    auto: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if is_hls_url(&url) {
+        if !auto {
+            crate::actions::notify(
+                "Transcription unavailable",
+                "HLS streams cannot be transcribed locally.",
+                window,
+                cx,
+            );
+        }
+        return;
+    }
+
+    let (already_in_progress, dispatch_fn, provider_fn, has_tr_fn) = {
+        let Some(state) = cx.try_global::<TranscriptionDispatcher>() else {
+            return;
+        };
+        (
+            state.in_progress.contains(&file_id),
+            state.dispatch.clone(),
+            state.preferred_provider.clone(),
+            state.has_transcript.clone(),
+        )
+    };
+    if already_in_progress {
+        return;
+    }
+    let Some(dispatch_fn) = dispatch_fn else {
+        return;
+    };
+    if auto && has_tr_fn.as_ref().is_some_and(|f| f(&file_id, cx)) {
+        return;
+    }
+
+    let user_provider = provider_fn
+        .as_ref()
+        .map_or(TranscriptionProvider::SlackBuiltIn, |f| f(cx));
+    let Some(provider) = resolve_local_file_provider(user_provider) else {
+        if !auto {
+            crate::actions::notify(
+                "Local transcription model needed",
+                "Download Parakeet v3 or Whisper Turbo in Preferences \u{2192} Audio & Video to transcribe videos locally.",
+                window,
+                cx,
+            );
+        }
+        return;
+    };
+
+    let Some(fetcher) = active_fetcher(cx) else {
+        if !auto {
+            crate::actions::notify(
+                "Transcription",
+                "Transcription needs a signed-in workspace.",
+                window,
+                cx,
+            );
+        }
+        return;
+    };
+
+    {
+        let state = cx.default_global::<TranscriptionDispatcher>();
+        state.in_progress.insert(file_id.clone());
+        if !auto {
+            state.manual_requests.insert(file_id.clone());
+        }
+    }
+    window.refresh();
+
+    let cache_id = file_id.to_string();
+    window
+        .spawn(cx, async move |cx| {
+            let bg = cx.background_executor().clone();
+            let fetched = fetch_cached_media(fetcher, cache_id, url, ext, bg).await;
+            let _ = cx.update(|window, cx| match fetched {
+                Ok(local_path) => {
+                    dispatch_fn(file_id, local_path, provider, cx);
+                }
+                Err(err) => {
+                    let was_manual = finish_transcription(&file_id, cx);
+                    if was_manual {
+                        crate::actions::notify("Transcription failed", err, window, cx);
+                    }
+                    window.refresh();
+                }
+            });
+        })
+        .detach();
 }
 
 fn spawn_inline_refresh_loop(generation: u64, tick_gen: u64, window: &mut Window, cx: &mut App) {
@@ -672,14 +922,43 @@ mod tests {
         assert!(mgr.active.is_none());
 
         // One-shot handoff only matches its file_id and clears on take.
-        mgr.stash_handoff("F_VID_2".into(), 12.5);
+        mgr.stash_handoff(
+            "F_VID_2".into(),
+            InlineVideoHandoff {
+                position_secs: 12.5,
+                rate: 1.5,
+            },
+        );
         assert_eq!(mgr.take_handoff("F_OTHER"), None);
-        assert_eq!(mgr.take_handoff("F_VID_2"), Some(12.5));
+        assert_eq!(
+            mgr.take_handoff("F_VID_2"),
+            Some(InlineVideoHandoff {
+                position_secs: 12.5,
+                rate: 1.5,
+            })
+        );
         assert_eq!(mgr.take_handoff("F_VID_2"), None);
 
-        // Near-zero timestamps are ignored for handoff.
-        mgr.stash_handoff("F_VID_2".into(), 0.01);
+        // Near-zero timestamps at default 1.0x speed are ignored for handoff.
+        mgr.stash_handoff(
+            "F_VID_2".into(),
+            InlineVideoHandoff {
+                position_secs: 0.01,
+                rate: 1.0,
+            },
+        );
         assert_eq!(mgr.take_handoff("F_VID_2"), None);
+
+        // Rate formatting & HLS URL detection helpers.
+        assert_eq!(format_playback_rate(1.0), "1x");
+        assert_eq!(format_playback_rate(1.5), "1.5x");
+        assert_eq!(format_playback_rate(2.0), "2x");
+        assert_eq!(format_playback_rate(f32::NAN), "1x");
+        assert!(is_hls_url(
+            "https://files.slack.com/hls/clip/master.m3u8?t=1"
+        ));
+        assert!(is_hls_url("https://cdn.example.com/VIDEO.M3U8"));
+        assert!(!is_hls_url("https://files.slack.com/pri/clip.mp4"));
     }
 
     #[cfg(target_os = "macos")]
@@ -734,7 +1013,9 @@ mod tests {
         let stopped_pos = mgr.stop_matching("F_SYNTH");
         assert!(mgr.active.is_none());
         assert!(
-            stopped_pos.is_some_and(|p| p >= 0.25),
+            stopped_pos
+                .as_ref()
+                .is_some_and(|h| h.position_secs >= 0.25),
             "expected stopped position >= 0.25s, got {stopped_pos:?}"
         );
         let _ = std::fs::remove_file(&path);

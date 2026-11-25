@@ -95,6 +95,7 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
         if let Some(snap) = crate::media::inline_video_snapshot(&vid_id, cx) {
             let fg = crate::theme::media_overlay_foreground();
             let id_toggle = vid_id.clone();
+            let id_rate = vid_id.clone();
             let id_mute = vid_id.clone();
             let id_close = vid_id.clone();
             let poster = Some(ImageSource::from(SharedString::from(thumb)));
@@ -157,6 +158,27 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                                 h_flex()
                                     .items_center()
                                     .gap_1()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "bk-video-rate-{}-{ix}",
+                                                kcx.ts.as_str()
+                                            )))
+                                            .px_1()
+                                            .py(px(1.))
+                                            .rounded_sm()
+                                            .text_size(px(10.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(fg)
+                                            .cursor_pointer()
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                crate::media::cycle_inline_video_rate(
+                                                    &id_rate, window, cx,
+                                                );
+                                            })
+                                            .child(crate::media::format_playback_rate(snap.rate)),
+                                    )
                                     .child(
                                         div()
                                             .id(SharedString::from(format!(
@@ -243,6 +265,7 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                     lower.ends_with(".mp4")
                         || lower.ends_with(".mov")
                         || lower.ends_with(".webm")
+                        || crate::media::is_hls_url(&href)
                         || lower.contains("files.slack.com")
                 };
                 let target = LinkTarget::Url(href.clone().into());

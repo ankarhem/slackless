@@ -11,6 +11,7 @@ use gpui_kit::gpui::{
 };
 use slackless_core::types::{File, FileId};
 
+use crate::fixtures::Fixtures;
 use crate::image_viewer::{ImageClick, ImageOrigin};
 
 use super::gallery::download_button;
@@ -38,8 +39,9 @@ struct ClipTranscriptStore {
 impl Global for ClipTranscriptStore {}
 
 /// Expandable clip transcript pill + transcript panel (`F-CORE-129`).
-fn clip_transcript_section(file: &File, cx: &App) -> Option<Div> {
-    let inline = inline_clip_transcript(file);
+fn clip_transcript_section(fixtures: &Fixtures, file: &File, cx: &App) -> Option<Div> {
+    let stored = fixtures.file_transcript(&file.id).map(str::to_owned);
+    let inline = stored.or_else(|| inline_clip_transcript(file));
     let vtt_url = clip_vtt_url(file);
     if inline.is_none() && vtt_url.is_none() {
         return None;
@@ -158,36 +160,108 @@ fn clip_transcript_section(file: &File, cx: &App) -> Option<Div> {
     )
 }
 
+/// Subtle header pill button triggering local on-device transcription when no transcript exists yet.
+fn transcribe_pill_button(
+    fixtures: &Fixtures,
+    file: &File,
+    play_url: Option<&str>,
+    ext: String,
+    cx: &App,
+) -> Option<gpui_kit::gpui::Stateful<Div>> {
+    let has_transcript =
+        fixtures.file_transcript(&file.id).is_some() || inline_clip_transcript(file).is_some();
+    if has_transcript {
+        return None;
+    }
+    let url = play_url
+        .filter(|u| !u.is_empty() && !crate::media::is_hls_url(u))?
+        .to_owned();
+    let theme = cx.theme();
+    let transcribing = crate::media::is_transcribing(&file.id, cx);
+    let fid = file.id.clone();
+    Some(
+        h_flex()
+            .id(SharedString::from(format!("media-transcribe-{}", file.id)))
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_1p5()
+            .py(px(1.))
+            .rounded_sm()
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.muted_foreground)
+            .when(!transcribing, |el| {
+                el.cursor_pointer()
+                    .hover(|h| h.bg(theme.secondary_hover).text_color(theme.foreground))
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Icon::new(IconName::Captions)
+                    .size(px(11.))
+                    .text_color(theme.muted_foreground),
+            )
+            .child(if transcribing {
+                "Transcribing\u{2026}"
+            } else {
+                "Transcribe"
+            })
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                if !transcribing {
+                    crate::media::transcribe_media(
+                        fid.clone(),
+                        url.clone(),
+                        ext.clone(),
+                        false,
+                        window,
+                        cx,
+                    );
+                }
+            }),
+    )
+}
+
 /// Slack-style inline audio player card for uploaded audio files and voice clips.
-pub(super) fn audio_card(file: &File, cx: &App) -> Div {
+pub(super) fn audio_card(fixtures: &Fixtures, file: &File, cx: &App) -> Div {
     let theme = cx.theme();
     let id_str = file.id.to_string();
     let state = crate::media::audio_state(&id_str, cx);
     let playing = state.as_ref().is_some_and(|s| s.playing);
     let paused = state.as_ref().is_some_and(|s| s.paused);
     let loading = state.as_ref().is_some_and(|s| s.loading);
+    let active = playing || paused;
+    let rate = state.as_ref().map_or(1.0, |s| s.rate);
+    let muted = state.as_ref().is_some_and(|s| s.muted);
     let duration_ms = state
         .as_ref()
         .and_then(|s| s.duration_ms)
         .or_else(|| media_duration_ms(file));
-    let elapsed_ms = state.as_ref().map(|s| s.elapsed_ms).unwrap_or(0);
-    let progress = match duration_ms {
-        Some(total) if total > 0 && (playing || paused) => {
-            (elapsed_ms as f32 / total as f32).clamp(0., 1.)
-        }
-        _ => 0.,
+    let duration_secs = state
+        .as_ref()
+        .map(|s| s.duration_secs)
+        .filter(|&d| d > 0.0)
+        .unwrap_or_else(|| duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0));
+    let position_secs = state.as_ref().map_or(0.0, |s| s.position_secs);
+    let progress = if active {
+        crate::media::progress_fraction(position_secs, duration_secs)
+    } else {
+        0.0
     };
     let status_text = if loading {
         "Loading audio\u{2026}".to_owned()
-    } else if playing || paused {
+    } else if active {
         let prefix = if paused { "Paused \u{b7} " } else { "" };
-        match duration_ms {
-            Some(total) => format!(
+        if duration_secs > 0.0 {
+            format!(
                 "{prefix}{} / {}",
-                format_duration(elapsed_ms),
-                format_duration(total)
-            ),
-            None => format!("{prefix}{}", format_duration(elapsed_ms)),
+                crate::media::format_video_time(position_secs),
+                crate::media::format_video_time(duration_secs)
+            )
+        } else {
+            format!("{prefix}{}", crate::media::format_video_time(position_secs))
         }
     } else {
         let kind = file
@@ -215,15 +289,44 @@ pub(super) fn audio_card(file: &File, cx: &App) -> Div {
     let dl_url = download_url(file);
     let name = file_name(file);
     let ext = file_ext(file, "m4a");
+    let transcribe_btn =
+        transcribe_pill_button(fixtures, file, play_url.as_deref(), ext.clone(), cx);
     let play_icon = if playing {
         IconName::Pause
     } else {
         IconName::Play
     };
-    let stop_btn = (playing || paused).then(|| {
+    let id_seek = id_str.clone();
+    let id_rate = id_str.clone();
+    let id_mute = id_str.clone();
+    let rate_btn = active.then(|| {
         div()
-            .id(SharedString::from(format!("audio-stop-{}", file.id)))
-            .size(px(28.))
+            .id(SharedString::from(format!("audio-rate-{}", file.id)))
+            .flex_none()
+            .px_1p5()
+            .h(px(22.))
+            .rounded_sm()
+            .border_1()
+            .border_color(theme.border)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.foreground)
+            .cursor_pointer()
+            .hover(|b| b.bg(theme.secondary_hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::media::format_playback_rate(rate))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                crate::media::cycle_audio_rate(&id_rate, window, cx);
+            })
+    });
+    let mute_btn = active.then(|| {
+        div()
+            .id(SharedString::from(format!("audio-mute-{}", file.id)))
+            .size(px(24.))
             .flex_none()
             .rounded_sm()
             .flex()
@@ -231,12 +334,40 @@ pub(super) fn audio_card(file: &File, cx: &App) -> Div {
             .justify_center()
             .cursor_pointer()
             .hover(|b| b.bg(theme.secondary_hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Icon::new(if muted {
+                    IconName::VolumeX
+                } else {
+                    IconName::Volume2
+                })
+                .text_color(theme.muted_foreground)
+                .size(px(14.)),
+            )
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                crate::media::toggle_audio_mute(&id_mute, window, cx);
+            })
+    });
+    let stop_btn = active.then(|| {
+        div()
+            .id(SharedString::from(format!("audio-stop-{}", file.id)))
+            .size(px(24.))
+            .flex_none()
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|b| b.bg(theme.secondary_hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 Icon::new(IconName::Square)
                     .text_color(theme.muted_foreground)
-                    .size(px(13.)),
+                    .size(px(12.)),
             )
             .on_click(move |_, window, cx| {
+                cx.stop_propagation();
                 crate::media::stop_audio(window, cx);
             })
     });
@@ -291,7 +422,7 @@ pub(super) fn audio_card(file: &File, cx: &App) -> Div {
     });
     let wave = audio_wave_bars(file);
     let has_wave = !wave.is_empty();
-    let transcript = clip_transcript_section(file, cx);
+    let transcript = clip_transcript_section(fixtures, file, cx);
     let card = h_flex()
         .w(px(CARD_W))
         .max_w_full()
@@ -309,54 +440,91 @@ pub(super) fn audio_card(file: &File, cx: &App) -> Div {
                 .min_w_0()
                 .gap_1()
                 .child(
-                    div()
-                        .truncate()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(file_name(file)),
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(file_name(file)),
+                        )
+                        .children(transcribe_btn),
                 )
-                .when(has_wave, |col| {
+                .when(has_wave && !active, |col| {
                     let total = wave.len();
                     col.child(h_flex().items_center().gap(px(2.)).h(px(18.)).children(
                         wave.into_iter().enumerate().map(|(ix, amp)| {
                             let filled = (ix as f32 / total.max(1) as f32) <= progress;
                             let h = (4. + amp * 13.).clamp(4., 17.);
-                            div().w(px(3.)).h(px(h)).rounded_full().bg(
-                                if filled && (playing || paused) {
+                            div()
+                                .w(px(3.))
+                                .h(px(h))
+                                .rounded_full()
+                                .bg(if filled && active {
                                     theme.primary
                                 } else {
                                     theme.foreground.opacity(0.28)
-                                },
-                            )
+                                })
                         }),
                     ))
                 })
-                .when(!has_wave && (playing || duration_ms.is_some()), |col| {
+                .when(active, |col| {
+                    col.child(h_flex().w_full().items_center().child(
+                        crate::media::video_scrub_bar(
+                            SharedString::from(format!("audio-scrub-{}", file.id)),
+                            progress,
+                            duration_secs,
+                            theme.border,
+                            theme.primary,
+                            move |secs, window, cx| {
+                                crate::media::seek_audio(&id_seek, secs, window, cx);
+                            },
+                        ),
+                    ))
+                })
+                .when(!active && !has_wave && duration_ms.is_some(), |col| {
                     col.child(
                         div()
                             .w_full()
                             .h(px(4.))
                             .rounded_full()
                             .bg(theme.border)
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(px((220. * progress).max(if playing { 6. } else { 0. })))
-                                    .rounded_full()
-                                    .bg(theme.primary),
-                            ),
+                            .overflow_hidden(),
                     )
                 })
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(status_text),
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(status_text),
+                        )
+                        .when(active, |row| {
+                            row.child(
+                                h_flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap_1()
+                                    .children(rate_btn)
+                                    .children(mute_btn)
+                                    .children(stop_btn),
+                            )
+                        }),
                 ),
         )
-        .children(stop_btn)
         .children(dl_btn);
     v_flex().gap_1().child(card).children(transcript)
 }
@@ -385,7 +553,13 @@ fn inline_transport_button(
 /// Slack-style inline video card: clicking the centered Play button plays natively right inside
 /// the chat card with compact transport controls; clicking anywhere else on the poster preview
 /// (or clicking Expand while playing) opens the video inside [`crate::image_viewer::ImageViewer`].
-pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, cx: &App) -> Div {
+pub(super) fn video_card(
+    fixtures: &Fixtures,
+    file: &File,
+    ix: usize,
+    on_open: Option<&ImageClick>,
+    cx: &App,
+) -> Div {
     let theme = cx.theme();
     let id_str = file.id.to_string();
     let snap = crate::media::inline_video_snapshot(&id_str, cx);
@@ -402,6 +576,8 @@ pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, c
         .map(|p| ImageSource::from(SharedString::from(p)));
     let video_url = video_playback_url(file);
     let ext = file_ext(file, "mp4");
+    let transcribe_btn =
+        transcribe_pill_button(fixtures, file, video_url.as_deref(), ext.clone(), cx);
     let meta_duration_ms = media_duration_ms(file);
     let duration_label = meta_duration_ms.map(format_duration);
     let group = SharedString::from(format!("video-tile-{}", file.id));
@@ -428,6 +604,7 @@ pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, c
         let id_surface = id_str.clone();
         let id_play = id_str.clone();
         let id_seek = id_str.clone();
+        let id_rate = id_str.clone();
         let id_mute = id_str.clone();
         let id_expand = id_str.clone();
         let id_close = id_str.clone();
@@ -456,6 +633,27 @@ pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, c
                 crate::media::seek_inline_video(&id_seek, secs, window, cx);
             },
         );
+
+        let rate_btn = div()
+            .id(SharedString::from(format!("video-inline-rate-{}", file.id)))
+            .flex_none()
+            .px_1()
+            .h(px(22.))
+            .rounded_sm()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(fg)
+            .cursor_pointer()
+            .hover(|b| b.bg(gpui_kit::gpui::hsla(0., 0., 1., 0.16)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::media::format_playback_rate(snap.rate))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                crate::media::cycle_inline_video_rate(&id_rate, window, cx);
+            });
 
         let mute_btn = inline_transport_button(
             SharedString::from(format!("video-inline-mute-{}", file.id)),
@@ -518,6 +716,7 @@ pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, c
                     .text_color(fg)
                     .child(time_text),
             )
+            .child(rate_btn)
             .child(mute_btn)
             .children(expand_btn)
             .child(close_btn);
@@ -709,7 +908,7 @@ pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, c
         .gap_1()
         .child(
             h_flex()
-                .gap_1()
+                .gap_1p5()
                 .items_center()
                 .text_xs()
                 .text_color(theme.muted_foreground)
@@ -718,8 +917,9 @@ pub(super) fn video_card(file: &File, ix: usize, on_open: Option<&ImageClick>, c
                     Icon::new(IconName::ChevronDown)
                         .text_color(theme.muted_foreground)
                         .size(px(12.)),
-                ),
+                )
+                .children(transcribe_btn),
         )
         .child(frame)
-        .children(clip_transcript_section(file, cx))
+        .children(clip_transcript_section(fixtures, file, cx))
 }

@@ -76,7 +76,8 @@ pub(crate) fn video_poster_url(file: &File) -> Option<String> {
     .map(str::to_owned)
 }
 
-/// Direct playback URL for a Slack video file (`extra["mp4"]` -> `url_private` -> `url_private_download`).
+/// Direct playback URL for a Slack video file (`extra["mp4"]` -> `url_private` ->
+/// `url_private_download` -> `extra["vjs_hls"]`).
 pub(crate) fn video_playback_url(file: &File) -> Option<String> {
     file.extra
         .get("mp4")
@@ -85,6 +86,13 @@ pub(crate) fn video_playback_url(file: &File) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| file.url_private.clone())
         .or_else(|| file.url_private_download.clone())
+        .or_else(|| {
+            file.extra
+                .get("vjs_hls")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// A live image's thumbnail URL, sized for the inline preview on a 2x display; for a GIF its

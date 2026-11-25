@@ -273,10 +273,38 @@ fn wire_window_and_input_subscriptions(
                 let Some(viewer) = app.image_viewer.clone() else {
                     return;
                 };
+                let mods = event.keystroke.modifiers;
+                let no_cmd = !mods.platform && !mods.control && !mods.alt;
                 match event.keystroke.key.as_str() {
                     "escape" => {
                         app.close_image_viewer(window, cx);
                         cx.stop_propagation();
+                    }
+                    "left" if mods.shift && no_cmd => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.seek_video_relative(-5.0, window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "right" if mods.shift && no_cmd => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.seek_video_relative(5.0, window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
                     }
                     "left" => {
                         viewer.update(cx, |viewer, cx| viewer.step(-1, window, cx));
@@ -302,6 +330,45 @@ fn wire_window_and_input_subscriptions(
                         let handled = viewer.update(cx, |viewer, cx| {
                             if viewer.is_video() {
                                 viewer.toggle_video_play(window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "m" if no_cmd && !mods.shift => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.toggle_video_mute(cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "j" if no_cmd && !mods.shift => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.seek_video_relative(-5.0, window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
+                    "l" if no_cmd && !mods.shift => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.seek_video_relative(5.0, window, cx);
                                 true
                             } else {
                                 false
@@ -1883,6 +1950,38 @@ impl App {
                 _subscriptions: subscriptions,
             }
         });
+        let dispatch_app = app.downgrade();
+        let provider_app = app.downgrade();
+        let has_tr_app = app.downgrade();
+        crate::media::install_transcription_dispatcher(
+            move |file_id, local_path, provider, cx| {
+                let _ = dispatch_app.update(cx, |app, _| {
+                    app.bridge.send(CollabCommand::TranscribeMediaFile {
+                        file_id,
+                        local_path,
+                        provider,
+                    });
+                });
+            },
+            move |cx| {
+                provider_app
+                    .upgrade()
+                    .map(|a| {
+                        a.read(cx)
+                            .preferences
+                            .read(cx)
+                            .settings()
+                            .transcription_provider()
+                    })
+                    .unwrap_or(slackless_core::huddle::TranscriptionProvider::SlackBuiltIn)
+            },
+            move |file_id, cx| {
+                has_tr_app
+                    .upgrade()
+                    .is_some_and(|a| a.read(cx).fixtures.file_transcript(file_id).is_some())
+            },
+            cx,
+        );
         install_os_and_lifecycle_hooks(&app, window, cx);
         hydrate_initial_channel(&app, window, cx);
         app

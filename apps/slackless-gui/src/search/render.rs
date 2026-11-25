@@ -11,6 +11,7 @@ use gpui_kit::gpui::{
 use slackless_core::store::SearchSort;
 use slackless_core::types::{ChannelId, Conversation, File, Message, Ts, User};
 
+use super::query::transcript_match_excerpt;
 use super::state::{SearchEvent, SearchSource, SearchTab, SearchView};
 use crate::messages::{list_stamp, message_row};
 
@@ -422,6 +423,21 @@ impl SearchView {
         let open_channel = channel.clone();
         let ts = message.ts.clone();
         let row = message_row(&self.fixtures, message, None, cx);
+        let transcript_match = message.files.iter().find_map(|file| {
+            let transcript = self
+                .fixtures
+                .file_transcript(&file.id)
+                .map(str::to_owned)
+                .or_else(|| slackless_core::domain::webvtt::inline_clip_transcript(file))?;
+            let excerpt = transcript_match_excerpt(&transcript, &self.query)?;
+            let filename = file
+                .name
+                .as_deref()
+                .or(file.title.as_deref())
+                .unwrap_or(file.id.as_str())
+                .to_owned();
+            Some((filename, excerpt))
+        });
         v_flex()
             .id(("search-hit", ix))
             .gap_1()
@@ -439,6 +455,28 @@ impl SearchView {
                     .child(format!("{label} · {}", list_stamp(&message.ts))),
             )
             .child(row)
+            .when_some(transcript_match, |col, (filename, excerpt)| {
+                col.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .pl(px(44.))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(
+                            Icon::new(IconName::Captions)
+                                .size(px(12.))
+                                .text_color(muted)
+                                .flex_none(),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(format!("Transcript ({filename}): {excerpt}")),
+                        ),
+                )
+            })
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(SearchEvent::Open {
                     channel: open_channel.clone(),

@@ -101,6 +101,8 @@ pub struct WorkspaceData {
     pub skin_tone: u8,
     /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
     pub thumbnails: HashMap<FileId, Arc<Image>>,
+    /// Locally persisted audio/video transcripts keyed by `FileId`.
+    pub file_transcripts: HashMap<FileId, String>,
     /// Profile data the typed `Profile` does not model (pronouns, custom fields).
     pub profile_extras: HashMap<UserId, ProfileExtras>,
     /// The workspace's custom emoji by name.
@@ -179,6 +181,29 @@ impl Fixtures {
         Self {
             data: Arc::clone(&self.data),
             counts,
+        }
+    }
+
+    /// Locally persisted transcript for an audio or video file, if available.
+    pub fn file_transcript(&self, id: &FileId) -> Option<&str> {
+        self.file_transcripts
+            .get(id)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Return a new [`Fixtures`] snapshot with `file_id`'s transcript inserted or updated.
+    pub fn with_file_transcript(&self, file_id: FileId, text: String) -> Self {
+        let mut data = (*self.data).clone();
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() {
+            data.file_transcripts.remove(&file_id);
+        } else {
+            data.file_transcripts.insert(file_id, trimmed);
+        }
+        Self {
+            data: Arc::new(data),
+            counts: self.counts.clone(),
         }
     }
 
