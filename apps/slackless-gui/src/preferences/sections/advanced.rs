@@ -336,47 +336,52 @@ impl Preferences {
         );
         let net_log_count = slackless_core::api::net_log_snapshot().len();
         let net_log_card = self.status_card(
-            dot_color,
-            if self.settings.net_log_enabled {
-                "Capturing requests"
-            } else {
-                "Capture paused"
-            },
-            Some(SharedString::from(format!(
-                "{net_log_count} {}",
-                if net_log_count == 1 {
-                    "request"
+            super::StatusCard {
+                dot_color,
+                title: if self.settings.net_log_enabled {
+                    "Capturing requests"
                 } else {
-                    "requests"
+                    "Capture paused"
                 }
-            ))),
-            "Credentials and tokens are redacted before recording.",
-            false,
-            h_flex()
-                .items_center()
-                .gap_1p5()
-                .child(
-                    self.btn(
-                        Button::new("adv-net-log-clear")
-                            .ghost()
-                            .disabled(net_log_count == 0)
-                            .label("Clear"),
+                .into(),
+                chip: Some(SharedString::from(format!(
+                    "{net_log_count} {}",
+                    if net_log_count == 1 {
+                        "request"
+                    } else {
+                        "requests"
+                    }
+                ))),
+                detail: "Credentials and tokens are redacted before recording.".into(),
+                detail_is_err: false,
+                actions: h_flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        self.btn(
+                            Button::new("adv-net-log-clear")
+                                .ghost()
+                                .disabled(net_log_count == 0)
+                                .label("Clear"),
+                        )
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            slackless_core::api::clear_net_log();
+                            cx.notify();
+                        })),
                     )
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        slackless_core::api::clear_net_log();
-                        cx.notify();
-                    })),
-                )
-                .child(
-                    self.btn(
-                        Button::new("adv-net-log-export")
-                            .outline()
-                            .disabled(net_log_count == 0)
-                            .icon(IconName::Download)
-                            .label("Export"),
-                    )
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog))),
-                ),
+                    .child(
+                        self.btn(
+                            Button::new("adv-net-log-export")
+                                .outline()
+                                .disabled(net_log_count == 0)
+                                .icon(IconName::Download)
+                                .label("Export"),
+                        )
+                        .on_click(
+                            cx.listener(|_, _, _, cx| cx.emit(PreferencesEvent::ExportNetLog)),
+                        ),
+                    ),
+            },
             cx,
         );
         self.group(

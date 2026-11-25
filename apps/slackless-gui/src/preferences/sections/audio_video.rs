@@ -396,12 +396,14 @@ impl Preferences {
                 });
 
             Some(self.status_card(
-                dot_color,
-                title,
-                badge.map(SharedString::from),
-                note,
-                false,
-                actions,
+                super::StatusCard {
+                    dot_color,
+                    title: title.into(),
+                    chip: badge.map(SharedString::from),
+                    detail: note.into(),
+                    detail_is_err: false,
+                    actions,
+                },
                 cx,
             ))
         } else {

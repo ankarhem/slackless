@@ -167,7 +167,17 @@ impl Preferences {
             },
         };
 
-        let card = self.status_card(dot_color, title, chip, detail, is_err, actions, cx);
+        let card = self.status_card(
+            super::StatusCard {
+                dot_color,
+                title: title.into(),
+                chip,
+                detail: detail.into(),
+                detail_is_err: is_err,
+                actions,
+            },
+            cx,
+        );
         let release_notes = match &self.update_state {
             UpdateState::Available(rel) => Some(rel),
             UpdateState::Idle => self.available_update.as_ref(),
@@ -328,7 +338,17 @@ impl Preferences {
             ),
         };
 
-        let card = self.status_card(dot_color, title, chip, detail, false, actions, cx);
+        let card = self.status_card(
+            super::StatusCard {
+                dot_color,
+                title: title.into(),
+                chip,
+                detail: detail.into(),
+                detail_is_err: false,
+                actions,
+            },
+            cx,
+        );
         let mut body = v_flex().gap_2().child(card);
 
         if !in_path && let Some(dir) = effective_dir {

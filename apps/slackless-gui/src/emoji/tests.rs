@@ -210,3 +210,65 @@ fn search_ranking_query_normalization_and_frequent_tracking() {
     assert_eq!(thumbs.len(), 1);
     assert_eq!(thumbs[0].0, "Thumbs up");
 }
+
+#[test]
+fn cldr_gendered_zwj_flags_and_skin_toned_slack_shortcodes_resolve() {
+    // Previously missing CLDR + gendered ZWJ shortcodes with and without skin tones.
+    assert_eq!(display_glyph("male_mage").as_deref(), Some("🧙‍♂️"));
+    assert_eq!(
+        display_glyph("male_mage::skin-tone-2").as_deref(),
+        Some("🧙🏻‍♂️")
+    );
+    assert_eq!(
+        display_glyph("male_mage::skin-tone-4").as_deref(),
+        Some("🧙🏽‍♂️")
+    );
+    assert_eq!(
+        display_glyph("female_mage::skin-tone-3").as_deref(),
+        Some("🧙🏼‍♀️")
+    );
+    assert_eq!(display_glyph("briefs").as_deref(), Some("🩲"));
+
+    // Regional indicator flag-XX resolution (both catalog and non-catalog ISO codes).
+    assert_eq!(display_glyph("flag-se").as_deref(), Some("🇸🇪"));
+    assert_eq!(display_glyph("flag-us").as_deref(), Some("🇺🇸"));
+    assert_eq!(display_glyph("flag-gb").as_deref(), Some("🇬🇧"));
+    assert_eq!(display_glyph("flag-jp").as_deref(), Some("🇯🇵"));
+    assert_eq!(display_glyph("flag-zz"), None);
+
+    // Slack professions, fantasy characters, prefixes, and hyphenated ZWJ tones.
+    assert_eq!(display_glyph("male-technologist").as_deref(), Some("👨‍💻"));
+    assert_eq!(
+        display_glyph("female-scientist::skin-tone-5").as_deref(),
+        Some("👩🏾‍🔬")
+    );
+    assert_eq!(display_glyph("male_vampire").as_deref(), Some("🧛‍♂️"));
+    assert_eq!(display_glyph("female_elf").as_deref(), Some("🧝‍♀️"));
+    assert_eq!(display_glyph("large_yellow_circle").as_deref(), Some("🟡"));
+    assert_eq!(
+        display_glyph("man-shrugging::skin-tone-3").as_deref(),
+        Some("🤷🏼‍♂️")
+    );
+    assert_eq!(display_glyph("female-doctor").as_deref(), Some("👩‍⚕️"));
+    assert_eq!(display_glyph("male-doctor").as_deref(), Some("👨‍⚕️"));
+    assert_eq!(display_glyph("sleuth_or_spy").as_deref(), Some("🕵️"));
+    assert_eq!(
+        display_glyph("man_in_business_suit_levitating").as_deref(),
+        Some("🕴️")
+    );
+    assert_eq!(
+        display_glyph("speaking_head_in_silhouette").as_deref(),
+        Some("🗣️")
+    );
+    assert_eq!(display_glyph("skin-tone-4").as_deref(), Some("\u{1F3FD}"));
+
+    // Inline parsing & shortcode replacement end-to-end.
+    assert_eq!(
+        parse_shortcode(":male_mage::skin-tone-4:"),
+        Some((24, "male_mage::skin-tone-4".into()))
+    );
+    assert_eq!(
+        replace_shortcodes(":male_mage::skin-tone-4: :briefs:"),
+        "🧙🏽‍♂️ 🩲"
+    );
+}

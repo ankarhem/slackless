@@ -26,6 +26,16 @@ use super::settings::{
 use super::*;
 use crate::theme::{CUSTOM_ACCENTS, CUSTOM_SIDEBARS};
 
+/// Specification for [`Preferences::status_card`].
+pub(super) struct StatusCard {
+    pub(super) dot_color: gpui_kit::gpui::Hsla,
+    pub(super) title: SharedString,
+    pub(super) chip: Option<SharedString>,
+    pub(super) detail: SharedString,
+    pub(super) detail_is_err: bool,
+    pub(super) actions: Div,
+}
+
 impl Preferences {
     pub(super) fn nav(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
@@ -371,17 +381,15 @@ impl Preferences {
             .child(text.into())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn status_card(
-        &self,
-        dot_color: gpui_kit::gpui::Hsla,
-        title: impl Into<SharedString>,
-        chip: Option<SharedString>,
-        detail: impl Into<SharedString>,
-        detail_is_err: bool,
-        actions: Div,
-        cx: &Context<Self>,
-    ) -> Div {
+    fn status_card(&self, card: StatusCard, cx: &Context<Self>) -> Div {
+        let StatusCard {
+            dot_color,
+            title,
+            chip,
+            detail,
+            detail_is_err,
+            actions,
+        } = card;
         let theme = cx.theme();
         let fg = theme.foreground;
         let muted = theme.muted_foreground;
@@ -399,7 +407,7 @@ impl Preferences {
                     .text_sm()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(if detail_is_err { danger } else { fg })
-                    .child(title.into()),
+                    .child(title),
             );
         if let Some(chip_text) = chip {
             header_row = header_row.child(self.mono_chip(chip_text, cx));
@@ -420,7 +428,7 @@ impl Preferences {
                     div()
                         .text_xs()
                         .text_color(if detail_is_err { danger } else { muted })
-                        .child(detail.into()),
+                        .child(detail),
                 ),
             )
             .child(actions.flex_none())
