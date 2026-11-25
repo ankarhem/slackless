@@ -26,13 +26,17 @@ mod backend;
 mod backfill;
 mod client;
 pub mod diff;
+pub mod domain;
 mod fetcher;
 mod notify;
 pub mod privacy;
 mod reducer;
 mod unfurl;
 
-pub use backend::Backend;
+pub use backend::{
+    Backend, ChannelsBackend, CollabBackend, FilesBackend, HuddleBackend, MessagingBackend,
+    UsersBackend, WorkspaceBackend,
+};
 pub use client::{Client, ClientHandle, SharedStore};
 pub use diff::{DiffKind, DiffSegment, diff_words};
 pub use fetcher::Fetcher;
@@ -716,8 +720,93 @@ pub enum Command {
         channel: ChannelId,
         call_id: String,
     },
+    /// Unified low-level huddle media/session control forwarder (preferred over individual
+    /// `SetHuddle*` / `SendHuddle*` variants for new callers).
+    HuddleControl(HuddleControlCommand),
     /// Close the websocket, cancel background work and stop the runtime thread.
     Shutdown,
+}
+
+/// Low-level media/session control forwarded directly to an active native huddle session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HuddleControlCommand {
+    SetMuted(bool),
+    SetAudioDevices {
+        input: Option<String>,
+        output: Option<String>,
+    },
+    SetAudioProcessing {
+        aec: bool,
+        ns: bool,
+        agc: bool,
+    },
+    SetCamera {
+        enabled: bool,
+        device_index: Option<usize>,
+        blur: bool,
+    },
+    SetBlurBackground(bool),
+    SetScreenShare {
+        source_id: Option<String>,
+        share_audio: bool,
+    },
+    SendReaction {
+        emoji: String,
+        kind: huddle::HuddleReactionKind,
+        emoji_url: Option<String>,
+    },
+    SetHandRaised(bool),
+    SetStickyEmoji(Option<String>),
+    SendDraw(huddle::HuddleDrawMessage),
+    SetJukebox(Option<String>),
+    MutePeer(String),
+    SetAudioOnly(bool),
+}
+
+impl From<HuddleControlCommand> for huddle::HuddleControl {
+    fn from(cmd: HuddleControlCommand) -> Self {
+        match cmd {
+            HuddleControlCommand::SetMuted(muted) => Self::SetMuted(muted),
+            HuddleControlCommand::SetAudioDevices { input, output } => {
+                Self::SetAudioDevices { input, output }
+            }
+            HuddleControlCommand::SetAudioProcessing { aec, ns, agc } => {
+                Self::SetAudioProcessing { aec, ns, agc }
+            }
+            HuddleControlCommand::SetCamera {
+                enabled,
+                device_index,
+                blur,
+            } => Self::SetCamera {
+                enabled,
+                device_index,
+                blur,
+            },
+            HuddleControlCommand::SetBlurBackground(blur) => Self::SetBlurBackground(blur),
+            HuddleControlCommand::SetScreenShare {
+                source_id,
+                share_audio,
+            } => Self::SetScreenShare {
+                source_id,
+                share_audio,
+            },
+            HuddleControlCommand::SendReaction {
+                emoji,
+                kind,
+                emoji_url,
+            } => Self::SendReaction {
+                emoji,
+                kind,
+                emoji_url,
+            },
+            HuddleControlCommand::SetHandRaised(raised) => Self::SetHandRaised(raised),
+            HuddleControlCommand::SetStickyEmoji(emoji) => Self::SetStickyEmoji(emoji),
+            HuddleControlCommand::SendDraw(draw) => Self::SendDraw(draw),
+            HuddleControlCommand::SetJukebox(song) => Self::SetJukebox(song),
+            HuddleControlCommand::MutePeer(peer_id) => Self::MutePeer(peer_id),
+            HuddleControlCommand::SetAudioOnly(enabled) => Self::SetAudioOnly(enabled),
+        }
+    }
 }
 
 /// Events the core emits to a front-end.
@@ -1026,6 +1115,17 @@ pub enum Event {
     FileDeleted { file_id: String },
     /// A non-fatal failure worth surfacing.
     Error(String),
+}
+
+impl Event {
+    /// Returns `true` for high-frequency huddle media events (60fps video frames and audio meter
+    /// ticks) that front-ends may route onto a separate bounded/latest-value lane.
+    pub fn is_high_frequency_media(&self) -> bool {
+        matches!(
+            self,
+            Self::HuddleVideoFrame { .. } | Self::HuddleAudioLevels(_)
+        )
+    }
 }
 
 /// An offline-queued mutation that failed to flush on reconnect.

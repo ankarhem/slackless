@@ -132,10 +132,23 @@ pub(super) async fn edge_search(
         SlackApi::edge_users_search(api, &team_id, &query, 15),
         SlackApi::edge_channels_search(api, &team_id, &query, 15),
     );
-    Ok(api::EdgeSearchResults {
-        users: users.unwrap_or_default(),
-        channels: channels.unwrap_or_default(),
-    })
+    match (users, channels) {
+        (Err(e), _) if e.is_auth_expired() => Err(e),
+        (_, Err(e)) if e.is_auth_expired() => Err(e),
+        (Err(e), Err(_)) => Err(e),
+        (users, channels) => {
+            if let Err(ref e) = users {
+                tracing::warn!(%e, "edgeapi users search failed");
+            }
+            if let Err(ref e) = channels {
+                tracing::warn!(%e, "edgeapi channels search failed");
+            }
+            Ok(api::EdgeSearchResults {
+                users: users.unwrap_or_default(),
+                channels: channels.unwrap_or_default(),
+            })
+        }
+    }
 }
 
 pub(super) async fn load_app_home(
@@ -143,12 +156,23 @@ pub(super) async fn load_app_home(
     channel: ChannelId,
 ) -> api::Result<api::AppHomeResponse> {
     let home = api.conversations_app_home(&channel).await?;
-    let _ = api.apps_home_dispatch_open_event(&channel).await;
+    if let Err(err) = api.apps_home_dispatch_open_event(&channel).await {
+        if err.is_auth_expired() {
+            return Err(err);
+        }
+        tracing::debug!(%channel, %err, "apps.home.dispatchOpenEvent failed");
+    }
     Ok(home)
 }
 
-pub(super) async fn rooms_get_link(api: &SlackApi, channel: ChannelId) -> api::Result<String> {
+pub(super) async fn rooms_get_link(
+    api: &SlackApi,
+    workspace: TeamId,
+    channel: ChannelId,
+) -> api::Result<String> {
     Ok(SlackApi::rooms_get_link(api, &channel)
         .await?
-        .unwrap_or_else(|| format!("https://app.slack.com/huddle/{channel}")))
+        .unwrap_or_else(|| {
+            crate::types::net::huddle_fallback_url(workspace.as_str(), channel.as_str())
+        }))
 }

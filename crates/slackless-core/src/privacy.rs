@@ -136,6 +136,23 @@ fn push_unique(out: &mut Vec<SecretMatch>, kind: &'static str, token: &str) {
     }
 }
 
+fn for_each_token_with_prefix(
+    text: &str,
+    bytes: &[u8],
+    prefix: &str,
+    mut on_token: impl FnMut(&str),
+) {
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(prefix) {
+        let start = search_from + rel;
+        let end = token_span_from(bytes, start);
+        if is_boundary_before(bytes, start) {
+            on_token(&text[start..end]);
+        }
+        search_from = start + prefix.len();
+    }
+}
+
 /// Scan outgoing message text for common leaked credentials, API keys, JWTs, private keys, and
 /// database connection strings with embedded passwords.
 pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
@@ -179,78 +196,49 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
     ];
 
     for &(prefix, kind, min_len) in PREFIX_RULES {
-        let mut search_from = 0;
-        while let Some(rel) = text[search_from..].find(prefix) {
-            let start = search_from + rel;
-            let end = token_span_from(bytes, start);
-            if is_boundary_before(bytes, start) && end - start >= min_len {
-                push_unique(&mut hits, kind, &text[start..end]);
+        for_each_token_with_prefix(text, bytes, prefix, |tok| {
+            if tok.len() >= min_len {
+                push_unique(&mut hits, kind, tok);
             }
-            search_from = start + prefix.len();
-        }
+        });
     }
 
     // OpenAI legacy `sk-` keys (exclude `sk-ant-` / `sk-proj-` already matched above).
-    {
-        let mut search_from = 0;
-        while let Some(rel) = text[search_from..].find("sk-") {
-            let start = search_from + rel;
-            let end = token_span_from(bytes, start);
-            let tok = &text[start..end];
-            if is_boundary_before(bytes, start)
-                && !tok.starts_with("sk-ant-")
-                && !tok.starts_with("sk-proj-")
-                && tok.len() >= 32
-                && tok[3..]
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                push_unique(&mut hits, "API secret key (sk-...)", tok);
-            }
-            search_from = start + 3;
+    for_each_token_with_prefix(text, bytes, "sk-", |tok| {
+        if !tok.starts_with("sk-ant-")
+            && !tok.starts_with("sk-proj-")
+            && tok.len() >= 32
+            && tok[3..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            push_unique(&mut hits, "API secret key (sk-...)", tok);
         }
-    }
+    });
 
     // 3. AWS Access Key IDs (`AKIA` + 16 uppercase alphanumeric chars).
-    {
-        let mut search_from = 0;
-        while let Some(rel) = text[search_from..].find("AKIA") {
-            let start = search_from + rel;
-            let end = token_span_from(bytes, start);
-            let tok = &text[start..end];
-            if is_boundary_before(bytes, start)
-                && tok.len() == 20
-                && tok[4..]
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-            {
-                push_unique(&mut hits, "AWS access key ID", tok);
-            }
-            search_from = start + 4;
+    for_each_token_with_prefix(text, bytes, "AKIA", |tok| {
+        if tok.len() == 20
+            && tok[4..]
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            push_unique(&mut hits, "AWS access key ID", tok);
         }
-    }
+    });
 
     // 4. JWTs (`eyJ<header>.eyJ<payload>.<signature>`).
-    {
-        let mut search_from = 0;
-        while let Some(rel) = text[search_from..].find("eyJ") {
-            let start = search_from + rel;
-            let end = token_span_from(bytes, start);
-            let tok = &text[start..end];
-            if is_boundary_before(bytes, start) {
-                let parts: Vec<&str> = tok.split('.').collect();
-                if parts.len() == 3
-                    && parts[0].len() >= 10
-                    && parts[1].starts_with("eyJ")
-                    && parts[1].len() >= 10
-                    && parts[2].len() >= 16
-                {
-                    push_unique(&mut hits, "JSON Web Token (JWT)", tok);
-                }
-            }
-            search_from = start + 3;
+    for_each_token_with_prefix(text, bytes, "eyJ", |tok| {
+        let parts: Vec<&str> = tok.split('.').collect();
+        if parts.len() == 3
+            && parts[0].len() >= 10
+            && parts[1].starts_with("eyJ")
+            && parts[1].len() >= 10
+            && parts[2].len() >= 16
+        {
+            push_unique(&mut hits, "JSON Web Token (JWT)", tok);
         }
-    }
+    });
 
     // 5. Database / cache URLs with embedded passwords (`scheme://user:pass@host`).
     for scheme in [

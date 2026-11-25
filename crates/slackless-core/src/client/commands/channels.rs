@@ -14,20 +14,18 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn fetch_latest_history(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
-        let unfurls = self.unfurls.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.history", async move {
             let items = wait_out_rate_limits(|| {
-                backend.recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
+                ctx.backend
+                    .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
             })
             .await?;
-            unfurls.resolve(items.iter());
+            ctx.unfurls.resolve(items.iter());
             let target = channel.clone();
-            with_store(&store, move |s| s.upsert_messages(&ws, &target, &items)).await?;
-            events.emit(Event::StoreChanged { channel });
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.upsert_messages(&ws, &target, &items)).await?;
+            ctx.events.emit(Event::StoreChanged { channel });
             Ok(())
         });
     }
@@ -56,57 +54,82 @@ impl<B: Backend> Core<B> {
             if !self.bots_asked.insert(bot.clone()) {
                 continue;
             }
-            let backend = self.backend.clone();
-            let store = Arc::clone(&self.store);
-            let bots = Arc::clone(&self.bots);
-            let ws = self.workspace.clone();
-            let events = self.events.clone();
-            self.spawn("bots.info", async move {
-                let profile = backend.bot_info(bot.clone()).await?;
-                bots.lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(bot.clone(), profile.clone());
-                let bot_store = bot.clone();
-                let profile_store = profile.clone();
-                let _ = with_store(&store, move |s| {
-                    s.upsert_bot_profile(&ws, &bot_store, &profile_store)
-                })
-                .await;
-                events.emit(Event::BotProfileLoaded {
-                    bot_id: bot,
-                    profile,
-                });
-                Ok(())
-            });
+            self.spawn_fetch_bot_profile(bot, None);
         }
     }
 
+    /// Unified bot-profile fetch, memory cache, SQLite persistence, and optional message-backfill
+    /// helper shared between [`Self::resolve_bots`] and RTM message handling (`rtm.rs`).
+    pub(in crate::client) fn spawn_fetch_bot_profile(
+        &self,
+        bot: BotId,
+        message_ref: Option<(ChannelId, Ts)>,
+    ) {
+        let ctx = self.ctx();
+        let bots = Arc::clone(&self.bots);
+        self.spawn("bots.info", async move {
+            let profile = ctx.backend.bot_info(bot.clone()).await?;
+            bots.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(bot.clone(), profile.clone());
+            let ws = ctx.workspace.clone();
+            let bot_store = bot.clone();
+            let profile_store = profile.clone();
+            let msg_ref = message_ref.clone();
+            let updated_channel = with_store(&ctx.store, move |s| {
+                s.upsert_bot_profile(&ws, &bot_store, &profile_store)?;
+                if let Some((ch, ts)) = msg_ref
+                    && let Some(mut stored) = s.message(&ws, &ch, &ts)?
+                    && stored.message.bot_profile.is_none()
+                {
+                    stored.message.bot_profile = Some(profile_store);
+                    s.upsert_message(&ws, &ch, &stored.message)?;
+                    return Ok(Some(ch));
+                }
+                Ok(None)
+            })
+            .await;
+            match updated_channel {
+                Ok(Some(channel)) => {
+                    ctx.events.emit(Event::StoreChanged { channel });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(%bot, %err, "failed to persist bot profile");
+                }
+            }
+            ctx.events.emit(Event::BotProfileLoaded {
+                bot_id: bot,
+                profile,
+            });
+            Ok(())
+        });
+    }
+
     pub(super) fn set_notify_level(&self, channel: ChannelId, level: NotifyLevel) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.prefs.setNotifications", async move {
             for &(name, value) in level.writes() {
-                backend
+                ctx.backend
                     .set_notification_pref(channel.clone(), name, value)
                     .await?;
             }
-            with_store(&store, move |s| {
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| {
                 let mut prefs = s.prefs(&ws)?.unwrap_or_default();
                 crate::notify::set_notify_level(&mut prefs, &channel, level);
                 s.replace_prefs(&ws, &prefs)
             })
             .await?;
-            events.emit(Event::SidebarChanged);
+            ctx.events.emit(Event::SidebarChanged);
             Ok(())
         });
     }
 
     pub(super) fn set_global_notification_pref(&self, name: String, value: String, sync: bool) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("users.prefs.setNotifications(global)", async move {
-            backend
+            ctx.backend
                 .set_global_notification_pref(name, value, sync)
                 .await?;
             Ok(())
@@ -114,113 +137,88 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn leave_conversation(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.leave", async move {
-            backend.leave_conversation(channel.clone()).await?;
-            let target = channel.clone();
-            with_store(&store, move |s| match s.conversation(&ws, &target)? {
-                Some(mut left) => {
-                    left.is_member = false;
-                    s.upsert_conversation(&ws, &left)
-                }
-                None => Ok(()),
+            ctx.backend.leave_conversation(channel.clone()).await?;
+            update_stored_conversation(&ctx, channel, |conv| {
+                conv.is_member = false;
             })
-            .await?;
-            events.emit(Event::Conversations(vec![channel]));
-            Ok(())
+            .await
         });
     }
 
     pub(super) fn join_conversation(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.join", async move {
-            let mut joined = backend.join_conversation(channel.clone()).await?;
+            let mut joined = ctx.backend.join_conversation(channel.clone()).await?;
             joined.is_member = true;
-            with_store(&store, move |s| s.upsert_conversation(&ws, &joined)).await?;
-            events.emit(Event::Conversations(vec![channel]));
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.upsert_conversation(&ws, &joined)).await?;
+            ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
     }
 
     pub(super) fn set_channel_topic(&self, channel: ChannelId, topic: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.setTopic", async move {
-            let updated = backend.set_topic(channel.clone(), topic).await?;
-            with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
-            events.emit(Event::Conversations(vec![channel]));
+            let updated = ctx.backend.set_topic(channel.clone(), topic).await?;
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &updated)).await?;
+            ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
     }
 
     pub(super) fn set_channel_purpose(&self, channel: ChannelId, purpose: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.setPurpose", async move {
-            let updated = backend.set_purpose(channel.clone(), purpose).await?;
-            with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
-            events.emit(Event::Conversations(vec![channel]));
+            let updated = ctx.backend.set_purpose(channel.clone(), purpose).await?;
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &updated)).await?;
+            ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
     }
 
     pub(super) fn fetch_channel_managers(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("admin.roles.entity.listAssignments", async move {
-            let users = backend.channel_managers(channel.clone()).await?;
-            events.emit(Event::ChannelManagers { channel, users });
+            let users = ctx.backend.channel_managers(channel.clone()).await?;
+            ctx.events.emit(Event::ChannelManagers { channel, users });
             Ok(())
         });
     }
 
     pub(super) fn open_dm(&self, users: Vec<UserId>) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.open", async move {
-            let dm = backend.open_dm(users).await?;
+            let dm = ctx.backend.open_dm(users).await?;
             let channel = dm.id.clone();
-            with_store(&store, move |s| s.upsert_conversation(&ws, &dm)).await?;
-            events.emit(Event::Conversations(vec![channel.clone()]));
-            events.emit(Event::ConversationOpened(channel));
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.upsert_conversation(&ws, &dm)).await?;
+            ctx.events.emit(Event::Conversations(vec![channel.clone()]));
+            ctx.events.emit(Event::ConversationOpened(channel));
             Ok(())
         });
     }
 
     pub(super) fn create_section(&self, name: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.channelSections.create", async move {
-            backend.create_section(name).await?;
-            refresh_sections(&backend, &store, ws, &events).await
+            ctx.backend.create_section(name).await?;
+            refresh_sections(&ctx).await
         });
     }
 
     pub(super) fn create_section_with_channel(&self, name: String, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.channelSections.create", async move {
-            let created = backend.create_section(name).await?;
+            let created = ctx.backend.create_section(name).await?;
             let section = created.channel_section_id;
             // The channel may sit in another section: move, not just add.
-            let (probe, read_ws) = (channel.clone(), ws.clone());
-            let source = with_store(&store, move |s| {
+            let (probe, read_ws) = (channel.clone(), ctx.workspace.clone());
+            let source = with_store(&ctx.store, move |s| {
                 s.sections(&read_ws).map(|sections| {
                     sections
                         .iter()
@@ -229,25 +227,22 @@ impl<B: Backend> Core<B> {
                 })
             })
             .await?;
-            backend
+            ctx.backend
                 .move_channel(
                     Some((section.clone(), channel.clone())),
                     source.map(|from| (from, channel.clone())),
                 )
                 .await?;
-            refresh_sections(&backend, &store, ws, &events).await
+            refresh_sections(&ctx).await
         });
     }
 
     pub(super) fn rename_section(&self, section: String, name: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.channelSections.set", async move {
             // `.set` clears every omitted key, so the emoji is re-read and resent.
-            let (read_ws, target) = (ws.clone(), section.clone());
-            let emoji = with_store(&store, move |s| {
+            let (read_ws, target) = (ctx.workspace.clone(), section.clone());
+            let emoji = with_store(&ctx.store, move |s| {
                 s.sections(&read_ws).map(|sections| {
                     sections
                         .iter()
@@ -257,19 +252,16 @@ impl<B: Backend> Core<B> {
                 })
             })
             .await?;
-            backend.rename_section(section, name, emoji).await?;
-            refresh_sections(&backend, &store, ws, &events).await
+            ctx.backend.rename_section(section, name, emoji).await?;
+            refresh_sections(&ctx).await
         });
     }
 
     pub(super) fn delete_section(&self, section: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.channelSections.delete", async move {
-            backend.delete_section(section).await?;
-            refresh_sections(&backend, &store, ws, &events).await
+            ctx.backend.delete_section(section).await?;
+            refresh_sections(&ctx).await
         });
     }
 
@@ -279,66 +271,56 @@ impl<B: Backend> Core<B> {
         from: Option<String>,
         to: Option<String>,
     ) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.channelSections.channels.bulkUpdate", async move {
             if from != to {
-                backend
+                ctx.backend
                     .move_channel(
                         to.map(|to| (to, channel.clone())),
                         from.map(|from| (from, channel.clone())),
                     )
                     .await?;
             }
-            refresh_sections(&backend, &store, ws, &events).await
+            refresh_sections(&ctx).await
         });
     }
 
     pub(super) fn create_channel(&self, name: String, is_private: bool, purpose: Option<String>) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.create", async move {
-            let mut created = backend.create_channel(name, is_private).await?;
+            let mut created = ctx.backend.create_channel(name, is_private).await?;
             let id = created.id.clone();
             if let Some(purpose) = purpose.filter(|p| !p.trim().is_empty())
-                && let Ok(updated) = backend.set_purpose(id.clone(), purpose).await
+                && let Ok(updated) = ctx.backend.set_purpose(id.clone(), purpose).await
             {
                 created = updated;
             }
             created.is_member = true;
             let for_store = created.clone();
-            with_store(&store, move |s| s.upsert_conversation(&ws, &for_store)).await?;
-            events.emit(Event::Conversations(vec![id.clone()]));
-            events.emit(Event::ConversationOpened(id));
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.upsert_conversation(&ws, &for_store)).await?;
+            ctx.events.emit(Event::Conversations(vec![id.clone()]));
+            ctx.events.emit(Event::ConversationOpened(id));
             Ok(())
         });
     }
 
     pub(super) fn rename_channel(&self, channel: ChannelId, name: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.rename", async move {
-            let updated = backend.rename_channel(channel.clone(), name).await?;
-            with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
-            events.emit(Event::Conversations(vec![channel]));
+            let updated = ctx.backend.rename_channel(channel.clone(), name).await?;
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &updated)).await?;
+            ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
     }
 
     pub(super) fn archive_channel(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.archive", async move {
-            backend.archive_channel(channel.clone()).await?;
-            update_stored_conversation(&store, ws, &events, channel, |conv| {
+            ctx.backend.archive_channel(channel.clone()).await?;
+            update_stored_conversation(&ctx, channel, |conv| {
                 conv.is_archived = true;
             })
             .await
@@ -346,13 +328,10 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn unarchive_channel(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.unarchive", async move {
-            backend.unarchive_channel(channel.clone()).await?;
-            update_stored_conversation(&store, ws, &events, channel, |conv| {
+            ctx.backend.unarchive_channel(channel.clone()).await?;
+            update_stored_conversation(&ctx, channel, |conv| {
                 conv.is_archived = false;
             })
             .await
@@ -360,13 +339,10 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn delete_channel(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("admin.conversations.delete", async move {
-            backend.delete_channel(channel.clone()).await?;
-            update_stored_conversation(&store, ws, &events, channel, |conv| {
+            ctx.backend.delete_channel(channel.clone()).await?;
+            update_stored_conversation(&ctx, channel, |conv| {
                 conv.is_archived = true;
                 conv.is_member = false;
             })
@@ -375,15 +351,16 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn convert_channel_to_private(&self, channel: ChannelId) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.convertToPrivate", async move {
-            let updated = backend.convert_channel_to_private(channel.clone()).await?;
-            with_store(&store, move |s| s.merge_conversation(&ws, &updated)).await?;
-            events.emit(Event::Conversations(vec![channel]));
-            events.emit(Event::SidebarChanged);
+            let updated = ctx
+                .backend
+                .convert_channel_to_private(channel.clone())
+                .await?;
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &updated)).await?;
+            ctx.events.emit(Event::Conversations(vec![channel]));
+            ctx.events.emit(Event::SidebarChanged);
             Ok(())
         });
     }
@@ -392,27 +369,33 @@ impl<B: Backend> Core<B> {
         if users.is_empty() {
             return;
         }
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.invite", async move {
-            let updated = backend.invite_to_channel(channel.clone(), users).await?;
-            let ws_merge = ws.clone();
-            with_store(&store, move |s| s.merge_conversation(&ws_merge, &updated)).await?;
-            if let Ok(members) = backend.conversation_members(channel.clone()).await {
+            let updated = ctx
+                .backend
+                .invite_to_channel(channel.clone(), users)
+                .await?;
+            let ws_merge = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| {
+                s.merge_conversation(&ws_merge, &updated)
+            })
+            .await?;
+            if let Ok(members) = ctx.backend.conversation_members(channel.clone()).await {
                 let for_counts = members.clone();
-                let counts = with_store(&store, move |s| s.member_counts(&ws, &for_counts))
-                    .await
-                    .ok();
-                events.emit(Event::ConversationInfo {
+                let ws_counts = ctx.workspace.clone();
+                let counts = with_store(&ctx.store, move |s| {
+                    s.member_counts(&ws_counts, &for_counts)
+                })
+                .await
+                .ok();
+                ctx.events.emit(Event::ConversationInfo {
                     channel: channel.clone(),
                     num_members: counts.map(|c| c.humans),
                     num_apps: counts.map(|c| c.apps),
                     members,
                 });
             }
-            events.emit(Event::Conversations(vec![channel]));
+            ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
     }
@@ -423,28 +406,22 @@ impl<B: Backend> Core<B> {
         tab_type: String,
         label: Option<String>,
     ) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.addTab", async move {
-            backend
+            ctx.backend
                 .add_conversation_tab(channel.clone(), tab_type, label)
                 .await?;
-            refresh_conversation_if_ok(&backend, &store, ws, &events, channel).await
+            refresh_conversation_if_ok(&ctx, channel).await
         });
     }
 
     pub(super) fn remove_conversation_tab(&self, channel: ChannelId, tab_id: String) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.removeTab", async move {
-            backend
+            ctx.backend
                 .remove_conversation_tab(channel.clone(), tab_id)
                 .await?;
-            refresh_conversation_if_ok(&backend, &store, ws, &events, channel).await
+            refresh_conversation_if_ok(&ctx, channel).await
         });
     }
 
@@ -454,98 +431,97 @@ impl<B: Backend> Core<B> {
         tab_id: String,
         after: Option<String>,
     ) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("conversations.moveTab", async move {
-            backend
+            ctx.backend
                 .move_conversation_tab(channel.clone(), tab_id, after)
                 .await?;
-            refresh_conversation_if_ok(&backend, &store, ws, &events, channel).await
+            refresh_conversation_if_ok(&ctx, channel).await
         });
     }
 
     pub(super) fn set_dnd_snooze(&self, minutes: u32) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("dnd.setSnooze", async move {
-            let status = backend.set_dnd_snooze(minutes).await?;
-            events.emit(Event::SelfDndUpdated(status));
+            let status = ctx.backend.set_dnd_snooze(minutes).await?;
+            ctx.events.emit(Event::SelfDndUpdated(status));
             Ok(())
         });
     }
 
     pub(super) fn end_dnd_snooze(&self) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("dnd.endSnooze", async move {
-            let status = backend.end_dnd_snooze().await?;
-            events.emit(Event::SelfDndUpdated(status));
+            let status = ctx.backend.end_dnd_snooze().await?;
+            ctx.events.emit(Event::SelfDndUpdated(status));
             Ok(())
         });
     }
 
     pub(super) fn end_dnd(&self) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("dnd.endDnd", async move {
-            backend.dnd_end_dnd().await?;
-            events.emit(Event::SelfDndUpdated(slackless_types::DndStatus::default()));
+            ctx.backend.dnd_end_dnd().await?;
+            ctx.events
+                .emit(Event::SelfDndUpdated(slackless_types::DndStatus::default()));
             Ok(())
         });
     }
 
     pub(super) fn load_team_dnd(&self, users: Vec<UserId>) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("dnd.teamInfo", async move {
-            let map = backend.dnd_team_info(users).await?;
+            let map = ctx.backend.dnd_team_info(users).await?;
             let now = now_secs();
             let paused = map
                 .into_iter()
                 .map(|(uid, status)| (uid, status.paused(now)))
                 .collect();
-            events.emit(Event::TeamDndLoaded(paused));
+            ctx.events.emit(Event::TeamDndLoaded(paused));
             Ok(())
         });
     }
 
     pub(super) fn update_profile(&self, update: ProfileUpdate) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         let self_user_id = Arc::clone(&self.self_user_id);
         self.spawn("users.profile.set", async move {
-            let profile = backend.update_profile(update).await?;
-            let me = self_user_id.lock().ok().and_then(|g| g.clone());
+            let profile = ctx.backend.update_profile(update).await?;
+            let me = self_user_id
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             if let Some(me) = me {
                 let me_for_store = me.clone();
-                let _ = with_store(&store, move |s| {
-                    if let Some(mut user) = s.users(&ws)?.into_iter().find(|u| u.id == me_for_store)
-                    {
+                let ws = ctx.workspace.clone();
+                if let Err(err) = with_store(&ctx.store, move |s| {
+                    if let Some(mut user) = s.user(&ws, &me_for_store)? {
                         user.profile = profile;
                         s.upsert_user(&ws, &user)?;
                     }
-                    Ok::<_, StoreError>(())
+                    Ok(())
                 })
-                .await;
-                events.emit(Event::UsersChanged(vec![me]));
+                .await
+                {
+                    tracing::warn!(%err, "failed to persist updated self profile");
+                }
+                ctx.events.emit(Event::UsersChanged(vec![me]));
             }
             Ok(())
         });
     }
 
     pub(super) fn set_presence(&self, away: bool) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         let self_user_id = Arc::clone(&self.self_user_id);
         self.spawn("presence.set", async move {
-            backend.set_presence(away).await?;
-            let me = self_user_id.lock().ok().and_then(|g| g.clone());
+            ctx.backend.set_presence(away).await?;
+            let me = self_user_id
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             if let Some(me) = me {
-                events.emit(Event::Presence {
+                ctx.events.emit(Event::Presence {
                     users: vec![me],
                     presence: if away {
                         crate::Presence::Away
@@ -559,23 +535,29 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn set_user_pref(&self, name: String, value: String) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("users.prefs.set", async move {
-            backend.set_user_pref(name, value).await?;
+            ctx.backend.set_user_pref(name, value).await?;
             Ok(())
         });
     }
 
     pub(super) fn fetch_user_profile(&self, user: UserId) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("users.profile.get", async move {
             let (profile, labels) = tokio::join!(
-                backend.user_profile(user.clone()),
-                backend.team_profile_fields(),
+                ctx.backend.user_profile(user.clone()),
+                ctx.backend.team_profile_fields(),
             );
             let profile = profile?;
-            let labels = labels.unwrap_or_default();
+            let labels = match labels {
+                Ok(labels) => labels,
+                Err(e) if e.is_auth_expired() => return Err(e.into()),
+                Err(e) => {
+                    tracing::debug!(%e, "team.profile.get failed");
+                    HashMap::new()
+                }
+            };
             let pronouns = profile.pronouns.clone().filter(|p| !p.trim().is_empty());
             let mut fields = Vec::new();
             if let Some(map) = profile.fields.as_ref().and_then(|v| v.as_object()) {
@@ -598,7 +580,7 @@ impl<B: Backend> Core<B> {
                     fields.push((label, val.to_owned()));
                 }
             }
-            events.emit(Event::UserProfileLoaded {
+            ctx.events.emit(Event::UserProfileLoaded {
                 user,
                 pronouns,
                 fields,
@@ -608,22 +590,21 @@ impl<B: Backend> Core<B> {
     }
 
     pub(super) fn set_user_photo(&self, filename: String, bytes: Vec<u8>) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("users.setPhoto", async move {
-            backend.users_set_photo(filename, bytes).await?;
+            ctx.backend.users_set_photo(filename, bytes).await?;
             Ok(())
         });
     }
 
     pub(super) fn create_usergroup(&self, name: String, handle: String, description: String) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("usergroups.create", async move {
-            let _ = backend.create_usergroup(name, handle, description).await?;
-            if let Ok(groups) = backend.usergroups().await {
-                events.emit(Event::Usergroups(groups));
-            }
-            Ok(())
+            let _ = ctx
+                .backend
+                .create_usergroup(name, handle, description)
+                .await?;
+            refresh_usergroups(&ctx.backend, &ctx.events).await
         });
     }
 
@@ -634,70 +615,80 @@ impl<B: Backend> Core<B> {
         handle: String,
         description: String,
     ) {
-        let backend = self.backend.clone();
-        let events = self.events.clone();
+        let ctx = self.ctx();
         self.spawn("usergroups.update", async move {
-            let _ = backend
+            let _ = ctx
+                .backend
                 .update_usergroup(usergroup, name, handle, description)
                 .await?;
-            if let Ok(groups) = backend.usergroups().await {
-                events.emit(Event::Usergroups(groups));
-            }
-            Ok(())
+            refresh_usergroups(&ctx.backend, &ctx.events).await
         });
     }
 
     pub(super) fn sign_out(&self) {
-        let backend = self.backend.clone();
+        let ctx = self.ctx();
         self.spawn("auth.revoke", async move {
-            let _ = backend.auth_revoke().await;
+            if let Err(err) = ctx.backend.auth_revoke().await {
+                tracing::debug!(%err, "auth.revoke failed during sign out");
+            }
             Ok(())
         });
     }
 }
 
-async fn update_stored_conversation(
-    store: &SharedStore,
-    ws: TeamId,
-    events: &Emitter,
+async fn refresh_usergroups<B: Backend>(backend: &B, events: &Emitter) -> Result<(), CoreError> {
+    match backend.usergroups().await {
+        Ok(groups) => {
+            events.emit(Event::Usergroups(groups));
+            Ok(())
+        }
+        Err(e) if e.is_auth_expired() => Err(e.into()),
+        Err(e) => {
+            tracing::warn!(%e, "usergroups.list refresh failed");
+            Ok(())
+        }
+    }
+}
+
+async fn update_stored_conversation<B: Backend>(
+    ctx: &TaskCtx<B>,
     channel: ChannelId,
     mutate: impl FnOnce(&mut slackless_types::Conversation) + Send + 'static,
 ) -> Result<(), CoreError> {
     let id = channel.clone();
-    with_store(store, move |s| {
+    let ws = ctx.workspace.clone();
+    with_store(&ctx.store, move |s| {
         if let Some(mut conv) = s.conversation(&ws, &id)? {
             mutate(&mut conv);
             s.upsert_conversation(&ws, &conv)?;
         }
-        Ok::<_, StoreError>(())
+        Ok(())
     })
     .await?;
-    events.emit(Event::Conversations(vec![channel]));
+    ctx.events.emit(Event::Conversations(vec![channel]));
     Ok(())
 }
 
-async fn refresh_sections<B: Backend>(
-    backend: &B,
-    store: &SharedStore,
-    ws: TeamId,
-    events: &Emitter,
-) -> Result<(), CoreError> {
-    let sections = backend.channel_sections().await?;
-    with_store(store, move |s| s.replace_sections(&ws, &sections)).await?;
-    events.emit(Event::SidebarChanged);
+async fn refresh_sections<B: Backend>(ctx: &TaskCtx<B>) -> Result<(), CoreError> {
+    let sections = ctx.backend.channel_sections().await?;
+    let ws = ctx.workspace.clone();
+    with_store(&ctx.store, move |s| s.replace_sections(&ws, &sections)).await?;
+    ctx.events.emit(Event::SidebarChanged);
     Ok(())
 }
 
 async fn refresh_conversation_if_ok<B: Backend>(
-    backend: &B,
-    store: &SharedStore,
-    ws: TeamId,
-    events: &Emitter,
+    ctx: &TaskCtx<B>,
     channel: ChannelId,
 ) -> Result<(), CoreError> {
-    if let Ok(fresh) = backend.conversation_info(channel.clone()).await {
-        with_store(store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+    match ctx.backend.conversation_info(channel.clone()).await {
+        Ok(fresh) => {
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws, &fresh)).await?;
+        }
+        Err(e) if e.is_auth_expired() => return Err(e.into()),
+        Err(e) => tracing::debug!(%channel, %e, "post-tab-edit conversations.info failed"),
     }
-    events.emit(Event::Conversations(vec![channel]));
+    ctx.events.emit(Event::Conversations(vec![channel]));
     Ok(())
 }

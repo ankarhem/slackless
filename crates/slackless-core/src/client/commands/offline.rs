@@ -1,6 +1,7 @@
 //! Persisted offline mutation queue and sequential FIFO flushing on reconnect.
 
 use super::super::*;
+use super::messaging::{mark_read_and_store, post_message_and_store};
 
 /// Serializable offline mutation stored in SQLite `offline_queue` until flushed on reconnect.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -80,18 +81,28 @@ impl QueuedMutation {
 }
 
 impl<B: Backend> Core<B> {
-    /// If the client is offline and `command` is queueable, persist it in SQLite and return `true`.
-    pub(super) fn enqueue_or_run(&mut self, command: &Command) -> bool {
+    /// If the client is offline and `command` is queueable, persist it in SQLite (off the async
+    /// worker thread) and return `true`.
+    pub(super) async fn enqueue_or_run(&mut self, command: &Command) -> bool {
         if self.is_offline
             && let Some(mutation) = QueuedMutation::from_command(command)
         {
+            // Defense-in-depth: never persist read receipts while Stealth Mode is enabled.
+            if self.stealth_mode.load(Ordering::Relaxed)
+                && matches!(mutation, QueuedMutation::MarkRead { .. })
+            {
+                return true;
+            }
             let payload = serde_json::to_string(&mutation).unwrap_or_default();
-            let id = self
-                .store
-                .lock()
-                .ok()
-                .and_then(|mut s| s.enqueue_offline(&self.workspace, &payload).ok())
-                .unwrap_or(0);
+            let ws = self.workspace.clone();
+            let id = match with_store(&self.store, move |s| s.enqueue_offline(&ws, &payload)).await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(%err, "failed to persist offline mutation");
+                    0
+                }
+            };
             self.offline_queue.push_back((id, mutation));
             self.events
                 .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
@@ -100,13 +111,16 @@ impl<B: Backend> Core<B> {
         false
     }
 
-    pub(super) fn retry_offline_mutation(&mut self, id: i64) {
-        let found = self
-            .store
-            .lock()
-            .ok()
-            .and_then(|s| s.list_offline(&self.workspace).ok())
-            .unwrap_or_default()
+    pub(super) async fn retry_offline_mutation(&mut self, id: i64) {
+        let ws = self.workspace.clone();
+        let rows = match with_store(&self.store, move |s| s.list_offline(&ws)).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "failed to read offline queue for retry");
+                return;
+            }
+        };
+        let found = rows
             .into_iter()
             .find(|(row_id, _)| *row_id == id)
             .and_then(|(_, payload)| serde_json::from_str::<QueuedMutation>(&payload).ok());
@@ -123,10 +137,10 @@ impl<B: Backend> Core<B> {
         }
     }
 
-    pub(super) fn discard_offline_mutation(&mut self, id: i64) {
+    pub(super) async fn discard_offline_mutation(&mut self, id: i64) {
         self.offline_queue.retain(|(row_id, _)| *row_id != id);
-        if let Ok(mut s) = self.store.lock() {
-            let _ = s.delete_offline(id);
+        if let Err(err) = with_store(&self.store, move |s| s.delete_offline(id)).await {
+            tracing::warn!(id, %err, "failed to delete discarded offline mutation");
         }
         self.events
             .emit(Event::OfflineQueueChanged(self.offline_queue.len()));
@@ -138,79 +152,47 @@ impl<B: Backend> Core<B> {
         &self,
         queued: Vec<(i64, QueuedMutation)>,
     ) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
-        let unfurls = self.unfurls.clone();
-        tokio::spawn(async move {
+        let ctx = self.ctx();
+        let stealth_mode = Arc::clone(&self.stealth_mode);
+        self.tasks.spawn(async move {
             for (id, mutation) in queued {
                 let summary = mutation.summary();
-                let outcome = Self::execute_queued_mutation(
-                    &backend, &store, &ws, &events, &unfurls, mutation,
-                )
-                .await;
+                let outcome = Self::execute_queued_mutation(&ctx, &stealth_mode, mutation).await;
                 match outcome {
                     Ok(()) => {
-                        if id > 0 {
-                            let _ = with_store(&store, move |s| s.delete_offline(id)).await;
+                        if id > 0
+                            && let Err(err) =
+                                with_store(&ctx.store, move |s| s.delete_offline(id)).await
+                        {
+                            tracing::warn!(id, %err, "failed to delete flushed offline mutation");
                         }
                     }
                     Err(CoreError::Api(ApiError::AuthExpired(code))) => {
-                        events.emit(Event::AuthExpired(code));
+                        ctx.events.emit(Event::AuthExpired(code));
                         break;
                     }
+                    Err(CoreError::Cancelled) => break,
                     Err(err) => {
-                        events.emit(Event::OfflineMutationFailed(FailedMutation {
-                            id,
-                            summary,
-                            error: err.to_string(),
-                        }));
+                        ctx.events
+                            .emit(Event::OfflineMutationFailed(FailedMutation {
+                                id,
+                                summary,
+                                error: err.to_string(),
+                            }));
                     }
                 }
             }
         });
     }
 
-    /// Execute one persisted offline mutation; deletes the SQLite row on success or emits
-    /// [`Event::OfflineMutationFailed`] on failure so the user can retry or discard it.
+    /// Execute one persisted offline mutation via [`Self::flush_queued_mutations_sequentially`].
     pub(in crate::client) fn flush_queued_mutation(&self, id: i64, mutation: QueuedMutation) {
-        let backend = self.backend.clone();
-        let store = Arc::clone(&self.store);
-        let ws = self.workspace.clone();
-        let events = self.events.clone();
-        let unfurls = self.unfurls.clone();
-        let summary = mutation.summary();
-        tokio::spawn(async move {
-            let outcome =
-                Self::execute_queued_mutation(&backend, &store, &ws, &events, &unfurls, mutation)
-                    .await;
-            match outcome {
-                Ok(()) => {
-                    if id > 0 {
-                        let _ = with_store(&store, move |s| s.delete_offline(id)).await;
-                    }
-                }
-                Err(CoreError::Api(ApiError::AuthExpired(code))) => {
-                    events.emit(Event::AuthExpired(code));
-                }
-                Err(err) => {
-                    events.emit(Event::OfflineMutationFailed(FailedMutation {
-                        id,
-                        summary,
-                        error: err.to_string(),
-                    }));
-                }
-            }
-        });
+        self.flush_queued_mutations_sequentially(vec![(id, mutation)]);
     }
 
     pub(in crate::client) async fn execute_queued_mutation(
-        backend: &B,
-        store: &SharedStore,
-        ws: &TeamId,
-        events: &Emitter,
-        unfurls: &Unfurls<B>,
+        ctx: &TaskCtx<B>,
+        stealth_mode: &AtomicBool,
         mutation: QueuedMutation,
     ) -> Result<(), CoreError> {
         match mutation {
@@ -220,34 +202,21 @@ impl<B: Backend> Core<B> {
                 thread_ts,
                 broadcast,
             } => {
-                let posted = backend
-                    .post_message(channel.clone(), content, thread_ts, broadcast)
-                    .await?;
-                if let Some(message) = posted.message {
-                    unfurls.resolve(std::slice::from_ref(&message));
-                    let target = channel.clone();
-                    let ws = ws.clone();
-                    with_store(store, move |s| s.upsert_message(&ws, &target, &message)).await?;
-                    events.emit(Event::StoreChanged { channel });
-                }
+                post_message_and_store(ctx, channel, content, thread_ts, broadcast).await?;
             }
             QueuedMutation::AddReaction { channel, ts, name } => {
-                backend.add_reaction(channel, ts, name).await?;
+                ctx.backend.add_reaction(channel, ts, name).await?;
             }
             QueuedMutation::RemoveReaction { channel, ts, name } => {
-                backend.remove_reaction(channel, ts, name).await?;
+                ctx.backend.remove_reaction(channel, ts, name).await?;
             }
             QueuedMutation::MarkRead { channel, ts } => {
-                backend.mark_read(channel.clone(), ts.clone()).await?;
-                let ws = ws.clone();
-                let _ = with_store(store, move |s| {
-                    if let Some(mut conv) = s.conversation(&ws, &channel)? {
-                        conv.last_read = Some(ts);
-                        s.upsert_conversation(&ws, &conv)?;
-                    }
-                    Ok::<_, StoreError>(())
-                })
-                .await;
+                // Never leak read receipts if Stealth Mode was enabled while queued.
+                if stealth_mode.load(Ordering::Relaxed) {
+                    tracing::debug!(%channel, "suppressing queued MarkRead under Stealth Mode");
+                    return Ok(());
+                }
+                mark_read_and_store(ctx, channel, ts).await?;
             }
         }
         Ok(())

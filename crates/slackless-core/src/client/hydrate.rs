@@ -9,216 +9,31 @@ impl<B: Backend> Core<B> {
     /// `emoji.list`, usergroups, app commands, and one [`Event::SidebarChanged`] at the end).
     /// Every step reports its own failure without aborting the rest. Ephemeral messages left from
     /// a past session are dropped first.
+    #[cfg(test)]
     pub async fn hydrate(&self) {
-        let ws = self.workspace.clone();
-        if let Err(e) = with_store(&self.store, move |s| s.drop_ephemeral(&ws)).await {
-            self.events.report("store", e.into());
-        }
-        let (
-            boot_res,
-            dms_res,
-            members_res,
-            users_res,
-            counts_res,
-            sections_res,
-            emoji_res,
-            groups_res,
-            commands_res,
-        ) = tokio::join!(
-            self.backend.user_boot(),
-            self.backend.dm_list(),
-            self.backend.channel_memberships(),
-            self.backend.users(),
-            self.backend.counts(),
-            self.backend.channel_sections(),
-            self.backend.custom_emoji(),
-            self.backend.usergroups(),
-            self.backend.app_commands(),
-        );
-        match boot_res {
-            Ok(boot) => {
-                let team = boot.team.clone();
-                let prefs = boot.prefs.clone();
-                let ws = self.workspace.clone();
-                let stored = with_store(&self.store, move |store| {
-                    // `client.userBoot` objects omit `is_member`, so a row the membership
-                    // sync already marked must keep its flag: the front-end rebuilds its
-                    // snapshot on this step's event, before `users.conversations` runs.
-                    let mut convs: Vec<_> = boot.channels.into_iter().chain(boot.ims).collect();
-                    let ids: Vec<ChannelId> = convs.iter().map(|c| c.id.clone()).collect();
-                    let member = store.member_flags(&ws, &ids)?;
-                    for conversation in &mut convs {
-                        conversation.is_member |= member.contains(&conversation.id);
-                    }
-                    store.upsert_conversations(&ws, &convs)?;
-                    if let Some(me) = &boot.self_user {
-                        store.upsert_user(&ws, me)?;
-                    }
-                    Ok::<_, StoreError>((ids, boot.self_user.map(|me| me.id)))
-                })
-                .await;
-                match stored {
-                    Ok((ids, me)) => {
-                        self.events.emit(Event::Conversations(ids));
-                        if let Some(me) = me {
-                            if let Ok(mut guard) = self.self_user_id.lock() {
-                                *guard = Some(me.clone());
-                            }
-                            self.events.emit(Event::UsersChanged(vec![me]));
-                        }
-                    }
-                    Err(e) => self.events.report("hydrate", e.into()),
-                }
-                if let Some(team) = team {
-                    let ws = self.workspace.clone();
-                    let stored = with_store(&self.store, move |s| s.upsert_team(&ws, &team)).await;
-                    if let Err(e) = stored {
-                        self.events.report("hydrate team", e.into());
-                    }
-                }
-                if let Some(prefs) = prefs {
-                    let ws = self.workspace.clone();
-                    let stored =
-                        with_store(&self.store, move |s| s.replace_prefs(&ws, &prefs)).await;
-                    if let Err(e) = stored {
-                        self.events.report("hydrate prefs", e.into());
-                    }
-                }
-            }
-            Err(e) => self.events.report("client.userBoot", e.into()),
-        }
-        match dms_res {
-            Ok(dms) => {
-                let ws = self.workspace.clone();
-                let stored = with_store(&self.store, move |store| {
-                    let mut ids = Vec::new();
-                    for conversation in &dms {
-                        // `client.userBoot` caps its channel list, so newer group DMs only
-                        // ever arrive here; merging keeps boot's richer rows intact.
-                        store.merge_conversation(&ws, conversation)?;
-                        ids.push(conversation.id.clone());
-                    }
-                    Ok::<_, StoreError>(ids)
-                })
-                .await;
-                match stored {
-                    Ok(ids) if !ids.is_empty() => {
-                        self.events.emit(Event::Conversations(ids));
-                    }
-                    Ok(_) => {}
-                    Err(e) => self.events.report("client.dms", e.into()),
-                }
-            }
-            Err(e) => self.events.report("client.dms", e.into()),
-        }
-        match members_res {
-            Ok(members) => {
-                let ws = self.workspace.clone();
-                let ids = members.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
-                let flipped =
-                    with_store(&self.store, move |s| s.set_channel_memberships(&ws, &ids)).await;
-                match flipped {
-                    Ok(flipped) if !flipped.is_empty() => {
-                        self.events.emit(Event::Conversations(flipped));
-                    }
-                    Ok(_) => {}
-                    Err(e) => self.events.report("users.conversations", e.into()),
-                }
-            }
-            // Slack Connect channels hosted by another org never reach `client.counts`, so
-            // the GUI's membership gate needs this row state; failing it leaves the boot
-            // flags (usually `false`) in place until the next hydrate.
-            Err(e) => self.events.report("users.conversations", e.into()),
-        }
-        match users_res {
-            Ok(users) => {
-                let ws = self.workspace.clone();
-                let stored = with_store(&self.store, move |store| {
-                    store.upsert_users(&ws, &users)?;
-                    Ok::<_, StoreError>(users.into_iter().map(|user| user.id).collect())
-                })
-                .await;
-                match stored {
-                    Ok(ids) => {
-                        self.events.emit(Event::UsersChanged(ids));
-                    }
-                    Err(e) => self.events.report("hydrate users", e.into()),
-                }
-            }
-            Err(e) => self.events.report("users.list", e.into()),
-        }
-        match counts_res {
-            Ok(counts) => {
-                self.prefetch_unreads(&counts);
-                self.events.emit(Event::Counts(Box::new(counts)));
-            }
-            Err(e) => self.events.report("client.counts", e.into()),
-        }
-        match sections_res {
-            Ok(sections) => {
-                let ws = self.workspace.clone();
-                let stored =
-                    with_store(&self.store, move |s| s.replace_sections(&ws, &sections)).await;
-                if let Err(e) = stored {
-                    self.events.report("hydrate sections", e.into());
-                }
-            }
-            Err(e) => self.events.report("users.channelSections.list", e.into()),
-        }
-        match emoji_res {
-            Ok(emoji) => {
-                let ws = self.workspace.clone();
-                let emoji: Vec<(String, String)> = emoji.into_iter().collect();
-                let stored =
-                    with_store(&self.store, move |s| s.replace_custom_emoji(&ws, &emoji)).await;
-                if let Err(e) = stored {
-                    self.events.report("hydrate emoji", e.into());
-                }
-            }
-            Err(e) => self.events.report("emoji.list", e.into()),
-        }
-        if let Ok(groups) = groups_res {
-            let active: Vec<_> = groups
-                .into_iter()
-                .filter(|g| !g.is_deleted() && !g.handle.is_empty())
-                .collect();
-            if !active.is_empty() {
-                self.events.emit(Event::Usergroups(active));
-            }
-        }
-        if let Ok(commands) = commands_res
-            && !commands.is_empty()
-        {
-            self.events.emit(Event::AppCommands(commands));
-        }
-        self.events.emit(Event::SidebarChanged);
-        self.fetch_dm_previews();
-        // The Activity badges need the feed's unread state; last, so the boot's own events
-        // keep their order. The boot fetch skips the `messages.list` hydration (the view
-        // asks for it with bodies when it opens).
-        self.fetch_activity(false);
-        self.fetch_saved();
-        if let Some(me) = self.self_user_id.lock().ok().and_then(|g| g.clone()) {
-            let (backend, events) = (self.backend.clone(), self.events.clone());
-            self.spawn("dnd.info (self)", async move {
-                if let Ok(status) = backend.dnd_info(me).await
-                    && status.snooze_enabled
-                {
-                    events.emit(Event::SelfDndUpdated(status));
-                }
-                Ok(())
-            });
-        }
+        run_hydrate(
+            self.ctx(),
+            Arc::clone(&self.self_user_id),
+            self.tasks.clone(),
+        )
+        .await;
+    }
+
+    /// Launch [`Self::hydrate`] concurrently on this core's tracked task set so RTM and command
+    /// handling start immediately without waiting for full workspace hydration.
+    pub(super) fn spawn_hydrate(&self) {
+        let ctx = self.ctx();
+        let self_user_id = Arc::clone(&self.self_user_id);
+        let tasks = self.tasks.clone();
+        self.tasks.spawn(async move {
+            run_hydrate(ctx, self_user_id, tasks).await;
+        });
     }
 
     /// Later / Saved items (`saved.list` across active, completed, and archived tabs), hydrated
     /// through `messages.list` so the Saved view and message markers stay synced across devices.
     pub(super) fn fetch_saved(&self) {
-        let (backend, events) = (self.backend.clone(), self.events.clone());
-        self.spawn("saved.list", async move {
-            let loaded = load_saved_items(&backend, &events).await;
-            answer_load(&events, loaded, Event::SavedLoaded)
-        });
+        spawn_fetch_saved(&self.tasks, self.backend.clone(), self.events.clone());
     }
 
     /// The Activity feed (`activity.feed`): announces [`Event::ActivityView`] when it lands,
@@ -226,98 +41,319 @@ impl<B: Backend> Core<B> {
     /// hydrates the rows through `messages.list` (the view wants bodies; the boot fetch
     /// that feeds the badges does not).
     pub(super) fn fetch_activity(&self, with_bodies: bool) {
-        let (backend, events) = (self.backend.clone(), self.events.clone());
-        self.spawn("activity.feed", async move {
-            let fetched = backend.activity_feed().await;
-            match fetched {
-                Ok(mut feed) => {
-                    if with_bodies {
-                        hydrate_activity(&backend, &events, &mut feed).await;
+        spawn_fetch_activity(
+            &self.tasks,
+            self.backend.clone(),
+            self.events.clone(),
+            with_bodies,
+        );
+    }
+}
+
+async fn run_hydrate<B: Backend>(
+    ctx: TaskCtx<B>,
+    self_user_id: Arc<Mutex<Option<UserId>>>,
+    tasks: TaskTracker,
+) {
+    let ws = ctx.workspace.clone();
+    if let Err(e) = with_store(&ctx.store, move |s| s.drop_ephemeral(&ws)).await {
+        ctx.events.report("store", e);
+    }
+    let (
+        boot_res,
+        dms_res,
+        members_res,
+        users_res,
+        counts_res,
+        sections_res,
+        emoji_res,
+        groups_res,
+        commands_res,
+    ) = tokio::join!(
+        ctx.backend.user_boot(),
+        ctx.backend.dm_list(),
+        ctx.backend.channel_memberships(),
+        ctx.backend.users(),
+        ctx.backend.counts(),
+        ctx.backend.channel_sections(),
+        ctx.backend.custom_emoji(),
+        ctx.backend.usergroups(),
+        ctx.backend.app_commands(),
+    );
+    match boot_res {
+        Ok(boot) => {
+            let team = boot.team.clone();
+            let prefs = boot.prefs.clone();
+            let ws = ctx.workspace.clone();
+            let stored = with_store(&ctx.store, move |store| {
+                // `client.userBoot` objects omit `is_member`, so a row the membership
+                // sync already marked must keep its flag: the front-end rebuilds its
+                // snapshot on this step's event, before `users.conversations` runs.
+                let mut convs: Vec<_> = boot.channels.into_iter().chain(boot.ims).collect();
+                let ids: Vec<ChannelId> = convs.iter().map(|c| c.id.clone()).collect();
+                let member = store.member_flags(&ws, &ids)?;
+                for conversation in &mut convs {
+                    conversation.is_member |= member.contains(&conversation.id);
+                }
+                store.upsert_conversations(&ws, &convs)?;
+                if let Some(me) = &boot.self_user {
+                    store.upsert_user(&ws, me)?;
+                }
+                Ok((ids, boot.self_user.map(|me| me.id)))
+            })
+            .await;
+            match stored {
+                Ok((ids, me)) => {
+                    ctx.events.emit(Event::Conversations(ids));
+                    if let Some(me) = me {
+                        *self_user_id.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(me.clone());
+                        ctx.events.emit(Event::UsersChanged(vec![me]));
                     }
-                    events.emit(Event::ActivityView {
-                        feed: Ok(Box::new(feed)),
-                    });
+                }
+                Err(e) => ctx.events.report("hydrate", e),
+            }
+            if let Some(team) = team {
+                let ws = ctx.workspace.clone();
+                if let Err(e) = with_store(&ctx.store, move |s| s.upsert_team(&ws, &team)).await {
+                    ctx.events.report("hydrate team", e);
+                }
+            }
+            if let Some(prefs) = prefs {
+                let ws = ctx.workspace.clone();
+                if let Err(e) = with_store(&ctx.store, move |s| s.replace_prefs(&ws, &prefs)).await
+                {
+                    ctx.events.report("hydrate prefs", e);
+                }
+            }
+        }
+        Err(e) => ctx.events.report("client.userBoot", e.into()),
+    }
+    match dms_res {
+        Ok(dms) => {
+            let ws = ctx.workspace.clone();
+            let stored = with_store(&ctx.store, move |store| {
+                let mut ids = Vec::new();
+                for conversation in &dms {
+                    // `client.userBoot` caps its channel list, so newer group DMs only
+                    // ever arrive here; merging keeps boot's richer rows intact.
+                    store.merge_conversation(&ws, conversation)?;
+                    ids.push(conversation.id.clone());
+                }
+                Ok(ids)
+            })
+            .await;
+            match stored {
+                Ok(ids) if !ids.is_empty() => {
+                    ctx.events.emit(Event::Conversations(ids));
+                }
+                Ok(_) => {}
+                Err(e) => ctx.events.report("client.dms", e),
+            }
+        }
+        Err(e) => ctx.events.report("client.dms", e.into()),
+    }
+    match members_res {
+        Ok(members) => {
+            let ws = ctx.workspace.clone();
+            let ids = members.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+            let flipped =
+                with_store(&ctx.store, move |s| s.set_channel_memberships(&ws, &ids)).await;
+            match flipped {
+                Ok(flipped) if !flipped.is_empty() => {
+                    ctx.events.emit(Event::Conversations(flipped));
+                }
+                Ok(_) => {}
+                Err(e) => ctx.events.report("users.conversations", e),
+            }
+        }
+        Err(e) => ctx.events.report("users.conversations", e.into()),
+    }
+    match users_res {
+        Ok(users) => {
+            let ws = ctx.workspace.clone();
+            let stored = with_store(&ctx.store, move |store| {
+                store.upsert_users(&ws, &users)?;
+                Ok(users.into_iter().map(|user| user.id).collect())
+            })
+            .await;
+            match stored {
+                Ok(ids) => {
+                    ctx.events.emit(Event::UsersChanged(ids));
+                }
+                Err(e) => ctx.events.report("hydrate users", e),
+            }
+        }
+        Err(e) => ctx.events.report("users.list", e.into()),
+    }
+    match counts_res {
+        Ok(counts) => {
+            spawn_prefetch_unreads(&tasks, ctx.clone(), &counts);
+            ctx.events.emit(Event::Counts(Box::new(counts)));
+        }
+        Err(e) => ctx.events.report("client.counts", e.into()),
+    }
+    match sections_res {
+        Ok(sections) => {
+            let ws = ctx.workspace.clone();
+            if let Err(e) =
+                with_store(&ctx.store, move |s| s.replace_sections(&ws, &sections)).await
+            {
+                ctx.events.report("hydrate sections", e);
+            }
+        }
+        Err(e) => ctx.events.report("users.channelSections.list", e.into()),
+    }
+    match emoji_res {
+        Ok(emoji) => {
+            let ws = ctx.workspace.clone();
+            let emoji: Vec<(String, String)> = emoji.into_iter().collect();
+            if let Err(e) =
+                with_store(&ctx.store, move |s| s.replace_custom_emoji(&ws, &emoji)).await
+            {
+                ctx.events.report("hydrate emoji", e);
+            }
+        }
+        Err(e) => ctx.events.report("emoji.list", e.into()),
+    }
+    match groups_res {
+        Ok(groups) => {
+            let active: Vec<_> = groups
+                .into_iter()
+                .filter(|g| !g.is_deleted() && !g.handle.is_empty())
+                .collect();
+            if !active.is_empty() {
+                ctx.events.emit(Event::Usergroups(active));
+            }
+        }
+        Err(e) if e.is_auth_expired() => ctx.events.report("usergroups.list", e.into()),
+        Err(e) => tracing::warn!(%e, "hydrate usergroups.list failed"),
+    }
+    match commands_res {
+        Ok(commands) if !commands.is_empty() => {
+            ctx.events.emit(Event::AppCommands(commands));
+        }
+        Ok(_) => {}
+        Err(e) if e.is_auth_expired() => ctx.events.report("client.appCommands", e.into()),
+        Err(e) => tracing::warn!(%e, "hydrate client.appCommands failed"),
+    }
+    ctx.events.emit(Event::SidebarChanged);
+    spawn_fetch_dm_previews(&tasks, ctx.clone());
+    // The Activity badges need the feed's unread state; last, so the boot's own events
+    // keep their order. The boot fetch skips the `messages.list` hydration (the view
+    // asks for it with bodies when it opens).
+    spawn_fetch_activity(&tasks, ctx.backend.clone(), ctx.events.clone(), false);
+    spawn_fetch_saved(&tasks, ctx.backend.clone(), ctx.events.clone());
+    let me = self_user_id
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    if let Some(me) = me {
+        let (backend, events) = (ctx.backend, ctx.events);
+        spawn_tracked(&tasks, &events.clone(), "dnd.info (self)", async move {
+            match backend.dnd_info(me).await {
+                Ok(status) if status.snooze_enabled => {
+                    events.emit(Event::SelfDndUpdated(status));
                     Ok(())
                 }
+                Ok(_) => Ok(()),
+                Err(e) if e.is_auth_expired() => Err(e.into()),
                 Err(e) => {
-                    events.emit(Event::ActivityView {
-                        feed: Err(e.to_string()),
-                    });
-                    Err(e.into())
+                    tracing::debug!(%e, "hydrate dnd.info (self) failed");
+                    Ok(())
                 }
             }
         });
     }
+}
 
-    /// Background-prefetch the newest messages of unread conversations reported by
-    /// `client.counts` whose local SQLite cache is behind `latest`, so clicking an unread channel
-    /// or DM renders the new messages on frame 0 without waiting for an HTTP round-trip.
-    pub(super) fn prefetch_unreads(&self, counts: &crate::api::ClientCounts) {
-        let targets = select_prefetch_targets(counts);
-        if targets.is_empty() {
-            return;
-        }
-        let (backend, store, ws, events, unfurls) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-            self.unfurls.clone(),
-        );
-        self.spawn("unread prefetch", async move {
-            prefetch_targets(backend, store, ws, events, unfurls, targets).await
-        });
-    }
+fn spawn_fetch_saved<B: Backend>(tasks: &TaskTracker, backend: B, events: Emitter) {
+    spawn_tracked(tasks, &events.clone(), "saved.list", async move {
+        let loaded = load_saved_items(&backend, &events).await;
+        answer_load(&events, loaded, Event::SavedLoaded)
+    });
+}
 
-    /// DM-list previews: every IM/MPIM that is open (listed in Slack's DMs tab) and has
-    /// nothing stored at all gets its newest message (one `conversations.history` limit-1
-    /// call each, sequential and paced at the Tier-3 rate) so the DM list previews and sorts
-    /// conversations never opened in slackless, as Slack does. Closed conversations stay
-    /// unfetched. A fetched preview only adds one message: it touches neither the backfill's
-    /// synced spans nor any completeness state, so opening the conversation still walks its
-    /// full history from the newest page.
-    pub(super) fn fetch_dm_previews(&self) {
-        let (backend, store, ws, events, unfurls) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-            self.unfurls.clone(),
-        );
-        self.spawn("dm previews", async move {
-            let ws2 = ws.clone();
-            let conversations = with_store(&store, move |s| s.conversations(&ws2)).await?;
-            let dms: Vec<ChannelId> = conversations
-                .iter()
-                .filter(|c| {
-                    matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim) && c.is_open
-                })
-                .map(|c| c.id.clone())
-                .collect();
-            let ws3 = ws.clone();
-            let asked = dms.clone();
-            let filled =
-                with_store(&store, move |s| s.channels_with_messages(&ws3, &asked)).await?;
-            let mut first = true;
-            for channel in dms.iter().filter(|id| !filled.contains(*id)) {
-                if !std::mem::take(&mut first) {
-                    tokio::time::sleep(PAGE_DELAY).await;
+fn spawn_fetch_activity<B: Backend>(
+    tasks: &TaskTracker,
+    backend: B,
+    events: Emitter,
+    with_bodies: bool,
+) {
+    spawn_tracked(tasks, &events.clone(), "activity.feed", async move {
+        match backend.activity_feed().await {
+            Ok(mut feed) => {
+                if with_bodies {
+                    hydrate_activity(&backend, &events, &mut feed).await;
                 }
-                let message =
-                    wait_out_rate_limits(|| backend.latest_message(channel.clone())).await?;
-                let Some(message) = message else {
-                    continue;
-                };
-                unfurls.resolve(std::slice::from_ref(&message));
-                let (ws4, target) = (ws.clone(), (*channel).clone());
-                with_store(&store, move |s| s.upsert_message(&ws4, &target, &message)).await?;
-                events.emit(Event::StoreChanged {
-                    channel: (*channel).clone(),
+                events.emit(Event::ActivityView {
+                    feed: Ok(Box::new(feed)),
                 });
+                Ok(())
             }
-            Ok(())
-        });
+            Err(e) => {
+                events.emit(Event::ActivityView {
+                    feed: Err(e.to_string()),
+                });
+                Err(e.into())
+            }
+        }
+    });
+}
+
+fn spawn_prefetch_unreads<B: Backend>(
+    tasks: &TaskTracker,
+    ctx: TaskCtx<B>,
+    counts: &crate::api::ClientCounts,
+) {
+    let targets = select_prefetch_targets(counts);
+    if targets.is_empty() {
+        return;
     }
+    let events = ctx.events.clone();
+    spawn_tracked(tasks, &events, "unread prefetch", async move {
+        prefetch_targets(ctx, targets).await
+    });
+}
+
+fn spawn_fetch_dm_previews<B: Backend>(tasks: &TaskTracker, ctx: TaskCtx<B>) {
+    let events = ctx.events.clone();
+    spawn_tracked(tasks, &events, "dm previews", async move {
+        let ws2 = ctx.workspace.clone();
+        let conversations = with_store(&ctx.store, move |s| s.conversations(&ws2)).await?;
+        let dms: Vec<ChannelId> = conversations
+            .iter()
+            .filter(|c| {
+                matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim) && c.is_open
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        let ws3 = ctx.workspace.clone();
+        let asked = dms.clone();
+        let filled =
+            with_store(&ctx.store, move |s| s.channels_with_messages(&ws3, &asked)).await?;
+        let mut first = true;
+        for channel in dms.iter().filter(|id| !filled.contains(*id)) {
+            if !std::mem::take(&mut first) {
+                tokio::time::sleep(PAGE_DELAY).await;
+            }
+            let message =
+                wait_out_rate_limits(|| ctx.backend.latest_message(channel.clone())).await?;
+            let Some(message) = message else {
+                continue;
+            };
+            ctx.unfurls.resolve(std::slice::from_ref(&message));
+            let (ws4, target) = (ctx.workspace.clone(), (*channel).clone());
+            with_store(&ctx.store, move |s| {
+                s.upsert_message(&ws4, &target, &message)
+            })
+            .await?;
+            ctx.events.emit(Event::StoreChanged {
+                channel: (*channel).clone(),
+            });
+        }
+        Ok(())
+    });
 }
 
 /// Select up to 25 unread conversations to prefetch, prioritizing DMs, then mentions, then
@@ -365,11 +401,7 @@ pub(super) fn select_prefetch_targets(
 
 /// Prefetch recent history for unread `targets` whose local SQLite archive is behind `latest`.
 pub(super) async fn prefetch_targets<B: Backend>(
-    backend: B,
-    store: SharedStore,
-    ws: TeamId,
-    events: Emitter,
-    unfurls: Unfurls<B>,
+    ctx: TaskCtx<B>,
     targets: Vec<(ChannelId, Option<Ts>)>,
 ) -> Result<(), CoreError> {
     let mut fetched = 0usize;
@@ -378,8 +410,8 @@ pub(super) async fn prefetch_targets<B: Backend>(
         if let Some(ref latest_ts) = latest
             && !latest_ts.as_str().is_empty()
         {
-            let (ws_check, ch_check) = (ws.clone(), channel.clone());
-            let local_newest = with_store(&store, move |s| {
+            let (ws_check, ch_check) = (ctx.workspace.clone(), channel.clone());
+            let local_newest = with_store(&ctx.store, move |s| {
                 s.channel_history(&ws_check, &ch_check, None, 1)
                     .map(|rows| rows.into_iter().last().map(|r| r.message.ts))
             })
@@ -395,60 +427,87 @@ pub(super) async fn prefetch_targets<B: Backend>(
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
         let items = match wait_out_rate_limits(|| {
-            backend.recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
+            ctx.backend
+                .recent_history(channel.clone(), crate::backend::UNREADS_HISTORY_LIMIT)
         })
         .await
         {
             Ok(items) => items,
-            Err(_) => continue,
+            Err(e) if e.is_auth_expired() => return Err(e.into()),
+            Err(e) => {
+                tracing::debug!(%channel, %e, "unread prefetch skipped channel");
+                continue;
+            }
         };
         fetched += 1;
         if items.is_empty() {
             continue;
         }
-        unfurls.resolve(items.iter());
-        let (ws_put, target) = (ws.clone(), channel.clone());
-        with_store(&store, move |s| s.upsert_messages(&ws_put, &target, &items)).await?;
-        events.emit(Event::StoreChanged { channel });
+        ctx.unfurls.resolve(items.iter());
+        let (ws_put, target) = (ctx.workspace.clone(), channel.clone());
+        with_store(&ctx.store, move |s| {
+            s.upsert_messages(&ws_put, &target, &items)
+        })
+        .await?;
+        ctx.events.emit(Event::StoreChanged { channel });
     }
     Ok(())
 }
 
+/// Shared O(N) `messages.list` batch hydrator used by both Activity feed and Later/Saved items.
+pub(super) async fn hydrate_messages_batch<B: Backend>(
+    backend: &B,
+    events: &Emitter,
+    missing: impl IntoIterator<Item = (ChannelId, Ts)>,
+) -> HashMap<(ChannelId, Ts), Message> {
+    let mut grouped: HashMap<ChannelId, Vec<Ts>> = HashMap::new();
+    for (channel, ts) in missing {
+        grouped.entry(channel).or_default().push(ts);
+    }
+    if grouped.is_empty() {
+        return HashMap::new();
+    }
+    let by_channel: Vec<(ChannelId, Vec<Ts>)> = grouped.into_iter().collect();
+    match backend.messages_list(by_channel).await {
+        Ok(bodies) => {
+            let mut lookup = HashMap::new();
+            for (channel, messages) in bodies {
+                for msg in messages {
+                    lookup.insert((channel.clone(), msg.ts.clone()), msg);
+                }
+            }
+            lookup
+        }
+        Err(e) => {
+            events.report("messages.list", e.into());
+            HashMap::new()
+        }
+    }
+}
+
 /// Fills each Activity row's body through `messages.list`, one batched call per
-/// [`api`] channel cap. Rows whose channel stays silent (or the whole call, when it fails)
-/// keep no body: the view renders them without text and the failure is reported.
+/// [`api`] channel cap.
 pub(super) async fn hydrate_activity<B: Backend>(
     backend: &B,
     events: &Emitter,
     feed: &mut crate::api::ActivityFeed,
 ) {
-    let mut by_channel: Vec<(ChannelId, Vec<Ts>)> = Vec::new();
-    for item in &feed.items {
-        if item.message.is_none() {
-            match by_channel
-                .iter_mut()
-                .find(|(channel, _)| *channel == item.channel)
-            {
-                Some((_, stamps)) => stamps.push(item.ts.clone()),
-                None => by_channel.push((item.channel.clone(), vec![item.ts.clone()])),
-            }
-        }
-    }
-    if by_channel.is_empty() {
+    let missing = feed
+        .items
+        .iter()
+        .filter(|item| item.message.is_none())
+        .map(|item| (item.channel.clone(), item.ts.clone()))
+        .collect::<Vec<_>>();
+    let lookup = hydrate_messages_batch(backend, events, missing).await;
+    if lookup.is_empty() {
         return;
     }
-    match backend.messages_list(by_channel).await {
-        Ok(bodies) => {
-            for item in &mut feed.items {
-                if item.message.is_none() {
-                    item.message = bodies
-                        .get(&item.channel)
-                        .and_then(|messages| messages.iter().find(|message| message.ts == item.ts))
-                        .cloned();
-                }
-            }
+    for item in &mut feed.items {
+        if item.message.is_none() {
+            item.message = lookup
+                .get(&(item.channel.clone(), item.ts.clone()))
+                .cloned();
         }
-        Err(e) => events.report("messages.list", e.into()),
     }
 }
 
@@ -459,43 +518,36 @@ pub(super) async fn load_saved_items<B: Backend>(
     events: &Emitter,
 ) -> Result<Vec<crate::api::SavedItem>, ApiError> {
     let mut items = backend.saved_list("saved").await?;
+    let mut seen: HashSet<(ChannelId, Ts)> = items
+        .iter()
+        .map(|item| (item.channel.clone(), item.ts.clone()))
+        .collect();
     for filter in ["completed", "archived"] {
-        if let Ok(extra) = backend.saved_list(filter).await {
-            for item in extra {
-                if !items
-                    .iter()
-                    .any(|existing| existing.channel == item.channel && existing.ts == item.ts)
-                {
-                    items.push(item);
-                }
-            }
-        }
-    }
-    let mut by_channel: Vec<(ChannelId, Vec<Ts>)> = Vec::new();
-    for item in &items {
-        if item.message.is_none() {
-            match by_channel
-                .iter_mut()
-                .find(|(channel, _)| *channel == item.channel)
-            {
-                Some((_, stamps)) => stamps.push(item.ts.clone()),
-                None => by_channel.push((item.channel.clone(), vec![item.ts.clone()])),
-            }
-        }
-    }
-    if !by_channel.is_empty() {
-        match backend.messages_list(by_channel).await {
-            Ok(bodies) => {
-                for item in &mut items {
-                    if item.message.is_none() {
-                        item.message = bodies
-                            .get(&item.channel)
-                            .and_then(|messages| messages.iter().find(|m| m.ts == item.ts))
-                            .cloned();
+        match backend.saved_list(filter).await {
+            Ok(extra) => {
+                for item in extra {
+                    if seen.insert((item.channel.clone(), item.ts.clone())) {
+                        items.push(item);
                     }
                 }
             }
-            Err(e) => events.report("messages.list", e.into()),
+            Err(e) if e.is_auth_expired() => return Err(e),
+            Err(e) => tracing::debug!(filter, %e, "saved.list secondary filter failed"),
+        }
+    }
+    let missing = items
+        .iter()
+        .filter(|item| item.message.is_none())
+        .map(|item| (item.channel.clone(), item.ts.clone()))
+        .collect::<Vec<_>>();
+    let lookup = hydrate_messages_batch(backend, events, missing).await;
+    if !lookup.is_empty() {
+        for item in &mut items {
+            if item.message.is_none() {
+                item.message = lookup
+                    .get(&(item.channel.clone(), item.ts.clone()))
+                    .cloned();
+            }
         }
     }
     Ok(items)
@@ -521,15 +573,9 @@ pub(super) fn answer_load<T>(
 }
 
 /// `team.info` for the connected organizations of shared channels (`team_ids`), each id
-/// asked once per session through `asked` (found or not). Records are stored beside the
-/// workspace's own team and announced with [`Event::SidebarChanged`], whose reload re-reads
-/// them; a failed lookup is reported and the rest still land, so one bad org never blocks
-/// the others.
-pub(super) async fn resolve_teams(
-    backend: impl Backend,
-    store: SharedStore,
-    workspace: TeamId,
-    events: Emitter,
+/// asked once per session through `asked` (found or not).
+pub(super) async fn resolve_teams<B: Backend>(
+    ctx: TaskCtx<B>,
     asked: Arc<Mutex<HashSet<TeamId>>>,
     team_ids: Vec<TeamId>,
 ) {
@@ -545,24 +591,23 @@ pub(super) async fn resolve_teams(
     }
     let mut teams = Vec::new();
     for id in fresh {
-        match backend.team_info(id).await {
+        match ctx.backend.team_info(id).await {
             Ok(team) => teams.push(team),
-            Err(e) => events.report("team.info", e.into()),
+            Err(e) => ctx.events.report("team.info", e.into()),
         }
     }
     if teams.is_empty() {
         return;
     }
-    let outcome = with_store(&store, move |s| {
-        teams
-            .iter()
-            .try_for_each(|team| s.upsert_team(&workspace, team))
+    let ws = ctx.workspace.clone();
+    let outcome = with_store(&ctx.store, move |s| {
+        teams.iter().try_for_each(|team| s.upsert_team(&ws, team))
     })
     .await;
     match outcome {
         Ok(()) => {
-            events.emit(Event::SidebarChanged);
+            ctx.events.emit(Event::SidebarChanged);
         }
-        Err(e) => events.report("team.info store", e.into()),
+        Err(e) => ctx.events.report("team.info store", e),
     }
 }

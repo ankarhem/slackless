@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Slack's recommended ceiling for one `presence_sub` frame.
+const PRESENCE_SUB_MAX: usize = 500;
+
 impl<B: Backend> Core<B> {
     /// Starts (or restarts) the backfill of `channel`, newest page first.
     pub(super) fn open(&mut self, channel: ChannelId) {
@@ -12,8 +15,9 @@ impl<B: Backend> Core<B> {
         {
             return;
         }
-        let task = tokio::spawn(self.backfill.clone().run(channel.clone()));
-        self.backfills.insert(channel, task.abort_handle());
+        if let Some(abort) = self.tasks.spawn(self.backfill.clone().run(channel.clone())) {
+            self.backfills.insert(channel, abort);
+        }
     }
 
     pub(super) async fn on_rtm(&mut self, event: RtmEvent) {
@@ -27,18 +31,12 @@ impl<B: Backend> Core<B> {
                         self.is_offline = false;
                         self.subscribe_dm_presence();
                         if reconnected {
-                            let (backend, store, ws, events, unfurls) = (
-                                self.backend.clone(),
-                                Arc::clone(&self.store),
-                                self.workspace.clone(),
-                                self.events.clone(),
-                                self.unfurls.clone(),
-                            );
+                            let ctx = self.ctx();
                             self.spawn("reconnect counts", async move {
-                                let counts = backend.counts().await?;
+                                let counts = ctx.backend.counts().await?;
                                 let targets = select_prefetch_targets(&counts);
-                                events.emit(Event::Counts(Box::new(counts)));
-                                prefetch_targets(backend, store, ws, events, unfurls, targets).await
+                                ctx.events.emit(Event::Counts(Box::new(counts)));
+                                prefetch_targets(ctx, targets).await
                             });
                         }
                         if !self.offline_queue.is_empty() {
@@ -113,20 +111,14 @@ impl<B: Backend> Core<B> {
                     _ => {}
                 }
                 if matches!(&event, SlackEvent::EmojiChanged(_)) {
-                    let (backend, store, ws, events) = (
-                        self.backend.clone(),
-                        Arc::clone(&self.store),
-                        self.workspace.clone(),
-                        self.events.clone(),
-                    );
+                    let ctx = self.ctx();
                     self.spawn("emoji.list", async move {
-                        if let Ok(emoji) = backend.custom_emoji().await {
-                            let pairs: Vec<(String, String)> = emoji.into_iter().collect();
-                            let _ =
-                                with_store(&store, move |s| s.replace_custom_emoji(&ws, &pairs))
-                                    .await;
-                            events.emit(Event::SidebarChanged);
-                        }
+                        let emoji = ctx.backend.custom_emoji().await?;
+                        let pairs: Vec<(String, String)> = emoji.into_iter().collect();
+                        let ws = ctx.workspace.clone();
+                        with_store(&ctx.store, move |s| s.replace_custom_emoji(&ws, &pairs))
+                            .await?;
+                        ctx.events.emit(Event::SidebarChanged);
                         Ok(())
                     });
                 }
@@ -141,11 +133,10 @@ impl<B: Backend> Core<B> {
                     ) {
                         self.fetch_saved();
                     } else if r#type == "commands_changed" {
-                        let (backend, events) = (self.backend.clone(), self.events.clone());
+                        let ctx = self.ctx();
                         self.spawn("client.appCommands", async move {
-                            if let Ok(commands) = backend.app_commands().await {
-                                events.emit(Event::AppCommands(commands));
-                            }
+                            let commands = ctx.backend.app_commands().await?;
+                            ctx.events.emit(Event::AppCommands(commands));
                             Ok(())
                         });
                     } else if r#type == "user_status_changed" {
@@ -155,8 +146,11 @@ impl<B: Backend> Core<B> {
                         {
                             let id = user.id.clone();
                             let ws = self.workspace.clone();
-                            let _ =
-                                with_store(&self.store, move |s| s.upsert_user(&ws, &user)).await;
+                            if let Err(err) =
+                                with_store(&self.store, move |s| s.upsert_user(&ws, &user)).await
+                            {
+                                tracing::warn!(%err, "failed to store user_status_changed");
+                            }
                             self.events.emit(Event::UsersChanged(vec![id]));
                         }
                     } else if matches!(
@@ -183,37 +177,48 @@ impl<B: Backend> Core<B> {
                 if let Some(channel) = refresh_target(&event) {
                     self.refresh_conversation(channel);
                 }
-                self.attach_bot_profile(&mut event).await;
+                let deferred_bot = self.attach_cached_bot_profile(&mut event);
                 self.unfurls.resolve(event_messages(&event));
                 let posted = posted_message(&event);
                 let ws = self.workspace.clone();
-                let changed = with_store(&self.store, move |s| apply_event(s, &ws, event)).await;
+                let changed = with_store_opt(&self.store, move |s| apply_event(s, &ws, event))
+                    .await
+                    .flatten();
                 if let Some(changed) = changed {
                     self.events.emit(changed);
                 }
                 if let Some((channel, message)) = posted {
                     self.events.emit(Event::MessagePosted { channel, message });
                 }
+                // Resolve unknown bot profiles asynchronously AFTER storing the message so live
+                // HTTP `bots.info` never blocks the RTM `select!` loop.
+                if let Some((bot, msg_ref)) = deferred_bot {
+                    self.spawn_fetch_bot_profile(bot, msg_ref);
+                }
             }
         }
     }
 
-    /// An ephemeral app message (Giphy's preview) carries only its `bot_id`: give it the
-    /// bot's profile (`bots.info`, once per bot per session) so it shows the app's name and
-    /// icon and its buttons know the app to dispatch to.
-    pub(super) async fn attach_bot_profile(&mut self, event: &mut SlackEvent) {
-        let message = match event {
-            SlackEvent::Message(MessageEvent::Message(message)) => message.as_mut(),
-            SlackEvent::Message(MessageEvent::Changed(changed)) => changed.message.as_mut(),
-            _ => return,
+    /// Attach a cached bot profile synchronously when available; otherwise claim `bot` in
+    /// `bots_asked` and return `(bot, optional_message_ref)` so the caller spawns `bots.info`
+    /// asynchronously off the RTM event loop.
+    fn attach_cached_bot_profile(
+        &mut self,
+        event: &mut SlackEvent,
+    ) -> Option<(BotId, Option<(ChannelId, Ts)>)> {
+        let (channel, message) = match event {
+            SlackEvent::Message(MessageEvent::Message(message)) => {
+                (message.channel.clone(), message.as_mut())
+            }
+            SlackEvent::Message(MessageEvent::Changed(changed)) => {
+                (changed.channel.clone(), changed.message.as_mut())
+            }
+            _ => return None,
         };
-        let Some(bot) = message
+        let bot = message
             .bot_id
             .clone()
-            .filter(|_| message.bot_profile.is_none())
-        else {
-            return;
-        };
+            .filter(|_| message.bot_profile.is_none())?;
         if let Some(profile) = self
             .bots
             .lock()
@@ -222,68 +227,40 @@ impl<B: Backend> Core<B> {
             .cloned()
         {
             message.bot_profile = Some(profile);
-            return;
+            return None;
         }
         if !self.bots_asked.insert(bot.clone()) {
-            return;
+            return None;
         }
-        match self.backend.bot_info(bot.clone()).await {
-            Ok(profile) => {
-                self.bots
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(bot.clone(), profile.clone());
-                let ws = self.workspace.clone();
-                let bot_store = bot;
-                let profile_store = profile.clone();
-                let _ = with_store(&self.store, move |s| {
-                    s.upsert_bot_profile(&ws, &bot_store, &profile_store)
-                })
-                .await;
-                message.bot_profile = Some(profile);
-            }
-            Err(e) => self.events.report("bots.info", e.into()),
-        }
+        let msg_ref = channel.map(|ch| (ch, message.ts.clone()));
+        Some((bot, msg_ref))
     }
 
-    /// Re-fetches a conversation whose event carries only its id.
+    /// Re-fetches a conversation whose event carries only its id, merging into the store so
+    /// existing metadata is never clobbered by partial payloads.
     pub(super) fn refresh_conversation(&self, channel: ChannelId) {
-        let (backend, store, ws, events) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-        );
+        let ctx = self.ctx();
         self.spawn("conversations.info", async move {
-            let conversation = backend.conversation_info(channel.clone()).await?;
-            with_store(&store, move |s| s.upsert_conversation(&ws, &conversation)).await?;
-            events.emit(Event::Conversations(vec![channel]));
+            let conversation = ctx.backend.conversation_info(channel.clone()).await?;
+            let ws = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| {
+                s.merge_conversation(&ws, &conversation)
+            })
+            .await?;
+            ctx.events.emit(Event::Conversations(vec![channel]));
             Ok(())
         });
     }
 
-    /// Open-time `conversations.info`: metadata `client.userBoot` omits (topic, member
-    /// counts) merged into the stored copy, so richer stored fields survive the refresh. The
-    /// header's counts come from `conversations.members` cross-checked against the stored
-    /// profiles (`Event::ConversationInfo` carries the split, plus the member id list for
-    /// member panels and Slack Connect org counts); when the member list cannot be read,
-    /// `conversations.info`'s raw `num_members` stands. A Slack Connect channel also resolves
-    /// the connected organizations' `team.info` records, each asked once per session.
+    /// Open-time `conversations.info` + `conversations.members` refresh.
     pub(super) fn merge_channel_info(&self, channel: ChannelId) {
-        let (backend, store, ws, events, teams_asked) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-            Arc::clone(&self.teams_asked),
-        );
+        let ctx = self.ctx();
+        let teams_asked = Arc::clone(&self.teams_asked);
         self.spawn("conversations.info", async move {
-            let mut fresh = match backend.conversation_info(channel.clone()).await {
+            let mut fresh = match ctx.backend.conversation_info(channel.clone()).await {
                 Ok(fresh) => fresh,
                 Err(e) => {
-                    // Nothing is known; the announcement still lands so front-ends waiting on
-                    // the member list stop waiting (the failure itself is reported).
-                    events.emit(Event::ConversationInfo {
+                    ctx.events.emit(Event::ConversationInfo {
                         channel,
                         num_members: None,
                         num_apps: None,
@@ -295,19 +272,16 @@ impl<B: Backend> Core<B> {
             let mut members = Vec::new();
             let mut num_apps = None;
             let mut external_teams = Vec::new();
-            if let Ok(listed) = backend.conversation_members(channel.clone()).await {
-                let (ws2, shared) = (ws.clone(), fresh.is_ext_shared);
-                // One store read for both: the header's split and, for a Slack Connect
-                // channel, the other organizations its stored people belong to. The list
-                // rides the event only: stored on the row it would bloat every snapshot.
-                let (counts, teams, listed) = with_store(&store, move |s| {
+            if let Ok(listed) = ctx.backend.conversation_members(channel.clone()).await {
+                let (ws2, shared) = (ctx.workspace.clone(), fresh.is_ext_shared);
+                let (counts, teams, listed) = with_store(&ctx.store, move |s| {
                     let counts = s.member_counts(&ws2, &listed)?;
                     let teams = if shared {
                         s.member_team_ids(&ws2, &listed)?
                     } else {
                         Vec::new()
                     };
-                    Ok::<_, StoreError>((counts, teams, listed))
+                    Ok((counts, teams, listed))
                 })
                 .await?;
                 fresh.num_members = Some(counts.humans);
@@ -316,36 +290,30 @@ impl<B: Backend> Core<B> {
                 members = listed;
             }
             let num_members = fresh.num_members;
-            let ws2 = ws.clone();
-            with_store(&store, move |s| s.merge_conversation(&ws2, &fresh)).await?;
-            events.emit(Event::ConversationInfo {
+            let ws2 = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| s.merge_conversation(&ws2, &fresh)).await?;
+            ctx.events.emit(Event::ConversationInfo {
                 channel,
                 num_members,
                 num_apps,
                 members,
             });
             if !external_teams.is_empty() {
-                resolve_teams(backend, store, ws, events, teams_asked, external_teams).await;
+                resolve_teams(ctx, teams_asked, external_teams).await;
             }
             Ok(())
         });
     }
 
-    /// Open-time `dnd.info` for a DM peer: whether their notifications are paused. Transient
-    /// by design, so it is re-fetched every time the DM opens and never stored.
+    /// Open-time `dnd.info` for a DM peer: whether their notifications are paused.
     pub(super) fn fetch_peer_dnd(&self, channel: ChannelId) {
-        let (backend, store, ws, events) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-        );
+        let ctx = self.ctx();
         self.spawn("dnd.info", async move {
-            let Some(peer) = im_peer(&store, &ws, &channel).await? else {
+            let Some(peer) = im_peer(&ctx.store, &ctx.workspace, &channel).await? else {
                 return Ok(());
             };
-            let status = backend.dnd_info(peer.clone()).await?;
-            events.emit(Event::DndPaused {
+            let status = ctx.backend.dnd_info(peer.clone()).await?;
+            ctx.events.emit(Event::DndPaused {
                 user: peer,
                 paused: status.paused(now_secs()),
             });
@@ -354,10 +322,7 @@ impl<B: Backend> Core<B> {
     }
 
     /// `users.info` for people `users.list` leaves out (members of other organizations in
-    /// shared channels and DMs), each id asked once per session. Found profiles are stored
-    /// and announced together; a failed lookup is reported and the rest still land. The
-    /// organizations the people found belong to are resolved next ([`resolve_teams`]), so a
-    /// Slack Connect channel can name them on its first visit.
+    /// shared channels and DMs), each id asked once per session.
     pub(super) fn resolve_users(&mut self, ids: Vec<UserId>) {
         let ids: Vec<UserId> = ids
             .into_iter()
@@ -366,37 +331,29 @@ impl<B: Backend> Core<B> {
         if ids.is_empty() {
             return;
         }
-        let (backend, store, ws, events, teams_asked) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-            Arc::clone(&self.teams_asked),
-        );
+        let ctx = self.ctx();
+        let teams_asked = Arc::clone(&self.teams_asked);
         self.spawn("users.info", async move {
-            // A full record already in the store (users.list or an earlier ask) needs no
-            // call: only the store-unknown ids - another organization's people, guests -
-            // are asked for.
-            let ws_known = ws.clone();
-            let stored = with_store(&store, move |s| {
-                s.users(&ws_known).map(|users| {
-                    users
-                        .into_iter()
-                        .map(|user| user.id)
-                        .collect::<HashSet<UserId>>()
-                })
+            // Check only the requested ids via PK lookup instead of scanning every stored user.
+            let ws_known = ctx.workspace.clone();
+            let ids = with_store(&ctx.store, move |s| {
+                let mut unknown = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if s.user(&ws_known, &id)?.is_none() {
+                        unknown.push(id);
+                    }
+                }
+                Ok(unknown)
             })
-            .await
-            .unwrap_or_default();
-            let ids: Vec<UserId> = ids.into_iter().filter(|id| !stored.contains(id)).collect();
+            .await?;
             if ids.is_empty() {
                 return Ok(());
             }
             let mut users = Vec::new();
             for id in ids {
-                match backend.user_info(id).await {
+                match ctx.backend.user_info(id).await {
                     Ok(user) => users.push(user),
-                    Err(e) => events.report("users.info", e.into()),
+                    Err(e) => ctx.events.report("users.info", e.into()),
                 }
             }
             if users.is_empty() {
@@ -406,42 +363,37 @@ impl<B: Backend> Core<B> {
             let teams: Vec<TeamId> = users
                 .iter()
                 .filter_map(|user| user.team_id.clone())
-                .filter(|team| *team != ws)
+                .filter(|team| *team != ctx.workspace)
                 .collect();
-            let ws2 = ws.clone();
-            with_store(&store, move |s| {
+            let ws2 = ctx.workspace.clone();
+            with_store(&ctx.store, move |s| {
                 users.iter().try_for_each(|user| s.upsert_user(&ws2, user))
             })
             .await?;
-            events.emit(Event::UsersChanged(ids));
+            ctx.events.emit(Event::UsersChanged(ids));
             if !teams.is_empty() {
-                resolve_teams(backend, store, ws, events, teams_asked, teams).await;
+                resolve_teams(ctx, teams_asked, teams).await;
             }
             Ok(())
         });
     }
 
-    /// Subscribes presence for every DM peer, so each DM row carries Slack's dot. Slack answers
-    /// a `presence_sub` with the current presence of each newly subscribed id, so no per-user
-    /// request is needed; each frame replaces the whole subscription, so the accumulated peers
-    /// (including ones a DM open added) are resent.
+    /// Subscribes presence for every DM peer (capped at [`PRESENCE_SUB_MAX`]).
     pub(super) fn subscribe_dm_presence(&self) {
-        /// Slack's recommended ceiling for one presence subscription.
-        const PRESENCE_SUB_MAX: usize = 500;
         let Some(rtm) = self.rtm.clone() else {
             return;
         };
-        let (store, ws, events) = (
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-        );
+        let ctx = self.ctx();
         let watched = Arc::clone(&self.presence_peers);
         self.spawn("presence_sub", async move {
-            let conversations = with_store(&store, move |s| s.conversations(&ws)).await?;
+            let ws = ctx.workspace.clone();
+            let dms = with_store(&ctx.store, move |s| {
+                s.list_conversations_by_kinds(&ws, &["im"])
+            })
+            .await?;
             let peers = {
                 let mut watched = watched.lock().unwrap_or_else(PoisonError::into_inner);
-                for peer in conversations.into_iter().filter_map(|c| c.user) {
+                for peer in dms.into_iter().filter_map(|c| c.user) {
                     if !watched.contains(&peer) {
                         watched.push(peer);
                     }
@@ -450,27 +402,20 @@ impl<B: Backend> Core<B> {
                 watched.clone()
             };
             if let Err(e) = rtm.presence_sub(peers) {
-                events.emit(Event::Error(format!("presence_sub: {e}")));
+                ctx.events.emit(Event::Error(format!("presence_sub: {e}")));
             }
             Ok(())
         });
     }
 
     /// Presence for a DM peer: one `users.getPresence` read the first time their DM opens,
-    /// then the websocket subscription keeps it current through `presence_change` events
-    /// (each `presence_sub` frame replaces the previous subscription, so the whole
-    /// accumulated peer set is resent).
+    /// then the websocket subscription keeps it current (bounded to [`PRESENCE_SUB_MAX`]).
     pub(super) fn watch_peer_presence(&self, channel: ChannelId) {
-        let (backend, store, ws, events) = (
-            self.backend.clone(),
-            Arc::clone(&self.store),
-            self.workspace.clone(),
-            self.events.clone(),
-        );
+        let ctx = self.ctx();
         let rtm = self.rtm.clone();
         let watched = Arc::clone(&self.presence_peers);
         self.spawn("users.getPresence", async move {
-            let Some(peer) = im_peer(&store, &ws, &channel).await? else {
+            let Some(peer) = im_peer(&ctx.store, &ctx.workspace, &channel).await? else {
                 return Ok(());
             };
             let newly_watched = {
@@ -478,6 +423,9 @@ impl<B: Backend> Core<B> {
                 if watched.contains(&peer) {
                     false
                 } else {
+                    while watched.len() >= PRESENCE_SUB_MAX {
+                        watched.remove(0);
+                    }
                     watched.push(peer.clone());
                     true
                 }
@@ -491,11 +439,11 @@ impl<B: Backend> Core<B> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone();
                 if let Err(e) = rtm.presence_sub(peers) {
-                    events.emit(Event::Error(format!("presence_sub: {e}")));
+                    ctx.events.emit(Event::Error(format!("presence_sub: {e}")));
                 }
             }
-            let presence = backend.user_presence(peer.clone()).await?;
-            events.emit(Event::Presence {
+            let presence = ctx.backend.user_presence(peer.clone()).await?;
+            ctx.events.emit(Event::Presence {
                 users: vec![peer],
                 presence: presence.presence,
             });
@@ -504,7 +452,7 @@ impl<B: Backend> Core<B> {
     }
 }
 
-/// thread broadcasts, not edits, deletions or channel events (joins, topics, ...).
+/// Thread broadcasts, not edits, deletions or channel events (joins, topics, ...).
 pub(super) fn posted_message(event: &SlackEvent) -> Option<(ChannelId, Box<Message>)> {
     let SlackEvent::Message(MessageEvent::Message(message)) = event else {
         return None;
@@ -537,7 +485,7 @@ pub(super) async fn im_peer(
     store: &SharedStore,
     workspace: &TeamId,
     channel: &ChannelId,
-) -> Result<Option<UserId>, StoreError> {
+) -> Result<Option<UserId>, CoreError> {
     let (ws, channel) = (workspace.clone(), channel.clone());
     let stored = with_store(store, move |s| s.conversation(&ws, &channel)).await?;
     Ok(stored
