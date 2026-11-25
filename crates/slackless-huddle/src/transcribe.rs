@@ -86,8 +86,8 @@ impl TranscriptionProvider {
     pub const fn label(self) -> &'static str {
         match self {
             Self::SlackBuiltIn => "Slack built-in (AWS Transcribe)",
-            Self::ParakeetV3 => "Parakeet TDT 0.6B v3 (Local EN + SV)",
-            Self::WhisperTurbo => "Whisper Large v3 Turbo (Local EN + SV)",
+            Self::ParakeetV3 => "Parakeet TDT 0.6B v3",
+            Self::WhisperTurbo => "Whisper Large v3 Turbo",
         }
     }
 }

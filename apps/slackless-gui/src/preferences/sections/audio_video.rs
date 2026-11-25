@@ -304,18 +304,18 @@ impl Preferences {
             } else {
                 warn_color
             };
-            let (title, badge, note) = if downloading {
+            let (title, badge, note): (String, Option<&'static str>, String) = if downloading {
                 (
                     format!("Downloading {}…", provider.label()),
-                    "Downloading",
+                    Some("Downloading"),
                     self.stt_download_status
                         .clone()
                         .unwrap_or_else(|| "Fetching model weights from Hugging Face…".to_owned()),
                 )
             } else if setup.is_ready() {
                 (
-                    format!("{} ready", provider.label()),
-                    "Ready (EN + SV)",
+                    provider.label().to_owned(),
+                    None,
                     format!(
                         "{} on disk · loads into RAM only during active huddles (0 MB idle).",
                         format_bytes(setup.disk_bytes)
@@ -329,7 +329,7 @@ impl Preferences {
                 };
                 (
                     format!("Model not downloaded ({})", setup.download_size_hint),
-                    "Opt-in",
+                    Some("Opt-in"),
                     self.stt_download_status.clone().unwrap_or_else(|| {
                         format!(
                             "0 MB on disk until you click Download.{extra} Stored in {}.",
@@ -340,7 +340,7 @@ impl Preferences {
             } else {
                 (
                     "Whisper runtime missing".to_owned(),
-                    "Install whisper-cpp",
+                    Some("Install whisper-cpp"),
                     "Model weights found, but whisper-server / whisper-cli was not detected. Run: brew install whisper-cpp".to_owned(),
                 )
             };
@@ -393,7 +393,7 @@ impl Preferences {
             Some(self.status_card(
                 dot_color,
                 title,
-                Some(SharedString::from(badge)),
+                badge.map(SharedString::from),
                 note,
                 false,
                 actions,
@@ -404,8 +404,8 @@ impl Preferences {
         };
 
         self.group(
-            "Searchable transcripts (EN + SV)",
-            Some("Choose Slack's built-in captions (0 MB on disk) or swap to a local multilingual English + Swedish model loaded only during active huddles. Zero audio or video is ever saved."),
+            "Searchable transcripts",
+            Some("Choose Slack's built-in captions (0 MB on disk) or a local multilingual model loaded only during active huddles. Zero audio or video is ever saved."),
             v_flex()
                 .gap_2p5()
                 .child(self.labeled("Transcription provider", provider_select))
