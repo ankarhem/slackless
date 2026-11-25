@@ -1,21 +1,28 @@
-//! The directory's row lists and filters: the people matching a search (by name or title) and
-//! the channels matching one (by name or topic), plus their rows. The view entity and tabs
-//! live in [`crate::directory`].
+//! The directory's row lists and filters: the people matching a search (by name or title),
+//! the channels matching one (by name or topic), and the user groups matching one (active and
+//! disabled, with Members / Edit / Disable / Enable actions), plus their rows. The view entity
+//! and tabs live in [`crate::directory`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
     AnyElement, App, ClickEvent, Context, ElementId, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
     Window, div, px,
 };
-use slackless_core::types::{ChannelId, Conversation, ConversationKind, UserId, Usergroup};
+use slackless_core::types::{
+    ChannelId, Conversation, ConversationKind, UserId, Usergroup, UsergroupId,
+};
 
 use crate::avatars::user_chip;
-use crate::directory::{DirectoryEvent, DirectoryView};
+use crate::directory::{
+    DirectoryEvent, DirectoryView, UsergroupAction, UsergroupLocalEdit, cached_usergroup_members,
+    dispatch_usergroup_action,
+};
 use crate::fixtures::Fixtures;
 
 /// People matching `needle` (name, title, pronouns, contact info, or custom profile fields;
@@ -214,26 +221,106 @@ pub(crate) fn render_channel_row(
     row.child(action).on_click(on_open).into_any_element()
 }
 
-/// Active user groups matching `needle` (handle, name, or description), by handle.
-pub(super) fn usergroups(fixtures: &Fixtures, needle: &str) -> Vec<Usergroup> {
-    let mut groups: Vec<Usergroup> = fixtures
-        .usergroups
-        .iter()
-        .filter(|g| g.date_delete == 0)
-        .filter(|g| {
-            needle.is_empty()
-                || g.handle.to_lowercase().contains(needle)
-                || g.name.to_lowercase().contains(needle)
-                || g.description
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(needle)
+/// Extract embedded member IDs from `Usergroup.extra["users"]` when present.
+pub(crate) fn usergroup_embedded_users(group: &Usergroup) -> Vec<UserId> {
+    group
+        .extra
+        .get("users")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(UserId::from)
+                .collect()
         })
-        .cloned()
-        .collect();
-    groups.sort_by_key(|a| a.handle.to_lowercase());
-    groups
+        .unwrap_or_default()
+}
+
+fn matches_usergroup_needle(group: &Usergroup, needle: &str) -> bool {
+    needle.is_empty()
+        || group.handle.to_lowercase().contains(needle)
+        || group.name.to_lowercase().contains(needle)
+        || group
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(needle)
+}
+
+/// User groups matching `needle` (handle, name, or description), merging any session-local
+/// disabled/edit overrides. Returns `(visible_groups, total_matching_disabled_count)` sorted with
+/// active groups first and then alphabetically by handle.
+pub(super) fn usergroups(
+    fixtures: &Fixtures,
+    disabled_overrides: &HashMap<UsergroupId, Usergroup>,
+    edit_overrides: &HashMap<UsergroupId, UsergroupLocalEdit>,
+    needle: &str,
+    include_disabled: bool,
+) -> (Vec<Usergroup>, usize) {
+    let mut seen: HashSet<UsergroupId> = HashSet::new();
+    let mut merged: Vec<Usergroup> = Vec::with_capacity(
+        fixtures
+            .usergroups
+            .len()
+            .saturating_add(disabled_overrides.len()),
+    );
+
+    for raw in &fixtures.usergroups {
+        seen.insert(raw.id.clone());
+        let mut group = raw.clone();
+        if disabled_overrides.contains_key(&group.id) && group.date_delete == 0 {
+            group.date_delete = 1;
+        }
+        if let Some(edit) = edit_overrides.get(&group.id) {
+            group.name = edit.name.clone();
+            if !edit.handle.is_empty() {
+                group.handle = edit.handle.clone();
+            }
+            group.description = edit.description.clone();
+        }
+        merged.push(group);
+    }
+
+    for (id, disabled) in disabled_overrides {
+        if !seen.contains(id) {
+            let mut group = disabled.clone();
+            if group.date_delete == 0 {
+                group.date_delete = 1;
+            }
+            if let Some(edit) = edit_overrides.get(id) {
+                group.name = edit.name.clone();
+                if !edit.handle.is_empty() {
+                    group.handle = edit.handle.clone();
+                }
+                group.description = edit.description.clone();
+            }
+            merged.push(group);
+        }
+    }
+
+    let mut disabled_count = 0usize;
+    let mut groups: Vec<Usergroup> = Vec::new();
+    for group in merged {
+        if !matches_usergroup_needle(&group, needle) {
+            continue;
+        }
+        let is_disabled = group.is_deleted();
+        if is_disabled {
+            disabled_count += 1;
+            if !include_disabled {
+                continue;
+            }
+        }
+        groups.push(group);
+    }
+
+    groups.sort_by(|a, b| {
+        a.is_deleted()
+            .cmp(&b.is_deleted())
+            .then_with(|| a.handle.to_lowercase().cmp(&b.handle.to_lowercase()))
+    });
+    (groups, disabled_count)
 }
 
 /// One person row: avatar, name and title; a click opens the profile panel.
@@ -315,7 +402,9 @@ pub(super) fn channel_row(
     )
 }
 
-/// One user group row: `@handle`, name, member count, description, and member names preview.
+/// One user group row: `@handle`, name, active/disabled status pill, member count, description,
+/// inline action buttons (`Members`, `Edit`, `Disable` / `Enable`), and expandable member/channel
+/// chips.
 pub(super) fn usergroup_row(
     view: &DirectoryView,
     ix: usize,
@@ -324,25 +413,26 @@ pub(super) fn usergroup_row(
 ) -> AnyElement {
     let fixtures = view.fixtures();
     let theme = cx.theme();
-    let (border, muted, foreground, link, hover) = (
+    let (border, muted, foreground, link, hover, success, warning) = (
         theme.border,
         theme.muted_foreground,
         theme.foreground,
         theme.link,
         theme.accent,
+        theme.success,
+        theme.warning,
     );
-    let user_ids: Vec<UserId> = group
-        .extra
-        .get("users")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(UserId::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    let count = group.user_count.unwrap_or(0).max(user_ids.len() as u32);
+    let disabled = group.is_deleted();
+    let cached_users = cached_usergroup_members(&group.id, cx);
+    let user_ids: Vec<UserId> = cached_users
+        .clone()
+        .unwrap_or_else(|| usergroup_embedded_users(group));
+    let count = if cached_users.is_some() {
+        user_ids.len() as u32
+    } else {
+        group.user_count.unwrap_or(0).max(user_ids.len() as u32)
+    };
+    let member_word = if count == 1 { "member" } else { "members" };
     let members_preview = if user_ids.is_empty() {
         String::new()
     } else {
@@ -360,9 +450,9 @@ pub(super) fn usergroup_row(
     };
     let desc = group.description.as_deref().unwrap_or_default().trim();
     let subtitle = if desc.is_empty() {
-        format!("{count} members{members_preview}")
+        format!("{count} {member_word}{members_preview}")
     } else {
-        format!("{desc} · {count} members{members_preview}")
+        format!("{desc} · {count} {member_word}{members_preview}")
     };
     let default_channels: Vec<ChannelId> = group
         .extra
@@ -380,6 +470,89 @@ pub(super) fn usergroup_row(
     let toggle_id = group.id.to_string();
     let chip_bg = theme.secondary;
     let chip_hover = theme.secondary_hover;
+
+    let group_for_members = group.clone();
+    let group_for_edit = group.clone();
+    let group_for_toggle = group.clone();
+
+    let status_pill = div()
+        .flex_none()
+        .px_1p5()
+        .py_0p5()
+        .rounded_full()
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .bg(if disabled {
+            warning.opacity(0.16)
+        } else {
+            success.opacity(0.14)
+        })
+        .text_color(if disabled { warning } else { success })
+        .child(if disabled { "Disabled" } else { "Active" });
+
+    let actions = h_flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .child(
+            Button::new(SharedString::from(format!("ug-members-{}", group.id)))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Users)
+                .label("Members")
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    dispatch_usergroup_action(
+                        UsergroupAction::InspectMembers(group_for_members.clone()),
+                        window,
+                        cx,
+                    );
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("ug-edit-{}", group.id)))
+                .ghost()
+                .with_size(Size::XSmall)
+                .icon(IconName::Pencil)
+                .label("Edit")
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    dispatch_usergroup_action(
+                        UsergroupAction::Edit(group_for_edit.clone()),
+                        window,
+                        cx,
+                    );
+                }),
+        )
+        .child(if disabled {
+            Button::new(SharedString::from(format!("ug-enable-{}", group.id)))
+                .outline()
+                .with_size(Size::XSmall)
+                .icon(IconName::RotateCcw)
+                .label("Enable")
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    dispatch_usergroup_action(
+                        UsergroupAction::Enable(group_for_toggle.clone()),
+                        window,
+                        cx,
+                    );
+                })
+        } else {
+            Button::new(SharedString::from(format!("ug-disable-{}", group.id)))
+                .ghost()
+                .with_size(Size::XSmall)
+                .label("Disable")
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    dispatch_usergroup_action(
+                        UsergroupAction::Disable(group_for_toggle.clone()),
+                        window,
+                        cx,
+                    );
+                })
+        });
+
     let details = expanded.then(|| {
         let mut panel = v_flex().pl(px(56.)).pr_4().pb_3().gap_2();
         if !user_ids.is_empty() {
@@ -447,7 +620,7 @@ pub(super) fn usergroup_row(
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("No member list available for this group."),
+                    .child("Click Members to load or manage this group's member list."),
             );
         }
         panel
@@ -455,6 +628,7 @@ pub(super) fn usergroup_row(
     v_flex()
         .border_b_1()
         .border_color(border)
+        .when(disabled, |row| row.opacity(0.7))
         .child(
             h_flex()
                 .id(("directory-usergroup", ix))
@@ -472,11 +646,19 @@ pub(super) fn usergroup_row(
                         .size(px(32.))
                         .flex_none()
                         .rounded_md()
-                        .bg(link.opacity(0.14))
+                        .bg(if disabled {
+                            muted.opacity(0.14)
+                        } else {
+                            link.opacity(0.14)
+                        })
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(Icon::new(IconName::Users).text_color(link).size(px(16.))),
+                        .child(
+                            Icon::new(IconName::Users)
+                                .text_color(if disabled { muted } else { link })
+                                .size(px(16.)),
+                        ),
                 )
                 .child(
                     v_flex()
@@ -485,24 +667,26 @@ pub(super) fn usergroup_row(
                         .child(
                             h_flex()
                                 .gap_2()
-                                .items_baseline()
+                                .items_center()
                                 .child(
                                     div()
                                         .truncate()
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(foreground)
+                                        .text_color(if disabled { muted } else { foreground })
                                         .child(group.name.clone()),
                                 )
                                 .child(
                                     div()
                                         .flex_none()
                                         .text_xs()
-                                        .text_color(link)
+                                        .text_color(if disabled { muted } else { link })
                                         .child(format!("@{}", group.handle)),
-                                ),
+                                )
+                                .child(status_pill),
                         )
                         .child(div().truncate().text_xs().text_color(muted).child(subtitle)),
                 )
+                .child(actions)
                 .child(
                     Icon::new(if expanded {
                         IconName::ChevronDown
@@ -515,4 +699,82 @@ pub(super) fn usergroup_row(
         )
         .children(details)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_group(id: &str, name: &str, handle: &str, date_delete: i64) -> Usergroup {
+        Usergroup {
+            id: UsergroupId::from(id),
+            name: name.to_owned(),
+            handle: handle.to_owned(),
+            description: Some(format!("{name} team")),
+            user_count: Some(2),
+            date_delete,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn usergroups_filters_disabled_and_sorts_active_first() {
+        let mut fx = crate::fixtures::load();
+        fx.usergroups = vec![
+            sample_group("S2", "Platform", "platform", 0),
+            sample_group("S1", "Alerts", "alerts", 1_700_000_000),
+            sample_group("S3", "Design", "design", 0),
+        ];
+
+        let empty_disabled = HashMap::new();
+        let empty_edits = HashMap::new();
+
+        // Active-only by default, but still reports total disabled count.
+        let (active_only, disabled_count) =
+            usergroups(&fx, &empty_disabled, &empty_edits, "", false);
+        assert_eq!(disabled_count, 1);
+        assert_eq!(
+            active_only
+                .iter()
+                .map(|g| g.handle.as_str())
+                .collect::<Vec<_>>(),
+            vec!["design", "platform"]
+        );
+
+        // Including disabled places active groups first, then disabled groups by handle.
+        let (with_disabled, disabled_count) =
+            usergroups(&fx, &empty_disabled, &empty_edits, "", true);
+        assert_eq!(disabled_count, 1);
+        assert_eq!(
+            with_disabled
+                .iter()
+                .map(|g| (g.handle.as_str(), g.is_deleted()))
+                .collect::<Vec<_>>(),
+            vec![("design", false), ("platform", false), ("alerts", true)]
+        );
+
+        // Local disable override hides an active group until "Show disabled" is toggled on.
+        let mut local_disabled = HashMap::new();
+        local_disabled.insert(
+            UsergroupId::from("S3"),
+            sample_group("S3", "Design", "design", 1),
+        );
+        let (filtered, disabled_count) = usergroups(&fx, &local_disabled, &empty_edits, "", false);
+        assert_eq!(disabled_count, 2);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|g| g.handle.as_str())
+                .collect::<Vec<_>>(),
+            vec!["platform"]
+        );
+
+        // Search needle filters both active and disabled groups cleanly.
+        let (searched, disabled_count) =
+            usergroups(&fx, &local_disabled, &empty_edits, "des", true);
+        assert_eq!(disabled_count, 1);
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].id, UsergroupId::from("S3"));
+        assert!(searched[0].is_deleted());
+    }
 }

@@ -3,6 +3,7 @@
 mod channels;
 mod profile;
 pub(super) mod storage;
+mod usergroups;
 
 use super::*;
 
@@ -19,6 +20,7 @@ impl App {
     /// Apply what the app honors from Preferences: the theme (Light / Dark / Sync with OS,
     /// tinted by the color theme), Enter-to-send, and the schedule shown in the user menu.
     pub(super) fn apply_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_usergroup_router(cx);
         let settings = self.preferences.read(cx).settings().clone();
         // Slack plays a sound when it is picked in Preferences.
         if self

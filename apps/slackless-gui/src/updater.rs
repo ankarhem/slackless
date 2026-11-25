@@ -1,22 +1,29 @@
 //! In-app auto-updater (`F-SHELL-163`) backed by GitHub Releases (`ankarhem/slackless`).
 //!
-//! Delegates version parsing, release parsing, checksum lookup, and path resolution to
-//! [`slackless_core::domain::updater`], while handling the macOS bundle swap & CLI symlink
+//! Delegates pure-Rust release checks (`reqwest`), streaming download + SHA-256 verification
+//! (`sha2`), archive extraction, and CLI symlink installation to
+//! [`slackless_core::domain::updater`], while handling the macOS bundle swap & relaunch
 //! lifecycle for the running GUI app.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 pub use slackless_core::domain::updater::{
-    RELEASES_REPO, ReleaseInfo, current_app_bundle, dir_in_path, find_sha256_entry,
-    is_newer_version, is_safe_asset_name,
+    RELEASES_REPO, ReleaseInfo, current_app_bundle, dir_in_path, is_newer_version,
 };
 use slackless_core::domain::updater::{
-    cli_candidate_dirs, is_dev_version, parse_github_release, resolve_cli_link_path,
-    resolve_target_app_bundle,
+    cli_candidate_dirs, fetch_latest_release_for_blocking, install_cli_symlink_at, is_dev_version,
+    resolve_cli_link_path,
+};
+#[cfg(target_os = "macos")]
+use slackless_core::domain::updater::{
+    download_and_verify_release_blocking, extract_tar_gz, resolve_target_app_bundle,
 };
 #[cfg(test)]
-pub use slackless_core::domain::updater::{parse_release_highlights, parse_version};
+pub use slackless_core::domain::updater::{
+    find_sha256_entry, is_safe_asset_name, parse_release_highlights, parse_version,
+};
 
 /// Release version embedded at build time (`SLACKLESS_VERSION` in CI, falling back to Cargo.toml).
 pub const CURRENT_VERSION: &str = match option_env!("SLACKLESS_VERSION") {
@@ -96,32 +103,11 @@ pub fn cli_install_status() -> CliInstallStatus {
 /// Create or refresh the `slackless` CLI symlink in the best writable `$PATH` directory
 /// (`/usr/local/bin/slackless` or `~/.local/bin/slackless`), pointing directly to the bundled CLI
 /// inside `Slackless.app`.
-#[cfg(unix)]
 pub fn install_cli_symlink() -> Result<PathBuf, String> {
-    let bundled = bundled_cli_path()
+    let bundle = current_app_bundle()
         .ok_or_else(|| "Slackless.app does not contain a bundled CLI executable".to_owned())?;
     let link = cli_link_path();
-    if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-    if std::fs::symlink_metadata(&link).is_ok() {
-        std::fs::remove_file(&link)
-            .map_err(|e| format!("cannot replace {}: {e}", link.display()))?;
-    }
-    std::os::unix::fs::symlink(&bundled, &link).map_err(|e| {
-        format!(
-            "cannot link {} -> {}: {e}",
-            link.display(),
-            bundled.display()
-        )
-    })?;
-    Ok(link)
-}
-
-#[cfg(not(unix))]
-pub fn install_cli_symlink() -> Result<PathBuf, String> {
-    Err("CLI symlink installation is currently supported on macOS/Unix only".to_owned())
+    install_cli_symlink_at(&bundle, &link)
 }
 
 /// Remove any installed `slackless` CLI symlink across standard bin directories.
@@ -167,34 +153,11 @@ pub fn installed_version() -> String {
     CURRENT_VERSION.to_owned()
 }
 
-/// Query GitHub Releases for the latest macOS arm64 release.
+/// Query GitHub Releases for the latest macOS arm64 release via pure-Rust `reqwest`.
 /// Returns `Ok(Some(info))` if a newer version is available, `Ok(None)` if already up to date.
 pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
-    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/latest");
     let ua = format!("Slackless/{CURRENT_VERSION}");
-    let out = Command::new("/usr/bin/curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "10",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            &format!("User-Agent: {ua}"),
-            &url,
-        ])
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        return Err(if stderr.is_empty() {
-            format!("GitHub API request failed (status {})", out.status)
-        } else {
-            stderr
-        });
-    }
-
-    let Some(info) = parse_github_release(&out.stdout)? else {
+    let Some(info) = fetch_latest_release_for_blocking(RELEASES_REPO, &ua)? else {
         return Ok(None);
     };
     let current = installed_version();
@@ -204,32 +167,9 @@ pub fn check_for_update() -> Result<Option<ReleaseInfo>, String> {
     Ok(Some(info))
 }
 
-fn verify_sha256(archive_path: &Path, expected_hex: &str) -> Result<(), String> {
-    let out = Command::new("/usr/bin/shasum")
-        .args(["-a", "256"])
-        .arg(archive_path)
-        .output()
-        .map_err(|e| format!("failed to run shasum: {e}"))?;
-    if !out.status.success() {
-        return Err("shasum verification failed".to_owned());
-    }
-    let actual = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let expected = expected_hex.trim().to_ascii_lowercase();
-    if actual != expected {
-        return Err(format!(
-            "SHA-256 mismatch (expected {expected}, got {actual})"
-        ));
-    }
-    Ok(())
-}
-
-/// Download `release`, verify its SHA-256 checksum, extract `Slackless.app`, and spawn a detached
-/// swap-and-relaunch helper that waits for this PID to exit. Caller should immediately quit the
-/// app (`cx.quit()`) upon `Ok(())`.
+/// Download `release` via pure-Rust `reqwest`, verify its SHA-256 checksum in pure Rust (`sha2`),
+/// extract `Slackless.app`, and spawn a detached swap-and-relaunch helper that waits for this PID
+/// to exit. Caller should immediately quit the app (`cx.quit()`) upon `Ok(())`.
 #[cfg(target_os = "macos")]
 pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
     let target_app = resolve_target_app_bundle()
@@ -249,53 +189,10 @@ pub fn download_and_schedule_swap(release: &ReleaseInfo) -> Result<(), String> {
         )
     })?;
 
+    let ua = format!("Slackless/{CURRENT_VERSION}");
     let result = (|| -> Result<PathBuf, String> {
-        if !is_safe_asset_name(&release.asset_name) {
-            return Err(format!(
-                "invalid release asset name: {}",
-                release.asset_name
-            ));
-        }
-        let sums_url = release.sha256_url.as_deref().ok_or_else(|| {
-            "release is missing SHA256SUMS.txt; refusing unverified update".to_owned()
-        })?;
-        let archive = stage_dir.join(&release.asset_name);
-        let dl = Command::new("/usr/bin/curl")
-            .args(["-fsSL", "--max-time", "180", "-o"])
-            .arg(&archive)
-            .arg(&release.download_url)
-            .status()
-            .map_err(|e| format!("download failed: {e}"))?;
-        if !dl.success() {
-            return Err(format!("download failed (curl exited {})", dl));
-        }
-
-        let sums_out = Command::new("/usr/bin/curl")
-            .args(["-fsSL", "--max-time", "15", sums_url])
-            .output()
-            .map_err(|e| format!("failed to fetch SHA256SUMS.txt: {e}"))?;
-        if !sums_out.status.success() {
-            return Err("failed to fetch SHA256SUMS.txt".to_owned());
-        }
-        let sums_text = String::from_utf8_lossy(&sums_out.stdout);
-        let expected = find_sha256_entry(&sums_text, &release.asset_name).ok_or_else(|| {
-            format!(
-                "SHA256SUMS.txt has no checksum entry for {}",
-                release.asset_name
-            )
-        })?;
-        verify_sha256(&archive, &expected)?;
-
-        let extract = Command::new("/usr/bin/tar")
-            .args(["-xzf"])
-            .arg(&archive)
-            .arg("-C")
-            .arg(&stage_dir)
-            .status()
-            .map_err(|e| format!("failed to extract update archive: {e}"))?;
-        if !extract.success() {
-            return Err("failed to extract update archive".to_owned());
-        }
+        let archive = download_and_verify_release_blocking(release, &stage_dir, &ua)?;
+        extract_tar_gz(&archive, &stage_dir)?;
 
         let new_app = stage_dir.join("Slackless.app");
         if !new_app.join("Contents/MacOS/slackless-gui").is_file() {
