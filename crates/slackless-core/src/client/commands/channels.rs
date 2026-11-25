@@ -625,6 +625,49 @@ impl<B: Backend> Core<B> {
         });
     }
 
+    pub(super) fn disable_usergroup(&self, usergroup: crate::types::UsergroupId) {
+        let ctx = self.ctx();
+        self.spawn("usergroups.disable", async move {
+            let _ = ctx.backend.disable_usergroup(usergroup).await?;
+            refresh_usergroups(&ctx.backend, &ctx.events).await
+        });
+    }
+
+    pub(super) fn enable_usergroup(&self, usergroup: crate::types::UsergroupId) {
+        let ctx = self.ctx();
+        self.spawn("usergroups.enable", async move {
+            let _ = ctx.backend.enable_usergroup(usergroup).await?;
+            refresh_usergroups(&ctx.backend, &ctx.events).await
+        });
+    }
+
+    pub(super) fn load_usergroup_users(&self, usergroup: crate::types::UsergroupId) {
+        let ctx = self.ctx();
+        self.spawn("usergroups.users.list", async move {
+            let users = ctx.backend.usergroup_users(usergroup.clone()).await?;
+            ctx.events
+                .emit(Event::UsergroupUsersLoaded { usergroup, users });
+            Ok(())
+        });
+    }
+
+    pub(super) fn update_usergroup_users(
+        &self,
+        usergroup: crate::types::UsergroupId,
+        users: Vec<UserId>,
+    ) {
+        let ctx = self.ctx();
+        self.spawn("usergroups.users.update", async move {
+            let _ = ctx
+                .backend
+                .update_usergroup_users(usergroup.clone(), users.clone())
+                .await?;
+            ctx.events
+                .emit(Event::UsergroupUsersLoaded { usergroup, users });
+            refresh_usergroups(&ctx.backend, &ctx.events).await
+        });
+    }
+
     pub(super) fn sign_out(&self) {
         let ctx = self.ctx();
         self.spawn("auth.revoke", async move {

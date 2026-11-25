@@ -10,7 +10,7 @@ use crate::api::{
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Team,
-    TeamId, Ts, User, UserId, UserPresence, Usergroup,
+    TeamId, Ts, User, UserId, UserPresence, Usergroup, UsergroupId,
 };
 
 use super::slack_api_helpers as helpers;
@@ -443,6 +443,22 @@ impl UsersBackend for SlackApi {
     }
     async fn usergroups(&self) -> api::Result<Vec<Usergroup>> {
         self.usergroups_list().await
+    }
+    async fn disable_usergroup(&self, usergroup: UsergroupId) -> api::Result<Usergroup> {
+        self.usergroups_disable(&usergroup).await
+    }
+    async fn enable_usergroup(&self, usergroup: UsergroupId) -> api::Result<Usergroup> {
+        self.usergroups_enable(&usergroup).await
+    }
+    async fn usergroup_users(&self, usergroup: UsergroupId) -> api::Result<Vec<UserId>> {
+        self.usergroups_users_list(&usergroup).await
+    }
+    async fn update_usergroup_users(
+        &self,
+        usergroup: UsergroupId,
+        users: Vec<UserId>,
+    ) -> api::Result<Usergroup> {
+        self.usergroups_users_update(&usergroup, &users).await
     }
 }
 

@@ -9693,8 +9693,10 @@ version = "0.1.0"
 dependencies = [
  "dirs 7.0.0",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "slackless-api",
  "slackless-auth",
  "slackless-huddle",

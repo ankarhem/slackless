@@ -176,6 +176,10 @@ struct FakeState {
     fail_emoji: bool,
     custom_emoji_override: Option<HashMap<String, String>>,
     usergroups: Vec<crate::types::Usergroup>,
+    usergroup_disable_calls: Vec<crate::types::UsergroupId>,
+    usergroup_enable_calls: Vec<crate::types::UsergroupId>,
+    usergroup_users: HashMap<crate::types::UsergroupId, Vec<UserId>>,
+    usergroup_users_update_calls: Vec<(crate::types::UsergroupId, Vec<UserId>)>,
     app_commands: Vec<api::AppCommand>,
     fail_activity_feed: bool,
     fail_messages_list: bool,
@@ -1429,6 +1433,74 @@ impl crate::backend::UsersBackend for FakeBackend {
 
     async fn usergroups(&self) -> api::Result<Vec<crate::types::Usergroup>> {
         Ok(self.state.lock().unwrap().usergroups.clone())
+    }
+
+    async fn disable_usergroup(
+        &self,
+        usergroup: crate::types::UsergroupId,
+    ) -> api::Result<crate::types::Usergroup> {
+        let mut state = self.state.lock().unwrap();
+        state.usergroup_disable_calls.push(usergroup.clone());
+        state.usergroups.retain(|g| g.id != usergroup);
+        Ok(crate::types::Usergroup {
+            id: usergroup,
+            date_delete: 1_700_000_000,
+            ..Default::default()
+        })
+    }
+
+    async fn enable_usergroup(
+        &self,
+        usergroup: crate::types::UsergroupId,
+    ) -> api::Result<crate::types::Usergroup> {
+        let mut state = self.state.lock().unwrap();
+        state.usergroup_enable_calls.push(usergroup.clone());
+        let ug = crate::types::Usergroup {
+            id: usergroup.clone(),
+            name: "Engineering".to_owned(),
+            handle: "eng".to_owned(),
+            ..Default::default()
+        };
+        if !state.usergroups.iter().any(|g| g.id == usergroup) {
+            state.usergroups.push(ug.clone());
+        }
+        Ok(ug)
+    }
+
+    async fn usergroup_users(
+        &self,
+        usergroup: crate::types::UsergroupId,
+    ) -> api::Result<Vec<UserId>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .usergroup_users
+            .get(&usergroup)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn update_usergroup_users(
+        &self,
+        usergroup: crate::types::UsergroupId,
+        users: Vec<UserId>,
+    ) -> api::Result<crate::types::Usergroup> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .usergroup_users_update_calls
+            .push((usergroup.clone(), users.clone()));
+        let count = users.len() as u32;
+        state.usergroup_users.insert(usergroup.clone(), users);
+        if let Some(existing) = state.usergroups.iter_mut().find(|g| g.id == usergroup) {
+            existing.user_count = Some(count);
+            return Ok(existing.clone());
+        }
+        Ok(crate::types::Usergroup {
+            id: usergroup,
+            user_count: Some(count),
+            ..Default::default()
+        })
     }
 }
 
@@ -6611,4 +6683,97 @@ fn command_domain_sub_enums_convert_into_command() {
     let _: Command = HuddleCommand::Leave.into();
     let _: Command = crate::HuddleControlCommand::SetMuted(true).into();
     let _: Command = WorkspaceCommand::SignOut.into();
+}
+
+#[tokio::test]
+async fn usergroup_disable_enable_and_users_commands_update_state_and_emit_events() {
+    use crate::types::{Usergroup, UsergroupId};
+
+    let fake = FakeBackend::default();
+    let ug_id = UsergroupId::from("S0614TZR7");
+    {
+        let mut state = fake.state.lock().expect("lock fake state");
+        state.usergroups.push(Usergroup {
+            id: ug_id.clone(),
+            name: "Engineering".to_owned(),
+            handle: "eng".to_owned(),
+            user_count: Some(1),
+            ..Default::default()
+        });
+        state
+            .usergroup_users
+            .insert(ug_id.clone(), vec![UserId::from("U01")]);
+    }
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(
+        fake.clone(),
+        Arc::clone(&store),
+        TeamId::from("T1"),
+        events,
+        test_media_tx(),
+    )
+    .await;
+
+    // 1. LoadUsergroupUsers -> Event::UsergroupUsersLoaded
+    core.handle(Command::Workspace(WorkspaceCommand::LoadUsergroupUsers(
+        ug_id.clone(),
+    )))
+    .await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::UsergroupUsersLoaded {
+            usergroup: ug_id.clone(),
+            users: vec![UserId::from("U01")],
+        }
+    );
+
+    // 2. UpdateUsergroupUsers -> Event::UsergroupUsersLoaded + refreshed Event::Usergroups
+    let updated_members = vec![UserId::from("U01"), UserId::from("U02")];
+    core.handle(Command::Workspace(WorkspaceCommand::UpdateUsergroupUsers {
+        usergroup: ug_id.clone(),
+        users: updated_members.clone(),
+    }))
+    .await;
+    assert_eq!(
+        next(&mut rx).await,
+        Event::UsergroupUsersLoaded {
+            usergroup: ug_id.clone(),
+            users: updated_members.clone(),
+        }
+    );
+    match next(&mut rx).await {
+        Event::Usergroups(groups) => {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].user_count, Some(2));
+        }
+        other => panic!("expected Event::Usergroups after member update, got {other:?}"),
+    }
+
+    // 3. DisableUsergroup -> refreshed Event::Usergroups without disabled group
+    core.handle(Command::Workspace(WorkspaceCommand::DisableUsergroup(
+        ug_id.clone(),
+    )))
+    .await;
+    assert_eq!(next(&mut rx).await, Event::Usergroups(Vec::new()));
+
+    // 4. EnableUsergroup -> refreshed Event::Usergroups with re-enabled group
+    core.handle(Command::Workspace(WorkspaceCommand::EnableUsergroup(
+        ug_id.clone(),
+    )))
+    .await;
+    match next(&mut rx).await {
+        Event::Usergroups(groups) => {
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].id, ug_id);
+        }
+        other => panic!("expected Event::Usergroups after enable, got {other:?}"),
+    }
+
+    let state = fake.state.lock().expect("lock fake state");
+    assert_eq!(state.usergroup_disable_calls, vec![ug_id.clone()]);
+    assert_eq!(state.usergroup_enable_calls, vec![ug_id.clone()]);
+    assert_eq!(
+        state.usergroup_users_update_calls,
+        vec![(ug_id, updated_members)]
+    );
 }

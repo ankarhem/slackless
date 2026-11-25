@@ -16,7 +16,7 @@ use crate::api::{
 };
 use crate::types::{
     BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus, File, Message, Team,
-    TeamId, Ts, User, UserId, UserPresence, Usergroup,
+    TeamId, Ts, User, UserId, UserPresence, Usergroup, UsergroupId,
 };
 
 /// `conversations.history` page size the core requests (Slack max 999).
@@ -574,6 +574,35 @@ pub trait UsersBackend: Clone + Send + Sync + 'static {
     /// Active `@handle` user groups (`usergroups.list`).
     fn usergroups(&self) -> impl Future<Output = api::Result<Vec<Usergroup>>> + Send {
         async { Ok(Vec::new()) }
+    }
+    /// Disable an existing `@handle` user group (`usergroups.disable`).
+    fn disable_usergroup(
+        &self,
+        _usergroup: UsergroupId,
+    ) -> impl Future<Output = api::Result<Usergroup>> + Send {
+        async { Err(api::ApiError::Slack("unsupported".to_owned())) }
+    }
+    /// Re-enable a disabled `@handle` user group (`usergroups.enable`).
+    fn enable_usergroup(
+        &self,
+        _usergroup: UsergroupId,
+    ) -> impl Future<Output = api::Result<Usergroup>> + Send {
+        async { Err(api::ApiError::Slack("unsupported".to_owned())) }
+    }
+    /// List member user IDs of a `@handle` user group (`usergroups.users.list`).
+    fn usergroup_users(
+        &self,
+        _usergroup: UsergroupId,
+    ) -> impl Future<Output = api::Result<Vec<UserId>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Replace the member list of a `@handle` user group (`usergroups.users.update`).
+    fn update_usergroup_users(
+        &self,
+        _usergroup: UsergroupId,
+        _users: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<Usergroup>> + Send {
+        async { Err(api::ApiError::Slack("unsupported".to_owned())) }
     }
 }
 
