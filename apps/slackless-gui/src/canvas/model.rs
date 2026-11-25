@@ -1,6 +1,124 @@
 //! Canvas document data model, markdown serialization, block mutations, and fixture data.
 
+use slackless_core::api::CanvasEditOp;
+
+use crate::canvas::CanvasUserLookupFn;
 use crate::canvas::parse::{parse_canvas_html_with_ids, parse_canvas_markdown};
+
+/// Kind of inline media embed inside a canvas (`F-COLLAB-141`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Audio,
+    Video,
+}
+
+impl MediaKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Audio => "Audio",
+            Self::Video => "Video",
+        }
+    }
+}
+
+/// Kind of embedded Slack document card inside a canvas (`F-COLLAB-148`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasEmbedKind {
+    Canvas,
+    List,
+}
+
+impl CanvasEmbedKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Canvas => "Canvas",
+            Self::List => "List",
+        }
+    }
+}
+
+/// Resolved display metadata for a canvas user profile card (`F-COLLAB-147`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanvasUserProfile {
+    pub user_id: String,
+    pub display_name: String,
+    pub title: Option<String>,
+    pub handle: Option<String>,
+}
+
+impl CanvasUserProfile {
+    /// Up to 2 uppercase avatar initials derived from `display_name` (or `user_id` fallback).
+    pub fn initials(&self) -> String {
+        let words: Vec<&str> = self
+            .display_name
+            .split_whitespace()
+            .map(|w| w.trim_start_matches('@'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        let chars: Vec<char> = match words.as_slice() {
+            [] => self
+                .user_id
+                .chars()
+                .take(2)
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+            [single] => single
+                .chars()
+                .take(2)
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+            many => many
+                .iter()
+                .take(2)
+                .filter_map(|w| w.chars().next())
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+        };
+        if chars.is_empty() {
+            "?".to_owned()
+        } else {
+            chars.into_iter().collect()
+        }
+    }
+}
+
+/// Pure resolver merging parsed card fields with a host-supplied [`CanvasUserLookupFn`]
+/// (`F-COLLAB-147`).
+pub fn resolve_profile_card(
+    user_id: &str,
+    fallback_name: Option<&str>,
+    fallback_title: Option<&str>,
+    fallback_handle: Option<&str>,
+    lookup: Option<&CanvasUserLookupFn>,
+) -> CanvasUserProfile {
+    let resolved = lookup.and_then(|f| f(user_id));
+    let clean = |opt: Option<&str>| {
+        opt.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let handle = resolved
+        .as_ref()
+        .and_then(|u| clean(u.handle.as_deref()))
+        .or_else(|| clean(fallback_handle));
+    let title = resolved
+        .as_ref()
+        .and_then(|u| clean(u.title.as_deref()))
+        .or_else(|| clean(fallback_title));
+    let display_name = resolved
+        .as_ref()
+        .and_then(|u| clean(Some(u.display_name.as_str())))
+        .or_else(|| clean(fallback_name))
+        .or_else(|| handle.as_ref().map(|h| format!("@{h}")))
+        .unwrap_or_else(|| user_id.to_owned());
+
+    CanvasUserProfile {
+        user_id: user_id.to_owned(),
+        display_name,
+        title,
+        handle,
+    }
+}
 
 /// One block of a canvas document, in reading order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +148,29 @@ pub enum CanvasBlock {
         width: Option<u32>,
         height: Option<u32>,
     },
+    /// Embedded inline audio or video clip/file (`F-COLLAB-141`).
+    MediaEmbed {
+        kind: MediaKind,
+        title: String,
+        url: String,
+        file_id: Option<String>,
+        duration: Option<String>,
+        mime: Option<String>,
+    },
+    /// Embedded Slack user profile card / user unfurl (`F-COLLAB-147`).
+    ProfileCard {
+        user_id: String,
+        display_name: Option<String>,
+        title: Option<String>,
+        handle: Option<String>,
+    },
+    /// Embedded Slack Canvas or List card by link (`F-COLLAB-148`).
+    DocEmbed {
+        kind: CanvasEmbedKind,
+        file_id: String,
+        title: String,
+        url: String,
+    },
     Divider,
 }
 
@@ -51,7 +192,102 @@ impl CanvasBlock {
                 header.iter().any(|s| has(s)) || rows.iter().any(|r| r.iter().any(|s| has(s)))
             }
             Self::Image { alt, url, .. } => has(alt) || has(url),
+            Self::MediaEmbed {
+                kind,
+                title,
+                url,
+                file_id,
+                duration,
+                mime,
+            } => {
+                has(kind.label())
+                    || has(title)
+                    || has(url)
+                    || file_id.as_deref().is_some_and(has)
+                    || duration.as_deref().is_some_and(has)
+                    || mime.as_deref().is_some_and(has)
+            }
+            Self::ProfileCard {
+                user_id,
+                display_name,
+                title,
+                handle,
+            } => {
+                has(user_id)
+                    || display_name.as_deref().is_some_and(has)
+                    || title.as_deref().is_some_and(has)
+                    || handle.as_deref().is_some_and(has)
+            }
+            Self::DocEmbed {
+                kind,
+                file_id,
+                title,
+                url,
+            } => has(kind.label()) || has(file_id) || has(title) || has(url),
             Self::Divider => false,
+        }
+    }
+
+    /// Short 1-line label for drag-and-drop preview chips (`F-COLLAB-144`).
+    pub(crate) fn preview_label(&self) -> String {
+        let raw = match self {
+            Self::Heading { text, .. } => text.clone(),
+            Self::Paragraph(text) => text.clone(),
+            Self::Bullets(items) => items
+                .first()
+                .map(|s| format!("• {s}"))
+                .unwrap_or_else(|| "Bullet list".to_owned()),
+            Self::NumberedList(items) => items
+                .first()
+                .map(|s| format!("1. {s}"))
+                .unwrap_or_else(|| "Numbered list".to_owned()),
+            Self::Checklist(items) => items
+                .first()
+                .map(|(_, s)| format!("☑ {s}"))
+                .unwrap_or_else(|| "Checklist".to_owned()),
+            Self::CodeBlock(code) => code
+                .lines()
+                .next()
+                .map(|l| format!("Code: {l}"))
+                .unwrap_or_else(|| "Code block".to_owned()),
+            Self::Quote(text) => text
+                .lines()
+                .next()
+                .map(|l| format!("“{l}”"))
+                .unwrap_or_else(|| "Quote".to_owned()),
+            Self::Table { header, .. } => {
+                if header.is_empty() {
+                    "Table".to_owned()
+                } else {
+                    format!("Table: {}", header.join(" · "))
+                }
+            }
+            Self::Image { alt, .. } => {
+                if alt.is_empty() {
+                    "Image".to_owned()
+                } else {
+                    format!("Image: {alt}")
+                }
+            }
+            Self::MediaEmbed { kind, title, .. } => format!("{}: {title}", kind.label()),
+            Self::ProfileCard {
+                user_id,
+                display_name,
+                ..
+            } => display_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|n| format!("Profile: {n}"))
+                .unwrap_or_else(|| format!("Profile: {user_id}")),
+            Self::DocEmbed { kind, title, .. } => format!("{}: {title}", kind.label()),
+            Self::Divider => "Divider".to_owned(),
+        };
+        let mut chars = raw.chars();
+        let truncated: String = chars.by_ref().take(42).collect();
+        if chars.next().is_some() {
+            format!("{truncated}…")
+        } else {
+            truncated
         }
     }
 
@@ -99,6 +335,49 @@ impl CanvasBlock {
                 .join("\n"),
             Self::Table { header, rows } => serialize_markdown_table(header, rows),
             Self::Image { url, alt, .. } => format!("![{alt}]({url})"),
+            Self::MediaEmbed { title, url, .. } => {
+                if title.is_empty() {
+                    url.clone()
+                } else {
+                    format!("[{title}]({url})")
+                }
+            }
+            Self::ProfileCard {
+                user_id,
+                display_name,
+                ..
+            } => {
+                let profile_url = format!("https://slack.com/team/{user_id}");
+                match display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(name) => format!("[{name}]({profile_url})"),
+                    None => profile_url,
+                }
+            }
+            Self::DocEmbed {
+                kind,
+                file_id,
+                title,
+                url,
+            } => {
+                let canonical = if !url.is_empty() {
+                    url.clone()
+                } else {
+                    let seg = match kind {
+                        CanvasEmbedKind::Canvas => "docs",
+                        CanvasEmbedKind::List => "lists",
+                    };
+                    format!("https://slack.com/{seg}/T0/{file_id}")
+                };
+                if title.is_empty() {
+                    canonical
+                } else {
+                    format!("[{title}]({canonical})")
+                }
+            }
             Self::Divider => "---".to_owned(),
         }
     }
@@ -233,7 +512,39 @@ impl CanvasDoc {
         self.section_ids.push(None);
     }
 
+    /// Reorder the block at `from` to land at `to`, keeping `blocks` and `section_ids` aligned
+    /// (`F-COLLAB-144`). Returns `false` if either index is out of bounds or `from == to`.
+    pub fn reorder_block(&mut self, from: usize, to: usize) -> bool {
+        let len = self.blocks.len();
+        if from >= len || to >= len || from == to {
+            return false;
+        }
+        if self.section_ids.len() < len {
+            self.section_ids.resize(len, None);
+        } else if self.section_ids.len() > len {
+            self.section_ids.truncate(len);
+        }
+        let block = self.blocks.remove(from);
+        let sid = self.section_ids.remove(from);
+        self.blocks.insert(to, block);
+        self.section_ids.insert(to, sid);
+        true
+    }
+
+    /// Reorder the block at `from` to `to` and return the resulting `canvases.edit` operation
+    /// (`F-COLLAB-144`).
+    pub fn reorder_block_op(&mut self, from: usize, to: usize) -> Option<CanvasEditOp> {
+        if !self.reorder_block(from, to) {
+            return None;
+        }
+        Some(CanvasEditOp::Replace {
+            section_id: None,
+            markdown: self.to_markdown(),
+        })
+    }
+
     /// Move block at `index` up (`delta = -1`) or down (`delta = 1`) (`F-SHELL-265`, `F-COLLAB-145`).
+    #[cfg(test)]
     pub fn move_block(&mut self, index: usize, delta: isize) -> bool {
         if index >= self.blocks.len() {
             return false;
@@ -242,13 +553,7 @@ impl CanvasDoc {
         if target < 0 || target as usize >= self.blocks.len() {
             return false;
         }
-        let target = target as usize;
-        self.blocks.swap(index, target);
-        if self.section_ids.len() < self.blocks.len() {
-            self.section_ids.resize(self.blocks.len(), None);
-        }
-        self.section_ids.swap(index, target);
-        true
+        self.reorder_block(index, target as usize)
     }
 
     /// Delete block at `index` (`F-SHELL-265`, `F-COLLAB-145`).
@@ -420,6 +725,28 @@ pub(super) fn fixture() -> CanvasDoc {
         CanvasBlock::Paragraph(
             "Do we gate huddles behind a setting while rolling out screen sharing?".into(),
         ),
+        CanvasBlock::ProfileCard {
+            user_id: "U01MAYA01".into(),
+            display_name: Some("Maya Chen".into()),
+            title: Some("Staff Engineer · Launch Lead".into()),
+            handle: Some("maya".into()),
+        },
+        CanvasBlock::MediaEmbed {
+            kind: MediaKind::Video,
+            title: "desktop-beta-walkthrough.mp4".into(),
+            url:
+                "https://files.slack.com/files-pri/T01SAMPLE-F01VID01/desktop-beta-walkthrough.mp4"
+                    .into(),
+            file_id: Some("F01VID01".into()),
+            duration: Some("2:14".into()),
+            mime: Some("video/mp4".into()),
+        },
+        CanvasBlock::DocEmbed {
+            kind: CanvasEmbedKind::List,
+            file_id: "F01LIST01".into(),
+            title: "Launch Readiness Tracker".into(),
+            url: "https://slackless.slack.com/lists/T01SAMPLE/F01LIST01".into(),
+        },
     ];
     let section_ids = vec![None; blocks.len()];
     CanvasDoc {

@@ -1,11 +1,185 @@
-//! Parsers for Slack Quip/Canvas HTML exports and Canvas markdown, including emoji resolution
-//! (`F-COLLAB-134`, `F-COLLAB-135`, `F-COLLAB-136`, `F-COLLAB-139`).
+//! Parsers for Slack Quip/Canvas HTML exports and Canvas markdown, including emoji resolution,
+//! inline audio/video embeds, user profile cards, and embedded canvases & lists
+//! (`F-COLLAB-134..136`, `F-COLLAB-139`, `F-COLLAB-141`, `F-COLLAB-147`, `F-COLLAB-148`).
 
-use crate::canvas::model::CanvasBlock;
+use crate::canvas::model::{CanvasBlock, CanvasEmbedKind, MediaKind};
 
 /// Resolve `:shortcode:` tokens inside canvas text into Unicode emoji glyphs (`F-COLLAB-139`).
 pub(crate) fn resolve_canvas_emoji(text: &str) -> String {
     crate::emoji::replace_shortcodes(text)
+}
+
+/// Classify a URL or filename by media file extension (`F-COLLAB-141`).
+/// Returns `(MediaKind, canonical_mime)`.
+pub(crate) fn classify_media_url(url_or_name: &str) -> Option<(MediaKind, &'static str)> {
+    let trimmed = url_or_name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_frag.split('?').next().unwrap_or(without_frag);
+    let segment = without_query.rsplit('/').next().unwrap_or(without_query);
+    let dot = segment.rfind('.')?;
+    let ext = segment[dot + 1..].to_ascii_lowercase();
+    match ext.as_str() {
+        "mp3" => Some((MediaKind::Audio, "audio/mpeg")),
+        "m4a" => Some((MediaKind::Audio, "audio/mp4")),
+        "wav" => Some((MediaKind::Audio, "audio/wav")),
+        "ogg" | "oga" => Some((MediaKind::Audio, "audio/ogg")),
+        "aac" => Some((MediaKind::Audio, "audio/aac")),
+        "flac" => Some((MediaKind::Audio, "audio/flac")),
+        "opus" => Some((MediaKind::Audio, "audio/opus")),
+        "mp4" | "m4v" => Some((MediaKind::Video, "video/mp4")),
+        "mov" => Some((MediaKind::Video, "video/quicktime")),
+        "webm" => Some((MediaKind::Video, "video/webm")),
+        "mkv" => Some((MediaKind::Video, "video/x-matroska")),
+        _ => None,
+    }
+}
+
+/// Classify a MIME type or Slack filetype string (`audio/*`, `video/*`, `mp3`, `mp4`, etc.)
+/// (`F-COLLAB-141`).
+pub(crate) fn classify_media_mime(mime: &str) -> Option<(MediaKind, String)> {
+    let lower = mime.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if lower.starts_with("audio/") {
+        return Some((MediaKind::Audio, lower));
+    }
+    if lower.starts_with("video/") {
+        return Some((MediaKind::Video, lower));
+    }
+    match lower.as_str() {
+        "mp3" | "m4a" | "wav" | "ogg" | "aac" | "flac" | "opus" | "slack_audio" => {
+            let fake = format!("clip.{lower}");
+            let mime_str = classify_media_url(&fake)
+                .map(|(_, m)| m.to_owned())
+                .unwrap_or_else(|| "audio/mpeg".to_owned());
+            Some((MediaKind::Audio, mime_str))
+        }
+        "mp4" | "mov" | "webm" | "m4v" | "mkv" | "slack_video" => {
+            let fake = format!("clip.{lower}");
+            let mime_str = classify_media_url(&fake)
+                .map(|(_, m)| m.to_owned())
+                .unwrap_or_else(|| "video/mp4".to_owned());
+            Some((MediaKind::Video, mime_str))
+        }
+        _ => None,
+    }
+}
+
+/// Short uppercase format pill label (e.g. `"MP4"`, `"MP3"`, `"WEBM"`) derived from MIME or URL.
+pub(crate) fn media_format_pill(mime: Option<&str>, url: &str) -> Option<String> {
+    if let Some(m) = mime {
+        let lower = m.trim().to_ascii_lowercase();
+        let sub = lower.split('/').nth(1).unwrap_or(lower.as_str());
+        let clean = sub.split(';').next().unwrap_or(sub).trim();
+        let pill = match clean {
+            "mpeg" => "MP3",
+            "quicktime" => "MOV",
+            "x-matroska" => "MKV",
+            "x-wav" | "wave" => "WAV",
+            "" => "",
+            other => return Some(other.to_ascii_uppercase()),
+        };
+        if !pill.is_empty() {
+            return Some(pill.to_owned());
+        }
+    }
+    let without_frag = url.split('#').next().unwrap_or(url);
+    let without_query = without_frag.split('?').next().unwrap_or(without_frag);
+    let segment = without_query.rsplit('/').next().unwrap_or(without_query);
+    let dot = segment.rfind('.')?;
+    let ext = &segment[dot + 1..];
+    if !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(ext.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// Whether `s` looks like a Slack user ID (`U...` or `W...`, uppercase ASCII alphanumeric).
+fn is_slack_user_id(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3
+        && matches!(bytes[0], b'U' | b'W')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Whether `s` looks like a Slack file/canvas/list ID (`F...`, uppercase ASCII alphanumeric).
+fn is_slack_file_id(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3
+        && bytes[0] == b'F'
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+/// Parse a Slack profile URL (`https://<ws>.slack.com/team/U...` or `/team/U...`) into its
+/// `user_id` (`F-COLLAB-147`).
+pub(crate) fn parse_slack_profile_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let without_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_frag.split('?').next().unwrap_or(without_frag);
+    let clean = without_query.trim_end_matches('/');
+    let marker = "/team/";
+    let pos = clean.find(marker)?;
+    let after = &clean[pos + marker.len()..];
+    let candidate = after.split('/').next()?;
+    if is_slack_user_id(candidate) {
+        Some(candidate.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Parse a Slack Canvas (`/docs/<T>/<F>`) or List (`/lists/<T>/<F>`) URL (`F-COLLAB-148`).
+pub(crate) fn parse_slack_doc_url(url: &str) -> Option<(CanvasEmbedKind, String)> {
+    let trimmed = url.trim();
+    let without_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_frag.split('?').next().unwrap_or(without_frag);
+    let clean = without_query.trim_end_matches('/');
+
+    for (marker, kind) in [
+        ("/docs/", CanvasEmbedKind::Canvas),
+        ("/lists/", CanvasEmbedKind::List),
+    ] {
+        if let Some(pos) = clean.find(marker) {
+            let after = &clean[pos + marker.len()..];
+            let mut parts = after.split('/').filter(|s| !s.is_empty());
+            let first = parts.next()?;
+            let second = parts.next();
+            let candidate = match second {
+                Some(fid) if is_slack_file_id(fid) => fid,
+                None if is_slack_file_id(first) => first,
+                _ => continue,
+            };
+            return Some((kind, candidate.to_owned()));
+        }
+    }
+    None
+}
+
+fn strip_slack_file_prefix(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix("sf:")
+        .unwrap_or(raw.trim())
+        .to_owned()
+}
+
+fn filename_from_url(url: &str) -> Option<String> {
+    let without_frag = url.split('#').next().unwrap_or(url);
+    let without_query = without_frag.split('?').next().unwrap_or(without_frag);
+    let seg = without_query.trim_end_matches('/').rsplit('/').next()?;
+    if seg.is_empty() {
+        None
+    } else {
+        Some(seg.to_owned())
+    }
 }
 
 /// Lightweight parser converting Slack's Quip/Canvas HTML export into structured [`CanvasBlock`]s.
@@ -72,6 +246,72 @@ pub fn parse_canvas_html_with_ids(html: &str) -> (Vec<CanvasBlock>, Vec<Option<S
             }
             continue;
         }
+        if matches!(tag_name.as_str(), "audio" | "video") {
+            let kind = if tag_name == "audio" {
+                MediaKind::Audio
+            } else {
+                MediaKind::Video
+            };
+            let inner = if trimmed.ends_with('/') {
+                ""
+            } else {
+                let close = format!("</{tag_name}>");
+                if let Some(end) = find_case_insensitive(rest, &close) {
+                    let slice = &rest[..end];
+                    rest = &rest[end + close.len()..];
+                    slice
+                } else {
+                    ""
+                }
+            };
+            if let Some(block) = parse_html_media_tag(kind, trimmed, inner) {
+                blocks.push(block);
+                ids.push(section_id);
+            }
+            continue;
+        }
+        if tag_name == "control" {
+            if let Some(end) = find_case_insensitive(rest, "</control>") {
+                let inner = &rest[..end];
+                if let Some(card) = parse_control_profile_card(inner) {
+                    rest = &rest[end + "</control>".len()..];
+                    blocks.push(card);
+                    ids.push(section_id);
+                    continue;
+                }
+                if let Some(emoji) = extract_control_emoji(inner) {
+                    rest = &rest[end + "</control>".len()..];
+                    blocks.push(CanvasBlock::Paragraph(emoji));
+                    ids.push(section_id);
+                    continue;
+                }
+            }
+            continue;
+        }
+        if matches!(tag_name.as_str(), "div" | "section") {
+            let is_profile_card = has_profile_card_marker(trimmed);
+            let is_doc_embed = has_doc_embed_marker(trimmed);
+            let is_media_container = has_embedded_file_marker(trimmed);
+            if (is_profile_card || is_doc_embed || is_media_container)
+                && let Some((inner, next_rest)) = take_balanced_inner(rest, &tag_name)
+            {
+                let parsed = if is_profile_card {
+                    parse_html_profile_card(trimmed, inner)
+                } else if is_doc_embed {
+                    parse_html_doc_embed(trimmed, inner)
+                } else {
+                    parse_html_embedded_file_media(trimmed, inner)
+                        .or_else(|| parse_html_doc_embed(trimmed, inner))
+                };
+                if let Some(block) = parsed {
+                    rest = next_rest;
+                    blocks.push(block);
+                    ids.push(section_id);
+                    continue;
+                }
+            }
+            continue;
+        }
         if matches!(tag_name.as_str(), "style" | "script" | "head") {
             let close = format!("</{tag_name}>");
             if let Some(end) = find_case_insensitive(rest, &close) {
@@ -103,9 +343,13 @@ pub fn parse_canvas_html_with_ids(html: &str) -> (Vec<CanvasBlock>, Vec<Option<S
                     }
                 }
                 "p" => {
-                    let text = clean_inline_html(inner);
-                    if !text.is_empty() {
-                        blocks.push(CanvasBlock::Paragraph(text));
+                    if let Some(embed_block) = parse_html_paragraph_embed(trimmed, inner) {
+                        blocks.push(embed_block);
+                    } else {
+                        let text = clean_inline_html(inner);
+                        if !text.is_empty() {
+                            blocks.push(CanvasBlock::Paragraph(text));
+                        }
                     }
                 }
                 "pre" => {
@@ -319,6 +563,11 @@ pub fn parse_canvas_markdown(markdown: &str) -> Vec<CanvasBlock> {
             blocks.push(CanvasBlock::Table { header, rows });
             continue;
         }
+        if let Some(embed_block) = parse_markdown_embed_line(trimmed) {
+            blocks.push(embed_block);
+            i += 1;
+            continue;
+        }
         blocks.push(CanvasBlock::Paragraph(trimmed.to_owned()));
         i += 1;
     }
@@ -347,6 +596,597 @@ fn parse_markdown_image_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((alt.to_owned(), url.to_owned()))
+}
+
+fn parse_markdown_link_line(line: &str) -> Option<(String, String)> {
+    let rest = line.strip_prefix('[')?;
+    let close_bracket = rest.find("](")?;
+    let label = &rest[..close_bracket];
+    let after = &rest[close_bracket + 2..];
+    let url = after.strip_suffix(')')?;
+    if url.is_empty() || url.contains(')') || url.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((label.trim().to_owned(), url.trim().to_owned()))
+}
+
+fn parse_standalone_user_mention(line: &str) -> Option<(String, Option<String>)> {
+    let inner = line.strip_prefix("<@")?.strip_suffix('>')?;
+    let mut parts = inner.splitn(2, '|');
+    let uid = parts.next()?.trim();
+    if !is_slack_user_id(uid) {
+        return None;
+    }
+    let handle = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    Some((uid.to_owned(), handle))
+}
+
+/// Classify a standalone markdown line as a doc embed (`F-COLLAB-148`), profile card
+/// (`F-COLLAB-147`), or inline audio/video embed (`F-COLLAB-141`).
+fn parse_markdown_embed_line(line: &str) -> Option<CanvasBlock> {
+    if let Some((user_id, handle)) = parse_standalone_user_mention(line) {
+        return Some(CanvasBlock::ProfileCard {
+            user_id,
+            display_name: None,
+            title: None,
+            handle,
+        });
+    }
+
+    let (label, url) = if let Some((l, u)) = parse_markdown_link_line(line) {
+        (Some(l), u)
+    } else if (line.starts_with("https://") || line.starts_with("http://"))
+        && !line.contains(char::is_whitespace)
+    {
+        (None, line.to_owned())
+    } else {
+        return None;
+    };
+
+    if let Some((kind, file_id)) = parse_slack_doc_url(&url) {
+        let title = label
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{} {file_id}", kind.label()));
+        return Some(CanvasBlock::DocEmbed {
+            kind,
+            file_id,
+            title,
+            url,
+        });
+    }
+
+    if let Some(user_id) = parse_slack_profile_url(&url) {
+        let display_name = label.filter(|s| !s.is_empty() && s != &user_id && s != &url);
+        return Some(CanvasBlock::ProfileCard {
+            user_id,
+            display_name,
+            title: None,
+            handle: None,
+        });
+    }
+
+    if let Some((kind, mime)) =
+        classify_media_url(&url).or_else(|| label.as_deref().and_then(classify_media_url))
+    {
+        let title = label
+            .filter(|s| !s.is_empty())
+            .or_else(|| filename_from_url(&url))
+            .unwrap_or_else(|| format!("{} clip", kind.label()));
+        return Some(CanvasBlock::MediaEmbed {
+            kind,
+            title,
+            url,
+            file_id: None,
+            duration: None,
+            mime: Some(mime.to_owned()),
+        });
+    }
+
+    None
+}
+
+fn has_profile_card_marker(open_tag: &str) -> bool {
+    let lower = open_tag.to_ascii_lowercase();
+    lower.contains("user_unfurl")
+        || lower.contains("user-unfurl")
+        || lower.contains("profile-card")
+        || lower.contains("profile_card")
+        || extract_attr(open_tag, "data-user-id").is_some_and(|id| is_slack_user_id(&id))
+}
+
+fn has_doc_embed_marker(open_tag: &str) -> bool {
+    let lower = open_tag.to_ascii_lowercase();
+    lower.contains("canvas_unfurl")
+        || lower.contains("canvas-unfurl")
+        || lower.contains("list_unfurl")
+        || lower.contains("list-unfurl")
+        || lower.contains("embedded-link")
+}
+
+fn has_embedded_file_marker(open_tag: &str) -> bool {
+    let lower = open_tag.to_ascii_lowercase();
+    lower.contains("embedded-file")
+        || lower.contains("media-embed")
+        || lower.contains("data-slack-file-id")
+}
+
+/// Extract the balanced inner HTML for `tag_name` (tracking nested `<tag_name>` opens/closes),
+/// returning `(inner, remaining_after_close_tag)`.
+fn take_balanced_inner<'a>(rest: &'a str, tag_name: &str) -> Option<(&'a str, &'a str)> {
+    let open_needle = format!("<{tag_name}");
+    let close_needle = format!("</{tag_name}>");
+    let lower = rest.to_ascii_lowercase();
+    let mut depth: usize = 1;
+    let mut cursor: usize = 0;
+
+    while cursor < lower.len() {
+        let next_open = lower[cursor..].find(&open_needle).map(|o| cursor + o);
+        let next_close = lower[cursor..].find(&close_needle).map(|c| cursor + c);
+
+        match (next_open, next_close) {
+            (_, None) => return None,
+            (Some(o), Some(c)) if o < c => {
+                let after = lower.as_bytes().get(o + open_needle.len()).copied();
+                let is_tag_boundary =
+                    after.is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/');
+                if is_tag_boundary {
+                    let gt_rel = lower[o..].find('>')?;
+                    let is_self_closing = lower[o..o + gt_rel].trim_end().ends_with('/');
+                    if !is_self_closing {
+                        depth += 1;
+                    }
+                    cursor = o + gt_rel + 1;
+                } else {
+                    cursor = o + open_needle.len();
+                }
+            }
+            (_, Some(c)) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&rest[..c], &rest[c + close_needle.len()..]));
+                }
+                cursor = c + close_needle.len();
+            }
+        }
+    }
+    None
+}
+
+/// Find the first opening tag matching `tag_name` inside `html`, returning `(raw_open_tag, inner)`.
+fn find_first_tag<'a>(html: &'a str, tag_name: &str) -> Option<(&'a str, &'a str)> {
+    let open = format!("<{tag_name}");
+    let lower = html.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(rel) = lower[offset..].find(&open) {
+        let pos = offset + rel;
+        let next_byte = lower.as_bytes().get(pos + open.len()).copied();
+        if !next_byte.is_some_and(|b| b.is_ascii_whitespace() || b == b'>' || b == b'/') {
+            offset = pos + open.len();
+            continue;
+        }
+        let after = &html[pos..];
+        let gt = after.find('>')?;
+        let raw = after[1..gt].trim();
+        let body = &after[gt + 1..];
+        if raw.ends_with('/') {
+            return Some((raw, ""));
+        }
+        let close = format!("</{tag_name}>");
+        let end = find_case_insensitive(body, &close).unwrap_or(body.len());
+        return Some((raw, &body[..end]));
+    }
+    None
+}
+
+/// Parse `<audio>` or `<video>` tags (including nested `<source src="..." type="...">`) into
+/// [`CanvasBlock::MediaEmbed`] (`F-COLLAB-141`).
+fn parse_html_media_tag(kind: MediaKind, open_tag: &str, inner: &str) -> Option<CanvasBlock> {
+    let source_tag = find_first_tag(inner, "source").map(|(t, _)| t);
+    let link_tag = find_first_tag(inner, "a").or_else(|| find_first_tag(inner, "lnk"));
+
+    let raw_url = extract_attr(open_tag, "src")
+        .or_else(|| source_tag.and_then(|t| extract_attr(t, "src")))
+        .or_else(|| link_tag.and_then(|(t, _)| extract_attr(t, "href")))?;
+    let url = decode_entities(&raw_url);
+    if url.is_empty() {
+        return None;
+    }
+
+    let mime = extract_attr(open_tag, "data-mime")
+        .or_else(|| extract_attr(open_tag, "type"))
+        .or_else(|| source_tag.and_then(|t| extract_attr(t, "type")))
+        .or_else(|| classify_media_url(&url).map(|(_, m)| m.to_owned()));
+    let duration = extract_attr(open_tag, "data-duration")
+        .or_else(|| extract_attr(open_tag, "duration"))
+        .filter(|s| !s.is_empty());
+    let file_id = extract_attr(open_tag, "data-slack-file-id")
+        .or_else(|| extract_attr(open_tag, "data-file-id"))
+        .map(|s| strip_slack_file_prefix(&s))
+        .filter(|s| !s.is_empty());
+    let title = extract_attr(open_tag, "title")
+        .or_else(|| extract_attr(open_tag, "data-title"))
+        .or_else(|| extract_attr(open_tag, "aria-label"))
+        .or_else(|| {
+            let txt = clean_inline_html(inner);
+            (!txt.is_empty()).then_some(txt)
+        })
+        .or_else(|| filename_from_url(&url))
+        .map(|s| resolve_canvas_emoji(&clean_text(&s)))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{} clip", kind.label()));
+
+    Some(CanvasBlock::MediaEmbed {
+        kind,
+        title,
+        url,
+        file_id,
+        duration,
+        mime,
+    })
+}
+
+/// Parse Quip `p.embedded-file` or `lnk[data-slack-file-id]` audio/video embeds (`F-COLLAB-141`).
+fn parse_html_embedded_file_media(open_tag: &str, inner: &str) -> Option<CanvasBlock> {
+    let link = find_first_tag(inner, "lnk").or_else(|| find_first_tag(inner, "a"));
+    let link_tag = link.map(|(t, _)| t).unwrap_or("");
+    let link_text = link
+        .map(|(_, body)| clean_inline_html(body))
+        .unwrap_or_default();
+
+    let file_id = extract_attr(link_tag, "data-slack-file-id")
+        .or_else(|| extract_attr(open_tag, "data-slack-file-id"))
+        .or_else(|| extract_attr(link_tag, "data-file-id"))
+        .or_else(|| extract_attr(open_tag, "data-file-id"))
+        .map(|s| strip_slack_file_prefix(&s))
+        .filter(|s| !s.is_empty());
+    let url = extract_attr(link_tag, "href")
+        .or_else(|| extract_attr(link_tag, "src"))
+        .or_else(|| extract_attr(open_tag, "href"))
+        .or_else(|| extract_attr(open_tag, "data-url"))
+        .map(|u| decode_entities(&u))
+        .unwrap_or_default();
+    let raw_mime = extract_attr(link_tag, "data-mime")
+        .or_else(|| extract_attr(open_tag, "data-mime"))
+        .or_else(|| extract_attr(link_tag, "type"))
+        .or_else(|| extract_attr(open_tag, "type"))
+        .or_else(|| extract_attr(link_tag, "data-filetype"))
+        .or_else(|| extract_attr(open_tag, "data-filetype"));
+    let duration = extract_attr(link_tag, "data-duration")
+        .or_else(|| extract_attr(open_tag, "data-duration"))
+        .filter(|s| !s.is_empty());
+
+    let raw_title = extract_attr(link_tag, "data-title")
+        .or_else(|| extract_attr(open_tag, "data-title"))
+        .or_else(|| extract_attr(link_tag, "title"))
+        .or_else(|| (!link_text.is_empty()).then_some(link_text))
+        .or_else(|| {
+            let txt = clean_inline_html(inner);
+            (!txt.is_empty()).then_some(txt)
+        })
+        .or_else(|| filename_from_url(&url))
+        .unwrap_or_default();
+
+    let (kind, mime) = raw_mime
+        .as_deref()
+        .and_then(classify_media_mime)
+        .or_else(|| classify_media_url(&url).map(|(k, m)| (k, m.to_owned())))
+        .or_else(|| classify_media_url(&raw_title).map(|(k, m)| (k, m.to_owned())))?;
+
+    let title = if raw_title.is_empty() {
+        format!("{} clip", kind.label())
+    } else {
+        resolve_canvas_emoji(&clean_text(&raw_title))
+    };
+
+    Some(CanvasBlock::MediaEmbed {
+        kind,
+        title,
+        url,
+        file_id,
+        duration,
+        mime: Some(mime),
+    })
+}
+
+/// Extract a Slack `user_id` from a `<control><a ...>@U...</a></control>` block (`F-COLLAB-147`).
+fn parse_control_profile_card(control_inner: &str) -> Option<CanvasBlock> {
+    let (link_tag, link_body) =
+        find_first_tag(control_inner, "a").or_else(|| find_first_tag(control_inner, "lnk"))?;
+    let body_text = clean_inline_html(link_body);
+    let href = extract_attr(link_tag, "href").map(|h| decode_entities(&h));
+
+    let user_id = extract_attr(link_tag, "data-user-id")
+        .filter(|s| is_slack_user_id(s))
+        .or_else(|| href.as_deref().and_then(parse_slack_profile_url))
+        .or_else(|| {
+            let bare = body_text.trim().trim_start_matches('@');
+            is_slack_user_id(bare).then(|| bare.to_owned())
+        })?;
+
+    let display_name = {
+        let trimmed = body_text.trim();
+        let bare = trimmed.trim_start_matches('@');
+        if trimmed.is_empty() || bare == user_id {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    };
+    let title = extract_attr(link_tag, "data-title").filter(|s| !s.is_empty());
+    let handle = extract_attr(link_tag, "data-handle").filter(|s| !s.is_empty());
+
+    Some(CanvasBlock::ProfileCard {
+        user_id,
+        display_name,
+        title,
+        handle,
+    })
+}
+
+/// Parse an HTML `user_unfurl` / `profile-card` / `data-user-id` container (`F-COLLAB-147`).
+fn parse_html_profile_card(open_tag: &str, inner: &str) -> Option<CanvasBlock> {
+    let link = find_first_tag(inner, "a").or_else(|| find_first_tag(inner, "lnk"));
+    let href = extract_attr(open_tag, "href")
+        .or_else(|| link.and_then(|(t, _)| extract_attr(t, "href")))
+        .map(|h| decode_entities(&h));
+    let inner_text = clean_inline_html(inner);
+
+    let user_id = extract_attr(open_tag, "data-user-id")
+        .filter(|s| is_slack_user_id(s))
+        .or_else(|| {
+            link.and_then(|(t, _)| extract_attr(t, "data-user-id"))
+                .filter(|s| is_slack_user_id(s))
+        })
+        .or_else(|| href.as_deref().and_then(parse_slack_profile_url))
+        .or_else(|| {
+            inner_text.split_whitespace().find_map(|tok| {
+                let bare = tok
+                    .trim_start_matches('@')
+                    .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+                is_slack_user_id(bare).then(|| bare.to_owned())
+            })
+        })?;
+
+    let title = extract_attr(open_tag, "data-title")
+        .or_else(|| extract_attr(open_tag, "data-role"))
+        .or_else(|| {
+            find_first_tag(inner, "span").and_then(|(t, body)| {
+                let lower = t.to_ascii_lowercase();
+                if lower.contains("title") || lower.contains("role") {
+                    let s = clean_inline_html(body);
+                    (!s.is_empty()).then_some(s)
+                } else {
+                    None
+                }
+            })
+        })
+        .filter(|s| !s.is_empty());
+
+    let handle = extract_attr(open_tag, "data-handle")
+        .or_else(|| extract_attr(open_tag, "data-username"))
+        .map(|h| h.trim_start_matches('@').to_owned())
+        .filter(|s| !s.is_empty());
+
+    let display_name = extract_attr(open_tag, "data-display-name")
+        .or_else(|| extract_attr(open_tag, "data-name"))
+        .or_else(|| extract_attr(open_tag, "data-user-name"))
+        .or_else(|| {
+            link.and_then(|(_, body)| {
+                let t = clean_inline_html(body);
+                let bare = t.trim_start_matches('@');
+                (!t.is_empty() && bare != user_id).then_some(t)
+            })
+        })
+        .or_else(|| {
+            let bare = inner_text.trim().trim_start_matches('@');
+            (!inner_text.is_empty()
+                && bare != user_id
+                && Some(inner_text.as_str()) != title.as_deref())
+            .then_some(inner_text)
+        });
+
+    Some(CanvasBlock::ProfileCard {
+        user_id,
+        display_name,
+        title,
+        handle,
+    })
+}
+
+/// Parse an HTML `p.embedded-link` / `canvas_unfurl` / list embed container (`F-COLLAB-148`).
+fn parse_html_doc_embed(open_tag: &str, inner: &str) -> Option<CanvasBlock> {
+    let link = find_first_tag(inner, "a").or_else(|| find_first_tag(inner, "lnk"));
+    let link_tag = link.map(|(t, _)| t).unwrap_or("");
+    let link_text = link
+        .map(|(_, body)| clean_inline_html(body))
+        .unwrap_or_default();
+
+    let url = extract_attr(link_tag, "href")
+        .or_else(|| extract_attr(open_tag, "href"))
+        .or_else(|| extract_attr(open_tag, "data-url"))
+        .map(|u| decode_entities(&u))
+        .unwrap_or_default();
+
+    let from_url = parse_slack_doc_url(&url);
+    let lower_tag = open_tag.to_ascii_lowercase();
+    let attr_file_id = extract_attr(link_tag, "data-slack-file-id")
+        .or_else(|| extract_attr(open_tag, "data-slack-file-id"))
+        .or_else(|| extract_attr(link_tag, "data-file-id"))
+        .or_else(|| extract_attr(open_tag, "data-file-id"))
+        .map(|s| strip_slack_file_prefix(&s))
+        .filter(|s| is_slack_file_id(s));
+
+    let (kind, file_id) = match from_url {
+        Some((k, fid)) => (k, fid),
+        None => {
+            let fid = attr_file_id?;
+            let is_list = lower_tag.contains("list_unfurl")
+                || lower_tag.contains("list-unfurl")
+                || extract_attr(open_tag, "data-doc-kind")
+                    .is_some_and(|k| k.eq_ignore_ascii_case("list"));
+            let is_canvas_marker = lower_tag.contains("canvas_unfurl")
+                || lower_tag.contains("canvas-unfurl")
+                || extract_attr(open_tag, "data-doc-kind")
+                    .is_some_and(|k| k.eq_ignore_ascii_case("canvas"));
+            if !is_list && !is_canvas_marker {
+                return None;
+            }
+            (
+                if is_list {
+                    CanvasEmbedKind::List
+                } else {
+                    CanvasEmbedKind::Canvas
+                },
+                fid,
+            )
+        }
+    };
+
+    let title = extract_attr(open_tag, "data-title")
+        .or_else(|| extract_attr(link_tag, "data-title"))
+        .or_else(|| (!link_text.is_empty() && link_text != url).then_some(link_text))
+        .or_else(|| {
+            let txt = clean_inline_html(inner);
+            (!txt.is_empty() && txt != url).then_some(txt)
+        })
+        .unwrap_or_else(|| format!("{} {file_id}", kind.label()));
+
+    let final_url = if url.is_empty() {
+        let seg = match kind {
+            CanvasEmbedKind::Canvas => "docs",
+            CanvasEmbedKind::List => "lists",
+        };
+        format!("https://slack.com/{seg}/T0/{file_id}")
+    } else {
+        url
+    };
+
+    Some(CanvasBlock::DocEmbed {
+        kind,
+        file_id,
+        title,
+        url: final_url,
+    })
+}
+
+/// Check whether a `<p ...>...</p>` block is an embedded media file, profile card, or
+/// canvas/list link card (`F-COLLAB-141`, `F-COLLAB-147`, `F-COLLAB-148`).
+fn parse_html_paragraph_embed(open_tag: &str, inner: &str) -> Option<CanvasBlock> {
+    if has_profile_card_marker(open_tag)
+        && let Some(card) = parse_html_profile_card(open_tag, inner)
+    {
+        return Some(card);
+    }
+
+    if has_embedded_file_marker(open_tag)
+        || inner.to_ascii_lowercase().contains("data-slack-file-id")
+    {
+        if let Some(media) = parse_html_embedded_file_media(open_tag, inner) {
+            return Some(media);
+        }
+        if let Some(doc) = parse_html_doc_embed(open_tag, inner) {
+            return Some(doc);
+        }
+    }
+
+    if has_doc_embed_marker(open_tag)
+        && let Some(doc) = parse_html_doc_embed(open_tag, inner)
+    {
+        return Some(doc);
+    }
+
+    // Standalone `<p><control><a ...>@U...</a></control></p>` (no surrounding prose).
+    if let Some((control_inner, remaining_text)) = extract_sole_tag(inner, "control")
+        && remaining_text.is_empty()
+        && let Some(card) = parse_control_profile_card(control_inner)
+    {
+        return Some(card);
+    }
+
+    // Standalone `<p><a href="...">...</a></p>` or `<p><lnk href="...">...</lnk></p>`.
+    let sole_link = extract_sole_tag_with_attrs(inner, "a")
+        .or_else(|| extract_sole_tag_with_attrs(inner, "lnk"));
+    if let Some((link_tag, link_body, remaining_text)) = sole_link
+        && remaining_text.is_empty()
+        && let Some(raw_href) = extract_attr(link_tag, "href")
+    {
+        let href = decode_entities(&raw_href);
+        let label = clean_inline_html(link_body);
+        if let Some((kind, file_id)) = parse_slack_doc_url(&href) {
+            let title = if !label.is_empty() && label != href {
+                label
+            } else {
+                format!("{} {file_id}", kind.label())
+            };
+            return Some(CanvasBlock::DocEmbed {
+                kind,
+                file_id,
+                title,
+                url: href,
+            });
+        }
+        if let Some(user_id) = parse_slack_profile_url(&href) {
+            let display_name = {
+                let bare = label.trim_start_matches('@');
+                (!label.is_empty() && bare != user_id && label != href).then_some(label)
+            };
+            return Some(CanvasBlock::ProfileCard {
+                user_id,
+                display_name,
+                title: extract_attr(link_tag, "data-title").filter(|s| !s.is_empty()),
+                handle: extract_attr(link_tag, "data-handle").filter(|s| !s.is_empty()),
+            });
+        }
+        if let Some((kind, mime)) = classify_media_url(&href).or_else(|| classify_media_url(&label))
+        {
+            let title = if !label.is_empty() {
+                label
+            } else {
+                filename_from_url(&href).unwrap_or_else(|| format!("{} clip", kind.label()))
+            };
+            let file_id = extract_attr(link_tag, "data-slack-file-id")
+                .map(|s| strip_slack_file_prefix(&s))
+                .filter(|s| !s.is_empty());
+            let duration = extract_attr(link_tag, "data-duration").filter(|s| !s.is_empty());
+            return Some(CanvasBlock::MediaEmbed {
+                kind,
+                title,
+                url: href,
+                file_id,
+                duration,
+                mime: Some(mime.to_owned()),
+            });
+        }
+    }
+
+    None
+}
+
+/// If `html` contains a `<tag>...</tag>`, return `(inner, cleaned_text_outside_tag)`.
+fn extract_sole_tag<'a>(html: &'a str, tag: &str) -> Option<(&'a str, String)> {
+    let (_, inner, outside) = extract_sole_tag_with_attrs(html, tag)?;
+    Some((inner, outside))
+}
+
+fn extract_sole_tag_with_attrs<'a>(html: &'a str, tag: &str) -> Option<(&'a str, &'a str, String)> {
+    let open = format!("<{tag}");
+    let pos = find_case_insensitive(html, &open)?;
+    let before = &html[..pos];
+    let after_start = &html[pos..];
+    let gt = after_start.find('>')?;
+    let raw_tag = after_start[1..gt].trim();
+    let after_open = &after_start[gt + 1..];
+    let close = format!("</{tag}>");
+    let end = find_case_insensitive(after_open, &close)?;
+    let inner = &after_open[..end];
+    let after = &after_open[end + close.len()..];
+    let mut outside = clean_inline_html(before);
+    outside.push_str(&clean_inline_html(after));
+    Some((raw_tag, inner, outside))
 }
 
 fn is_markdown_table_row(line: &str) -> bool {

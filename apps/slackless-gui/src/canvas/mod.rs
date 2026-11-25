@@ -1,11 +1,13 @@
 //! Native Slack Canvas reader & section editor (`F-COLLAB-125`, `F-COLLAB-128`, `F-COLLAB-129`,
-//! `F-COLLAB-132..136`, `F-COLLAB-139..140`, `F-COLLAB-143`, `F-COLLAB-145`, `F-SHELL-261`,
-//! `F-SHELL-264`, `F-SHELL-266`, `F-SHELL-268`, `F-SHELL-277`): renders both the sample
-//! workspace's fixture canvas and live Slack canvases fetched via `files.info` -> `url_private`
-//! HTML export (keeping `temp:C:...` section IDs), with an in-canvas Find bar, collapsible
-//! Outline, interactive checklists, rich tables, emoji rendering and insertion, file uploads,
-//! markdown section editor with selection formatting bar, `/` slash insert palette, per-section
-//! actions menu, undo/redo, Request edit access, Pop-out window, and "Open in browser".
+//! `F-COLLAB-132..136`, `F-COLLAB-139..141`, `F-COLLAB-143..145`, `F-COLLAB-147..148`,
+//! `F-SHELL-261`, `F-SHELL-264`, `F-SHELL-266`, `F-SHELL-268`, `F-SHELL-277`): renders both the
+//! sample workspace's fixture canvas and live Slack canvases fetched via `files.info` ->
+//! `url_private` HTML export (keeping `temp:C:...` section IDs), with an in-canvas Find bar,
+//! collapsible Outline, interactive checklists, rich tables, emoji rendering and insertion, file
+//! uploads, drag-to-reorder sections, inline audio/video media cards, user profile cards,
+//! embedded canvases & lists, markdown section editor with selection formatting bar, `/` slash
+//! insert palette, per-section actions menu, undo/redo, Request edit access, Pop-out window, and
+//! "Open in browser".
 
 mod blocks;
 mod comments;
@@ -19,13 +21,17 @@ mod tests;
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui_kit::component::input::TextareaState;
 use gpui_kit::gpui::{App, Entity, Global, Window};
 use slackless_core::api::CanvasEditOp;
+use slackless_core::types::UserId;
 
 #[allow(unused_imports)]
-pub use model::{CanvasBlock, CanvasDoc};
+pub use model::{
+    CanvasBlock, CanvasDoc, CanvasEmbedKind, CanvasUserProfile, MediaKind, resolve_profile_card,
+};
 #[cfg(test)]
 pub use parse::parse_canvas_html;
 #[allow(unused_imports)]
@@ -38,6 +44,14 @@ pub type OpenBrowserFn = Rc<dyn Fn(&mut Window, &mut App)>;
 pub type CanvasEditFn = Rc<dyn Fn(CanvasEditOp, &mut Window, &mut App)>;
 /// Callback invoked when the user pops a canvas out into its own window (`F-COLLAB-128`).
 pub type CanvasPopOutFn = Rc<dyn Fn(CanvasDoc, &mut Window, &mut App)>;
+/// Callback invoked when opening an inline audio or video embed (`F-COLLAB-141`).
+pub type CanvasOpenMediaFn = Rc<dyn Fn(String, MediaKind, &mut Window, &mut App)>;
+/// Resolver mapping a Slack `user_id` to display metadata for profile cards (`F-COLLAB-147`).
+pub type CanvasUserLookupFn = Rc<dyn Fn(&str) -> Option<CanvasUserProfile>>;
+/// Callback invoked when clicking a user profile card inside a canvas (`F-COLLAB-147`).
+pub type CanvasOpenProfileFn = Rc<dyn Fn(UserId, &mut Window, &mut App)>;
+/// Callback invoked when opening an embedded canvas or list by `(kind, file_id, url)` (`F-COLLAB-148`).
+pub type CanvasOpenEmbedFn = Rc<dyn Fn(CanvasEmbedKind, String, String, &mut Window, &mut App)>;
 
 /// Result of uploading a file into a canvas (`F-COLLAB-140`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +66,30 @@ pub type CanvasUploadCompleteFn = Rc<dyn Fn(UploadedCanvasFile, &mut Window, &mu
 /// Callback invoked when the user clicks "Upload file" inside a canvas (`F-COLLAB-140`).
 pub type CanvasUploadFileFn = Rc<dyn Fn(CanvasUploadCompleteFn, &mut Window, &mut App)>;
 
+/// Build a [`CanvasUserLookupFn`] backed by the workspace's [`crate::fixtures::Fixtures`] cache
+/// (`F-COLLAB-147`).
+pub fn user_lookup_from_fixtures(fixtures: Arc<crate::fixtures::Fixtures>) -> CanvasUserLookupFn {
+    Rc::new(move |user_id: &str| {
+        let uid = UserId::from(user_id);
+        let user = fixtures.user(&uid)?;
+        let display_name = fixtures.name_of(user).to_owned();
+        let title = user
+            .profile
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let handle = (!user.name.is_empty()).then(|| user.name.clone());
+        Some(CanvasUserProfile {
+            user_id: user_id.to_owned(),
+            display_name,
+            title,
+            handle,
+        })
+    })
+}
+
 /// Optional interactive callbacks wired by the host window (`app/render.rs` or `popout/mod.rs`).
 #[derive(Clone, Default)]
 pub struct CanvasActions {
@@ -65,6 +103,14 @@ pub struct CanvasActions {
     pub on_upload_file: Option<CanvasUploadFileFn>,
     /// Canonical canvas URL used when copying heading anchor links (`F-SHELL-267`).
     pub canvas_url: Option<String>,
+    /// Open an inline audio/video embed (`F-COLLAB-141`).
+    pub on_open_media: Option<CanvasOpenMediaFn>,
+    /// Resolve `user_id` -> display metadata for profile cards (`F-COLLAB-147`).
+    pub user_lookup: Option<CanvasUserLookupFn>,
+    /// Open a user's profile pane when clicking a profile card (`F-COLLAB-147`).
+    pub on_open_profile: Option<CanvasOpenProfileFn>,
+    /// Open an embedded canvas or list card (`F-COLLAB-148`).
+    pub on_open_embed: Option<CanvasOpenEmbedFn>,
 }
 
 #[derive(Clone, Default)]

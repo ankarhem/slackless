@@ -19,14 +19,14 @@ use gpui_kit::gpui::{
 use slackless_core::api::CanvasEditOp;
 
 use crate::canvas::blocks::{
-    BlockCallbacks, append_section_edit_menu_items, build_block_callbacks, render_block,
-    render_section_actions_button,
+    CanvasBlockDrag, append_section_edit_menu_items, build_block_callbacks, render_block,
+    render_drag_handle, render_section_actions_button,
 };
 use crate::canvas::comments::render_comments_drawer;
 use crate::canvas::editor::render_canvas_editor;
 use crate::canvas::format::{canvas_file_markdown, is_image_filename};
 use crate::canvas::model::{CanvasBlock, CanvasDoc, fixture};
-use crate::canvas::parse::resolve_canvas_emoji;
+use crate::canvas::parse::{classify_media_url, resolve_canvas_emoji};
 use crate::canvas::{
     CanvasActions, CanvasUploadCompleteFn, UploadedCanvasFile, commit_block_edit, mutate_ui,
     ui_state,
@@ -250,6 +250,17 @@ fn render_canvas_doc(
                                     alt: uploaded.filename.clone(),
                                     width: None,
                                     height: None,
+                                }
+                            } else if let Some((kind, mime)) =
+                                classify_media_url(&uploaded.filename)
+                            {
+                                CanvasBlock::MediaEmbed {
+                                    kind,
+                                    title: uploaded.filename.clone(),
+                                    url: uploaded.url.clone(),
+                                    file_id: None,
+                                    duration: None,
+                                    mime: Some(mime.to_owned()),
                                 }
                             } else {
                                 CanvasBlock::Paragraph(md.clone())
@@ -537,20 +548,18 @@ fn render_canvas_doc(
             .into_iter()
             .fold(v_flex().gap_3(), |doc_col, (block_ix, block)| {
                 let section_id_owned = canvas.section_ids.get(block_ix).and_then(|s| s.clone());
-                let cbs = if can_edit {
-                    build_block_callbacks(
-                        key,
-                        canvas,
-                        block_ix,
-                        section_id_owned.clone(),
-                        is_fixture,
-                        actions.on_edit.clone(),
-                    )
-                } else {
-                    BlockCallbacks::default()
-                };
+                let cbs = build_block_callbacks(
+                    key,
+                    canvas,
+                    block_ix,
+                    section_id_owned.clone(),
+                    can_edit,
+                    is_fixture,
+                    &actions,
+                );
 
                 let block_count = canvas.blocks.len();
+                let can_drag = can_edit && block_count > 1;
                 let block_md = canvas.block_plain_text(block_ix).unwrap_or_default();
                 let full_md_export = canvas.to_markdown();
                 let section_menu_btn = render_section_actions_button(
@@ -572,80 +581,114 @@ fn render_canvas_doc(
                 let already_pinned = ui.pinned_tab;
                 let sid_ctx = section_id_owned.clone();
 
-                doc_col.child(
-                    h_flex()
-                        .id(SharedString::from(format!("canvas-blk-{key}-{block_ix}")))
-                        .items_start()
-                        .gap_1()
-                        .rounded_sm()
-                        .child(div().flex_1().min_w_0().child(render_block(
-                            key,
-                            block_ix,
-                            block,
-                            section_id_owned.as_deref(),
-                            actions.canvas_url.as_deref(),
-                            &ui,
-                            &cbs,
-                            cx,
-                        )))
-                        .child(section_menu_btn)
-                        .context_menu(move |mut menu, _, _| {
-                            let copy_text = block_md.clone();
-                            menu = menu.item(PopupMenuItem::new("Copy markdown").on_click(
-                                move |_, window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text.clone(),
-                                    ));
-                                    crate::actions::notify(
-                                        "Copied section",
-                                        "Copied canvas section markdown to clipboard.",
+                let drag_key_over = key.to_owned();
+                let drag_key_drop = key.to_owned();
+                let canvas_drop = canvas.clone();
+                let on_edit_drop = actions.on_edit.clone();
+
+                let row = h_flex()
+                    .id(SharedString::from(format!("canvas-blk-{key}-{block_ix}")))
+                    .items_start()
+                    .gap_1()
+                    .rounded_sm()
+                    .when(can_drag, |row| {
+                        row.child(render_drag_handle(key, block_ix, block, cx))
+                            .drag_over::<CanvasBlockDrag>(move |style, drag, _, cx| {
+                                if drag.key == drag_key_over && drag.from_ix != block_ix {
+                                    let themed = style
+                                        .bg(cx.theme().accent.opacity(0.24))
+                                        .border_color(cx.theme().link);
+                                    if drag.from_ix > block_ix {
+                                        themed.border_t_2()
+                                    } else {
+                                        themed.border_b_2()
+                                    }
+                                } else {
+                                    style
+                                }
+                            })
+                            .on_drop(move |drag: &CanvasBlockDrag, window, cx| {
+                                if drag.key != drag_key_drop || drag.from_ix == block_ix {
+                                    return;
+                                }
+                                let mut updated = canvas_drop.clone();
+                                if let Some(op) = updated.reorder_block_op(drag.from_ix, block_ix) {
+                                    commit_block_edit(
+                                        &drag_key_drop,
+                                        updated,
+                                        op,
+                                        is_fixture,
+                                        on_edit_drop.as_ref(),
                                         window,
                                         cx,
                                     );
-                                },
-                            ));
-                            if can_edit {
-                                menu = append_section_edit_menu_items(
-                                    menu,
-                                    &key_ctx,
-                                    block_ix,
-                                    block_count,
-                                    is_fixture,
-                                    &canvas_ctx,
-                                    sid_ctx.as_deref(),
-                                    on_edit_ctx.as_ref(),
-                                );
-                            }
-                            let export_md = full_md_export.clone();
-                            menu = menu.separator().item(
-                                PopupMenuItem::new("Export Markdown").on_click(
-                                    move |_, window, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            export_md.clone(),
-                                        ));
-                                        crate::actions::notify(
-                                            "Exported Markdown",
-                                            "Copied full canvas markdown to clipboard.",
-                                            window,
-                                            cx,
-                                        );
-                                    },
-                                ),
+                                }
+                            })
+                    })
+                    .child(div().flex_1().min_w_0().child(render_block(
+                        key,
+                        block_ix,
+                        block,
+                        section_id_owned.as_deref(),
+                        actions.canvas_url.as_deref(),
+                        &ui,
+                        &cbs,
+                        cx,
+                    )))
+                    .child(section_menu_btn);
+
+                doc_col.child(row.context_menu(move |mut menu, _, _| {
+                    let copy_text = block_md.clone();
+                    menu = menu.item(PopupMenuItem::new("Copy markdown").on_click(
+                        move |_, window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                            crate::actions::notify(
+                                "Copied section",
+                                "Copied canvas section markdown to clipboard.",
+                                window,
+                                cx,
                             );
-                            if let Some(pin_cb) = on_pin_ctx.clone() {
-                                let k_pin = key_ctx.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new("Pin to channel tabs")
-                                        .disabled(already_pinned)
-                                        .on_click(move |_, window, cx| {
-                                            mutate_ui(&k_pin, |s| s.pinned_tab = true, window, cx);
-                                            pin_cb(window, cx);
-                                        }),
+                        },
+                    ));
+                    if can_edit {
+                        menu = append_section_edit_menu_items(
+                            menu,
+                            &key_ctx,
+                            block_ix,
+                            block_count,
+                            is_fixture,
+                            &canvas_ctx,
+                            sid_ctx.as_deref(),
+                            on_edit_ctx.as_ref(),
+                        );
+                    }
+                    let export_md = full_md_export.clone();
+                    menu = menu
+                        .separator()
+                        .item(PopupMenuItem::new("Export Markdown").on_click(
+                            move |_, window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(export_md.clone()));
+                                crate::actions::notify(
+                                    "Exported Markdown",
+                                    "Copied full canvas markdown to clipboard.",
+                                    window,
+                                    cx,
                                 );
-                            }
-                            menu
-                        }),
-                )
+                            },
+                        ));
+                    if let Some(pin_cb) = on_pin_ctx.clone() {
+                        let k_pin = key_ctx.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new("Pin to channel tabs")
+                                .disabled(already_pinned)
+                                .on_click(move |_, window, cx| {
+                                    mutate_ui(&k_pin, |s| s.pinned_tab = true, window, cx);
+                                    pin_cb(window, cx);
+                                }),
+                        );
+                    }
+                    menu
+                }))
             })
     };
 

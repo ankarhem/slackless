@@ -1,6 +1,8 @@
 //! Per-block rendering (headings, multi-line quotes, bullets, numbered lists, interactive
-//! checklists, rich tables, images, emoji) and per-section actions menu (`F-COLLAB-134..136`,
-//! `F-COLLAB-139`, `F-COLLAB-145`).
+//! checklists, rich tables, images, inline audio/video embeds, user profile cards, embedded
+//! canvases & lists, emoji), drag-to-reorder handles, and per-section actions menu
+//! (`F-COLLAB-134..136`, `F-COLLAB-139`, `F-COLLAB-141`, `F-COLLAB-144..145`,
+//! `F-COLLAB-147..148`).
 
 use std::rc::Rc;
 
@@ -11,18 +13,98 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    Anchor, App, AppContext as _, ClipboardItem, Div, FontWeight, InteractiveElement as _,
-    IntoElement, ObjectFit, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Window, div, img, px,
+    Anchor, App, AppContext as _, ClipboardItem, Context, Div, FontWeight, InteractiveElement as _,
+    IntoElement, ObjectFit, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Window, div, img, px,
 };
-use slackless_core::api::CanvasEditOp;
+use slackless_core::types::UserId;
 
-use crate::canvas::model::{CanvasBlock, CanvasDoc};
-use crate::canvas::parse::resolve_canvas_emoji;
+use crate::canvas::model::{
+    CanvasBlock, CanvasDoc, CanvasEmbedKind, MediaKind, resolve_profile_card,
+};
+use crate::canvas::parse::{media_format_pill, resolve_canvas_emoji};
 use crate::canvas::{
-    CanvasEditFn, CanvasUiState, commit_block_edit, mutate_ui, section_delete_op,
+    CanvasActions, CanvasEditFn, CanvasOpenEmbedFn, CanvasOpenMediaFn, CanvasOpenProfileFn,
+    CanvasUiState, CanvasUserLookupFn, commit_block_edit, mutate_ui, section_delete_op,
     section_insert_after_op, section_replace_op,
 };
+
+/// Drag payload and floating preview chip for drag-to-reorder canvas blocks (`F-COLLAB-144`).
+#[derive(Clone, Debug)]
+pub(super) struct CanvasBlockDrag {
+    pub(super) key: String,
+    pub(super) from_ix: usize,
+    pub(super) label: String,
+    pub(super) position: Point<Pixels>,
+}
+
+impl Render for CanvasBlockDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .pl(self.position.x + px(10.))
+            .pt(self.position.y - px(14.))
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .max_w(px(280.))
+                    .px_2p5()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.ring)
+                    .bg(theme.background.opacity(0.94))
+                    .shadow_md()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(
+                        Icon::new(IconName::ArrowUpDown)
+                            .size(px(12.))
+                            .text_color(theme.link),
+                    )
+                    .child(div().truncate().child(self.label.clone())),
+            )
+    }
+}
+
+/// Compact left-gutter drag handle for reordering a canvas block (`F-COLLAB-144`).
+pub(super) fn render_drag_handle(
+    key: &str,
+    block_ix: usize,
+    block: &CanvasBlock,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let hover_bg = theme.secondary.opacity(0.55);
+    let fg = theme.foreground;
+    let drag = CanvasBlockDrag {
+        key: key.to_owned(),
+        from_ix: block_ix,
+        label: block.preview_label(),
+        position: Point::default(),
+    };
+    div()
+        .id(SharedString::from(format!(
+            "canvas-drag-handle-{key}-{block_ix}"
+        )))
+        .flex_none()
+        .mt_0p5()
+        .px_0p5()
+        .py_1()
+        .rounded_sm()
+        .cursor_grab()
+        .text_color(theme.muted_foreground.opacity(0.65))
+        .hover(move |s| s.bg(hover_bg).text_color(fg))
+        .on_drag(drag, |drag: &CanvasBlockDrag, position, _, cx| {
+            cx.new(|_| CanvasBlockDrag {
+                position,
+                ..drag.clone()
+            })
+        })
+        .child(Icon::new(IconName::ArrowUpDown).size(px(12.)))
+}
 
 type ChecklistItemFn = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 type ChecklistAddFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
@@ -35,17 +117,36 @@ pub(super) struct BlockCallbacks {
     pub(super) on_add_check_submit: Option<ChecklistAddFn>,
     pub(super) on_table_add_row: Option<TableMutateFn>,
     pub(super) on_table_add_col: Option<TableMutateFn>,
+    pub(super) on_open_media: Option<CanvasOpenMediaFn>,
+    pub(super) user_lookup: Option<CanvasUserLookupFn>,
+    pub(super) on_open_profile: Option<CanvasOpenProfileFn>,
+    pub(super) on_open_embed: Option<CanvasOpenEmbedFn>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_block_callbacks(
     key: &str,
     canvas: &CanvasDoc,
     block_ix: usize,
     section_id: Option<String>,
+    can_edit: bool,
     is_fixture: bool,
-    on_edit: Option<CanvasEditFn>,
+    actions: &CanvasActions,
 ) -> BlockCallbacks {
-    let on_toggle_check = {
+    let mut cbs = BlockCallbacks {
+        on_open_media: actions.on_open_media.clone(),
+        user_lookup: actions.user_lookup.clone(),
+        on_open_profile: actions.on_open_profile.clone(),
+        on_open_embed: actions.on_open_embed.clone(),
+        ..Default::default()
+    };
+    if !can_edit {
+        return cbs;
+    }
+
+    let on_edit = actions.on_edit.clone();
+
+    cbs.on_toggle_check = {
         let k = key.to_owned();
         let doc = canvas.clone();
         let sid = section_id.clone();
@@ -62,7 +163,7 @@ pub(super) fn build_block_callbacks(
         )
     };
 
-    let on_delete_check = {
+    cbs.on_delete_check = {
         let k = key.to_owned();
         let doc = canvas.clone();
         let sid = section_id.clone();
@@ -82,7 +183,7 @@ pub(super) fn build_block_callbacks(
         )
     };
 
-    let on_add_check_submit = {
+    cbs.on_add_check_submit = {
         let k = key.to_owned();
         let doc = canvas.clone();
         let sid = section_id.clone();
@@ -99,7 +200,7 @@ pub(super) fn build_block_callbacks(
         )
     };
 
-    let on_table_add_row = {
+    cbs.on_table_add_row = {
         let k = key.to_owned();
         let doc = canvas.clone();
         let sid = section_id.clone();
@@ -114,7 +215,7 @@ pub(super) fn build_block_callbacks(
         }) as Rc<dyn Fn(&mut Window, &mut App)>)
     };
 
-    let on_table_add_col = {
+    cbs.on_table_add_col = {
         let k = key.to_owned();
         let doc = canvas.clone();
         let sid = section_id;
@@ -129,13 +230,7 @@ pub(super) fn build_block_callbacks(
         }) as Rc<dyn Fn(&mut Window, &mut App)>)
     };
 
-    BlockCallbacks {
-        on_toggle_check,
-        on_delete_check,
-        on_add_check_submit,
-        on_table_add_row,
-        on_table_add_col,
-    }
+    cbs
 }
 
 /// Compact per-section actions menu trigger button (`F-COLLAB-145`).
@@ -206,13 +301,19 @@ pub(super) fn append_section_edit_menu_items(
         PopupMenuItem::new("Move up")
             .disabled(block_ix == 0)
             .on_click(move |_, window, cx| {
-                let mut updated = c_up.clone();
-                if updated.move_block(block_ix, -1) {
-                    let op = CanvasEditOp::Replace {
-                        section_id: None,
-                        markdown: updated.to_markdown(),
-                    };
-                    commit_block_edit(&k_up, updated, op, is_fixture, e_up.as_ref(), window, cx);
+                if block_ix > 0 {
+                    let mut updated = c_up.clone();
+                    if let Some(op) = updated.reorder_block_op(block_ix, block_ix - 1) {
+                        commit_block_edit(
+                            &k_up,
+                            updated,
+                            op,
+                            is_fixture,
+                            e_up.as_ref(),
+                            window,
+                            cx,
+                        );
+                    }
                 }
             }),
     );
@@ -223,11 +324,7 @@ pub(super) fn append_section_edit_menu_items(
             .disabled(block_ix + 1 >= block_count)
             .on_click(move |_, window, cx| {
                 let mut updated = c_dn.clone();
-                if updated.move_block(block_ix, 1) {
-                    let op = CanvasEditOp::Replace {
-                        section_id: None,
-                        markdown: updated.to_markdown(),
-                    };
+                if let Some(op) = updated.reorder_block_op(block_ix, block_ix + 1) {
                     commit_block_edit(&k_dn, updated, op, is_fixture, e_dn.as_ref(), window, cx);
                 }
             }),
@@ -441,8 +538,348 @@ pub(super) fn render_block(
                     )
                 })
         }
+        CanvasBlock::MediaEmbed {
+            kind,
+            title,
+            url,
+            file_id,
+            duration,
+            mime,
+        } => render_media_embed_block(
+            key,
+            block_ix,
+            *kind,
+            title,
+            url,
+            file_id.as_deref(),
+            duration.as_deref(),
+            mime.as_deref(),
+            cbs,
+            cx,
+        ),
+        CanvasBlock::ProfileCard {
+            user_id,
+            display_name,
+            title,
+            handle,
+        } => render_profile_card_block(
+            key,
+            block_ix,
+            user_id,
+            display_name.as_deref(),
+            title.as_deref(),
+            handle.as_deref(),
+            cbs,
+            cx,
+        ),
+        CanvasBlock::DocEmbed {
+            kind,
+            file_id,
+            title,
+            url,
+        } => render_doc_embed_block(key, block_ix, *kind, file_id, title, url, cbs, cx),
         CanvasBlock::Divider => div().h(px(1.)).w_full().bg(theme.border),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_media_embed_block(
+    key: &str,
+    block_ix: usize,
+    kind: MediaKind,
+    title: &str,
+    url: &str,
+    file_id: Option<&str>,
+    duration: Option<&str>,
+    mime: Option<&str>,
+    cbs: &BlockCallbacks,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let icon = match kind {
+        MediaKind::Audio => IconName::Headphones,
+        MediaKind::Video => IconName::Video,
+    };
+    let format_pill = media_format_pill(mime, url);
+    let url_open = url.to_owned();
+    let on_open_media = cbs.on_open_media.clone();
+
+    let mut pills = h_flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1p5()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(
+            div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .bg(theme.secondary.opacity(0.7))
+                .text_color(theme.foreground)
+                .font_weight(FontWeight::MEDIUM)
+                .child(kind.label()),
+        );
+    if let Some(fmt) = format_pill {
+        pills = pills.child(
+            div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .child(fmt),
+        );
+    }
+    if let Some(dur) = duration {
+        pills = pills.child(div().child(dur.to_owned()));
+    }
+    if let Some(fid) = file_id {
+        pills = pills.child(div().child(fid.to_owned()));
+    }
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .p_2p5()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.28))
+        .child(
+            h_flex()
+                .flex_none()
+                .w(px(36.))
+                .h(px(36.))
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(theme.link.opacity(0.14))
+                .child(Icon::new(icon).size(px(18.)).text_color(theme.link)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(resolve_canvas_emoji(title)),
+                )
+                .child(pills),
+        )
+        .child(
+            Button::new(SharedString::from(format!(
+                "canvas-media-open-{key}-{block_ix}"
+            )))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::Play)
+            .label("Play")
+            .tooltip(format!("Open {} media", kind.label().to_ascii_lowercase()))
+            .on_click(move |_, window, cx| {
+                if let Some(cb) = &on_open_media {
+                    cb(url_open.clone(), kind, window, cx);
+                } else if url_open.starts_with("https://") || url_open.starts_with("http://") {
+                    cx.open_url(&url_open);
+                }
+            }),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_profile_card_block(
+    key: &str,
+    block_ix: usize,
+    user_id: &str,
+    display_name: Option<&str>,
+    title: Option<&str>,
+    handle: Option<&str>,
+    cbs: &BlockCallbacks,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let profile = resolve_profile_card(
+        user_id,
+        display_name,
+        title,
+        handle,
+        cbs.user_lookup.as_ref(),
+    );
+    let initials = profile.initials();
+    let uid_click = UserId::from(profile.user_id.as_str());
+    let on_open_profile = cbs.on_open_profile.clone();
+
+    let name_row = h_flex()
+        .items_center()
+        .gap_1p5()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .truncate()
+                .child(resolve_canvas_emoji(&profile.display_name)),
+        )
+        .when_some(profile.handle.clone(), |row, h| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("@{h}")),
+            )
+        });
+
+    let subtitle = profile
+        .title
+        .clone()
+        .unwrap_or_else(|| profile.user_id.clone());
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .p_2p5()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.24))
+        .child(
+            h_flex()
+                .flex_none()
+                .w(px(36.))
+                .h(px(36.))
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.link.opacity(0.18))
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.link)
+                .child(initials),
+        )
+        .child(
+            v_flex().flex_1().min_w_0().gap_0p5().child(name_row).child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .truncate()
+                    .child(resolve_canvas_emoji(&subtitle)),
+            ),
+        )
+        .when_some(on_open_profile, |row, cb| {
+            let uid = uid_click.clone();
+            row.child(
+                Button::new(SharedString::from(format!(
+                    "canvas-profile-open-{key}-{block_ix}"
+                )))
+                .outline()
+                .with_size(Size::XSmall)
+                .icon(IconName::UserRound)
+                .label("View profile")
+                .tooltip("Open user profile")
+                .on_click(move |_, window, cx| cb(uid.clone(), window, cx)),
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_doc_embed_block(
+    key: &str,
+    block_ix: usize,
+    kind: CanvasEmbedKind,
+    file_id: &str,
+    title: &str,
+    url: &str,
+    cbs: &BlockCallbacks,
+    cx: &App,
+) -> Div {
+    let theme = cx.theme();
+    let icon = match kind {
+        CanvasEmbedKind::Canvas => IconName::LayoutTemplate,
+        CanvasEmbedKind::List => IconName::ListChecks,
+    };
+    let on_open_embed = cbs.on_open_embed.clone();
+    let fid_open = file_id.to_owned();
+    let url_open = url.to_owned();
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_3()
+        .p_2p5()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.28))
+        .child(
+            h_flex()
+                .flex_none()
+                .w(px(36.))
+                .h(px(36.))
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(theme.link.opacity(0.14))
+                .child(Icon::new(icon).size(px(18.)).text_color(theme.link)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(resolve_canvas_emoji(title)),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            div()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(theme.secondary.opacity(0.7))
+                                .text_color(theme.foreground)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(kind.label()),
+                        )
+                        .child(div().truncate().child(file_id.to_owned())),
+                ),
+        )
+        .child(
+            Button::new(SharedString::from(format!(
+                "canvas-embed-open-{key}-{block_ix}"
+            )))
+            .outline()
+            .with_size(Size::XSmall)
+            .icon(IconName::ExternalLink)
+            .label("Open")
+            .tooltip(format!(
+                "Open embedded {}",
+                kind.label().to_ascii_lowercase()
+            ))
+            .on_click(move |_, window, cx| {
+                if let Some(cb) = &on_open_embed {
+                    cb(kind, fid_open.clone(), url_open.clone(), window, cx);
+                } else if url_open.starts_with("https://") || url_open.starts_with("http://") {
+                    cx.open_url(&url_open);
+                }
+            }),
+        )
 }
 
 fn render_checklist_block(

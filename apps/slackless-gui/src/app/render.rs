@@ -126,164 +126,31 @@ impl Render for App {
                     }
                 }
                 ConversationTab::Canvas => {
-                    let view =
-                        if self.fixtures.sample {
-                            let this_pop = cx.weak_entity();
-                            let on_pop_out: crate::canvas::CanvasPopOutFn =
-                                Rc::new(move |doc, window, cx| {
-                                    let _ = this_pop.update(cx, |app, cx| {
-                                        app.pop_out_canvas(doc, None, window, cx);
-                                    });
+                    let view = if self.fixtures.sample {
+                        let this_pop = cx.weak_entity();
+                        let on_pop_out: crate::canvas::CanvasPopOutFn =
+                            Rc::new(move |doc, window, cx| {
+                                let _ = this_pop.update(cx, |app, cx| {
+                                    app.pop_out_canvas(doc, None, window, cx);
                                 });
-                            let on_pin_tab: crate::canvas::OpenBrowserFn =
-                                Rc::new(move |window, cx| {
-                                    notify(
-                                        "Pinned to channel tabs",
-                                        "Canvas pinned to channel header tabs.",
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            let on_upload_file: crate::canvas::CanvasUploadFileFn =
-                                Rc::new(move |on_done, window, cx| {
-                                    let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
-                                        files: true,
-                                        directories: false,
-                                        multiple: false,
-                                        prompt: Some("Upload file to canvas".into()),
-                                    });
-                                    window
-                                        .spawn(cx, async move |cx| {
-                                            let Ok(Ok(Some(paths))) = rx.await else {
-                                                return;
-                                            };
-                                            let Some(path) = paths.into_iter().next() else {
-                                                return;
-                                            };
-                                            let filename = path
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or("attachment")
-                                                .to_owned();
-                                            let url = format!("file://{}", path.display());
-                                            let _ = cx.update(|window, cx| {
-                                                on_done(
-                                                    crate::canvas::UploadedCanvasFile {
-                                                        filename: filename.clone(),
-                                                        url,
-                                                    },
-                                                    window,
-                                                    cx,
-                                                );
-                                                notify(
-                                                    "Inserted file",
-                                                    format!("Added {filename} to canvas."),
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        })
-                                        .detach();
-                                });
-                            canvas_view(
-                                &self.canvas_query,
-                                Some(&self.canvas_search),
-                                crate::canvas::CanvasActions {
-                                    on_pop_out: Some(on_pop_out),
-                                    on_pin_tab: Some(on_pin_tab),
-                                    on_upload_file: Some(on_upload_file),
-                                    ..Default::default()
-                                },
-                                cx,
-                            )
-                        } else {
-                            let file_id = self.ws.active_canvas.clone().or_else(|| {
-                                conversation
-                                    .as_ref()
-                                    .and_then(|c| c.properties.as_ref())
-                                    .and_then(|p| p.canvas.as_ref())
-                                    .and_then(|cv| cv.file_id.as_ref())
-                                    .map(|f| f.to_string())
                             });
-                            let loaded = file_id.as_deref().and_then(|id| self.ws.canvases.get(id));
-                            let open_browser = file_id.as_ref().map(|id| {
-                                let url = self.canvas_link(id);
-                                Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
-                                    cx.open_url(&url);
-                                }) as crate::canvas::OpenBrowserFn
+                        let on_pin_tab: crate::canvas::OpenBrowserFn =
+                            Rc::new(move |window, cx| {
+                                notify(
+                                    "Pinned to channel tabs",
+                                    "Canvas pinned to channel header tabs.",
+                                    window,
+                                    cx,
+                                );
                             });
-                            let on_edit = file_id.as_ref().map(|id| {
-                                let fid = id.clone();
-                                let this = cx.weak_entity();
-                                Rc::new(move |op, _: &mut Window, cx: &mut gpui::App| {
-                                    let _ = this.update(cx, |app, _| {
-                                        app.bridge.send(Command::EditCanvas {
-                                            file_id: fid.clone(),
-                                            op,
-                                        });
-                                    });
-                                }) as crate::canvas::CanvasEditFn
-                            });
-                            let on_request_access = file_id.as_ref().map(|id| {
-                                let fid = id.clone();
-                                let this = cx.weak_entity();
-                                Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
-                                    let _ = this.update(cx, |app, _| {
-                                        app.bridge.send(Command::RequestFilePermission {
-                                            file_id: fid.clone(),
-                                            request_type: "upgrade".to_owned(),
-                                        });
-                                    });
-                                }) as crate::canvas::OpenBrowserFn
-                            });
-                            let on_pop_out = file_id.as_ref().map(|id| {
-                                let fid = id.clone();
-                                let this = cx.weak_entity();
-                                Rc::new(move |doc, window: &mut Window, cx: &mut gpui::App| {
-                                    let _ = this.update(cx, |app, cx| {
-                                        app.pop_out_canvas(doc, Some(fid.clone()), window, cx);
-                                    });
-                                }) as crate::canvas::CanvasPopOutFn
-                            });
-                            let canvas_url = file_id.as_ref().map(|id| self.canvas_link(id));
-                            let on_pin_tab = file_id.as_ref().map(|_| {
-                                let ch = self.channel.clone();
-                                let label = loaded
-                                    .and_then(|res| res.as_ref().ok())
-                                    .map(|doc| doc.title.clone());
-                                let this = cx.weak_entity();
-                                Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
-                                    let _ = this.update(cx, |app, _| {
-                                        app.bridge.send(Command::AddConversationTab {
-                                            channel: ch.clone(),
-                                            tab_type: "canvas".to_owned(),
-                                            label: label.clone(),
-                                        });
-                                    });
-                                    notify(
-                                        "Pinned to channel tabs",
-                                        "Canvas added to the channel header tabs.",
-                                        window,
-                                        cx,
-                                    );
-                                }) as crate::canvas::OpenBrowserFn
-                            });
-                            let on_upload_file =
-                                file_id.as_ref().map(|_| {
-                                    let ch = self.channel.clone();
-                                    let this = cx.weak_entity();
-                                    Rc::new(
-                                move |on_done: crate::canvas::CanvasUploadCompleteFn,
-                                      window: &mut Window,
-                                      cx: &mut gpui::App| {
+                        let on_upload_file: crate::canvas::CanvasUploadFileFn =
+                            Rc::new(move |on_done, window, cx| {
                                 let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
                                     files: true,
                                     directories: false,
                                     multiple: false,
                                     prompt: Some("Upload file to canvas".into()),
                                 });
-                                let ch_u = ch.clone();
-                                let this_u = this.clone();
                                 window
                                     .spawn(cx, async move |cx| {
                                         let Ok(Ok(Some(paths))) = rx.await else {
@@ -292,12 +159,6 @@ impl Render for App {
                                         let Some(path) = paths.into_iter().next() else {
                                             return;
                                         };
-                                        let Ok(bytes) = std::fs::read(&path) else {
-                                            return;
-                                        };
-                                        if bytes.is_empty() {
-                                            return;
-                                        }
                                         let filename = path
                                             .file_name()
                                             .and_then(|n| n.to_str())
@@ -305,17 +166,6 @@ impl Render for App {
                                             .to_owned();
                                         let url = format!("file://{}", path.display());
                                         let _ = cx.update(|window, cx| {
-                                            let _ = this_u.update(cx, |app, _| {
-                                                app.bridge.send(Command::UploadFiles {
-                                                    channel: ch_u.clone(),
-                                                    thread_ts: None,
-                                                    content: None,
-                                                    files: vec![slackless_core::api::UploadFile {
-                                                        filename: filename.clone(),
-                                                        bytes,
-                                                    }],
-                                                });
-                                            });
                                             on_done(
                                                 crate::canvas::UploadedCanvasFile {
                                                     filename: filename.clone(),
@@ -325,33 +175,265 @@ impl Render for App {
                                                 cx,
                                             );
                                             notify(
-                                                "Uploaded file to canvas",
-                                                format!("Uploaded and inserted {filename}."),
+                                                "Inserted file",
+                                                format!("Added {filename} to canvas."),
                                                 window,
                                                 cx,
                                             );
                                         });
                                     })
                                     .detach();
-                            }) as crate::canvas::CanvasUploadFileFn
+                            });
+                        let user_lookup =
+                            crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
+                        let this_prof = cx.weak_entity();
+                        let on_open_profile: crate::canvas::CanvasOpenProfileFn =
+                            Rc::new(move |user_id, _window, cx| {
+                                let _ = this_prof.update(cx, |app, cx| {
+                                    app.open_profile(user_id, cx);
                                 });
-                            crate::canvas::live_canvas_view(
-                                file_id.as_deref().unwrap_or("live-canvas"),
-                                loaded,
-                                &self.canvas_query,
-                                Some(&self.canvas_search),
-                                crate::canvas::CanvasActions {
-                                    open_browser,
-                                    on_edit,
-                                    on_request_access,
-                                    on_pop_out,
-                                    on_pin_tab,
-                                    on_upload_file,
-                                    canvas_url,
+                            });
+                        let this_emb = cx.weak_entity();
+                        let on_open_embed: crate::canvas::CanvasOpenEmbedFn =
+                            Rc::new(move |kind, _fid, _url, _window, cx| {
+                                let _ = this_emb.update(cx, |app, cx| match kind {
+                                    crate::canvas::CanvasEmbedKind::Canvas => {
+                                        app.select_tab(ConversationTab::Canvas, cx);
+                                    }
+                                    crate::canvas::CanvasEmbedKind::List => {
+                                        app.select_tab(ConversationTab::List, cx);
+                                    }
+                                });
+                            });
+                        let on_open_media: crate::canvas::CanvasOpenMediaFn =
+                            Rc::new(move |url, _kind, window, cx| {
+                                if url.starts_with("https://") || url.starts_with("http://") {
+                                    cx.open_url(&url);
+                                } else {
+                                    notify(
+                                        "Media link",
+                                        format!("Cannot open unsupported media URL: {url}"),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            });
+                        canvas_view(
+                            &self.canvas_query,
+                            Some(&self.canvas_search),
+                            crate::canvas::CanvasActions {
+                                on_pop_out: Some(on_pop_out),
+                                on_pin_tab: Some(on_pin_tab),
+                                on_upload_file: Some(on_upload_file),
+                                on_open_media: Some(on_open_media),
+                                user_lookup: Some(user_lookup),
+                                on_open_profile: Some(on_open_profile),
+                                on_open_embed: Some(on_open_embed),
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    } else {
+                        let file_id = self.ws.active_canvas.clone().or_else(|| {
+                            conversation
+                                .as_ref()
+                                .and_then(|c| c.properties.as_ref())
+                                .and_then(|p| p.canvas.as_ref())
+                                .and_then(|cv| cv.file_id.as_ref())
+                                .map(|f| f.to_string())
+                        });
+                        let loaded = file_id.as_deref().and_then(|id| self.ws.canvases.get(id));
+                        let open_browser = file_id.as_ref().map(|id| {
+                            let url = self.canvas_link(id);
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                cx.open_url(&url);
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let on_edit = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |op, _: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::EditCanvas {
+                                        file_id: fid.clone(),
+                                        op,
+                                    });
+                                });
+                            }) as crate::canvas::CanvasEditFn
+                        });
+                        let on_request_access = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::RequestFilePermission {
+                                        file_id: fid.clone(),
+                                        request_type: "upgrade".to_owned(),
+                                    });
+                                });
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let on_pop_out = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |doc, window: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.pop_out_canvas(doc, Some(fid.clone()), window, cx);
+                                });
+                            }) as crate::canvas::CanvasPopOutFn
+                        });
+                        let canvas_url = file_id.as_ref().map(|id| self.canvas_link(id));
+                        let on_pin_tab = file_id.as_ref().map(|_| {
+                            let ch = self.channel.clone();
+                            let label = loaded
+                                .and_then(|res| res.as_ref().ok())
+                                .map(|doc| doc.title.clone());
+                            let this = cx.weak_entity();
+                            Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, _| {
+                                    app.bridge.send(Command::AddConversationTab {
+                                        channel: ch.clone(),
+                                        tab_type: "canvas".to_owned(),
+                                        label: label.clone(),
+                                    });
+                                });
+                                notify(
+                                    "Pinned to channel tabs",
+                                    "Canvas added to the channel header tabs.",
+                                    window,
+                                    cx,
+                                );
+                            }) as crate::canvas::OpenBrowserFn
+                        });
+                        let on_upload_file = file_id.as_ref().map(|_| {
+                            let ch = self.channel.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(
+                                move |on_done: crate::canvas::CanvasUploadCompleteFn,
+                                      window: &mut Window,
+                                      cx: &mut gpui::App| {
+                                    let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                        files: true,
+                                        directories: false,
+                                        multiple: false,
+                                        prompt: Some("Upload file to canvas".into()),
+                                    });
+                                    let ch_u = ch.clone();
+                                    let this_u = this.clone();
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            let Ok(Ok(Some(paths))) = rx.await else {
+                                                return;
+                                            };
+                                            let Some(path) = paths.into_iter().next() else {
+                                                return;
+                                            };
+                                            let Ok(bytes) = std::fs::read(&path) else {
+                                                return;
+                                            };
+                                            if bytes.is_empty() {
+                                                return;
+                                            }
+                                            let filename = path
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("attachment")
+                                                .to_owned();
+                                            let url = format!("file://{}", path.display());
+                                            let _ = cx.update(|window, cx| {
+                                                let _ = this_u.update(cx, |app, _| {
+                                                    app.bridge.send(Command::UploadFiles {
+                                                        channel: ch_u.clone(),
+                                                        thread_ts: None,
+                                                        content: None,
+                                                        files: vec![
+                                                            slackless_core::api::UploadFile {
+                                                                filename: filename.clone(),
+                                                                bytes,
+                                                            },
+                                                        ],
+                                                    });
+                                                });
+                                                on_done(
+                                                    crate::canvas::UploadedCanvasFile {
+                                                        filename: filename.clone(),
+                                                        url,
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                                notify(
+                                                    "Uploaded file to canvas",
+                                                    format!("Uploaded and inserted {filename}."),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                        .detach();
                                 },
-                                cx,
-                            )
-                        };
+                            ) as crate::canvas::CanvasUploadFileFn
+                        });
+                        let user_lookup =
+                            crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
+                        let this_prof = cx.weak_entity();
+                        let on_open_profile: crate::canvas::CanvasOpenProfileFn =
+                            Rc::new(move |user_id, _window, cx| {
+                                let _ = this_prof.update(cx, |app, cx| {
+                                    app.open_profile(user_id, cx);
+                                });
+                            });
+                        let this_emb = cx.weak_entity();
+                        let on_open_embed: crate::canvas::CanvasOpenEmbedFn =
+                            Rc::new(move |kind, fid, url, _window, cx| {
+                                if !fid.is_empty() {
+                                    let _ = this_emb.update(cx, |app, cx| match kind {
+                                        crate::canvas::CanvasEmbedKind::Canvas => {
+                                            app.open_live_canvas(fid, cx);
+                                        }
+                                        crate::canvas::CanvasEmbedKind::List => {
+                                            app.open_live_list(fid, cx);
+                                        }
+                                    });
+                                } else if url.starts_with("https://") || url.starts_with("http://")
+                                {
+                                    cx.open_url(&url);
+                                }
+                            });
+                        let on_open_media: crate::canvas::CanvasOpenMediaFn =
+                            Rc::new(move |url, _kind, window, cx| {
+                                if url.starts_with("https://") || url.starts_with("http://") {
+                                    cx.open_url(&url);
+                                } else {
+                                    notify(
+                                        "Media link",
+                                        format!("Cannot open unsupported media URL: {url}"),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            });
+                        crate::canvas::live_canvas_view(
+                            file_id.as_deref().unwrap_or("live-canvas"),
+                            loaded,
+                            &self.canvas_query,
+                            Some(&self.canvas_search),
+                            crate::canvas::CanvasActions {
+                                open_browser,
+                                on_edit,
+                                on_request_access,
+                                on_pop_out,
+                                on_pin_tab,
+                                on_upload_file,
+                                canvas_url,
+                                on_open_media: Some(on_open_media),
+                                user_lookup: Some(user_lookup),
+                                on_open_profile: Some(on_open_profile),
+                                on_open_embed: Some(on_open_embed),
+                            },
+                            cx,
+                        )
+                    };
                     column.child(div().flex_1().min_h_0().child(view))
                 }
                 ConversationTab::List => {

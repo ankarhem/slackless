@@ -1680,6 +1680,68 @@ impl Render for PopoutWindow {
                             .detach();
                     })
                 };
+                let user_lookup = crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
+                let on_open_profile: crate::canvas::CanvasOpenProfileFn = {
+                    let fixtures = self.fixtures.clone();
+                    let send = self.send.clone();
+                    let is_live = file_id.is_some();
+                    Rc::new(move |user_id, window: &mut Window, cx: &mut App| {
+                        if is_live {
+                            (send)(Command::FetchUserProfile(user_id.clone()));
+                        }
+                        if let Some(team) =
+                            fixtures.workspaces.first().filter(|t| !t.domain.is_empty())
+                        {
+                            cx.open_url(&format!(
+                                "https://{}.slack.com/team/{}",
+                                team.domain, user_id
+                            ));
+                        } else {
+                            let name = fixtures.user_name(&user_id).to_owned();
+                            actions::notify("Profile", format!("User: {name}"), window, cx);
+                        }
+                    })
+                };
+                let on_open_embed: crate::canvas::CanvasOpenEmbedFn = {
+                    let fixtures = self.fixtures.clone();
+                    Rc::new(move |kind, fid, url, window: &mut Window, cx: &mut App| {
+                        if url.starts_with("https://") || url.starts_with("http://") {
+                            cx.open_url(&url);
+                        } else if let Some(team) =
+                            fixtures.workspaces.first().filter(|t| !t.domain.is_empty())
+                            && !fid.is_empty()
+                        {
+                            let seg = match kind {
+                                crate::canvas::CanvasEmbedKind::Canvas => "docs",
+                                crate::canvas::CanvasEmbedKind::List => "lists",
+                            };
+                            cx.open_url(&format!(
+                                "https://{}.slack.com/{seg}/{}/{fid}",
+                                team.domain, team.id
+                            ));
+                        } else {
+                            actions::notify(
+                                "Embedded link",
+                                format!("Cannot open embedded item {fid}"),
+                                window,
+                                cx,
+                            );
+                        }
+                    })
+                };
+                let on_open_media: crate::canvas::CanvasOpenMediaFn =
+                    Rc::new(move |url, _kind, window: &mut Window, cx: &mut App| {
+                        if url.starts_with("https://") || url.starts_with("http://") {
+                            cx.open_url(&url);
+                        } else {
+                            actions::notify(
+                                "Media link",
+                                format!("Cannot open unsupported media URL: {url}"),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
                 let key = file_id.as_deref().unwrap_or("popout-canvas");
                 crate::canvas::render_popout_canvas(
                     key,
@@ -1690,6 +1752,10 @@ impl Render for PopoutWindow {
                         open_browser,
                         on_edit,
                         on_upload_file: Some(on_upload_file),
+                        on_open_media: Some(on_open_media),
+                        user_lookup: Some(user_lookup),
+                        on_open_profile: Some(on_open_profile),
+                        on_open_embed: Some(on_open_embed),
                         ..Default::default()
                     },
                     file_id.is_none(),

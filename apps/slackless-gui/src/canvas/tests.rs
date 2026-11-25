@@ -12,10 +12,15 @@ use crate::canvas::format::{
     cycle_last_line_heading, detect_slash_query, filter_slash_commands, insert_markdown_table,
     insert_text_at, is_image_filename, move_last_line,
 };
-use crate::canvas::parse::resolve_canvas_emoji;
+use crate::canvas::parse::{
+    classify_media_mime, classify_media_url, media_format_pill, parse_slack_doc_url,
+    parse_slack_profile_url, resolve_canvas_emoji,
+};
 use crate::canvas::{
-    CanvasActions, CanvasBlock, CanvasDoc, CanvasUploadCompleteFn, CanvasUploadFileFn,
-    OpenBrowserFn, UploadedCanvasFile, canvas_view, parse_canvas_html, parse_canvas_markdown,
+    CanvasActions, CanvasBlock, CanvasDoc, CanvasEditFn, CanvasEmbedKind, CanvasOpenEmbedFn,
+    CanvasOpenMediaFn, CanvasOpenProfileFn, CanvasUploadCompleteFn, CanvasUploadFileFn,
+    CanvasUserLookupFn, CanvasUserProfile, MediaKind, OpenBrowserFn, UploadedCanvasFile,
+    canvas_view, live_canvas_view, parse_canvas_html, parse_canvas_markdown, resolve_profile_card,
     section_delete_op, section_insert_after_op, section_replace_op,
 };
 
@@ -556,4 +561,496 @@ fn canvas_renders_context_menus_pin_tab_and_rich_blocks_without_os_dialogs(
     cx.run_until_parked();
     assert!(!pinned.get());
     assert!(!uploaded.get());
+}
+
+#[test]
+fn drag_reorder_keeps_blocks_and_section_ids_aligned_and_builds_edit_op() {
+    let html = r#"<html><body>
+        <h1 id="temp:C:h1">Intro</h1>
+        <p id="temp:C:p1">Alpha</p>
+        <p id="temp:C:p2">Beta</p>
+        <p id="temp:C:p3">Gamma</p>
+    </body></html>"#;
+    let mut doc = CanvasDoc::from_html("Spec".into(), html);
+    assert_eq!(doc.blocks.len(), 4);
+
+    // No-op & out-of-bounds guards.
+    assert!(!doc.reorder_block(1, 1));
+    assert!(!doc.reorder_block(9, 1));
+    assert!(!doc.reorder_block(1, 9));
+    assert!(doc.reorder_block_op(2, 2).is_none());
+
+    // Drag downward: index 0 -> index 2 puts Intro after Beta.
+    let op = doc
+        .reorder_block_op(0, 2)
+        .expect("reordering 0 -> 2 produces edit op");
+    assert_eq!(
+        doc.blocks,
+        vec![
+            CanvasBlock::Paragraph("Alpha".into()),
+            CanvasBlock::Paragraph("Beta".into()),
+            CanvasBlock::Heading {
+                level: 1,
+                text: "Intro".into(),
+            },
+            CanvasBlock::Paragraph("Gamma".into()),
+        ]
+    );
+    assert_eq!(
+        doc.section_ids,
+        vec![
+            Some("temp:C:p1".into()),
+            Some("temp:C:p2".into()),
+            Some("temp:C:h1".into()),
+            Some("temp:C:p3".into()),
+        ]
+    );
+    assert_eq!(
+        op,
+        CanvasEditOp::Replace {
+            section_id: None,
+            markdown: "Alpha\n\nBeta\n\n# Intro\n\nGamma".into(),
+        }
+    );
+
+    // Drag upward: index 3 (Gamma) -> index 0 puts Gamma first.
+    assert!(doc.reorder_block(3, 0));
+    assert_eq!(doc.blocks[0], CanvasBlock::Paragraph("Gamma".into()));
+    assert_eq!(doc.section_ids[0].as_deref(), Some("temp:C:p3"));
+
+    // Menu move_block stays consistent with reorder_block and preserves section_ids.
+    assert!(doc.move_block(0, 1));
+    assert_eq!(doc.blocks[1], CanvasBlock::Paragraph("Gamma".into()));
+    assert_eq!(doc.section_ids[1].as_deref(), Some("temp:C:p3"));
+
+    // Shorter section_ids vec is padded cleanly before reordering.
+    doc.section_ids.truncate(2);
+    assert!(doc.reorder_block(0, 3));
+    assert_eq!(doc.section_ids.len(), doc.blocks.len());
+
+    // Preview labels stay compact and truncate long blocks cleanly.
+    let long_para = CanvasBlock::Paragraph("a".repeat(80));
+    let label = long_para.preview_label();
+    assert!(label.ends_with('…'));
+    assert!(label.chars().count() <= 43);
+}
+
+#[test]
+fn parses_and_roundtrips_inline_audio_and_video_embeds() {
+    // Extension & MIME classifiers.
+    assert_eq!(
+        classify_media_url("https://files.slack.com/clip.MP3?download=1"),
+        Some((MediaKind::Audio, "audio/mpeg"))
+    );
+    assert_eq!(
+        classify_media_url("voice-note.m4a"),
+        Some((MediaKind::Audio, "audio/mp4"))
+    );
+    assert_eq!(
+        classify_media_url("demo.webm#t=10"),
+        Some((MediaKind::Video, "video/webm"))
+    );
+    assert_eq!(
+        classify_media_url("recording.mov"),
+        Some((MediaKind::Video, "video/quicktime"))
+    );
+    assert_eq!(classify_media_url("spec.pdf"), None);
+    assert_eq!(
+        classify_media_mime("audio/ogg"),
+        Some((MediaKind::Audio, "audio/ogg".into()))
+    );
+    assert_eq!(
+        media_format_pill(Some("video/quicktime"), "https://x/y"),
+        Some("MOV".into())
+    );
+    assert_eq!(
+        media_format_pill(Some("audio/mpeg"), "https://x/y"),
+        Some("MP3".into())
+    );
+
+    // Quip HTML <audio>, <video><source>, and p.embedded-file / lnk[data-slack-file-id].
+    let html = r#"<html><body>
+        <audio id="temp:C:a1" src="https://files.slack.com/files/standup.mp3" title="Weekly Standup" data-duration="1:24"></audio>
+        <video id="temp:C:v1" data-title="Beta Demo" data-duration="3:10" data-slack-file-id="sf:F01VID">
+            <source src="https://files.slack.com/files/demo.webm" type="video/webm" />
+        </video>
+        <p id="temp:C:ef1" class="embedded-file">
+            <lnk data-slack-file-id="sf:F02AUD" href="https://files.slack.com/files/note.m4a" data-mime="audio/mp4" data-duration="0:45">Voice memo</lnk>
+        </p>
+        <p id="temp:C:ef2" class="embedded-file">
+            <lnk data-slack-file-id="sf:F03PDF" href="https://files.slack.com/files/spec.pdf">spec.pdf</lnk>
+        </p>
+    </body></html>"#;
+    let doc = CanvasDoc::from_html("Media".into(), html);
+    assert_eq!(
+        doc.blocks,
+        vec![
+            CanvasBlock::MediaEmbed {
+                kind: MediaKind::Audio,
+                title: "Weekly Standup".into(),
+                url: "https://files.slack.com/files/standup.mp3".into(),
+                file_id: None,
+                duration: Some("1:24".into()),
+                mime: Some("audio/mpeg".into()),
+            },
+            CanvasBlock::MediaEmbed {
+                kind: MediaKind::Video,
+                title: "Beta Demo".into(),
+                url: "https://files.slack.com/files/demo.webm".into(),
+                file_id: Some("F01VID".into()),
+                duration: Some("3:10".into()),
+                mime: Some("video/webm".into()),
+            },
+            CanvasBlock::MediaEmbed {
+                kind: MediaKind::Audio,
+                title: "Voice memo".into(),
+                url: "https://files.slack.com/files/note.m4a".into(),
+                file_id: Some("F02AUD".into()),
+                duration: Some("0:45".into()),
+                mime: Some("audio/mp4".into()),
+            },
+            // Non-media embedded files stay paragraphs.
+            CanvasBlock::Paragraph("spec.pdf".into()),
+        ]
+    );
+    assert_eq!(doc.section_ids[0].as_deref(), Some("temp:C:a1"));
+    assert_eq!(doc.section_ids[1].as_deref(), Some("temp:C:v1"));
+    assert_eq!(doc.section_ids[2].as_deref(), Some("temp:C:ef1"));
+
+    // Search matching across title, kind, duration, file_id.
+    assert!(doc.blocks[0].matches("standup"));
+    assert!(doc.blocks[0].matches("audio"));
+    assert!(doc.blocks[1].matches("f01vid"));
+    assert!(doc.blocks[1].matches("3:10"));
+    assert!(!doc.blocks[0].matches("video"));
+
+    // Markdown parsing & round-trip across audio and video extensions.
+    let md = "[Kickoff audio](https://cdn.example.com/kickoff.ogg)\n\n\
+              https://cdn.example.com/launch.mp4\n\n\
+              [Clip](https://cdn.example.com/raw.wav)";
+    let parsed = parse_canvas_markdown(md);
+    assert_eq!(parsed.len(), 3);
+    assert!(matches!(
+        &parsed[0],
+        CanvasBlock::MediaEmbed {
+            kind: MediaKind::Audio,
+            title,
+            ..
+        } if title == "Kickoff audio"
+    ));
+    assert!(matches!(
+        &parsed[1],
+        CanvasBlock::MediaEmbed {
+            kind: MediaKind::Video,
+            title,
+            ..
+        } if title == "launch.mp4"
+    ));
+    assert!(matches!(
+        &parsed[2],
+        CanvasBlock::MediaEmbed {
+            kind: MediaKind::Audio,
+            ..
+        }
+    ));
+    let roundtripped = parse_canvas_markdown(&parsed[0].to_markdown());
+    assert_eq!(roundtripped, vec![parsed[0].clone()]);
+}
+
+#[test]
+fn parses_resolves_and_roundtrips_user_profile_cards() {
+    assert_eq!(
+        parse_slack_profile_url("https://acme.slack.com/team/U01ALICE?tab=about"),
+        Some("U01ALICE".into())
+    );
+    assert_eq!(
+        parse_slack_profile_url("https://acme.slack.com/archives/C01"),
+        None
+    );
+
+    let html = r#"<html><body>
+        <div id="temp:C:u1" class="user_unfurl" data-user-id="U01ALICE" data-title="Staff Engineer" data-handle="alice">Alice Rivera</div>
+        <p id="temp:C:u2"><control><a href="https://acme.slack.com/team/U02BOB">@U02BOB</a></control></p>
+        <p id="temp:C:u3"><a href="https://acme.slack.com/team/U03CAROL">Carol Lin</a></p>
+        <p id="temp:C:p1">Ask <control><a href="https://acme.slack.com/team/U02BOB">@U02BOB</a></control> before shipping.</p>
+    </body></html>"#;
+    let doc = CanvasDoc::from_html("Team".into(), html);
+    assert_eq!(
+        doc.blocks,
+        vec![
+            CanvasBlock::ProfileCard {
+                user_id: "U01ALICE".into(),
+                display_name: Some("Alice Rivera".into()),
+                title: Some("Staff Engineer".into()),
+                handle: Some("alice".into()),
+            },
+            CanvasBlock::ProfileCard {
+                user_id: "U02BOB".into(),
+                display_name: None,
+                title: None,
+                handle: None,
+            },
+            CanvasBlock::ProfileCard {
+                user_id: "U03CAROL".into(),
+                display_name: Some("Carol Lin".into()),
+                title: None,
+                handle: None,
+            },
+            // Inline mention inside prose must NOT become a standalone profile card.
+            CanvasBlock::Paragraph("Ask @U02BOB before shipping.".into()),
+        ]
+    );
+    assert_eq!(doc.section_ids[0].as_deref(), Some("temp:C:u1"));
+    assert_eq!(doc.section_ids[1].as_deref(), Some("temp:C:u2"));
+
+    // Pure user resolver seam without booting full app.
+    let lookup: CanvasUserLookupFn = Rc::new(|uid: &str| match uid {
+        "U02BOB" => Some(CanvasUserProfile {
+            user_id: "U02BOB".into(),
+            display_name: "Bob Park".into(),
+            title: Some("Design Lead".into()),
+            handle: Some("bpark".into()),
+        }),
+        _ => None,
+    });
+    let resolved_bob = resolve_profile_card("U02BOB", None, None, None, Some(&lookup));
+    assert_eq!(resolved_bob.display_name, "Bob Park");
+    assert_eq!(resolved_bob.title.as_deref(), Some("Design Lead"));
+    assert_eq!(resolved_bob.handle.as_deref(), Some("bpark"));
+    assert_eq!(resolved_bob.initials(), "BP");
+
+    // Fallback when lookup misses.
+    let fallback_carol =
+        resolve_profile_card("U03CAROL", Some("Carol Lin"), None, None, Some(&lookup));
+    assert_eq!(fallback_carol.display_name, "Carol Lin");
+    assert_eq!(fallback_carol.initials(), "CL");
+
+    let bare_unknown = resolve_profile_card("U09ZED", None, None, None, None);
+    assert_eq!(bare_unknown.display_name, "U09ZED");
+    assert_eq!(bare_unknown.initials(), "U0");
+
+    // Search matching & markdown round-trip.
+    assert!(doc.blocks[0].matches("alice"));
+    assert!(doc.blocks[0].matches("staff engineer"));
+    assert!(doc.blocks[1].matches("u02bob"));
+
+    let md = "[Carol Lin](https://slack.com/team/U03CAROL)\n\n\
+              https://acme.slack.com/team/U02BOB\n\n\
+              <@U04DAVE|dave>";
+    let parsed_md = parse_canvas_markdown(md);
+    assert_eq!(
+        parsed_md,
+        vec![
+            CanvasBlock::ProfileCard {
+                user_id: "U03CAROL".into(),
+                display_name: Some("Carol Lin".into()),
+                title: None,
+                handle: None,
+            },
+            CanvasBlock::ProfileCard {
+                user_id: "U02BOB".into(),
+                display_name: None,
+                title: None,
+                handle: None,
+            },
+            CanvasBlock::ProfileCard {
+                user_id: "U04DAVE".into(),
+                display_name: None,
+                title: None,
+                handle: Some("dave".into()),
+            },
+        ]
+    );
+    assert_eq!(
+        parse_canvas_markdown(&parsed_md[0].to_markdown()),
+        vec![parsed_md[0].clone()]
+    );
+}
+
+#[test]
+fn parses_and_roundtrips_embedded_canvases_and_lists_by_link() {
+    assert_eq!(
+        parse_slack_doc_url("https://acme.slack.com/docs/T01TEAM/F01CANVAS"),
+        Some((CanvasEmbedKind::Canvas, "F01CANVAS".into()))
+    );
+    assert_eq!(
+        parse_slack_doc_url("https://acme.slack.com/lists/T01TEAM/F02LIST?view=board"),
+        Some((CanvasEmbedKind::List, "F02LIST".into()))
+    );
+    assert_eq!(
+        parse_slack_doc_url("https://acme.slack.com/archives/C01GENERAL"),
+        None
+    );
+
+    let html = r#"<html><body>
+        <p id="temp:C:c1" class="embedded-link"><a href="https://acme.slack.com/docs/T01/F01SPEC">Q4 Launch Spec</a></p>
+        <div id="temp:C:c2" class="canvas_unfurl" data-slack-file-id="sf:F02RUNBOOK" data-title="Incident Runbook">Incident Runbook</div>
+        <p id="temp:C:l1" class="embedded-link"><a href="https://acme.slack.com/lists/T01/F03BUGS">Release Blockers</a></p>
+        <p id="temp:C:p1"><a href="https://example.com/docs/guide">External Docs</a></p>
+    </body></html>"#;
+    let doc = CanvasDoc::from_html("Hub".into(), html);
+    assert_eq!(
+        doc.blocks,
+        vec![
+            CanvasBlock::DocEmbed {
+                kind: CanvasEmbedKind::Canvas,
+                file_id: "F01SPEC".into(),
+                title: "Q4 Launch Spec".into(),
+                url: "https://acme.slack.com/docs/T01/F01SPEC".into(),
+            },
+            CanvasBlock::DocEmbed {
+                kind: CanvasEmbedKind::Canvas,
+                file_id: "F02RUNBOOK".into(),
+                title: "Incident Runbook".into(),
+                url: "https://slack.com/docs/T0/F02RUNBOOK".into(),
+            },
+            CanvasBlock::DocEmbed {
+                kind: CanvasEmbedKind::List,
+                file_id: "F03BUGS".into(),
+                title: "Release Blockers".into(),
+                url: "https://acme.slack.com/lists/T01/F03BUGS".into(),
+            },
+            // Ordinary external links remain paragraphs.
+            CanvasBlock::Paragraph("External Docs".into()),
+        ]
+    );
+    assert_eq!(doc.section_ids[0].as_deref(), Some("temp:C:c1"));
+    assert_eq!(doc.section_ids[2].as_deref(), Some("temp:C:l1"));
+
+    // Search matching & markdown round-trip.
+    assert!(doc.blocks[0].matches("launch spec"));
+    assert!(doc.blocks[0].matches("canvas"));
+    assert!(doc.blocks[2].matches("f03bugs"));
+    assert!(doc.blocks[2].matches("list"));
+
+    let md = "[Q4 Launch Spec](https://acme.slack.com/docs/T01/F01SPEC)\n\n\
+              https://acme.slack.com/lists/T01/F03BUGS";
+    let parsed_md = parse_canvas_markdown(md);
+    assert_eq!(
+        parsed_md,
+        vec![
+            CanvasBlock::DocEmbed {
+                kind: CanvasEmbedKind::Canvas,
+                file_id: "F01SPEC".into(),
+                title: "Q4 Launch Spec".into(),
+                url: "https://acme.slack.com/docs/T01/F01SPEC".into(),
+            },
+            CanvasBlock::DocEmbed {
+                kind: CanvasEmbedKind::List,
+                file_id: "F03BUGS".into(),
+                title: "List F03BUGS".into(),
+                url: "https://acme.slack.com/lists/T01/F03BUGS".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        parse_canvas_markdown(&parsed_md[0].to_markdown()),
+        vec![parsed_md[0].clone()]
+    );
+}
+
+#[gpui::test]
+fn canvas_renders_drag_reorder_media_profile_and_doc_embeds_with_mock_callbacks(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct RichCanvasHost {
+        doc: CanvasDoc,
+        editable: bool,
+        media_opened: Rc<Cell<bool>>,
+        profile_opened: Rc<Cell<bool>>,
+        embed_opened: Rc<Cell<bool>>,
+        edited: Rc<Cell<bool>>,
+    }
+    impl Render for RichCanvasHost {
+        fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+            let media_opened = self.media_opened.clone();
+            let on_open_media: CanvasOpenMediaFn = Rc::new(move |_, _, _, _| {
+                media_opened.set(true);
+            });
+            let profile_opened = self.profile_opened.clone();
+            let on_open_profile: CanvasOpenProfileFn = Rc::new(move |_, _, _| {
+                profile_opened.set(true);
+            });
+            let embed_opened = self.embed_opened.clone();
+            let on_open_embed: CanvasOpenEmbedFn = Rc::new(move |_, _, _, _, _| {
+                embed_opened.set(true);
+            });
+            let edited = self.edited.clone();
+            let on_edit: Option<CanvasEditFn> = self.editable.then(|| {
+                Rc::new(move |_: CanvasEditOp, _: &mut Window, _: &mut gpui::App| {
+                    edited.set(true);
+                }) as CanvasEditFn
+            });
+            let user_lookup: CanvasUserLookupFn = Rc::new(|uid: &str| {
+                (uid == "U01ALICE").then(|| CanvasUserProfile {
+                    user_id: "U01ALICE".into(),
+                    display_name: "Alice Rivera".into(),
+                    title: Some("Engineering Lead".into()),
+                    handle: Some("alice".into()),
+                })
+            });
+            let loaded = Ok(self.doc.clone());
+            live_canvas_view(
+                "F01RICH",
+                Some(&loaded),
+                "",
+                None,
+                CanvasActions {
+                    on_edit,
+                    on_open_media: Some(on_open_media),
+                    user_lookup: Some(user_lookup),
+                    on_open_profile: Some(on_open_profile),
+                    on_open_embed: Some(on_open_embed),
+                    ..Default::default()
+                },
+                cx,
+            )
+        }
+    }
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+    let html = r#"<html><body>
+        <h1 id="temp:C:h1">Launch Hub</h1>
+        <audio id="temp:C:a1" src="https://files.slack.com/sync.mp3" title="Launch Sync" data-duration="1:15"></audio>
+        <video id="temp:C:v1" src="https://files.slack.com/demo.mp4" title="Walkthrough" data-duration="2:40"></video>
+        <p id="temp:C:u1"><control><a href="https://acme.slack.com/team/U01ALICE">@U01ALICE</a></control></p>
+        <p id="temp:C:c1" class="embedded-link"><a href="https://acme.slack.com/docs/T01/F01SPEC">Design Doc</a></p>
+        <p id="temp:C:l1" class="embedded-link"><a href="https://acme.slack.com/lists/T01/F02TASKS">Launch Tasks</a></p>
+    </body></html>"#;
+    let doc = CanvasDoc::from_html("Launch Hub".into(), html);
+    assert_eq!(doc.blocks.len(), 6);
+
+    for editable in [true, false] {
+        let media_opened = Rc::new(Cell::new(false));
+        let profile_opened = Rc::new(Cell::new(false));
+        let embed_opened = Rc::new(Cell::new(false));
+        let edited = Rc::new(Cell::new(false));
+        let doc_c = doc.clone();
+        let (m, p, e, ed) = (
+            media_opened.clone(),
+            profile_opened.clone(),
+            embed_opened.clone(),
+            edited.clone(),
+        );
+        let (_root, cx) = cx.add_window_view(move |_, _| RichCanvasHost {
+            doc: doc_c,
+            editable,
+            media_opened: m,
+            profile_opened: p,
+            embed_opened: e,
+            edited: ed,
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert!(!media_opened.get());
+        assert!(!profile_opened.get());
+        assert!(!embed_opened.get());
+        assert!(!edited.get());
+    }
 }
