@@ -9691,13 +9691,13 @@ dependencies = [
 name = "slackless-core"
 version = "0.1.0"
 dependencies = [
+ "dirs 7.0.0",
  "futures",
  "serde",
  "serde_json",
  "slackless-api",
  "slackless-auth",
  "slackless-huddle",
- "slackless-platform",
  "slackless-rtm",
  "slackless-store",
  "slackless-types",

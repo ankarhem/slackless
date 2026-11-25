@@ -4,8 +4,10 @@
 //! thin and never diverge on Slack protocol rules, export formats, or update verification.
 
 pub mod canvas;
+pub mod canvas_doc;
 pub mod huddles;
 pub mod lists;
+pub mod mrkdwn;
 pub mod slash;
 pub mod updater;
 pub mod webvtt;

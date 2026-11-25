@@ -46,7 +46,7 @@ fn cache_key(url: &str) -> String {
 
 /// Platform cache directory for persistent public media assets (avatars, workspace icons, emoji).
 pub fn disk_cache_dir() -> Option<PathBuf> {
-    crate::platform::app_cache_dir().map(|dir| dir.join("media"))
+    crate::paths::app_cache_dir().map(|dir| dir.join("media"))
 }
 
 fn read_disk_cache(dir: &Path, url: &str) -> Option<Vec<u8>> {

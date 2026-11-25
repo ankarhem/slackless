@@ -524,9 +524,9 @@ impl<B: Backend> Core<B> {
                 ctx.events.emit(Event::Presence {
                     users: vec![me],
                     presence: if away {
-                        crate::Presence::Away
+                        crate::types::Presence::Away
                     } else {
-                        crate::Presence::Active
+                        crate::types::Presence::Active
                     },
                 });
             }

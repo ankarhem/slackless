@@ -30,8 +30,11 @@ pub(in crate::client) enum QueuedMutation {
 
 impl QueuedMutation {
     pub(in crate::client) fn from_command(command: &Command) -> Option<Self> {
-        match command {
-            Command::SendMessage {
+        let Command::Messaging(cmd) = command else {
+            return None;
+        };
+        match cmd {
+            MessagingCommand::SendMessage {
                 channel,
                 content,
                 thread_ts,
@@ -42,17 +45,17 @@ impl QueuedMutation {
                 thread_ts: thread_ts.clone(),
                 broadcast: *broadcast,
             }),
-            Command::AddReaction { channel, ts, name } => Some(Self::AddReaction {
+            MessagingCommand::AddReaction { channel, ts, name } => Some(Self::AddReaction {
                 channel: channel.clone(),
                 ts: ts.clone(),
                 name: name.clone(),
             }),
-            Command::RemoveReaction { channel, ts, name } => Some(Self::RemoveReaction {
+            MessagingCommand::RemoveReaction { channel, ts, name } => Some(Self::RemoveReaction {
                 channel: channel.clone(),
                 ts: ts.clone(),
                 name: name.clone(),
             }),
-            Command::MarkRead { channel, ts } => Some(Self::MarkRead {
+            MessagingCommand::MarkRead { channel, ts } => Some(Self::MarkRead {
                 channel: channel.clone(),
                 ts: ts.clone(),
             }),
