@@ -238,6 +238,13 @@ async fn run_reconnect_supervisor(
     }
 }
 
+struct VideoPushResult {
+    frame: Option<VideoFrame>,
+    decode_err: Option<String>,
+    needs_keyframe: bool,
+    seq_gaps_delta: u64,
+}
+
 enum RemoteVideoDecoder {
     Av1 {
         frames: Av1Frames,
@@ -270,16 +277,34 @@ impl RemoteVideoDecoder {
         }
     }
 
-    fn push(&mut self, pkt: &InboundVideoPacket) -> (Option<VideoFrame>, Option<String>) {
+    fn push(&mut self, pkt: &InboundVideoPacket) -> VideoPushResult {
         match self {
             Self::Av1 { frames, dec } => {
-                if let Some(unit) = frames.push(pkt.seq, pkt.marker, &pkt.payload) {
-                    (dec.decode_unit(&unit), None)
-                } else {
-                    (None, None)
+                let prev_gaps = frames.seq_gaps();
+                let frame = frames
+                    .push(pkt.seq, pkt.marker, &pkt.payload)
+                    .and_then(|unit| dec.decode_unit(&unit));
+                let seq_gaps_delta = frames.seq_gaps().saturating_sub(prev_gaps);
+                let needs_keyframe = frames.take_needs_keyframe();
+                VideoPushResult {
+                    frame,
+                    decode_err: None,
+                    needs_keyframe,
+                    seq_gaps_delta,
                 }
             }
-            Self::H264(dec) => (dec.push_rtp_payload(&pkt.payload, pkt.marker), None),
+            Self::H264(dec) => {
+                let prev_gaps = dec.seq_gaps();
+                let frame = dec.push_rtp_packet(pkt.seq, &pkt.payload, pkt.marker);
+                let seq_gaps_delta = dec.seq_gaps().saturating_sub(prev_gaps);
+                let needs_keyframe = dec.take_needs_keyframe();
+                VideoPushResult {
+                    frame,
+                    decode_err: None,
+                    needs_keyframe,
+                    seq_gaps_delta,
+                }
+            }
         }
     }
 }
@@ -1012,6 +1037,9 @@ async fn run_connected_loop(
                     rx_fps = format_args!("{}.{}", perf_snap.rx_fps_tenths / 10, perf_snap.rx_fps_tenths % 10),
                     rx_dec_ms = format_args!("{:.2}", perf_snap.rx_decode_us as f64 / 1000.0),
                     rx_kbps = perf_snap.rx_kbps,
+                    rx_seq_gaps = perf_snap.rx_seq_gaps,
+                    rx_loss_pct = format_args!("{:.1}", perf_snap.rx_loss_pct),
+                    degraded = perf_snap.is_degraded(),
                     "huddle perf"
                 );
                 if snap.perf != perf_snap {
@@ -1523,13 +1551,17 @@ fn run_single_track_decoder(
     keyframe_req_tx: mpsc::UnboundedSender<u32>,
 ) {
     let mut decoded_first = false;
+    let mut pending_keyframe_req = false;
     let mut last_keyframe_req = Instant::now();
     let mut last_decode_err_log: Option<Instant> = None;
 
     while let Ok(pkt) = rx.recv() {
         let t0 = Instant::now();
-        let (frame_opt, decode_err) = decoder.push(&pkt);
-        if let Some(err) = &decode_err
+        let res = decoder.push(&pkt);
+        if res.seq_gaps_delta > 0 {
+            perf.record_rx_seq_gap(res.seq_gaps_delta);
+        }
+        if let Some(err) = &res.decode_err
             && last_decode_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
         {
             last_decode_err_log = Some(Instant::now());
@@ -1541,12 +1573,17 @@ fn run_single_track_decoder(
                 "remote video decode error; requesting keyframe"
             );
         }
-        let needs_keyframe = decode_err.is_some() || (!decoded_first && pkt.marker);
-        if needs_keyframe && last_keyframe_req.elapsed() >= Duration::from_millis(1500) {
+        if res.needs_keyframe || res.decode_err.is_some() {
+            pending_keyframe_req = true;
+        }
+        if (pending_keyframe_req || (!decoded_first && pkt.marker))
+            && last_keyframe_req.elapsed() >= Duration::from_millis(1500)
+        {
+            pending_keyframe_req = false;
             last_keyframe_req = Instant::now();
             let _ = keyframe_req_tx.send(pkt.ssrc);
         }
-        if let Some(frame) = frame_opt {
+        if let Some(frame) = res.frame {
             let decode_us = t0.elapsed().as_micros() as u64;
             perf.record_rx_frame(frame.width, frame.height, decode_us);
             let tile = routing.lock().ok().and_then(|rt| {
@@ -2239,5 +2276,77 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_millis(1300));
         assert_eq!(snap.phase, HuddlePhase::Idle);
         assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn remote_video_decoder_h264_propagates_seq_gaps_and_keyframe_requests() {
+        let mut enc = crate::video::H264VideoEncoder::new_camera().unwrap();
+        let (w, h) = (96usize, 64usize);
+        let rgb = vec![120u8; w * h * 3];
+        let annex_b = enc.encode_rgb(&rgb, w, h).unwrap();
+
+        // Extract NALs and pack into a single STAP-A packet for deterministic test delivery.
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= annex_b.len() {
+            if annex_b[i] == 0 && annex_b[i + 1] == 0 {
+                if i + 4 <= annex_b.len() && annex_b[i + 2] == 0 && annex_b[i + 3] == 1 {
+                    starts.push((i, 4));
+                    i += 4;
+                    continue;
+                }
+                if annex_b[i + 2] == 1 {
+                    starts.push((i, 3));
+                    i += 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        let mut stap_a = vec![24u8];
+        for (idx, &(pos, sc)) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).map_or(annex_b.len(), |&(n, _)| n);
+            let nal = &annex_b[pos + sc..end];
+            if !nal.is_empty() {
+                stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+                stap_a.extend_from_slice(nal);
+            }
+        }
+
+        let mut dec = RemoteVideoDecoder::for_mime("video/H264").expect("H.264 decoder");
+        let perf = HuddlePerfCounters::default();
+        let make_pkt = |seq: u16, payload: Vec<u8>, marker: bool| InboundVideoPacket {
+            ssrc: 42,
+            mid: "2".into(),
+            track_id: "v0".into(),
+            mime_type: "video/H264".into(),
+            seq,
+            payload,
+            marker,
+        };
+
+        // Packet seq 10: clean STAP-A keyframe -> decodes, zero gaps, no keyframe request.
+        let p10 = make_pkt(10, stap_a.clone(), true);
+        perf.record_rx_packet(p10.payload.len() as u64);
+        let r1 = dec.push(&p10);
+        assert!(r1.frame.is_some());
+        assert_eq!(r1.seq_gaps_delta, 0);
+        assert!(!r1.needs_keyframe);
+
+        // Packet seq 15 (4 missing packets: 11..=14) with STAP-A -> reports 4 missing packets,
+        // flags needs_keyframe, and records accurately in perf.
+        let p15 = make_pkt(15, stap_a, true);
+        perf.record_rx_packet(p15.payload.len() as u64);
+        let r2 = dec.push(&p15);
+        assert!(r2.frame.is_some());
+        assert_eq!(r2.seq_gaps_delta, 4);
+        assert!(r2.needs_keyframe);
+        perf.record_rx_seq_gap(r2.seq_gaps_delta);
+
+        let snap = perf.sample(1.0, 10, 100);
+        assert_eq!(snap.rx_seq_gaps, 4);
+        // 2 rx packets + 4 missing packets -> 4/6 = 66.67% loss -> degraded!
+        assert!((snap.rx_loss_pct - 66.6667).abs() < 0.1);
+        assert!(snap.is_degraded());
     }
 }

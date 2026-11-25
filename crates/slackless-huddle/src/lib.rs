@@ -166,7 +166,7 @@ pub enum HuddlePhase {
 }
 
 /// Immutable snapshot of the active huddle session forwarded to UI / CLI subscribers.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct HuddleSessionSnapshot {
     pub phase: HuddlePhase,
     pub channel: ChannelId,

@@ -75,9 +75,21 @@ pub struct Av1Frames {
     partial: Vec<u8>,
     last_seq: Option<u16>,
     broken: bool,
+    seq_gaps: u64,
+    needs_keyframe: bool,
 }
 
 impl Av1Frames {
+    /// Total number of RTP 16-bit sequence gaps observed on this stream.
+    pub fn seq_gaps(&self) -> u64 {
+        self.seq_gaps
+    }
+
+    /// Returns `true` (and clears the flag) if a mid-frame sequence gap requires a PLI keyframe.
+    pub fn take_needs_keyframe(&mut self) -> bool {
+        std::mem::take(&mut self.needs_keyframe)
+    }
+
     /// Push one RTP packet payload; returns `Some(temporal_unit)` when `marker` closes a valid unit.
     pub fn push(&mut self, seq: u16, marker: bool, payload: &[u8]) -> Option<Vec<u8>> {
         let Some(&header) = payload.first() else {
@@ -87,10 +99,26 @@ impl Av1Frames {
         let z_continues_prev = header & 0b1000_0000 != 0;
         let n_new_cvs = header & 0b0000_1000 != 0;
 
-        let seq_gap = self
-            .last_seq
-            .is_some_and(|prev| seq.wrapping_sub(prev) != 1);
-        self.last_seq = Some(seq);
+        let missing_pkts = match self.last_seq {
+            None => {
+                self.last_seq = Some(seq);
+                0
+            }
+            Some(prev) => {
+                let diff = seq.wrapping_sub(prev) as i16;
+                if diff <= 0 {
+                    // Late/reordered or duplicate RTP packet; drop without inflating loss or
+                    // regressing `last_seq`.
+                    return None;
+                }
+                self.last_seq = Some(seq);
+                (diff - 1) as u64
+            }
+        };
+        let seq_gap = missing_pkts > 0;
+        if seq_gap {
+            self.seq_gaps = self.seq_gaps.saturating_add(missing_pkts);
+        }
 
         // An SFU routinely skips RTP sequence numbers between complete frames (e.g. dropped
         // non-reference frames, layer switches, or padding). Only treat a gap as breaking an
@@ -102,6 +130,7 @@ impl Av1Frames {
         } else if seq_gap {
             if !self.unit.is_empty() || !self.partial.is_empty() || z_continues_prev {
                 self.broken = true;
+                self.needs_keyframe = true;
             } else {
                 self.reset();
             }

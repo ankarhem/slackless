@@ -6,8 +6,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Inbound packet-loss percentage threshold at or above which the video stream is degraded.
+pub const DEGRADED_RX_LOSS_PCT: f32 = 5.0;
+/// Outbound encode latency threshold in microseconds (40 ms) indicating encoder backpressure.
+pub const DEGRADED_TX_ENCODE_US: u32 = 40_000;
+/// Inbound decode latency threshold in microseconds (40 ms) indicating decoder backpressure.
+pub const DEGRADED_RX_DECODE_US: u32 = 40_000;
+
 /// Windowed performance snapshot surfaced in `HuddleSessionSnapshot` and periodic `tracing` logs.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct HuddlePerfSnapshot {
     /// Process CPU usage in tenths of a percent (e.g., `34` == `3.4%`).
     pub cpu_tenths_pct: u32,
@@ -33,6 +40,20 @@ pub struct HuddlePerfSnapshot {
     pub rx_decode_us: u32,
     /// Inbound video bitrate in kbps.
     pub rx_kbps: u32,
+    /// Inbound RTP video sequence gaps observed during this sampling window.
+    pub rx_seq_gaps: u64,
+    /// Estimated inbound RTP video packet loss percentage (`0.0..=100.0`) during this window.
+    pub rx_loss_pct: f32,
+}
+
+impl HuddlePerfSnapshot {
+    /// Returns `true` when packet loss (`>= 5%`) or encode/decode latency (`>= 40 ms`) suggests
+    /// the media pipeline is degraded and may benefit from auto-degrade / quality reduction.
+    pub fn is_degraded(&self) -> bool {
+        self.rx_loss_pct >= DEGRADED_RX_LOSS_PCT
+            || self.tx_encode_us >= DEGRADED_TX_ENCODE_US
+            || self.rx_decode_us >= DEGRADED_RX_DECODE_US
+    }
 }
 
 /// Lock-free atomic counters updated by capture, encode, and decode threads.
@@ -48,6 +69,8 @@ pub struct HuddlePerfCounters {
     rx_backend: Mutex<Option<String>>,
     rx_width: AtomicU32,
     rx_height: AtomicU32,
+    rx_packets: AtomicU64,
+    rx_seq_gaps: AtomicU64,
     rx_frames: AtomicU64,
     rx_bytes: AtomicU64,
     rx_decode_us_sum: AtomicU64,
@@ -84,7 +107,12 @@ impl HuddlePerfCounters {
     }
 
     pub fn record_rx_packet(&self, payload_bytes: u64) {
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
         self.rx_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_rx_seq_gap(&self, n: u64) {
+        self.rx_seq_gaps.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn record_rx_frame(&self, width: u32, height: u32, decode_us: u64) {
@@ -106,6 +134,8 @@ impl HuddlePerfCounters {
         let tx_frames = self.tx_frames.swap(0, Ordering::Relaxed);
         let tx_bytes = self.tx_bytes.swap(0, Ordering::Relaxed);
         let tx_us = self.tx_encode_us_sum.swap(0, Ordering::Relaxed);
+        let rx_packets = self.rx_packets.swap(0, Ordering::Relaxed);
+        let rx_seq_gaps = self.rx_seq_gaps.swap(0, Ordering::Relaxed);
         let rx_frames = self.rx_frames.swap(0, Ordering::Relaxed);
         let rx_bytes = self.rx_bytes.swap(0, Ordering::Relaxed);
         let rx_us = self.rx_decode_us_sum.swap(0, Ordering::Relaxed);
@@ -114,6 +144,13 @@ impl HuddlePerfCounters {
         let th = self.tx_height.load(Ordering::Relaxed);
         let rw = self.rx_width.load(Ordering::Relaxed);
         let rh = self.rx_height.load(Ordering::Relaxed);
+
+        let expected_rx = rx_packets.saturating_add(rx_seq_gaps);
+        let rx_loss_pct = if expected_rx == 0 {
+            0.0
+        } else {
+            ((rx_seq_gaps as f64 / expected_rx as f64) * 100.0).clamp(0.0, 100.0) as f32
+        };
 
         HuddlePerfSnapshot {
             cpu_tenths_pct,
@@ -128,6 +165,8 @@ impl HuddlePerfCounters {
             rx_fps_tenths: ((rx_frames as f64 / dt) * 10.0).round() as u32,
             rx_decode_us: rx_us.checked_div(rx_frames).unwrap_or(0) as u32,
             rx_kbps: (((rx_bytes as f64 * 8.0) / dt) / 1000.0).round() as u32,
+            rx_seq_gaps,
+            rx_loss_pct,
         }
     }
 }
@@ -335,5 +374,72 @@ mod tests {
         assert!(s3.tx_resolution.is_none());
         assert_eq!(s3.rx_backend.as_deref(), Some("AV1 (rav1d SW)"));
         assert_eq!(s3.rx_resolution.as_deref(), Some("1920x1080"));
+    }
+
+    #[test]
+    fn perf_counters_seq_gaps_loss_pct_and_degraded_thresholds() {
+        let c = HuddlePerfCounters::default();
+
+        // 1. Zero packets and zero gaps -> 0.0% loss, not degraded.
+        let s_empty = c.sample(1.0, 10, 120);
+        assert_eq!(s_empty.rx_seq_gaps, 0);
+        assert_eq!(s_empty.rx_loss_pct, 0.0);
+        assert!(!s_empty.is_degraded());
+
+        // 2. Partial loss below 5% threshold: 96 rx packets + 4 gaps = 4.0% loss -> healthy.
+        for _ in 0..96 {
+            c.record_rx_packet(1000);
+        }
+        c.record_rx_seq_gap(4);
+        let s_low_loss = c.sample(1.0, 10, 120);
+        assert_eq!(s_low_loss.rx_seq_gaps, 4);
+        assert!((s_low_loss.rx_loss_pct - 4.0).abs() < 0.01);
+        assert!(!s_low_loss.is_degraded());
+
+        // 3. Partial loss at 5% threshold: 95 rx packets + 5 gaps = 5.0% loss -> degraded!
+        for _ in 0..95 {
+            c.record_rx_packet(1000);
+        }
+        c.record_rx_seq_gap(2);
+        c.record_rx_seq_gap(3);
+        let s_threshold = c.sample(1.0, 10, 120);
+        assert_eq!(s_threshold.rx_seq_gaps, 5);
+        assert!((s_threshold.rx_loss_pct - 5.0).abs() < 0.01);
+        assert!(s_threshold.is_degraded());
+
+        // 4. Saturation: gaps without any received packets -> 100.0% loss, finite & clamped.
+        c.record_rx_seq_gap(12);
+        let s_sat = c.sample(1.0, 10, 120);
+        assert_eq!(s_sat.rx_seq_gaps, 12);
+        assert_eq!(s_sat.rx_loss_pct, 100.0);
+        assert!(s_sat.rx_loss_pct.is_finite());
+        assert!(s_sat.is_degraded());
+
+        // 5. Window reset: next sample clears rx_seq_gaps and rx_loss_pct back to 0.
+        let s_reset = c.sample(1.0, 10, 120);
+        assert_eq!(s_reset.rx_seq_gaps, 0);
+        assert_eq!(s_reset.rx_loss_pct, 0.0);
+        assert!(!s_reset.is_degraded());
+
+        // 6. Latency degradation checks (tx_encode_us and rx_decode_us >= 40ms).
+        let snap_enc_slow = HuddlePerfSnapshot {
+            tx_encode_us: DEGRADED_TX_ENCODE_US,
+            ..Default::default()
+        };
+        assert!(snap_enc_slow.is_degraded());
+
+        let snap_dec_slow = HuddlePerfSnapshot {
+            rx_decode_us: DEGRADED_RX_DECODE_US,
+            ..Default::default()
+        };
+        assert!(snap_dec_slow.is_degraded());
+
+        let snap_fast = HuddlePerfSnapshot {
+            tx_encode_us: DEGRADED_TX_ENCODE_US - 1,
+            rx_decode_us: DEGRADED_RX_DECODE_US - 1,
+            rx_loss_pct: DEGRADED_RX_LOSS_PCT - 0.1,
+            ..Default::default()
+        };
+        assert!(!snap_fast.is_degraded());
     }
 }

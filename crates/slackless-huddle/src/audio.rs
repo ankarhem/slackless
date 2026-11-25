@@ -2374,4 +2374,94 @@ mod tests {
         assert!(pb2.lock().unwrap().primed);
         assert!(tap2.lock().unwrap().is_empty());
     }
+
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_audio_jitter_and_opus_pipeline() {
+        const FRAMES: usize = 500;
+        let mut enc = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).unwrap();
+        let _ = enc.set_bitrate(Bitrate::Bits(32_000));
+        let _ = enc.set_vbr(true);
+        let _ = enc.set_inband_fec(true);
+        let _ = enc.set_packet_loss_perc(5);
+
+        let mut dec = Decoder::new(SAMPLE_RATE, Channels::Mono).unwrap();
+        let mut jitter = AudioJitterBuffer::new();
+        let mut normalizer = LoudnessNormalizer::speech();
+
+        // Pre-generate 20ms speech-like multi-tone PCM frames so benchmark measures DSP + codec + jitter.
+        let pcm_frames: Vec<Vec<f32>> = (0..FRAMES)
+            .map(|f| {
+                (0..FRAME_20MS)
+                    .map(|i| {
+                        let t = (f * FRAME_20MS + i) as f32 / SAMPLE_RATE as f32;
+                        ((2.0 * std::f32::consts::PI * 260.0 * t).sin() * 0.18)
+                            + ((2.0 * std::f32::consts::PI * 520.0 * t).sin() * 0.08)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut enc_buf = vec![0u8; 4000];
+        let mut dec_buf = vec![0.0f32; FRAME_20MS * 2];
+        let mut decoded_frames = 0usize;
+        let mut fec_count = 0usize;
+        let mut plc_count = 0usize;
+        let mut pending_swap: Option<(u16, Bytes)> = None;
+
+        let t0 = Instant::now();
+        let mut sim_now = t0;
+
+        for (idx, pcm) in pcm_frames.iter().enumerate() {
+            let n = enc.encode_float(pcm, &mut enc_buf).unwrap();
+            let pkt = Bytes::copy_from_slice(&enc_buf[..n]);
+            let seq = idx as u16;
+            sim_now += Duration::from_millis(20);
+
+            // Simulate 2% single-packet drop (exercises in-band Opus FEC) and 2% adjacent reorder.
+            if idx > 2 && idx % 50 == 25 {
+                // Drop packet `seq`; next packet will trigger FEC recovery after 35ms.
+            } else if idx > 2 && idx % 50 == 10 && pending_swap.is_none() {
+                pending_swap = Some((seq, pkt));
+            } else {
+                jitter.push(seq, pkt, sim_now);
+                if let Some((delayed_seq, delayed_pkt)) = pending_swap.take() {
+                    jitter.push(delayed_seq, delayed_pkt, sim_now + Duration::from_millis(4));
+                }
+            }
+
+            let drain_now = sim_now + Duration::from_millis(40);
+            while let Some(step) = jitter.pop_ready(drain_now) {
+                let decoded_res = match step {
+                    JitterStep::Packet(bytes) => dec.decode_float(&bytes, &mut dec_buf, false),
+                    JitterStep::FecFromNext(next) => {
+                        fec_count += 1;
+                        dec.decode_float(&next, &mut dec_buf[..FRAME_20MS], true)
+                    }
+                    JitterStep::Plc => {
+                        plc_count += 1;
+                        decode_opus_or_plc(&mut dec, &[], &mut dec_buf)
+                    }
+                };
+                if let Ok(samples) = decoded_res {
+                    normalizer.process_frame(&mut dec_buf[..samples]);
+                    decoded_frames += 1;
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        let total_ms = elapsed.as_secs_f64() * 1000.0;
+        let fps = decoded_frames as f64 / elapsed.as_secs_f64().max(1e-9);
+        let ms_per_frame = total_ms / decoded_frames.max(1) as f64;
+        let realtime_x = (decoded_frames as f64 * 20.0) / total_ms.max(1e-6);
+        println!(
+            "bench_audio_jitter_and_opus_pipeline: {decoded_frames} frames (20ms @ 48kHz) in {total_ms:.2} ms | {fps:.1} frames/sec | {ms_per_frame:.3} ms/frame ({realtime_x:.1}x realtime, fec={fec_count}, plc={plc_count})"
+        );
+        assert!(
+            decoded_frames >= FRAMES - 5,
+            "expected near-complete decode with FEC, got {decoded_frames}/{FRAMES}"
+        );
+        assert!(fec_count > 0, "benchmark should exercise Opus FEC recovery");
+    }
 }

@@ -238,6 +238,10 @@ pub struct H264VideoDecoder {
     inner: Box<dyn VideoDecoderHandle>,
     depacketizer: H264Packet,
     annex_b_buf: Vec<u8>,
+    last_seq: Option<u16>,
+    broken: bool,
+    seq_gaps: u64,
+    needs_keyframe: bool,
 }
 
 impl H264VideoDecoder {
@@ -247,6 +251,10 @@ impl H264VideoDecoder {
             inner,
             depacketizer: H264Packet::default(),
             annex_b_buf: Vec::with_capacity(64 * 1024),
+            last_seq: None,
+            broken: false,
+            seq_gaps: 0,
+            needs_keyframe: false,
         })
     }
 
@@ -254,8 +262,75 @@ impl H264VideoDecoder {
         self.inner.backend_name()
     }
 
-    /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit).
-    pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<VideoFrame> {
+    /// Total number of RTP 16-bit sequence gaps observed on this stream.
+    pub fn seq_gaps(&self) -> u64 {
+        self.seq_gaps
+    }
+
+    /// Returns `true` (and clears the flag) if a sequence gap was detected and the caller should
+    /// request an immediate PLI keyframe from the sender.
+    pub fn take_needs_keyframe(&mut self) -> bool {
+        std::mem::take(&mut self.needs_keyframe)
+    }
+
+    /// Feed one RTP packet (`seq` = 16-bit RTP sequence number, `marker` = RTP marker bit
+    /// indicating end of access unit).
+    ///
+    /// Tracks 16-bit wrapping sequence continuity so mid-frame loss discards damaged partial
+    /// access units, ignores trailing fragments until `marker == true` completes the damaged unit,
+    /// flags `needs_keyframe`, and recovers cleanly on the next access unit.
+    pub fn push_rtp_packet(
+        &mut self,
+        seq: u16,
+        payload: &[u8],
+        marker: bool,
+    ) -> Option<VideoFrame> {
+        let is_fua_continuation =
+            payload.len() >= 2 && (payload[0] & 0x1F) == 28 && (payload[1] & 0x80) == 0;
+
+        let missing_pkts = match self.last_seq {
+            None => {
+                self.last_seq = Some(seq);
+                if is_fua_continuation {
+                    self.broken = !marker;
+                    return None;
+                }
+                0
+            }
+            Some(prev) => {
+                let diff = seq.wrapping_sub(prev) as i16;
+                if diff <= 0 {
+                    // Late/reordered or duplicate RTP packet; drop without inflating loss or
+                    // regressing `last_seq`.
+                    return None;
+                }
+                self.last_seq = Some(seq);
+                (diff - 1) as u64
+            }
+        };
+
+        if missing_pkts > 0 {
+            self.seq_gaps = self.seq_gaps.saturating_add(missing_pkts);
+            self.needs_keyframe = true;
+            self.depacketizer = H264Packet::default();
+            if !self.annex_b_buf.is_empty() {
+                self.annex_b_buf.clear();
+                self.broken = true;
+            } else if is_fua_continuation {
+                self.broken = !marker;
+                return None;
+            }
+        }
+
+        if self.broken {
+            if marker {
+                self.broken = false;
+                self.annex_b_buf.clear();
+                self.depacketizer = H264Packet::default();
+            }
+            return None;
+        }
+
         let raw = bytes::Bytes::copy_from_slice(payload);
         if let Ok(nal) = self.depacketizer.depacketize(&raw)
             && !nal.is_empty()
@@ -270,6 +345,13 @@ impl H264VideoDecoder {
         self.annex_b_buf = bitstream;
         self.annex_b_buf.clear();
         frame
+    }
+
+    /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit) using
+    /// monotonically synthesized sequence numbers for backwards compatibility.
+    pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<VideoFrame> {
+        let next_seq = self.last_seq.map_or(0, |prev| prev.wrapping_add(1));
+        self.push_rtp_packet(next_seq, payload, marker)
     }
 
     /// Decode a complete Annex-B H.264 access unit into a [`VideoFrame`].
@@ -1025,5 +1107,289 @@ mod tests {
         let mut short = vec![77u8; 16 * 16 * 3 - 1];
         apply_portrait_blur(&mut short, 16, 16);
         assert!(short.iter().all(|&b| b == 77));
+    }
+
+    fn build_stap_a(nals: &[&[u8]]) -> Vec<u8> {
+        let mut stap_a = vec![24u8];
+        for nal in nals {
+            stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            stap_a.extend_from_slice(nal);
+        }
+        stap_a
+    }
+
+    fn build_fua_packets(nal: &[u8], parts: usize) -> Vec<Vec<u8>> {
+        let nri = nal[0] & 0x60;
+        let nal_type = nal[0] & 0x1F;
+        let body = &nal[1..];
+        let mut out = Vec::with_capacity(parts);
+        for i in 0..parts {
+            let start = (body.len() * i) / parts;
+            let end = (body.len() * (i + 1)) / parts;
+            let chunk = &body[start..end];
+            let mut pkt = Vec::with_capacity(2 + chunk.len());
+            pkt.push(nri | 28);
+            let mut fu_hdr = nal_type;
+            if i == 0 {
+                fu_hdr |= 0x80; // Start bit
+            }
+            if i + 1 == parts {
+                fu_hdr |= 0x40; // End bit
+            }
+            pkt.push(fu_hdr);
+            pkt.extend_from_slice(chunk);
+            out.push(pkt);
+        }
+        out
+    }
+
+    #[test]
+    fn h264_decoder_push_rtp_packet_single_nal_stap_a_fua_and_seq_wraparound() {
+        let (w, h) = (96usize, 64usize);
+        let annex_b = encode_test_keyframe(w, h, 30, 150, 210);
+        let nals = split_annex_b_for_test(&annex_b);
+        assert!(nals.len() >= 3, "expected SPS, PPS, IDR NALs");
+
+        // 1. Single NAL sequence via push_rtp_packet.
+        let mut dec = H264VideoDecoder::new().unwrap();
+        let mut decoded = None;
+        for (i, nal) in nals.iter().enumerate() {
+            let marker = i + 1 == nals.len();
+            let out = dec.push_rtp_packet(100 + i as u16, nal, marker);
+            if marker {
+                decoded = out;
+            } else {
+                assert!(out.is_none());
+            }
+        }
+        let f1 = decoded.expect("Single NAL packets should decode cleanly");
+        assert_eq!((f1.width, f1.height), (w as u32, h as u32));
+        assert_eq!(dec.seq_gaps(), 0);
+        assert!(!dec.take_needs_keyframe());
+
+        // 2. STAP-A packet at next contiguous seq.
+        let stap_a = build_stap_a(&nals);
+        let next_seq = 100 + nals.len() as u16;
+        let f2 = dec
+            .push_rtp_packet(next_seq, &stap_a, true)
+            .expect("STAP-A packet should decode cleanly");
+        assert_eq!((f2.width, f2.height), (w as u32, h as u32));
+        assert_eq!(dec.seq_gaps(), 0);
+        assert!(!dec.take_needs_keyframe());
+
+        // 3. Multi-packet FU-A spanning 16-bit sequence wraparound (65534 -> 65535 -> 0 -> 1).
+        let mut dec_wrap = H264VideoDecoder::new().unwrap();
+        let prefix = &nals[..nals.len() - 1];
+        let idr = nals[nals.len() - 1];
+        let fua_pkts = build_fua_packets(idr, 3);
+        let mut seq: u16 = 65535u16.wrapping_sub(prefix.len() as u16);
+        for nal in prefix {
+            assert!(dec_wrap.push_rtp_packet(seq, nal, false).is_none());
+            seq = seq.wrapping_add(1);
+        }
+        // seq is now 65535; FU-A chunks traverse 65535 -> 0 -> 1 with zero gaps!
+        assert_eq!(seq, 65535);
+        assert!(dec_wrap.push_rtp_packet(seq, &fua_pkts[0], false).is_none());
+        seq = seq.wrapping_add(1);
+        assert_eq!(seq, 0);
+        assert!(dec_wrap.push_rtp_packet(seq, &fua_pkts[1], false).is_none());
+        seq = seq.wrapping_add(1);
+        assert_eq!(seq, 1);
+        let wrapped_frame = dec_wrap
+            .push_rtp_packet(seq, &fua_pkts[2], true)
+            .expect("FU-A crossing 65535 -> 0 wraparound must decode without gap");
+        assert_eq!(
+            (wrapped_frame.width, wrapped_frame.height),
+            (w as u32, h as u32)
+        );
+        assert_eq!(dec_wrap.seq_gaps(), 0);
+        assert!(!dec_wrap.take_needs_keyframe());
+    }
+
+    #[test]
+    fn h264_decoder_mid_frame_seq_gap_discards_partial_fua_and_recovers_cleanly() {
+        let (w, h) = (96usize, 64usize);
+        let annex_b = encode_test_keyframe(w, h, 200, 80, 50);
+        let nals = split_annex_b_for_test(&annex_b);
+        let prefix = &nals[..nals.len() - 1];
+        let idr = nals[nals.len() - 1];
+        let fua4 = build_fua_packets(idr, 4);
+        let stap_a = build_stap_a(&nals);
+
+        // Prime decoder with one clean frame at seq 10.
+        let mut dec = H264VideoDecoder::new().unwrap();
+        assert!(dec.push_rtp_packet(10, &stap_a, true).is_some());
+        assert_eq!(dec.seq_gaps(), 0);
+        assert!(!dec.take_needs_keyframe());
+
+        // Start a fragmented frame: prefix NALs + FU-A chunk 0, then DROP chunk 1!
+        let mut seq = 11u16;
+        for nal in prefix {
+            assert!(dec.push_rtp_packet(seq, nal, false).is_none());
+            seq = seq.wrapping_add(1);
+        }
+        assert!(dec.push_rtp_packet(seq, &fua4[0], false).is_none());
+        // Skip chunk 1 (`seq + 1`), deliver chunk 2 (`seq + 2`, marker=false) and chunk 3 (`seq + 3`, marker=true).
+        let seq_after_drop = seq.wrapping_add(2);
+        assert!(
+            dec.push_rtp_packet(seq_after_drop, &fua4[2], false)
+                .is_none()
+        );
+        assert_eq!(dec.seq_gaps(), 1);
+        assert!(dec.take_needs_keyframe(), "gap must flag needs_keyframe");
+        assert!(
+            !dec.take_needs_keyframe(),
+            "take_needs_keyframe must clear flag after reading"
+        );
+        // Trailing end fragment of damaged AU must also be discarded, clearing `broken` on marker=true.
+        assert!(
+            dec.push_rtp_packet(seq_after_drop.wrapping_add(1), &fua4[3], true)
+                .is_none()
+        );
+        assert_eq!(dec.seq_gaps(), 1);
+
+        // Next clean frame recovers immediately!
+        let recovered = dec
+            .push_rtp_packet(seq_after_drop.wrapping_add(2), &stap_a, true)
+            .expect("decoder must recover cleanly after damaged AU ends");
+        assert_eq!((recovered.width, recovered.height), (w as u32, h as u32));
+        assert!(!dec.take_needs_keyframe());
+    }
+
+    #[test]
+    fn h264_decoder_gap_on_empty_buf_fua_continuation_drops_damaged_au_and_recovers() {
+        let (w, h) = (96usize, 64usize);
+        let annex_b = encode_test_keyframe(w, h, 60, 220, 90);
+        let nals = split_annex_b_for_test(&annex_b);
+        let idr = nals[nals.len() - 1];
+        let fua3 = build_fua_packets(idr, 3);
+        let stap_a = build_stap_a(&nals);
+
+        let mut dec = H264VideoDecoder::new().unwrap();
+        // Clean frame at seq 50 leaves `annex_b_buf` empty.
+        assert!(dec.push_rtp_packet(50, &stap_a, true).is_some());
+        assert_eq!(dec.seq_gaps(), 0);
+
+        // Case A: Gap lands on mid-FU-A continuation (S=0, marker=false) -> drops it and sets broken=true.
+        // Packet 51 (FU-A S=1) was lost; packet 52 (FU-A S=0, marker=false) arrives.
+        assert!(dec.push_rtp_packet(52, &fua3[1], false).is_none());
+        assert_eq!(dec.seq_gaps(), 1);
+        assert!(dec.take_needs_keyframe());
+        // Packet 53 (FU-A S=0, E=1, marker=true) closes the damaged AU and clears broken.
+        assert!(dec.push_rtp_packet(53, &fua3[2], true).is_none());
+        assert_eq!(dec.seq_gaps(), 1);
+        assert!(!dec.take_needs_keyframe());
+        // Packet 54 clean STAP-A decodes cleanly.
+        assert!(dec.push_rtp_packet(54, &stap_a, true).is_some());
+
+        // Case B: Gap lands on final FU-A continuation (S=0, E=1, marker=true) -> drops it, broken=false immediately.
+        assert!(dec.push_rtp_packet(56, &fua3[2], true).is_none());
+        assert_eq!(dec.seq_gaps(), 2);
+        assert!(dec.take_needs_keyframe());
+        // Immediately next packet 57 decodes cleanly.
+        let f = dec
+            .push_rtp_packet(57, &stap_a, true)
+            .expect("broken must already be cleared when S=0 continuation had marker=true");
+        assert_eq!((f.width, f.height), (w as u32, h as u32));
+
+        // Case C: Inter-frame burst gap (57 -> 62 skips 4 packets: 58..=61) landing on a clean
+        // STAP-A keyframe: accumulates all 4 missing packets + needs_keyframe, yet decodes cleanly.
+        let f_clean = dec
+            .push_rtp_packet(62, &stap_a, true)
+            .expect("clean new keyframe after inter-frame gap should decode");
+        assert_eq!((f_clean.width, f_clean.height), (w as u32, h as u32));
+        assert_eq!(dec.seq_gaps(), 6);
+        assert!(dec.take_needs_keyframe());
+
+        // Case D: Late/reordered packet (seq 60 < 62) is dropped without inflating loss or
+        // regressing `last_seq`, so contiguous packet 63 still decodes with zero extra gaps.
+        assert!(dec.push_rtp_packet(60, &stap_a, true).is_none());
+        assert_eq!(dec.seq_gaps(), 6);
+        assert!(!dec.take_needs_keyframe());
+        assert!(dec.push_rtp_packet(63, &stap_a, true).is_some());
+        assert_eq!(dec.seq_gaps(), 6);
+        assert!(!dec.take_needs_keyframe());
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+    fn bench_video_scale_and_h264_encode() {
+        use std::time::Instant;
+
+        const FRAMES: usize = 30;
+        let (src_w, src_h) = (1280u32, 720u32);
+        let (max_w, max_h) = (640u32, 360u32);
+
+        let mut rgba = vec![0u8; (src_w * src_h * 4) as usize];
+        for y in 0..src_h as usize {
+            for x in 0..src_w as usize {
+                let off = (y * src_w as usize + x) * 4;
+                rgba[off] = ((x * 255) / src_w as usize) as u8;
+                rgba[off + 1] = ((y * 255) / src_h as usize) as u8;
+                rgba[off + 2] = ((x ^ y) & 0xff) as u8;
+                rgba[off + 3] = 255;
+            }
+        }
+
+        let mut scratch = ScreenScaleScratch::default();
+        let mut enc = H264VideoEncoder::new_camera().unwrap();
+
+        // Warm up scratch allocation & OpenH264 internal buffers.
+        let (dst_w, dst_h) =
+            downscale_rgba_area_to_bgra_and_i420(&rgba, src_w, src_h, max_w, max_h, &mut scratch);
+        let _ = enc
+            .encode_i420(
+                &scratch.y,
+                &scratch.u,
+                &scratch.v,
+                dst_w as usize,
+                dst_h as usize,
+            )
+            .unwrap();
+
+        let mut scale_ns = 0u128;
+        let mut enc_ns = 0u128;
+        let mut total_bytes = 0usize;
+        let t_all = Instant::now();
+
+        for i in 0..FRAMES {
+            // Mutate a small stripe per frame so temporal compression behaves realistically.
+            let stripe_row = (i * 17) % src_h as usize;
+            let row_start = stripe_row * src_w as usize * 4;
+            for b in &mut rgba[row_start..row_start + 256] {
+                *b = b.wrapping_add(29);
+            }
+
+            let t0 = Instant::now();
+            let (dw, dh) = downscale_rgba_area_to_bgra_and_i420(
+                &rgba,
+                src_w,
+                src_h,
+                max_w,
+                max_h,
+                &mut scratch,
+            );
+            scale_ns += t0.elapsed().as_nanos();
+
+            let t1 = Instant::now();
+            let bs = enc
+                .encode_i420(&scratch.y, &scratch.u, &scratch.v, dw as usize, dh as usize)
+                .unwrap();
+            enc_ns += t1.elapsed().as_nanos();
+            total_bytes += bs.len();
+        }
+
+        let total_secs = t_all.elapsed().as_secs_f64().max(1e-9);
+        let total_ms = total_secs * 1000.0;
+        let fps = FRAMES as f64 / total_secs;
+        let ms_per_frame = total_ms / FRAMES as f64;
+        let scale_ms = (scale_ns as f64 / 1_000_000.0) / FRAMES as f64;
+        let encode_ms = (enc_ns as f64 / 1_000_000.0) / FRAMES as f64;
+        let avg_bytes = total_bytes / FRAMES;
+        println!(
+            "bench_video_scale_and_h264_encode: {FRAMES} frames ({src_w}x{src_h} -> {dst_w}x{dst_h}) in {total_ms:.2} ms | {fps:.1} frames/sec | {ms_per_frame:.2} ms/frame (scale {scale_ms:.2} ms, encode {encode_ms:.2} ms, avg {avg_bytes} B/frame)"
+        );
+        assert_eq!((dst_w, dst_h), (640, 360));
+        assert!(total_bytes > 0);
     }
 }
