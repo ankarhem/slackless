@@ -1,10 +1,12 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use opus::Decoder;
 
 use super::FRAME_20MS;
+use super::ring::SpscRing;
 
 /// Target playback jitter-buffer pre-fill before releasing audio after startup or underrun
 /// (60 ms = 3 × 20 ms Opus frames). Eliminates 512-sample CoreAudio vs 960-sample Opus beat
@@ -14,68 +16,108 @@ pub(super) const PLAYBACK_PRIME_SAMPLES: usize = FRAME_20MS * 3;
 pub(super) const PLAYBACK_MAX_SAMPLES: usize = FRAME_20MS * 12;
 /// Target sample depth after an overflow trim (80 ms).
 pub(super) const PLAYBACK_TRIM_TARGET: usize = FRAME_20MS * 4;
+/// Underlying SPSC ring capacity (power of two > `PLAYBACK_MAX_SAMPLES` to absorb bursty pushes
+/// before consumer-side trimming runs).
+const PLAYBACK_RING_CAPACITY: usize = 32_768;
+/// Crossfade length at overflow trim splice boundaries to eliminate audible clicks.
+const SPLICE_FADE_SAMPLES: usize = 32;
 
-/// Smooth, glitch-free playback ring buffer shared between the dedicated inbound Opus decoder
+/// Lock-free, glitch-free playback ring buffer shared between the dedicated inbound Opus decoder
 /// thread (`push`) and the real-time CoreAudio / `cpal` render callback (`pull_into`).
+///
+/// Neither side ever locks a mutex or allocates on the heap.
 pub(crate) struct PlaybackBuffer {
-    pub(super) samples: VecDeque<f32>,
-    pub(super) primed: bool,
-    last_sample: f32,
+    ring: SpscRing<f32>,
+    primed: AtomicBool,
+    last_sample_bits: AtomicU32,
+    splice_from_bits: AtomicU32,
+    splice_pos: AtomicUsize,
 }
 
 impl PlaybackBuffer {
     pub(crate) fn new() -> Self {
         Self {
-            samples: VecDeque::with_capacity(PLAYBACK_MAX_SAMPLES),
-            primed: false,
-            last_sample: 0.0,
+            ring: SpscRing::new(PLAYBACK_RING_CAPACITY),
+            primed: AtomicBool::new(false),
+            last_sample_bits: AtomicU32::new(0.0f32.to_bits()),
+            splice_from_bits: AtomicU32::new(0.0f32.to_bits()),
+            splice_pos: AtomicUsize::new(SPLICE_FADE_SAMPLES),
         }
     }
 
-    pub(crate) fn push(&mut self, pcm: &[f32]) {
-        if self.samples.len() + pcm.len() > PLAYBACK_MAX_SAMPLES {
-            let keep = PLAYBACK_TRIM_TARGET.min(self.samples.len());
-            let drop_n = self.samples.len().saturating_sub(keep);
-            if drop_n > 0 {
-                let prev_end = self.samples.front().copied().unwrap_or(self.last_sample);
-                self.samples.drain(..drop_n);
-                // Short 32-sample crossfade at the splice boundary avoids an audible pop.
-                let fade = 32.min(self.samples.len());
-                for i in 0..fade {
-                    let t = (i + 1) as f32 / (fade + 1) as f32;
-                    if let Some(s) = self.samples.get_mut(i) {
-                        *s = prev_end * (1.0 - t) + *s * t;
-                    }
-                }
-            }
-        }
-        self.samples.extend(pcm.iter().copied());
-        if !self.primed && self.samples.len() >= PLAYBACK_PRIME_SAMPLES {
-            self.primed = true;
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.ring.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_primed(&self) -> bool {
+        self.primed.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn last_sample(&self) -> f32 {
+        f32::from_bits(self.last_sample_bits.load(Ordering::Relaxed))
+    }
+
+    /// Producer (inbound Opus decoder thread): append decoded PCM samples without blocking.
+    pub(crate) fn push(&self, pcm: &[f32]) {
+        self.ring.push_slice(pcm);
+        if !self.primed.load(Ordering::Acquire) && self.ring.len() >= PLAYBACK_PRIME_SAMPLES {
+            self.primed.store(true, Ordering::Release);
         }
     }
 
-    pub(crate) fn pull_into(&mut self, out: &mut [f32]) {
-        if !self.primed {
+    /// Consumer (real-time audio render callback): pull PCM samples into `out` without locks or
+    /// allocations, performing consumer-side overflow trimming with a 32-sample crossfade splice
+    /// and smooth fade-to-silence on underrun.
+    pub(crate) fn pull_into(&self, out: &mut [f32]) {
+        if !self.primed.load(Ordering::Acquire) {
             self.fade_to_silence(out);
             return;
         }
-        let avail = self.samples.len().min(out.len());
-        for dst in out.iter_mut().take(avail) {
-            let s = self.samples.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
-            *dst = s;
-            self.last_sample = s;
+        let cur_len = self.ring.len();
+        if cur_len > PLAYBACK_MAX_SAMPLES {
+            let keep = PLAYBACK_TRIM_TARGET.min(cur_len);
+            let drop_n = cur_len.saturating_sub(keep);
+            if drop_n > 0 {
+                let prev_end = self.ring.peek_front().unwrap_or_else(|| self.last_sample());
+                self.ring.skip(drop_n);
+                self.splice_from_bits
+                    .store(prev_end.to_bits(), Ordering::Relaxed);
+                self.splice_pos.store(0, Ordering::Relaxed);
+            }
         }
+
+        let avail = self.ring.pop_slice(out);
+        let mut last = self.last_sample();
+        let mut splice_pos = self.splice_pos.load(Ordering::Relaxed);
+        let splice_from = f32::from_bits(self.splice_from_bits.load(Ordering::Relaxed));
+        for dst in out.iter_mut().take(avail) {
+            let mut s = *dst;
+            if splice_pos < SPLICE_FADE_SAMPLES {
+                let t = (splice_pos + 1) as f32 / (SPLICE_FADE_SAMPLES + 1) as f32;
+                s = splice_from * (1.0 - t) + s * t;
+                splice_pos += 1;
+            }
+            s = s.clamp(-1.0, 1.0);
+            *dst = s;
+            last = s;
+        }
+        self.splice_pos.store(splice_pos, Ordering::Relaxed);
+        self.last_sample_bits
+            .store(last.to_bits(), Ordering::Relaxed);
+
         if avail < out.len() {
             // Genuine network underrun: ramp smoothly to zero and re-prime before resuming so
             // playback never sputters 1 frame at a time.
-            self.primed = false;
+            self.primed.store(false, Ordering::Release);
             self.fade_to_silence(&mut out[avail..]);
         }
     }
 
-    fn fade_to_silence(&mut self, out: &mut [f32]) {
-        let mut s = self.last_sample;
+    fn fade_to_silence(&self, out: &mut [f32]) {
+        let mut s = self.last_sample();
         for dst in out.iter_mut() {
             s *= 0.85;
             if s.abs() < 1e-5 {
@@ -83,7 +125,7 @@ impl PlaybackBuffer {
             }
             *dst = s;
         }
-        self.last_sample = s;
+        self.last_sample_bits.store(s.to_bits(), Ordering::Relaxed);
     }
 }
 

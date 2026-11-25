@@ -1,14 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::connected::SessionRuntime;
-use super::signaling_handlers::content_share_source_type;
+use super::connected::{SessionRuntime, announce_screen_share_capabilities};
 use super::supervisor::LoopExit;
-use crate::audio::{AmbientMusicPlayer, AudioEngine};
+use crate::audio::AudioEngine;
 use crate::content_share::ContentShareSession;
 use crate::peer_message::{
-    SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_content_share_details_message,
-    build_draw_message, build_jukebox_message, build_mute_request_message, build_reacji_message,
+    SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message, build_draw_message,
+    build_jukebox_message, build_mute_request_message, build_reacji_message,
     build_sticky_emoji_awareness,
 };
 use crate::rtc::ChimeRtcPeer;
@@ -54,19 +53,53 @@ pub(super) async fn handle_control(
                 .send(HuddleUpdate::State(Box::new(snap.clone())));
         }
         Some(HuddleControl::SetAudioDevices { input, output }) => {
+            let prev_input = config.input_device.clone();
+            let prev_output = config.output_device.clone();
             config.input_device = input.clone();
             config.output_device = output.clone();
             snap.input_device = input;
             snap.output_device = output;
-            if let Some(rx) = state.audio_engine.stop()
-                && let Ok(restarted) = AudioEngine::start(
+            let inbound_rx = state
+                .audio_engine
+                .stop()
+                .or_else(|| state.parked_inbound_opus_rx.take());
+            if let Some(rx) = inbound_rx {
+                match AudioEngine::start_recoverable(
                     config,
                     state.shared.clone(),
                     state.outbound_opus_tx.clone(),
                     rx,
-                )
-            {
-                state.audio_engine = restarted;
+                ) {
+                    Ok(restarted) => {
+                        state.audio_engine = restarted;
+                        snap.error = None;
+                    }
+                    Err((err, recovered_rx)) => {
+                        tracing::error!(%err, "failed to switch huddle audio devices; reverting");
+                        snap.error = Some(err.to_string());
+                        config.input_device = prev_input.clone();
+                        config.output_device = prev_output.clone();
+                        snap.input_device = prev_input;
+                        snap.output_device = prev_output;
+                        match AudioEngine::start_recoverable(
+                            config,
+                            state.shared.clone(),
+                            state.outbound_opus_tx.clone(),
+                            recovered_rx,
+                        ) {
+                            Ok(reverted) => {
+                                state.audio_engine = reverted;
+                            }
+                            Err((revert_err, parked_rx)) => {
+                                tracing::error!(
+                                    %revert_err,
+                                    "failed to revert huddle audio devices; preserving rx for retry"
+                                );
+                                state.parked_inbound_opus_rx = Some(parked_rx);
+                            }
+                        }
+                    }
+                }
             }
             let _ = state
                 .updates
@@ -175,28 +208,12 @@ pub(super) async fn handle_control(
                         if let Some(cap) = &state.camera_capture {
                             cap.set_compact(true);
                         }
-                        // Announce desktop draw capability + content source details on
-                        // official `"data-channel"` (`desktop:screen` / `desktop:window`
-                        // is required by Official Slack to enable remote drawing!).
-                        let cap_bytes = build_capabilities_message(&state.creds.attendee_id, true);
-                        let _ = signal
-                            .send_frame(&build_data_message_frame(
-                                SLACK_DATA_CHANNEL_TOPIC,
-                                cap_bytes,
-                                300_000,
-                            ))
-                            .await;
-                        let det_bytes = build_content_share_details_message(
+                        announce_screen_share_capabilities(
                             &state.creds.attendee_id,
-                            content_share_source_type(&src_id),
-                        );
-                        let _ = signal
-                            .send_frame(&build_data_message_frame(
-                                SLACK_DATA_CHANNEL_TOPIC,
-                                det_bytes,
-                                300_000,
-                            ))
-                            .await;
+                            signal,
+                            &src_id,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         tracing::error!(
@@ -308,14 +325,7 @@ pub(super) async fn handle_control(
                 }));
         }
         Some(HuddleControl::SetJukebox(song_key)) => {
-            if let Some(mut prev) = state.music_player.take() {
-                prev.stop();
-            }
-            if song_key.is_some() {
-                state.music_player =
-                    AmbientMusicPlayer::start(config.output_device.clone(), song_key.as_deref())
-                        .ok();
-            }
+            state.set_jukebox_player(config.output_device.clone(), song_key.as_deref());
             snap.jukebox_song = song_key.clone();
             let bytes = build_jukebox_message(&state.creds.attendee_id, song_key.as_deref());
             let frame = build_data_message_frame(SLACK_DATA_CHANNEL_TOPIC, bytes, 15_000);

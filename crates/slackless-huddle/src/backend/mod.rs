@@ -15,11 +15,13 @@
 mod macos;
 pub(crate) mod portable;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use crate::Result;
+use crate::audio::ring::SpscRing;
 use crate::metrics::HuddlePerfCounters;
 use crate::video::{CameraDeviceInfo, VideoFrame};
 
@@ -78,6 +80,26 @@ pub struct CameraConfig {
     pub blur_background: bool,
 }
 
+/// Configuration for starting a lightweight preview-only camera capture (Preferences / clips).
+#[derive(Debug, Clone)]
+pub struct CameraPreviewConfig {
+    pub device_index: Option<usize>,
+    pub max_w: u32,
+    pub max_h: u32,
+    pub max_fps: u32,
+    pub blur_background: bool,
+}
+
+/// Configuration for starting an OS-native hardware full-duplex audio stream.
+#[derive(Debug, Clone, Copy)]
+pub struct HwAudioDuplexConfig<'a> {
+    pub sample_rate: u32,
+    pub input_device: Option<&'a str>,
+    pub output_device: Option<&'a str>,
+    pub enable_aec_ns: bool,
+    pub enable_agc: bool,
+}
+
 /// Active screen/window share capture & encode session.
 pub trait ScreenShareHandle: Send {
     fn force_keyframe(&self);
@@ -95,6 +117,12 @@ pub trait CameraHandle: Send {
     fn stop(&mut self);
 }
 
+/// Active preview-only camera capture handle (no H.264 encoder).
+pub trait CameraPreviewHandle: Send {
+    fn set_blur(&self, enabled: bool);
+    fn stop(&mut self);
+}
+
 /// Active single-stream video decoder (H.264 Annex-B access unit or AV1 temporal unit).
 pub trait VideoDecoderHandle: Send {
     fn backend_name(&self) -> &'static str;
@@ -103,6 +131,14 @@ pub trait VideoDecoderHandle: Send {
 
 /// Active OS audio device hot-plug monitor; dropping stops listening.
 pub trait AudioDeviceMonitorHandle: Send {}
+
+/// Active OS-native system audio tap streaming stereo `i16` PCM; dropping stops the tap.
+pub trait SystemAudioTapHandle: Send {}
+
+/// Active OS-native routed looping audio file player.
+pub trait AudioLoopHandle: Send {
+    fn stop(&mut self);
+}
 
 /// Active OS-native full-duplex 48 kHz mono audio stream with built-in hardware AEC/NS/AGC
 /// (e.g. macOS CoreAudio `VoiceProcessingIO`; future Windows WASAPI Voice Capture / Linux PipeWire).
@@ -123,6 +159,19 @@ pub trait MediaBackend: Send + Sync {
 
     /// Dynamically probed hardware capabilities of this machine.
     fn capabilities(&self) -> MediaCapabilities;
+
+    /// Returns `true` if OS screen recording permission is granted.
+    fn has_screen_capture_permission(&self) -> bool {
+        true
+    }
+
+    /// Prompts for OS screen recording permission where applicable.
+    fn request_screen_capture_permission(&self) -> bool {
+        true
+    }
+
+    /// Opens OS Screen Recording privacy settings where applicable.
+    fn open_screen_capture_settings(&self) {}
 
     /// Enumerate local camera devices in stable index order matching [`Self::start_camera`].
     fn list_cameras(&self) -> Vec<CameraDeviceInfo>;
@@ -152,6 +201,13 @@ pub trait MediaBackend: Send + Sync {
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
     ) -> Result<Box<dyn CameraHandle>>;
 
+    /// Start preview-only camera capture (for Preferences preview and video clip recording).
+    fn start_camera_preview(
+        &self,
+        config: CameraPreviewConfig,
+        on_frame: Arc<dyn Fn(VideoFrame) + Send + Sync>,
+    ) -> Result<Box<dyn CameraPreviewHandle>>;
+
     /// Create an H.264 Annex-B decoder (HW with lazy SW fallback).
     fn create_h264_decoder(&self) -> Result<Box<dyn VideoDecoderHandle>>;
 
@@ -165,16 +221,55 @@ pub trait MediaBackend: Send + Sync {
         on_change: Arc<dyn Fn(AudioDeviceChangeKind) + Send + Sync>,
     ) -> Option<Box<dyn AudioDeviceMonitorHandle>>;
 
+    /// Human-readable label for a zero-driver OS-native system audio tap, if available.
+    fn native_system_audio_label(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Start an OS-native system audio tap pushing stereo `i16` PCM into `ring`.
+    /// Returns `None` when unsupported so callers can fall back to virtual loopback devices.
+    fn start_system_audio_tap(
+        &self,
+        _ring: Arc<SpscRing<i16>>,
+    ) -> Option<Result<Box<dyn SystemAudioTapHandle>>> {
+        None
+    }
+
+    /// Measure perceptually weighted RMS loudness of an audio file via native OS decoder.
+    fn measure_audio_file_rms(&self, _path: &Path) -> Option<f32> {
+        None
+    }
+
+    /// Play a one-shot audio file routed to `device_name` via native OS audio engine.
+    fn play_routed_audio_oneshot(
+        &self,
+        _path: &Path,
+        _device_name: Option<&str>,
+        _volume: f32,
+    ) -> bool {
+        false
+    }
+
+    /// Start a looping audio file routed to `device_name` via native OS audio engine.
+    fn start_routed_audio_loop(
+        &self,
+        _path: &Path,
+        _device_name: Option<&str>,
+        _volume: f32,
+    ) -> Option<Box<dyn AudioLoopHandle>> {
+        None
+    }
+
+    /// Whether this backend supports native routed audio file playback (MP3 chimes / lounge music).
+    fn supports_routed_audio_files(&self) -> bool {
+        false
+    }
+
     /// Start an OS-native full-duplex 48 kHz mono audio stream with built-in hardware AEC/NS/AGC.
     /// Returns `None` when the caller should use the portable `cpal + sonora` pipeline instead.
-    #[allow(clippy::too_many_arguments)]
     fn start_hw_audio_duplex(
         &self,
-        _sample_rate: u32,
-        _input_device: Option<&str>,
-        _output_device: Option<&str>,
-        _enable_aec_ns: bool,
-        _enable_agc: bool,
+        _config: HwAudioDuplexConfig<'_>,
         _on_capture: AudioCaptureCallback,
         _on_render: AudioRenderCallback,
     ) -> Option<Result<Box<dyn HwAudioDuplexHandle>>> {

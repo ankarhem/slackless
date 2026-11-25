@@ -1,6 +1,5 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -9,8 +8,9 @@ use tokio::sync::mpsc;
 
 use super::devices::{current_default_input_name, current_default_output_name};
 use super::dsp::{LoudnessNormalizer, build_sonora, compute_rms_mono};
+use super::ring::SpscRing;
 use super::streams::{
-    AudioIoBackend, CaptureSignal, open_hw_duplex, open_input_stream, open_output_stream,
+    AudioIoBackend, CaptureRing, open_hw_duplex, open_input_stream, open_output_stream,
 };
 use super::{
     AudioJitterBuffer, FRAME_10MS, FRAME_20MS, JitterStep, PlaybackBuffer, SAMPLE_RATE,
@@ -67,8 +67,7 @@ impl AudioSharedState {
 /// on macOS CoreAudio (where `cpal::Stream` is `!Send`).
 pub struct AudioEngine {
     shared: AudioSharedState,
-    capture_signal: CaptureSignal,
-    rx_wake: Arc<AtomicBool>,
+    capture_ring: Arc<CaptureRing>,
     worker: Option<std::thread::JoinHandle<()>>,
     rx_worker: Option<std::thread::JoinHandle<mpsc::UnboundedReceiver<InboundAudioPacket>>>,
 }
@@ -78,20 +77,27 @@ impl AudioEngine {
         cfg: &HuddleAudioConfig,
         shared: AudioSharedState,
         outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
-        mut inbound_opus_rx: mpsc::UnboundedReceiver<InboundAudioPacket>,
+        inbound_opus_rx: mpsc::UnboundedReceiver<InboundAudioPacket>,
     ) -> Result<Self> {
-        shared.running.store(true, Ordering::Relaxed);
-        let capture_signal: CaptureSignal = Arc::new((
-            Mutex::new(VecDeque::with_capacity(FRAME_20MS * 8)),
-            Condvar::new(),
-        ));
-        let playback_buf: Arc<Mutex<PlaybackBuffer>> = Arc::new(Mutex::new(PlaybackBuffer::new()));
-        // Optional render tap used only when software `cpal + sonora` fallback is active
+        Self::start_recoverable(cfg, shared, outbound_opus_tx, inbound_opus_rx)
+            .map_err(|(err, _)| err)
+    }
+
+    /// Start the audio engine, returning `inbound_opus_rx` intact alongside the error if opening
+    /// the audio device fails so live device hot-swaps never permanently kill session audio.
+    pub(crate) fn start_recoverable(
+        cfg: &HuddleAudioConfig,
+        shared: AudioSharedState,
+        outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
+        inbound_opus_rx: mpsc::UnboundedReceiver<InboundAudioPacket>,
+    ) -> std::result::Result<Self, (HuddleError, mpsc::UnboundedReceiver<InboundAudioPacket>)> {
+        shared.running.store(true, Ordering::Release);
+        let capture_ring = Arc::new(CaptureRing::new());
+        let playback_buf = Arc::new(PlaybackBuffer::new());
+        // Optional lock-free render tap used only when software `cpal + sonora` fallback is active
         // (macOS CoreAudio `VoiceProcessingIO` taps its own render bus in hardware).
-        let aec_render_tap: Arc<Mutex<VecDeque<f32>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(FRAME_20MS * 6)));
+        let aec_render_tap = Arc::new(SpscRing::<f32>::new(FRAME_20MS * 8));
         let needs_sw_aec_ref = Arc::new(AtomicBool::new(false));
-        let rx_wake = Arc::new(AtomicBool::new(true));
 
         let in_name = cfg.input_device.clone();
         let out_name = cfg.output_device.clone();
@@ -102,13 +108,14 @@ impl AudioEngine {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
 
         let worker_shared = shared.clone();
-        let worker_capture = Arc::clone(&capture_signal);
+        let worker_capture = Arc::clone(&capture_ring);
         let worker_playback = Arc::clone(&playback_buf);
         let worker_aec_tap = Arc::clone(&aec_render_tap);
         let worker_needs_aec = Arc::clone(&needs_sw_aec_ref);
-        let worker = std::thread::Builder::new()
+        let worker = match std::thread::Builder::new()
             .name("slackless-huddle-audio".to_owned())
             .spawn(move || {
+                worker_capture.register_worker();
                 let io_backend: Result<AudioIoBackend> = if let Some(hw) = open_hw_duplex(
                     in_name.as_deref(),
                     out_name.as_deref(),
@@ -138,59 +145,88 @@ impl AudioEngine {
                 match io_backend {
                     Ok(io) => {
                         let _ = ready_tx.send(Ok(()));
-                        run_audio_dsp_loop(
-                            worker_shared,
-                            worker_capture,
-                            worker_playback,
-                            worker_aec_tap,
+                        run_audio_dsp_loop(AudioDspLoopArgs {
+                            shared: worker_shared,
+                            capture_ring: worker_capture,
+                            playback_buf: worker_playback,
+                            aec_render_tap: worker_aec_tap,
                             outbound_opus_tx,
-                            in_name,
-                            out_name,
+                            configured_in: in_name,
+                            configured_out: out_name,
                             io,
-                        );
+                        });
                     }
                     Err(err) => {
                         let _ = ready_tx.send(Err(err));
                     }
                 }
-            })
-            .map_err(|e| HuddleError::Audio(e.to_string()))?;
+            }) {
+            Ok(h) => h,
+            Err(e) => return Err((HuddleError::Audio(e.to_string()), inbound_opus_rx)),
+        };
 
         if let Err(err) = ready_rx
             .recv()
             .map_err(|e| HuddleError::Audio(e.to_string()))
             .and_then(|r| r)
         {
-            shared.running.store(false, Ordering::Relaxed);
-            capture_signal.1.notify_all();
+            shared.running.store(false, Ordering::Release);
+            capture_ring.wake_now();
             let _ = worker.join();
-            return Err(err);
+            return Err((err, inbound_opus_rx));
         }
 
         // Dedicated inbound Opus jitter-buffer + decoder thread: completely decoupled from the
         // microphone capture loop so remote speech is decoded within microseconds of UDP arrival!
+        // Hand `inbound_opus_rx` across a 1-slot channel only after the thread spawns so a spawn
+        // failure still returns `inbound_opus_rx` intact.
+        let (rx_handoff_tx, rx_handoff_rx) =
+            std::sync::mpsc::sync_channel::<mpsc::UnboundedReceiver<InboundAudioPacket>>(1);
         let rx_shared = shared.clone();
         let rx_playback = Arc::clone(&playback_buf);
         let rx_aec_tap = Arc::clone(&aec_render_tap);
         let rx_needs_aec = Arc::clone(&needs_sw_aec_ref);
-        let rx_worker = std::thread::Builder::new()
+        let rx_worker = match std::thread::Builder::new()
             .name("slackless-huddle-audio-rx".to_owned())
             .spawn(move || {
+                let mut rx = match rx_handoff_rx.recv() {
+                    Ok(rx) => rx,
+                    Err(_) => {
+                        let (_tx, dummy_rx) = mpsc::unbounded_channel();
+                        return dummy_rx;
+                    }
+                };
                 run_inbound_audio_rx_loop(
                     rx_shared,
-                    &mut inbound_opus_rx,
+                    &mut rx,
                     rx_playback,
                     rx_aec_tap,
                     rx_needs_aec,
                 );
-                inbound_opus_rx
-            })
-            .map_err(|e| HuddleError::Audio(e.to_string()))?;
+                rx
+            }) {
+            Ok(h) => h,
+            Err(e) => {
+                shared.running.store(false, Ordering::Release);
+                capture_ring.wake_now();
+                let _ = worker.join();
+                return Err((HuddleError::Audio(e.to_string()), inbound_opus_rx));
+            }
+        };
+        if let Err(std::sync::mpsc::SendError(rx_back)) = rx_handoff_tx.send(inbound_opus_rx) {
+            shared.running.store(false, Ordering::Release);
+            capture_ring.wake_now();
+            let _ = worker.join();
+            let _ = rx_worker.join();
+            return Err((
+                HuddleError::Audio("audio rx worker exited before handoff".to_owned()),
+                rx_back,
+            ));
+        }
 
         Ok(Self {
             shared,
-            capture_signal,
-            rx_wake,
+            capture_ring,
             worker: Some(worker),
             rx_worker: Some(rx_worker),
         })
@@ -199,9 +235,8 @@ impl AudioEngine {
     /// Stop streams & DSP threads, returning the inbound Opus receiver so a hot-swapped device
     /// restart keeps receiving remote audio seamlessly.
     pub fn stop(&mut self) -> Option<mpsc::UnboundedReceiver<InboundAudioPacket>> {
-        self.shared.running.store(false, Ordering::Relaxed);
-        self.rx_wake.store(false, Ordering::Relaxed);
-        self.capture_signal.1.notify_all();
+        self.shared.running.store(false, Ordering::Release);
+        self.capture_ring.wake_now();
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
@@ -218,8 +253,8 @@ impl Drop for AudioEngine {
 pub(super) fn run_inbound_audio_rx_loop(
     shared: AudioSharedState,
     inbound_opus_rx: &mut mpsc::UnboundedReceiver<InboundAudioPacket>,
-    playback_buf: Arc<Mutex<PlaybackBuffer>>,
-    aec_render_tap: Arc<Mutex<VecDeque<f32>>>,
+    playback_buf: Arc<PlaybackBuffer>,
+    aec_render_tap: Arc<SpscRing<f32>>,
     needs_sw_aec_ref: Arc<AtomicBool>,
 ) {
     let Ok(mut decoder) = Decoder::new(SAMPLE_RATE, Channels::Mono) else {
@@ -229,7 +264,7 @@ pub(super) fn run_inbound_audio_rx_loop(
     let mut normalizer = LoudnessNormalizer::speech();
     let mut decoded_pcm = vec![0.0f32; FRAME_20MS * 2];
 
-    while shared.running.load(Ordering::Relaxed) {
+    while shared.running.load(Ordering::Acquire) {
         let mut received_any = false;
         while let Ok(pkt) = inbound_opus_rx.try_recv() {
             jitter.push(pkt.seq, pkt.payload, Instant::now());
@@ -251,9 +286,7 @@ pub(super) fn run_inbound_audio_rx_loop(
                 // Generalized per-stream speech loudness normalization: lifts quiet mics and tames
                 // hot mics to a consistent conversational level without boosting silence.
                 normalizer.process_frame(pcm);
-                if let Ok(mut pb) = playback_buf.lock() {
-                    pb.push(pcm);
-                }
+                playback_buf.push(pcm);
                 if let Ok(guard) = shared.transcribe_tap.lock()
                     && let Some(tap) = guard.as_ref()
                 {
@@ -268,13 +301,8 @@ pub(super) fn run_inbound_audio_rx_loop(
                 if needs_sw_aec_ref.load(Ordering::Relaxed)
                     && !shared.muted.load(Ordering::Relaxed)
                     && shared.aec.load(Ordering::Relaxed)
-                    && let Ok(mut tap) = aec_render_tap.lock()
                 {
-                    if tap.len() > FRAME_20MS * 6 {
-                        let drop_n = tap.len() - FRAME_20MS * 3;
-                        tap.drain(..drop_n);
-                    }
-                    tap.extend(pcm.iter().copied());
+                    aec_render_tap.push_slice(pcm);
                 }
                 decoded_any = true;
             }
@@ -288,17 +316,29 @@ pub(super) fn run_inbound_audio_rx_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_audio_dsp_loop(
+struct AudioDspLoopArgs {
     shared: AudioSharedState,
-    capture_signal: CaptureSignal,
-    playback_buf: Arc<Mutex<PlaybackBuffer>>,
-    aec_render_tap: Arc<Mutex<VecDeque<f32>>>,
+    capture_ring: Arc<CaptureRing>,
+    playback_buf: Arc<PlaybackBuffer>,
+    aec_render_tap: Arc<SpscRing<f32>>,
     outbound_opus_tx: mpsc::UnboundedSender<Bytes>,
     configured_in: Option<String>,
     configured_out: Option<String>,
-    mut io: AudioIoBackend,
-) {
+    io: AudioIoBackend,
+}
+
+fn run_audio_dsp_loop(args: AudioDspLoopArgs) {
+    let AudioDspLoopArgs {
+        shared,
+        capture_ring,
+        playback_buf,
+        aec_render_tap,
+        outbound_opus_tx,
+        configured_in,
+        configured_out,
+        mut io,
+    } = args;
+
     let Ok(mut encoder) = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip) else {
         return;
     };
@@ -323,7 +363,7 @@ fn run_audio_dsp_loop(
         .encode_float(&silence_pcm, &mut opus_out)
         .map(|n| Bytes::copy_from_slice(&opus_out[..n]))
         .unwrap_or_else(|_| Bytes::from_static(&[0xF8, 0xFF, 0xFE]));
-    let mut mic_frame = Vec::with_capacity(FRAME_20MS);
+    let mut mic_frame = [0.0f32; FRAME_20MS];
     let mut processed_capture = Vec::with_capacity(FRAME_20MS);
     let mut mic_normalizer = LoudnessNormalizer::speech();
     let mut aec_ref_chunk = [0.0f32; FRAME_10MS];
@@ -335,13 +375,13 @@ fn run_audio_dsp_loop(
     let device_monitor = {
         let in_d = Arc::clone(&in_dirty);
         let out_d = Arc::clone(&out_dirty);
-        let wake = Arc::clone(&capture_signal);
+        let wake = Arc::clone(&capture_ring);
         platform_backend().start_audio_device_monitor(Arc::new(move |kind| {
             match kind {
                 AudioDeviceChangeKind::Input => in_d.store(true, Ordering::Release),
                 AudioDeviceChangeKind::Output => out_d.store(true, Ordering::Release),
             }
-            wake.1.notify_one();
+            wake.wake_now();
         }))
     };
     let use_polling_hotplug = device_monitor.is_none();
@@ -356,16 +396,16 @@ fn run_audio_dsp_loop(
     } else {
         None
     };
-    let mut last_device_check = std::time::Instant::now();
+    let mut last_device_check = Instant::now();
 
-    while shared.running.load(Ordering::Relaxed) {
+    while shared.running.load(Ordering::Acquire) {
         let check_in = in_dirty.swap(false, Ordering::AcqRel);
         let check_out = out_dirty.swap(false, Ordering::AcqRel);
         let poll_due =
             use_polling_hotplug && last_device_check.elapsed() >= Duration::from_millis(1500);
         if check_in || check_out || poll_due {
             if poll_due {
-                last_device_check = std::time::Instant::now();
+                last_device_check = Instant::now();
             }
             match &mut io {
                 AudioIoBackend::Hardware(_) => {
@@ -382,7 +422,7 @@ fn run_audio_dsp_loop(
                             !cur_muted && cur_aec,
                             !cur_muted && cur_ns,
                             !cur_muted && cur_agc,
-                            &capture_signal,
+                            &capture_ring,
                             &playback_buf,
                         ) {
                             io = AudioIoBackend::Hardware(next_hw);
@@ -399,7 +439,7 @@ fn run_audio_dsp_loop(
                         if now_in.is_some()
                             && now_in != last_default_in
                             && let Ok(next_stream) =
-                                open_input_stream(None, Arc::clone(&capture_signal))
+                                open_input_stream(None, Arc::clone(&capture_ring))
                         {
                             *in_stream = next_stream;
                             last_default_in = now_in;
@@ -447,40 +487,28 @@ fn run_audio_dsp_loop(
         // decoding runs on the dedicated `slackless-huddle-audio-rx` thread without mic-loop lag.)
         if let AudioIoBackend::Cpal { apm, .. } = &mut io {
             if !cur_muted && cur_aec {
-                if let Ok(mut tap) = aec_render_tap.lock() {
-                    while tap.len() >= FRAME_10MS {
-                        for dst in &mut aec_ref_chunk {
-                            *dst = tap.pop_front().unwrap_or(0.0);
-                        }
-                        let mut out_ref = [0.0f32; FRAME_10MS];
-                        let _ =
-                            apm.process_render_f32(&[&aec_ref_chunk[..]], &mut [&mut out_ref[..]]);
-                    }
+                let tap_len = aec_render_tap.len();
+                if tap_len > FRAME_20MS * 6 {
+                    aec_render_tap.skip(tap_len - FRAME_20MS * 3);
                 }
-            } else if let Ok(mut tap) = aec_render_tap.lock() {
-                tap.clear();
+                while aec_render_tap.len() >= FRAME_10MS {
+                    if aec_render_tap.pop_slice(&mut aec_ref_chunk) < FRAME_10MS {
+                        break;
+                    }
+                    let mut out_ref = [0.0f32; FRAME_10MS];
+                    let _ = apm.process_render_f32(&[&aec_ref_chunk[..]], &mut [&mut out_ref[..]]);
+                }
+            } else {
+                aec_render_tap.clear_consumer();
             }
         }
 
         // 2. Drain captured 20ms mic chunks -> (HW already processed or Sonora) -> Opus -> RTC TX.
-        mic_frame.clear();
-        {
-            let (lock, cvar) = &*capture_signal;
-            if let Ok(mut ring) = lock.lock() {
-                if ring.len() < FRAME_20MS && shared.running.load(Ordering::Relaxed) {
-                    if let Ok((guard, _)) = cvar.wait_timeout(ring, Duration::from_millis(18)) {
-                        ring = guard;
-                    } else {
-                        continue;
-                    }
-                }
-                if ring.len() >= FRAME_20MS {
-                    mic_frame.extend(ring.drain(..FRAME_20MS));
-                }
-            }
-        }
-
-        if mic_frame.len() == FRAME_20MS {
+        if capture_ring.wait_and_pop_frame(
+            &mut mic_frame,
+            &shared.running,
+            Duration::from_millis(18),
+        ) {
             let muted = shared.muted.load(Ordering::Relaxed);
             if muted {
                 shared

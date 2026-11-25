@@ -9,9 +9,11 @@ pub mod backend;
 pub mod clips;
 pub mod content_share;
 #[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "macos")]
 pub mod macos_audio_tap;
 #[cfg(target_os = "macos")]
-pub mod macos_media;
+pub use macos as macos_media;
 pub mod metrics;
 pub mod peer_message;
 pub mod rtc;
@@ -66,32 +68,17 @@ pub use video::{
 
 /// Returns `true` if OS screen recording permission is granted (always `true` on non-macOS).
 pub fn has_screen_capture_permission() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        macos_media::has_screen_capture_permission()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
-    }
+    platform_backend().has_screen_capture_permission()
 }
 
 /// Prompts for OS screen recording permission on macOS (registers the app in System Settings).
 pub fn request_screen_capture_permission() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        macos_media::request_screen_capture_permission()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
-    }
+    platform_backend().request_screen_capture_permission()
 }
 
 /// Opens OS Screen Recording privacy settings on macOS (no-op on other platforms).
 pub fn open_screen_capture_settings() {
-    #[cfg(target_os = "macos")]
-    macos_media::open_screen_capture_settings();
+    platform_backend().open_screen_capture_settings();
 }
 
 /// Errors returned by the native huddle engine.

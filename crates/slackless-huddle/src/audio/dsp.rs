@@ -127,13 +127,14 @@ pub(super) fn downmix_to_mono_f32_into(data: &[f32], channels: usize, out: &mut 
     }
 }
 
+#[cfg(test)]
 pub(super) fn downmix_to_mono_f32(data: &[f32], channels: usize) -> Vec<f32> {
     let mut out = Vec::new();
     downmix_to_mono_f32_into(data, channels, &mut out);
     out
 }
 
-pub(super) fn resample_linear_into(
+pub(crate) fn resample_linear_into(
     input: &[f32],
     src_rate: u32,
     dst_rate: u32,
@@ -172,10 +173,30 @@ pub fn compute_rms_mono(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f32).sqrt().clamp(0.0, 1.0)
 }
 
-pub(super) fn compute_rms_interleaved(samples: &[f32], channels: usize) -> f32 {
-    if samples.is_empty() {
+/// Zero-allocation interleaved RMS computation safe for real-time audio callbacks.
+pub(super) fn compute_rms_interleaved_map<T: Copy>(
+    samples: &[T],
+    channels: usize,
+    to_f32: impl Fn(T) -> f32,
+) -> f32 {
+    let ch = channels.max(1);
+    if samples.len() < ch {
         return 0.0;
     }
-    let mono = downmix_to_mono_f32(samples, channels);
-    compute_rms_mono(&mono)
+    let inv_ch = 1.0 / ch as f32;
+    let mut sum_sq = 0.0f32;
+    let mut frames = 0usize;
+    for frame in samples.chunks_exact(ch) {
+        let mut mono = 0.0f32;
+        for &s in frame {
+            mono += to_f32(s);
+        }
+        mono *= inv_ch;
+        sum_sq += mono * mono;
+        frames += 1;
+    }
+    if frames == 0 {
+        return 0.0;
+    }
+    (sum_sq / frames as f32).sqrt().clamp(0.0, 1.0)
 }

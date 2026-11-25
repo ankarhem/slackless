@@ -2,18 +2,8 @@
 //! Linux/Windows), software portrait background blur, Cisco OpenH264 encode/decode (`openh264`),
 //! and RTP H.264 depacketization for Chime SFU.
 
-#[cfg(not(target_os = "macos"))]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_os = "macos"))]
-use std::time::Duration;
 
-#[cfg(not(target_os = "macos"))]
-use nokhwa::Camera;
-#[cfg(not(target_os = "macos"))]
-use nokhwa::pixel_format::RgbFormat;
-#[cfg(not(target_os = "macos"))]
-use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 use openh264::OpenH264API;
 use openh264::encoder::{
     BitRate, Complexity, Encoder as H264Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
@@ -25,7 +15,10 @@ use rtc::rtp::packetizer::Depacketizer as _;
 use slackless_types::UserId;
 use tokio::sync::mpsc;
 
-use crate::backend::{CameraConfig, CameraHandle, VideoDecoderHandle, platform_backend};
+use crate::backend::{
+    CameraConfig, CameraHandle, CameraPreviewConfig, CameraPreviewHandle, VideoDecoderHandle,
+    platform_backend,
+};
 use crate::{HuddleError, Result};
 
 /// Maximum dimensions for webcam capture (720p, even numbers required for YUV420).
@@ -279,15 +272,104 @@ impl H264VideoEncoder {
     }
 }
 
+/// Result of advancing a 16-bit wrapping RTP sequence tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtpSeqStep {
+    First,
+    Contiguous,
+    Gap(u64),
+    LateOrDuplicate,
+}
+
+/// Shared 16-bit wrapping RTP sequence-gap tracker used by both H.264 and AV1 depacketizers.
+#[derive(Default)]
+pub(crate) struct RtpSeqTracker {
+    last_seq: Option<u16>,
+    seq_gaps: u64,
+}
+
+impl RtpSeqTracker {
+    pub(crate) fn advance(&mut self, seq: u16) -> RtpSeqStep {
+        match self.last_seq {
+            None => {
+                self.last_seq = Some(seq);
+                RtpSeqStep::First
+            }
+            Some(prev) => {
+                let diff = seq.wrapping_sub(prev) as i16;
+                if diff <= 0 {
+                    return RtpSeqStep::LateOrDuplicate;
+                }
+                self.last_seq = Some(seq);
+                let missing = (diff - 1) as u64;
+                if missing == 0 {
+                    RtpSeqStep::Contiguous
+                } else {
+                    self.seq_gaps = self.seq_gaps.saturating_add(missing);
+                    RtpSeqStep::Gap(missing)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_last_seq(&mut self, seq: u16) {
+        self.last_seq = Some(seq);
+    }
+
+    pub(crate) fn next_synthetic_seq(&self) -> u16 {
+        self.last_seq.map_or(0, |prev| prev.wrapping_add(1))
+    }
+
+    pub(crate) fn seq_gaps(&self) -> u64 {
+        self.seq_gaps
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_seq(&self) -> Option<u16> {
+        self.last_seq
+    }
+}
+
+/// Split an Annex-B H.264 byte stream (3-byte `00 00 01` or 4-byte `00 00 00 01` start codes)
+/// into individual non-empty NAL unit slices.
+pub(crate) fn split_annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                starts.push((i, 4));
+                i += 4;
+                continue;
+            }
+            if data[i + 2] == 1 {
+                starts.push((i, 3));
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let mut nals = Vec::with_capacity(starts.len());
+    for idx in 0..starts.len() {
+        let (pos, sc_len) = starts[idx];
+        let end = starts.get(idx + 1).map_or(data.len(), |&(next, _)| next);
+        let nal = &data[pos + sc_len..end];
+        if !nal.is_empty() {
+            nals.push(nal);
+        }
+    }
+    nals
+}
+
 /// Depacketize RTP H.264 payloads (Single NAL, STAP-A, FU-A) and decode via the active platform
 /// [`crate::backend::MediaBackend`] (hardware VideoToolbox zero-copy on macOS with lazy OpenH264 fallback).
 pub struct H264VideoDecoder {
     inner: Box<dyn VideoDecoderHandle>,
     depacketizer: H264Packet,
     annex_b_buf: Vec<u8>,
-    last_seq: Option<u16>,
+    seq_tracker: RtpSeqTracker,
     broken: bool,
-    seq_gaps: u64,
     needs_keyframe: bool,
 }
 
@@ -298,9 +380,8 @@ impl H264VideoDecoder {
             inner,
             depacketizer: H264Packet::default(),
             annex_b_buf: Vec::with_capacity(64 * 1024),
-            last_seq: None,
+            seq_tracker: RtpSeqTracker::default(),
             broken: false,
-            seq_gaps: 0,
             needs_keyframe: false,
         })
     }
@@ -311,7 +392,7 @@ impl H264VideoDecoder {
 
     /// Total number of RTP 16-bit sequence gaps observed on this stream.
     pub fn seq_gaps(&self) -> u64 {
-        self.seq_gaps
+        self.seq_tracker.seq_gaps()
     }
 
     /// Returns `true` (and clears the flag) if a sequence gap was detected and the caller should
@@ -322,10 +403,6 @@ impl H264VideoDecoder {
 
     /// Feed one RTP packet (`seq` = 16-bit RTP sequence number, `marker` = RTP marker bit
     /// indicating end of access unit).
-    ///
-    /// Tracks 16-bit wrapping sequence continuity so mid-frame loss discards damaged partial
-    /// access units, ignores trailing fragments until `marker == true` completes the damaged unit,
-    /// flags `needs_keyframe`, and recovers cleanly on the next access unit.
     pub fn push_rtp_packet(
         &mut self,
         seq: u16,
@@ -335,37 +412,25 @@ impl H264VideoDecoder {
         let is_fua_continuation =
             payload.len() >= 2 && (payload[0] & 0x1F) == 28 && (payload[1] & 0x80) == 0;
 
-        let missing_pkts = match self.last_seq {
-            None => {
-                self.last_seq = Some(seq);
+        match self.seq_tracker.advance(seq) {
+            RtpSeqStep::First => {
                 if is_fua_continuation {
                     self.broken = !marker;
                     return None;
                 }
-                0
             }
-            Some(prev) => {
-                let diff = seq.wrapping_sub(prev) as i16;
-                if diff <= 0 {
-                    // Late/reordered or duplicate RTP packet; drop without inflating loss or
-                    // regressing `last_seq`.
+            RtpSeqStep::Contiguous => {}
+            RtpSeqStep::LateOrDuplicate => return None,
+            RtpSeqStep::Gap(_) => {
+                self.needs_keyframe = true;
+                self.depacketizer = H264Packet::default();
+                if !self.annex_b_buf.is_empty() {
+                    self.annex_b_buf.clear();
+                    self.broken = true;
+                } else if is_fua_continuation {
+                    self.broken = !marker;
                     return None;
                 }
-                self.last_seq = Some(seq);
-                (diff - 1) as u64
-            }
-        };
-
-        if missing_pkts > 0 {
-            self.seq_gaps = self.seq_gaps.saturating_add(missing_pkts);
-            self.needs_keyframe = true;
-            self.depacketizer = H264Packet::default();
-            if !self.annex_b_buf.is_empty() {
-                self.annex_b_buf.clear();
-                self.broken = true;
-            } else if is_fua_continuation {
-                self.broken = !marker;
-                return None;
             }
         }
 
@@ -397,13 +462,103 @@ impl H264VideoDecoder {
     /// Feed one RTP payload (`marker` = RTP marker bit indicating end of access unit) using
     /// monotonically synthesized sequence numbers for backwards compatibility.
     pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<VideoFrame> {
-        let next_seq = self.last_seq.map_or(0, |prev| prev.wrapping_add(1));
+        let next_seq = self.seq_tracker.next_synthetic_seq();
         self.push_rtp_packet(next_seq, payload, marker)
     }
 
     /// Decode a complete Annex-B H.264 access unit into a [`VideoFrame`].
     pub fn decode_annex_b(&mut self, bitstream: &[u8]) -> Option<VideoFrame> {
         self.inner.decode_unit(bitstream)
+    }
+}
+
+/// Compute aspect-preserving target dimensions fitting `(src_w, src_h)` within `(max_w, max_h)`.
+/// When `even` is `true`, clamps output width and height down to even numbers (`>= 2`) for YUV420.
+pub(crate) fn compute_fit_dimensions(
+    src_w: u32,
+    src_h: u32,
+    max_w: u32,
+    max_h: u32,
+    even: bool,
+) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_w == 0 || max_h == 0 {
+        return (0, 0);
+    }
+    let scale = (max_w as f64 / src_w as f64)
+        .min(max_h as f64 / src_h as f64)
+        .min(1.0);
+    if even {
+        let dw = (((src_w as f64 * scale) as u32) & !1).max(2);
+        let dh = (((src_h as f64 * scale) as u32) & !1).max(2);
+        (dw, dh)
+    } else {
+        let dw = ((src_w as f64 * scale).round() as u32).max(2);
+        let dh = ((src_h as f64 * scale).round() as u32).max(2);
+        (dw, dh)
+    }
+}
+
+/// Shared integer box/area-averaged downscaler for 3-byte RGB or 4-byte RGBA source buffers.
+///
+/// When `max_samples_per_axis > 0`, strides within very large source boxes so thumbnails stay fast
+/// while small/medium downscales average every pixel cleanly.
+pub(crate) fn box_downscale_rgb<const SRC_STRIDE: usize, F>(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    max_samples_per_axis: usize,
+    mut emit: F,
+) where
+    F: FnMut(usize, usize, u8, u8, u8),
+{
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || src.len() < sw * sh * SRC_STRIDE {
+        return;
+    }
+    let mut x_bounds = Vec::with_capacity(dw);
+    for x in 0..dw {
+        let sx0 = (x * sw) / dw;
+        let sx1 = (((x + 1) * sw) / dw).max(sx0 + 1).min(sw);
+        x_bounds.push((sx0, sx1));
+    }
+
+    for y in 0..dh {
+        let sy0 = (y * sh) / dh;
+        let sy1 = (((y + 1) * sh) / dh).max(sy0 + 1).min(sh);
+        let step_y = (sy1 - sy0)
+            .checked_div(max_samples_per_axis)
+            .unwrap_or(1)
+            .max(1);
+        for (x, &(sx0, sx1)) in x_bounds.iter().enumerate() {
+            let step_x = (sx1 - sx0)
+                .checked_div(max_samples_per_axis)
+                .unwrap_or(1)
+                .max(1);
+            let (mut r_sum, mut g_sum, mut b_sum, mut cnt) = (0u32, 0u32, 0u32, 0u32);
+            let mut sy = sy0;
+            while sy < sy1 {
+                let row_off = sy * sw;
+                let mut sx = sx0;
+                while sx < sx1 {
+                    let off = (row_off + sx) * SRC_STRIDE;
+                    r_sum += src[off] as u32;
+                    g_sum += src[off + 1] as u32;
+                    b_sum += src[off + 2] as u32;
+                    cnt += 1;
+                    sx += step_x;
+                }
+                sy += step_y;
+            }
+            let c = cnt.max(1);
+            emit(
+                x,
+                y,
+                (r_sum / c) as u8,
+                (g_sum / c) as u8,
+                (b_sum / c) as u8,
+            );
+        }
     }
 }
 
@@ -416,53 +571,71 @@ pub fn resize_rgb_even(
     max_w: u32,
     max_h: u32,
 ) -> (Vec<u8>, u32, u32) {
-    if src_w == 0 || src_h == 0 {
+    let (dst_w, dst_h) = compute_fit_dimensions(src_w, src_h, max_w, max_h, true);
+    if dst_w == 0 || dst_h == 0 {
         return (Vec::new(), 0, 0);
     }
-    let scale = (max_w as f32 / src_w as f32)
-        .min(max_h as f32 / src_h as f32)
-        .min(1.0);
-    let dst_w = (((src_w as f32 * scale) as u32) & !1).max(2);
-    let dst_h = (((src_h as f32 * scale) as u32) & !1).max(2);
     if dst_w == src_w && dst_h == src_h {
         return (rgb.to_vec(), src_w, src_h);
     }
-    let sw = src_w as usize;
-    let sh = src_h as usize;
     let dw = dst_w as usize;
     let dh = dst_h as usize;
     let mut out = vec![0u8; dw * dh * 3];
-    for y in 0..dh {
-        let sy0 = (y * sh) / dh;
-        let sy1 = (((y + 1) * sh) / dh).max(sy0 + 1).min(sh);
-        for x in 0..dw {
-            let sx0 = (x * sw) / dw;
-            let sx1 = (((x + 1) * sw) / dw).max(sx0 + 1).min(sw);
-            let mut r_sum = 0u32;
-            let mut g_sum = 0u32;
-            let mut b_sum = 0u32;
-            let mut cnt = 0u32;
-            for sy in sy0..sy1 {
-                let row = sy * sw;
-                for sx in sx0..sx1 {
-                    let off = (row + sx) * 3;
-                    if off + 3 <= rgb.len() {
-                        r_sum += rgb[off] as u32;
-                        g_sum += rgb[off + 1] as u32;
-                        b_sum += rgb[off + 2] as u32;
-                        cnt += 1;
-                    }
-                }
-            }
-            if let Some(r) = r_sum.checked_div(cnt) {
-                let d_off = (y * dw + x) * 3;
-                out[d_off] = r as u8;
-                out[d_off + 1] = g_sum.checked_div(cnt).unwrap_or(0) as u8;
-                out[d_off + 2] = b_sum.checked_div(cnt).unwrap_or(0) as u8;
-            }
-        }
-    }
+    box_downscale_rgb::<3, _>(
+        rgb,
+        src_w as usize,
+        src_h as usize,
+        dw,
+        dh,
+        0,
+        |x, y, r, g, b| {
+            let d_off = (y * dw + x) * 3;
+            out[d_off] = r;
+            out[d_off + 1] = g;
+            out[d_off + 2] = b;
+        },
+    );
     (out, dst_w, dst_h)
+}
+
+/// Single-pass area-averaged downscale from RGBA8888 directly into even-dimension RGB888 + BGRA8888
+/// (used by screen clip recording to avoid intermediate full-resolution conversions).
+pub(crate) fn downscale_rgba_to_rgb_and_bgra_even(
+    rgba: &[u8],
+    src_w: u32,
+    src_h: u32,
+    max_w: u32,
+    max_h: u32,
+) -> (Vec<u8>, Vec<u8>, u32, u32) {
+    let (dst_w, dst_h) = compute_fit_dimensions(src_w, src_h, max_w, max_h, true);
+    if dst_w == 0 || dst_h == 0 || rgba.len() < (src_w as usize) * (src_h as usize) * 4 {
+        return (Vec::new(), Vec::new(), 0, 0);
+    }
+    let dw = dst_w as usize;
+    let dh = dst_h as usize;
+    let mut rgb = vec![0u8; dw * dh * 3];
+    let mut bgra = vec![0u8; dw * dh * 4];
+    box_downscale_rgb::<4, _>(
+        rgba,
+        src_w as usize,
+        src_h as usize,
+        dw,
+        dh,
+        0,
+        |x, y, r, g, b| {
+            let px = y * dw + x;
+            let roff = px * 3;
+            rgb[roff] = r;
+            rgb[roff + 1] = g;
+            rgb[roff + 2] = b;
+            let boff = px * 4;
+            bgra[boff] = b;
+            bgra[boff + 1] = g;
+            bgra[boff + 2] = r;
+            bgra[boff + 3] = 255;
+        },
+    );
+    (rgb, bgra, dst_w, dst_h)
 }
 
 /// Reusable scratch buffers for single-pass area-averaged RGBA -> BGRA + I420 downscaling
@@ -488,13 +661,10 @@ pub fn downscale_rgba_area_to_bgra_and_i420(
     if src_w == 0 || src_h == 0 || rgba.len() < (src_w as usize * src_h as usize * 4) {
         return (0, 0);
     }
-    let scale = (max_w as f32 / src_w as f32)
-        .min(max_h as f32 / src_h as f32)
-        .min(1.0);
-    let dst_w = (((src_w as f32 * scale) as u32) & !1).max(2);
-    let dst_h = (((src_h as f32 * scale) as u32) & !1).max(2);
-    let sw = src_w as usize;
-    let sh = src_h as usize;
+    let (dst_w, dst_h) = compute_fit_dimensions(src_w, src_h, max_w, max_h, true);
+    if dst_w == 0 || dst_h == 0 {
+        return (0, 0);
+    }
     let dw = dst_w as usize;
     let dh = dst_h as usize;
 
@@ -505,48 +675,26 @@ pub fn downscale_rgba_area_to_bgra_and_i420(
     scratch.u.resize(cw * ch, 128);
     scratch.v.resize(cw * ch, 128);
 
-    // Precompute source x intervals once per frame.
-    let mut x_bounds = Vec::with_capacity(dw);
-    for x in 0..dw {
-        let sx0 = (x * sw) / dw;
-        let sx1 = (((x + 1) * sw) / dw).max(sx0 + 1).min(sw);
-        x_bounds.push((sx0, sx1));
-    }
-
-    for y in 0..dh {
-        let sy0 = (y * sh) / dh;
-        let sy1 = (((y + 1) * sh) / dh).max(sy0 + 1).min(sh);
-        let dy_row = y * dw;
-        for (x, &(sx0, sx1)) in x_bounds.iter().enumerate() {
-            let mut r_sum = 0u32;
-            let mut g_sum = 0u32;
-            let mut b_sum = 0u32;
-            let cnt = ((sy1 - sy0) * (sx1 - sx0)) as u32;
-            for sy in sy0..sy1 {
-                let row_off = sy * sw;
-                for sx in sx0..sx1 {
-                    let off = (row_off + sx) * 4;
-                    r_sum += rgba[off] as u32;
-                    g_sum += rgba[off + 1] as u32;
-                    b_sum += rgba[off + 2] as u32;
-                }
-            }
-            let r = (r_sum / cnt) as i32;
-            let g = (g_sum / cnt) as i32;
-            let b = (b_sum / cnt) as i32;
-
-            let px_idx = dy_row + x;
+    box_downscale_rgb::<4, _>(
+        rgba,
+        src_w as usize,
+        src_h as usize,
+        dw,
+        dh,
+        0,
+        |x, y, r, g, b| {
+            let px_idx = y * dw + x;
             let boff = px_idx * 4;
-            scratch.bgra[boff] = b as u8;
-            scratch.bgra[boff + 1] = g as u8;
-            scratch.bgra[boff + 2] = r as u8;
+            scratch.bgra[boff] = b;
+            scratch.bgra[boff + 1] = g;
+            scratch.bgra[boff + 2] = r;
             scratch.bgra[boff + 3] = 255;
 
             // BT.601 studio-swing integer Y.
-            let y_val = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            let y_val = ((66 * r as i32 + 129 * g as i32 + 25 * b as i32 + 128) >> 8) + 16;
             scratch.y[px_idx] = y_val.clamp(0, 255) as u8;
-        }
-    }
+        },
+    );
 
     // 2x2 chroma planes from the already anti-aliased BGRA buffer.
     for cy in 0..ch {
@@ -636,29 +784,12 @@ pub fn apply_portrait_blur(rgb: &mut [u8], w: usize, h: usize) {
     let bw = (w / 8).max(4);
     let bh = (h / 8).max(4);
     let mut small = vec![0u8; bw * bh * 3];
-    for y in 0..bh {
-        let sy0 = (y * h) / bh;
-        let sy1 = (((y + 1) * h) / bh).max(sy0 + 1).min(h);
-        for x in 0..bw {
-            let sx0 = (x * w) / bw;
-            let sx1 = (((x + 1) * w) / bw).max(sx0 + 1).min(w);
-            let mut acc = [0u32; 3];
-            let mut count = 0u32;
-            for sy in sy0..sy1 {
-                for sx in sx0..sx1 {
-                    let s = (sy * w + sx) * 3;
-                    acc[0] += rgb[s] as u32;
-                    acc[1] += rgb[s + 1] as u32;
-                    acc[2] += rgb[s + 2] as u32;
-                    count += 1;
-                }
-            }
-            let d = (y * bw + x) * 3;
-            small[d] = (acc[0] / count) as u8;
-            small[d + 1] = (acc[1] / count) as u8;
-            small[d + 2] = (acc[2] / count) as u8;
-        }
-    }
+    box_downscale_rgb::<3, _>(rgb, w, h, bw, bh, 0, |x, y, r, g, b| {
+        let d = (y * bw + x) * 3;
+        small[d] = r;
+        small[d + 1] = g;
+        small[d + 2] = b;
+    });
     // Two quick 3x3 box-blur passes on the downsampled image.
     let mut tmp = small.clone();
     for _ in 0..2 {
@@ -820,140 +951,47 @@ pub(crate) fn fit_preview_frame(frame: &VideoFrame, max_w: u32, max_h: u32) -> O
     Some(VideoFrame::from_bgra(w, h, bgra))
 }
 
-/// Lightweight local camera preview probe for Preferences -> Audio & video (`F-COLLAB-046`).
+/// Lightweight local camera preview probe for Preferences -> Audio & video (`F-COLLAB-046`),
+/// routed through the active platform [`crate::backend::MediaBackend`].
 pub struct CameraPreviewProbe {
-    #[cfg(target_os = "macos")]
-    capture: crate::macos_media::AvVtCameraCapture,
-    #[cfg(not(target_os = "macos"))]
-    running: Arc<AtomicBool>,
-    #[cfg(not(target_os = "macos"))]
-    blur: Arc<AtomicBool>,
+    capture: Box<dyn CameraPreviewHandle>,
     latest: Arc<Mutex<Option<VideoFrame>>>,
-    #[cfg(not(target_os = "macos"))]
-    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CameraPreviewProbe {
-    #[cfg(target_os = "macos")]
     pub fn start(device_index: Option<usize>, blur_background: bool) -> Result<Self> {
         let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
         let latest_cb = Arc::clone(&latest);
-        let available = crate::macos_media::list_macos_cameras();
-        let resolved = select_camera_index(device_index, &available)
-            .ok_or_else(|| HuddleError::Video("no camera device found".into()))?;
-        let capture = crate::macos_media::AvVtCameraCapture::start_preview_only(
-            Some(resolved),
-            640,
-            480,
-            15,
-            blur_background,
-            move |frame| {
+        let capture = platform_backend().start_camera_preview(
+            CameraPreviewConfig {
+                device_index,
+                max_w: 640,
+                max_h: 480,
+                max_fps: 15,
+                blur_background,
+            },
+            Arc::new(move |frame| {
                 if let Ok(mut guard) = latest_cb.lock() {
                     *guard = Some(frame);
                 }
-            },
+            }),
         )?;
         Ok(Self { capture, latest })
     }
 
-    #[cfg(not(target_os = "macos"))]
-    pub fn start(device_index: Option<usize>, blur_background: bool) -> Result<Self> {
-        let running = Arc::new(AtomicBool::new(true));
-        let blur = Arc::new(AtomicBool::new(blur_background));
-        let latest: Arc<Mutex<Option<VideoFrame>>> = Arc::new(Mutex::new(None));
-        let run_flag = Arc::clone(&running);
-        let blur_flag = Arc::clone(&blur);
-        let latest_cb = Arc::clone(&latest);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
-        let idx = device_index.unwrap_or(0) as u32;
-
-        let worker = std::thread::Builder::new()
-            .name("slackless-cam-probe".to_owned())
-            .spawn(move || {
-                let open = (|| -> Result<Camera> {
-                    let req = RequestedFormat::new::<RgbFormat>(
-                        RequestedFormatType::AbsoluteHighestFrameRate,
-                    );
-                    let mut cam = Camera::new(CameraIndex::Index(idx), req)
-                        .map_err(|e| HuddleError::Video(e.to_string()))?;
-                    cam.open_stream()
-                        .map_err(|e| HuddleError::Video(e.to_string()))?;
-                    Ok(cam)
-                })();
-                let mut cam = match open {
-                    Ok(c) => {
-                        let _ = ready_tx.send(Ok(()));
-                        c
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                while run_flag.load(Ordering::Relaxed) {
-                    if let Ok(frame) = cam.frame()
-                        && let Ok(img) = frame.decode_image::<RgbFormat>()
-                        && let Some(vf) = prepare_preview_frame_rgb(
-                            img.as_raw(),
-                            img.width(),
-                            img.height(),
-                            PREVIEW_MAX_W,
-                            PREVIEW_MAX_H,
-                            blur_flag.load(Ordering::Relaxed),
-                        )
-                        && let Ok(mut guard) = latest_cb.lock()
-                    {
-                        *guard = Some(vf);
-                    }
-                    std::thread::sleep(Duration::from_millis(80));
-                }
-                let _ = cam.stop_stream();
-            })
-            .map_err(|e| HuddleError::Video(e.to_string()))?;
-
-        ready_rx
-            .recv()
-            .map_err(|e| HuddleError::Video(e.to_string()))??;
-
-        Ok(Self {
-            running,
-            blur,
-            latest,
-            worker: Some(worker),
-        })
-    }
-
     pub fn set_blur(&self, enabled: bool) {
-        #[cfg(target_os = "macos")]
         self.capture.set_blur(enabled);
-        #[cfg(not(target_os = "macos"))]
-        self.blur.store(enabled, Ordering::Relaxed);
     }
 
     pub fn latest_frame(&self) -> Option<VideoFrame> {
         let frame = self.latest.lock().ok().and_then(|g| g.clone())?;
-        #[cfg(target_os = "macos")]
-        {
-            fit_preview_frame(&frame, PREVIEW_MAX_W, PREVIEW_MAX_H)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Some(frame)
-        }
+        fit_preview_frame(&frame, PREVIEW_MAX_W, PREVIEW_MAX_H)
     }
 }
 
 impl Drop for CameraPreviewProbe {
     fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
         self.capture.stop();
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.running.store(false, Ordering::Relaxed);
-            if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
-            }
-        }
     }
 }
 
@@ -1009,35 +1047,6 @@ mod tests {
         assert!(corner > 40 && corner < 220, "corner was {corner}");
     }
 
-    fn split_annex_b_for_test(data: &[u8]) -> Vec<&[u8]> {
-        let mut starts = Vec::new();
-        let mut i = 0;
-        while i + 3 <= data.len() {
-            if data[i] == 0 && data[i + 1] == 0 {
-                if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
-                    starts.push((i, 4));
-                    i += 4;
-                    continue;
-                }
-                if data[i + 2] == 1 {
-                    starts.push((i, 3));
-                    i += 3;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        starts
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &(pos, sc))| {
-                let end = starts.get(idx + 1).map_or(data.len(), |&(n, _)| n);
-                let nal = &data[pos + sc..end];
-                (!nal.is_empty()).then_some(nal)
-            })
-            .collect()
-    }
-
     fn encode_test_keyframe(w: usize, h: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
         let mut enc = H264VideoEncoder::new_camera().unwrap();
         let mut rgb = vec![0u8; w * h * 3];
@@ -1053,7 +1062,7 @@ mod tests {
     fn h264_decoder_push_rtp_single_nal_stap_a_fua_reset_and_malformed() {
         let (w, h) = (96usize, 64usize);
         let annex_b = encode_test_keyframe(w, h, 40, 180, 220);
-        let nals = split_annex_b_for_test(&annex_b);
+        let nals = split_annex_b_nals(&annex_b);
         assert!(nals.len() >= 3, "expected SPS, PPS, IDR NALs");
 
         // 1. Single NAL RTP payloads (one NAL per packet, marker=true on final NAL).
@@ -1378,7 +1387,7 @@ mod tests {
     fn h264_decoder_push_rtp_packet_single_nal_stap_a_fua_and_seq_wraparound() {
         let (w, h) = (96usize, 64usize);
         let annex_b = encode_test_keyframe(w, h, 30, 150, 210);
-        let nals = split_annex_b_for_test(&annex_b);
+        let nals = split_annex_b_nals(&annex_b);
         assert!(nals.len() >= 3, "expected SPS, PPS, IDR NALs");
 
         // 1. Single NAL sequence via push_rtp_packet.
@@ -1441,7 +1450,7 @@ mod tests {
     fn h264_decoder_mid_frame_seq_gap_discards_partial_fua_and_recovers_cleanly() {
         let (w, h) = (96usize, 64usize);
         let annex_b = encode_test_keyframe(w, h, 200, 80, 50);
-        let nals = split_annex_b_for_test(&annex_b);
+        let nals = split_annex_b_nals(&annex_b);
         let prefix = &nals[..nals.len() - 1];
         let idr = nals[nals.len() - 1];
         let fua4 = build_fua_packets(idr, 4);
@@ -1491,7 +1500,7 @@ mod tests {
     fn h264_decoder_gap_on_empty_buf_fua_continuation_drops_damaged_au_and_recovers() {
         let (w, h) = (96usize, 64usize);
         let annex_b = encode_test_keyframe(w, h, 60, 220, 90);
-        let nals = split_annex_b_for_test(&annex_b);
+        let nals = split_annex_b_nals(&annex_b);
         let idr = nals[nals.len() - 1];
         let fua3 = build_fua_packets(idr, 3);
         let stap_a = build_stap_a(&nals);

@@ -3,20 +3,19 @@ use std::sync::atomic::Ordering;
 
 use slackless_types::UserId;
 
-use super::connected::SessionRuntime;
+use super::connected::{SessionRuntime, announce_screen_share_capabilities};
 use super::supervisor::LoopExit;
 use super::video_rx::same_remote_video_sources;
-use crate::audio::AmbientMusicPlayer;
 use crate::peer_message::{
-    CHIME_TRANSCRIPTION_TOPIC, SLACK_DATA_CHANNEL_TOPIC, build_capabilities_message,
-    build_content_share_details_message, decode_chime_transcript_frame, decode_slack_peer_message,
+    CHIME_TRANSCRIPTION_TOPIC, SLACK_DATA_CHANNEL_TOPIC, decode_chime_transcript_frame,
+    decode_slack_peer_message,
 };
 use crate::proto::{SdkDataMessagePayload, SdkIndexFrame, SdkSignalFrame};
 use crate::rtc::ChimeRtcPeer;
 use crate::signaling::{
-    ChimeSignalClient, RemoteVideoSource, build_audio_control_frame, build_data_message_frame,
-    build_pong_frame, build_remote_video_update_frame, build_subscribe_frame,
-    decode_sdp_answer_with_prev, now_ms, parse_external_user_id, parse_index_sources_with_lookup,
+    ChimeSignalClient, RemoteVideoSource, build_audio_control_frame,
+    build_remote_video_update_frame, build_subscribe_frame, decode_sdp_answer_with_prev, now_ms,
+    parse_external_user_id, parse_index_sources_with_lookup,
 };
 use crate::video::VideoTileKey;
 use crate::{HuddleAudioConfig, HuddleDataEvent, HuddleError, HuddleSessionSnapshot, HuddleUpdate};
@@ -30,8 +29,7 @@ pub(super) async fn handle_signal_frame(
     state: &mut SessionRuntime<'_>,
 ) -> Option<LoopExit> {
     if let Some(pp) = frame.ping_pong
-        && let Some(id) = pp.ping_id
-        && signal.send_frame(&build_pong_frame(id)).await.is_ok()
+        && signal.reply_ping_if_needed(&pp).await
     {
         snap.pongs_sent = snap.pongs_sent.saturating_add(1);
     }
@@ -88,16 +86,7 @@ pub(super) async fn handle_signal_frame(
                             .send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
                     HuddleDataEvent::Jukebox { song_key, .. } => {
-                        if let Some(mut prev) = state.music_player.take() {
-                            prev.stop();
-                        }
-                        if song_key.is_some() {
-                            state.music_player = AmbientMusicPlayer::start(
-                                config.output_device.clone(),
-                                song_key.as_deref(),
-                            )
-                            .ok();
-                        }
+                        state.set_jukebox_player(config.output_device.clone(), song_key.as_deref());
                         snap.jukebox_song = song_key.clone();
                         let _ = state
                             .updates
@@ -147,25 +136,7 @@ pub(super) async fn handle_signal_frame(
             && snap.sharing
             && let Some(src_id) = snap.share_source_id.as_deref()
         {
-            let cap_bytes = build_capabilities_message(&state.creds.attendee_id, true);
-            let _ = signal
-                .send_frame(&build_data_message_frame(
-                    SLACK_DATA_CHANNEL_TOPIC,
-                    cap_bytes,
-                    300_000,
-                ))
-                .await;
-            let det_bytes = build_content_share_details_message(
-                &state.creds.attendee_id,
-                content_share_source_type(src_id),
-            );
-            let _ = signal
-                .send_frame(&build_data_message_frame(
-                    SLACK_DATA_CHANNEL_TOPIC,
-                    det_bytes,
-                    300_000,
-                ))
-                .await;
+            announce_screen_share_capabilities(&state.creds.attendee_id, signal, src_id).await;
         }
     }
     if let Some(meta) = frame.audio_metadata {

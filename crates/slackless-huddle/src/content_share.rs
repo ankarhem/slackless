@@ -7,9 +7,8 @@
 //! `receive_stream_ids = [0]`), so webcam video and screen sharing run simultaneously and appear
 //! as a native screen share on official Slack desktop/web clients.
 
-use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::SampleFormat;
@@ -17,19 +16,25 @@ use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use tokio::sync::mpsc;
 use webrtc::peer_connection::RTCPeerConnectionState;
 
+use crate::audio::ring::SpscRing;
+use crate::backend::platform_backend;
 use crate::metrics::HuddlePerfCounters;
-use crate::proto::{SdkPingPongType, sdk_signal_frame};
+use crate::proto::sdk_signal_frame;
 use crate::rtc::{ChimeRtcPeer, VideoSenderFeedback};
 use crate::screen::ScreenCapture;
 use crate::signaling::{
     ChimeSignalClient, ClientMetricsSnapshot, build_client_metric_frame,
-    build_content_subscribe_frame, build_join_frame, build_leave_frame, build_pong_frame,
-    decode_sdp_answer,
+    build_content_subscribe_frame, build_join_frame, decode_sdp_answer,
 };
 use crate::video::VideoFrame;
 use crate::{HuddleCredentials, HuddleError, Result};
 
 const CONTENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Capacity of the lock-free stereo 48 kHz loopback PCM ring (~2.7 s of interleaved stereo i16).
+const LOOPBACK_RING_CAPACITY: usize = 262_144;
+/// Consumer-side high-water mark (2 s of 48 kHz stereo = `48_000 * 4` i16 samples).
+const LOOPBACK_OVERFLOW_THRESHOLD: usize = 48_000 * 4;
+const LOOPBACK_OVERFLOW_DROP: usize = 48_000;
 
 /// Returns `true` when an audio input device name matches a known virtual loopback driver.
 pub(crate) fn is_loopback_device_name(name: &str) -> bool {
@@ -58,69 +63,12 @@ pub(crate) fn compute_content_abr_bitrate(target_bps: u32, last_abr_bps: u32) ->
     (clamped.abs_diff(last_abr_bps) >= 200_000).then_some(clamped)
 }
 
-/// Push interleaved stereo i16 PCM into the loopback queue, draining 1 second of oldest samples
-/// when the buffer exceeds 4 seconds (`48_000 * 4` stereo samples = 2 seconds of stereo pairs).
-pub(crate) fn push_stereo_pcm_with_overflow(queue: &mut VecDeque<i16>, stereo: Vec<i16>) {
-    if queue.len() > 48_000 * 4 {
-        queue.drain(..48_000);
+/// Consumer-side overflow trim for the lock-free stereo loopback ring: discards 0.5 s of stereo
+/// samples (`48_000` interleaved i16) whenever queued latency exceeds 2 s (`48_000 * 4` samples).
+pub(crate) fn trim_loopback_ring_overflow(ring: &SpscRing<i16>) {
+    if ring.len() > LOOPBACK_OVERFLOW_THRESHOLD {
+        ring.skip(LOOPBACK_OVERFLOW_DROP);
     }
-    queue.extend(stereo);
-}
-
-async fn wait_for_content_join_ack(
-    sig: &mut ChimeSignalClient,
-    timeout: Duration,
-) -> Result<crate::proto::SdkJoinAckFrame> {
-    tokio::time::timeout(timeout, async {
-        loop {
-            let Some(frame) = sig.next_frame().await? else {
-                return Err(HuddleError::Signaling(
-                    "content share WS closed before JOIN_ACK".into(),
-                ));
-            };
-            if let Some(err) = frame.error {
-                return Err(HuddleError::Protocol {
-                    status: err.status.unwrap_or(500),
-                    description: err.description.unwrap_or_default(),
-                });
-            }
-            if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32) {
-                return frame.joinack.ok_or_else(|| {
-                    HuddleError::Signaling("content JOIN_ACK missing payload".into())
-                });
-            }
-        }
-    })
-    .await
-    .map_err(|_| HuddleError::Signaling("timed out waiting for content JOIN_ACK".into()))?
-}
-
-async fn wait_for_content_subscribe_ack(
-    sig: &mut ChimeSignalClient,
-    timeout: Duration,
-) -> Result<crate::proto::SdkSubscribeAckFrame> {
-    tokio::time::timeout(timeout, async {
-        loop {
-            let Some(frame) = sig.next_frame().await? else {
-                return Err(HuddleError::Signaling(
-                    "content share WS closed before SUBSCRIBE_ACK".into(),
-                ));
-            };
-            if let Some(err) = frame.error {
-                return Err(HuddleError::Protocol {
-                    status: err.status.unwrap_or(500),
-                    description: err.description.unwrap_or_default(),
-                });
-            }
-            if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32) {
-                return frame.suback.ok_or_else(|| {
-                    HuddleError::Signaling("content SUBSCRIBE_ACK missing payload".into())
-                });
-            }
-        }
-    })
-    .await
-    .map_err(|_| HuddleError::Signaling("timed out waiting for content SUBSCRIBE_ACK".into()))?
 }
 
 /// Detect an installed virtual system-audio loopback input device (`BlackHole`, `Loopback`,
@@ -141,15 +89,12 @@ pub fn detect_system_audio_loopback() -> Option<String> {
 }
 
 /// Human-readable status of system audio capture for screen sharing (`F-COLLAB-022`).
-/// Prefers macOS 14.2+ native CoreAudio Process Tap (zero driver needed), then virtual loopback.
+/// Prefers OS-native system audio tap (e.g. macOS 14.2+ CoreAudio Process Tap), then virtual loopback.
 pub fn system_audio_source_label() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        if crate::macos_audio_tap::supports_native_system_audio_tap() {
-            return Some("macOS Native System Audio".to_owned());
-        }
-    }
-    detect_system_audio_loopback()
+    platform_backend()
+        .native_system_audio_label()
+        .map(str::to_owned)
+        .or_else(detect_system_audio_loopback)
 }
 
 /// Running `#content` screen-share session handle.
@@ -164,9 +109,10 @@ impl ContentShareSession {
     pub fn loopback_device(&self) -> Option<&str> {
         self.loopback_device.as_deref()
     }
+
     /// Start a native `#content` attendee sharing `source_id`, forwarding local preview frames
-    /// onto `preview_tx`. When `share_audio` is `true`, captures system audio via macOS CoreAudio
-    /// Process Tap (14.2+) or a virtual loopback device.
+    /// onto `preview_tx`. When `share_audio` is `true`, captures system audio via the platform
+    /// backend's native system-audio tap or a virtual loopback device.
     pub async fn start(
         base_creds: HuddleCredentials,
         source_id: String,
@@ -185,7 +131,9 @@ impl ContentShareSession {
         let audio_session_id: u64 = rand::random();
         sig.send_frame(&build_join_frame(audio_session_id)).await?;
 
-        let join_ack = wait_for_content_join_ack(&mut sig, CONTENT_HANDSHAKE_TIMEOUT).await?;
+        let join_ack = sig
+            .wait_for_join_ack(CONTENT_HANDSHAKE_TIMEOUT, |_| {})
+            .await?;
         let turn = join_ack
             .turn_credentials
             .as_ref()
@@ -202,7 +150,9 @@ impl ContentShareSession {
         let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, false)?;
         sig.send_frame(&sub_frame).await?;
 
-        let sub_ack = wait_for_content_subscribe_ack(&mut sig, CONTENT_HANDSHAKE_TIMEOUT).await?;
+        let sub_ack = sig
+            .wait_for_subscribe_ack(CONTENT_HANDSHAKE_TIMEOUT, |_| {})
+            .await?;
         let answer = decode_sdp_answer(
             sub_ack.sdp_answer.as_deref(),
             sub_ack.compressed_sdp_answer.as_deref(),
@@ -223,36 +173,32 @@ impl ContentShareSession {
         let running = Arc::new(AtomicBool::new(true));
         let running_audio = Arc::clone(&running);
         let rtc_audio = Arc::clone(&rtc);
-        let loopback_pcm: Arc<Mutex<VecDeque<i16>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(48_000 * 2)));
+        let loopback_pcm = Arc::new(SpscRing::<i16>::new(LOOPBACK_RING_CAPACITY));
         let loopback_capture_running = Arc::clone(&running);
         let loopback_pcm_tx = Arc::clone(&loopback_pcm);
 
-        // Priority 1 (macOS 14.2+): Zero-driver CoreAudio Process Tap (`F-COLLAB-022`).
-        #[cfg(target_os = "macos")]
-        let native_tap = if share_audio
-            && crate::macos_audio_tap::supports_native_system_audio_tap()
-        {
-            match crate::macos_audio_tap::SystemAudioTap::start(Arc::clone(&loopback_pcm)) {
-                Ok(tap) => Some(tap),
-                Err(err) => {
+        // Priority 1: Zero-driver OS-native system audio tap (`F-COLLAB-022`).
+        let backend = platform_backend();
+        let native_tap = if share_audio {
+            match backend.start_system_audio_tap(Arc::clone(&loopback_pcm)) {
+                Some(Ok(tap)) => Some(tap),
+                Some(Err(err)) => {
                     tracing::warn!(
                         %err,
-                        "macOS native system audio tap unavailable; continuing without native tap"
+                        "native system audio tap unavailable; continuing without native tap"
                     );
                     None
                 }
+                None => None,
             }
         } else {
             None
         };
-        #[cfg(not(target_os = "macos"))]
-        let native_tap: Option<()> = None;
 
         let loopback_device = if !share_audio {
             None
         } else if native_tap.is_some() {
-            Some("macOS Native System Audio".to_owned())
+            backend.native_system_audio_label().map(str::to_owned)
         } else {
             detect_system_audio_loopback()
         };
@@ -275,32 +221,36 @@ impl ContentShareSession {
                         return;
                     };
                     let fmt = supported.sample_format();
-                    let ch = supported.channels() as usize;
+                    let ch = (supported.channels() as usize).max(1);
                     let cfg: cpal::StreamConfig = supported.into();
-                    let push = move |stereo: Vec<i16>| {
-                        if let Ok(mut q) = loopback_pcm_tx.lock() {
-                            push_stereo_pcm_with_overflow(&mut q, stereo);
-                        }
-                    };
                     let stream = match fmt {
                         SampleFormat::F32 => dev
                             .build_input_stream(
                                 cfg,
                                 move |data: &[f32], _| {
-                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
-                                    for frame in data.chunks(ch.max(1)) {
-                                        let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
+                                    // Stack-buffered lock-free conversion: zero heap allocs or locks in RT callback.
+                                    let mut buf = [0i16; 1024];
+                                    let mut n = 0usize;
+                                    for frame in data.chunks(ch) {
+                                        let l = (frame[0].clamp(-1.0, 1.0) * 32_767.0) as i16;
                                         let r = (frame
                                             .get(1)
                                             .copied()
                                             .unwrap_or(frame[0])
                                             .clamp(-1.0, 1.0)
-                                            * 32767.0)
+                                            * 32_767.0)
                                             as i16;
-                                        out.push(l);
-                                        out.push(r);
+                                        buf[n] = l;
+                                        buf[n + 1] = r;
+                                        n += 2;
+                                        if n == buf.len() {
+                                            loopback_pcm_tx.push_slice(&buf[..n]);
+                                            n = 0;
+                                        }
                                     }
-                                    push(out);
+                                    if n > 0 {
+                                        loopback_pcm_tx.push_slice(&buf[..n]);
+                                    }
                                 },
                                 |_| {},
                                 None,
@@ -310,12 +260,47 @@ impl ContentShareSession {
                             .build_input_stream(
                                 cfg,
                                 move |data: &[i16], _| {
-                                    let mut out = Vec::with_capacity((data.len() / ch.max(1)) * 2);
-                                    for frame in data.chunks(ch.max(1)) {
-                                        out.push(frame[0]);
-                                        out.push(*frame.get(1).unwrap_or(&frame[0]));
+                                    let mut buf = [0i16; 1024];
+                                    let mut n = 0usize;
+                                    for frame in data.chunks(ch) {
+                                        buf[n] = frame[0];
+                                        buf[n + 1] = *frame.get(1).unwrap_or(&frame[0]);
+                                        n += 2;
+                                        if n == buf.len() {
+                                            loopback_pcm_tx.push_slice(&buf[..n]);
+                                            n = 0;
+                                        }
                                     }
-                                    push(out);
+                                    if n > 0 {
+                                        loopback_pcm_tx.push_slice(&buf[..n]);
+                                    }
+                                },
+                                |_| {},
+                                None,
+                            )
+                            .ok(),
+                        SampleFormat::U16 => dev
+                            .build_input_stream(
+                                cfg,
+                                move |data: &[u16], _| {
+                                    let mut buf = [0i16; 1024];
+                                    let mut n = 0usize;
+                                    for frame in data.chunks(ch) {
+                                        let l = (i32::from(frame[0]) - 32_768) as i16;
+                                        let r = (i32::from(*frame.get(1).unwrap_or(&frame[0]))
+                                            - 32_768)
+                                            as i16;
+                                        buf[n] = l;
+                                        buf[n + 1] = r;
+                                        n += 2;
+                                        if n == buf.len() {
+                                            loopback_pcm_tx.push_slice(&buf[..n]);
+                                            n = 0;
+                                        }
+                                    }
+                                    if n > 0 {
+                                        loopback_pcm_tx.push_slice(&buf[..n]);
+                                    }
                                 },
                                 |_| {},
                                 None,
@@ -353,17 +338,16 @@ impl ContentShareSession {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             while running_audio.load(Ordering::Relaxed) {
                 tick.tick().await;
-                let has_audio = share_audio
-                    && loopback_pcm.lock().ok().is_some_and(|mut q| {
-                        if q.len() >= 960 * 2 {
-                            for dst in &mut pcm {
-                                *dst = q.pop_front().unwrap_or(0);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    });
+                let has_audio = if share_audio {
+                    trim_loopback_ring_overflow(&loopback_pcm);
+                    if loopback_pcm.len() >= pcm.len() {
+                        loopback_pcm.pop_slice(&mut pcm) == pcm.len()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
                 if has_audio {
                     if let Ok(n) = enc.encode(&pcm, &mut out) {
                         let _ = rtc_audio
@@ -438,11 +422,8 @@ impl ContentShareSession {
                     res = sig.next_frame() => {
                         match res {
                             Ok(Some(frame)) => {
-                                if frame.r#type == Some(sdk_signal_frame::Type::PingPong as i32) {
-                                    if let Some(pp) = frame.ping_pong
-                                        && pp.r#type == Some(SdkPingPongType::Ping as i32) {
-                                            let _ = sig.send_frame(&build_pong_frame(pp.ping_id.unwrap_or(0))).await;
-                                        }
+                                if let Some(pp) = frame.ping_pong {
+                                    let _ = sig.reply_ping_if_needed(&pp).await;
                                 } else if frame.r#type == Some(sdk_signal_frame::Type::Leave as i32) {
                                     break;
                                 }
@@ -455,9 +436,7 @@ impl ContentShareSession {
 
             running.store(false, Ordering::Relaxed);
             drop(capture);
-            let _ = sig.send_frame(&build_leave_frame()).await;
-            let _ = tokio::time::timeout(Duration::from_millis(300), sig.next_frame()).await;
-            sig.close().await;
+            sig.send_leave_and_close(Duration::from_millis(300)).await;
             rtc.close().await;
             let _ = done_tx.send(());
         });
@@ -496,7 +475,7 @@ mod tests {
     use crate::proto::{
         SdkErrorFrame, SdkJoinAckFrame, SdkSignalFrame, SdkSubscribeAckFrame, SdkTurnCredentials,
     };
-    use crate::signaling::{encode_wire_frame, now_ms};
+    use crate::signaling::{build_pong_frame, encode_wire_frame, now_ms};
     use futures_util::SinkExt as _;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
@@ -569,17 +548,17 @@ mod tests {
     }
 
     #[test]
-    fn stereo_pcm_overflow_drain_caps_queue_growth() {
-        let mut q = VecDeque::new();
-        push_stereo_pcm_with_overflow(&mut q, vec![1; 48_000 * 4]);
-        assert_eq!(q.len(), 48_000 * 4);
-        // Pushing 100 more is still <= 48_000 * 4 before push, so no drain yet.
-        push_stereo_pcm_with_overflow(&mut q, vec![2; 100]);
-        assert_eq!(q.len(), 48_000 * 4 + 100);
-        // Now len > 48_000 * 4 -> drains oldest 48_000 samples before extending.
-        push_stereo_pcm_with_overflow(&mut q, vec![3; 50]);
-        assert_eq!(q.len(), 48_000 * 3 + 150);
-        assert_eq!(*q.back().unwrap(), 3);
+    fn stereo_pcm_overflow_trim_caps_ring_latency() {
+        let ring = SpscRing::<i16>::new(LOOPBACK_RING_CAPACITY);
+        assert_eq!(ring.push_slice(&vec![1; 48_000 * 4]), 48_000 * 4);
+        trim_loopback_ring_overflow(&ring);
+        assert_eq!(ring.len(), 48_000 * 4);
+
+        assert_eq!(ring.push_slice(&[2; 100]), 100);
+        assert_eq!(ring.len(), 48_000 * 4 + 100);
+        // Consumer-side trim discards oldest 48_000 samples when > 48_000 * 4.
+        trim_loopback_ring_overflow(&ring);
+        assert_eq!(ring.len(), 48_000 * 3 + 100);
     }
 
     #[tokio::test]
@@ -611,7 +590,8 @@ mod tests {
         let creds = content_credentials(sample_creds(format!("ws://{addr}/control/M1")));
 
         let mut sig1 = ChimeSignalClient::connect(&creds).await.unwrap();
-        let err1 = wait_for_content_join_ack(&mut sig1, Duration::from_millis(60))
+        let err1 = sig1
+            .wait_for_join_ack(Duration::from_millis(60), |_| {})
             .await
             .unwrap_err();
         assert!(
@@ -621,7 +601,8 @@ mod tests {
         sig1.close().await;
 
         let mut sig2 = ChimeSignalClient::connect(&creds).await.unwrap();
-        let err2 = wait_for_content_subscribe_ack(&mut sig2, Duration::from_millis(60))
+        let err2 = sig2
+            .wait_for_subscribe_ack(Duration::from_millis(60), |_| {})
             .await
             .unwrap_err();
         assert!(
@@ -724,25 +705,29 @@ mod tests {
         let creds = content_credentials(sample_creds(format!("ws://{addr}/control/M1")));
 
         let mut c1 = ChimeSignalClient::connect(&creds).await.unwrap();
-        let ja = wait_for_content_join_ack(&mut c1, Duration::from_secs(2))
+        let ja = c1
+            .wait_for_join_ack(Duration::from_secs(2), |_| {})
             .await
             .unwrap();
         assert!(ja.turn_credentials.is_some());
-        let sa = wait_for_content_subscribe_ack(&mut c1, Duration::from_secs(2))
+        let sa = c1
+            .wait_for_subscribe_ack(Duration::from_secs(2), |_| {})
             .await
             .unwrap();
         assert_eq!(sa.sdp_answer.as_deref(), Some("v=0\r\n"));
         c1.close().await;
 
         let mut c2 = ChimeSignalClient::connect(&creds).await.unwrap();
-        let e2 = wait_for_content_join_ack(&mut c2, Duration::from_secs(2))
+        let e2 = c2
+            .wait_for_join_ack(Duration::from_secs(2), |_| {})
             .await
             .unwrap_err();
         assert!(matches!(e2, HuddleError::Protocol { status: 403, .. }));
         c2.close().await;
 
         let mut c3 = ChimeSignalClient::connect(&creds).await.unwrap();
-        let e3 = wait_for_content_subscribe_ack(&mut c3, Duration::from_secs(2))
+        let e3 = c3
+            .wait_for_subscribe_ack(Duration::from_secs(2), |_| {})
             .await
             .unwrap_err();
         assert!(matches!(e3, HuddleError::Signaling(ref m) if m.contains("closed")));

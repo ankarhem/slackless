@@ -9,11 +9,13 @@
 //!   fallback) running OpenAI Whisper Large v3 Turbo `q5_0` (~574 MB opt-in download; EN + SV
 //!   code-switching with `-l auto`; server stays hot during active huddles and exits on hangup).
 
+use std::future::Future;
 use std::io::Write as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -300,6 +302,44 @@ fn find_whisper_model(custom_model: Option<&str>, default_dir: &Path) -> Option<
     None
 }
 
+/// Return a shared Tokio handle for blocking HTTP helpers without spawning nested runtimes per
+/// call. Reuses the ambient multi-thread Tokio runtime when present; otherwise lazily initializes
+/// one shared lightweight background runtime for the lifetime of the process.
+fn shared_http_runtime_handle() -> tokio::runtime::Handle {
+    static SHARED_HTTP_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let rt = SHARED_HTTP_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("slackless-huddle-http")
+            .enable_all()
+            .build()
+            .expect("failed to initialize shared huddle HTTP runtime")
+    });
+    rt.handle().clone()
+}
+
+/// Execute an async HTTP future from a synchronous context without creating a fresh Tokio runtime.
+pub(crate) fn block_on_http<F>(fut: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        return tokio::task::block_in_place(|| handle.block_on(fut));
+    }
+    // Outside Tokio (e.g. dedicated OS worker thread) or on a `current_thread` runtime where
+    // `block_in_place` is forbidden: drive on the single shared background HTTP runtime.
+    let handle = shared_http_runtime_handle();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| s.spawn(|| handle.block_on(fut)).join())
+            .expect("http helper thread panicked")
+    } else {
+        handle.block_on(fut)
+    }
+}
+
 /// Download the opt-in local model weights for `provider` atomically (`.part` -> rename) with
 /// incremental progress updates. Blocking helper — call on a background executor/thread.
 pub fn download_provider_model(
@@ -309,11 +349,7 @@ pub fn download_provider_model(
     if !provider.is_local() {
         return Err("Slack built-in captions do not require a model download.".to_owned());
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("failed to create download runtime: {e}"))?;
-    rt.block_on(download_provider_model_async(provider, on_progress))
+    block_on_http(download_provider_model_async(provider, on_progress))
 }
 
 async fn download_provider_model_async(
@@ -605,26 +641,7 @@ impl VadSegmenter {
 
 /// Encode 16 kHz mono 16-bit PCM into a standard RIFF WAVE byte buffer.
 pub fn encode_wav_16khz_mono(samples: &[i16]) -> Vec<u8> {
-    let data_bytes = (samples.len() * 2) as u32;
-    let riff_size = 36u32.saturating_add(data_bytes);
-    let mut out = Vec::with_capacity(44 + data_bytes as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&riff_size.to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&(TARGET_RATE as u32).to_le_bytes());
-    out.extend_from_slice(&((TARGET_RATE as u32) * 2).to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_bytes.to_le_bytes());
-    for &s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
+    crate::clips::encode_wav_pcm16(samples, TARGET_RATE as u32, 1)
 }
 
 /// Parse `whisper-cli -oj` or `whisper-server` JSON output into `(detected_language, cleaned_text)`.
@@ -680,9 +697,9 @@ pub struct TranscribeChunk {
 enum ActiveSttBackend {
     Parakeet(Box<ParakeetModel>),
     WhisperServer {
-        child: Child,
+        child: Arc<Mutex<Option<Child>>>,
         url: String,
-        rt: tokio::runtime::Runtime,
+        handle: tokio::runtime::Handle,
         http: reqwest::Client,
     },
     WhisperCli {
@@ -691,11 +708,19 @@ enum ActiveSttBackend {
     },
 }
 
+fn kill_whisper_server(slot: &Mutex<Option<Child>>) {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(mut child) = guard.take()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 impl Drop for ActiveSttBackend {
     fn drop(&mut self) {
         if let ActiveSttBackend::WhisperServer { child, .. } = self {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_whisper_server(child);
         }
     }
 }
@@ -716,11 +741,13 @@ impl ActiveSttBackend {
                 let lang = detect_spoken_lang(&text).map(str::to_owned);
                 Some((lang, text))
             }
-            ActiveSttBackend::WhisperServer { url, rt, http, .. } => {
+            ActiveSttBackend::WhisperServer {
+                url, handle, http, ..
+            } => {
                 let wav_bytes = encode_wav_16khz_mono(pcm_16k);
                 let url = url.clone();
                 let http = http.clone();
-                rt.block_on(async move {
+                handle.block_on(async move {
                     let part = reqwest::multipart::Part::bytes(wav_bytes)
                         .file_name("utterance.wav")
                         .mime_str("audio/wav")
@@ -746,9 +773,12 @@ impl ActiveSttBackend {
 }
 
 /// Background opt-in local multilingual transcriber for a live huddle.
-/// Loads weights only while the huddle is active; drops completely on hangup (**0 MB RAM idle**).
+/// Loads weights only while the huddle is active; drops completely on hangup (**0 MB RAM idle**)
+/// and joins its worker thread / terminates any spawned `whisper-server` synchronously on drop.
 pub struct LocalTranscriber {
-    tx: SyncSender<TranscribeChunk>,
+    tx: Option<SyncSender<TranscribeChunk>>,
+    server_child: Arc<Mutex<Option<Child>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LocalTranscriber {
@@ -771,11 +801,18 @@ impl LocalTranscriber {
             );
             return None;
         }
+        let runtime_handle = tokio::runtime::Handle::try_current()
+            .ok()
+            .unwrap_or_else(shared_http_runtime_handle);
+        let server_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let worker_server_child = Arc::clone(&server_child);
         let (tx, rx) = mpsc::sync_channel::<TranscribeChunk>(64);
-        let _ = std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name(format!("slackless-stt-{}", provider.source_tag()))
             .spawn(move || {
-                let Some(mut backend) = init_stt_backend(provider, &setup) else {
+                let Some(mut backend) =
+                    init_stt_backend(provider, &setup, runtime_handle, worker_server_child)
+                else {
                     return;
                 };
                 tracing::info!(
@@ -815,24 +852,45 @@ impl LocalTranscriber {
                     emit_transcribed(&mut backend, seq, last_remote_speaker, &pcm_16k, &updates);
                 }
                 tracing::info!(?provider, "local multilingual STT backend unloaded");
-            });
-        Some(Self { tx })
+            })
+            .ok()?;
+        Some(Self {
+            tx: Some(tx),
+            server_child,
+            worker: Some(worker),
+        })
     }
 
     /// Non-blocking enqueue of a 48 kHz mono frame (drops silently under backpressure so real-time
     /// huddle audio never stalls).
     pub fn push(&self, is_local: bool, speaker: UserId, pcm_48k: &[f32]) {
-        let _ = self.tx.try_send(TranscribeChunk {
-            is_local,
-            speaker,
-            pcm_48k: pcm_48k.to_vec(),
-        });
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(TranscribeChunk {
+                is_local,
+                speaker,
+                pcm_48k: pcm_48k.to_vec(),
+            });
+        }
+    }
+}
+
+impl Drop for LocalTranscriber {
+    fn drop(&mut self) {
+        // Close channel first so the worker exits its receive loop, then kill any active
+        // `whisper-server` child synchronously so an in-flight HTTP inference cannot hang drop.
+        drop(self.tx.take());
+        kill_whisper_server(&self.server_child);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 
 fn init_stt_backend(
     provider: TranscriptionProvider,
     setup: &ProviderSetupStatus,
+    runtime_handle: tokio::runtime::Handle,
+    server_child: Arc<Mutex<Option<Child>>>,
 ) -> Option<ActiveSttBackend> {
     match provider {
         TranscriptionProvider::SlackBuiltIn => None,
@@ -847,7 +905,12 @@ fn init_stt_backend(
         }
         TranscriptionProvider::WhisperTurbo => {
             if let Some(server_bin) = find_whisper_binary(&["whisper-server"])
-                && let Some(srv) = spawn_whisper_server(&server_bin, &setup.model_path)
+                && let Some(srv) = spawn_whisper_server(
+                    &server_bin,
+                    &setup.model_path,
+                    runtime_handle,
+                    server_child,
+                )
             {
                 return Some(srv);
             }
@@ -860,7 +923,12 @@ fn init_stt_backend(
     }
 }
 
-fn spawn_whisper_server(bin: &Path, model: &Path) -> Option<ActiveSttBackend> {
+fn spawn_whisper_server(
+    bin: &Path,
+    model: &Path,
+    handle: tokio::runtime::Handle,
+    server_child: Arc<Mutex<Option<Child>>>,
+) -> Option<ActiveSttBackend> {
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let port = listener.local_addr().ok()?.port();
     drop(listener);
@@ -878,11 +946,10 @@ fn spawn_whisper_server(bin: &Path, model: &Path) -> Option<ActiveSttBackend> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    if let Ok(mut slot) = server_child.lock() {
+        *slot = Some(child);
+    }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .ok()?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -890,7 +957,7 @@ fn spawn_whisper_server(bin: &Path, model: &Path) -> Option<ActiveSttBackend> {
 
     // Wait up to 8s for `whisper-server` to finish loading the model onto Metal/CPU.
     let health_url = format!("http://127.0.0.1:{port}/");
-    let ready = rt.block_on(async {
+    let ready = handle.block_on(async {
         for _ in 0..80 {
             if http.get(&health_url).send().await.is_ok() {
                 return true;
@@ -900,16 +967,14 @@ fn spawn_whisper_server(bin: &Path, model: &Path) -> Option<ActiveSttBackend> {
         false
     });
     if !ready {
-        let mut child = child;
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_whisper_server(&server_child);
         return None;
     }
 
     Some(ActiveSttBackend::WhisperServer {
-        child,
+        child: server_child,
         url: format!("http://127.0.0.1:{port}/inference"),
-        rt,
+        handle,
         http,
     })
 }

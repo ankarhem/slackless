@@ -209,11 +209,16 @@ impl ProcessResourceSampler {
 
 #[cfg(unix)]
 fn current_process_cpu_us() -> u64 {
+    #[cfg(target_os = "macos")]
+    type SusecondsT = i32;
+    #[cfg(not(target_os = "macos"))]
+    type SusecondsT = std::ffi::c_long;
+
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct TimeVal {
-        tv_sec: isize,
-        tv_usec: i32,
+        tv_sec: std::ffi::c_long,
+        tv_usec: SusecondsT,
     }
 
     #[repr(C)]
@@ -221,7 +226,7 @@ fn current_process_cpu_us() -> u64 {
     struct RUsage {
         ru_utime: TimeVal,
         ru_stime: TimeVal,
-        _rest: [isize; 14],
+        _rest: [std::ffi::c_long; 14],
     }
 
     unsafe extern "C" {

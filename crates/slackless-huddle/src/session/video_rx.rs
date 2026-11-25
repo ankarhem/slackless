@@ -15,7 +15,6 @@ use crate::video::{H264VideoDecoder, VideoFrame, VideoTileKey};
 
 pub(super) struct VideoPushResult {
     pub(super) frame: Option<VideoFrame>,
-    pub(super) decode_err: Option<String>,
     pub(super) needs_keyframe: bool,
     pub(super) seq_gaps_delta: u64,
 }
@@ -63,7 +62,6 @@ impl RemoteVideoDecoder {
                 let needs_keyframe = frames.take_needs_keyframe();
                 VideoPushResult {
                     frame,
-                    decode_err: None,
                     needs_keyframe,
                     seq_gaps_delta,
                 }
@@ -75,7 +73,6 @@ impl RemoteVideoDecoder {
                 let needs_keyframe = dec.take_needs_keyframe();
                 VideoPushResult {
                     frame,
-                    decode_err: None,
                     needs_keyframe,
                     seq_gaps_delta,
                 }
@@ -90,21 +87,34 @@ pub(super) struct VideoRoutingTable {
     pub(super) remote_sources: Vec<(String, RemoteVideoSource)>,
 }
 
+pub(super) struct VideoDecoderThreadArgs {
+    pub(super) inbound_video_rx: std::sync::mpsc::Receiver<Option<InboundVideoPacket>>,
+    pub(super) audio_only: Arc<AtomicBool>,
+    pub(super) clear_decoders: Arc<AtomicBool>,
+    pub(super) routing: Arc<Mutex<VideoRoutingTable>>,
+    pub(super) perf: Arc<HuddlePerfCounters>,
+    pub(super) updates: mpsc::UnboundedSender<HuddleUpdate>,
+    pub(super) keyframe_req_tx: mpsc::UnboundedSender<u32>,
+    pub(super) codec_tx: mpsc::UnboundedSender<String>,
+}
+
 /// Spawn a lightweight dispatcher that routes inbound remote video RTP packets by `ssrc` to
 /// parallel per-track decoder workers (H.264 VideoToolbox / AV1 VideoToolbox or `rav1d` /
 /// OpenH264) so a heavy 1080p remote screen share never head-of-line-blocks other participants'
 /// cameras and decoding scales smoothly across CPU cores.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_video_decoder_thread(
-    inbound_video_rx: std::sync::mpsc::Receiver<Option<InboundVideoPacket>>,
-    audio_only: Arc<AtomicBool>,
-    clear_decoders: Arc<AtomicBool>,
-    routing: Arc<Mutex<VideoRoutingTable>>,
-    perf: Arc<HuddlePerfCounters>,
-    updates: mpsc::UnboundedSender<HuddleUpdate>,
-    keyframe_req_tx: mpsc::UnboundedSender<u32>,
-    codec_tx: mpsc::UnboundedSender<String>,
+    args: VideoDecoderThreadArgs,
 ) -> Option<std::thread::JoinHandle<()>> {
+    let VideoDecoderThreadArgs {
+        inbound_video_rx,
+        audio_only,
+        clear_decoders,
+        routing,
+        perf,
+        updates,
+        keyframe_req_tx,
+        codec_tx,
+    } = args;
     std::thread::Builder::new()
         .name("slackless-huddle-vdec".to_owned())
         .spawn(move || {
@@ -203,19 +213,7 @@ fn run_single_track_decoder(
         if res.seq_gaps_delta > 0 {
             perf.record_rx_seq_gap(res.seq_gaps_delta);
         }
-        if let Some(err) = &res.decode_err
-            && last_decode_err_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(3))
-        {
-            last_decode_err_log = Some(Instant::now());
-            tracing::warn!(
-                ssrc = pkt.ssrc,
-                mid = %pkt.mid,
-                mime = %pkt.mime_type,
-                %err,
-                "remote video decode error; requesting keyframe"
-            );
-        }
-        if res.needs_keyframe || res.decode_err.is_some() {
+        if res.needs_keyframe {
             pending_keyframe_req = true;
         }
         if (pending_keyframe_req || (!decoded_first && pkt.marker))
@@ -287,13 +285,7 @@ pub(super) fn resolve_remote_video_tile(
             VideoTileKey::RemoteCamera(src.user_id.clone())
         });
     }
-    sources.first().map(|(_, src)| {
-        if src.is_content {
-            VideoTileKey::RemoteScreen(src.user_id.clone())
-        } else {
-            VideoTileKey::RemoteCamera(src.user_id.clone())
-        }
-    })
+    None
 }
 
 /// Compare two remote video source lists by stream identity, ignoring transient

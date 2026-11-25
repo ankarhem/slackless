@@ -1,11 +1,10 @@
 use super::audio::{
     downsample_waveform, encode_wav_pcm16, parse_adts_frames, transcode_wav_to_aac_adts,
 };
-use super::mp4::split_annex_b_nals;
 use super::video::{CapturedRgbFrame, ClipFrameSource, video_frame_to_clip_rgb};
 use super::*;
 use crate::HuddleError;
-use crate::video::{CAMERA_MAX_H, CAMERA_MAX_W, H264VideoEncoder, VideoFrame};
+use crate::video::{CAMERA_MAX_H, CAMERA_MAX_W, H264VideoEncoder, VideoFrame, split_annex_b_nals};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

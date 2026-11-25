@@ -1,31 +1,62 @@
 //! Audio clip recording, resampling, WAV encoding, waveform downsampling, and AAC transcoding.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cpal::SampleFormat;
 use cpal::traits::{DeviceTrait as _, HostTrait as _, StreamTrait as _};
 use sonora::config::{Config as SonoraConfig, GainController2, NoiseSuppression};
 use sonora::{AudioProcessing, StreamConfig as SonoraStreamConfig};
 
-use crate::audio::{FRAME_10MS, SAMPLE_RATE};
+use crate::audio::ring::SpscRing;
+use crate::audio::{FRAME_10MS, SAMPLE_RATE, resample_linear_into};
 use crate::{HuddleError, Result};
 
 use super::{LIVE_BARS, MAX_AUDIO_SAMPLES, RecordedClip, timestamp_slug};
 
-/// Live microphone clip recorder backed by `cpal` + `sonora` DSP (`F-CORE-127`).
+#[cfg(target_os = "macos")]
+static AFCONVERT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Live microphone clip recorder backed by `cpal` + lock-free SPSC ring + worker-thread `sonora`
+/// DSP (`F-CORE-127`).
 pub struct AudioClipRecorder {
-    _stream: cpal::Stream,
+    stream: Option<cpal::Stream>,
+    running: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
     samples: Arc<Mutex<Vec<i16>>>,
     rms_bits: Arc<AtomicU32>,
     bars: Arc<Mutex<VecDeque<f32>>>,
     started_at: Instant,
 }
 
-// `cpal::Stream` is `!Send` on some platforms, so we keep `AudioClipRecorder` on the UI thread
-// (or drop it where created) — GPUI entities live on the main thread!
+/// Push downmixed mono samples into `ring` using a fixed stack buffer (zero heap allocations
+/// and zero locks in the real-time `cpal` callback).
+fn push_downmixed_rt<T: Copy>(
+    data: &[T],
+    channels: usize,
+    ring: &SpscRing<f32>,
+    to_f32: impl Fn(T) -> f32,
+) {
+    let ch = channels.max(1);
+    let div = ch as f32;
+    let mut stack = [0.0f32; 512];
+    let mut n = 0usize;
+    for frame in data.chunks(ch) {
+        let sum: f32 = frame.iter().map(|&s| to_f32(s)).sum();
+        stack[n] = sum / div;
+        n += 1;
+        if n == stack.len() {
+            let _ = ring.push_slice(&stack);
+            n = 0;
+        }
+    }
+    if n > 0 {
+        let _ = ring.push_slice(&stack[..n]);
+    }
+}
+
 impl AudioClipRecorder {
     /// Start capturing audio from the default input microphone.
     pub fn start() -> Result<Self> {
@@ -46,92 +77,21 @@ impl AudioClipRecorder {
         )));
         let rms_bits = Arc::new(AtomicU32::new(0));
         let bars = Arc::new(Mutex::new(VecDeque::from(vec![0.0f32; LIVE_BARS])));
+        let running = Arc::new(AtomicBool::new(true));
+        // Lock-free SPSC ring (~1.3s at 48 kHz mono) decouples the real-time cpal callback from
+        // Sonora DSP and sample accumulation.
+        let ring = Arc::new(SpscRing::<f32>::new(65_536));
 
-        let samples_cb = Arc::clone(&samples);
-        let rms_cb = Arc::clone(&rms_bits);
-        let bars_cb = Arc::clone(&bars);
-
-        let apm_cfg = SonoraConfig {
-            noise_suppression: Some(NoiseSuppression::default()),
-            gain_controller2: Some(GainController2::default()),
-            ..Default::default()
-        };
-        let apm_stream = SonoraStreamConfig::new(SAMPLE_RATE, 1);
-        let mut apm = AudioProcessing::builder()
-            .config(apm_cfg)
-            .capture_config(apm_stream)
-            .build();
-        let mut apm_pending: Vec<f32> = Vec::with_capacity(FRAME_10MS * 2);
-        let mut bar_accum = 0.0f32;
-        let mut bar_chunks = 0usize;
-
-        let mut push_mono_f32 = move |mono: &[f32]| {
-            let resampled = resample_mono(mono, in_rate, SAMPLE_RATE);
-            apm_pending.extend_from_slice(&resampled);
-            let mut processed_i16 = Vec::new();
-            let mut sum_sq = 0.0f32;
-            let mut count = 0usize;
-            while apm_pending.len() >= FRAME_10MS {
-                let mut frame: [f32; FRAME_10MS] = [0.0; FRAME_10MS];
-                frame.copy_from_slice(&apm_pending[..FRAME_10MS]);
-                apm_pending.drain(..FRAME_10MS);
-                let mut out = [0.0f32; FRAME_10MS];
-                let src = [&frame[..]];
-                let mut dst = [&mut out[..]];
-                if apm.process_capture_f32(&src, &mut dst).is_err() {
-                    out = frame;
-                }
-                for &s in &out {
-                    let clamped = s.clamp(-1.0, 1.0);
-                    sum_sq += clamped * clamped;
-                    count += 1;
-                    processed_i16.push((clamped * 32767.0) as i16);
-                }
-            }
-            if count > 0 {
-                let rms = (sum_sq / count as f32).sqrt().min(1.0);
-                // Boost visual sensitivity slightly so normal speech fills the meter nicely.
-                let visual = (rms * 3.2).min(1.0);
-                rms_cb.store(visual.to_bits(), Ordering::Relaxed);
-                bar_accum = bar_accum.max(visual);
-                bar_chunks += 1;
-                if bar_chunks >= 4 {
-                    if let Ok(mut q) = bars_cb.lock() {
-                        if q.len() >= LIVE_BARS {
-                            q.pop_front();
-                        }
-                        q.push_back(bar_accum);
-                    }
-                    bar_accum = 0.0;
-                    bar_chunks = 0;
-                }
-            }
-            if !processed_i16.is_empty()
-                && let Ok(mut buf) = samples_cb.lock()
-            {
-                let remaining = MAX_AUDIO_SAMPLES.saturating_sub(buf.len());
-                if remaining > 0 {
-                    let take = processed_i16.len().min(remaining);
-                    buf.extend_from_slice(&processed_i16[..take]);
-                }
-            }
-        };
-
+        let ring_cb = Arc::clone(&ring);
         let err_fn = |err| {
-            eprintln!("slackless: audio clip stream error: {err}");
+            tracing::warn!(%err, "audio clip stream error");
         };
 
         let stream = match sample_format {
             SampleFormat::F32 => device
                 .build_input_stream(
                     config,
-                    move |data: &[f32], _| {
-                        let mono: Vec<f32> = data
-                            .chunks(in_channels.max(1))
-                            .map(|f| f.iter().copied().sum::<f32>() / f.len() as f32)
-                            .collect();
-                        push_mono_f32(&mono);
-                    },
+                    move |data: &[f32], _| push_downmixed_rt(data, in_channels, &ring_cb, |s| s),
                     err_fn,
                     None,
                 )
@@ -140,13 +100,7 @@ impl AudioClipRecorder {
                 .build_input_stream(
                     config,
                     move |data: &[i16], _| {
-                        let mono: Vec<f32> = data
-                            .chunks(in_channels.max(1))
-                            .map(|f| {
-                                f.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() / f.len() as f32
-                            })
-                            .collect();
-                        push_mono_f32(&mono);
+                        push_downmixed_rt(data, in_channels, &ring_cb, |s| s as f32 / 32768.0)
                     },
                     err_fn,
                     None,
@@ -156,16 +110,9 @@ impl AudioClipRecorder {
                 .build_input_stream(
                     config,
                     move |data: &[u16], _| {
-                        let mono: Vec<f32> = data
-                            .chunks(in_channels.max(1))
-                            .map(|f| {
-                                f.iter()
-                                    .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                                    .sum::<f32>()
-                                    / f.len() as f32
-                            })
-                            .collect();
-                        push_mono_f32(&mono);
+                        push_downmixed_rt(data, in_channels, &ring_cb, |s| {
+                            (s as f32 - 32768.0) / 32768.0
+                        })
                     },
                     err_fn,
                     None,
@@ -178,12 +125,107 @@ impl AudioClipRecorder {
             }
         };
 
-        stream
-            .play()
+        let samples_worker = Arc::clone(&samples);
+        let rms_worker = Arc::clone(&rms_bits);
+        let bars_worker = Arc::clone(&bars);
+        let run_worker = Arc::clone(&running);
+        let ring_worker = Arc::clone(&ring);
+
+        let worker = std::thread::Builder::new()
+            .name("slackless-clip-audio-dsp".to_owned())
+            .spawn(move || {
+                let apm_cfg = SonoraConfig {
+                    noise_suppression: Some(NoiseSuppression::default()),
+                    gain_controller2: Some(GainController2::default()),
+                    ..Default::default()
+                };
+                let apm_stream = SonoraStreamConfig::new(SAMPLE_RATE, 1);
+                let mut apm = AudioProcessing::builder()
+                    .config(apm_cfg)
+                    .capture_config(apm_stream)
+                    .build();
+                let mut apm_pending: Vec<f32> = Vec::with_capacity(FRAME_10MS * 4);
+                let mut resampled: Vec<f32> = Vec::with_capacity(FRAME_10MS * 4);
+                let mut processed_i16: Vec<i16> = Vec::with_capacity(FRAME_10MS * 4);
+                let mut raw_buf = [0.0f32; 2048];
+                let mut bar_accum = 0.0f32;
+                let mut bar_chunks = 0usize;
+
+                let mut process_mono = |mono: &[f32]| {
+                    resample_linear_into(mono, in_rate, SAMPLE_RATE, &mut resampled);
+                    apm_pending.extend_from_slice(&resampled);
+                    processed_i16.clear();
+                    let mut sum_sq = 0.0f32;
+                    let mut count = 0usize;
+                    while apm_pending.len() >= FRAME_10MS {
+                        let mut frame: [f32; FRAME_10MS] = [0.0; FRAME_10MS];
+                        frame.copy_from_slice(&apm_pending[..FRAME_10MS]);
+                        apm_pending.drain(..FRAME_10MS);
+                        let mut out = [0.0f32; FRAME_10MS];
+                        let src = [&frame[..]];
+                        let mut dst = [&mut out[..]];
+                        if apm.process_capture_f32(&src, &mut dst).is_err() {
+                            out = frame;
+                        }
+                        for &s in &out {
+                            let clamped = s.clamp(-1.0, 1.0);
+                            sum_sq += clamped * clamped;
+                            count += 1;
+                            processed_i16.push((clamped * 32767.0) as i16);
+                        }
+                    }
+                    if count > 0 {
+                        let rms = (sum_sq / count as f32).sqrt().min(1.0);
+                        let visual = (rms * 3.2).min(1.0);
+                        rms_worker.store(visual.to_bits(), Ordering::Relaxed);
+                        bar_accum = bar_accum.max(visual);
+                        bar_chunks += 1;
+                        if bar_chunks >= 4 {
+                            if let Ok(mut q) = bars_worker.lock() {
+                                if q.len() >= LIVE_BARS {
+                                    q.pop_front();
+                                }
+                                q.push_back(bar_accum);
+                            }
+                            bar_accum = 0.0;
+                            bar_chunks = 0;
+                        }
+                    }
+                    if !processed_i16.is_empty()
+                        && let Ok(mut buf) = samples_worker.lock()
+                    {
+                        let remaining = MAX_AUDIO_SAMPLES.saturating_sub(buf.len());
+                        if remaining > 0 {
+                            let take = processed_i16.len().min(remaining);
+                            buf.extend_from_slice(&processed_i16[..take]);
+                        }
+                    }
+                };
+
+                loop {
+                    let got = ring_worker.pop_slice(&mut raw_buf);
+                    if got > 0 {
+                        process_mono(&raw_buf[..got]);
+                    } else if !run_worker.load(Ordering::Acquire) {
+                        break;
+                    } else {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            })
             .map_err(|e| HuddleError::Audio(e.to_string()))?;
 
+        if let Err(e) = stream.play() {
+            drop(stream);
+            running.store(false, Ordering::Release);
+            let _ = worker.join();
+            return Err(HuddleError::Audio(e.to_string()));
+        }
+
         Ok(Self {
-            _stream: stream,
+            stream: Some(stream),
+            running,
+            worker: Some(worker),
             samples,
             rms_bits,
             bars,
@@ -206,18 +248,27 @@ impl AudioClipRecorder {
             .unwrap_or_else(|_| vec![0.0; LIVE_BARS])
     }
 
+    fn shutdown(&mut self) {
+        // Drop stream first so no more callbacks push to the ring, then drain and join worker.
+        drop(self.stream.take());
+        self.running.store(false, Ordering::Release);
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+
     /// Discard the recording without encoding.
-    pub fn cancel(self) {
-        drop(self);
+    pub fn cancel(mut self) {
+        self.shutdown();
     }
 
     /// Stop capturing on the caller's thread and return the raw 48 kHz mono PCM buffer + elapsed
     /// duration so encoding/transcoding can run off the UI thread via [`finish_audio_clip`].
-    pub fn stop_to_pcm(self) -> Result<(Vec<i16>, u64)> {
+    pub fn stop_to_pcm(mut self) -> Result<(Vec<i16>, u64)> {
         let elapsed_ms = self.elapsed_ms();
-        let samples = self.samples.clone();
-        drop(self._stream);
-        let pcm = samples
+        self.shutdown();
+        let pcm = self
+            .samples
             .lock()
             .map(|g| g.clone())
             .map_err(|_| HuddleError::Audio("audio clip buffer poisoned".into()))?;
@@ -228,6 +279,12 @@ impl AudioClipRecorder {
     pub fn stop(self) -> Result<RecordedClip> {
         let (pcm, elapsed_ms) = self.stop_to_pcm()?;
         finish_audio_clip(pcm, elapsed_ms)
+    }
+}
+
+impl Drop for AudioClipRecorder {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -264,23 +321,6 @@ pub fn finish_audio_clip(pcm: Vec<i16>, elapsed_ms: u64) -> Result<RecordedClip>
     })
 }
 
-pub(super) fn resample_mono(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
-    if input.is_empty() || from_rate == 0 || to_rate == 0 || from_rate == to_rate {
-        return input.to_vec();
-    }
-    let out_len = ((input.len() as u64 * to_rate as u64) / from_rate as u64).max(1) as usize;
-    let ratio = from_rate as f64 / to_rate as f64;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let pos = i as f64 * ratio;
-        let idx = (pos as usize).min(input.len() - 1);
-        let next = (idx + 1).min(input.len() - 1);
-        let frac = (pos - idx as f64) as f32;
-        out.push(input[idx] * (1.0 - frac) + input[next] * frac);
-    }
-    out
-}
-
 /// Encode signed 16-bit PCM samples into a standard RIFF/WAVE file.
 pub fn encode_wav_pcm16(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
     let data_bytes = (samples.len() * 2) as u32;
@@ -288,7 +328,7 @@ pub fn encode_wav_pcm16(samples: &[i16], sample_rate: u32, channels: u16) -> Vec
     let block_align = channels * 2;
     let mut out = Vec::with_capacity(44 + data_bytes as usize);
     out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    out.extend_from_slice(&(36u32.saturating_add(data_bytes)).to_le_bytes());
     out.extend_from_slice(b"WAVE");
     out.extend_from_slice(b"fmt ");
     out.extend_from_slice(&16u32.to_le_bytes());
@@ -338,64 +378,47 @@ pub fn downsample_waveform(samples: &[i16], bars: usize) -> Vec<f32> {
         .collect()
 }
 
-/// On macOS, transcode PCM WAV bytes into a compact AAC `.m4a` via `/usr/bin/afconvert`.
+/// Shared macOS `/usr/bin/afconvert` transcoder with atomic collision-free temp filenames.
 #[cfg(target_os = "macos")]
+fn transcode_wav_with_afconvert(wav: &[u8], file_format: &str, out_ext: &str) -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir();
+    let stamp = timestamp_slug();
+    let pid = std::process::id();
+    let seq = AFCONVERT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let wav_path = dir.join(format!("slackless-clip-{pid}-{stamp}-{seq}.wav"));
+    let out_path = dir.join(format!("slackless-clip-{pid}-{stamp}-{seq}.{out_ext}"));
+    std::fs::write(&wav_path, wav).ok()?;
+    let status = std::process::Command::new("/usr/bin/afconvert")
+        .args(["-f", file_format, "-d", "aac", "-b", "96000"])
+        .arg(&wav_path)
+        .arg(&out_path)
+        .status()
+        .ok()?;
+    let _ = std::fs::remove_file(&wav_path);
+    if !status.success() {
+        let _ = std::fs::remove_file(&out_path);
+        return None;
+    }
+    let bytes = std::fs::read(&out_path).ok();
+    let _ = std::fs::remove_file(&out_path);
+    bytes.filter(|b| !b.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn transcode_wav_with_afconvert(
+    _wav: &[u8],
+    _file_format: &str,
+    _out_ext: &str,
+) -> Option<Vec<u8>> {
+    None
+}
+
 fn transcode_wav_to_m4a(wav: &[u8]) -> Option<Vec<u8>> {
-    let dir = std::env::temp_dir();
-    let stamp = timestamp_slug();
-    let pid = std::process::id();
-    let wav_path = dir.join(format!("slackless-clip-{pid}-{stamp}.wav"));
-    let m4a_path = dir.join(format!("slackless-clip-{pid}-{stamp}.m4a"));
-    std::fs::write(&wav_path, wav).ok()?;
-    let status = std::process::Command::new("/usr/bin/afconvert")
-        .args(["-f", "m4af", "-d", "aac", "-b", "96000"])
-        .arg(&wav_path)
-        .arg(&m4a_path)
-        .status()
-        .ok()?;
-    let _ = std::fs::remove_file(&wav_path);
-    if !status.success() {
-        let _ = std::fs::remove_file(&m4a_path);
-        return None;
-    }
-    let bytes = std::fs::read(&m4a_path).ok();
-    let _ = std::fs::remove_file(&m4a_path);
-    bytes.filter(|b| !b.is_empty())
+    transcode_wav_with_afconvert(wav, "m4af", "m4a")
 }
 
-#[cfg(not(target_os = "macos"))]
-fn transcode_wav_to_m4a(_wav: &[u8]) -> Option<Vec<u8>> {
-    None
-}
-
-/// On macOS, transcode PCM WAV bytes into ADTS AAC frames via `/usr/bin/afconvert` for MP4 muxing.
-#[cfg(target_os = "macos")]
 pub(super) fn transcode_wav_to_aac_adts(wav: &[u8]) -> Option<Vec<u8>> {
-    let dir = std::env::temp_dir();
-    let stamp = timestamp_slug();
-    let pid = std::process::id();
-    let wav_path = dir.join(format!("slackless-vidclip-{pid}-{stamp}.wav"));
-    let aac_path = dir.join(format!("slackless-vidclip-{pid}-{stamp}.aac"));
-    std::fs::write(&wav_path, wav).ok()?;
-    let status = std::process::Command::new("/usr/bin/afconvert")
-        .args(["-f", "adts", "-d", "aac", "-b", "96000"])
-        .arg(&wav_path)
-        .arg(&aac_path)
-        .status()
-        .ok()?;
-    let _ = std::fs::remove_file(&wav_path);
-    if !status.success() {
-        let _ = std::fs::remove_file(&aac_path);
-        return None;
-    }
-    let bytes = std::fs::read(&aac_path).ok();
-    let _ = std::fs::remove_file(&aac_path);
-    bytes.filter(|b| !b.is_empty())
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(super) fn transcode_wav_to_aac_adts(_wav: &[u8]) -> Option<Vec<u8>> {
-    None
+    transcode_wav_with_afconvert(wav, "adts", "aac")
 }
 
 /// Decoded raw AAC-LC frames ready for ISO-BMFF `mp4a`/`esds` track muxing.
@@ -440,7 +463,6 @@ pub fn parse_adts_frames(data: &[u8]) -> Option<AacAudioTrack> {
         if header_meta.is_none() {
             let sr = *ADTS_SAMPLE_RATES.get(sr_idx)?;
             let channels = (ch_cfg as u16).max(1);
-            // AudioSpecificConfig: 5 bits objectType | 4 bits freqIndex | 4 bits chanConfig | 3 bits 0
             let asc0 = (profile_object_type << 3) | ((sr_idx as u8) >> 1);
             let asc1 = (((sr_idx as u8) & 0x01) << 7) | ((ch_cfg & 0x0F) << 3);
             header_meta = Some((sr, channels, [asc0, asc1]));
