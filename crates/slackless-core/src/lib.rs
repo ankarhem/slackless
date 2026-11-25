@@ -57,3 +57,22 @@ pub use privacy::{
     SecretMatch, detect_secrets, strip_tracking_params, strip_tracking_params_in_text,
 };
 pub use reducer::apply_event;
+
+/// Transcribe a local video or audio file with `preferred` (or any ready local provider), store
+/// the transcript under `(workspace, file_id)`, and re-index every carrying message in `message_fts`.
+///
+/// Returns `(used_provider, transcript_text, indexed_message_count)`.
+pub fn transcribe_and_index_file(
+    store: &mut store::Store,
+    workspace: &types::TeamId,
+    file_id: &types::FileId,
+    local_path: &std::path::Path,
+    preferred: huddle::TranscriptionProvider,
+) -> std::result::Result<(huddle::TranscriptionProvider, String, usize), String> {
+    let (used, text) = huddle::transcribe_media_file(local_path, preferred)?;
+    let trimmed = text.trim().to_owned();
+    let updated = store
+        .upsert_file_transcript(workspace, file_id, used.source_tag(), &trimmed)
+        .map_err(|e| format!("failed to index transcript in local store: {e}"))?;
+    Ok((used, trimmed, updated))
+}

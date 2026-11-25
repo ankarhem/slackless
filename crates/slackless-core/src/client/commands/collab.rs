@@ -671,6 +671,73 @@ impl<B: Backend> Core<B> {
             Ok(())
         });
     }
+
+    pub(super) fn transcribe_media_file(
+        &self,
+        file_id: crate::types::FileId,
+        local_path: std::path::PathBuf,
+        provider: crate::huddle::TranscriptionProvider,
+    ) {
+        let ctx = self.ctx();
+        self.spawn("media.transcribe", async move {
+            let ws_check = ctx.workspace.clone();
+            let fid_check = file_id.clone();
+            if let Ok(Some(existing)) = with_store(&ctx.store, move |s| {
+                s.file_transcript(&ws_check, &fid_check)
+            })
+            .await
+                && !existing.text.trim().is_empty()
+            {
+                ctx.events.emit(Event::FileTranscriptReady {
+                    file_id,
+                    text: existing.text,
+                });
+                return Ok(());
+            }
+
+            let path_for_task = local_path.clone();
+            let transcribed = tokio::task::spawn_blocking(move || {
+                crate::huddle::transcribe_media_file(&path_for_task, provider)
+            })
+            .await;
+
+            match transcribed {
+                Ok(Ok((used_provider, text))) => {
+                    let trimmed = text.trim().to_owned();
+                    let ws_save = ctx.workspace.clone();
+                    let fid_save = file_id.clone();
+                    let text_save = trimmed.clone();
+                    let source = used_provider.source_tag().to_owned();
+                    if let Err(err) = with_store(&ctx.store, move |s| {
+                        s.upsert_file_transcript(&ws_save, &fid_save, &source, &text_save)
+                    })
+                    .await
+                    {
+                        ctx.events.emit(Event::FileTranscriptFailed {
+                            file_id,
+                            error: err.to_string(),
+                        });
+                        return Ok(());
+                    }
+                    ctx.events.emit(Event::FileTranscriptReady {
+                        file_id,
+                        text: trimmed,
+                    });
+                }
+                Ok(Err(error)) => {
+                    ctx.events
+                        .emit(Event::FileTranscriptFailed { file_id, error });
+                }
+                Err(join_err) => {
+                    ctx.events.emit(Event::FileTranscriptFailed {
+                        file_id,
+                        error: format!("transcription worker failed: {join_err}"),
+                    });
+                }
+            }
+            Ok(())
+        });
+    }
 }
 
 fn emit_if_auth_expired(events: &Emitter, err: &ApiError) {

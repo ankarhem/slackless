@@ -478,6 +478,13 @@ pub enum CollabCommand {
         view_id: String,
         hash: Option<String>,
     },
+    /// Transcribe a locally cached video/audio file with the configured local transcription
+    /// provider, persist it in SQLite, and index it in `message_fts` under carrying messages.
+    TranscribeMediaFile {
+        file_id: crate::types::FileId,
+        local_path: std::path::PathBuf,
+        provider: huddle::TranscriptionProvider,
+    },
 }
 
 /// Native audio/video huddle lifecycle, REST calls, and low-level media controls.

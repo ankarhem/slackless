@@ -357,6 +357,11 @@ impl<B: Backend> Core<B> {
                 state_values,
             } => self.submit_modal(view_id, hash, state_values),
             CollabCommand::CloseModal { view_id, hash } => self.close_modal(view_id, hash),
+            CollabCommand::TranscribeMediaFile {
+                file_id,
+                local_path,
+                provider,
+            } => self.transcribe_media_file(file_id, local_path, provider),
         }
     }
 

@@ -322,6 +322,16 @@ pub enum Event {
     FileRestored { file_id: String },
     /// A user-owned file was deleted via `files.delete` (`F-CORE-130`).
     FileDeleted { file_id: String },
+    /// A video or audio file finished local transcription and was indexed in `message_fts`.
+    FileTranscriptReady {
+        file_id: crate::types::FileId,
+        text: String,
+    },
+    /// Local transcription of a video or audio file failed.
+    FileTranscriptFailed {
+        file_id: crate::types::FileId,
+        error: String,
+    },
     /// A non-fatal failure worth surfacing.
     Error(String),
 }
