@@ -82,13 +82,13 @@ impl App {
             later.save(request.clone(), workspace, label, cx)
         });
         if request.saved {
-            self.bridge.send(Command::SaveItem {
+            self.bridge.send(MessagingCommand::SaveItem {
                 channel: request.channel.clone(),
                 ts: request.ts.clone(),
                 date_due: request.due,
             });
         } else {
-            self.bridge.send(Command::DeleteSavedItem {
+            self.bridge.send(MessagingCommand::DeleteSavedItem {
                 channel: request.channel.clone(),
                 ts: request.ts.clone(),
             });

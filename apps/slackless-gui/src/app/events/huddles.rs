@@ -1,16 +1,39 @@
-//! Huddle-specific `CoreBridge` event handling (participants, session, audio/video, invites).
+//! Huddle-specific `CoreBridge` event handling: low-frequency lifecycle/control [`HuddleEvent`]s
+//! and high-frequency [`HuddleMediaEvent`]s drained on their own bounded coalescing lane.
 
 use super::super::*;
 
 impl App {
+    pub(in crate::app) fn on_huddle_media_event(
+        &mut self,
+        event: &HuddleMediaEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.huddle_state.clone() else {
+            return;
+        };
+        match event {
+            HuddleMediaEvent::AudioLevels(levels) => {
+                state.update(cx, |s, cx| s.update_levels(levels.clone(), cx));
+            }
+            HuddleMediaEvent::VideoFrame { tile, frame } => {
+                state.update(cx, |s, cx| s.update_video_frame(tile.clone(), frame, cx));
+            }
+            HuddleMediaEvent::VideoTileClosed(tile) => {
+                state.update(cx, |s, cx| s.close_video_tile(tile, cx));
+            }
+        }
+    }
+
     pub(super) fn on_huddle_core_event(
         &mut self,
-        event: &Event,
+        event: &HuddleEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            Event::HuddleUpdated {
+            HuddleEvent::Updated {
                 channel,
                 participants,
                 ended,
@@ -34,8 +57,8 @@ impl App {
                 let huddles = self.ws.active_huddles.clone();
                 self.sidebar
                     .update(cx, |sidebar, cx| sidebar.set_huddles(huddles, cx));
-                if let Some(dock) = self.huddle_dock.clone()
-                    && dock.read(cx).session().channel == *channel
+                if let Some(state) = self.huddle_state.clone()
+                    && state.read(cx).session().channel == *channel
                 {
                     let self_uid = &self.fixtures.self_user;
                     let new_peers = if *ended {
@@ -56,21 +79,21 @@ impl App {
                     }
 
                     let alone_music = self.preferences.read(cx).settings().huddle_music_when_alone;
-                    let playing_jukebox = dock.read(cx).session().jukebox_song.is_some();
+                    let playing_jukebox = state.read(cx).session().jukebox_song.is_some();
                     if !*ended && participants.len() > 1 {
                         self.huddle_alone_music_task = None;
                         if alone_music && playing_jukebox {
-                            self.bridge.send(Command::SetHuddleJukebox(None));
+                            self.bridge.send(HuddleControlCommand::SetJukebox(None));
                         }
                     } else if !*ended
                         && participants.len() <= 1
-                        && dock.read(cx).session().phase
+                        && state.read(cx).session().phase
                             == slackless_core::huddle::HuddlePhase::Connected
                     {
                         self.arm_huddle_alone_music(channel.clone(), cx);
                     }
-                    dock.update(cx, |d, cx| {
-                        d.set_participants(
+                    state.update(cx, |s, cx| {
+                        s.set_participants(
                             if *ended {
                                 Vec::new()
                             } else {
@@ -78,7 +101,7 @@ impl App {
                             },
                             cx,
                         );
-                        d.apply_room_meta(
+                        s.apply_room_meta(
                             topic.clone(),
                             background_id.clone(),
                             thread_root_ts.clone(),
@@ -86,14 +109,9 @@ impl App {
                         );
                     });
                 }
-                if let Some((bar_ch, bar)) = &self.huddle
-                    && bar_ch == channel
-                {
-                    bar.update(cx, |b, cx| b.set_participants(participants.clone(), cx));
-                }
                 cx.notify();
             }
-            Event::HuddleSessionChanged(snap) => {
+            HuddleEvent::SessionChanged(snap) => {
                 let snap = (**snap).clone();
                 let prev_phase = self.huddle_session.as_ref().map(|s| s.phase);
                 if snap.phase == slackless_core::huddle::HuddlePhase::Idle {
@@ -106,15 +124,10 @@ impl App {
                         == slackless_core::huddle::HuddlePhase::Connected
                         && prev_phase != Some(slackless_core::huddle::HuddlePhase::Connected);
                     self.huddle_session = Some(snap.clone());
-                    if let Some(dock) = self.huddle_dock.clone() {
-                        dock.update(cx, |d, cx| d.update_session(snap.clone(), cx));
+                    if let Some(state) = self.huddle_state.clone() {
+                        state.update(cx, |s, cx| s.update_session(snap.clone(), cx));
                     } else {
                         self.mount_huddle_dock(snap.clone(), window, cx);
-                    }
-                    if let Some((bar_ch, bar)) = &self.huddle
-                        && *bar_ch == snap.channel
-                    {
-                        bar.update(cx, |b, cx| b.update_session(Some(snap.clone()), cx));
                     }
                     if newly_connected {
                         self.play_huddle_chime(slackless_core::huddle::HuddleChime::Join, cx);
@@ -124,7 +137,7 @@ impl App {
                             && !snap.captions_enabled
                             && !self.fixtures.sample
                         {
-                            self.bridge.send(Command::SetHuddleCaptions(true));
+                            self.bridge.send(HuddleCommand::SetCaptions(true));
                         }
                         let peer_count = self
                             .ws
@@ -142,26 +155,8 @@ impl App {
                 }
                 cx.notify();
             }
-            Event::HuddleAudioLevels(levels) => {
-                if let Some(dock) = self.huddle_dock.clone() {
-                    dock.update(cx, |d, cx| d.update_levels(levels.clone(), cx));
-                }
-                if let Some((_, bar)) = &self.huddle {
-                    bar.update(cx, |b, cx| b.update_levels(levels.clone(), cx));
-                }
-            }
-            Event::HuddleVideoFrame { tile, frame } => {
-                if let Some(dock) = self.huddle_dock.clone() {
-                    dock.update(cx, |d, cx| d.update_video_frame(tile.clone(), frame, cx));
-                }
-            }
-            Event::HuddleVideoTileClosed(tile) => {
-                if let Some(dock) = self.huddle_dock.clone() {
-                    dock.update(cx, |d, cx| d.close_video_tile(tile, cx));
-                }
-            }
-            Event::HuddleDataEvent(ev) => {
-                if let Some(dock) = self.huddle_dock.clone() {
+            HuddleEvent::Data(ev) => {
+                if let Some(state) = self.huddle_state.clone() {
                     let show_reactions = self
                         .preferences
                         .read(cx)
@@ -170,11 +165,11 @@ impl App {
                     if show_reactions
                         || !matches!(ev, slackless_core::huddle::HuddleDataEvent::Reaction { .. })
                     {
-                        dock.update(cx, |d, cx| d.apply_data_event(ev, cx));
+                        state.update(cx, |s, cx| s.apply_data_event(ev, cx));
                     }
                 }
             }
-            Event::HuddleInvite {
+            HuddleEvent::Invite {
                 channel,
                 inviter,
                 call_id,
@@ -200,7 +195,7 @@ impl App {
                     );
                 }
             }
-            Event::HuddleInviteCancelled { channel, .. } => {
+            HuddleEvent::InviteCancelled { channel, .. } => {
                 let should_dismiss = self.huddle_invite.as_ref().is_some_and(|b| {
                     channel.is_none() || channel.as_ref() == Some(&b.read(cx).invite().channel)
                 });
@@ -208,11 +203,10 @@ impl App {
                     self.dismiss_huddle_invite(cx);
                 }
             }
-            Event::HuddleLinkLoaded { url, .. } => {
+            HuddleEvent::LinkLoaded { url, .. } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
                 notify("Huddle link copied", url.clone(), window, cx);
             }
-            _ => {}
         }
     }
 }

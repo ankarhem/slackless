@@ -14,7 +14,7 @@ use gpui_kit::component::input::{
     InlineTokenError, InputContent, InputEdit, InputEditsEvent, TextareaState,
 };
 use gpui_kit::gpui::{Context, Entity, EntityInputHandler as _, Window};
-use slackless_core::platform::SpellChecker as _;
+use slackless_platform::SpellChecker as _;
 
 use super::Composer;
 use super::menu::Menu;
@@ -217,7 +217,7 @@ impl Composer {
                 }
             }
         }
-        let checker = slackless_core::platform::current();
+        let checker = slackless_platform::current();
         let raw = checker.check_spelling(text, self.spellcheck_lang);
         self.misspellings = raw
             .into_iter()
@@ -249,7 +249,7 @@ impl Composer {
             .cloned();
         self.spell_guesses = hit.and_then(|range| {
             let word = text.get(range.clone())?.to_owned();
-            let checker = slackless_core::platform::current();
+            let checker = slackless_platform::current();
             let guesses = checker.spelling_guesses(&word, self.spellcheck_lang);
             Some((range, word, guesses))
         });
@@ -273,7 +273,7 @@ impl Composer {
 
     /// Teach the OS spellchecker `word` and clear its underline.
     pub(super) fn learn_spelling_word(&mut self, word: &str, cx: &mut Context<Self>) {
-        let checker = slackless_core::platform::current();
+        let checker = slackless_platform::current();
         checker.learn_word(word);
         self.spell_typing_end = None;
         self.refresh_spellcheck();

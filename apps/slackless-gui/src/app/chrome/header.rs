@@ -381,7 +381,7 @@ impl App {
                             .disabled(at_tab_limit)
                             .on_click(move |_, _, cx| {
                                 let _ = this_files.update(cx, |app, _| {
-                                    app.bridge.send(Command::AddConversationTab {
+                                    app.bridge.send(ChannelCommand::AddConversationTab {
                                         channel: ch_files.clone(),
                                         tab_type: "files".to_owned(),
                                         label: None,
@@ -397,7 +397,7 @@ impl App {
                             .disabled(at_tab_limit)
                             .on_click(move |_, _, cx| {
                                 let _ = this_pins.update(cx, |app, _| {
-                                    app.bridge.send(Command::AddConversationTab {
+                                    app.bridge.send(ChannelCommand::AddConversationTab {
                                         channel: ch_pins.clone(),
                                         tab_type: "bookmarks".to_owned(),
                                         label: None,
@@ -477,11 +477,13 @@ impl App {
                                         .icon(IconName::ArrowLeft)
                                         .on_click(move |_, _, cx| {
                                             let _ = app.update(cx, |app, _| {
-                                                app.bridge.send(Command::MoveConversationTab {
-                                                    channel: ch.clone(),
-                                                    tab_id: tid.clone(),
-                                                    after: after.clone(),
-                                                });
+                                                app.bridge.send(
+                                                    ChannelCommand::MoveConversationTab {
+                                                        channel: ch.clone(),
+                                                        tab_id: tid.clone(),
+                                                        after: after.clone(),
+                                                    },
+                                                );
                                             });
                                         }),
                                 );
@@ -495,11 +497,13 @@ impl App {
                                         .icon(IconName::ArrowRight)
                                         .on_click(move |_, _, cx| {
                                             let _ = app.update(cx, |app, _| {
-                                                app.bridge.send(Command::MoveConversationTab {
-                                                    channel: ch.clone(),
-                                                    tab_id: tid.clone(),
-                                                    after: Some(after.clone()),
-                                                });
+                                                app.bridge.send(
+                                                    ChannelCommand::MoveConversationTab {
+                                                        channel: ch.clone(),
+                                                        tab_id: tid.clone(),
+                                                        after: Some(after.clone()),
+                                                    },
+                                                );
                                             });
                                         }),
                                 );
@@ -512,10 +516,12 @@ impl App {
                                     .icon(IconName::Trash)
                                     .on_click(move |_, _, cx| {
                                         let _ = app.update(cx, |app, _| {
-                                            app.bridge.send(Command::RemoveConversationTab {
-                                                channel: ch.clone(),
-                                                tab_id: tid.clone(),
-                                            });
+                                            app.bridge.send(
+                                                ChannelCommand::RemoveConversationTab {
+                                                    channel: ch.clone(),
+                                                    tab_id: tid.clone(),
+                                                },
+                                            );
                                         });
                                     }),
                             )

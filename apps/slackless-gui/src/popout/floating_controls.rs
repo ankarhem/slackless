@@ -18,7 +18,7 @@ use gpui_kit::gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowOptions, div, hsla, px, rgb, rgba, size,
 };
 
-use crate::huddle_dock::HuddleDock;
+use crate::huddle_state::HuddleState;
 use crate::menu_bar::CloseWindow;
 
 const PANEL_HEIGHT: f32 = 54.0;
@@ -35,7 +35,7 @@ const PEN_HUES: [(i32, &str); 6] = [
 ];
 
 pub struct HuddleFloatingPanel {
-    dock: WeakEntity<HuddleDock>,
+    state: WeakEntity<HuddleState>,
     focus: FocusHandle,
     last_pen_open: bool,
     _subs: Vec<Subscription>,
@@ -48,14 +48,14 @@ impl Focusable for HuddleFloatingPanel {
 }
 
 impl HuddleFloatingPanel {
-    fn new(dock: WeakEntity<HuddleDock>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: WeakEntity<HuddleState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
-        let initial_pen = dock.upgrade().is_some_and(|d| d.read(cx).draw_mode());
+        let initial_pen = state.upgrade().is_some_and(|s| s.read(cx).draw_mode());
         let mut subs = Vec::new();
-        if let Some(d) = dock.upgrade() {
-            subs.push(cx.observe_in(&d, window, |this, dock_entity, window, cx| {
-                let pen_on = dock_entity.read(cx).draw_mode();
+        if let Some(s) = state.upgrade() {
+            subs.push(cx.observe_in(&s, window, |this, state_entity, window, cx| {
+                let pen_on = state_entity.read(cx).draw_mode();
                 if pen_on != this.last_pen_open {
                     this.last_pen_open = pen_on;
                     let w = if pen_on {
@@ -74,7 +74,7 @@ impl HuddleFloatingPanel {
             }
         }));
         Self {
-            dock,
+            state,
             focus,
             last_pen_open: initial_pen,
             _subs: subs,
@@ -84,10 +84,10 @@ impl HuddleFloatingPanel {
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Turn off interactive desktop pen capture when closing the floating bar so a full-screen
         // overlay never traps desktop mouse clicks with no panel visible to toggle it off.
-        if let Some(dock) = self.dock.upgrade() {
-            dock.update(cx, |d, cx| {
-                if d.session().sharing && d.draw_mode() {
-                    d.set_draw_mode(false, cx);
+        if let Some(state) = self.state.upgrade() {
+            state.update(cx, |s, cx| {
+                if s.session().sharing && s.draw_mode() {
+                    s.set_draw_mode(false, cx);
                 }
             });
         }
@@ -97,7 +97,7 @@ impl HuddleFloatingPanel {
 
 impl Render for HuddleFloatingPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(dock) = self.dock.upgrade() else {
+        let Some(dock) = self.state.upgrade() else {
             window.remove_window();
             return div().id("huddle-floating-panel-empty");
         };
@@ -344,11 +344,11 @@ impl Render for HuddleFloatingPanel {
 /// Open the always-on-top movable, closeable floating huddle control panel near the bottom center
 /// of `display_id` (or the primary display).
 pub fn open_huddle_floating_panel(
-    dock: WeakEntity<HuddleDock>,
+    state: WeakEntity<HuddleState>,
     display_id: Option<DisplayId>,
     cx: &mut App,
 ) -> Option<AnyWindowHandle> {
-    let pen_on = dock.upgrade().is_some_and(|d| d.read(cx).draw_mode());
+    let pen_on = state.upgrade().is_some_and(|s| s.read(cx).draw_mode());
     let w = if pen_on {
         PANEL_WIDTH_PEN
     } else {
@@ -386,22 +386,22 @@ pub fn open_huddle_floating_panel(
             {
                 // SAFETY: GPUI's macOS window yields a valid `NSView *` during window creation.
                 unsafe {
-                    slackless_core::huddle::configure_floating_panel(appkit.ns_view.as_ptr());
+                    slackless_platform::configure_floating_panel(appkit.ns_view.as_ptr());
                 }
             }
-            let dock_on_close = dock.clone();
+            let state_on_close = state.clone();
             window.on_window_should_close(cx, move |_, cx| {
-                if let Some(d) = dock_on_close.upgrade() {
-                    d.update(cx, |d, cx| {
-                        if d.session().sharing && d.draw_mode() {
-                            d.set_draw_mode(false, cx);
+                if let Some(s) = state_on_close.upgrade() {
+                    s.update(cx, |s, cx| {
+                        if s.session().sharing && s.draw_mode() {
+                            s.set_draw_mode(false, cx);
                         }
                     });
                 }
                 true
             });
             window.activate_window();
-            cx.new(|cx| HuddleFloatingPanel::new(dock, window, cx))
+            cx.new(|cx| HuddleFloatingPanel::new(state, window, cx))
         })
         .ok()?;
     Some(handle.into())

@@ -414,7 +414,8 @@ impl App {
                                     .label("Retry")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.ws.failed_mutations.retain(|m| m.id != retry_id);
-                                        this.bridge.send(Command::RetryOfflineMutation(retry_id));
+                                        this.bridge
+                                            .send(MessagingCommand::RetryOfflineMutation(retry_id));
                                         cx.notify();
                                     })),
                                 )
@@ -427,8 +428,9 @@ impl App {
                                     .label("Discard")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.ws.failed_mutations.retain(|m| m.id != discard_id);
-                                        this.bridge
-                                            .send(Command::DiscardOfflineMutation(discard_id));
+                                        this.bridge.send(MessagingCommand::DiscardOfflineMutation(
+                                            discard_id,
+                                        ));
                                         cx.notify();
                                     })),
                                 ),

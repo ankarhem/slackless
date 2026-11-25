@@ -245,7 +245,7 @@ impl App {
                                 .on_click(move |_, window, cx| {
                                     window.close_dialog(cx);
                                     let _ = this.update(cx, |app, _| {
-                                        app.bridge.send(Command::DeleteFile {
+                                        app.bridge.send(CollabCommand::DeleteFile {
                                             file_id: file_id.clone(),
                                         });
                                     });

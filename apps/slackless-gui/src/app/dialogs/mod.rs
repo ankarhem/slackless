@@ -103,14 +103,14 @@ impl App {
             .is_none_or(|prev| prev.stealth_mode != settings.stealth_mode)
         {
             self.bridge
-                .send(Command::SetStealthMode(settings.stealth_mode));
+                .send(WorkspaceCommand::SetStealthMode(settings.stealth_mode));
         }
         if self
             .saved_settings
             .as_ref()
             .is_none_or(|prev| prev.huddle_save_transcripts != settings.huddle_save_transcripts)
         {
-            self.bridge.send(Command::SetSaveHuddleTranscripts(
+            self.bridge.send(WorkspaceCommand::SetSaveHuddleTranscripts(
                 settings.huddle_save_transcripts,
             ));
         }
@@ -163,7 +163,7 @@ impl App {
             // Cloud pref write-back (`users.prefs.set`) for display, emoji, and notification prefs.
             if !self.fixtures.sample {
                 let sync_pref = |name: &str, value: String| {
-                    self.bridge.send(Command::SetUserPref {
+                    self.bridge.send(WorkspaceCommand::SetUserPref {
                         name: name.to_owned(),
                         value,
                     });
@@ -236,11 +236,12 @@ impl App {
                     );
                 }
                 let sync_global_notif = |name: &str, value: String, sync: bool| {
-                    self.bridge.send(Command::SetGlobalNotificationPref {
-                        name: name.to_owned(),
-                        value,
-                        sync,
-                    });
+                    self.bridge
+                        .send(WorkspaceCommand::SetGlobalNotificationPref {
+                            name: name.to_owned(),
+                            value,
+                            sync,
+                        });
                 };
                 if prev.notify_level != settings.notify_level
                     || prev.mobile_different != settings.mobile_different
@@ -369,7 +370,7 @@ impl App {
                 if prev.huddle_input_device != settings.huddle_input_device
                     || prev.huddle_output_device != settings.huddle_output_device
                 {
-                    self.bridge.send(Command::SetHuddleAudioDevices {
+                    self.bridge.send(HuddleControlCommand::SetAudioDevices {
                         input: settings.huddle_input_device.clone(),
                         output: settings.huddle_output_device.clone(),
                     });
@@ -378,14 +379,14 @@ impl App {
                     || prev.huddle_ns != settings.huddle_ns
                     || prev.huddle_agc != settings.huddle_agc
                 {
-                    self.bridge.send(Command::SetHuddleAudioProcessing {
+                    self.bridge.send(HuddleControlCommand::SetAudioProcessing {
                         aec: settings.huddle_aec,
                         ns: settings.huddle_ns,
                         agc: settings.huddle_agc,
                     });
                 }
                 if prev.huddle_blur_background != settings.huddle_blur_background {
-                    self.bridge.send(Command::SetHuddleBlurBackground(
+                    self.bridge.send(HuddleControlCommand::SetBlurBackground(
                         settings.huddle_blur_background,
                     ));
                 }
@@ -425,7 +426,8 @@ impl App {
             UserMenuEvent::SetAway(away) => {
                 self.self_state.away = *away;
                 if !self.fixtures.sample {
-                    self.bridge.send(Command::SetPresence { away: *away });
+                    self.bridge
+                        .send(WorkspaceCommand::SetPresence { away: *away });
                 }
             }
             UserMenuEvent::Pause(until) => {
@@ -436,9 +438,9 @@ impl App {
                         Some(ts) => {
                             let secs = ts.saturating_sub(now_secs() as i64).max(0) as u64;
                             let minutes = secs.div_ceil(60).max(1) as u32;
-                            self.bridge.send(Command::SetDndSnooze { minutes });
+                            self.bridge.send(WorkspaceCommand::SetDndSnooze { minutes });
                         }
-                        None => self.bridge.send(Command::EndDndSnooze),
+                        None => self.bridge.send(WorkspaceCommand::EndDndSnooze),
                     }
                 }
             }
@@ -496,9 +498,9 @@ impl App {
     /// launch runs the sign-in helper.
     pub(super) fn sign_out(&mut self, index: usize, cx: &mut Context<Self>) {
         if index == self.workspace {
-            self.bridge.send(Command::SignOut);
+            self.bridge.send(WorkspaceCommand::SignOut);
         } else if let Some(Some(bridge)) = self.parked_bridges.get(index) {
-            bridge.send(Command::SignOut);
+            bridge.send(WorkspaceCommand::SignOut);
         }
         if let Some(team) = self.fixtures.workspaces.get(index)
             && let Err(e) =
@@ -773,7 +775,7 @@ impl App {
                 .on_click(move |_, window, cx| {
                     if notify_on_close && let Some(app) = this_close.upgrade() {
                         app.update(cx, |app, _| {
-                            app.bridge.send(Command::CloseModal {
+                            app.bridge.send(CollabCommand::CloseModal {
                                 view_id: close_id.clone(),
                                 hash: close_hash.clone(),
                             });
@@ -808,7 +810,7 @@ impl App {
                             Ok(state_values) => {
                                 if let Some(app) = this_submit.upgrade() {
                                     app.update(cx, |app, _| {
-                                        app.bridge.send(Command::SubmitModal {
+                                        app.bridge.send(CollabCommand::SubmitModal {
                                             view_id: sub_id.clone(),
                                             hash: sub_hash.clone(),
                                             state_values,

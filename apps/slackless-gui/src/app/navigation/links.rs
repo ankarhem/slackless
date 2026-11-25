@@ -35,7 +35,7 @@ impl App {
                             cx,
                         );
                     } else {
-                        self.bridge.send(Command::TripWorkflowTrigger {
+                        self.bridge.send(CollabCommand::TripWorkflowTrigger {
                             url: url.to_string(),
                             context: crate::blockkit::serde_json::json!({
                                 "location": "link",
@@ -142,7 +142,7 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        use slackless_core::platform::{DeepLink, SlackLinkKind, parse_deep_link};
+        use slackless_platform::{DeepLink, SlackLinkKind, parse_deep_link};
         let Ok(link) = parse_deep_link(url) else {
             return false;
         };
@@ -275,7 +275,7 @@ impl App {
                             .map(|t| t.id.to_string())
                     })
                 {
-                    self.bridge.send(Command::OpenAppHome {
+                    self.bridge.send(CollabCommand::OpenAppHome {
                         app_id,
                         team_id: resolved_team,
                     });
@@ -293,7 +293,7 @@ impl App {
         if self.self_state.focused() {
             self.self_state.end_focus();
             if !self.fixtures.sample {
-                self.bridge.send(Command::EndDndSnooze);
+                self.bridge.send(WorkspaceCommand::EndDndSnooze);
                 self.send_status_to_slack(self.self_state.status.as_ref());
             }
         } else {
@@ -301,7 +301,8 @@ impl App {
                 .start_focus_with_status(FOCUS_UNTIL_OFF, auto_status);
             if !self.fixtures.sample {
                 // Default 8-hour DND snooze for indefinite focus mode.
-                self.bridge.send(Command::SetDndSnooze { minutes: 480 });
+                self.bridge
+                    .send(WorkspaceCommand::SetDndSnooze { minutes: 480 });
                 if auto_status {
                     self.send_status_to_slack(self.self_state.status.as_ref());
                 }

@@ -28,6 +28,4 @@ pub(super) use inline::{
     ParagraphBuilder, angle_token, jumbomoji_elements, mrkdwn_fences, push_mrkdwn_text,
     strip_quote_prefix, styled_label, toggle_marker,
 };
-pub(crate) use inline::{
-    expand_shortcodes_in_text, hex_color, mrkdwn_preview, unescape, unescape_cow,
-};
+pub(crate) use inline::{expand_shortcodes_in_text, hex_color, mrkdwn_preview, unescape};

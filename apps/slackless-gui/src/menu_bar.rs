@@ -13,8 +13,8 @@ use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::gpui::{
     App, KeyBinding, Menu, MenuItem, OsAction, SharedString, SystemMenuType, Window, actions,
 };
-use slackless_core::platform::{self, AboutPanel as _, FullScreenItem as _};
 use slackless_core::types::ChannelId;
+use slackless_platform::{self as platform, AboutPanel as _, FullScreenItem as _};
 
 use crate::app::{
     ActualSize, CreateChannelAction, FocusSearch, JumpToUnread, NavigateBack, NavigateForward,

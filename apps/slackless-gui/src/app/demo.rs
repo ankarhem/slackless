@@ -281,8 +281,8 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                             .find(|u| u.id != u_self)
                             .map(|u| u.id.clone())
                             .unwrap_or_else(|| u_self.clone());
-                        if let Some(dock) = app.huddle_dock.clone() {
-                            dock.update(cx, |d, cx| {
+                        if let Some(state) = app.huddle_state.clone() {
+                            state.update(cx, |d, cx| {
                                 d.set_captions_local(true, cx);
                                 d.apply_data_event(
                                     &slackless_core::huddle::HuddleDataEvent::Caption {
@@ -435,12 +435,12 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
     };
     if let Some(tab) = surface {
         let this = cx.weak_entity();
-        window.defer(cx, move |_, cx| {
+        window.defer(cx, move |window, cx| {
             if let Some(this) = this.upgrade() {
                 this.update(cx, |app, cx| {
-                    if let Some(channel) = app.huddle.as_ref().map(|(channel, _)| channel.clone()) {
-                        app.select(channel, cx);
-                        app.huddle_open = true;
+                    if let Some(h) = huddle_state::fixture_huddle(&app.fixtures) {
+                        app.select(h.channel, cx);
+                        app.start_huddle(window, cx);
                     }
                     app.tab = tab;
                     cx.notify();

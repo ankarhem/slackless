@@ -12,7 +12,7 @@ impl App {
             .huddle_session
             .as_ref()
             .map(|s| s.channel.clone())
-            .or_else(|| self.huddle.as_ref().map(|(ch, _)| ch.clone()))
+            .or_else(|| huddle_state::fixture_huddle(&self.fixtures).map(|h| h.channel))
             .unwrap_or_else(|| self.channel.clone());
         let huddle_ts = self
             .huddle_session
@@ -120,7 +120,8 @@ impl App {
                     .label("Refresh")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.ws.app_homes.remove(&this.channel);
-                        this.bridge.send(Command::LoadAppHome(this.channel.clone()));
+                        this.bridge
+                            .send(CollabCommand::LoadAppHome(this.channel.clone()));
                         cx.notify();
                     })),
             );
@@ -178,7 +179,7 @@ impl App {
                                 action
                             {
                                 let _ = this_action.update(cx, |app, _| {
-                                    app.bridge.send(Command::BlockAction {
+                                    app.bridge.send(CollabCommand::BlockAction {
                                         bot: bot_id.clone(),
                                         app_id: app_id.clone(),
                                         team: team.clone(),
@@ -472,10 +473,12 @@ impl App {
                                             .update(cx, |d, cx| d.take_scheduled(sched_ix, cx));
                                         if let Some(entry) = taken {
                                             if let Some(id) = entry.id {
-                                                this.bridge.send(Command::DeleteScheduledMessage {
-                                                    channel: entry.channel,
-                                                    scheduled_message_id: id,
-                                                });
+                                                this.bridge.send(
+                                                    MessagingCommand::DeleteScheduledMessage {
+                                                        channel: entry.channel,
+                                                        scheduled_message_id: id,
+                                                    },
+                                                );
                                             }
                                             notify(
                                                 "Scheduled message cancelled",

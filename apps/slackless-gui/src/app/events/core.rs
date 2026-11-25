@@ -178,7 +178,7 @@ impl App {
                 );
                 self.ws.connection = Some(state.clone());
                 if became_connected && !self.fixtures.sample {
-                    self.bridge.send(Command::LoadScheduledMessages);
+                    self.bridge.send(MessagingCommand::LoadScheduledMessages);
                 }
                 cx.notify();
             }
@@ -288,15 +288,7 @@ impl App {
                     view.set_remote_files(query, *sort, *page, mapped, cx);
                 });
             }
-            Event::HuddleUpdated { .. }
-            | Event::HuddleSessionChanged(_)
-            | Event::HuddleAudioLevels(_)
-            | Event::HuddleVideoFrame { .. }
-            | Event::HuddleVideoTileClosed(_)
-            | Event::HuddleDataEvent(_)
-            | Event::HuddleInvite { .. }
-            | Event::HuddleInviteCancelled { .. }
-            | Event::HuddleLinkLoaded { .. } => self.on_huddle_core_event(event, window, cx),
+            Event::Huddle(huddle_ev) => self.on_huddle_core_event(huddle_ev, window, cx),
             Event::UserProfileLoaded {
                 user,
                 pronouns,
@@ -563,7 +555,11 @@ impl App {
             } => {
                 let was_loaded = self.ws.canvases.get(file_id).is_some_and(Result::is_ok);
                 let parsed = match html {
-                    Ok(raw) => Ok(crate::canvas::CanvasDoc::from_html(title.clone(), raw)),
+                    Ok(raw) => Ok(crate::canvas::CanvasDoc::from_html_with_emoji(
+                        title.clone(),
+                        raw,
+                        &crate::emoji::display_glyph,
+                    )),
                     Err(err) => Err(err.clone()),
                 };
                 if was_loaded && parsed.is_ok() {
@@ -610,7 +606,7 @@ impl App {
                     self.ws
                         .canvas_status
                         .insert(canvas_id.clone(), (false, summary.clone()));
-                    self.bridge.send(Command::LoadCanvas {
+                    self.bridge.send(CollabCommand::LoadCanvas {
                         file_id: canvas_id.clone(),
                     });
                     notify("Canvas access updated", summary.clone(), window, cx);
@@ -640,7 +636,7 @@ impl App {
             },
             Event::CanvasCommentPosted { canvas_id, result } => match result {
                 Ok(()) => {
-                    self.bridge.send(Command::LoadCanvasComments {
+                    self.bridge.send(CollabCommand::LoadCanvasComments {
                         canvas_id: canvas_id.clone(),
                     });
                     cx.notify();
@@ -671,7 +667,7 @@ impl App {
                             t.resolved = *resolved;
                         }
                     }
-                    self.bridge.send(Command::LoadCanvasComments {
+                    self.bridge.send(CollabCommand::LoadCanvasComments {
                         canvas_id: canvas_id.clone(),
                     });
                     cx.notify();
@@ -712,7 +708,7 @@ impl App {
                 notify("List created", name.clone(), window, cx);
             }
             Event::MessageAddedToList { list_id, .. } => {
-                self.bridge.send(Command::LoadList {
+                self.bridge.send(CollabCommand::LoadList {
                     file_id: list_id.clone(),
                 });
                 notify(

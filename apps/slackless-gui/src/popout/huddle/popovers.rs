@@ -128,9 +128,9 @@ impl PopoutWindow {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let next = !captions_now;
-                    (send_cc)(Command::SetHuddleCaptions(next));
+                    (send_cc)(HuddleCommand::SetCaptions(next).into());
                     if this.fixtures.sample
-                        && let Some(dock) = this.huddle_dock_entity()
+                        && let Some(dock) = this.huddle_state_entity()
                     {
                         dock.update(cx, |d, cx| d.set_captions_local(next, cx));
                     }
@@ -151,9 +151,9 @@ impl PopoutWindow {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let next_song = (!music_on).then(|| "jazz".to_owned());
-                    (send_music)(Command::SetHuddleJukebox(next_song.clone()));
+                    (send_music)(HuddleControlCommand::SetJukebox(next_song.clone()).into());
                     if this.fixtures.sample
-                        && let Some(dock) = this.huddle_dock_entity()
+                        && let Some(dock) = this.huddle_state_entity()
                     {
                         dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
                     }
@@ -193,9 +193,12 @@ impl PopoutWindow {
                     false,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    (send_copy)(Command::CopyHuddleLink {
-                        channel: copy_ch.clone(),
-                    });
+                    (send_copy)(
+                        HuddleCommand::GetLink {
+                            channel: copy_ch.clone(),
+                        }
+                        .into(),
+                    );
                     this.close_huddle_popovers();
                     cx.notify();
                 })),
@@ -295,11 +298,14 @@ impl PopoutWindow {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.huddle_selected_camera = Some(cam_idx);
                                 if video_now {
-                                    (send)(Command::SetHuddleCamera {
-                                        enabled: true,
-                                        device_index: Some(cam_idx),
-                                        blur: blur_now,
-                                    });
+                                    (send)(
+                                        HuddleControlCommand::SetCamera {
+                                            enabled: true,
+                                            device_index: Some(cam_idx),
+                                            blur: blur_now,
+                                        }
+                                        .into(),
+                                    );
                                 }
                                 this.close_huddle_popovers();
                                 cx.notify();
@@ -339,9 +345,9 @@ impl PopoutWindow {
                     .child("Blur background")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let next_blur = !blur_now;
-                        (send_blur)(Command::SetHuddleBlurBackground(next_blur));
+                        (send_blur)(HuddleControlCommand::SetBlurBackground(next_blur).into());
                         if this.fixtures.sample
-                            && let Some(dock) = this.huddle_dock_entity()
+                            && let Some(dock) = this.huddle_state_entity()
                         {
                             dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
                         }
@@ -837,12 +843,15 @@ impl PopoutWindow {
                                 .text_color(pal.danger_fg)
                                 .child("Stop sharing")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    (send_stop)(Command::SetHuddleScreenShare {
-                                        source_id: None,
-                                        share_audio: false,
-                                    });
+                                    (send_stop)(
+                                        HuddleControlCommand::SetScreenShare {
+                                            source_id: None,
+                                            share_audio: false,
+                                        }
+                                        .into(),
+                                    );
                                     if this.fixtures.sample
-                                        && let Some(dock) = this.huddle_dock_entity()
+                                        && let Some(dock) = this.huddle_state_entity()
                                     {
                                         dock.update(cx, |d, cx| d.set_sharing_local(None, cx));
                                     }
@@ -1050,13 +1059,16 @@ impl PopoutWindow {
                             .text_base()
                             .child(glyph)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                (send_em)(Command::SendHuddleReaction {
-                                    emoji: em.clone(),
-                                    kind: HuddleReactionKind::Standard,
-                                    emoji_url: None,
-                                });
+                                (send_em)(
+                                    HuddleControlCommand::SendReaction {
+                                        emoji: em.clone(),
+                                        kind: HuddleReactionKind::Standard,
+                                        emoji_url: None,
+                                    }
+                                    .into(),
+                                );
                                 if this.fixtures.sample
-                                    && let Some(dock) = this.huddle_dock_entity()
+                                    && let Some(dock) = this.huddle_state_entity()
                                 {
                                     let me = this.fixtures.self_user.clone();
                                     dock.update(cx, |d, cx| {
@@ -1107,13 +1119,16 @@ impl PopoutWindow {
                                     .text_color(pal.popover_fg)
                                     .child(format!("{glyph} {label}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        (send_ef)(Command::SendHuddleReaction {
-                                            emoji: em.clone(),
-                                            kind: HuddleReactionKind::Effect,
-                                            emoji_url: None,
-                                        });
+                                        (send_ef)(
+                                            HuddleControlCommand::SendReaction {
+                                                emoji: em.clone(),
+                                                kind: HuddleReactionKind::Effect,
+                                                emoji_url: None,
+                                            }
+                                            .into(),
+                                        );
                                         if this.fixtures.sample
-                                            && let Some(dock) = this.huddle_dock_entity()
+                                            && let Some(dock) = this.huddle_state_entity()
                                         {
                                             let me = this.fixtures.self_user.clone();
                                             dock.update(cx, |d, cx| {
@@ -1167,9 +1182,12 @@ impl PopoutWindow {
                                     .text_color(if selected { primary_fg } else { pal.popover_fg })
                                     .child(format!("{glyph} {label}"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        (send_st)(Command::SetHuddleStickyEmoji(next.clone()));
+                                        (send_st)(
+                                            HuddleControlCommand::SetStickyEmoji(next.clone())
+                                                .into(),
+                                        );
                                         if this.fixtures.sample
-                                            && let Some(dock) = this.huddle_dock_entity()
+                                            && let Some(dock) = this.huddle_state_entity()
                                         {
                                             let me = this.fixtures.self_user.clone();
                                             dock.update(cx, |d, cx| {
@@ -1258,8 +1276,8 @@ impl PopoutWindow {
                     )
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        (send_bg)(Command::SetHuddleBackground(bg_id.clone()));
-                        if let Some(dock) = this.huddle_dock_entity() {
+                        (send_bg)(HuddleCommand::SetBackground(bg_id.clone()).into());
+                        if let Some(dock) = this.huddle_state_entity() {
                             dock.update(cx, |d, cx| d.set_background_local(bg_id.clone(), cx));
                         }
                         this.close_huddle_popovers();
@@ -1333,10 +1351,13 @@ impl PopoutWindow {
                             )
                             .child(label)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                (send)(Command::InviteToHuddle {
-                                    channel: ch.clone(),
-                                    users: vec![uid.clone()],
-                                });
+                                (send)(
+                                    HuddleCommand::Invite {
+                                        channel: ch.clone(),
+                                        users: vec![uid.clone()],
+                                    }
+                                    .into(),
+                                );
                                 actions::notify(
                                     "Invitation sent",
                                     "Notified member to join this huddle.",
@@ -1409,10 +1430,13 @@ impl PopoutWindow {
                                     d.name.clone()
                                 })
                                 .on_click(move |_, _, _| {
-                                    (send)(Command::SetHuddleAudioDevices {
-                                        input: Some(name.clone()),
-                                        output: out.clone(),
-                                    });
+                                    (send)(
+                                        HuddleControlCommand::SetAudioDevices {
+                                            input: Some(name.clone()),
+                                            output: out.clone(),
+                                        }
+                                        .into(),
+                                    );
                                 })
                         }),
                 ),
@@ -1455,10 +1479,13 @@ impl PopoutWindow {
                                     d.name.clone()
                                 })
                                 .on_click(move |_, _, _| {
-                                    (send)(Command::SetHuddleAudioDevices {
-                                        input: inp.clone(),
-                                        output: Some(name.clone()),
-                                    });
+                                    (send)(
+                                        HuddleControlCommand::SetAudioDevices {
+                                            input: inp.clone(),
+                                            output: Some(name.clone()),
+                                        }
+                                        .into(),
+                                    );
                                 })
                         }),
                 ),

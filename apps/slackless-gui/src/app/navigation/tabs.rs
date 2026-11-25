@@ -12,7 +12,7 @@ impl App {
             TabAction::OpenList(file) => self.open_live_list(file, cx),
             TabAction::AddCanvas => {
                 self.bridge
-                    .send(Command::CreateChannelCanvas(self.channel.clone()));
+                    .send(CollabCommand::CreateChannelCanvas(self.channel.clone()));
             }
         }
     }
@@ -29,7 +29,7 @@ impl App {
         };
         if needs_load && !self.fixtures.sample {
             self.ws.canvases.remove(&file_id);
-            self.bridge.send(Command::LoadCanvas { file_id });
+            self.bridge.send(CollabCommand::LoadCanvas { file_id });
         }
         cx.notify();
     }
@@ -47,7 +47,7 @@ impl App {
         };
         if needs_load && !self.fixtures.sample {
             self.ws.lists.remove(&file_id);
-            self.bridge.send(Command::LoadList { file_id });
+            self.bridge.send(CollabCommand::LoadList { file_id });
         }
         cx.notify();
     }
@@ -76,24 +76,24 @@ impl App {
             return;
         }
         let channel = self.channel.clone();
-        let command = match tab {
+        let command: Command = match tab {
             ConversationTab::Home => {
                 if self.ws.app_homes.get(&channel).is_some_and(Result::is_err) {
                     self.ws.app_homes.remove(&channel);
                 }
-                Command::LoadAppHome(channel)
+                CollabCommand::LoadAppHome(channel).into()
             }
             ConversationTab::Pins => {
                 forget_failure(&mut self.ws.pins, &channel);
-                Command::LoadPins(channel)
+                MessagingCommand::LoadPins(channel).into()
             }
             ConversationTab::Files => {
                 forget_failure(&mut self.ws.files, &channel);
-                Command::LoadFiles(FilesFilter::channel(channel))
+                CollabCommand::LoadFiles(FilesFilter::channel(channel)).into()
             }
             ConversationTab::Folder { .. } => {
                 forget_failure(&mut self.ws.bookmarks, &channel);
-                Command::LoadBookmarks(channel)
+                MessagingCommand::LoadBookmarks(channel).into()
             }
             ConversationTab::Messages | ConversationTab::Canvas | ConversationTab::List => {
                 return;
@@ -181,7 +181,7 @@ impl App {
             Some(file) => self.open_live_canvas(file, cx),
             None => {
                 self.bridge
-                    .send(Command::CreateChannelCanvas(self.channel.clone()));
+                    .send(CollabCommand::CreateChannelCanvas(self.channel.clone()));
             }
         }
     }
@@ -201,7 +201,7 @@ impl App {
                 .push(bookmarks::Bookmark::link(title, url));
             cx.notify();
         } else {
-            self.bridge.send(Command::AddBookmark {
+            self.bridge.send(MessagingCommand::AddBookmark {
                 channel: self.channel.clone(),
                 title,
                 url,

@@ -97,7 +97,7 @@ impl PopoutWindow {
                                     )
                                     .child("Floating bar")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(dock) = this.huddle_dock_entity() {
+                                        if let Some(dock) = this.huddle_state_entity() {
                                             dock.update(cx, |d, cx| {
                                                 d.request_open_floating_panel(cx);
                                             });
@@ -225,9 +225,9 @@ impl PopoutWindow {
                         .child(Icon::new(IconName::X).size(px(12.)).text_color(muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_huddle_popovers();
-                            (send_stop)(Command::SetHuddleJukebox(None));
+                            (send_stop)(HuddleControlCommand::SetJukebox(None).into());
                             if this.fixtures.sample
-                                && let Some(dock) = this.huddle_dock_entity()
+                                && let Some(dock) = this.huddle_state_entity()
                             {
                                 dock.update(cx, |d, cx| d.set_jukebox_local(None, cx));
                             }
@@ -274,9 +274,11 @@ impl PopoutWindow {
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_huddle_popovers();
-                            (send_pick)(Command::SetHuddleJukebox(Some(key_owned.clone())));
+                            (send_pick)(
+                                HuddleControlCommand::SetJukebox(Some(key_owned.clone())).into(),
+                            );
                             if this.fixtures.sample
-                                && let Some(dock) = this.huddle_dock_entity()
+                                && let Some(dock) = this.huddle_state_entity()
                             {
                                 dock.update(cx, |d, cx| {
                                     d.set_jukebox_local(Some(key_owned.clone()), cx)
@@ -333,9 +335,9 @@ impl PopoutWindow {
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(inp) = this.huddle_topic_editing.take() {
                                 let text = inp.read(cx).value().trim().to_owned();
-                                (this.send)(Command::SetHuddleTopic(text.clone()));
+                                (this.send)(HuddleCommand::SetTopic(text.clone()).into());
                                 if this.fixtures.sample
-                                    && let Some(dock) = this.huddle_dock_entity()
+                                    && let Some(dock) = this.huddle_state_entity()
                                 {
                                     let me = this.fixtures.self_user.clone();
                                     dock.update(cx, |d, cx| {

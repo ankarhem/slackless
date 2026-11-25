@@ -1,6 +1,10 @@
 use std::sync::Mutex;
 
-use gpui_kit::gpui::TestAppContext;
+use gpui_kit::gpui::{TestAppContext, gpui};
+use slackless_core::MessagingCommand;
+
+use crate::actions::MessageAction;
+use crate::emoji::EmojiChoice;
 
 use super::*;
 
@@ -12,12 +16,18 @@ fn popout_message_actions_mutate_state_and_forward_commands(cx: &mut TestAppCont
     let sent_cb = sent.clone();
     let send: CommandForward = Arc::new(move |cmd| {
         let tag = match cmd {
-            Command::AddReaction { name, .. } => format!("add:{name}"),
-            Command::RemoveReaction { name, .. } => format!("rm:{name}"),
-            Command::EditMessage { content, .. } => format!("edit:{}", content.text),
-            Command::SaveItem { .. } => "save".to_owned(),
-            Command::DeleteSavedItem { .. } => "unsave".to_owned(),
-            Command::SetPinned { pinned, .. } => format!("pin:{pinned}"),
+            Command::Messaging(MessagingCommand::AddReaction { name, .. }) => format!("add:{name}"),
+            Command::Messaging(MessagingCommand::RemoveReaction { name, .. }) => {
+                format!("rm:{name}")
+            }
+            Command::Messaging(MessagingCommand::EditMessage { content, .. }) => {
+                format!("edit:{}", content.text)
+            }
+            Command::Messaging(MessagingCommand::SaveItem { .. }) => "save".to_owned(),
+            Command::Messaging(MessagingCommand::DeleteSavedItem { .. }) => "unsave".to_owned(),
+            Command::Messaging(MessagingCommand::SetPinned { pinned, .. }) => {
+                format!("pin:{pinned}")
+            }
             _ => "other".to_owned(),
         };
         sent_cb.lock().unwrap().push(tag);
@@ -290,12 +300,12 @@ fn huddle_popout_thread_starts_empty_filters_root_and_uses_composer(cx: &mut Tes
     let sent: Arc<Mutex<Vec<SentRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let sent_cb = sent.clone();
     let send: CommandForward = Arc::new(move |cmd| {
-        if let Command::SendMessage {
+        if let Command::Messaging(MessagingCommand::SendMessage {
             channel,
             content,
             thread_ts,
             broadcast,
-        } = cmd
+        }) = cmd
         {
             sent_cb
                 .lock()
@@ -317,7 +327,12 @@ fn huddle_popout_thread_starts_empty_filters_root_and_uses_composer(cx: &mut Tes
         ..Default::default()
     };
     let dock = cx.update(|cx| {
-        crate::huddle_dock::HuddleDock::new(fixtures.clone(), initial_snap.clone(), Vec::new(), cx)
+        crate::huddle_state::HuddleState::new(
+            fixtures.clone(),
+            initial_snap.clone(),
+            Vec::new(),
+            cx,
+        )
     });
     let mut popout_slot: Option<Entity<PopoutWindow>> = None;
     let win_handle = cx.add_window(|window, cx| {
@@ -551,7 +566,7 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
 
     let cmds = sent.lock().unwrap();
     match &cmds[0] {
-        Command::MarkRead { ts, .. } => {
+        Command::Messaging(MessagingCommand::MarkRead { ts, .. }) => {
             let first_ts = vcx.read(|cx| conv.read(cx).messages[0].ts.clone());
             assert_eq!(*ts, crate::threads_cards::ts_just_before(&first_ts));
             assert_ne!(*ts, first_ts);
@@ -559,7 +574,7 @@ fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
         other => panic!("expected MarkRead for MarkUnread, got {other:?}"),
     }
     match cmds.last().unwrap() {
-        Command::SendMessage { content, .. } => {
+        Command::Messaging(MessagingCommand::SendMessage { content, .. }) => {
             assert!(content.text.contains(":slightly_smiling_face:"));
             assert!(!content.text.contains("utm_source"));
             assert!(content.text.contains("keep=1"));

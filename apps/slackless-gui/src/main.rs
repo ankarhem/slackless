@@ -37,9 +37,9 @@ mod files;
 mod files_page;
 mod fixtures;
 mod hover_card;
-mod huddle;
 mod huddle_dock;
 mod huddle_invite;
+mod huddle_state;
 mod huddle_video;
 mod huddles;
 mod image_viewer;
@@ -84,7 +84,7 @@ use gpui_kit::gpui::{
     Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_kit::open_window;
-use slackless_core::platform::{self, IconSetter as _};
+use slackless_platform::{self as platform, IconSetter as _};
 
 use crate::app::App;
 use crate::bridge::CoreBridge;

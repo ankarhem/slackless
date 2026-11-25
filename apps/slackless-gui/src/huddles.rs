@@ -26,7 +26,7 @@ use slackless_core::types::{ChannelId, ConversationKind, MessageSubtype, TeamId,
 
 use crate::avatars::user_chip;
 use crate::fixtures::Fixtures;
-use crate::huddle;
+use crate::huddle_state;
 use crate::messages::list_stamp;
 
 /// Trail messages scanned per conversation in the live derivation.
@@ -106,7 +106,7 @@ impl HuddlesView {
     /// Fixture mode: the bundled sample workspace's live huddle.
     pub fn show_local(&mut self, fixtures: &Fixtures, cx: &mut Context<Self>) {
         self.loading = false;
-        self.huddles = huddle::fixture(fixtures)
+        self.huddles = huddle_state::fixture_huddle(fixtures)
             .map(|huddle| {
                 let ts = fixtures
                     .messages

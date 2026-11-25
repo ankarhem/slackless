@@ -183,7 +183,7 @@
 //!   ActivityFeed::new(Arc<Fixtures>, &mut App) -> Entity<ActivityFeed>
 //!   emits ActivityEvent::Open { channel, thread_ts } (this root opens the conversation,
 //!   thread items with the thread panel), Mark { entries, read } (forwarded to the core as
-//!   Command::MarkActivity) and Retry (Command::FetchActivity)
+//!   MessagingCommand::MarkActivity) and Retry (MessagingCommand::FetchActivity)
 //!   Sidebar::badge_count() -> u32 drives the dock badge (slackless_core::platform); the
 //!   sidebar's activity part is pushed from the feed's unread rows
 //!
@@ -199,7 +199,7 @@
 //! the sidebar's Files list column)
 //!   FilesPage::new(Arc<Fixtures>, &mut Window, &mut App) -> Entity<FilesPage>
 //!   open(Arc<Fixtures>, cx) / show_section(FilesSection, ..) / land(&FilesFilter, ..)
-//!   emits FilesPageEvent::Load(FilesFilter) (forwarded to the core as Command::LoadFiles);
+//!   emits FilesPageEvent::Load(FilesFilter) (forwarded to the core as CollabCommand::LoadFiles);
 //!   the sidebar emits SidebarEvent::OpenFiles and ShowFilesSection(FilesSection)
 //!
 //! app.rs
@@ -239,15 +239,18 @@ use gpui_kit::gpui::{
     actions, anchored, canvas, deferred, div, hsla, point, px, relative,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
-use slackless_core::platform::{self, DesktopPlatform, StatusBarState};
-#[cfg(not(test))]
-use slackless_core::platform::{MouseNavDirection, StatusBarAction};
 use slackless_core::types::rich_text::BroadcastRange;
 use slackless_core::types::{
     Block, ChannelId, Conversation, ConversationKind, File, Message, RichTextContainer,
     RichTextElement, Team, Ts, UserId, Usergroup,
 };
-use slackless_core::{Command, Event, NotifyLevel, SharedStore};
+use slackless_core::{
+    ChannelCommand, CollabCommand, Command, Event, HuddleCommand, HuddleControlCommand,
+    HuddleEvent, HuddleMediaEvent, MessagingCommand, NotifyLevel, SharedStore, WorkspaceCommand,
+};
+use slackless_platform::{self as platform, DesktopPlatform, StatusBarState};
+#[cfg(not(test))]
+use slackless_platform::{MouseNavDirection, StatusBarAction};
 
 use crate::actions::{
     self, FocusDeleteMessage, FocusEditMessage, FocusForwardMessage, FocusMarkMessageUnread,
@@ -268,9 +271,9 @@ use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent, PickerTab};
 use crate::files_page::{FilesPage, FilesPageEvent, FilesSection};
 use crate::fixtures::{self, Fixtures};
 use crate::hover_card;
-use crate::huddle::{self, HuddleBar, HuddleEvent};
 use crate::huddle_dock::HuddleDock;
 use crate::huddle_invite::HuddleInviteBanner;
+use crate::huddle_state::{self, HuddleState, HuddleStateEvent};
 use crate::huddles::{self, HuddlesEvent, HuddlesView};
 use crate::image_viewer::{ImageViewer, ViewerEvent, ViewerImage};
 use crate::later::{LaterEvent, LaterView, Remind, SaveRequest};
@@ -427,7 +430,6 @@ struct WorkspaceViews {
     thread: Entity<ThreadPanel>,
     results: Entity<SearchView>,
     browser: Entity<ChannelBrowser>,
-    huddle: Option<(ChannelId, Entity<HuddleBar>)>,
     profile: Entity<ProfilePanel>,
     switcher: Entity<QuickSwitcher>,
 }
@@ -636,11 +638,11 @@ pub struct App {
     /// Which right-hand flexpane is currently open (thread, profile, or pins).
     right_pane: RightPane,
     tab: ConversationTab,
-    /// The fixture huddle's bar and the channel it runs in; `None` without a huddle.
-    huddle: Option<(ChannelId, Entity<HuddleBar>)>,
-    huddle_open: bool,
     /// Active native audio huddle session snapshot (Chime SFU).
     huddle_session: Option<slackless_core::huddle::HuddleSessionSnapshot>,
+    /// Shared huddle UI state observed by `HuddleDock`, `PopoutKind::Huddle`, and `HuddleFloatingPanel`.
+    huddle_state: Option<Entity<HuddleState>>,
+    _huddle_state_sub: Option<Subscription>,
     /// Persistent sidebar mini-dock mounted at the bottom of the sidebar while in a huddle.
     huddle_dock: Option<Entity<HuddleDock>>,
     huddle_floating_panel: Option<gpui::AnyWindowHandle>,
@@ -733,7 +735,7 @@ pub struct App {
     /// The connect banner's lines for the open conversation, recomputed when its members or
     /// the snapshot change - never per frame.
     connect_orgs: Vec<channel_details::OrgLine>,
-    /// A compose send waiting for its DM to open ([`Command::OpenDm`]).
+    /// A compose send waiting for its DM to open ([`ChannelCommand::OpenDm`]).
     pending_dm: Option<MessageContent>,
     /// In-canvas Find field (`F-SHELL-266`).
     canvas_search: Entity<TextareaState>,

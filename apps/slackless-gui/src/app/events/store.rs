@@ -100,8 +100,8 @@ impl App {
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
         self.tools_page
             .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
-        if let Some(dock) = &self.huddle_dock {
-            dock.update(cx, |dock, cx| dock.set_fixtures(fixtures, cx));
+        if let Some(state) = &self.huddle_state {
+            state.update(cx, |state, cx| state.set_fixtures(fixtures, cx));
         }
     }
 
@@ -446,7 +446,7 @@ impl App {
             .into_iter()
             .collect();
         if !named.is_empty() {
-            self.bridge.send(Command::ResolveUsers(named));
+            self.bridge.send(WorkspaceCommand::ResolveUsers(named));
         }
     }
 
@@ -474,7 +474,7 @@ impl App {
             .into_iter()
             .collect();
         if !bots.is_empty() {
-            self.bridge.send(Command::ResolveBots(bots));
+            self.bridge.send(WorkspaceCommand::ResolveBots(bots));
         }
     }
 }

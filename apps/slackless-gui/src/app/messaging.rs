@@ -19,7 +19,8 @@ impl App {
             self.messages.update(cx, |list, cx| {
                 list.delete(&ts, cx);
             });
-            self.bridge.send(Command::DeleteMessage { channel, ts });
+            self.bridge
+                .send(MessagingCommand::DeleteMessage { channel, ts });
             actions::notify("Message unsent", "Deleted your last message.", window, cx);
         }
     }
@@ -88,41 +89,47 @@ impl App {
     /// Post a reaction, edit or deletion a view already shows to Slack.
     pub(super) fn post_change(&self, channel: &ChannelId, change: &MessageChange) {
         let channel = channel.clone();
-        self.bridge.send(match change {
+        let cmd: Command = match change {
             MessageChange::React { ts, name, add } => {
                 let (ts, name) = (ts.clone(), name.clone());
                 if *add {
-                    Command::AddReaction { channel, ts, name }
+                    MessagingCommand::AddReaction { channel, ts, name }.into()
                 } else {
-                    Command::RemoveReaction { channel, ts, name }
+                    MessagingCommand::RemoveReaction { channel, ts, name }.into()
                 }
             }
-            MessageChange::Edit { ts, content } => Command::EditMessage {
+            MessageChange::Edit { ts, content } => MessagingCommand::EditMessage {
                 channel,
                 ts: ts.clone(),
                 content: content.clone(),
-            },
-            MessageChange::Delete { ts } => Command::DeleteMessage {
+            }
+            .into(),
+            MessageChange::Delete { ts } => MessagingCommand::DeleteMessage {
                 channel,
                 ts: ts.clone(),
-            },
-            MessageChange::Pin { ts, pinned } => Command::SetPinned {
+            }
+            .into(),
+            MessageChange::Pin { ts, pinned } => MessagingCommand::SetPinned {
                 channel,
                 ts: ts.clone(),
                 pinned: *pinned,
-            },
-            MessageChange::MarkUnread { ts } => Command::MarkRead {
+            }
+            .into(),
+            MessageChange::MarkUnread { ts } => MessagingCommand::MarkRead {
                 channel,
                 ts: ts.clone(),
-            },
-            MessageChange::BlockAction(dispatch) => Command::BlockAction {
+            }
+            .into(),
+            MessageChange::BlockAction(dispatch) => CollabCommand::BlockAction {
                 bot: dispatch.bot.clone(),
                 app_id: dispatch.app_id.clone(),
                 team: dispatch.team.clone(),
                 action: dispatch.action.clone(),
                 container: dispatch.container.clone(),
-            },
-        });
+            }
+            .into(),
+        };
+        self.bridge.send(cmd);
     }
 
     /// Route a pick: composers get the emoji, messages a reaction.
@@ -217,7 +224,7 @@ impl App {
                 );
             }
             if let Ok(encoded) = crate::blockkit::serde_json::to_string(&map) {
-                self.bridge.send(Command::SetUserPref {
+                self.bridge.send(WorkspaceCommand::SetUserPref {
                     name: "emoji_use".to_owned(),
                     value: encoded,
                 });
@@ -336,7 +343,7 @@ impl App {
                     .insert(channel.clone(), target_ts.clone());
             }
         }
-        self.bridge.send(Command::MarkRead {
+        self.bridge.send(MessagingCommand::MarkRead {
             channel: channel.clone(),
             ts: target_ts,
         });
@@ -422,7 +429,7 @@ impl App {
             .is_some_and(|prev| *prev == ts);
         if !already_marked {
             self.ws.marked_threads.insert(key, ts.clone());
-            self.bridge.send(Command::MarkThreadRead {
+            self.bridge.send(MessagingCommand::MarkThreadRead {
                 channel: channel.clone(),
                 thread_ts: thread_ts.clone(),
                 ts: ts.clone(),
@@ -445,7 +452,7 @@ impl App {
         self.ws
             .marked_threads
             .insert((channel.clone(), thread_ts.clone()), cursor.clone());
-        self.bridge.send(Command::MarkThreadRead {
+        self.bridge.send(MessagingCommand::MarkThreadRead {
             channel: channel.clone(),
             thread_ts: thread_ts.clone(),
             ts: cursor.clone(),
@@ -468,7 +475,7 @@ impl App {
             let key = (channel.clone(), thread_ts.clone());
             if self.ws.marked_threads.get(&key) != Some(&ts) {
                 self.ws.marked_threads.insert(key, ts.clone());
-                self.bridge.send(Command::MarkThreadRead {
+                self.bridge.send(MessagingCommand::MarkThreadRead {
                     channel,
                     thread_ts,
                     ts,
@@ -488,7 +495,7 @@ impl App {
             let key = (channel.clone(), thread_ts.clone());
             if self.ws.marked_threads.get(&key) != Some(&ts) {
                 self.ws.marked_threads.insert(key, ts.clone());
-                self.bridge.send(Command::MarkThreadRead {
+                self.bridge.send(MessagingCommand::MarkThreadRead {
                     channel,
                     thread_ts,
                     ts,
@@ -540,7 +547,7 @@ impl App {
     /// Shift+Esc: Slack marks every conversation and thread read (`users.markAllRead`); the
     /// sidebar un-bolds at once and the core's fresh counts follow.
     pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
-        self.bridge.send(Command::MarkAllRead);
+        self.bridge.send(MessagingCommand::MarkAllRead);
         for (id, counts) in &mut self.ws.counts {
             counts.clear_unreads();
             if let Some(latest) = counts.latest.clone() {
@@ -599,7 +606,7 @@ impl App {
             .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
         self.persist_drafts(cx);
         if !self.fixtures.sample {
-            self.bridge.send(Command::SyncDraft {
+            self.bridge.send(MessagingCommand::SyncDraft {
                 channel: self.channel.clone(),
                 text: text_for_cloud,
             });
@@ -665,7 +672,7 @@ impl App {
         } = spec;
         if !self.fixtures.sample {
             let content = composer::content_of(&text, &self.fixtures);
-            self.bridge.send(Command::ScheduleMessage {
+            self.bridge.send(MessagingCommand::ScheduleMessage {
                 channel: channel.clone(),
                 post_at,
                 content,
@@ -705,7 +712,7 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         if let Some(id) = entry.id.take() {
-            self.bridge.send(Command::DeleteScheduledMessage {
+            self.bridge.send(MessagingCommand::DeleteScheduledMessage {
                 channel: entry.channel.clone(),
                 scheduled_message_id: id,
             });
@@ -721,7 +728,7 @@ impl App {
             self.messages
                 .update(cx, |list, cx| list.append(channel, message, cx));
         }
-        self.bridge.send(Command::SendMessage {
+        self.bridge.send(MessagingCommand::SendMessage {
             channel: entry.channel.clone(),
             content,
             thread_ts: None,
@@ -757,7 +764,7 @@ impl App {
                 Some((channel, thread_ts)) => (channel, Some(thread_ts)),
                 None => (self.channel.clone(), None),
             };
-            self.bridge.send(Command::RunCommand {
+            self.bridge.send(MessagingCommand::RunCommand {
                 channel,
                 command: format!("/{}", invocation.name),
                 args: invocation.args.clone(),
@@ -782,7 +789,7 @@ impl App {
             SlashKind::Away => {
                 self.self_state.away = !self.self_state.away;
                 if !self.fixtures.sample {
-                    self.bridge.send(Command::SetPresence {
+                    self.bridge.send(WorkspaceCommand::SetPresence {
                         away: self.self_state.away,
                     });
                 }
@@ -805,7 +812,7 @@ impl App {
                 Some(None) => {
                     self.self_state.paused_until = None;
                     if !self.fixtures.sample {
-                        self.bridge.send(Command::EndDndSnooze);
+                        self.bridge.send(WorkspaceCommand::EndDndSnooze);
                     }
                     self.push_self_state(cx);
                     notify("/dnd", "Notifications resumed.", window, cx);
@@ -814,7 +821,7 @@ impl App {
                     let until = crate::messages::now_secs() + i64::from(minutes) * 60;
                     self.self_state.paused_until = Some(until);
                     if !self.fixtures.sample {
-                        self.bridge.send(Command::SetDndSnooze { minutes });
+                        self.bridge.send(WorkspaceCommand::SetDndSnooze { minutes });
                     }
                     self.push_self_state(cx);
                     notify(
@@ -1107,7 +1114,7 @@ impl App {
                     move |app, _window, cx| {
                         let mut c = content.clone();
                         app.sanitize_outgoing_content(&mut c, cx);
-                        app.bridge.send(Command::SendMessage {
+                        app.bridge.send(MessagingCommand::SendMessage {
                             channel: channel.clone(),
                             content: c,
                             thread_ts: Some(thread_ts.clone()),
@@ -1124,7 +1131,7 @@ impl App {
             }
         }
         self.sanitize_outgoing_content(&mut content, cx);
-        self.bridge.send(Command::SendMessage {
+        self.bridge.send(MessagingCommand::SendMessage {
             channel,
             content,
             thread_ts: Some(thread_ts),
@@ -1171,7 +1178,7 @@ impl App {
         };
         self.drafts
             .update(cx, |drafts, cx| drafts.record_sent(entry, cx));
-        self.bridge.send(Command::SendMessage {
+        self.bridge.send(MessagingCommand::SendMessage {
             channel,
             content,
             thread_ts: None,
@@ -1222,7 +1229,7 @@ impl App {
                     bytes: f.bytes,
                 })
                 .collect();
-            self.bridge.send(Command::UploadFiles {
+            self.bridge.send(CollabCommand::UploadFiles {
                 channel,
                 thread_ts,
                 content,
@@ -1569,7 +1576,7 @@ impl App {
             }
             MessageAction::SendToChannel => {
                 let content = crate::composer::content_of(&message.text, &self.fixtures);
-                self.bridge.send(Command::SendMessage {
+                self.bridge.send(MessagingCommand::SendMessage {
                     channel,
                     content,
                     thread_ts: Some(thread_ts),
@@ -1680,11 +1687,13 @@ impl App {
                                             .on_click(move |_, window, cx| {
                                                 window.close_dialog(cx);
                                                 let _ = this_row.update(cx, |app, _| {
-                                                    app.bridge.send(Command::AddMessageToList {
-                                                        list_id: lid_click.clone(),
-                                                        channel: ch_row.clone(),
-                                                        ts: ts_row.clone(),
-                                                    });
+                                                    app.bridge.send(
+                                                        CollabCommand::AddMessageToList {
+                                                            list_id: lid_click.clone(),
+                                                            channel: ch_row.clone(),
+                                                            ts: ts_row.clone(),
+                                                        },
+                                                    );
                                                 });
                                             })
                                             .child(div().text_sm().child(title))
@@ -1729,7 +1738,7 @@ impl App {
                                     }
                                     window.close_dialog(cx);
                                     let _ = this_ok.update(cx, |app, _| {
-                                        app.bridge.send(Command::AddMessageToList {
+                                        app.bridge.send(CollabCommand::AddMessageToList {
                                             list_id,
                                             channel: ch_ok.clone(),
                                             ts: ts_ok.clone(),

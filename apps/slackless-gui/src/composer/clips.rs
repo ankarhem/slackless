@@ -148,7 +148,7 @@ impl Composer {
                                 let thumbs = clip
                                     .thumbnail_frames
                                     .iter()
-                                    .filter_map(crate::huddle_dock::frame_to_render_image)
+                                    .filter_map(crate::huddle_video::frame_to_render_image)
                                     .collect::<Vec<_>>();
                                 if thumbs.is_empty() {
                                     composer.attachments.push(PendingAttachment {
@@ -220,7 +220,7 @@ impl Composer {
                         }
                         if let ActiveClipRecorder::Video { recorder, .. } = active
                             && let Some(vf) = recorder.latest_preview()
-                            && let Some(img) = crate::huddle_dock::frame_into_render_image(vf)
+                            && let Some(img) = crate::huddle_video::frame_into_render_image(vf)
                             && let Some(old) = composer.clip_preview.replace(img)
                         {
                             cx.drop_image(old, None);
