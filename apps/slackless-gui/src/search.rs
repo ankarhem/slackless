@@ -1631,6 +1631,21 @@ mod tests {
                 },
             )
             .unwrap();
+        store
+            .insert_huddle_transcript_segment(
+                &team_id,
+                &slackless_core::store::NewHuddleTranscriptSegment {
+                    channel: &ch_eng.id,
+                    call_id: "R0HUDDLE1",
+                    thread_root_ts: None,
+                    speaker_id: Some(&UserId::from("U0ALICE")),
+                    lang: Some("sv"),
+                    source: "parakeet-v3",
+                    text: "Vi tar ett snabbt möte om nya releasen efter lunch.",
+                    at_ms: 1_700_000_100_000,
+                },
+            )
+            .unwrap();
         let archive: SharedStore = Arc::new(Mutex::new(store));
 
         let mut fx = crate::fixtures::load();
@@ -1811,6 +1826,13 @@ mod tests {
                 .map(|c| c.id.as_str())
                 .collect();
             assert_eq!(matched_ids, vec!["C0ENG", "C0OPS"]);
+
+            // 5. Huddle transcripts tab searches local SQLite FTS5 with Swedish åäö diacritic folding.
+            v.set_tab(SearchTab::Transcripts, cx);
+            v.run("mote".into(), cx);
+            assert_eq!(v.transcript_results.len(), 1);
+            assert_eq!(v.transcript_results[0].call_id, "R0HUDDLE1");
+            assert_eq!(v.transcript_results[0].lang.as_deref(), Some("sv"));
         });
     }
 }

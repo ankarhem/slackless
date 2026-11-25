@@ -56,7 +56,9 @@ pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_sc
 pub use session::spawn_huddle_session;
 pub use signaling::install_default_crypto_provider;
 pub use transcribe::{
-    WhisperSetupStatus, default_whisper_model_dir, detect_spoken_lang, detect_whisper_setup,
+    ModelDownloadProgress, ProviderSetupStatus, TranscriptionProvider, default_parakeet_model_dir,
+    default_whisper_model_dir, delete_provider_model, detect_provider_setup, detect_spoken_lang,
+    download_provider_model,
 };
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,
@@ -141,8 +143,8 @@ pub struct HuddleAudioConfig {
     pub aec: bool,
     pub ns: bool,
     pub agc: bool,
-    /// Opt-in local multilingual (English + Swedish auto-detect) Whisper transcription.
-    pub local_transcribe: bool,
+    /// Opt-in huddle transcription provider (`SlackBuiltIn` default, `ParakeetV3`, or `WhisperTurbo`).
+    pub transcription_provider: TranscriptionProvider,
 }
 
 impl Default for HuddleAudioConfig {
@@ -156,7 +158,7 @@ impl Default for HuddleAudioConfig {
             aec: true,
             ns: true,
             agc: true,
-            local_transcribe: false,
+            transcription_provider: TranscriptionProvider::SlackBuiltIn,
         }
     }
 }

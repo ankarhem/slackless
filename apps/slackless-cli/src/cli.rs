@@ -592,9 +592,9 @@ pub(crate) enum HuddleCommand {
         /// Share a monitor or window source ID once connected (e.g. `monitor:2` from `huddle screens`).
         #[arg(long, value_name = "SOURCE_ID")]
         screen: Option<String>,
-        /// Enable opt-in local multilingual (English + Swedish auto-detect) Whisper transcription.
-        #[arg(long)]
-        transcribe: bool,
+        /// Transcription provider: `slack` (default), `parakeet` (local ONNX EN+SV), or `whisper` (local Whisper Turbo EN+SV).
+        #[arg(long, value_name = "PROVIDER", default_value = "slack")]
+        transcribe: String,
     },
     /// Search, list, or export locally archived text-only huddle transcripts (offline).
     Transcripts {

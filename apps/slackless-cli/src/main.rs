@@ -339,8 +339,18 @@ async fn dispatch(
                 transcribe,
             } => {
                 live::run_huddle_join(
-                    ctx, flag, &channel, muted, duration, input, output, react, camera, blur,
-                    screen, transcribe,
+                    ctx,
+                    flag,
+                    &channel,
+                    muted,
+                    duration,
+                    input,
+                    output,
+                    react,
+                    camera,
+                    blur,
+                    screen,
+                    &transcribe,
                 )
                 .await
             }

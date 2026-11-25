@@ -386,15 +386,19 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         } if ch == "#eng" && q == "möte" && l == "sv"
     ));
     assert!(matches!(
-        Cli::try_parse_from(["slackless", "huddle", "join", "#eng", "--transcribe"])
-            .unwrap()
-            .command,
+        Cli::try_parse_from([
+            "slackless",
+            "huddle",
+            "join",
+            "#eng",
+            "--transcribe",
+            "parakeet"
+        ])
+        .unwrap()
+        .command,
         Commands::Huddle {
-            command: HuddleCommand::Join {
-                transcribe: true,
-                ..
-            }
-        }
+            command: HuddleCommand::Join { ref transcribe, .. }
+        } if transcribe == "parakeet"
     ));
 
     // Thread live, digest defaults, upload multi-file, export defaults, nested subcommands.

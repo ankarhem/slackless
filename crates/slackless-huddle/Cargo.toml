@@ -6,10 +6,12 @@ license.workspace = true
 
 [dependencies]
 slackless-types.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "multipart"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -29,6 +31,8 @@ openh264 = "0.9"
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false }
+transcribe-rs = { version = "0.3.12", features = ["onnx"] }
+ort = "=2.0.0-rc.12"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 nokhwa = { version = "0.10", features = ["input-native"] }

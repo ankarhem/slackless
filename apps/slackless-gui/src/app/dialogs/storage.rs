@@ -479,6 +479,16 @@ impl App {
                     .unwrap_or_default()
             };
         let subtitle = format!("{} · {}", self.label(&channel), ts);
+        self.open_revision_history_with(subtitle, revisions, window, cx);
+    }
+
+    pub(in crate::app) fn open_revision_history_with(
+        &self,
+        subtitle: String,
+        revisions: Vec<(String, bool, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.open_dialog(cx, move |dialog, _, cx| {
             let theme = cx.theme();
             let (border, muted, danger, success, foreground, card_bg, font) = (
@@ -510,11 +520,35 @@ impl App {
                     let content_el: AnyElement = if ix > 0 && revisions[ix - 1].2 != *text {
                         let segments = slackless_core::diff_words(&revisions[ix - 1].2, text);
                         let mut combined = String::new();
-                        let mut runs = Vec::with_capacity(segments.len());
+                        let mut runs = Vec::with_capacity(segments.len() * 2);
+                        let mut prev_kind: Option<slackless_core::DiffKind> = None;
                         for seg in segments {
                             let len = seg.text.len();
                             if len == 0 {
                                 continue;
+                            }
+                            if matches!(
+                                (prev_kind, seg.kind),
+                                (
+                                    Some(slackless_core::DiffKind::Removed),
+                                    slackless_core::DiffKind::Added
+                                ) | (
+                                    Some(slackless_core::DiffKind::Added),
+                                    slackless_core::DiffKind::Removed
+                                )
+                            ) {
+                                combined.push(' ');
+                                runs.push(gpui::TextRun {
+                                    len: 1,
+                                    font: gpui::Font {
+                                        family: font.clone(),
+                                        ..Default::default()
+                                    },
+                                    color: foreground,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                });
                             }
                             combined.push_str(&seg.text);
                             let (color, background_color, strikethrough) = match seg.kind {
@@ -542,6 +576,7 @@ impl App {
                                 underline: None,
                                 strikethrough,
                             });
+                            prev_kind = Some(seg.kind);
                         }
                         if combined.is_empty() {
                             div()
@@ -630,7 +665,6 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let fixtures = self.fixtures.clone();
         let segments: Vec<slackless_core::store::HuddleTranscriptSegment> =
             if let (Some(store), Some(team)) = (self.bridge.store(), self.bridge.team_id()) {
                 store
@@ -641,6 +675,18 @@ impl App {
             } else {
                 Vec::new()
             };
+        self.open_huddle_transcript_with(call_id, channel, segments, window, cx);
+    }
+
+    pub(in crate::app) fn open_huddle_transcript_with(
+        &self,
+        call_id: String,
+        channel: ChannelId,
+        segments: Vec<slackless_core::store::HuddleTranscriptSegment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fixtures = self.fixtures.clone();
         let ch_label = self.label(&channel);
         let subtitle = format!(
             "{ch_label} \u{b7} {call_id} \u{b7} {} lines",

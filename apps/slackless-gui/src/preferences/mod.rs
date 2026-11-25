@@ -260,6 +260,12 @@ const ENTER_OPTIONS: [&str; 2] = [
     "Start a new line (\u{2318}+Enter sends)",
 ];
 const OPEN_LINKS: [&str; 3] = ["Default browser", "Safari", "Firefox"];
+/// Opt-in huddle transcription provider selector (Preferences -> Audio & video).
+pub const TRANSCRIPTION_PROVIDERS: [&str; 3] = [
+    "Slack built-in (AWS Transcribe)",
+    "Parakeet TDT 0.6B v3 (Local)",
+    "Whisper Large v3 Turbo (Local)",
+];
 
 /// Every preference, in memory. Pure-choice settings are indexes into the option tables
 /// next to their controls; what the app acts on is typed.
@@ -439,8 +445,9 @@ pub struct Settings {
     pub huddle_auto_captions: bool,
     /// Save finalized huddle captions into local SQLite FTS5 (text-only; zero audio on disk).
     pub huddle_save_transcripts: bool,
-    /// Opt-in local multilingual (English + Swedish auto-detect) Whisper transcription via `whisper-cli`.
-    pub huddle_local_transcribe: bool,
+    /// Opt-in huddle transcription provider index into [`TRANSCRIPTION_PROVIDERS`]
+    /// (`0` = Slack built-in, `1` = Parakeet TDT 0.6B v3 local ONNX, `2` = Whisper Large v3 Turbo).
+    pub huddle_transcription_provider: usize,
     /// Play gentle ambient music when waiting alone in a huddle (`F-COLLAB-058`).
     pub huddle_music_when_alone: bool,
 }
@@ -720,13 +727,20 @@ impl Default for Settings {
             huddle_reaction_animations: true,
             huddle_auto_captions: false,
             huddle_save_transcripts: true,
-            huddle_local_transcribe: false,
+            huddle_transcription_provider: 0,
             huddle_music_when_alone: true,
         }
     }
 }
 
 impl Settings {
+    /// Active huddle transcription provider (`SlackBuiltIn` by default; local models opt-in).
+    pub fn transcription_provider(&self) -> slackless_core::huddle::TranscriptionProvider {
+        slackless_core::huddle::TranscriptionProvider::from_index(
+            self.huddle_transcription_provider,
+        )
+    }
+
     /// Clean, normalized list of one-click reaction shortcodes (empty when disabled).
     pub fn resolved_quick_reactions(&self) -> Vec<String> {
         if !self.show_quick_reactions {
@@ -924,6 +938,8 @@ pub struct Preferences {
     camera_probe_gen: u64,
     camera_probe: Option<slackless_core::huddle::CameraPreviewProbe>,
     camera_frame: Option<std::sync::Arc<gpui_kit::gpui::RenderImage>>,
+    stt_downloading: Option<slackless_core::huddle::TranscriptionProvider>,
+    stt_download_status: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1094,6 +1110,8 @@ impl Preferences {
                 camera_probe_gen: 0,
                 camera_probe: None,
                 camera_frame: None,
+                stt_downloading: None,
+                stt_download_status: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -1166,6 +1184,14 @@ impl Preferences {
     pub fn set_stealth_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if self.settings.stealth_mode != enabled {
             self.settings.stealth_mode = enabled;
+            self.changed(cx);
+        }
+    }
+
+    /// Select a huddle transcription provider index (`0`=Slack, `1`=Parakeet v3, `2`=Whisper Turbo).
+    pub fn set_transcription_provider(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.settings.huddle_transcription_provider != index {
+            self.settings.huddle_transcription_provider = index;
             self.changed(cx);
         }
     }

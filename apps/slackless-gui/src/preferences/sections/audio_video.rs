@@ -252,6 +252,7 @@ impl Preferences {
         let transcripts_group = self.audio_video_transcripts(cx);
 
         v_flex()
+            .child(transcripts_group)
             .child(camera_group)
             .child(self.group(
                 "Microphone",
@@ -271,51 +272,17 @@ impl Preferences {
                 dsp,
                 cx,
             ))
-            .child(transcripts_group)
             .child(self.group("When joining a huddle", None, behavior, cx))
     }
 
     fn audio_video_transcripts(&mut self, cx: &mut Context<Self>) -> Div {
-        let setup = slackless_core::huddle::detect_whisper_setup(None, None);
-        let theme = cx.theme();
-        let dot_color = if setup.is_ready() {
-            theme.success
-        } else if self.settings.huddle_local_transcribe {
-            theme.warning
-        } else {
-            theme.muted_foreground
-        };
-        let (title, note) = if setup.is_ready() {
-            let model_name = setup
-                .model
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("model");
-            (
-                "Local EN/SV Whisper ready",
-                format!("Using {model_name} with automatic English + Swedish language detection."),
-            )
-        } else {
-            (
-                "Local Whisper optional (0 MB on disk)",
-                format!(
-                    "Slack live captions archive automatically. For offline EN/SV code-switching fallback, install `brew install whisper-cpp` and place a multilingual model (e.g. `ggml-small.bin`) in {}.",
-                    setup.default_model_dir.display()
-                ),
-            )
-        };
-        let status = self.status_card(
-            dot_color,
-            title,
-            Some(SharedString::from(if setup.is_ready() {
-                "EN + SV auto"
-            } else {
-                "Not installed"
-            })),
-            note,
-            false,
-            div(),
+        let provider = self.settings.transcription_provider();
+        let setup = slackless_core::huddle::detect_provider_setup(provider);
+        let downloading = self.stt_downloading == Some(provider);
+        let provider_select = self.select(
+            "prefs-huddle-stt-provider",
+            &TRANSCRIPTION_PROVIDERS,
+            |s| &mut s.huddle_transcription_provider,
             cx,
         );
         let save_toggle = self.checkbox(
@@ -324,22 +291,210 @@ impl Preferences {
             |s| &mut s.huddle_save_transcripts,
             cx,
         );
-        let local_stt_toggle = self.checkbox(
-            "prefs-huddle-local-transcribe",
-            "Enable local multilingual transcription (English + Swedish auto-detect per utterance)",
-            |s| &mut s.huddle_local_transcribe,
-            cx,
-        );
+        let (link_color, success_color, warn_color) = {
+            let theme = cx.theme();
+            (theme.link, theme.success, theme.warning)
+        };
+
+        let status_card = if provider.is_local() {
+            let dot_color = if downloading {
+                link_color
+            } else if setup.is_ready() {
+                success_color
+            } else {
+                warn_color
+            };
+            let (title, badge, note) = if downloading {
+                (
+                    format!("Downloading {}…", provider.label()),
+                    "Downloading",
+                    self.stt_download_status
+                        .clone()
+                        .unwrap_or_else(|| "Fetching model weights from Hugging Face…".to_owned()),
+                )
+            } else if setup.is_ready() {
+                (
+                    format!("{} ready", provider.label()),
+                    "Ready (EN + SV)",
+                    format!(
+                        "{} on disk · loads into RAM only during active huddles (0 MB idle).",
+                        format_bytes(setup.disk_bytes)
+                    ),
+                )
+            } else if !setup.model_ready {
+                let extra = if !setup.binary_ready {
+                    " Also install brew install whisper-cpp for local Whisper."
+                } else {
+                    " Runs natively in-process (no external tools required)."
+                };
+                (
+                    format!("Model not downloaded ({})", setup.download_size_hint),
+                    "Opt-in",
+                    self.stt_download_status.clone().unwrap_or_else(|| {
+                        format!(
+                            "0 MB on disk until you click Download.{extra} Stored in {}.",
+                            setup.model_path.display()
+                        )
+                    }),
+                )
+            } else {
+                (
+                    "Whisper runtime missing".to_owned(),
+                    "Install whisper-cpp",
+                    "Model weights found, but whisper-server / whisper-cli was not detected. Run: brew install whisper-cpp".to_owned(),
+                )
+            };
+
+            let actions = h_flex()
+                .items_center()
+                .gap_1p5()
+                .when(!setup.model_ready, |row| {
+                    row.child(
+                        Button::new("prefs-stt-download")
+                            .primary()
+                            .with_size(Size::Small)
+                            .icon(IconName::Download)
+                            .disabled(self.stt_downloading.is_some())
+                            .label(if downloading {
+                                "Downloading…".to_owned()
+                            } else {
+                                format!("Download ({})", setup.download_size_hint)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_stt_model_download(provider, cx);
+                            })),
+                    )
+                })
+                .when(setup.model_ready && !downloading, |row| {
+                    row.child(
+                        Button::new("prefs-stt-delete")
+                            .ghost()
+                            .with_size(Size::Small)
+                            .icon(IconName::Trash)
+                            .label("Remove model")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match slackless_core::huddle::delete_provider_model(provider) {
+                                    Ok(freed) => {
+                                        this.stt_download_status = Some(format!(
+                                            "Removed local model (reclaimed {}).",
+                                            format_bytes(freed)
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        this.stt_download_status =
+                                            Some(format!("Could not remove model: {err}"));
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    )
+                });
+
+            Some(self.status_card(
+                dot_color,
+                title,
+                Some(SharedString::from(badge)),
+                note,
+                false,
+                actions,
+                cx,
+            ))
+        } else {
+            None
+        };
+
         self.group(
             "Searchable transcripts (EN + SV)",
-            Some("Zero audio or video files are stored on disk. Finalized caption lines are indexed in FTS5 and searchable under Search \u{2192} Huddles."),
+            Some("Choose Slack's built-in captions (0 MB on disk) or swap to a local multilingual English + Swedish model loaded only during active huddles. Zero audio or video is ever saved."),
             v_flex()
-                .gap_2()
-                .child(save_toggle)
-                .child(local_stt_toggle)
-                .child(status),
+                .gap_2p5()
+                .child(self.labeled("Transcription provider", provider_select))
+                .children(status_card)
+                .child(save_toggle),
             cx,
         )
+    }
+
+    fn start_stt_model_download(
+        &mut self,
+        provider: slackless_core::huddle::TranscriptionProvider,
+        cx: &mut Context<Self>,
+    ) {
+        if self.stt_downloading.is_some() || !provider.is_local() {
+            return;
+        }
+        self.stt_downloading = Some(provider);
+        self.stt_download_status = Some("Connecting to Hugging Face…".to_owned());
+        cx.notify();
+
+        let progress_note: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let done_result: std::sync::Arc<
+            std::sync::Mutex<Option<Result<std::path::PathBuf, String>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        let prog_writer = std::sync::Arc::clone(&progress_note);
+        let done_writer = std::sync::Arc::clone(&done_result);
+        std::thread::Builder::new()
+            .name("slackless-stt-download".to_owned())
+            .spawn(move || {
+                let res = slackless_core::huddle::download_provider_model(provider, move |p| {
+                    let pct = p
+                        .total_bytes
+                        .filter(|&t| t > 0)
+                        .map(|t| format!(" · {}%", (p.downloaded_bytes * 100 / t).min(100)))
+                        .unwrap_or_default();
+                    let line = format!(
+                        "[{}/{}] {} ({}{})",
+                        p.file_index,
+                        p.file_count,
+                        p.file_name,
+                        format_bytes(p.downloaded_bytes),
+                        pct
+                    );
+                    if let Ok(mut guard) = prog_writer.lock() {
+                        *guard = Some(line);
+                    }
+                });
+                if let Ok(mut guard) = done_writer.lock() {
+                    *guard = Some(res);
+                }
+            })
+            .ok();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(180))
+                    .await;
+                let latest_prog = progress_note.lock().ok().and_then(|g| g.clone());
+                let finished = done_result.lock().ok().and_then(|mut g| g.take());
+                let keep = this
+                    .update(cx, |prefs, cx| {
+                        if let Some(res) = finished {
+                            prefs.stt_downloading = None;
+                            prefs.stt_download_status = match res {
+                                Ok(_) => None,
+                                Err(err) => Some(format!("Download failed: {err}")),
+                            };
+                            cx.notify();
+                            return false;
+                        }
+                        if let Some(line) = latest_prog
+                            && prefs.stt_download_status.as_deref() != Some(line.as_str())
+                        {
+                            prefs.stt_download_status = Some(line);
+                            cx.notify();
+                        }
+                        prefs.stt_downloading.is_some()
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn audio_video_camera(&mut self, cx: &mut Context<Self>) -> Div {

@@ -2053,3 +2053,85 @@ fn accessibility_cross_workspace_summary_and_replay_focused_message(cx: &mut gpu
     });
     drop(root);
 }
+
+#[gpui::test]
+fn wave1_and_wave2_gui_secret_guard_link_scrubber_stealth_and_stt_provider(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // 1. Pre-send secret guard blocks sending a leaked token and opens confirmation modal.
+            let leaked = format!(
+                "API_KEY={} rotate me",
+                ["xoxb", "1234567890", "abcdefghij123456"].join("-")
+            );
+            let before_msgs = app.messages.read(cx).message_count_for_test(cx);
+            app.send(MessageContent::plain(leaked), window, cx);
+            assert_eq!(
+                app.messages.read(cx).message_count_for_test(cx),
+                before_msgs,
+                "secret guard must block send until confirmed"
+            );
+            window.close_dialog(cx);
+
+            // 2. Outgoing tracking-parameter scrubber cleans text + rich-text links.
+            let mut content = MessageContent::plain(
+                "Check https://example.com/page?utm_source=slack&id=42&fbclid=abc".to_owned(),
+            );
+            app.sanitize_outgoing_content(&mut content, cx);
+            assert_eq!(content.text, "Check https://example.com/page?id=42");
+
+            // 3. Stealth mode toggle updates settings cleanly.
+            app.preferences
+                .update(cx, |p, cx| p.set_stealth_mode(true, cx));
+            app.apply_preferences(window, cx);
+            assert!(app.preferences.read(cx).settings().stealth_mode);
+            app.preferences
+                .update(cx, |p, cx| p.set_stealth_mode(false, cx));
+            app.apply_preferences(window, cx);
+            assert!(!app.preferences.read(cx).settings().stealth_mode);
+
+            // 4. Transcription provider select switches cleanly between Slack, Parakeet v3, and Whisper Turbo.
+            assert_eq!(
+                app.preferences.read(cx).settings().transcription_provider(),
+                slackless_core::huddle::TranscriptionProvider::SlackBuiltIn
+            );
+            app.preferences
+                .update(cx, |p, cx| p.set_transcription_provider(1, cx));
+            assert_eq!(
+                app.preferences.read(cx).settings().transcription_provider(),
+                slackless_core::huddle::TranscriptionProvider::ParakeetV3
+            );
+            app.preferences
+                .update(cx, |p, cx| p.set_transcription_provider(2, cx));
+            assert_eq!(
+                app.preferences.read(cx).settings().transcription_provider(),
+                slackless_core::huddle::TranscriptionProvider::WhisperTurbo
+            );
+        });
+    });
+    drop(root);
+}

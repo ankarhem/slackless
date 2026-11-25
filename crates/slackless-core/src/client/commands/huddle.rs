@@ -79,7 +79,7 @@ impl<B: Backend> Core<B> {
                     .huddle_link
                     .or_else(|| Some(format!("https://app.slack.com/huddle/{team_id}/{channel}"))),
             };
-            let local_transcribe = audio.local_transcribe;
+            let transcript_source = audio.transcription_provider.source_tag();
             let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
             let handle = crate::huddle::spawn_huddle_session(creds, audio, upd_tx);
             let rejected = {
@@ -103,11 +103,7 @@ impl<B: Backend> Core<B> {
                 channel,
                 call_id,
                 thread_root_ts,
-                source: if local_transcribe {
-                    "local-whisper"
-                } else {
-                    "chime"
-                },
+                source: transcript_source,
                 enabled: save_transcripts,
             };
             spawn_huddle_watcher(Arc::clone(&huddle), my_gen, upd_rx, events, Some(persist));

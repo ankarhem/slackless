@@ -236,8 +236,22 @@ pub async fn run_huddle_join(
     camera: bool,
     blur: bool,
     screen: Option<String>,
-    transcribe: bool,
+    transcribe: &str,
 ) -> Result<ExitCode> {
+    let provider = match transcribe.trim().to_ascii_lowercase().as_str() {
+        "" | "slack" | "chime" => slackless_core::huddle::TranscriptionProvider::SlackBuiltIn,
+        "parakeet" | "parakeet-v3" => slackless_core::huddle::TranscriptionProvider::ParakeetV3,
+        "whisper" | "whisper-turbo" => slackless_core::huddle::TranscriptionProvider::WhisperTurbo,
+        other => {
+            return Ok(crate::fail(
+                ctx,
+                "invalid_arguments",
+                &format!(
+                    "unknown --transcribe provider '{other}' (expected slack, parakeet, or whisper)"
+                ),
+            ));
+        }
+    };
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
@@ -256,7 +270,7 @@ pub async fn run_huddle_join(
         input_device: input,
         output_device: output_dev,
         blur_background: blur,
-        local_transcribe: transcribe,
+        transcription_provider: provider,
         ..Default::default()
     };
 
@@ -346,7 +360,7 @@ pub async fn run_huddle_join(
                                 thread_root_ts: thread_root_ts.as_ref(),
                                 speaker_id: Some(user),
                                 lang: lang.as_deref(),
-                                source: if transcribe { "local-whisper" } else { "chime" },
+                                source: provider.source_tag(),
                                 text,
                                 at_ms: seg_at_ms,
                             };

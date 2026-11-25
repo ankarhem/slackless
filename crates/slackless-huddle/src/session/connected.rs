@@ -130,12 +130,17 @@ pub(super) async fn run_connected_loop(
     if let Ok(mut su) = hs.shared.self_user.lock() {
         *su = self_user.clone();
     }
-    if config.local_transcribe
-        && let Some(tap) =
-            crate::transcribe::LocalTranscriber::try_start(updates.clone(), None, None)
+    if config.transcription_provider.is_local()
+        && let Some(tap) = crate::transcribe::LocalTranscriber::try_start(
+            config.transcription_provider,
+            updates.clone(),
+        )
         && let Ok(mut guard) = hs.shared.transcribe_tap.lock()
     {
-        tracing::info!("local multilingual Whisper transcriber active for huddle");
+        tracing::info!(
+            provider = ?config.transcription_provider,
+            "local multilingual transcriber active for huddle"
+        );
         *guard = Some(Arc::new(tap));
     }
 

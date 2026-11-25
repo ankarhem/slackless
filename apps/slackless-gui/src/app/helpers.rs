@@ -180,6 +180,13 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
         demo.as_str(),
         "prefs"
             | "prefs:nav"
+            | "prefs:advanced"
+            | "prefs:audio:parakeet"
+            | "prefs:audio:whisper"
+            | "stealth"
+            | "secret-guard"
+            | "revisions"
+            | "transcript"
             | "huddle:popout"
             | "profile"
             | "status"
@@ -215,6 +222,125 @@ pub(super) fn demo(results: &Entity<SearchView>, window: &mut Window, cx: &mut C
                 this.update(cx, |app, cx| match demo.as_str() {
                     "prefs" => app.open_preferences(Some(Section::Appearance), window, cx),
                     "prefs:nav" => app.open_preferences(Some(Section::Navigation), window, cx),
+                    "prefs:advanced" => app.open_preferences(Some(Section::Advanced), window, cx),
+                    "prefs:audio:parakeet" => {
+                        app.preferences
+                            .update(cx, |p, cx| p.set_transcription_provider(1, cx));
+                        app.open_preferences(Some(Section::AudioVideo), window, cx);
+                    }
+                    "prefs:audio:whisper" => {
+                        app.preferences
+                            .update(cx, |p, cx| p.set_transcription_provider(2, cx));
+                        app.open_preferences(Some(Section::AudioVideo), window, cx);
+                    }
+                    "stealth" => {
+                        app.preferences.update(cx, |p, cx| p.set_stealth_mode(true, cx));
+                        app.apply_preferences(window, cx);
+                        let ch = app.channel.clone();
+                        let mut ghost = app.fixtures.local_message(
+                            &ch,
+                            "Vi sköt upp releasen till imorgon kl 10 (raderat av avsändaren)".into(),
+                            None,
+                        );
+                        ghost.extra.insert(
+                            crate::bridge::DELETED_EXTRA_KEY.to_owned(),
+                            crate::blockkit::serde_json::Value::Bool(true),
+                        );
+                        app.messages.update(cx, |list, cx| list.append(ch, ghost, cx));
+                    }
+                    "secret-guard" => {
+                        let leaked = format!(
+                            "SLACK_TOKEN={} please rotate this key",
+                            ["xoxb", "1234567890", "abcdefghij123456"].join("-")
+                        );
+                        app.send(MessageContent::plain(leaked), window, cx);
+                    }
+                    "revisions" => {
+                        app.open_revision_history_with(
+                            "#engineering · 1764082200.000100".to_owned(),
+                            vec![
+                                (
+                                    "Original · 10:15 AM".to_owned(),
+                                    false,
+                                    "Vi tar mötet klockan 10 imorgon i staging.".to_owned(),
+                                ),
+                                (
+                                    "Edited · 10:18 AM".to_owned(),
+                                    false,
+                                    "Vi tar mötet klockan 14 imorgon efter deploy av checkout-order."
+                                        .to_owned(),
+                                ),
+                                (
+                                    "Deleted · 10:22 AM".to_owned(),
+                                    true,
+                                    "Vi tar mötet klockan 14 imorgon efter deploy av checkout-order."
+                                        .to_owned(),
+                                ),
+                            ],
+                            window,
+                            cx,
+                        );
+                    }
+                    "transcript" => {
+                        let ch = ChannelId::from("C0ENG");
+                        let u_alice = app
+                            .fixtures
+                            .users
+                            .first()
+                            .map(|u| u.id.clone())
+                            .unwrap_or_else(|| UserId::from("U0ALICE"));
+                        let u_bob = app
+                            .fixtures
+                            .users
+                            .get(1)
+                            .map(|u| u.id.clone())
+                            .unwrap_or_else(|| UserId::from("U0BOB"));
+                        let segs = vec![
+                            slackless_core::store::HuddleTranscriptSegment {
+                                id: 1,
+                                channel: ch.clone(),
+                                call_id: "R0DEMO123".to_owned(),
+                                thread_root_ts: None,
+                                speaker_id: Some(u_alice.clone()),
+                                lang: Some("sv".to_owned()),
+                                source: "parakeet-v3".to_owned(),
+                                text: "Hej allihopa! Ska vi gå igenom nya releasen innan lunch?"
+                                    .to_owned(),
+                                at_ms: 1_764_082_200_000,
+                            },
+                            slackless_core::store::HuddleTranscriptSegment {
+                                id: 2,
+                                channel: ch.clone(),
+                                call_id: "R0DEMO123".to_owned(),
+                                thread_root_ts: None,
+                                speaker_id: Some(u_bob),
+                                lang: Some("en".to_owned()),
+                                source: "parakeet-v3".to_owned(),
+                                text: "Sounds good, let's check the checkout-order metrics first and then ship."
+                                    .to_owned(),
+                                at_ms: 1_764_082_212_000,
+                            },
+                            slackless_core::store::HuddleTranscriptSegment {
+                                id: 3,
+                                channel: ch.clone(),
+                                call_id: "R0DEMO123".to_owned(),
+                                thread_root_ts: None,
+                                speaker_id: Some(u_alice),
+                                lang: Some("sv".to_owned()),
+                                source: "parakeet-v3".to_owned(),
+                                text: "Perfekt, jag tar ett snabbt möte med teamet och pingar i kanalen."
+                                    .to_owned(),
+                                at_ms: 1_764_082_225_000,
+                            },
+                        ];
+                        app.open_huddle_transcript_with(
+                            "R0DEMO123".to_owned(),
+                            ch,
+                            segs,
+                            window,
+                            cx,
+                        );
+                    }
                     "huddle:popout" => {
                         let ch = app.channel.clone();
                         app.join_huddle_in(ch, window, cx);
