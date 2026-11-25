@@ -149,16 +149,26 @@ jobs:
           rm -rf "$DIST"
           mkdir -p "$DIST"
 
-          # 1. Drag-to-Applications DMG
+          # 1. Drag-to-Applications DMG (retry on transient macOS Spotlight "Resource busy")
           DMG_STAGE="$(mktemp -d)"
           cp -R target/bundle/Slackless.app "$DMG_STAGE/Slackless.app"
           ln -s /Applications "$DMG_STAGE/Applications"
-          hdiutil create \
-            -volname "Slackless ${VERSION}" \
-            -srcfolder "$DMG_STAGE" \
-            -ov \
-            -format UDZO \
-            "${DIST}/Slackless-${VERSION}-macos-arm64.dmg"
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create \
+              -volname "Slackless ${VERSION}" \
+              -srcfolder "$DMG_STAGE" \
+              -ov \
+              -format UDZO \
+              "${DIST}/Slackless-${VERSION}-macos-arm64.dmg"; then
+              break
+            fi
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "hdiutil create failed after 5 attempts" >&2
+              exit 1
+            fi
+            echo "hdiutil create busy (attempt $attempt/5); retrying in $((attempt * 3))s..." >&2
+            sleep $((attempt * 3))
+          done
           rm -rf "$DMG_STAGE"
 
           # 2. Compressed .app tarball (for scripted installs / auto-updater)
