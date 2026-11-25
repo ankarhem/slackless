@@ -780,4 +780,250 @@ mod tests {
         let corner = rgb[0];
         assert!(corner > 40 && corner < 220, "corner was {corner}");
     }
+
+    fn split_annex_b_for_test(data: &[u8]) -> Vec<&[u8]> {
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+                    starts.push((i, 4));
+                    i += 4;
+                    continue;
+                }
+                if data[i + 2] == 1 {
+                    starts.push((i, 3));
+                    i += 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        starts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &(pos, sc))| {
+                let end = starts.get(idx + 1).map_or(data.len(), |&(n, _)| n);
+                let nal = &data[pos + sc..end];
+                (!nal.is_empty()).then_some(nal)
+            })
+            .collect()
+    }
+
+    fn encode_test_keyframe(w: usize, h: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let mut enc = H264VideoEncoder::new_camera().unwrap();
+        let mut rgb = vec![0u8; w * h * 3];
+        for px in rgb.as_chunks_mut::<3>().0 {
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+        }
+        enc.encode_rgb(&rgb, w, h).unwrap()
+    }
+
+    #[test]
+    fn h264_decoder_push_rtp_single_nal_stap_a_fua_reset_and_malformed() {
+        let (w, h) = (96usize, 64usize);
+        let annex_b = encode_test_keyframe(w, h, 40, 180, 220);
+        let nals = split_annex_b_for_test(&annex_b);
+        assert!(nals.len() >= 3, "expected SPS, PPS, IDR NALs");
+
+        // 1. Single NAL RTP payloads (one NAL per packet, marker=true on final NAL).
+        let mut dec = H264VideoDecoder::new().unwrap();
+        let mut decoded = None;
+        for (i, nal) in nals.iter().enumerate() {
+            let marker = i + 1 == nals.len();
+            let out = dec.push_rtp_payload(nal, marker);
+            if !marker {
+                assert!(out.is_none());
+            } else {
+                decoded = out;
+            }
+        }
+        let frame = decoded.expect("Single NAL sequence must decode");
+        assert_eq!((frame.width, frame.height), (w as u32, h as u32));
+        // Buffer resets after decode: malformed or empty marker must return None.
+        assert!(dec.push_rtp_payload(&[], true).is_none());
+
+        // 2. STAP-A (NAL type 24) aggregating all NALs into a single RTP packet.
+        let mut stap_a = vec![24u8];
+        for nal in &nals {
+            stap_a.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+            stap_a.extend_from_slice(nal);
+        }
+        let mut dec_stap = H264VideoDecoder::new().unwrap();
+        let frame_stap = dec_stap
+            .push_rtp_payload(&stap_a, true)
+            .expect("STAP-A packet must decode");
+        assert_eq!((frame_stap.width, frame_stap.height), (w as u32, h as u32));
+
+        // 3. Multi-packet FU-A fragmentation (NAL type 28) on the final IDR NAL.
+        let mut dec_fua = H264VideoDecoder::new().unwrap();
+        for nal in &nals[..nals.len() - 1] {
+            assert!(dec_fua.push_rtp_payload(nal, false).is_none());
+        }
+        let idr = nals[nals.len() - 1];
+        assert!(idr.len() > 6, "IDR should be large enough to fragment");
+        let nri = idr[0] & 0x60;
+        let nal_type = idr[0] & 0x1F;
+        let body = &idr[1..];
+        let c1 = body.len() / 3;
+        let c2 = (body.len() * 2) / 3;
+        let chunks = [&body[..c1], &body[c1..c2], &body[c2..]];
+        let mut fua_decoded = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut pkt = Vec::with_capacity(2 + chunk.len());
+            pkt.push(nri | 28); // FU indicator
+            let mut fu_hdr = nal_type;
+            if i == 0 {
+                fu_hdr |= 0x80; // Start bit
+            }
+            if i + 1 == chunks.len() {
+                fu_hdr |= 0x40; // End bit
+            }
+            pkt.push(fu_hdr);
+            pkt.extend_from_slice(chunk);
+            let marker = i + 1 == chunks.len();
+            let res = dec_fua.push_rtp_payload(&pkt, marker);
+            if !marker {
+                assert!(res.is_none());
+            } else {
+                fua_decoded = res;
+            }
+        }
+        let frame_fua = fua_decoded.expect("FU-A fragmented IDR must decode on marker");
+        assert_eq!((frame_fua.width, frame_fua.height), (w as u32, h as u32));
+
+        // 4. Malformed payloads (truncated STAP-A, truncated FU-A) never panic.
+        assert!(
+            dec_fua
+                .push_rtp_payload(&[24, 0x00, 0x20, 0x01], true)
+                .is_none()
+        );
+        assert!(dec_fua.push_rtp_payload(&[28], true).is_none());
+        assert!(dec_fua.push_rtp_payload(&[0xFF], false).is_none());
+    }
+
+    #[test]
+    fn downscale_rgba_area_bt601_bgra_odd_dims_scratch_reuse_and_screen_round_trip() {
+        let mut scratch = ScreenScaleScratch::default();
+
+        // Short-buffer & zero-dim guards.
+        assert_eq!(
+            downscale_rgba_area_to_bgra_and_i420(&[], 0, 10, 64, 64, &mut scratch),
+            (0, 0)
+        );
+        assert_eq!(
+            downscale_rgba_area_to_bgra_and_i420(&[0u8; 12], 2, 2, 64, 64, &mut scratch),
+            (0, 0)
+        );
+
+        // Pure white (255,255,255,255) -> BT.601 Y=235, U=128, V=128, BGRA=[255,255,255,255].
+        let white = vec![255u8; 8 * 8 * 4];
+        let (dw, dh) = downscale_rgba_area_to_bgra_and_i420(&white, 8, 8, 8, 8, &mut scratch);
+        assert_eq!((dw, dh), (8, 8));
+        assert!(scratch.y.iter().all(|&y| y == 235));
+        assert!(scratch.u.iter().all(|&u| u == 128));
+        assert!(scratch.v.iter().all(|&v| v == 128));
+        assert!(
+            scratch
+                .bgra
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| *px == [255, 255, 255, 255])
+        );
+
+        // Pure red (255,0,0,123) -> BGRA=[0,0,255,255], Y=81, U=90, V=240 (within +-1).
+        let mut red = Vec::with_capacity(13 * 9 * 4);
+        for _ in 0..(13 * 9) {
+            red.extend_from_slice(&[255, 0, 0, 123]);
+        }
+        // Odd source dims (13x9) downscaled to even target dims inside (10x8).
+        let (dw2, dh2) = downscale_rgba_area_to_bgra_and_i420(&red, 13, 9, 10, 8, &mut scratch);
+        assert!((2..=10).contains(&dw2) && dw2 % 2 == 0);
+        assert!((2..=8).contains(&dh2) && dh2 % 2 == 0);
+        assert_eq!(scratch.bgra.len(), (dw2 * dh2 * 4) as usize);
+        assert_eq!(scratch.y.len(), (dw2 * dh2) as usize);
+        assert_eq!(scratch.u.len(), ((dw2 / 2) * (dh2 / 2)) as usize);
+        assert_eq!(scratch.v.len(), ((dw2 / 2) * (dh2 / 2)) as usize);
+        assert_eq!(&scratch.bgra[0..4], &[0, 0, 255, 255]);
+        assert!((scratch.y[0] as i32 - 81).abs() <= 1);
+        assert!((scratch.u[0] as i32 - 90).abs() <= 1);
+        assert!((scratch.v[0] as i32 - 240).abs() <= 1);
+
+        // Reuse scratch for larger 128x96 -> 64x48 gradient and round-trip via H264 screen encoder.
+        let mut grad = vec![0u8; 128 * 96 * 4];
+        for y in 0..96usize {
+            for x in 0..128usize {
+                let off = (y * 128 + x) * 4;
+                grad[off] = (x * 2) as u8;
+                grad[off + 1] = (y * 2) as u8;
+                grad[off + 2] = 160;
+                grad[off + 3] = 255;
+            }
+        }
+        let (sw, sh) = downscale_rgba_area_to_bgra_and_i420(&grad, 128, 96, 64, 48, &mut scratch);
+        assert_eq!((sw, sh), (64, 48));
+        let mut enc = H264VideoEncoder::new_screen().unwrap();
+        let h264 = enc
+            .encode_i420(&scratch.y, &scratch.u, &scratch.v, sw as usize, sh as usize)
+            .expect("screen encode_i420");
+        assert!(!h264.is_empty());
+        let mut dec = H264VideoDecoder::new().unwrap();
+        let decoded = dec.decode_annex_b(&h264).expect("decode screen frame");
+        assert_eq!((decoded.width, decoded.height), (64, 48));
+    }
+
+    #[test]
+    fn pixel_helpers_video_frame_into_bgra_and_blur_guards() {
+        // resize_rgb_even: zero dims, passthrough, and odd downscale.
+        assert_eq!(resize_rgb_even(&[], 0, 10, 64, 64), (Vec::new(), 0, 0));
+        let passthrough = vec![10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let (same, w, h) = resize_rgb_even(&passthrough, 2, 2, 10, 10);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(same, passthrough);
+        let solid = vec![100u8; 15 * 11 * 3];
+        let (resized, rw, rh) = resize_rgb_even(&solid, 15, 11, 8, 8);
+        assert!((2..=8).contains(&rw) && rw % 2 == 0);
+        assert!((2..=8).contains(&rh) && rh % 2 == 0);
+        assert_eq!(resized.len(), (rw * rh * 3) as usize);
+        assert!(resized.iter().all(|&b| b == 100));
+
+        // rgb_to_bgra & rgba_to_rgb_and_bgra.
+        assert_eq!(
+            rgb_to_bgra(&[10, 20, 30, 40, 50, 60, 99]),
+            vec![30, 20, 10, 255, 60, 50, 40, 255]
+        );
+        let (rgb, bgra) = rgba_to_rgb_and_bgra(&[11, 22, 33, 44, 55, 66, 77, 88, 99]);
+        assert_eq!(rgb, vec![11, 22, 33, 55, 66, 77]);
+        assert_eq!(bgra, vec![33, 22, 11, 44, 77, 66, 55, 88]);
+
+        // VideoFrame::into_bgra: unique Arc moves without cloning; shared Arc clones cleanly.
+        let unique_bytes = vec![1u8, 2, 3, 255];
+        let orig_ptr = unique_bytes.as_ptr();
+        let vf_unique = VideoFrame::from_bgra(1, 1, unique_bytes);
+        let (uw, uh, moved) = vf_unique.into_bgra().unwrap();
+        assert_eq!((uw, uh), (1, 1));
+        assert_eq!(
+            moved.as_ptr(),
+            orig_ptr,
+            "unique Arc should unwrap without reallocation"
+        );
+
+        let vf_shared_a = VideoFrame::from_bgra(1, 1, vec![9, 8, 7, 255]);
+        let vf_shared_b = vf_shared_a.clone();
+        assert_eq!(vf_shared_a, vf_shared_b);
+        let (_, _, cloned) = vf_shared_a.into_bgra().unwrap();
+        assert_eq!(cloned, vec![9, 8, 7, 255]);
+        assert_eq!(vf_shared_b.to_bgra_fit(0, 0).unwrap().2, vec![9, 8, 7, 255]);
+
+        // apply_portrait_blur guards: small dims and short buffers are untouched.
+        let mut small = vec![42u8; 8 * 8 * 3];
+        apply_portrait_blur(&mut small, 8, 8);
+        assert!(small.iter().all(|&b| b == 42));
+        let mut short = vec![77u8; 16 * 16 * 3 - 1];
+        apply_portrait_blur(&mut short, 16, 16);
+        assert!(short.iter().all(|&b| b == 77));
+    }
 }

@@ -64,6 +64,12 @@ pub fn chime_setting_engine() -> SettingEngine {
 /// types, RFC 4588 RTX streams, RTCP feedback, and `sdes:mid` RTP header extensions on BOTH audio
 /// and video (required for BUNDLEd SFU tracks whose SSRCs arrive dynamically).
 pub fn chime_media_engine() -> Result<MediaEngine> {
+    chime_media_engine_for_caps(crate::backend::platform_backend().capabilities())
+}
+
+/// Build the Chime-compatible `MediaEngine` for explicit [`crate::backend::MediaCapabilities`]
+/// (deterministically selecting AV1-first vs H.264-first video codec ordering).
+pub fn chime_media_engine_for_caps(caps: crate::backend::MediaCapabilities) -> Result<MediaEngine> {
     let mut m = MediaEngine::default();
     m.register_codec(
         RTCRtpCodecParameters {
@@ -114,7 +120,6 @@ pub fn chime_media_engine() -> Result<MediaEngine> {
     // - M3/M4 Macs (`hw_av1_decode == true`): AV1 first (both AV1 & H.264 decode in HW).
     // - M1/M2 Macs (`hw_h264_decode && !hw_av1_decode`): H.264 first so peers prefer HW-decoded
     //   H.264 while still allowing seamless `rav1d` fallback when Chime forces AV1.
-    let caps = crate::backend::platform_backend().capabilities();
     let video_codecs = if caps.prefer_h264_over_av1() {
         [
             (
@@ -214,6 +219,26 @@ pub enum VideoSenderFeedback {
     ForceKeyframe,
     /// Remote SFU/viewer estimated available uplink bandwidth in bits per second (RTCP REMB).
     TargetBitrateBps(u32),
+}
+
+/// Classify an inbound RTCP packet on an outbound video sender into [`VideoSenderFeedback`].
+pub(crate) fn classify_rtcp_video_feedback(
+    pkt: &(dyn webrtc::rtcp::packet::Packet + Send + Sync),
+) -> Option<VideoSenderFeedback> {
+    let any = pkt.as_any();
+    if any.downcast_ref::<PictureLossIndication>().is_some()
+        || any.downcast_ref::<FullIntraRequest>().is_some()
+    {
+        Some(VideoSenderFeedback::ForceKeyframe)
+    } else if let Some(remb) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
+        if remb.bitrate.is_nan() {
+            return None;
+        }
+        let bps = remb.bitrate.clamp(100_000.0, 10_000_000.0) as u32;
+        Some(VideoSenderFeedback::TargetBitrateBps(bps))
+    } else {
+        None
+    }
 }
 
 /// One inbound RTP Opus audio packet read from Chime's mixed remote audio track.
@@ -515,16 +540,8 @@ impl ChimeRtcPeer {
             tokio::spawn(async move {
                 while let Ok((packets, _)) = sender.read_rtcp().await {
                     for pkt in packets {
-                        let any = pkt.as_any();
-                        if any.downcast_ref::<PictureLossIndication>().is_some()
-                            || any.downcast_ref::<FullIntraRequest>().is_some()
-                        {
-                            let _ = tx.send(VideoSenderFeedback::ForceKeyframe);
-                        } else if let Some(remb) =
-                            any.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
-                        {
-                            let bps = remb.bitrate.clamp(100_000.0, 10_000_000.0) as u32;
-                            let _ = tx.send(VideoSenderFeedback::TargetBitrateBps(bps));
+                        if let Some(fb) = classify_rtcp_video_feedback(pkt.as_ref()) {
+                            let _ = tx.send(fb);
                         }
                     }
                 }
@@ -726,5 +743,194 @@ mod tests {
     fn media_and_setting_engines_configure_cleanly() {
         let _settings = chime_setting_engine();
         let _media = chime_media_engine().expect("chime media engine builds");
+    }
+
+    #[test]
+    fn filter_udp_turn_uris_handles_case_schemes_and_empty() {
+        assert!(filter_udp_turn_uris(&[]).is_empty());
+        let uris = vec![
+            "TURN:ice.example:3478?transport=UDP".to_owned(),
+            "turn:ice.example:3478".to_owned(),
+            "TURN:ice.example:3478?TRANSPORT=TCP".to_owned(),
+            "turns:ice.example:443?transport=udp".to_owned(),
+            "stun:stun.example:3478".to_owned(),
+        ];
+        assert_eq!(
+            filter_udp_turn_uris(&uris),
+            vec![
+                "TURN:ice.example:3478?transport=UDP".to_owned(),
+                "turn:ice.example:3478".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn chime_media_engine_for_caps_orders_av1_vs_h264_deterministically() {
+        async fn video_m_line(caps: crate::backend::MediaCapabilities) -> String {
+            let media = chime_media_engine_for_caps(caps).unwrap();
+            let api = APIBuilder::new().with_media_engine(media).build();
+            let pc = api
+                .new_peer_connection(RTCConfiguration::default())
+                .await
+                .unwrap();
+            pc.add_transceiver_from_kind(RTPCodecType::Video, None)
+                .await
+                .unwrap();
+            let offer = pc.create_offer(None).await.unwrap();
+            let line = offer
+                .sdp
+                .lines()
+                .find(|l| l.starts_with("m=video "))
+                .expect("SDP must include m=video")
+                .to_owned();
+            let _ = pc.close().await;
+            line
+        }
+
+        // M3+ (HW AV1 + HW H.264) -> AV1 (PT 45) advertised ahead of H.264 (PT 108).
+        let m3_line = video_m_line(crate::backend::MediaCapabilities {
+            hw_h264_decode: true,
+            hw_av1_decode: true,
+            ..Default::default()
+        })
+        .await;
+        let av1_pos_m3 = m3_line.find(" 45").expect("AV1 PT 45");
+        let h264_pos_m3 = m3_line.find(" 108").expect("H.264 PT 108");
+        assert!(
+            av1_pos_m3 < h264_pos_m3,
+            "M3+ should advertise AV1 before H.264: {m3_line}"
+        );
+
+        // M1/M2 (HW H.264 only, no HW AV1) -> H.264 (PT 108) advertised ahead of AV1 (PT 45).
+        let m1_line = video_m_line(crate::backend::MediaCapabilities {
+            hw_h264_decode: true,
+            hw_av1_decode: false,
+            ..Default::default()
+        })
+        .await;
+        let av1_pos_m1 = m1_line.find(" 45").expect("AV1 PT 45");
+        let h264_pos_m1 = m1_line.find(" 108").expect("H.264 PT 108");
+        assert!(
+            h264_pos_m1 < av1_pos_m1,
+            "M1/M2 should advertise H.264 before AV1: {m1_line}"
+        );
+    }
+
+    #[test]
+    fn classify_rtcp_video_feedback_handles_pli_fir_remb_and_others() {
+        use webrtc::rtcp::receiver_report::ReceiverReport;
+
+        let pli = PictureLossIndication {
+            sender_ssrc: 1,
+            media_ssrc: 2,
+        };
+        assert_eq!(
+            classify_rtcp_video_feedback(&pli),
+            Some(VideoSenderFeedback::ForceKeyframe)
+        );
+
+        let fir = FullIntraRequest {
+            sender_ssrc: 1,
+            media_ssrc: 2,
+            fir: vec![FirEntry {
+                ssrc: 2,
+                sequence_number: 1,
+            }],
+        };
+        assert_eq!(
+            classify_rtcp_video_feedback(&fir),
+            Some(VideoSenderFeedback::ForceKeyframe)
+        );
+
+        let remb_low = ReceiverEstimatedMaximumBitrate {
+            sender_ssrc: 1,
+            bitrate: 10_000.0,
+            ssrcs: vec![2],
+        };
+        assert_eq!(
+            classify_rtcp_video_feedback(&remb_low),
+            Some(VideoSenderFeedback::TargetBitrateBps(100_000))
+        );
+
+        let remb_mid = ReceiverEstimatedMaximumBitrate {
+            sender_ssrc: 1,
+            bitrate: 1_500_000.0,
+            ssrcs: vec![2],
+        };
+        assert_eq!(
+            classify_rtcp_video_feedback(&remb_mid),
+            Some(VideoSenderFeedback::TargetBitrateBps(1_500_000))
+        );
+
+        let remb_high = ReceiverEstimatedMaximumBitrate {
+            sender_ssrc: 1,
+            bitrate: 50_000_000.0,
+            ssrcs: vec![2],
+        };
+        assert_eq!(
+            classify_rtcp_video_feedback(&remb_high),
+            Some(VideoSenderFeedback::TargetBitrateBps(10_000_000))
+        );
+
+        let remb_nan = ReceiverEstimatedMaximumBitrate {
+            sender_ssrc: 1,
+            bitrate: f32::NAN,
+            ssrcs: vec![2],
+        };
+        assert_eq!(classify_rtcp_video_feedback(&remb_nan), None);
+
+        let rr = ReceiverReport::default();
+        assert_eq!(classify_rtcp_video_feedback(&rr), None);
+    }
+
+    #[tokio::test]
+    async fn chime_rtc_peer_rejects_zero_udp_turn_uris_and_tracks_metrics_snapshot() {
+        let (a_tx, _a_rx) = mpsc::unbounded_channel();
+        let (v_tx, _v_rx) = mpsc::unbounded_channel();
+        let (s_tx, _s_rx) = mpsc::unbounded_channel();
+
+        // Zero UDP TURN URIs returns WebRtc error cleanly.
+        let tcp_only = SdkTurnCredentials {
+            uris: vec!["turns:ice.example:443?transport=tcp".into()],
+            ..Default::default()
+        };
+        let err = ChimeRtcPeer::new(&tcp_only, a_tx.clone(), v_tx.clone(), s_tx.clone())
+            .await
+            .err()
+            .expect("zero UDP TURN URIs must fail");
+        assert!(matches!(err, HuddleError::WebRtc(ref m) if m.contains("no UDP TURN")));
+
+        // Valid UDP TURN URI constructs peer; take_metrics_snapshot drains deltas & clamps RMS.
+        let udp_turn = SdkTurnCredentials {
+            username: Some("u".into()),
+            password: Some("p".into()),
+            uris: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+            ..Default::default()
+        };
+        let peer = ChimeRtcPeer::new(&udp_turn, a_tx, v_tx, s_tx)
+            .await
+            .expect("peer with UDP TURN builds");
+        peer.packets_sent.store(50, Ordering::Relaxed);
+        peer.bytes_sent.store(4_000, Ordering::Relaxed);
+        peer.packets_received.store(40, Ordering::Relaxed);
+        peer.bytes_received.store(3_000, Ordering::Relaxed);
+
+        let snap1 = peer.take_metrics_snapshot(0.5);
+        assert_eq!(snap1.mic_pps, 50.0);
+        assert_eq!(snap1.mic_bitrate_bps, 32_000.0);
+        assert_eq!(snap1.spk_pps, 40.0);
+        assert_eq!(snap1.spk_bitrate_bps, 24_000.0);
+        assert!((snap1.mic_audio_level - 16_383.5).abs() < 1.0);
+
+        // Second call sees zeroed delta counters and clamped RMS bounds.
+        let snap2 = peer.take_metrics_snapshot(2.0);
+        assert_eq!(snap2.mic_pps, 0.0);
+        assert_eq!(snap2.spk_pps, 0.0);
+        assert_eq!(snap2.mic_audio_level, 32_767.0);
+
+        let snap3 = peer.take_metrics_snapshot(-0.5);
+        assert_eq!(snap3.mic_audio_level, 0.0);
+
+        peer.close().await;
     }
 }

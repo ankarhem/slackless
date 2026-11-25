@@ -114,12 +114,67 @@ impl VideoDecoderHandle for MacH264Decoder {
     }
 }
 
+const HW_AV1_FAILURE_FALLBACK_THRESHOLD: u32 = 8;
+
+/// Generic HW->SW fallback state machine for AV1 decoding: falls back permanently to `Sw`
+/// after [`HW_AV1_FAILURE_FALLBACK_THRESHOLD`] consecutive HW decode failures, resetting the
+/// failure counter on any successful HW frame.
+struct Av1FallbackState<Hw, Sw> {
+    hw: Option<Hw>,
+    sw: Option<Sw>,
+    hw_consecutive_failures: u32,
+}
+
+impl<Hw, Sw> Av1FallbackState<Hw, Sw> {
+    fn new(hw: Option<Hw>, sw: Option<Sw>) -> Self {
+        Self {
+            hw,
+            sw,
+            hw_consecutive_failures: 0,
+        }
+    }
+
+    fn is_hw_active(&self) -> bool {
+        self.hw.is_some()
+    }
+
+    fn decode_with<F, G, H>(
+        &mut self,
+        unit: &[u8],
+        mut decode_hw: F,
+        mut make_sw: G,
+        mut decode_sw: H,
+    ) -> Option<VideoFrame>
+    where
+        F: FnMut(&mut Hw, &[u8]) -> Option<VideoFrame>,
+        G: FnMut() -> Option<Sw>,
+        H: FnMut(&mut Sw, &[u8]) -> Option<VideoFrame>,
+    {
+        if let Some(hw) = self.hw.as_mut() {
+            if let Some(frame) = decode_hw(hw, unit) {
+                self.hw_consecutive_failures = 0;
+                return Some(frame);
+            }
+            // Wait for initial sequence header / keyframe; only fall back to `rav1d` if HW
+            // fails repeatedly on decodable units (e.g. unsupported profile/12-bit).
+            self.hw_consecutive_failures = self.hw_consecutive_failures.saturating_add(1);
+            if self.hw_consecutive_failures < HW_AV1_FAILURE_FALLBACK_THRESHOLD {
+                return None;
+            }
+            tracing::info!("VideoToolbox HW AV1 decode unavailable for stream; switching to rav1d");
+            self.hw = None;
+        }
+        if self.sw.is_none() {
+            self.sw = make_sw();
+        }
+        decode_sw(self.sw.as_mut()?, unit)
+    }
+}
+
 /// Runtime-gated VideoToolbox HW AV1 decoder (M3/M4+) with seamless lazy `rav1d` fallback
 /// (always uses `rav1d` on M1/M2 without assuming M3+).
 struct MacAv1Decoder {
-    vt: Option<VtAv1Decoder>,
-    sw: Option<SoftwareAv1Decoder>,
-    vt_consecutive_failures: u32,
+    state: Av1FallbackState<VtAv1Decoder, SoftwareAv1Decoder>,
 }
 
 impl MacAv1Decoder {
@@ -132,16 +187,14 @@ impl MacAv1Decoder {
             None
         };
         Ok(Self {
-            vt,
-            sw,
-            vt_consecutive_failures: 0,
+            state: Av1FallbackState::new(vt, sw),
         })
     }
 }
 
 impl VideoDecoderHandle for MacAv1Decoder {
     fn backend_name(&self) -> &'static str {
-        if self.vt.is_some() {
+        if self.state.is_hw_active() {
             "AV1 (VideoToolbox HW)"
         } else {
             "AV1 (rav1d SW)"
@@ -149,24 +202,12 @@ impl VideoDecoderHandle for MacAv1Decoder {
     }
 
     fn decode_unit(&mut self, unit: &[u8]) -> Option<VideoFrame> {
-        if let Some(vt) = self.vt.as_mut() {
-            if let Some(frame) = vt.decode_temporal_unit(unit) {
-                self.vt_consecutive_failures = 0;
-                return Some(frame);
-            }
-            // Wait for initial sequence header / keyframe; only fall back to `rav1d` if HW
-            // fails repeatedly on decodable units (e.g. unsupported profile/12-bit).
-            self.vt_consecutive_failures = self.vt_consecutive_failures.saturating_add(1);
-            if self.vt_consecutive_failures < 8 {
-                return None;
-            }
-            tracing::info!("VideoToolbox HW AV1 decode unavailable for stream; switching to rav1d");
-            self.vt = None;
-        }
-        if self.sw.is_none() {
-            self.sw = SoftwareAv1Decoder::new().ok();
-        }
-        self.sw.as_mut()?.decode_unit(unit)
+        self.state.decode_with(
+            unit,
+            |vt, u| vt.decode_temporal_unit(u),
+            || SoftwareAv1Decoder::new().ok(),
+            |sw, u| sw.decode_unit(u),
+        )
     }
 }
 
@@ -321,5 +362,94 @@ impl MediaBackend for MacOsMediaBackend {
             )
             .map(|v| Box::new(v) as Box<dyn HwAudioDuplexHandle>),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_frame(tag: u8) -> VideoFrame {
+        VideoFrame::from_bgra(2, 2, vec![tag; 16])
+    }
+
+    #[test]
+    fn av1_hw_fallback_switches_to_sw_after_eight_consecutive_failures() {
+        let mut state: Av1FallbackState<&str, &str> = Av1FallbackState::new(Some("hw"), None);
+        let mut sw_created = 0u32;
+
+        // 7 consecutive HW failures keep HW active without initializing SW.
+        for _ in 0..7 {
+            let out = state.decode_with(
+                b"bad",
+                |_, _| None,
+                || {
+                    sw_created += 1;
+                    Some("sw")
+                },
+                |_, _| Some(dummy_frame(2)),
+            );
+            assert!(out.is_none());
+            assert!(state.is_hw_active());
+            assert_eq!(sw_created, 0);
+        }
+
+        // A single HW success resets the consecutive failure counter.
+        let ok = state.decode_with(
+            b"good",
+            |_, _| Some(dummy_frame(1)),
+            || {
+                sw_created += 1;
+                Some("sw")
+            },
+            |_, _| Some(dummy_frame(2)),
+        );
+        assert!(ok.is_some());
+        assert_eq!(state.hw_consecutive_failures, 0);
+        assert!(state.is_hw_active());
+
+        // Now 7 more failures still stay on HW; 8th failure permanently falls back to SW and decodes!
+        for _ in 0..7 {
+            assert!(
+                state
+                    .decode_with(
+                        b"bad",
+                        |_, _| None,
+                        || Some("sw"),
+                        |_, _| Some(dummy_frame(2))
+                    )
+                    .is_none()
+            );
+            assert!(state.is_hw_active());
+        }
+        let fallback_frame = state
+            .decode_with(
+                b"fallback",
+                |_, _| None,
+                || {
+                    sw_created += 1;
+                    Some("sw")
+                },
+                |_, _| Some(dummy_frame(9)),
+            )
+            .expect("8th failure must switch to SW and decode unit");
+        assert!(!state.is_hw_active());
+        assert_eq!(sw_created, 1);
+        assert_eq!(fallback_frame.into_bgra().unwrap().2[0], 9);
+
+        // Subsequent calls go straight to SW without re-invoking SW factory.
+        let next = state
+            .decode_with(
+                b"next",
+                |_, _| unreachable!("HW must no longer be invoked after fallback"),
+                || {
+                    sw_created += 1;
+                    Some("sw")
+                },
+                |_, _| Some(dummy_frame(7)),
+            )
+            .expect("SW continues decoding");
+        assert_eq!(sw_created, 1);
+        assert_eq!(next.into_bgra().unwrap().2[0], 7);
     }
 }

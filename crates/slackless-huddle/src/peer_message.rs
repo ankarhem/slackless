@@ -449,4 +449,281 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn peer_message_draw_variants_and_defaults() {
+        let sender = UserId::from("U01BOB");
+        let seg = HuddleDrawSegment {
+            a: [0.0, 0.1],
+            b: [0.2, 0.3],
+            c: [0.4, 0.5],
+            d: [0.6, 0.7],
+        };
+        let cases = vec![
+            HuddleDrawMessage::Edit {
+                item_id: "stroke-1".to_owned(),
+                segment: seg,
+            },
+            HuddleDrawMessage::End {
+                item_id: "stroke-1".to_owned(),
+            },
+            HuddleDrawMessage::ChangeHue {
+                item_id: "stroke-1".to_owned(),
+                hue: 320,
+            },
+            HuddleDrawMessage::Position {
+                item_id: "stroke-1".to_owned(),
+                x: 0.25,
+                y: 0.75,
+            },
+        ];
+        for draw in cases {
+            let raw = build_draw_message("att-bob", &draw);
+            let evs = decode_slack_peer_message(&sender, "att-bob", "att-me", &raw, 55);
+            assert_eq!(
+                evs,
+                vec![HuddleDataEvent::Draw {
+                    user: sender.clone(),
+                    message: draw,
+                    at_ms: 55,
+                }]
+            );
+        }
+
+        // Missing item_id falls back to sender_attendee_id; missing hue defaults to 210.
+        let raw_defaults = encode_peer_message(&PeerMessage {
+            draw: Some(peer_message::Draw {
+                r#type: Some(peer_message::draw::Type::ChangeHue as i32),
+                item_id: Some(String::new()),
+                hue: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            decode_slack_peer_message(&sender, "att-fallback", "att-me", &raw_defaults, 1),
+            vec![HuddleDataEvent::Draw {
+                user: sender.clone(),
+                message: HuddleDrawMessage::ChangeHue {
+                    item_id: "att-fallback".to_owned(),
+                    hue: 210,
+                },
+                at_ms: 1,
+            }]
+        );
+
+        // Edit without segment emits no Draw event.
+        let raw_no_seg = encode_peer_message(&PeerMessage {
+            draw: Some(peer_message::Draw {
+                r#type: Some(peer_message::draw::Type::Edit as i32),
+                item_id: Some("x".to_owned()),
+                segment: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(decode_slack_peer_message(&sender, "att", "att-me", &raw_no_seg, 1).is_empty());
+    }
+
+    #[test]
+    fn peer_message_reacji_jukebox_mute_and_awareness_edge_cases() {
+        let sender = UserId::from("U02CAROL");
+
+        // Reacji Standard & Gif with URL vs empty URL vs empty emoji.
+        let std_bytes = build_reacji_message(
+            "att-c",
+            "tada",
+            HuddleReactionKind::Standard,
+            Some(String::new()),
+        );
+        assert_eq!(
+            decode_slack_peer_message(&sender, "att-c", "att-me", &std_bytes, 10),
+            vec![HuddleDataEvent::Reaction {
+                user: sender.clone(),
+                emoji: "tada".to_owned(),
+                kind: HuddleReactionKind::Standard,
+                emoji_url: None,
+                at_ms: 10,
+            }]
+        );
+
+        let gif_bytes = build_reacji_message(
+            "att-c",
+            "party_parrot",
+            HuddleReactionKind::Gif,
+            Some("https://cdn.example/parrot.gif".to_owned()),
+        );
+        assert_eq!(
+            decode_slack_peer_message(&sender, "att-c", "att-me", &gif_bytes, 20),
+            vec![HuddleDataEvent::Reaction {
+                user: sender.clone(),
+                emoji: "party_parrot".to_owned(),
+                kind: HuddleReactionKind::Gif,
+                emoji_url: Some("https://cdn.example/parrot.gif".to_owned()),
+                at_ms: 20,
+            }]
+        );
+
+        let empty_emoji = build_reacji_message("att-c", "", HuddleReactionKind::Standard, None);
+        assert!(decode_slack_peer_message(&sender, "att-c", "att-me", &empty_emoji, 30).is_empty());
+
+        // Jukebox start & stop.
+        let play_juke = build_jukebox_message("att-c", Some("lofi"));
+        assert_eq!(
+            decode_slack_peer_message(&sender, "att-c", "att-me", &play_juke, 40),
+            vec![HuddleDataEvent::Jukebox {
+                user: sender.clone(),
+                song_key: Some("lofi".to_owned()),
+            }]
+        );
+        let stop_juke = build_jukebox_message("att-c", None);
+        assert_eq!(
+            decode_slack_peer_message(&sender, "att-c", "att-me", &stop_juke, 41),
+            vec![HuddleDataEvent::Jukebox {
+                user: sender.clone(),
+                song_key: None,
+            }]
+        );
+
+        // Mute request: targeting self emits MutedByPeer, targeting another peer emits nothing.
+        let mute_self = build_mute_request_message("att-c", "att-me");
+        assert_eq!(
+            decode_slack_peer_message(&sender, "att-c", "att-me", &mute_self, 50),
+            vec![HuddleDataEvent::MutedByPeer {
+                actor: sender.clone(),
+            }]
+        );
+        let mute_other = build_mute_request_message("att-c", "att-other");
+        assert!(decode_slack_peer_message(&sender, "att-c", "att-me", &mute_other, 51).is_empty());
+
+        // AwarenessBroadcast: all 4 raised-hand aliases.
+        for alias in ["raised_hand", "hand", "raising_hand", "✋"] {
+            let bytes = build_sticky_emoji_awareness("att-c", "R1", &sender, Some(alias), 60);
+            let evs = decode_slack_peer_message(&sender, "att-c", "att-me", &bytes, 60);
+            assert!(evs.contains(&HuddleDataEvent::HandRaise {
+                user: sender.clone(),
+                raised: true,
+            }));
+            assert!(evs.contains(&HuddleDataEvent::StickyEmoji {
+                user: sender.clone(),
+                emoji: Some(alias.to_owned()),
+            }));
+        }
+
+        // AwarenessBroadcast: sticky clear sets raised=false and emoji=None.
+        let clear_bytes = build_sticky_emoji_awareness("att-c", "R1", &sender, None, 61);
+        let clear_evs = decode_slack_peer_message(&sender, "att-c", "att-me", &clear_bytes, 61);
+        assert_eq!(
+            clear_evs,
+            vec![
+                HuddleDataEvent::HandRaise {
+                    user: sender.clone(),
+                    raised: false,
+                },
+                HuddleDataEvent::StickyEmoji {
+                    user: sender.clone(),
+                    emoji: None,
+                },
+            ]
+        );
+
+        // AwarenessBroadcast with huddleActiveSong + non-hand sticky emoji.
+        let aw_song = encode_peer_message(&PeerMessage {
+            awareness_broadcast: Some(peer_message::AwarenessBroadcast {
+                channel: Some("R1".to_owned()),
+                user: None, // falls back to sender
+                awareness_state: vec![
+                    peer_message::AwarenessPayload {
+                        field_name: Some(AWARENESS_STICKY_EMOJI.to_owned()),
+                        field_value: Some("coffee".to_owned()),
+                        field_timestamp_ms: Some(100),
+                    },
+                    peer_message::AwarenessPayload {
+                        field_name: Some(AWARENESS_ACTIVE_SONG.to_owned()),
+                        field_value: Some("jazz".to_owned()),
+                        field_timestamp_ms: Some(100),
+                    },
+                ],
+            }),
+            ..Default::default()
+        });
+        let song_evs = decode_slack_peer_message(&sender, "att-c", "att-me", &aw_song, 62);
+        assert_eq!(
+            song_evs,
+            vec![
+                HuddleDataEvent::HandRaise {
+                    user: sender.clone(),
+                    raised: false,
+                },
+                HuddleDataEvent::StickyEmoji {
+                    user: sender.clone(),
+                    emoji: Some("coffee".to_owned()),
+                },
+                HuddleDataEvent::Jukebox {
+                    user: sender.clone(),
+                    song_key: Some("jazz".to_owned()),
+                },
+            ]
+        );
+
+        // Corrupt bytes -> empty Vec.
+        assert!(
+            decode_slack_peer_message(&sender, "att-c", "att-me", &[0xFF, 0xFF, 0xFF, 0xFF], 70)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chime_transcript_frame_partial_blank_missing_speaker_non_transcript_and_corrupt() {
+        use crate::proto::SdkTranscriptionStatus;
+
+        let frame = SdkTranscriptFrame {
+            events: vec![
+                // Non-transcript event (Status) -> skipped.
+                SdkTranscriptEvent {
+                    event: Some(TranscriptEventKind::Status(
+                        SdkTranscriptionStatus::default(),
+                    )),
+                },
+                SdkTranscriptEvent {
+                    event: Some(TranscriptEventKind::Transcript(SdkTranscript {
+                        results: vec![
+                            // Blank / whitespace-only -> skipped.
+                            SdkTranscriptResult {
+                                is_partial: Some(false),
+                                alternatives: vec![SdkTranscriptAlternative {
+                                    transcript: Some("   \t\n ".to_owned()),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                            // Partial caption with missing speaker -> USLACKBOT fallback.
+                            SdkTranscriptResult {
+                                is_partial: Some(true),
+                                alternatives: vec![SdkTranscriptAlternative {
+                                    transcript: Some("  hello world  ".to_owned()),
+                                    items: Vec::new(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        ],
+                    })),
+                },
+            ],
+        };
+        let evs = decode_chime_transcript_frame(&frame.encode_to_vec(), 1234);
+        assert_eq!(
+            evs,
+            vec![HuddleDataEvent::Caption {
+                user: UserId::from("USLACKBOT"),
+                text: "hello world".to_owned(),
+                is_partial: true,
+                at_ms: 1234,
+            }]
+        );
+
+        // Corrupt protobuf -> empty.
+        assert!(decode_chime_transcript_frame(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF], 1).is_empty());
+    }
 }

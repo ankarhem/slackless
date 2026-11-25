@@ -1994,4 +1994,387 @@ mod tests {
             "huddles_focus_lofihaus_music_mixdown_stereo-07cf114.mp3"
         );
     }
+
+    #[test]
+    fn jitter_buffer_wraparound_stale_multi_loss_fast_trigger_dtx_resync_overflow_and_rearm() {
+        let t0 = Instant::now();
+
+        // 1. 16-bit seq wraparound (65534..=1) + out-of-order across wrap.
+        let mut jb = AudioJitterBuffer::new();
+        jb.push(65534, Bytes::from_static(b"a"), t0);
+        jb.push(0, Bytes::from_static(b"c"), t0 + Duration::from_millis(5));
+        jb.push(
+            65535,
+            Bytes::from_static(b"b"),
+            t0 + Duration::from_millis(8),
+        );
+        jb.push(1, Bytes::from_static(b"d"), t0 + Duration::from_millis(12));
+        for expected in [b"a", b"b", b"c", b"d"] {
+            assert_eq!(
+                jb.pop_ready(t0 + Duration::from_millis(12)),
+                Some(JitterStep::Packet(Bytes::from_static(expected)))
+            );
+        }
+
+        // 2. Stale packets (already played) are ignored; duplicate of queued seq doesn't corrupt.
+        jb.push(
+            65535,
+            Bytes::from_static(b"stale"),
+            t0 + Duration::from_millis(20),
+        );
+        assert_eq!(jb.pop_ready(t0 + Duration::from_millis(20)), None);
+        jb.push(2, Bytes::from_static(b"v1"), t0 + Duration::from_millis(20));
+        jb.push(2, Bytes::from_static(b"v2"), t0 + Duration::from_millis(21));
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(21)),
+            Some(JitterStep::Packet(Bytes::from_static(b"v2")))
+        );
+
+        // 3. Multi-packet loss (3 & 4 lost, 5 arrives): after 35ms yields Plc then FecFromNext(5) then Packet(5).
+        jb.push(5, Bytes::from_static(b"p5"), t0 + Duration::from_millis(40));
+        assert_eq!(jb.pop_ready(t0 + Duration::from_millis(60)), None);
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(80)),
+            Some(JitterStep::Plc)
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(80)),
+            Some(JitterStep::FecFromNext(Bytes::from_static(b"p5")))
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(80)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p5")))
+        );
+
+        // 4. `enough_newer` fast-trigger: 2 newer packets within gap <= 4 trigger immediately without 35ms wait.
+        jb.push(
+            7,
+            Bytes::from_static(b"p7"),
+            t0 + Duration::from_millis(100),
+        );
+        jb.push(
+            8,
+            Bytes::from_static(b"p8"),
+            t0 + Duration::from_millis(101),
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(101)),
+            Some(JitterStep::FecFromNext(Bytes::from_static(b"p7")))
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(101)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p7")))
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(101)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p8")))
+        );
+
+        // 5. DTX jump (gap > 4 and <= 20): waits 35ms then jumps straight to first available packet.
+        jb.push(
+            16,
+            Bytes::from_static(b"p16"),
+            t0 + Duration::from_millis(200),
+        );
+        assert_eq!(jb.pop_ready(t0 + Duration::from_millis(220)), None);
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(240)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p16")))
+        );
+
+        // 6. Large jump resync (> 20): clears queue and plays immediately.
+        jb.push(
+            18,
+            Bytes::from_static(b"old"),
+            t0 + Duration::from_millis(300),
+        );
+        jb.push(
+            50,
+            Bytes::from_static(b"resync"),
+            t0 + Duration::from_millis(305),
+        );
+        assert_eq!(
+            jb.pop_ready(t0 + Duration::from_millis(305)),
+            Some(JitterStep::Packet(Bytes::from_static(b"resync")))
+        );
+
+        // 7. 24-packet overflow cap (exercised directly when queue exceeds 24 entries) + 21-packet resync boundary.
+        let mut jb_cap = AudioJitterBuffer::new();
+        for seq in 0u16..=20 {
+            jb_cap.push(seq, Bytes::from(vec![seq as u8]), t0);
+        }
+        assert_eq!(jb_cap.queue.len(), 21);
+        assert_eq!(jb_cap.next_seq, Some(0));
+        // Pre-fill extra synthetic entries below next_seq + 20 to verify the >24 cap trims oldest.
+        for extra in 21i64..26 {
+            jb_cap.queue.insert(extra, Bytes::from(vec![extra as u8]));
+        }
+        jb_cap.push(20, Bytes::from(vec![20u8]), t0);
+        assert_eq!(jb_cap.queue.len(), 24);
+        assert_eq!(jb_cap.next_seq, Some(2));
+        assert_eq!(
+            jb_cap.pop_ready(t0),
+            Some(JitterStep::Packet(Bytes::from(vec![2u8])))
+        );
+
+        // 8. `missing_since` re-arming when popping `next` exposes a new gap.
+        let mut jb_rearm = AudioJitterBuffer::new();
+        jb_rearm.push(10, Bytes::from_static(b"p10"), t0);
+        jb_rearm.push(12, Bytes::from_static(b"p12"), t0);
+        // Popping 10 at t0 + 100ms re-arms missing_since to t0 + 100ms for missing 11.
+        assert_eq!(
+            jb_rearm.pop_ready(t0 + Duration::from_millis(100)),
+            Some(JitterStep::Packet(Bytes::from_static(b"p10")))
+        );
+        // At t0 + 120ms (only 20ms since re-arm), must still wait for 11.
+        assert_eq!(jb_rearm.pop_ready(t0 + Duration::from_millis(120)), None);
+        // At t0 + 140ms (40ms since re-arm), triggers FEC from 12.
+        assert_eq!(
+            jb_rearm.pop_ready(t0 + Duration::from_millis(140)),
+            Some(JitterStep::FecFromNext(Bytes::from_static(b"p12")))
+        );
+    }
+
+    #[test]
+    fn playback_buffer_overflow_crossfade_exact_drain_clamping_reprime_and_snap() {
+        let mut pb = PlaybackBuffer::new();
+
+        // Exact drain stays primed!
+        pb.push(&vec![0.5f32; PLAYBACK_PRIME_SAMPLES]);
+        assert!(pb.primed);
+        let mut exact = vec![0.0f32; PLAYBACK_PRIME_SAMPLES];
+        pb.pull_into(&mut exact);
+        assert!(pb.primed, "exact drain without shortage must stay primed");
+        assert!(exact.iter().all(|&s| (s - 0.5).abs() < 1e-6));
+
+        // Clamping out-of-range samples [-1.0, 1.0].
+        pb.push(&[2.5, -3.0, 0.25, -0.75]);
+        let mut clamped = vec![0.0f32; 4];
+        pb.pull_into(&mut clamped);
+        assert_eq!(clamped, vec![1.0, -1.0, 0.25, -0.75]);
+
+        // Re-priming cycle: trigger underrun -> unprimed -> fade snaps to exact 0.0.
+        let mut fade = vec![99.0f32; 128];
+        pb.pull_into(&mut fade);
+        assert!(!pb.primed);
+        assert_eq!(
+            *fade.last().unwrap(),
+            0.0,
+            "fade_to_silence must snap to 0.0"
+        );
+        pb.push(&vec![0.3f32; FRAME_20MS * 2]);
+        assert!(!pb.primed);
+        pb.push(&vec![0.3f32; FRAME_20MS]);
+        assert!(pb.primed);
+
+        // Overflow trim + 32-sample crossfade splice.
+        let mut pb_ov = PlaybackBuffer::new();
+        // Fill first portion with -0.6 and later portion with +0.6 up to PLAYBACK_MAX_SAMPLES.
+        pb_ov.push(&vec![-0.6f32; PLAYBACK_MAX_SAMPLES - PLAYBACK_TRIM_TARGET]);
+        pb_ov.push(&vec![0.6f32; PLAYBACK_TRIM_TARGET]);
+        assert_eq!(pb_ov.samples.len(), PLAYBACK_MAX_SAMPLES);
+        // Pushing 1 more frame exceeds PLAYBACK_MAX_SAMPLES -> trims to PLAYBACK_TRIM_TARGET + FRAME_20MS.
+        pb_ov.push(&vec![0.6f32; FRAME_20MS]);
+        assert_eq!(pb_ov.samples.len(), PLAYBACK_TRIM_TARGET + FRAME_20MS);
+        let mut splice = vec![0.0f32; 40];
+        pb_ov.pull_into(&mut splice);
+        // First 32 samples ramp smoothly from -0.6 toward +0.6.
+        assert!(splice[0] < -0.4);
+        assert!(splice[15].abs() < 0.15);
+        assert!((splice[31] - 0.6).abs() < 0.1);
+        assert!((splice[35] - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dsp_helpers_and_shared_state_edge_cases() {
+        // LoudnessNormalizer: empty frame no-op & silence drift toward unity.
+        let mut norm = LoudnessNormalizer::speech();
+        norm.process_frame(&mut []);
+        assert!((norm.gain() - 1.0).abs() < 1e-6);
+        let mut loud = vec![0.8f32; FRAME_20MS];
+        for _ in 0..10 {
+            loud.fill(0.8);
+            norm.process_frame(&mut loud);
+        }
+        let attenuated = norm.gain();
+        assert!(attenuated < 0.5);
+        let mut silence = vec![0.0f32; FRAME_20MS];
+        for _ in 0..100 {
+            silence.fill(0.0);
+            norm.process_frame(&mut silence);
+        }
+        assert!(
+            norm.gain() > attenuated,
+            "silence must drift gain back toward 1.0"
+        );
+
+        // soft_limit_sample: linear inside knee, bounded outside, antisymmetric.
+        assert_eq!(soft_limit_sample(0.0), 0.0);
+        assert_eq!(soft_limit_sample(0.80), 0.80);
+        assert_eq!(soft_limit_sample(-0.80), -0.80);
+        assert!(soft_limit_sample(10.0) <= 0.98 && soft_limit_sample(10.0) > 0.95);
+        assert!((soft_limit_sample(-10.0) + soft_limit_sample(10.0)).abs() < 1e-6);
+
+        // normalized_gain_for_rms edge cases (NaN, Inf, 0, negative, clamp bounds).
+        assert!((normalized_gain_for_rms(f32::NAN, 0.1, 0.2, 5.0) - 0.2).abs() < 1e-6);
+        assert!((normalized_gain_for_rms(f32::INFINITY, 0.5, 0.2, 5.0) - 0.5).abs() < 1e-6);
+        assert!((normalized_gain_for_rms(f32::NEG_INFINITY, 0.5, 0.2, 5.0) - 0.5).abs() < 1e-6);
+        assert!((normalized_gain_for_rms(0.0, 0.5, 0.2, 5.0) - 0.5).abs() < 1e-6);
+        assert!((normalized_gain_for_rms(-1.0, 0.5, 0.2, 5.0) - 0.5).abs() < 1e-6);
+        assert!((normalized_gain_for_rms(0.001, 0.5, 0.2, 5.0) - 5.0).abs() < 1e-6);
+        assert!((normalized_gain_for_rms(10.0, 0.5, 0.2, 5.0) - 0.2).abs() < 1e-6);
+
+        // downmix_to_mono_f32.
+        assert!(downmix_to_mono_f32(&[], 2).is_empty());
+        assert_eq!(downmix_to_mono_f32(&[0.2, -0.4], 1), vec![0.2, -0.4]);
+        assert_eq!(
+            downmix_to_mono_f32(&[0.2, 0.6, -0.4, 0.4], 2),
+            vec![0.4, 0.0]
+        );
+        assert_eq!(downmix_to_mono_f32(&[1.0, 1.0, 0.0, 0.0], 4), vec![0.5]);
+
+        // resample_linear edge cases.
+        assert!(resample_linear(&[], 44_100, 48_000).is_empty());
+        assert_eq!(resample_linear(&[0.1, 0.2], 48_000, 48_000), vec![0.1, 0.2]);
+        let down = resample_linear(&vec![0.75f32; 480], 48_000, 16_000);
+        assert_eq!(down.len(), 160);
+        assert!((down[80] - 0.75).abs() < 1e-4);
+
+        // compute_rms_mono.
+        assert_eq!(compute_rms_mono(&[]), 0.0);
+        assert!((compute_rms_mono(&[0.5; 10]) - 0.5).abs() < 1e-6);
+        assert_eq!(compute_rms_mono(&[2.0; 10]), 1.0);
+
+        // AudioSharedState::local_rms respects muted flag.
+        let cfg = HuddleAudioConfig::default();
+        let shared = AudioSharedState::from_config(&cfg);
+        shared
+            .local_rms_bits
+            .store(0.42f32.to_bits(), Ordering::Relaxed);
+        assert!((shared.local_rms() - 0.42).abs() < 1e-6);
+        shared.muted.store(true, Ordering::Relaxed);
+        assert_eq!(shared.local_rms(), 0.0);
+    }
+
+    #[test]
+    fn inbound_audio_rx_loop_reorders_fec_plc_primes_playback_and_gates_aec_tap() {
+        let mut enc = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).unwrap();
+        let _ = enc.set_bitrate(Bitrate::Bits(32_000));
+        let _ = enc.set_inband_fec(true);
+        let _ = enc.set_packet_loss_perc(20);
+
+        let mut packets = Vec::new();
+        let mut out_buf = vec![0u8; 4000];
+        for frame_ix in 0..10usize {
+            let pcm: Vec<f32> = (0..FRAME_20MS)
+                .map(|i| {
+                    let t = (frame_ix * FRAME_20MS + i) as f32 / SAMPLE_RATE as f32;
+                    (2.0 * std::f32::consts::PI * 350.0 * t).sin() * 0.25
+                })
+                .collect();
+            let n = enc.encode_float(&pcm, &mut out_buf).unwrap();
+            packets.push(Bytes::copy_from_slice(&out_buf[..n]));
+        }
+
+        // Case 1: needs_sw_aec_ref = true, unmuted, aec = true -> populates both PlaybackBuffer and aec_render_tap (with overflow trim).
+        let cfg = HuddleAudioConfig::default();
+        let shared = AudioSharedState::from_config(&cfg);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let playback = Arc::new(Mutex::new(PlaybackBuffer::new()));
+        let aec_tap = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let needs_aec = Arc::new(AtomicBool::new(true));
+
+        let s_clone = shared.clone();
+        let pb_clone = Arc::clone(&playback);
+        let tap_clone = Arc::clone(&aec_tap);
+        let needs_clone = Arc::clone(&needs_aec);
+        let handle = std::thread::spawn(move || {
+            run_inbound_audio_rx_loop(s_clone, &mut rx, pb_clone, tap_clone, needs_clone);
+        });
+
+        // Deliver out of order (100, 102, 101), drop 103 (FEC from 104), then 104..109.
+        let send_order = [0usize, 2, 1, 4, 5, 6, 7, 8, 9];
+        for idx in send_order {
+            tx.send(InboundAudioPacket {
+                seq: 100 + idx as u16,
+                payload: packets[idx].clone(),
+            })
+            .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let primed = playback.lock().unwrap().primed;
+            let tap_len = aec_tap.lock().unwrap().len();
+            if primed && tap_len > 0 {
+                // Wait briefly for remaining packets to decode through the jitter buffer.
+                if playback.lock().unwrap().samples.len() >= FRAME_20MS * 8 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        shared.running.store(false, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        {
+            let mut pb = playback.lock().unwrap();
+            assert!(
+                pb.primed,
+                "playback buffer should be primed after decoding Opus packets"
+            );
+            let mut rendered = vec![0.0f32; FRAME_20MS * 3];
+            pb.pull_into(&mut rendered);
+            assert!(
+                compute_rms_mono(&rendered) > 0.01,
+                "decoded playback audio should contain non-silent tone"
+            );
+        }
+        {
+            let tap = aec_tap.lock().unwrap();
+            assert!(
+                !tap.is_empty(),
+                "aec_render_tap should receive decoded samples"
+            );
+            // Overflow cap trims when > FRAME_20MS * 6 down to FRAME_20MS * 3 before extending.
+            assert!(
+                tap.len() <= FRAME_20MS * 7,
+                "aec_render_tap must be bounded by overflow trim, got {}",
+                tap.len()
+            );
+        }
+
+        // Case 2: needs_sw_aec_ref = false -> aec_render_tap stays empty while playback still works.
+        let shared2 = AudioSharedState::from_config(&cfg);
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let pb2 = Arc::new(Mutex::new(PlaybackBuffer::new()));
+        let tap2 = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let needs2 = Arc::new(AtomicBool::new(false));
+        let s2 = shared2.clone();
+        let pb2_c = Arc::clone(&pb2);
+        let tap2_c = Arc::clone(&tap2);
+        let needs2_c = Arc::clone(&needs2);
+        let h2 = std::thread::spawn(move || {
+            run_inbound_audio_rx_loop(s2, &mut rx2, pb2_c, tap2_c, needs2_c);
+        });
+        for (i, pkt) in packets.iter().take(4).enumerate() {
+            tx2.send(InboundAudioPacket {
+                seq: i as u16,
+                payload: pkt.clone(),
+            })
+            .unwrap();
+        }
+        let dl2 = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dl2 {
+            if pb2.lock().unwrap().primed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        shared2.running.store(false, Ordering::Relaxed);
+        h2.join().unwrap();
+        assert!(pb2.lock().unwrap().primed);
+        assert!(tap2.lock().unwrap().is_empty());
+    }
 }

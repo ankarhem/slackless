@@ -29,6 +29,100 @@ use crate::signaling::{
 use crate::video::VideoFrame;
 use crate::{HuddleCredentials, HuddleError, Result};
 
+const CONTENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns `true` when an audio input device name matches a known virtual loopback driver.
+pub(crate) fn is_loopback_device_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("blackhole")
+        || lower.contains("loopback")
+        || lower.contains("soundflower")
+        || lower.contains("vb-cable")
+        || lower.contains("cable output")
+        || lower.contains("monitor of")
+}
+
+/// Derive `#content` attendee credentials from base huddle credentials.
+pub(crate) fn content_credentials(base_creds: HuddleCredentials) -> HuddleCredentials {
+    HuddleCredentials {
+        attendee_id: format!("{}#content", base_creds.attendee_id),
+        join_token: format!("{}#content", base_creds.join_token),
+        ..base_creds
+    }
+}
+
+/// Compute an updated screen-share ABR target bitrate (clamped `800 kbps..=3.5 Mbps`) when the
+/// change exceeds the 200 kbps hysteresis threshold; returns `None` when no update is needed.
+pub(crate) fn compute_content_abr_bitrate(target_bps: u32, last_abr_bps: u32) -> Option<u32> {
+    let clamped = target_bps.clamp(800_000, 3_500_000);
+    (clamped.abs_diff(last_abr_bps) >= 200_000).then_some(clamped)
+}
+
+/// Push interleaved stereo i16 PCM into the loopback queue, draining 1 second of oldest samples
+/// when the buffer exceeds 4 seconds (`48_000 * 4` stereo samples = 2 seconds of stereo pairs).
+pub(crate) fn push_stereo_pcm_with_overflow(queue: &mut VecDeque<i16>, stereo: Vec<i16>) {
+    if queue.len() > 48_000 * 4 {
+        queue.drain(..48_000);
+    }
+    queue.extend(stereo);
+}
+
+async fn wait_for_content_join_ack(
+    sig: &mut ChimeSignalClient,
+    timeout: Duration,
+) -> Result<crate::proto::SdkJoinAckFrame> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let Some(frame) = sig.next_frame().await? else {
+                return Err(HuddleError::Signaling(
+                    "content share WS closed before JOIN_ACK".into(),
+                ));
+            };
+            if let Some(err) = frame.error {
+                return Err(HuddleError::Protocol {
+                    status: err.status.unwrap_or(500),
+                    description: err.description.unwrap_or_default(),
+                });
+            }
+            if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32) {
+                return frame.joinack.ok_or_else(|| {
+                    HuddleError::Signaling("content JOIN_ACK missing payload".into())
+                });
+            }
+        }
+    })
+    .await
+    .map_err(|_| HuddleError::Signaling("timed out waiting for content JOIN_ACK".into()))?
+}
+
+async fn wait_for_content_subscribe_ack(
+    sig: &mut ChimeSignalClient,
+    timeout: Duration,
+) -> Result<crate::proto::SdkSubscribeAckFrame> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let Some(frame) = sig.next_frame().await? else {
+                return Err(HuddleError::Signaling(
+                    "content share WS closed before SUBSCRIBE_ACK".into(),
+                ));
+            };
+            if let Some(err) = frame.error {
+                return Err(HuddleError::Protocol {
+                    status: err.status.unwrap_or(500),
+                    description: err.description.unwrap_or_default(),
+                });
+            }
+            if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32) {
+                return frame.suback.ok_or_else(|| {
+                    HuddleError::Signaling("content SUBSCRIBE_ACK missing payload".into())
+                });
+            }
+        }
+    })
+    .await
+    .map_err(|_| HuddleError::Signaling("timed out waiting for content SUBSCRIBE_ACK".into()))?
+}
+
 /// Detect an installed virtual system-audio loopback input device (`BlackHole`, `Loopback`,
 /// `Soundflower`, `VB-Cable`, PulseAudio/PipeWire `Monitor of ...`) for screen-share audio
 /// capture (`F-COLLAB-022`).
@@ -37,14 +131,7 @@ pub fn detect_system_audio_loopback() -> Option<String> {
     let inputs = host.input_devices().ok()?;
     for dev in inputs {
         let Ok(name) = dev.name() else { continue };
-        let lower = name.to_ascii_lowercase();
-        if lower.contains("blackhole")
-            || lower.contains("loopback")
-            || lower.contains("soundflower")
-            || lower.contains("vb-cable")
-            || lower.contains("cable output")
-            || lower.contains("monitor of")
-        {
+        if is_loopback_device_name(&name) {
             return Some(name);
         }
     }
@@ -85,11 +172,7 @@ impl ContentShareSession {
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
-        let content_creds = HuddleCredentials {
-            attendee_id: format!("{}#content", base_creds.attendee_id),
-            join_token: format!("{}#content", base_creds.join_token),
-            ..base_creds
-        };
+        let content_creds = content_credentials(base_creds);
 
         tracing::info!(
             source_id = %source_id,
@@ -100,24 +183,7 @@ impl ContentShareSession {
         let audio_session_id: u64 = rand::random();
         sig.send_frame(&build_join_frame(audio_session_id)).await?;
 
-        let join_ack = loop {
-            let Some(frame) = sig.next_frame().await? else {
-                return Err(HuddleError::Signaling(
-                    "content share WS closed before JOIN_ACK".into(),
-                ));
-            };
-            if let Some(err) = frame.error {
-                return Err(HuddleError::Protocol {
-                    status: err.status.unwrap_or(500),
-                    description: err.description.unwrap_or_default(),
-                });
-            }
-            if frame.r#type == Some(sdk_signal_frame::Type::JoinAck as i32) {
-                break frame.joinack.ok_or_else(|| {
-                    HuddleError::Signaling("content JOIN_ACK missing payload".into())
-                })?;
-            }
-        };
+        let join_ack = wait_for_content_join_ack(&mut sig, CONTENT_HANDSHAKE_TIMEOUT).await?;
         let turn = join_ack
             .turn_credentials
             .as_ref()
@@ -134,24 +200,7 @@ impl ContentShareSession {
         let sub_frame = build_content_subscribe_frame(&content_creds, &offer_sdp, false)?;
         sig.send_frame(&sub_frame).await?;
 
-        let sub_ack = loop {
-            let Some(frame) = sig.next_frame().await? else {
-                return Err(HuddleError::Signaling(
-                    "content share WS closed before SUBSCRIBE_ACK".into(),
-                ));
-            };
-            if let Some(err) = frame.error {
-                return Err(HuddleError::Protocol {
-                    status: err.status.unwrap_or(500),
-                    description: err.description.unwrap_or_default(),
-                });
-            }
-            if frame.r#type == Some(sdk_signal_frame::Type::SubscribeAck as i32) {
-                break frame.suback.ok_or_else(|| {
-                    HuddleError::Signaling("content SUBSCRIBE_ACK missing payload".into())
-                })?;
-            }
-        };
+        let sub_ack = wait_for_content_subscribe_ack(&mut sig, CONTENT_HANDSHAKE_TIMEOUT).await?;
         let answer = decode_sdp_answer(
             sub_ack.sdp_answer.as_deref(),
             sub_ack.compressed_sdp_answer.as_deref(),
@@ -225,10 +274,7 @@ impl ContentShareSession {
                         let cfg: cpal::StreamConfig = supported.into();
                         let push = move |stereo: Vec<i16>| {
                             if let Ok(mut q) = loopback_pcm_tx.lock() {
-                                if q.len() > 48_000 * 4 {
-                                    q.drain(..48_000);
-                                }
-                                q.extend(stereo);
+                                push_stereo_pcm_with_overflow(&mut q, stereo);
                             }
                         };
                         let stream = match fmt {
@@ -345,8 +391,9 @@ impl ContentShareSession {
                                 capture.force_keyframe();
                             }
                             VideoSenderFeedback::TargetBitrateBps(bps) => {
-                                let clamped = bps.clamp(800_000, 3_500_000);
-                                if clamped.abs_diff(last_abr_bps) >= 200_000 {
+                                if let Some(clamped) =
+                                    compute_content_abr_bitrate(bps, last_abr_bps)
+                                {
                                     last_abr_bps = clamped;
                                     capture.set_target_bitrate(clamped);
                                 }
@@ -439,5 +486,267 @@ impl ContentShareSession {
 impl Drop for ContentShareSession {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{
+        SdkErrorFrame, SdkJoinAckFrame, SdkSignalFrame, SdkSubscribeAckFrame, SdkTurnCredentials,
+    };
+    use crate::signaling::{encode_wire_frame, now_ms};
+    use futures_util::SinkExt as _;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::tungstenite::http::HeaderValue;
+
+    fn sample_creds(url: String) -> HuddleCredentials {
+        HuddleCredentials {
+            channel: slackless_types::ChannelId::from("C1"),
+            call_id: "R1".into(),
+            meeting_id: "M1".into(),
+            attendee_id: "att-user".into(),
+            external_user_id: "T1-R1-U1".into(),
+            join_token: "tok-user".into(),
+            signaling_url: url,
+            audio_host_url: "audio.invalid:3478".into(),
+            turn_control_url: String::new(),
+            thread_root_ts: None,
+            canvas_file_id: None,
+            huddle_link: None,
+        }
+    }
+
+    #[test]
+    fn loopback_device_name_detection() {
+        assert!(is_loopback_device_name("BlackHole 2ch"));
+        assert!(is_loopback_device_name("Loopback Audio"));
+        assert!(is_loopback_device_name("Soundflower (64ch)"));
+        assert!(is_loopback_device_name("VB-Cable Virtual"));
+        assert!(is_loopback_device_name("CABLE Output (VB-Audio)"));
+        assert!(is_loopback_device_name(
+            "Monitor of Built-in Audio Analog Stereo"
+        ));
+        assert!(!is_loopback_device_name("MacBook Pro Microphone"));
+        assert!(!is_loopback_device_name("AirPods Pro"));
+    }
+
+    #[test]
+    fn content_credentials_appends_content_suffix() {
+        let base = sample_creds("wss://example.invalid".into());
+        let content = content_credentials(base.clone());
+        assert_eq!(content.attendee_id, "att-user#content");
+        assert_eq!(content.join_token, "tok-user#content");
+        assert_eq!(content.meeting_id, base.meeting_id);
+        assert_eq!(content.external_user_id, base.external_user_id);
+    }
+
+    #[test]
+    fn abr_hysteresis_clamps_and_suppresses_small_jitter() {
+        // Below hysteresis threshold (200k) -> None.
+        assert_eq!(compute_content_abr_bitrate(3_100_000, 3_000_000), None);
+        assert_eq!(compute_content_abr_bitrate(2_800_001, 3_000_000), None);
+        // At or above threshold -> Some(clamped).
+        assert_eq!(
+            compute_content_abr_bitrate(2_800_000, 3_000_000),
+            Some(2_800_000)
+        );
+        // Clamped to floor 800_000 and ceiling 3_500_000.
+        assert_eq!(
+            compute_content_abr_bitrate(100_000, 3_000_000),
+            Some(800_000)
+        );
+        assert_eq!(
+            compute_content_abr_bitrate(9_000_000, 3_000_000),
+            Some(3_500_000)
+        );
+        // Already at ceiling -> no update.
+        assert_eq!(compute_content_abr_bitrate(9_000_000, 3_500_000), None);
+    }
+
+    #[test]
+    fn stereo_pcm_overflow_drain_caps_queue_growth() {
+        let mut q = VecDeque::new();
+        push_stereo_pcm_with_overflow(&mut q, vec![1; 48_000 * 4]);
+        assert_eq!(q.len(), 48_000 * 4);
+        // Pushing 100 more is still <= 48_000 * 4 before push, so no drain yet.
+        push_stereo_pcm_with_overflow(&mut q, vec![2; 100]);
+        assert_eq!(q.len(), 48_000 * 4 + 100);
+        // Now len > 48_000 * 4 -> drains oldest 48_000 samples before extending.
+        push_stereo_pcm_with_overflow(&mut q, vec![3; 50]);
+        assert_eq!(q.len(), 48_000 * 3 + 150);
+        assert_eq!(*q.back().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn content_handshake_join_and_subscribe_ack_timeout_on_stalled_ws() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut ws = accept_hdr_async(stream, |_req: &Request, mut resp: Response| {
+                        resp.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            HeaderValue::from_static("_aws_wt_session"),
+                        );
+                        Ok(resp)
+                    })
+                    .await
+                    .unwrap();
+                    // Hold socket open without sending JOIN_ACK or SUBSCRIBE_ACK.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = ws.close(None).await;
+                });
+            }
+        });
+
+        let creds = content_credentials(sample_creds(format!("ws://{addr}/control/M1")));
+
+        let mut sig1 = ChimeSignalClient::connect(&creds).await.unwrap();
+        let err1 = wait_for_content_join_ack(&mut sig1, Duration::from_millis(60))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err1, HuddleError::Signaling(ref m) if m.contains("timed out")),
+            "expected JOIN_ACK timeout, got {err1:?}"
+        );
+        sig1.close().await;
+
+        let mut sig2 = ChimeSignalClient::connect(&creds).await.unwrap();
+        let err2 = wait_for_content_subscribe_ack(&mut sig2, Duration::from_millis(60))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err2, HuddleError::Signaling(ref m) if m.contains("timed out")),
+            "expected SUBSCRIBE_ACK timeout, got {err2:?}"
+        );
+        sig2.close().await;
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn content_handshake_handles_ack_protocol_error_and_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: send non-ACK ping, then JOIN_ACK, then SUBSCRIBE_ACK.
+            let (s1, _) = listener.accept().await.unwrap();
+            let mut ws1 = accept_hdr_async(s1, |_req: &Request, mut resp: Response| {
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("_aws_wt_session"),
+                );
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+            ws1.send(WsMessage::Binary(
+                encode_wire_frame(&build_pong_frame(1)).into(),
+            ))
+            .await
+            .unwrap();
+            let join_ack = SdkSignalFrame {
+                timestamp_ms: Some(now_ms()),
+                r#type: Some(sdk_signal_frame::Type::JoinAck as i32),
+                joinack: Some(SdkJoinAckFrame {
+                    turn_credentials: Some(SdkTurnCredentials {
+                        uris: vec!["turn:127.0.0.1:3478?transport=udp".into()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            ws1.send(WsMessage::Binary(encode_wire_frame(&join_ack).into()))
+                .await
+                .unwrap();
+            let sub_ack = SdkSignalFrame {
+                timestamp_ms: Some(now_ms()),
+                r#type: Some(sdk_signal_frame::Type::SubscribeAck as i32),
+                suback: Some(SdkSubscribeAckFrame {
+                    sdp_answer: Some("v=0\r\n".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            ws1.send(WsMessage::Binary(encode_wire_frame(&sub_ack).into()))
+                .await
+                .unwrap();
+
+            // Connection 2: protocol error before JOIN_ACK.
+            let (s2, _) = listener.accept().await.unwrap();
+            let mut ws2 = accept_hdr_async(s2, |_req: &Request, mut resp: Response| {
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("_aws_wt_session"),
+                );
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+            let err_frame = SdkSignalFrame {
+                timestamp_ms: Some(now_ms()),
+                error: Some(SdkErrorFrame {
+                    status: Some(403),
+                    description: Some("forbidden".into()),
+                }),
+                ..Default::default()
+            };
+            ws2.send(WsMessage::Binary(encode_wire_frame(&err_frame).into()))
+                .await
+                .unwrap();
+
+            // Connection 3: immediate close before SUBSCRIBE_ACK.
+            let (s3, _) = listener.accept().await.unwrap();
+            let mut ws3 = accept_hdr_async(s3, |_req: &Request, mut resp: Response| {
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("_aws_wt_session"),
+                );
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+            ws3.send(WsMessage::Close(None)).await.unwrap();
+        });
+
+        let creds = content_credentials(sample_creds(format!("ws://{addr}/control/M1")));
+
+        let mut c1 = ChimeSignalClient::connect(&creds).await.unwrap();
+        let ja = wait_for_content_join_ack(&mut c1, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(ja.turn_credentials.is_some());
+        let sa = wait_for_content_subscribe_ack(&mut c1, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(sa.sdp_answer.as_deref(), Some("v=0\r\n"));
+        c1.close().await;
+
+        let mut c2 = ChimeSignalClient::connect(&creds).await.unwrap();
+        let e2 = wait_for_content_join_ack(&mut c2, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(e2, HuddleError::Protocol { status: 403, .. }));
+        c2.close().await;
+
+        let mut c3 = ChimeSignalClient::connect(&creds).await.unwrap();
+        let e3 = wait_for_content_subscribe_ack(&mut c3, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(matches!(e3, HuddleError::Signaling(ref m) if m.contains("closed")));
+        c3.close().await;
+
+        server.await.unwrap();
     }
 }

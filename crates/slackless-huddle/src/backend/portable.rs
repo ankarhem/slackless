@@ -488,3 +488,39 @@ impl MediaBackend for PortableMediaBackend {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lazy_openh264_decoder_initializes_lazily_and_decodes_keyframe() {
+        let mut dec = LazyOpenH264Decoder::new();
+        assert!(dec.decoder.is_none(), "OpenH264 decoder must start lazy");
+        assert_eq!(dec.backend_name(), "H.264 (OpenH264 SW)");
+
+        // Garbage bytes return None safely.
+        assert!(dec.decode_unit(&[0x00, 0x01, 0xFF]).is_none());
+        assert!(dec.decoder.is_some());
+
+        // Real encoded Annex-B frame decodes cleanly to BGRA.
+        let mut enc = H264VideoEncoder::new().unwrap();
+        let (w, h) = (64usize, 48usize);
+        let rgb = vec![120u8; w * h * 3];
+        let annex_b = enc.encode_rgb(&rgb, w, h).unwrap();
+        let frame = dec
+            .decode_unit(&annex_b)
+            .expect("LazyOpenH264Decoder should decode valid H.264 keyframe");
+        assert_eq!((frame.width, frame.height), (w as u32, h as u32));
+        let (_, _, bgra) = frame.into_bgra().unwrap();
+        assert_eq!(bgra.len(), w * h * 4);
+    }
+
+    #[test]
+    fn software_av1_decoder_handles_empty_and_invalid_units_safely() {
+        let mut dec = SoftwareAv1Decoder::new().expect("rav1d decoder");
+        assert_eq!(dec.backend_name(), "AV1 (rav1d SW)");
+        assert!(dec.decode_unit(&[]).is_none());
+        assert!(dec.decode_unit(&[0xFF, 0xFE, 0xFD, 0xFC]).is_none());
+    }
+}

@@ -294,4 +294,46 @@ mod tests {
         assert_eq!(snap.tx_encode_us, 1200);
         assert_eq!(snap.tx_kbps, 200); // 25_000 bytes * 8 / 1000
     }
+
+    #[test]
+    fn perf_counters_reset_deltas_handle_clear_tx_and_track_rx() {
+        let c = HuddlePerfCounters::default();
+        c.set_tx_backend("TX-HW");
+        c.record_tx_frame(1280, 720, 5_000, 800);
+        c.set_rx_backend("AV1 (rav1d SW)");
+        c.record_rx_packet(2_500);
+        c.record_rx_packet(2_500);
+        c.record_rx_frame(1920, 1080, 2_000);
+        c.record_rx_frame(1920, 1080, 4_000);
+
+        let s1 = c.sample(2.0, 15, 200);
+        assert_eq!(s1.tx_backend.as_deref(), Some("TX-HW"));
+        assert_eq!(s1.tx_resolution.as_deref(), Some("1280x720"));
+        assert_eq!(s1.tx_fps_tenths, 5); // 0.5 fps
+        assert_eq!(s1.tx_kbps, 20); // 5000*8 / 2 / 1000
+        assert_eq!(s1.rx_backend.as_deref(), Some("AV1 (rav1d SW)"));
+        assert_eq!(s1.rx_resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(s1.rx_fps_tenths, 10); // 1.0 fps
+        assert_eq!(s1.rx_decode_us, 3000);
+        assert_eq!(s1.rx_kbps, 20);
+
+        // Second sample without new frames resets delta metrics to 0 while preserving backend/res.
+        let s2 = c.sample(0.01, 0, 200); // dt clamps to 0.1
+        assert_eq!(s2.tx_fps_tenths, 0);
+        assert_eq!(s2.tx_encode_us, 0);
+        assert_eq!(s2.tx_kbps, 0);
+        assert_eq!(s2.rx_fps_tenths, 0);
+        assert_eq!(s2.rx_decode_us, 0);
+        assert_eq!(s2.rx_kbps, 0);
+        assert_eq!(s2.tx_resolution.as_deref(), Some("1280x720"));
+        assert_eq!(s2.rx_resolution.as_deref(), Some("1920x1080"));
+
+        // clear_tx clears TX backend & resolution without touching RX.
+        c.clear_tx();
+        let s3 = c.sample(1.0, 0, 200);
+        assert!(s3.tx_backend.is_none());
+        assert!(s3.tx_resolution.is_none());
+        assert_eq!(s3.rx_backend.as_deref(), Some("AV1 (rav1d SW)"));
+        assert_eq!(s3.rx_resolution.as_deref(), Some("1920x1080"));
+    }
 }

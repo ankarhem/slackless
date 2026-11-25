@@ -388,3 +388,68 @@ pub(crate) fn capture_once_result(
         .capture_image()
         .map_err(|e| format!("primary monitor capture_image failed: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_chrome_window_filters_macos_system_ui_and_keeps_user_apps() {
+        for app in [
+            "Dock",
+            " NotificationCenter ",
+            "Notiscenter",
+            "Window Server",
+            "Control Center",
+            "Kontrollcenter",
+            "SystemUIServer",
+            "Spotlight",
+        ] {
+            assert!(is_system_chrome_window(app, "anything"), "app={app}");
+        }
+        for title in ["Dock", "Menubar", "StatusIndicator"] {
+            assert!(
+                is_system_chrome_window("SomeProcess", title),
+                "title={title}"
+            );
+        }
+        assert!(!is_system_chrome_window(
+            "Firefox",
+            "GitHub - Pull Requests"
+        ));
+        assert!(!is_system_chrome_window("Terminal", "zsh"));
+    }
+
+    #[test]
+    fn downscale_rgba_thumbnail_swaps_bgra_scales_and_handles_zero_dims() {
+        let zero = xcap::image::RgbaImage::new(0, 0);
+        assert!(downscale_rgba_thumbnail(&zero, 160, 90).is_none());
+
+        let mut img = xcap::image::RgbaImage::new(40, 20);
+        for px in img.pixels_mut() {
+            *px = xcap::image::Rgba([220, 110, 30, 128]);
+        }
+        assert!(downscale_rgba_thumbnail(&img, 0, 10).is_none());
+        assert!(downscale_rgba_thumbnail(&img, 10, 0).is_none());
+
+        let frame = downscale_rgba_thumbnail(&img, 20, 20).expect("thumbnail");
+        assert_eq!((frame.width, frame.height), (20, 10));
+        let (_, _, bgra) = frame.into_bgra().unwrap();
+        assert_eq!(bgra.len(), 20 * 10 * 4);
+        // RGBA(220, 110, 30, 128) -> BGRA(30, 110, 220, 255).
+        assert_eq!(&bgra[0..4], &[30, 110, 220, 255]);
+    }
+
+    #[test]
+    fn fast_stride_hash_is_deterministic_and_detects_changes() {
+        let h_empty = fast_stride_hash(&[]);
+        assert_eq!(h_empty, fast_stride_hash(&[]));
+
+        let a = vec![42u8; 8192];
+        let mut b = a.clone();
+        assert_eq!(fast_stride_hash(&a), fast_stride_hash(&b));
+        // Mutating a sampled byte (index 0) must change the hash.
+        b[0] = 99;
+        assert_ne!(fast_stride_hash(&a), fast_stride_hash(&b));
+    }
+}

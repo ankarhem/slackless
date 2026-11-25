@@ -535,4 +535,496 @@ mod tests {
     fn av1_decoder_initializes_cleanly() {
         let _dec = Av1Decoder::new().expect("rav1d should initialize");
     }
+
+    fn make_rtp_packet_w(z: bool, y: bool, w: u8, n: bool, elems: &[&[u8]]) -> Vec<u8> {
+        let mut h = (w & 0b11) << 4;
+        if z {
+            h |= 0b1000_0000;
+        }
+        if y {
+            h |= 0b0100_0000;
+        }
+        if n {
+            h |= 0b0000_1000;
+        }
+        let mut out = vec![h];
+        for (i, e) in elems.iter().enumerate() {
+            let idx = (i + 1) as u8;
+            if w == 0 || idx < w {
+                write_leb128(&mut out, e.len());
+            }
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    #[test]
+    fn leb128_round_trips_multibyte_and_rejects_truncated_and_overflow() {
+        for &val in &[0usize, 1, 127, 128, 300, 16_383, 16_384, 2_097_151] {
+            let mut buf = Vec::new();
+            write_leb128(&mut buf, val);
+            assert_eq!(read_leb128(&buf), Some((val, buf.len())));
+        }
+        // Multi-byte lengths match expected LEB128 byte counts.
+        let mut b128 = Vec::new();
+        write_leb128(&mut b128, 128);
+        assert_eq!(b128, vec![0x80, 0x01]);
+        let mut b16384 = Vec::new();
+        write_leb128(&mut b16384, 16_384);
+        assert_eq!(b16384, vec![0x80, 0x80, 0x01]);
+
+        // Empty and truncated varints return None.
+        assert_eq!(read_leb128(&[]), None);
+        assert_eq!(read_leb128(&[0x80]), None);
+        assert_eq!(read_leb128(&[0x85, 0x80, 0xff]), None);
+
+        // >8-byte varint overflow returns None.
+        let overflow = [0x81u8; 9];
+        assert_eq!(read_leb128(&overflow), None);
+    }
+
+    #[test]
+    fn append_sized_obu_handles_extended_header_truncated_and_empty() {
+        // Empty OBU is a no-op.
+        let mut out = Vec::new();
+        append_sized_obu(&mut out, &[]);
+        assert!(out.is_empty());
+
+        // Extended OBU header (`obu_extension_flag` bit 2 = 0x04) keeps 2 header bytes before size.
+        let ext_header = (6u8 << 3) | 0b0000_0100;
+        let ext_byte = 0b0010_1000;
+        let ext_obu = vec![ext_header, ext_byte, b'a', b'b', b'c'];
+        append_sized_obu(&mut out, &ext_obu);
+        assert_eq!(
+            out,
+            vec![ext_header | 0b0000_0010, ext_byte, 3, b'a', b'b', b'c']
+        );
+
+        // Truncated extended OBU (only 1 byte present) is safely skipped.
+        let mut out_trunc = Vec::new();
+        append_sized_obu(&mut out_trunc, &[ext_header]);
+        assert!(out_trunc.is_empty());
+
+        // Multi-byte payload size (>127 bytes) encodes a 2-byte LEB128 length.
+        let mut large_obu = vec![6u8 << 3];
+        large_obu.extend(vec![0x42u8; 200]);
+        let mut out_large = Vec::new();
+        append_sized_obu(&mut out_large, &large_obu);
+        assert_eq!(out_large[0], (6u8 << 3) | 0b10);
+        assert_eq!(read_leb128(&out_large[1..]), Some((200, 2)));
+        assert_eq!(out_large.len(), 1 + 2 + 200);
+    }
+
+    #[test]
+    fn parse_packet_handles_w_1_2_3_multi_obu_and_trailing_y_continuation() {
+        // W = 1: single OBU with no length prefix.
+        let mut f = Av1Frames::default();
+        let o1 = make_obu(1, b"seq");
+        let u = f
+            .push(1, true, &make_rtp_packet_w(false, false, 1, false, &[&o1]))
+            .expect("W=1 unit");
+        assert_eq!(u, vec![(1 << 3) | 0b10, 3, b's', b'e', b'q']);
+
+        // W = 2: first OBU length-prefixed, second OBU consumes remainder.
+        let o2 = make_obu(6, b"frm");
+        let u = f
+            .push(
+                2,
+                true,
+                &make_rtp_packet_w(false, false, 2, false, &[&o1, &o2]),
+            )
+            .expect("W=2 unit");
+        assert_eq!(
+            u,
+            vec![
+                (1 << 3) | 0b10,
+                3,
+                b's',
+                b'e',
+                b'q',
+                (6 << 3) | 0b10,
+                3,
+                b'f',
+                b'r',
+                b'm',
+            ]
+        );
+
+        // W = 3 with trailing Y = 1 continuation into next packet (W = 1, Z = 1).
+        let o3 = make_obu(3, b"hdr");
+        let mut o4 = make_obu(6, b"splitbody");
+        let o4_tail = o4.split_off(4);
+        assert!(
+            f.push(
+                3,
+                false,
+                &make_rtp_packet_w(false, true, 3, false, &[&o1, &o3, &o4])
+            )
+            .is_none()
+        );
+        let u = f
+            .push(
+                4,
+                true,
+                &make_rtp_packet_w(true, false, 1, false, &[&o4_tail]),
+            )
+            .expect("W=3 + Y=1 continuation");
+        let mut expected = Vec::new();
+        append_sized_obu(&mut expected, &o1);
+        append_sized_obu(&mut expected, &o3);
+        append_sized_obu(&mut expected, &make_obu(6, b"splitbody"));
+        assert_eq!(u, expected);
+
+        // W = 2 with Y = 1 continuation on second element.
+        let mut o5 = make_obu(6, b"abcdef");
+        let o5_tail = o5.split_off(3);
+        assert!(
+            f.push(
+                5,
+                false,
+                &make_rtp_packet_w(false, true, 2, false, &[&o1, &o5])
+            )
+            .is_none()
+        );
+        let u = f
+            .push(
+                6,
+                true,
+                &make_rtp_packet_w(true, false, 1, false, &[&o5_tail]),
+            )
+            .expect("W=2 + Y=1 continuation");
+        let mut exp2 = Vec::new();
+        append_sized_obu(&mut exp2, &o1);
+        append_sized_obu(&mut exp2, &make_obu(6, b"abcdef"));
+        assert_eq!(u, exp2);
+    }
+
+    #[test]
+    fn av1_frames_mid_frame_gap_n_cvs_recovery_and_seq_wraparound() {
+        let mut f = Av1Frames::default();
+        let mut obu = make_obu(6, b"hello_world");
+        let tail = obu.split_off(4);
+
+        // Start a frame at seq 100 (Y=1, marker=false).
+        assert!(
+            f.push(100, false, &make_rtp_packet(false, true, &[&obu]))
+                .is_none()
+        );
+        // Mid-frame seq gap (skip 101, arrive 102 with marker=false) -> broken = true.
+        assert!(
+            f.push(102, false, &make_rtp_packet(true, true, &[&tail]))
+                .is_none()
+        );
+        assert!(f.broken);
+        // Subsequent packet with marker=true discards the broken frame and resets.
+        assert!(
+            f.push(103, true, &make_rtp_packet(true, false, &[&tail]))
+                .is_none()
+        );
+        assert!(!f.broken);
+
+        // Next clean frame recovers immediately.
+        let clean = make_obu(6, b"ok");
+        assert!(
+            f.push(104, true, &make_rtp_packet(false, false, &[&clean]))
+                .is_some()
+        );
+
+        // Break a frame, then recover immediately on N=1 && Z=0 even before a marker clears `broken`.
+        assert!(
+            f.push(105, false, &make_rtp_packet(false, true, &[&obu]))
+                .is_none()
+        );
+        assert!(
+            f.push(107, false, &make_rtp_packet(true, false, &[&tail]))
+                .is_none()
+        );
+        assert!(f.broken);
+        // N=1 && Z=1 must NOT reset; stays broken.
+        assert!(
+            f.push(
+                108,
+                false,
+                &make_rtp_packet_w(true, false, 1, true, &[&clean])
+            )
+            .is_none()
+        );
+        assert!(f.broken);
+        // N=1 && Z=0 resets and delivers the new CVS keyframe cleanly!
+        let cvs = f
+            .push(
+                109,
+                true,
+                &make_rtp_packet_w(false, false, 1, true, &[&clean]),
+            )
+            .expect("N=1 && Z=0 must recover from broken state");
+        assert_eq!(cvs, vec![(6 << 3) | 0b10, 2, b'o', b'k']);
+
+        // 16-bit RTP sequence wraparound: 65535 -> 0 mid-frame succeeds without triggering a gap.
+        let mut f_wrap = Av1Frames::default();
+        assert!(
+            f_wrap
+                .push(65535, false, &make_rtp_packet(false, true, &[&obu]))
+                .is_none()
+        );
+        let wrapped = f_wrap
+            .push(0, true, &make_rtp_packet(true, false, &[&tail]))
+            .expect("65535 -> 0 must wrap seamlessly");
+        let mut expected = Vec::new();
+        append_sized_obu(&mut expected, &make_obu(6, b"hello_world"));
+        assert_eq!(wrapped, expected);
+    }
+
+    #[test]
+    fn av1_frames_protocol_violation_edge_cases() {
+        let mut f = Av1Frames::default();
+        let o1 = make_obu(6, b"abc");
+
+        // Empty payload updates last_seq and returns None.
+        assert!(f.push(1, false, &[]).is_none());
+        assert_eq!(f.last_seq, Some(1));
+
+        // Z=0 while partial is non-empty is a protocol violation -> marks broken and resets on marker.
+        assert!(
+            f.push(2, false, &make_rtp_packet(false, true, &[&o1]))
+                .is_none()
+        );
+        assert!(
+            f.push(3, true, &make_rtp_packet(false, false, &[&o1]))
+                .is_none()
+        );
+        assert!(!f.broken);
+
+        // Marker=true with Y=1 leaves non-empty partial -> discarded and reset.
+        assert!(
+            f.push(4, true, &make_rtp_packet(false, true, &[&o1]))
+                .is_none()
+        );
+        assert!(f.partial.is_empty());
+        assert!(f.unit.is_empty());
+
+        // Truncated LEB128 in W=0 packet -> returns None, resets on marker.
+        assert!(f.push(5, true, &[0x00, 0x80, 0x80]).is_none());
+        assert!(!f.broken);
+
+        // LEB128 length exceeding remaining bytes -> returns None.
+        assert!(f.push(6, true, &[0x00, 50, 0x01, 0x02]).is_none());
+    }
+
+    #[test]
+    fn picture_to_bgra_handles_i420_odd_i422_i444_i400_10bit_and_padded_strides() {
+        use rav1d::include::dav1d::headers::Dav1dPixelLayout;
+
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn build_pic(
+            w: i32,
+            h: i32,
+            bpc: i32,
+            layout: Dav1dPixelLayout,
+            y_ptr: *const u8,
+            u_ptr: Option<*const u8>,
+            v_ptr: Option<*const u8>,
+            y_stride: isize,
+            c_stride: isize,
+        ) -> Dav1dPicture {
+            let mut pic = unsafe { std::mem::MaybeUninit::<Dav1dPicture>::zeroed().assume_init() };
+            pic.p.w = w;
+            pic.p.h = h;
+            pic.p.bpc = bpc;
+            pic.p.layout = layout;
+            pic.data[0] = NonNull::new(y_ptr as *mut _);
+            pic.data[1] = u_ptr.and_then(|p| NonNull::new(p as *mut _));
+            pic.data[2] = v_ptr.and_then(|p| NonNull::new(p as *mut _));
+            pic.stride[0] = y_stride;
+            pic.stride[1] = c_stride;
+            pic
+        }
+
+        // 1. 8-bit I420 fast path with padded strides (4x4, stride 8 / 4).
+        let (w, h) = (4usize, 4usize);
+        let y_stride = 8usize;
+        let c_stride = 4usize;
+        let mut y_buf = vec![0xAAu8; h * y_stride];
+        let mut u_buf = vec![0xAAu8; (h / 2) * c_stride];
+        let mut v_buf = vec![0xAAu8; (h / 2) * c_stride];
+        for r in 0..h {
+            for c in 0..w {
+                y_buf[r * y_stride + c] = 235; // studio white Y
+            }
+        }
+        for r in 0..(h / 2) {
+            for c in 0..(w / 2) {
+                u_buf[r * c_stride + c] = 128;
+                v_buf[r * c_stride + c] = 128;
+            }
+        }
+        let pic = unsafe {
+            build_pic(
+                w as i32,
+                h as i32,
+                8,
+                DAV1D_PIXEL_LAYOUT_I420,
+                y_buf.as_ptr(),
+                Some(u_buf.as_ptr()),
+                Some(v_buf.as_ptr()),
+                y_stride as isize,
+                c_stride as isize,
+            )
+        };
+        let frame = unsafe { picture_to_bgra(&pic) }.expect("8-bit I420");
+        let (fw, fh, bgra) = frame.into_bgra().unwrap();
+        assert_eq!((fw, fh), (4, 4));
+        for px in bgra.as_chunks::<4>().0 {
+            assert_eq!(px, &[255, 255, 255, 255]);
+        }
+
+        // 2. Odd dimensions 5x3 I420 (exercises fallback path after 2x2 fast path).
+        let (ow, oh) = (5usize, 3usize);
+        let oy = vec![16u8; ow * oh]; // studio black Y=16
+        let ou = vec![128u8; ow.div_ceil(2) * oh.div_ceil(2)];
+        let ov = vec![128u8; ow.div_ceil(2) * oh.div_ceil(2)];
+        let pic_odd = unsafe {
+            build_pic(
+                ow as i32,
+                oh as i32,
+                8,
+                DAV1D_PIXEL_LAYOUT_I420,
+                oy.as_ptr(),
+                Some(ou.as_ptr()),
+                Some(ov.as_ptr()),
+                ow as isize,
+                ow.div_ceil(2) as isize,
+            )
+        };
+        let frame_odd = unsafe { picture_to_bgra(&pic_odd) }.expect("odd I420");
+        let (fw, fh, bgra_odd) = frame_odd.into_bgra().unwrap();
+        assert_eq!((fw, fh), (5, 3));
+        for px in bgra_odd.as_chunks::<4>().0 {
+            assert_eq!(px, &[0, 0, 0, 255]);
+        }
+
+        // 3. I422 (chroma half-width, full-height) with pure red chroma (Y=81, U=90, V=240).
+        let y422 = [81u8; 4 * 2];
+        let u422 = [90u8; 2 * 2];
+        let v422 = [240u8; 2 * 2];
+        let pic_422 = unsafe {
+            build_pic(
+                4,
+                2,
+                8,
+                DAV1D_PIXEL_LAYOUT_I422,
+                y422.as_ptr(),
+                Some(u422.as_ptr()),
+                Some(v422.as_ptr()),
+                4,
+                2,
+            )
+        };
+        let (_, _, bgra_422) = unsafe { picture_to_bgra(&pic_422) }
+            .expect("I422")
+            .into_bgra()
+            .unwrap();
+        assert!(bgra_422[2] > 245 && bgra_422[1] < 10 && bgra_422[0] < 10 && bgra_422[3] == 255);
+
+        // 4. I444 (full-res chroma) with pure blue (Y=41, U=240, V=110).
+        let y444 = [41u8; 2 * 2];
+        let u444 = [240u8; 2 * 2];
+        let v444 = [110u8; 2 * 2];
+        let pic_444 = unsafe {
+            build_pic(
+                2,
+                2,
+                8,
+                DAV1D_PIXEL_LAYOUT_I444,
+                y444.as_ptr(),
+                Some(u444.as_ptr()),
+                Some(v444.as_ptr()),
+                2,
+                2,
+            )
+        };
+        let (_, _, bgra_444) = unsafe { picture_to_bgra(&pic_444) }
+            .expect("I444")
+            .into_bgra()
+            .unwrap();
+        assert!(bgra_444[0] > 245 && bgra_444[1] < 10 && bgra_444[2] < 10);
+
+        // 5. I400 (grayscale, no chroma pointers).
+        let y400 = [126u8; 3 * 2];
+        let pic_400 = unsafe {
+            build_pic(
+                3,
+                2,
+                8,
+                DAV1D_PIXEL_LAYOUT_I400,
+                y400.as_ptr(),
+                None,
+                None,
+                3,
+                0,
+            )
+        };
+        let (_, _, bgra_400) = unsafe { picture_to_bgra(&pic_400) }
+            .expect("I400")
+            .into_bgra()
+            .unwrap();
+        assert_eq!(bgra_400[0], bgra_400[1]);
+        assert_eq!(bgra_400[1], bgra_400[2]);
+        assert!(bgra_400[0] > 110 && bgra_400[0] < 145);
+
+        // 6. 10-bit I420 shift path (`<< 2` matches 8-bit white).
+        let y10 = [235u16 << 2; 4 * 2];
+        let u10 = [128u16 << 2; 2];
+        let v10 = [128u16 << 2; 2];
+        let pic_10 = unsafe {
+            build_pic(
+                4,
+                2,
+                10,
+                DAV1D_PIXEL_LAYOUT_I420,
+                y10.as_ptr().cast(),
+                Some(u10.as_ptr().cast()),
+                Some(v10.as_ptr().cast()),
+                (4 * 2) as isize,
+                (2 * 2) as isize,
+            )
+        };
+        let (_, _, bgra_10) = unsafe { picture_to_bgra(&pic_10) }
+            .expect("10-bit I420")
+            .into_bgra()
+            .unwrap();
+        for px in bgra_10.as_chunks::<4>().0 {
+            assert_eq!(px, &[255, 255, 255, 255]);
+        }
+
+        // 7. Invalid dimensions or unsupported bpc return None.
+        let pic_zero = unsafe {
+            build_pic(
+                0,
+                4,
+                8,
+                DAV1D_PIXEL_LAYOUT_I400,
+                y400.as_ptr(),
+                None,
+                None,
+                0,
+                0,
+            )
+        };
+        assert!(unsafe { picture_to_bgra(&pic_zero) }.is_none());
+        let pic_12bit = unsafe {
+            build_pic(
+                2,
+                2,
+                12,
+                DAV1D_PIXEL_LAYOUT_I400,
+                y400.as_ptr(),
+                None,
+                None,
+                4,
+                0,
+            )
+        };
+        assert!(unsafe { picture_to_bgra(&pic_12bit) }.is_none());
+    }
 }

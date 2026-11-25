@@ -436,6 +436,18 @@ unsafe extern "C" fn on_error_cb(_ctx: *mut c_void, message: *const c_char) {
     tracing::warn!(error = msg, "macOS hardware media capture error");
 }
 
+/// Parse a screen-share source identifier (`"monitor:<u32>"` or `"window:<u32>"`) into
+/// `(is_monitor, target_id)`.
+pub(crate) fn parse_screen_source_id(source_id: &str) -> Option<(bool, u32)> {
+    if let Some(rest) = source_id.strip_prefix("monitor:") {
+        rest.parse::<u32>().ok().map(|id| (true, id))
+    } else if let Some(rest) = source_id.strip_prefix("window:") {
+        rest.parse::<u32>().ok().map(|id| (false, id))
+    } else {
+        None
+    }
+}
+
 /// Hardware-accelerated macOS `ScreenCaptureKit` (`420f`) + `VideoToolbox` H.264 High/CABAC screen share.
 pub struct ScVtScreenCapture {
     handle: *mut SlacklessScCapture,
@@ -457,18 +469,10 @@ impl ScVtScreenCapture {
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Self> {
-        let (is_monitor, target_id) = if let Some(id) = source_id
-            .strip_prefix("monitor:")
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            (1u32, id)
-        } else if let Some(id) = source_id
-            .strip_prefix("window:")
-            .and_then(|s| s.parse::<u32>().ok())
-        {
-            (0u32, id)
-        } else {
-            (1u32, 0u32)
+        let (is_monitor, target_id) = match parse_screen_source_id(source_id) {
+            Some((true, id)) => (1u32, id),
+            Some((false, id)) => (0u32, id),
+            None => (1u32, 0u32),
         };
 
         perf.set_tx_backend("ScreenCaptureKit + VideoToolbox H.264 High (HW)");
@@ -1064,13 +1068,7 @@ pub fn update_desktop_draw_overlay(
     segments: &[OverlaySegmentFfi],
     cursors: &[OverlayCursorFfi],
 ) {
-    let (is_monitor, target_id) = if let Some(rest) = source_id.strip_prefix("monitor:") {
-        let Ok(id) = rest.parse::<u32>() else { return };
-        (true, id)
-    } else if let Some(rest) = source_id.strip_prefix("window:") {
-        let Ok(id) = rest.parse::<u32>() else { return };
-        (false, id)
-    } else {
+    let Some((is_monitor, target_id)) = parse_screen_source_id(source_id) else {
         return;
     };
     let seg_ptr = if segments.is_empty() {
@@ -1149,13 +1147,7 @@ pub fn set_desktop_draw_pen_mode(
     let Some(src) = source_id else {
         return;
     };
-    let (is_monitor, target_id) = if let Some(rest) = src.strip_prefix("monitor:") {
-        let Ok(id) = rest.parse::<u32>() else { return };
-        (true, id)
-    } else if let Some(rest) = src.strip_prefix("window:") {
-        let Ok(id) = rest.parse::<u32>() else { return };
-        (false, id)
-    } else {
+    let Some((is_monitor, target_id)) = parse_screen_source_id(src) else {
         return;
     };
 
@@ -1271,5 +1263,70 @@ mod tests {
         update_desktop_draw_overlay("monitor:notanumber", &[], &[]);
         update_desktop_draw_overlay("window:notanumber", &[], &[]);
         hide_desktop_draw_overlay();
+    }
+
+    #[test]
+    fn parse_screen_source_id_handles_valid_and_invalid_inputs_consistently() {
+        assert_eq!(parse_screen_source_id("monitor:0"), Some((true, 0)));
+        assert_eq!(parse_screen_source_id("monitor:42"), Some((true, 42)));
+        assert_eq!(
+            parse_screen_source_id(&format!("monitor:{}", u32::MAX)),
+            Some((true, u32::MAX))
+        );
+        assert_eq!(parse_screen_source_id("window:12345"), Some((false, 12345)));
+        assert_eq!(parse_screen_source_id("window:0"), Some((false, 0)));
+
+        for bad in [
+            "",
+            "monitor:",
+            "window:",
+            "monitor:-1",
+            "window:abc",
+            "monitor:4294967296", // u32::MAX + 1 overflow
+            "MONITOR:1",
+            "display:1",
+            "monitor:1 ",
+            " window:1",
+        ] {
+            assert_eq!(
+                parse_screen_source_id(bad),
+                None,
+                "expected None for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn measure_audio_file_rms_measures_wav_tone_and_rejects_silence_or_missing() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+
+        // 0.25s 440 Hz sine wave at ~0.5 amplitude (RMS ~0.353).
+        let tone_path = dir.join(format!("slackless-test-tone-{pid}.wav"));
+        let tone_pcm: Vec<i16> = (0..12_000)
+            .map(|i| {
+                ((i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 16_384.0) as i16
+            })
+            .collect();
+        let tone_wav = crate::clips::encode_wav_pcm16(&tone_pcm, 48_000, 1);
+        std::fs::write(&tone_path, &tone_wav).unwrap();
+        let rms = measure_audio_file_rms(&tone_path).expect("tone WAV should have positive RMS");
+        let _ = std::fs::remove_file(&tone_path);
+        assert!(
+            rms > 0.1 && rms < 0.8,
+            "expected reasonable RMS for 440 Hz sine, got {rms}"
+        );
+
+        // Silent WAV -> None (below 1e-5 gate).
+        let silent_path = dir.join(format!("slackless-test-silence-{pid}.wav"));
+        let silent_wav = crate::clips::encode_wav_pcm16(&vec![0i16; 4_800], 48_000, 1);
+        std::fs::write(&silent_path, &silent_wav).unwrap();
+        let silent_rms = measure_audio_file_rms(&silent_path);
+        let _ = std::fs::remove_file(&silent_path);
+        assert!(silent_rms.is_none());
+
+        // Missing file -> None.
+        let missing = dir.join(format!("slackless-nonexistent-{pid}.wav"));
+        assert!(measure_audio_file_rms(&missing).is_none());
     }
 }

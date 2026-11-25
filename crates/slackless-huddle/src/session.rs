@@ -7,7 +7,9 @@
 //!   (reactions, effects, GIFs, sticky emoji / hand raise, drawing on shared screens, jukebox, mute)
 //! - Official AWS Chime `SdkTranscriptFrame` live captions on `"aws:chime:transcription"`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -81,10 +83,159 @@ pub fn spawn_huddle_session(
     HuddleHandle::new(ctrl_tx, finished, done)
 }
 
+#[derive(Debug)]
 enum LoopExit {
     LeftCleanly,
-    Reconnect(HuddleError),
+    Reconnect {
+        err: HuddleError,
+        /// `true` when this attempt reached `Connected` before dropping, resetting retry budget.
+        was_connected: bool,
+    },
     Fatal(HuddleError),
+}
+
+const MAX_RECONNECTS: u32 = 3;
+
+/// Classify a signaling/handshake failure: on reconnect attempts (`attempt > 0`), treat transient
+/// network/signaling/WebRTC errors as retryable `Reconnect` so retries #2 and #3 actually run.
+fn classify_handshake_err(err: HuddleError, is_reconnect: bool) -> LoopExit {
+    if is_reconnect
+        && !matches!(
+            err,
+            HuddleError::Protocol { status, .. } if (400..500).contains(&status)
+        )
+    {
+        LoopExit::Reconnect {
+            err,
+            was_connected: false,
+        }
+    } else {
+        LoopExit::Fatal(err)
+    }
+}
+
+/// Classify an unexpected clean close (`Ok(None)`) from `signal.next_frame()`.
+fn classify_signal_close(ever_connected: bool, is_reconnect: bool) -> LoopExit {
+    let err = HuddleError::Signaling("signaling socket closed unexpectedly".to_owned());
+    if ever_connected || is_reconnect {
+        LoopExit::Reconnect {
+            err,
+            was_connected: ever_connected,
+        }
+    } else {
+        LoopExit::Fatal(err)
+    }
+}
+
+trait ReconnectRunner {
+    fn run_attempt<'a>(
+        &'a mut self,
+        attempt: u32,
+        snap: &'a mut HuddleSessionSnapshot,
+        ctrl_rx: &'a mut mpsc::UnboundedReceiver<HuddleControl>,
+        pending_controls: &'a mut VecDeque<HuddleControl>,
+    ) -> Pin<Box<dyn Future<Output = LoopExit> + Send + 'a>>;
+}
+
+struct LiveSessionRunner<'a> {
+    creds: &'a HuddleCredentials,
+    config: &'a mut HuddleAudioConfig,
+    updates: &'a mpsc::UnboundedSender<HuddleUpdate>,
+}
+
+impl ReconnectRunner for LiveSessionRunner<'_> {
+    fn run_attempt<'a>(
+        &'a mut self,
+        attempt: u32,
+        snap: &'a mut HuddleSessionSnapshot,
+        ctrl_rx: &'a mut mpsc::UnboundedReceiver<HuddleControl>,
+        pending_controls: &'a mut VecDeque<HuddleControl>,
+    ) -> Pin<Box<dyn Future<Output = LoopExit> + Send + 'a>> {
+        Box::pin(run_connected_loop(
+            self.creds,
+            self.config,
+            snap,
+            ctrl_rx,
+            pending_controls,
+            self.updates,
+            attempt > 0,
+        ))
+    }
+}
+
+async fn run_reconnect_supervisor(
+    runner: &mut impl ReconnectRunner,
+    snap: &mut HuddleSessionSnapshot,
+    ctrl_rx: &mut mpsc::UnboundedReceiver<HuddleControl>,
+    updates: &mpsc::UnboundedSender<HuddleUpdate>,
+) {
+    let mut attempt = 0u32;
+    let mut pending_controls: VecDeque<HuddleControl> = VecDeque::new();
+
+    let final_err = loop {
+        match runner
+            .run_attempt(attempt, snap, ctrl_rx, &mut pending_controls)
+            .await
+        {
+            LoopExit::LeftCleanly => break None,
+            LoopExit::Fatal(err) => break Some(err),
+            LoopExit::Reconnect { err, was_connected } => {
+                if was_connected {
+                    attempt = 0;
+                }
+                attempt += 1;
+                if attempt > MAX_RECONNECTS {
+                    break Some(err);
+                }
+                snap.phase = HuddlePhase::Reconnecting;
+                snap.error = None;
+                let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+                let backoff = Duration::from_secs(1u64 << (attempt - 1));
+                let sleep = tokio::time::sleep(backoff);
+                tokio::pin!(sleep);
+                let mut cancelled = false;
+                loop {
+                    tokio::select! {
+                        () = &mut sleep => break,
+                        ctrl = ctrl_rx.recv() => {
+                            match ctrl {
+                                Some(HuddleControl::Leave) | None => {
+                                    cancelled = true;
+                                    break;
+                                }
+                                Some(other) => {
+                                    pending_controls.push_back(other);
+                                }
+                            }
+                        }
+                    }
+                }
+                if cancelled {
+                    break None;
+                }
+            }
+        }
+    };
+
+    match final_err {
+        None => {
+            snap.phase = HuddlePhase::Idle;
+            snap.video = false;
+            snap.sharing = false;
+            snap.jukebox_song = None;
+            snap.error = None;
+            let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+        }
+        Some(err) => {
+            snap.phase = HuddlePhase::Failed;
+            snap.video = false;
+            snap.sharing = false;
+            snap.jukebox_song = None;
+            snap.udp_blocked = matches!(err, HuddleError::UdpBlocked);
+            snap.error = Some(err.to_string());
+            let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
+        }
+    }
 }
 
 enum RemoteVideoDecoder {
@@ -178,57 +329,12 @@ async fn run_session(
     };
     let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
 
-    let mut attempt = 0u32;
-    const MAX_RECONNECTS: u32 = 3;
-
-    let final_err = loop {
-        match run_connected_loop(&creds, &mut config, &mut snap, &mut ctrl_rx, &updates).await {
-            LoopExit::LeftCleanly => break None,
-            LoopExit::Fatal(err) => break Some(err),
-            LoopExit::Reconnect(err) => {
-                attempt += 1;
-                if attempt > MAX_RECONNECTS {
-                    break Some(err);
-                }
-                snap.phase = HuddlePhase::Reconnecting;
-                snap.error = None;
-                let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
-                let backoff = Duration::from_secs(1u64 << (attempt - 1));
-                let mut cancelled = false;
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
-                    ctrl = ctrl_rx.recv() => {
-                        if matches!(ctrl, Some(HuddleControl::Leave) | None) {
-                            cancelled = true;
-                        }
-                    }
-                }
-                if cancelled {
-                    break None;
-                }
-            }
-        }
+    let mut runner = LiveSessionRunner {
+        creds: &creds,
+        config: &mut config,
+        updates: &updates,
     };
-
-    match final_err {
-        None => {
-            snap.phase = HuddlePhase::Idle;
-            snap.video = false;
-            snap.sharing = false;
-            snap.jukebox_song = None;
-            snap.error = None;
-            let _ = updates.send(HuddleUpdate::State(Box::new(snap)));
-        }
-        Some(err) => {
-            snap.phase = HuddlePhase::Failed;
-            snap.video = false;
-            snap.sharing = false;
-            snap.jukebox_song = None;
-            snap.udp_blocked = matches!(err, HuddleError::UdpBlocked);
-            snap.error = Some(err.to_string());
-            let _ = updates.send(HuddleUpdate::State(Box::new(snap)));
-        }
-    }
+    run_reconnect_supervisor(&mut runner, &mut snap, &mut ctrl_rx, &updates).await;
 }
 
 async fn run_connected_loop(
@@ -236,26 +342,29 @@ async fn run_connected_loop(
     config: &mut HuddleAudioConfig,
     snap: &mut HuddleSessionSnapshot,
     ctrl_rx: &mut mpsc::UnboundedReceiver<HuddleControl>,
+    pending_controls: &mut VecDeque<HuddleControl>,
     updates: &mpsc::UnboundedSender<HuddleUpdate>,
+    is_reconnect: bool,
 ) -> LoopExit {
     // 1. Connect Chime signaling WebSocket and send JOIN.
     tracing::info!(
         channel = %creds.channel,
         call_id = %creds.call_id,
         attendee_id = %creds.attendee_id,
+        is_reconnect,
         "connecting to Chime huddle signaling"
     );
     let mut signal = match ChimeSignalClient::connect(creds).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(%e, "Chime signaling connect failed");
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
     let audio_session_id: u64 = rand::rng().random();
     if let Err(e) = signal.send_frame(&build_join_frame(audio_session_id)).await {
         tracing::error!(%e, "failed to send Chime JOIN");
-        return LoopExit::Fatal(e);
+        return classify_handshake_err(e, is_reconnect);
     }
 
     // Buffer any INDEX or AUDIO_STREAM_ID_INFO frames sent by Chime during the initial handshake
@@ -294,14 +403,15 @@ async fn run_connected_loop(
         Ok(Ok(ack)) => ack,
         Ok(Err(e)) | Err(e) => {
             tracing::error!(%e, "JOIN_ACK failed");
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
 
     let Some(turn) = join_ack.turn_credentials else {
-        return LoopExit::Fatal(HuddleError::Signaling(
-            "JOIN_ACK did not include TURN credentials".to_owned(),
-        ));
+        return classify_handshake_err(
+            HuddleError::Signaling("JOIN_ACK did not include TURN credentials".to_owned()),
+            is_reconnect,
+        );
     };
     // Always request plaintext SDP on SUBSCRIBE so renegotiations avoid XOR-diff ambiguity;
     // `decode_sdp_answer_with_prev` still handles compressed XOR-diff answers if Chime sends one.
@@ -352,7 +462,7 @@ async fn run_connected_loop(
             if let Ok(Ok(mut ae)) = audio_start_handle.await {
                 ae.stop();
             }
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
     peer.attach_video_feedback(cam_fb_tx).await;
@@ -362,7 +472,7 @@ async fn run_connected_loop(
             if let Ok(Ok(mut ae)) = audio_start_handle.await {
                 ae.stop();
             }
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
 
@@ -380,14 +490,14 @@ async fn run_connected_loop(
             if let Ok(Ok(mut ae)) = audio_start_handle.await {
                 ae.stop();
             }
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
     if let Err(e) = signal.send_frame(&sub).await {
         if let Ok(Ok(mut ae)) = audio_start_handle.await {
             ae.stop();
         }
-        return LoopExit::Fatal(e);
+        return classify_handshake_err(e, is_reconnect);
     }
 
     let sub_ack = match tokio::time::timeout(Duration::from_secs(10), async {
@@ -423,7 +533,7 @@ async fn run_connected_loop(
             if let Ok(Ok(mut ae)) = audio_start_handle.await {
                 ae.stop();
             }
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
 
@@ -444,7 +554,7 @@ async fn run_connected_loop(
             if let Ok(Ok(mut ae)) = audio_start_handle.await {
                 ae.stop();
             }
-            return LoopExit::Fatal(e);
+            return classify_handshake_err(e, is_reconnect);
         }
     };
     let mut last_sdp_answer = Some(sdp_answer.clone());
@@ -453,7 +563,7 @@ async fn run_connected_loop(
         if let Ok(Ok(mut ae)) = audio_start_handle.await {
             ae.stop();
         }
-        return LoopExit::Fatal(e);
+        return classify_handshake_err(e, is_reconnect);
     }
     tracing::info!(
         tracks = sub_ack.tracks.len(),
@@ -592,7 +702,7 @@ async fn run_connected_loop(
         };
         tokio::select! {
             _ = connect_timeout => {
-                exit_reason = Some(LoopExit::Fatal(HuddleError::UdpBlocked));
+                exit_reason = Some(classify_handshake_err(HuddleError::UdpBlocked, is_reconnect));
             }
             Some(opus_pkt) = outbound_opus_rx.recv() => {
                 let _ = peer.write_opus_frame(opus_pkt).await;
@@ -648,8 +758,11 @@ async fn run_connected_loop(
                         let _ = updates.send(HuddleUpdate::State(Box::new(snap.clone())));
                     }
                     RTCPeerConnectionState::Failed => {
-                        exit_reason = Some(if ever_connected {
-                            LoopExit::Reconnect(HuddleError::UdpBlocked)
+                        exit_reason = Some(if ever_connected || is_reconnect {
+                            LoopExit::Reconnect {
+                                err: HuddleError::UdpBlocked,
+                                was_connected: ever_connected,
+                            }
                         } else {
                             LoopExit::Fatal(HuddleError::UdpBlocked)
                         });
@@ -853,17 +966,14 @@ async fn run_connected_loop(
                         }
                     }
                     Ok(None) => {
-                        exit_reason = Some(if ever_connected {
-                            LoopExit::Reconnect(HuddleError::Signaling(
-                                "signaling socket closed unexpectedly".to_owned(),
-                            ))
-                        } else {
-                            LoopExit::LeftCleanly
-                        });
+                        exit_reason = Some(classify_signal_close(ever_connected, is_reconnect));
                     }
                     Err(e) => {
-                        exit_reason = Some(if ever_connected {
-                            LoopExit::Reconnect(e)
+                        exit_reason = Some(if ever_connected || is_reconnect {
+                            LoopExit::Reconnect {
+                                err: e,
+                                was_connected: ever_connected,
+                            }
                         } else {
                             LoopExit::Fatal(e)
                         });
@@ -937,7 +1047,13 @@ async fn run_connected_loop(
                     }));
                 }
             }
-            ctrl = ctrl_rx.recv() => {
+            ctrl = async {
+                if let Some(c) = pending_controls.pop_front() {
+                    Some(c)
+                } else {
+                    ctrl_rx.recv().await
+                }
+            } => {
                 match ctrl {
                     Some(HuddleControl::SetMuted(muted)) => {
                         config.muted = muted;
@@ -1697,5 +1813,437 @@ mod tests {
         };
         assert!(same_remote_video_sources(&[&a], &[b_same_diff_bps]));
         assert!(!same_remote_video_sources(&[&a], &[b_diff_stream]));
+        assert!(!same_remote_video_sources(&[&a], &[]));
+        let b_diff_content = RemoteVideoSource {
+            is_content: true,
+            ..a.clone()
+        };
+        assert!(!same_remote_video_sources(&[&a], &[b_diff_content]));
+    }
+
+    #[test]
+    fn resolve_remote_video_tile_matches_mid_ssrc_and_fallback() {
+        let cam = RemoteVideoSource {
+            stream_id: 10,
+            group_id: 1,
+            attendee_id: "att-a".into(),
+            user_id: UserId::from("U1"),
+            is_content: false,
+            max_bitrate_kbps: 1000,
+        };
+        let screen = RemoteVideoSource {
+            stream_id: 20,
+            group_id: 2,
+            attendee_id: "att-b#content".into(),
+            user_id: UserId::from("U2"),
+            is_content: true,
+            max_bitrate_kbps: 2000,
+        };
+        let sources = vec![("2".to_owned(), cam), ("3".to_owned(), screen)];
+        let mut ssrc_map = HashMap::new();
+        ssrc_map.insert(555, 20);
+        ssrc_map.insert(444, 10);
+
+        // Exact mid match takes precedence over ssrc.
+        assert_eq!(
+            resolve_remote_video_tile(555, "2", &ssrc_map, &sources),
+            Some(VideoTileKey::RemoteCamera(UserId::from("U1")))
+        );
+        assert_eq!(
+            resolve_remote_video_tile(444, "3", &ssrc_map, &sources),
+            Some(VideoTileKey::RemoteScreen(UserId::from("U2")))
+        );
+        // Empty or unmatched mid falls back to SSRC -> stream_id map.
+        assert_eq!(
+            resolve_remote_video_tile(555, "", &ssrc_map, &sources),
+            Some(VideoTileKey::RemoteScreen(UserId::from("U2")))
+        );
+        assert_eq!(
+            resolve_remote_video_tile(555, "99", &ssrc_map, &sources),
+            Some(VideoTileKey::RemoteScreen(UserId::from("U2")))
+        );
+        // Unmatched mid and unmatched SSRC falls back to first source.
+        assert_eq!(
+            resolve_remote_video_tile(999, "99", &ssrc_map, &sources),
+            Some(VideoTileKey::RemoteCamera(UserId::from("U1")))
+        );
+        // Empty sources -> None.
+        assert_eq!(resolve_remote_video_tile(555, "2", &ssrc_map, &[]), None);
+    }
+
+    #[test]
+    fn parse_incoming_data_message_routes_topics_and_timestamps() {
+        use crate::HuddleReactionKind;
+        use crate::proto::{
+            SdkDataMessagePayload, SdkTranscript, SdkTranscriptAlternative, SdkTranscriptEvent,
+            SdkTranscriptFrame, SdkTranscriptItem, SdkTranscriptResult,
+            sdk_transcript_event::Event as TrEvent,
+        };
+        use prost::Message as _;
+
+        // Slack data-channel topic.
+        let reacji = build_reacji_message("att-1", "fire", HuddleReactionKind::Standard, None);
+        let msg = SdkDataMessagePayload {
+            topic: Some(SLACK_DATA_CHANNEL_TOPIC.into()),
+            data: Some(reacji),
+            ingest_time_ns: Some(42_000_000),
+            sender_attendee_id: Some("att-1".into()),
+            sender_external_user_id: Some("T1-R1-U0ALICE".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_incoming_data_message(&msg, "att-me"),
+            vec![HuddleDataEvent::Reaction {
+                user: UserId::from("U0ALICE"),
+                emoji: "fire".into(),
+                kind: HuddleReactionKind::Standard,
+                emoji_url: None,
+                at_ms: 42,
+            }]
+        );
+
+        // Chime transcription topic with negative ingest_time_ns clamped to 0.
+        let tr = SdkTranscriptFrame {
+            events: vec![SdkTranscriptEvent {
+                event: Some(TrEvent::Transcript(SdkTranscript {
+                    results: vec![SdkTranscriptResult {
+                        is_partial: Some(false),
+                        alternatives: vec![SdkTranscriptAlternative {
+                            transcript: Some("Hi".into()),
+                            items: vec![SdkTranscriptItem {
+                                speaker_external_user_id: Some("T1-R1-U0BOB".into()),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                })),
+            }],
+        };
+        let tr_msg = SdkDataMessagePayload {
+            topic: Some(CHIME_TRANSCRIPTION_TOPIC.into()),
+            data: Some(tr.encode_to_vec()),
+            ingest_time_ns: Some(-500),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_incoming_data_message(&tr_msg, "att-me"),
+            vec![HuddleDataEvent::Caption {
+                user: UserId::from("U0BOB"),
+                text: "Hi".into(),
+                is_partial: false,
+                at_ms: 0,
+            }]
+        );
+
+        // Unknown topic -> empty.
+        let unknown = SdkDataMessagePayload {
+            topic: Some("custom:other".into()),
+            data: Some(b"hello".to_vec()),
+            ..Default::default()
+        };
+        assert!(parse_incoming_data_message(&unknown, "att-me").is_empty());
+    }
+
+    #[test]
+    fn handshake_and_signal_close_classification() {
+        // Initial connect failure is Fatal; reconnect failure is Reconnect (except 4xx protocol error).
+        assert!(matches!(
+            classify_handshake_err(HuddleError::Signaling("dns".into()), false),
+            LoopExit::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_handshake_err(HuddleError::Signaling("dns".into()), true),
+            LoopExit::Reconnect {
+                was_connected: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_handshake_err(
+                HuddleError::Protocol {
+                    status: 403,
+                    description: "expired".into()
+                },
+                true
+            ),
+            LoopExit::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_handshake_err(
+                HuddleError::Protocol {
+                    status: 503,
+                    description: "unavailable".into()
+                },
+                true
+            ),
+            LoopExit::Reconnect {
+                was_connected: false,
+                ..
+            }
+        ));
+
+        // Ok(None) while !ever_connected is NEVER LeftCleanly: Fatal on attempt 0, Reconnect on retry.
+        assert!(matches!(
+            classify_signal_close(false, false),
+            LoopExit::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_signal_close(false, true),
+            LoopExit::Reconnect {
+                was_connected: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_signal_close(true, false),
+            LoopExit::Reconnect {
+                was_connected: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn huddle_handle_leave_and_wait_drop_and_session_done_guard() {
+        // 1. leave_and_wait sends Leave and returns as soon as SessionDoneGuard drops.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let handle = HuddleHandle::new(tx, Arc::clone(&finished), Arc::clone(&done));
+        let guard = SessionDoneGuard {
+            finished: Arc::clone(&finished),
+            done: Arc::clone(&done),
+        };
+        let worker = tokio::spawn(async move {
+            let _g = guard;
+            let ctrl = rx.recv().await;
+            assert!(matches!(ctrl, Some(HuddleControl::Leave)));
+        });
+        handle.leave_and_wait(Duration::from_secs(2)).await;
+        assert!(finished.load(Ordering::Acquire));
+        worker.await.unwrap();
+        // Calling leave_and_wait again after already finished returns immediately.
+        handle.leave_and_wait(Duration::from_millis(10)).await;
+
+        // 2. Dropping HuddleHandle sends Leave automatically.
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let handle2 = HuddleHandle::new(
+            tx2,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        drop(handle2);
+        assert!(matches!(rx2.recv().await, Some(HuddleControl::Leave)));
+    }
+
+    struct ScriptedRunner {
+        exits: VecDeque<LoopExit>,
+        observed: Vec<(u32, Duration, usize)>,
+        buffered_seen: Vec<Vec<String>>,
+        start: tokio::time::Instant,
+    }
+
+    impl ScriptedRunner {
+        fn new(exits: Vec<LoopExit>) -> Self {
+            Self {
+                exits: exits.into(),
+                observed: Vec::new(),
+                buffered_seen: Vec::new(),
+                start: tokio::time::Instant::now(),
+            }
+        }
+    }
+
+    impl ReconnectRunner for ScriptedRunner {
+        fn run_attempt<'a>(
+            &'a mut self,
+            attempt: u32,
+            _snap: &'a mut HuddleSessionSnapshot,
+            _ctrl_rx: &'a mut mpsc::UnboundedReceiver<HuddleControl>,
+            pending_controls: &'a mut VecDeque<HuddleControl>,
+        ) -> Pin<Box<dyn Future<Output = LoopExit> + Send + 'a>> {
+            let elapsed = self.start.elapsed();
+            let names: Vec<String> = pending_controls
+                .drain(..)
+                .map(|c| format!("{c:?}"))
+                .collect();
+            self.observed.push((attempt, elapsed, names.len()));
+            self.buffered_seen.push(names);
+            let next = self.exits.pop_front().unwrap_or(LoopExit::LeftCleanly);
+            Box::pin(async move { next })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_supervisor_backoff_doubling_and_max_retries_to_failed() {
+        let mut runner = ScriptedRunner::new(vec![
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("drop 0".into()),
+                was_connected: true,
+            },
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("retry 1 failed".into()),
+                was_connected: false,
+            },
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("retry 2 failed".into()),
+                was_connected: false,
+            },
+            LoopExit::Reconnect {
+                err: HuddleError::UdpBlocked,
+                was_connected: false,
+            },
+        ]);
+        let mut snap = HuddleSessionSnapshot::default();
+        let (_ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, mut upd_rx) = mpsc::unbounded_channel();
+
+        run_reconnect_supervisor(&mut runner, &mut snap, &mut ctrl_rx, &upd_tx).await;
+
+        // Initial attempt at t=0, retries at +1s (t=1s), +2s (t=3s), +4s (t=7s).
+        assert_eq!(runner.observed.len(), 4);
+        assert_eq!(runner.observed[0].0, 0);
+        assert_eq!(runner.observed[0].1, Duration::from_secs(0));
+        assert_eq!(runner.observed[1].0, 1);
+        assert_eq!(runner.observed[1].1, Duration::from_secs(1));
+        assert_eq!(runner.observed[2].0, 2);
+        assert_eq!(runner.observed[2].1, Duration::from_secs(3));
+        assert_eq!(runner.observed[3].0, 3);
+        assert_eq!(runner.observed[3].1, Duration::from_secs(7));
+
+        assert_eq!(snap.phase, HuddlePhase::Failed);
+        assert!(snap.udp_blocked);
+        assert!(snap.error.is_some());
+
+        let mut phases = Vec::new();
+        while let Ok(HuddleUpdate::State(s)) = upd_rx.try_recv() {
+            phases.push(s.phase);
+        }
+        assert_eq!(
+            phases,
+            vec![
+                HuddlePhase::Reconnecting,
+                HuddlePhase::Reconnecting,
+                HuddlePhase::Reconnecting,
+                HuddlePhase::Failed,
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_supervisor_resets_attempt_counter_after_healthy_session() {
+        let mut runner = ScriptedRunner::new(vec![
+            // First drop -> attempt 1 (1s)
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("drop1".into()),
+                was_connected: true,
+            },
+            // Retry 1 fails -> attempt 2 (2s)
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("fail1".into()),
+                was_connected: false,
+            },
+            // Retry 2 connects cleanly, then drops later -> resets attempt to 0 -> next is attempt 1 (1s)!
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("drop2".into()),
+                was_connected: true,
+            },
+            // Retry 1 after reset fails -> attempt 2 (2s)
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("fail2".into()),
+                was_connected: false,
+            },
+            // Retry 2 after reset fails -> attempt 3 (4s)
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("fail3".into()),
+                was_connected: false,
+            },
+            // Retry 3 succeeds and user leaves cleanly.
+            LoopExit::LeftCleanly,
+        ]);
+        let mut snap = HuddleSessionSnapshot::default();
+        let (_ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+
+        run_reconnect_supervisor(&mut runner, &mut snap, &mut ctrl_rx, &upd_tx).await;
+
+        let attempts: Vec<u32> = runner.observed.iter().map(|(a, _, _)| *a).collect();
+        let times: Vec<u64> = runner
+            .observed
+            .iter()
+            .map(|(_, d, _)| d.as_secs())
+            .collect();
+        assert_eq!(attempts, vec![0, 1, 2, 1, 2, 3]);
+        // Cumulative backoffs: 0, +1=1, +2=3, +1=4, +2=6, +4=10.
+        assert_eq!(times, vec![0, 1, 3, 4, 6, 10]);
+        assert_eq!(snap.phase, HuddlePhase::Idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_supervisor_buffers_non_leave_controls_and_preserves_full_backoff() {
+        let mut runner = ScriptedRunner::new(vec![
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("drop".into()),
+                was_connected: true,
+            },
+            LoopExit::LeftCleanly,
+        ]);
+        let mut snap = HuddleSessionSnapshot::default();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+
+        // Send non-Leave controls during the 1s backoff sleep.
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = ctrl_tx.send(HuddleControl::SetMuted(true));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = ctrl_tx.send(HuddleControl::SetTopic("Standup".into()));
+            // Keep sender alive past the 1s backoff so channel doesn't close early.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        run_reconnect_supervisor(&mut runner, &mut snap, &mut ctrl_rx, &upd_tx).await;
+        sender.abort();
+
+        // Backoff must NOT terminate early when non-Leave controls arrive!
+        assert_eq!(runner.observed.len(), 2);
+        assert_eq!(runner.observed[1].1, Duration::from_secs(1));
+        assert_eq!(runner.buffered_seen[1].len(), 2);
+        assert!(runner.buffered_seen[1][0].contains("SetMuted(true)"));
+        assert!(runner.buffered_seen[1][1].contains("SetTopic(\"Standup\")"));
+        assert_eq!(snap.phase, HuddlePhase::Idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_supervisor_leave_cancels_backoff_immediately() {
+        let mut runner = ScriptedRunner::new(vec![
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("drop".into()),
+                was_connected: true,
+            },
+            LoopExit::Reconnect {
+                err: HuddleError::Signaling("fail1".into()),
+                was_connected: false,
+            },
+        ]);
+        let mut snap = HuddleSessionSnapshot::default();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+        let (upd_tx, _upd_rx) = mpsc::unbounded_channel();
+
+        let start = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            // Let attempt 1 finish (t=1s), then cancel 300ms into the 2s backoff (t=1.3s).
+            tokio::time::sleep(Duration::from_millis(1300)).await;
+            let _ = ctrl_tx.send(HuddleControl::Leave);
+        });
+
+        run_reconnect_supervisor(&mut runner, &mut snap, &mut ctrl_rx, &upd_tx).await;
+
+        assert_eq!(runner.observed.len(), 2);
+        assert_eq!(start.elapsed(), Duration::from_millis(1300));
+        assert_eq!(snap.phase, HuddlePhase::Idle);
+        assert!(snap.error.is_none());
     }
 }

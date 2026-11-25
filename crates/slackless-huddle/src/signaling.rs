@@ -874,4 +874,347 @@ mod tests {
         client.close().await;
         server.await.unwrap();
     }
+
+    #[test]
+    fn decode_wire_frame_handles_alt_prefix_empty_unknown_and_corrupt() {
+        // Empty slice -> Ok(None).
+        assert!(decode_wire_frame(&[]).unwrap().is_none());
+        // Unknown prefix -> Ok(None).
+        assert!(decode_wire_frame(&[0x99, 0x01, 0x02]).unwrap().is_none());
+
+        // Alternate prefix 0x02 decodes valid protobuf frame.
+        let join = build_join_frame(123);
+        let mut alt = vec![FRAME_TYPE_ALT];
+        join.encode(&mut alt).unwrap();
+        let decoded = decode_wire_frame(&alt).unwrap().expect("0x02 frame");
+        assert_eq!(decoded.join.unwrap().audio_session_id, Some(123));
+
+        // Corrupt protobuf payload after valid prefix -> Err.
+        let corrupt = [
+            FRAME_TYPE_RTC,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+            0xFF,
+        ];
+        assert!(decode_wire_frame(&corrupt).is_err());
+    }
+
+    #[test]
+    fn decode_sdp_answer_with_prev_precedence_errors_and_xor_length_diffs() {
+        let compressed = deflate_sdp("v=0\r\nfrom-compressed").unwrap();
+
+        // Plaintext takes precedence over compressed.
+        assert_eq!(
+            decode_sdp_answer_with_prev(Some("v=0\r\nplain"), Some(&compressed), None).unwrap(),
+            "v=0\r\nplain"
+        );
+
+        // Empty plaintext falls through to compressed.
+        assert_eq!(
+            decode_sdp_answer_with_prev(Some(""), Some(&compressed), None).unwrap(),
+            "v=0\r\nfrom-compressed"
+        );
+
+        // Both empty/missing -> Err.
+        assert!(decode_sdp_answer_with_prev(None, None, None).is_err());
+        assert!(decode_sdp_answer_with_prev(Some(""), Some(&[]), None).is_err());
+
+        // Corrupt deflate bytes -> Err.
+        assert!(decode_sdp_answer_with_prev(None, Some(&[0xFF, 0x00, 0xAB]), None).is_err());
+
+        // Invalid UTF-8 after inflate -> Err.
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
+        let bad_utf8 = enc.finish().unwrap();
+        assert!(decode_sdp_answer_with_prev(None, Some(&bad_utf8), None).is_err());
+
+        // XOR-diff where new SDP is LONGER than previous SDP (trailing bytes XOR with 0).
+        let prev = "v=0\r\ns=old";
+        let longer = "v=0\r\ns=new-and-much-longer-sdp";
+        let xor_long: Vec<u8> = longer
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ prev.as_bytes().get(i).copied().unwrap_or(0))
+            .collect();
+        let mut enc_l = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc_l.write_all(&xor_long).unwrap();
+        let comp_l = enc_l.finish().unwrap();
+        assert_eq!(
+            decode_sdp_answer_with_prev(None, Some(&comp_l), Some(prev)).unwrap(),
+            longer
+        );
+
+        // XOR-diff where new SDP is SHORTER than previous SDP.
+        let shorter = "v=0\r\ns=1";
+        let xor_short: Vec<u8> = shorter
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ prev.as_bytes().get(i).copied().unwrap_or(0))
+            .collect();
+        let mut enc_s = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc_s.write_all(&xor_short).unwrap();
+        let comp_s = enc_s.finish().unwrap();
+        assert_eq!(
+            decode_sdp_answer_with_prev(None, Some(&comp_s), Some(prev)).unwrap(),
+            shorter
+        );
+    }
+
+    #[test]
+    fn parse_index_sources_edge_cases_and_subscribe_variants() {
+        let index = SdkIndexFrame {
+            sources: vec![
+                // Missing stream_id -> ignored.
+                SdkStreamDescriptor {
+                    stream_id: None,
+                    attendee_id: Some("att-ignored".to_owned()),
+                    ..Default::default()
+                },
+                // Empty attendee_id -> ignored.
+                SdkStreamDescriptor {
+                    stream_id: Some(1),
+                    attendee_id: Some(String::new()),
+                    ..Default::default()
+                },
+                // Self attendee -> ignored.
+                SdkStreamDescriptor {
+                    stream_id: Some(2),
+                    attendee_id: Some("att-self".to_owned()),
+                    ..Default::default()
+                },
+                // Tie-break on equal bitrate: higher stream_id wins (15 > 10).
+                SdkStreamDescriptor {
+                    stream_id: Some(10),
+                    group_id: Some(1),
+                    max_bitrate_kbps: Some(800),
+                    attendee_id: Some("att-tie".to_owned()),
+                    external_user_id: Some("T1-R1-U0TIE".to_owned()),
+                    ..Default::default()
+                },
+                SdkStreamDescriptor {
+                    stream_id: Some(15),
+                    group_id: Some(1),
+                    max_bitrate_kbps: Some(800),
+                    attendee_id: Some("att-tie".to_owned()),
+                    external_user_id: Some("T1-R1-U0TIE".to_owned()),
+                    ..Default::default()
+                },
+                // Lower stream_id with same bitrate must not overwrite winner 15.
+                SdkStreamDescriptor {
+                    stream_id: Some(12),
+                    group_id: Some(1),
+                    max_bitrate_kbps: Some(800),
+                    attendee_id: Some("att-tie".to_owned()),
+                    external_user_id: Some("T1-R1-U0TIE".to_owned()),
+                    ..Default::default()
+                },
+                // #content via external_user_id suffix, missing bitrate defaults to 1500, missing user falls back to base attendee.
+                SdkStreamDescriptor {
+                    stream_id: Some(20),
+                    group_id: None,
+                    max_bitrate_kbps: None,
+                    attendee_id: Some("att-anon#content".to_owned()),
+                    external_user_id: Some("".to_owned()),
+                    ..Default::default()
+                },
+                // Non-content with missing bitrate defaults to 350.
+                SdkStreamDescriptor {
+                    stream_id: Some(21),
+                    group_id: Some(3),
+                    max_bitrate_kbps: None,
+                    attendee_id: Some("att-cam".to_owned()),
+                    external_user_id: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let parsed = parse_index_sources(&index, "att-self");
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].stream_id, 15);
+        assert_eq!(parsed[0].user_id, UserId::from("U0TIE"));
+        assert_eq!(parsed[1].stream_id, 20);
+        assert!(parsed[1].is_content);
+        assert_eq!(parsed[1].max_bitrate_kbps, 1500);
+        assert_eq!(parsed[1].user_id, UserId::from("att-anon"));
+        assert_eq!(parsed[1].group_id, 1);
+        assert_eq!(parsed[2].stream_id, 21);
+        assert!(!parsed[2].is_content);
+        assert_eq!(parsed[2].max_bitrate_kbps, 350);
+
+        // build_subscribe_frame with send_video = true + compressed SDP.
+        let creds = HuddleCredentials {
+            channel: slackless_types::ChannelId::from("C1"),
+            call_id: "R1".to_owned(),
+            meeting_id: "M1".to_owned(),
+            signaling_url: "wss://example.invalid".to_owned(),
+            audio_host_url: "audio.invalid:3478".to_owned(),
+            turn_control_url: String::new(),
+            attendee_id: "att-self".to_owned(),
+            external_user_id: "T1-R1-U0SELF".to_owned(),
+            join_token: "tok".to_owned(),
+            thread_root_ts: None,
+            canvas_file_id: None,
+            huddle_link: None,
+        };
+        let frame = build_subscribe_frame(&creds, "v=0\r\ns=-\r\n", true, true, true, &[]).unwrap();
+        let sub = frame.sub.unwrap();
+        assert_eq!(sub.duplex, Some(SdkStreamServiceType::Duplex as i32));
+        assert_eq!(sub.send_streams.len(), 2);
+        assert_eq!(sub.receive_stream_ids, vec![0]);
+        assert!(sub.sdp_offer.is_none());
+        let inflated = decode_sdp_answer(None, sub.compressed_sdp_offer.as_deref()).unwrap();
+        assert_eq!(inflated, "v=0\r\ns=-\r\n");
+
+        // Audio-only subscribe (send_video=false, no remote video) -> Rx, empty receive_stream_ids.
+        let audio_only = build_audio_subscribe_frame(&creds, "v=0\r\n", false, false).unwrap();
+        let sub_a = audio_only.sub.unwrap();
+        assert_eq!(sub_a.duplex, Some(SdkStreamServiceType::Rx as i32));
+        assert_eq!(sub_a.send_streams.len(), 1);
+        assert!(sub_a.receive_stream_ids.is_empty());
+    }
+
+    #[test]
+    fn parse_external_user_id_edge_cases() {
+        assert_eq!(parse_external_user_id(""), None);
+        assert_eq!(parse_external_user_id("   "), None);
+        assert_eq!(parse_external_user_id("#content"), None);
+        assert_eq!(parse_external_user_id("foo-bar-"), None);
+        // Single-char "U" is too short for Slack ID match, falls back to last segment.
+        assert_eq!(
+            parse_external_user_id("T1-U-fallback"),
+            Some(UserId::from("fallback"))
+        );
+        // Non-alphanumeric segment starting with U is skipped.
+        assert_eq!(
+            parse_external_user_id("T1-U_BAD-W99VALID-123"),
+            Some(UserId::from("W99VALID"))
+        );
+        // Plain fallback without hyphens.
+        assert_eq!(
+            parse_external_user_id("plainuser"),
+            Some(UserId::from("plainuser"))
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn mock_ws_handles_ping_pong_text_skip_corrupt_binary_and_clean_close() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        // 1. Ping -> Pong, Text skip, unknown binary prefix skip, valid frame, clean Close.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_hdr_async(stream, |_req: &Request, mut resp: Response| {
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("_aws_wt_session"),
+                );
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+            ws.send(WsMessage::Ping(bytes::Bytes::from_static(b"hi")))
+                .await
+                .unwrap();
+            ws.send(WsMessage::Text("ignore-text".into()))
+                .await
+                .unwrap();
+            ws.send(WsMessage::Binary(vec![0x99, 0x01].into()))
+                .await
+                .unwrap();
+            ws.send(WsMessage::Binary(
+                encode_wire_frame(&build_pong_frame(7)).into(),
+            ))
+            .await
+            .unwrap();
+            // Client must reply Pong("hi") before closing.
+            let mut saw_pong = false;
+            while let Some(Ok(msg)) = ws.next().await {
+                if let WsMessage::Pong(p) = msg {
+                    if p.as_ref() == b"hi" {
+                        saw_pong = true;
+                        break;
+                    }
+                }
+            }
+            assert!(saw_pong, "client must echo Pong for server Ping");
+            ws.send(WsMessage::Close(None)).await.unwrap();
+        });
+
+        let creds = HuddleCredentials {
+            channel: slackless_types::ChannelId::from("C1"),
+            call_id: "R1".into(),
+            meeting_id: "M1".into(),
+            attendee_id: "A1".into(),
+            external_user_id: "T1-R1-U1".into(),
+            join_token: "tok".into(),
+            signaling_url: format!("ws://{addr}/control/M1"),
+            audio_host_url: "h:3478".into(),
+            turn_control_url: String::new(),
+            thread_root_ts: None,
+            canvas_file_id: None,
+            huddle_link: None,
+        };
+        let mut client = ChimeSignalClient::connect(&creds).await.unwrap();
+        let frame = client.next_frame().await.unwrap().expect("pong frame");
+        assert_eq!(frame.ping_pong.unwrap().ping_id, Some(7));
+        assert!(client.next_frame().await.unwrap().is_none());
+        server.await.unwrap();
+
+        // 2. Corrupt binary frame returns Err.
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = tokio::spawn(async move {
+            let (stream, _) = listener2.accept().await.unwrap();
+            let mut ws = accept_hdr_async(stream, |_req: &Request, mut resp: Response| {
+                resp.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("_aws_wt_session"),
+                );
+                Ok(resp)
+            })
+            .await
+            .unwrap();
+            ws.send(WsMessage::Binary(
+                vec![
+                    FRAME_TYPE_RTC,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                    0xFF,
+                ]
+                .into(),
+            ))
+            .await
+            .unwrap();
+            let _ = ws.close(None).await;
+        });
+        let creds2 = HuddleCredentials {
+            signaling_url: format!("ws://{addr2}/control/M1"),
+            ..creds
+        };
+        let mut client2 = ChimeSignalClient::connect(&creds2).await.unwrap();
+        assert!(client2.next_frame().await.is_err());
+        server2.await.unwrap();
+    }
 }

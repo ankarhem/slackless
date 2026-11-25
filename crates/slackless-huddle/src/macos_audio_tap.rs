@@ -174,6 +174,38 @@ struct TapCallbackCtx {
     channels: u32,
 }
 
+/// Convert non-interleaved stereo `f32` channel slices into interleaved `i16` stereo PCM.
+pub(crate) fn convert_non_interleaved_f32_to_stereo_i16(left: &[f32], right: &[f32]) -> Vec<i16> {
+    let frames = left.len().min(right.len());
+    let mut stereo_out = Vec::with_capacity(frames * 2);
+    for i in 0..frames {
+        stereo_out.push((left[i].clamp(-1.0, 1.0) * 32767.0) as i16);
+        stereo_out.push((right[i].clamp(-1.0, 1.0) * 32767.0) as i16);
+    }
+    stereo_out
+}
+
+/// Convert interleaved `f32` samples with `channels` channels into interleaved stereo `i16` PCM.
+pub(crate) fn convert_interleaved_f32_to_stereo_i16(samples: &[f32], channels: usize) -> Vec<i16> {
+    let ch = channels.max(1);
+    let mut stereo_out = Vec::with_capacity((samples.len() / ch) * 2);
+    for frame in samples.chunks(ch) {
+        let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
+        let r = (frame.get(1).copied().unwrap_or(frame[0]).clamp(-1.0, 1.0) * 32767.0) as i16;
+        stereo_out.push(l);
+        stereo_out.push(r);
+    }
+    stereo_out
+}
+
+/// Append stereo `i16` PCM to the tap ring queue, draining 48,000 samples on overflow.
+pub(crate) fn push_tap_pcm_to_queue(queue: &mut VecDeque<i16>, stereo: Vec<i16>) {
+    if queue.len() > 48_000 * 4 {
+        queue.drain(..48_000);
+    }
+    queue.extend(stereo);
+}
+
 unsafe extern "C" fn tap_io_proc(
     _inDevice: AudioDeviceID,
     _inNow: *const c_void,
@@ -197,22 +229,18 @@ unsafe extern "C" fn tap_io_proc(
     // SAFETY: Flexible array tail of `AudioBufferList`.
     let buffers = unsafe { std::slice::from_raw_parts(list.mBuffers.as_ptr(), num_bufs) };
 
-    let mut stereo_out = Vec::<i16>::new();
-    if ctx.non_interleaved && num_bufs >= 2 {
+    let stereo_out = if ctx.non_interleaved && num_bufs >= 2 {
         let b0 = &buffers[0];
         let b1 = &buffers[1];
         if !b0.mData.is_null() && !b1.mData.is_null() {
             let n0 = (b0.mDataByteSize as usize) / std::mem::size_of::<f32>();
             let n1 = (b1.mDataByteSize as usize) / std::mem::size_of::<f32>();
-            let frames = n0.min(n1);
             // SAFETY: CoreAudio guarantees `mData` holds `mDataByteSize` bytes of f32 PCM.
-            let left = unsafe { std::slice::from_raw_parts(b0.mData as *const f32, frames) };
-            let right = unsafe { std::slice::from_raw_parts(b1.mData as *const f32, frames) };
-            stereo_out.reserve(frames * 2);
-            for i in 0..frames {
-                stereo_out.push((left[i].clamp(-1.0, 1.0) * 32767.0) as i16);
-                stereo_out.push((right[i].clamp(-1.0, 1.0) * 32767.0) as i16);
-            }
+            let left = unsafe { std::slice::from_raw_parts(b0.mData as *const f32, n0) };
+            let right = unsafe { std::slice::from_raw_parts(b1.mData as *const f32, n1) };
+            convert_non_interleaved_f32_to_stereo_i16(left, right)
+        } else {
+            Vec::new()
         }
     } else {
         let b0 = &buffers[0];
@@ -221,23 +249,15 @@ unsafe extern "C" fn tap_io_proc(
             let ch = (b0.mNumberChannels.max(ctx.channels).max(1)) as usize;
             // SAFETY: CoreAudio guarantees `mData` holds `mDataByteSize` bytes of f32 PCM.
             let samples = unsafe { std::slice::from_raw_parts(b0.mData as *const f32, total_f32) };
-            stereo_out.reserve((total_f32 / ch) * 2);
-            for frame in samples.chunks(ch) {
-                let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
-                let r =
-                    (frame.get(1).copied().unwrap_or(frame[0]).clamp(-1.0, 1.0) * 32767.0) as i16;
-                stereo_out.push(l);
-                stereo_out.push(r);
-            }
+            convert_interleaved_f32_to_stereo_i16(samples, ch)
+        } else {
+            Vec::new()
         }
-    }
+    };
 
     if !stereo_out.is_empty() {
         if let Ok(mut q) = ctx.queue.try_lock() {
-            if q.len() > 48_000 * 4 {
-                q.drain(..48_000);
-            }
-            q.extend(stereo_out);
+            push_tap_pcm_to_queue(&mut q, stereo_out);
         }
     }
     0
@@ -572,5 +592,46 @@ mod tests {
             msg_1_bool(desc, set_private_sel, 1);
             msg_void(desc, sel_registerName(c"release".as_ptr()));
         }
+    }
+
+    #[test]
+    fn tap_pcm_conversion_handles_non_interleaved_interleaved_clamping_and_overflow() {
+        // Non-interleaved stereo with clamping and mismatched lengths (uses min length).
+        let left = [0.0f32, 0.5, 2.0, -2.0, 0.25];
+        let right = [1.0f32, -0.5, -1.5];
+        let ni = convert_non_interleaved_f32_to_stereo_i16(&left, &right);
+        assert_eq!(ni.len(), 6);
+        assert_eq!(ni[0], 0);
+        assert_eq!(ni[1], 32767);
+        assert!((ni[2] - 16383).abs() <= 1);
+        assert!((ni[3] + 16383).abs() <= 1);
+        assert_eq!(ni[4], 32767);
+        assert_eq!(ni[5], -32767);
+
+        // Interleaved mono duplicates L -> R; channels == 0 guards to 1.
+        let mono = convert_interleaved_f32_to_stereo_i16(&[0.5, -1.0], 1);
+        assert_eq!(mono, vec![16383, 16383, -32767, -32767]);
+        assert_eq!(
+            convert_interleaved_f32_to_stereo_i16(&[0.5], 0),
+            vec![16383, 16383]
+        );
+
+        // Interleaved stereo & 4-channel (takes ch0 & ch1, clamps extremes).
+        let stereo = convert_interleaved_f32_to_stereo_i16(&[1.5, -1.5, 0.0, 0.25], 2);
+        assert_eq!(stereo, vec![32767, -32767, 0, 8191]);
+        let quad = convert_interleaved_f32_to_stereo_i16(&[0.5, -0.5, 0.9, 0.9], 4);
+        assert_eq!(quad, vec![16383, -16383]);
+
+        // Empty slices return empty Vec.
+        assert!(convert_non_interleaved_f32_to_stereo_i16(&[], &[0.5]).is_empty());
+        assert!(convert_interleaved_f32_to_stereo_i16(&[], 2).is_empty());
+
+        // Overflow drain when queue exceeds 48_000 * 4 samples.
+        let mut q = VecDeque::new();
+        push_tap_pcm_to_queue(&mut q, vec![10; 48_000 * 4 + 10]);
+        assert_eq!(q.len(), 48_000 * 4 + 10);
+        push_tap_pcm_to_queue(&mut q, vec![20; 100]);
+        assert_eq!(q.len(), 48_000 * 3 + 110);
+        assert_eq!(*q.back().unwrap(), 20);
     }
 }
