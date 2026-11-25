@@ -573,6 +573,207 @@ fn canvases_wire_defaults_and_all_edit_operations() {
 }
 
 #[test]
+fn canvas_access_level_meta_errors_and_comments_parsers() {
+    use std::collections::HashMap;
+
+    // CanvasAccessLevel
+    assert_eq!(CanvasAccessLevel::Read.as_str(), "read");
+    assert_eq!(CanvasAccessLevel::Write.as_str(), "write");
+    assert_eq!(CanvasAccessLevel::Owner.as_str(), "owner");
+    assert_eq!(
+        CanvasAccessLevel::parse("read"),
+        Some(CanvasAccessLevel::Read)
+    );
+    assert_eq!(
+        CanvasAccessLevel::parse(" WRITE "),
+        Some(CanvasAccessLevel::Write)
+    );
+    assert_eq!(
+        CanvasAccessLevel::parse("Owner"),
+        Some(CanvasAccessLevel::Owner)
+    );
+    assert_eq!(CanvasAccessLevel::parse("comment"), None);
+    assert_eq!(CanvasAccessLevel::parse(""), None);
+
+    // canvas_comment_channel_id
+    assert_eq!(
+        canvas_comment_channel_id("F0123ABC"),
+        ChannelId::from("C0123ABC")
+    );
+    assert_eq!(
+        canvas_comment_channel_id("C0123ABC"),
+        ChannelId::from("C0123ABC")
+    );
+    assert_eq!(canvas_comment_channel_id(""), ChannelId::from(""));
+
+    // parse_canvas_meta_from_file: full fields from File.extra
+    let rich_file: crate::types::File = serde_json::from_value(json!({
+        "id": "F099CANVAS",
+        "title": "Q4 Roadmap",
+        "permalink": "https://acme.slack.com/docs/T1/F099CANVAS",
+        "user": "U0CREATOR_FALLBACK",
+        "editable": true,
+        "access": "owner",
+        "org_or_workspace_access": "write",
+        "canvas_printing_enabled": false,
+        "canvas_creator_id": "U0OWNER",
+        "editors": ["U0OWNER", "U0EDITOR2", "", 42],
+        "quip_thread_id": "OYP123XYZ"
+    }))
+    .expect("canvas file parses");
+    let meta = parse_canvas_meta_from_file(&rich_file, None);
+    assert_eq!(meta.file_id, "F099CANVAS");
+    assert_eq!(meta.title, "Q4 Roadmap");
+    assert_eq!(
+        meta.permalink.as_deref(),
+        Some("https://acme.slack.com/docs/T1/F099CANVAS")
+    );
+    assert!(meta.editable);
+    assert_eq!(meta.access.as_deref(), Some("owner"));
+    assert_eq!(meta.org_or_workspace_access.as_deref(), Some("write"));
+    assert!(!meta.canvas_printing_enabled);
+    assert_eq!(
+        meta.canvas_creator_id,
+        Some(crate::types::UserId::from("U0OWNER"))
+    );
+    assert_eq!(
+        meta.editors,
+        vec![
+            crate::types::UserId::from("U0OWNER"),
+            crate::types::UserId::from("U0EDITOR2")
+        ]
+    );
+    assert_eq!(meta.quip_thread_id.as_deref(), Some("OYP123XYZ"));
+    assert_eq!(meta.comment_channel_id, ChannelId::from("C099CANVAS"));
+
+    // parse_canvas_meta_from_file: defaults + raw fallback
+    let minimal_file: crate::types::File =
+        serde_json::from_value(json!({ "id": "F0MIN", "name": "Fallback Name", "user": "U1" }))
+            .expect("minimal canvas file parses");
+    let raw_override = json!({
+        "file": {
+            "editable": "true",
+            "access": "read"
+        }
+    });
+    let min_meta = parse_canvas_meta_from_file(&minimal_file, Some(&raw_override));
+    assert_eq!(min_meta.title, "Fallback Name");
+    assert!(min_meta.editable);
+    assert_eq!(min_meta.access.as_deref(), Some("read"));
+    assert!(
+        min_meta.canvas_printing_enabled,
+        "canvas_printing_enabled must default to true when absent"
+    );
+    assert_eq!(
+        min_meta.canvas_creator_id,
+        Some(crate::types::UserId::from("U1"))
+    );
+    assert_eq!(min_meta.comment_channel_id, ChannelId::from("C0MIN"));
+
+    // Empty file defaults title to "Canvas" and editable to false.
+    let blank_meta = parse_canvas_meta_from_file(&crate::types::File::default(), None);
+    assert_eq!(blank_meta.title, "Canvas");
+    assert!(!blank_meta.editable);
+    assert!(blank_meta.canvas_printing_enabled);
+
+    // format_canvas_error: every documented error code + prefixed + unknown passthrough
+    for code in [
+        "free_teams_cannot_create_standalone_canvases",
+        "free_team_canvas_tab_already_exists",
+        "channel_canvas_already_exists",
+        "restricted_action",
+        "canvas_printing_disabled",
+        "not_allowed_token_type",
+        "canvas_not_found",
+        "invalid_parameters",
+        "missing_scope",
+        "cant_delete_file",
+    ] {
+        let translated = format_canvas_error(code);
+        assert_ne!(translated, code, "expected friendly message for {code}");
+        assert_eq!(
+            format_canvas_error(&format!("slack api error: {code}")),
+            translated
+        );
+    }
+    assert_eq!(
+        format_canvas_error("some_custom_unmapped_error"),
+        "some_custom_unmapped_error"
+    );
+
+    // parse_canvas_comment_threads: roots, replies, skipping thread replies in history,
+    // and all resolved flag representations.
+    let history: Vec<crate::types::Message> = serde_json::from_value(json!([
+        {
+            "ts": "1700.1",
+            "user": "U1",
+            "text": "Open thread",
+            "subtype": "document_comment_root",
+            "reply_count": 1,
+            "document_comment": { "is_archived": false }
+        },
+        {
+            "ts": "1700.15",
+            "thread_ts": "1700.1",
+            "user": "U2",
+            "text": "Inline reply in history should not become a root"
+        },
+        {
+            "ts": "1700.2",
+            "user": "U2",
+            "text": "Resolved via is_archived",
+            "is_archived": true
+        },
+        {
+            "ts": "1700.3",
+            "text": "Resolved via quip_thread_archived",
+            "quip_thread_archived": "true",
+            "document_comment": { "authors": ["U3"] }
+        },
+        {
+            "ts": "1700.4",
+            "user": "U4",
+            "text": "Resolved via document_comment.is_archived",
+            "document_comment": { "is_archived": true }
+        },
+        {
+            "ts": "1700.5",
+            "user": "U5",
+            "text": "Resolved via subtype",
+            "subtype": "document_comment_archived"
+        }
+    ]))
+    .expect("comment history parses");
+
+    let thread_replies: Vec<crate::types::Message> = serde_json::from_value(json!([
+        { "ts": "1700.1", "user": "U1", "text": "Open thread" },
+        { "ts": "1700.15", "thread_ts": "1700.1", "user": "U2", "text": "First reply" },
+        { "ts": "1700.16", "thread_ts": "1700.1", "user": "U3", "text": "Second reply" }
+    ]))
+    .expect("replies parse");
+
+    let mut replies_map = HashMap::new();
+    replies_map.insert(Ts::from("1700.1"), thread_replies);
+
+    let threads = parse_canvas_comment_threads(&history, &replies_map);
+    assert_eq!(threads.len(), 5);
+
+    assert_eq!(threads[0].root_ts, Ts::from("1700.1"));
+    assert_eq!(threads[0].author, Some(crate::types::UserId::from("U1")));
+    assert!(!threads[0].resolved);
+    assert_eq!(threads[0].reply_count, 2);
+    assert_eq!(threads[0].replies.len(), 2);
+    assert_eq!(threads[0].replies[0].text, "First reply");
+    assert_eq!(threads[0].replies[1].text, "Second reply");
+
+    assert!(threads[1].resolved);
+    assert!(threads[2].resolved);
+    assert_eq!(threads[2].author, Some(crate::types::UserId::from("U3")));
+    assert!(threads[3].resolved);
+    assert!(threads[4].resolved);
+}
+
+#[test]
 fn lists_schema_records_cells_and_inputs_handle_missing_null_and_drifted_shapes() {
     // Fallback title -> name -> "List", missing metadata, empty id/key skipped, id <- key, choice label <- value.
     let (t1, d1, c1) = parse_list_schema(&json!({}));

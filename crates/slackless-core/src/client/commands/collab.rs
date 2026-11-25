@@ -3,8 +3,8 @@
 
 use super::super::*;
 use crate::api::{
-    ActionContainer, CanvasEditOp, FilesFilter, ListCellInput, MessageContent, SearchSort,
-    UploadFile,
+    ActionContainer, CanvasAccessLevel, CanvasEditOp, FilesFilter, ListCellInput, MessageContent,
+    SearchSort, UploadFile,
 };
 
 impl<B: Backend> Core<B> {
@@ -275,6 +275,235 @@ impl<B: Backend> Core<B> {
         });
     }
 
+    pub(super) fn delete_canvas(&self, canvas_id: String) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        self.spawn("canvases.delete", async move {
+            let result = match backend.canvases_delete(canvas_id.clone()).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasDeleted { canvas_id, result });
+            Ok(())
+        });
+    }
+
+    pub(super) fn set_canvas_access(
+        &self,
+        canvas_id: String,
+        access_level: CanvasAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+        post_permalink: Option<String>,
+    ) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        self.spawn("canvases.access.set", async move {
+            let summary = if !channel_ids.is_empty() {
+                format!(
+                    "Granted {} access to {} channel(s)",
+                    access_level.as_str(),
+                    channel_ids.len()
+                )
+            } else if !user_ids.is_empty() {
+                format!(
+                    "Granted {} access to {} user(s)",
+                    access_level.as_str(),
+                    user_ids.len()
+                )
+            } else {
+                format!("Updated {} access", access_level.as_str())
+            };
+            let result = match backend
+                .canvases_access_set(
+                    canvas_id.clone(),
+                    access_level,
+                    channel_ids.clone(),
+                    user_ids,
+                )
+                .await
+            {
+                Ok(()) => {
+                    if let Some(url) = post_permalink.filter(|u| !u.trim().is_empty())
+                        && !channel_ids.is_empty()
+                    {
+                        for channel in &channel_ids {
+                            let _ = backend
+                                .post_message(
+                                    channel.clone(),
+                                    MessageContent::plain(url.clone()),
+                                    None,
+                                    false,
+                                )
+                                .await;
+                        }
+                    }
+                    Ok(())
+                }
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasAccessUpdated {
+                canvas_id,
+                summary,
+                result,
+            });
+            Ok(())
+        });
+    }
+
+    pub(super) fn delete_canvas_access(
+        &self,
+        canvas_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        self.spawn("canvases.access.delete", async move {
+            let summary = if !channel_ids.is_empty() {
+                format!("Revoked access for {} channel(s)", channel_ids.len())
+            } else if !user_ids.is_empty() {
+                format!("Revoked access for {} user(s)", user_ids.len())
+            } else {
+                "Revoked access".to_owned()
+            };
+            let result = match backend
+                .canvases_access_delete(canvas_id.clone(), channel_ids, user_ids)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasAccessUpdated {
+                canvas_id,
+                summary,
+                result,
+            });
+            Ok(())
+        });
+    }
+
+    pub(super) fn load_canvas_comments(&self, canvas_id: String) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        self.spawn("canvas.comments.list", async move {
+            let result = match backend.canvas_comments_list(canvas_id.clone()).await {
+                Ok(threads) => Ok(threads),
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasCommentsLoaded { canvas_id, result });
+            Ok(())
+        });
+    }
+
+    pub(super) fn post_canvas_comment(
+        &self,
+        canvas_id: String,
+        text: String,
+        thread_ts: Option<Ts>,
+    ) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        self.spawn("canvas.comment.post", async move {
+            let result = match backend
+                .canvas_comment_post(canvas_id.clone(), text, thread_ts)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasCommentPosted { canvas_id, result });
+            Ok(())
+        });
+    }
+
+    pub(super) fn resolve_canvas_comment(&self, canvas_id: String, thread_ts: Ts, resolved: bool) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        let context = if resolved {
+            "quip.thread.archive"
+        } else {
+            "quip.thread.unarchive"
+        };
+        self.spawn(context, async move {
+            let channel_id = crate::api::canvas_comment_channel_id(&canvas_id);
+            let res = if resolved {
+                backend
+                    .quip_thread_archive(channel_id, thread_ts.clone())
+                    .await
+            } else {
+                backend
+                    .quip_thread_unarchive(channel_id, thread_ts.clone())
+                    .await
+            };
+            let result = match res {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasCommentResolved {
+                canvas_id,
+                thread_ts,
+                resolved,
+                result,
+            });
+            Ok(())
+        });
+    }
+
+    pub(super) fn resolve_all_canvas_comments(&self, canvas_id: String) {
+        let backend = self.backend.clone();
+        let events = self.events.clone();
+        self.spawn("quip.thread.archiveAll", async move {
+            let channel_id = crate::api::canvas_comment_channel_id(&canvas_id);
+            let result = match backend.quip_thread_archive_all(channel_id).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if let ApiError::AuthExpired(ref code) = err {
+                        events.emit(Event::AuthExpired(code.clone()));
+                    }
+                    Err(format_canvas_api_error(&err))
+                }
+            };
+            events.emit(Event::CanvasCommentResolved {
+                canvas_id,
+                thread_ts: Ts::default(),
+                resolved: true,
+                result,
+            });
+            Ok(())
+        });
+    }
+
     pub(super) fn load_list(&self, file_id: String) {
         let backend = self.backend.clone();
         let events = self.events.clone();
@@ -478,20 +707,34 @@ impl<B: Backend> Core<B> {
     }
 }
 
+fn format_canvas_api_error(err: &ApiError) -> String {
+    match err {
+        ApiError::Slack(code) | ApiError::AuthExpired(code) => {
+            crate::api::format_canvas_error(code)
+        }
+        other => crate::api::format_canvas_error(&other.to_string()),
+    }
+}
+
 async fn emit_canvas_html<B: Backend>(backend: &B, events: &Emitter, file_id: String) {
-    match backend.fetch_canvas_html(file_id.clone()).await {
-        Ok((title, html)) => {
+    match backend.fetch_canvas_with_meta(file_id.clone()).await {
+        Ok((meta, html)) => {
+            let title = meta.title.clone();
             events.emit(Event::CanvasLoaded {
-                file_id,
+                file_id: file_id.clone(),
                 title,
                 html: Ok(html),
             });
+            events.emit(Event::CanvasMetaLoaded { file_id, meta });
         }
         Err(err) => {
+            if let ApiError::AuthExpired(ref code) = err {
+                events.emit(Event::AuthExpired(code.clone()));
+            }
             events.emit(Event::CanvasLoaded {
                 file_id,
                 title: "Canvas".to_owned(),
-                html: Err(err.to_string()),
+                html: Err(format_canvas_api_error(&err)),
             });
         }
     }

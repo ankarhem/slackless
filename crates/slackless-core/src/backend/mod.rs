@@ -666,6 +666,23 @@ pub trait Backend: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = api::Result<(String, String)>> + Send {
         async { Ok((String::new(), String::new())) }
     }
+    /// Fetch a live Slack canvas's parsed metadata and HTML export (`files.info` -> `url_private`
+    /// with `canvases.getContent` fallback). Defaults to delegating to [`Self::fetch_canvas_html`].
+    fn fetch_canvas_with_meta(
+        &self,
+        file_id: String,
+    ) -> impl Future<Output = api::Result<(api::CanvasMeta, String)>> + Send {
+        async move {
+            let (title, html) = self.fetch_canvas_html(file_id.clone()).await?;
+            let meta = api::CanvasMeta {
+                comment_channel_id: api::canvas_comment_channel_id(&file_id),
+                file_id,
+                title,
+                ..Default::default()
+            };
+            Ok((meta, html))
+        }
+    }
     /// Create a standalone or channel-tabbed canvas (`canvases.create`, `F-COLLAB-119`).
     fn canvases_create(
         &self,
@@ -680,6 +697,68 @@ pub trait Backend: Clone + Send + Sync + 'static {
         &self,
         _file_id: String,
         _op: api::CanvasEditOp,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Permanently delete a canvas (`canvases.delete`).
+    fn canvases_delete(&self, _canvas_id: String) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Grant read/write/owner access on a canvas (`canvases.access.set`).
+    fn canvases_access_set(
+        &self,
+        _canvas_id: String,
+        _access_level: api::CanvasAccessLevel,
+        _channel_ids: Vec<ChannelId>,
+        _user_ids: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Revoke canvas access from channels or users (`canvases.access.delete`).
+    fn canvases_access_delete(
+        &self,
+        _canvas_id: String,
+        _channel_ids: Vec<ChannelId>,
+        _user_ids: Vec<UserId>,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Load comment threads on a canvas (`conversations.history` + `conversations.replies`).
+    fn canvas_comments_list(
+        &self,
+        _canvas_id: String,
+    ) -> impl Future<Output = api::Result<Vec<api::CanvasCommentThread>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+    /// Post a comment or reply into a canvas's comment channel (`chat.postMessage`).
+    fn canvas_comment_post(
+        &self,
+        _canvas_id: String,
+        _text: String,
+        _thread_ts: Option<Ts>,
+    ) -> impl Future<Output = api::Result<PostedMessage>> + Send {
+        async { Ok(PostedMessage::default()) }
+    }
+    /// Resolve one canvas comment thread (`quip.thread.archive`).
+    fn quip_thread_archive(
+        &self,
+        _channel_id: ChannelId,
+        _thread_ts: Ts,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Reopen one resolved canvas comment thread (`quip.thread.unarchive`).
+    fn quip_thread_unarchive(
+        &self,
+        _channel_id: ChannelId,
+        _thread_ts: Ts,
+    ) -> impl Future<Output = api::Result<()>> + Send {
+        async { Ok(()) }
+    }
+    /// Resolve every open canvas comment thread (`quip.thread.archiveAll`).
+    fn quip_thread_archive_all(
+        &self,
+        _channel_id: ChannelId,
     ) -> impl Future<Output = api::Result<()>> + Send {
         async { Ok(()) }
     }

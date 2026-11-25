@@ -1900,3 +1900,304 @@ async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client
         );
     }
 }
+
+#[tokio::test]
+async fn canvas_access_delete_quip_threads_meta_and_comments_round_trips() {
+    use slackless_api::CanvasAccessLevel;
+
+    // 1. canvases_access_set (channels, users, and XOR validation)
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/canvases.access.set"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        // Invalid XOR cases fail locally before sending HTTP requests.
+        let both_empty = api
+            .canvases_access_set("F1", CanvasAccessLevel::Read, &[], &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(both_empty, ApiError::Slack(ref e) if e == "invalid_parameters"));
+
+        let both_non_empty = api
+            .canvases_access_set(
+                "F1",
+                CanvasAccessLevel::Write,
+                &[ChannelId::from("C1")],
+                &[UserId::from("U1")],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(both_non_empty, ApiError::Slack(ref e) if e == "invalid_parameters"));
+
+        api.canvases_access_set(
+            "F1",
+            CanvasAccessLevel::Write,
+            &[ChannelId::from("C1"), ChannelId::from("C2")],
+            &[],
+        )
+        .await
+        .unwrap();
+        api.canvases_access_set("F1", CanvasAccessLevel::Owner, &[], &[UserId::from("U9")])
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        let f0 = form(&reqs[0]);
+        assert_eq!(field(&f0, "canvas_id"), Some("F1"));
+        assert_eq!(field(&f0, "access_level"), Some("write"));
+        assert_eq!(field(&f0, "channel_ids"), Some(r#"["C1","C2"]"#));
+        assert_eq!(field(&f0, "user_ids"), None);
+
+        let f1 = form(&reqs[1]);
+        assert_eq!(field(&f1, "canvas_id"), Some("F1"));
+        assert_eq!(field(&f1, "access_level"), Some("owner"));
+        assert_eq!(field(&f1, "user_ids"), Some(r#"["U9"]"#));
+        assert_eq!(field(&f1, "channel_ids"), None);
+    }
+
+    // 2. canvases_access_delete & canvases_delete
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/canvases.access.delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/canvases.delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bad = api
+            .canvases_access_delete("F1", &[], &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(bad, ApiError::Slack(ref e) if e == "invalid_parameters"));
+
+        api.canvases_access_delete("F1", &[ChannelId::from("C1")], &[])
+            .await
+            .unwrap();
+        api.canvases_access_delete("F1", &[], &[UserId::from("U2")])
+            .await
+            .unwrap();
+        api.canvases_delete("F1").await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let f0 = form(&reqs[0]);
+        assert_eq!(field(&f0, "canvas_id"), Some("F1"));
+        assert_eq!(field(&f0, "channel_ids"), Some(r#"["C1"]"#));
+        let f1 = form(&reqs[1]);
+        assert_eq!(field(&f1, "user_ids"), Some(r#"["U2"]"#));
+        let f2 = form(&reqs[2]);
+        assert_eq!(field(&f2, "canvas_id"), Some("F1"));
+    }
+
+    // 3. quip_thread_archive / unarchive / archive_all
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/quip.thread.archive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/quip.thread.unarchive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/quip.thread.archiveAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        api.quip_thread_archive(&ChannelId::from("C0CANVAS"), &Ts::from("1700.1"))
+            .await
+            .unwrap();
+        api.quip_thread_unarchive(&ChannelId::from("C0CANVAS"), &Ts::from("1700.1"))
+            .await
+            .unwrap();
+        api.quip_thread_archive_all(&ChannelId::from("C0CANVAS"))
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(field(&form(&reqs[0]), "channel_id"), Some("C0CANVAS"));
+        assert_eq!(field(&form(&reqs[0]), "thread_ts"), Some("1700.1"));
+        assert_eq!(field(&form(&reqs[1]), "channel_id"), Some("C0CANVAS"));
+        assert_eq!(field(&form(&reqs[1]), "thread_ts"), Some("1700.1"));
+        assert_eq!(field(&form(&reqs[2]), "channel_id"), Some("C0CANVAS"));
+    }
+
+    // 4. fetch_canvas_with_meta (both url_private and canvases.getContent fallback)
+    {
+        let (server, api) = setup().await;
+        let export_url = format!("{}/files-pri/T1-FMETA1/canvas.html", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=FMETA1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "FMETA1",
+                    "title": "Design Doc",
+                    "permalink": "https://acme.slack.com/docs/T1/FMETA1",
+                    "url_private": export_url,
+                    "editable": true,
+                    "access": "write",
+                    "org_or_workspace_access": "read",
+                    "canvas_printing_enabled": false,
+                    "canvas_creator_id": "U1",
+                    "editors": ["U1", "U2"],
+                    "quip_thread_id": "QTHREAD1"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files-pri/T1-FMETA1/canvas.html"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("<h1>Design Doc</h1>", "application/octet-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (meta, html) = api.fetch_canvas_with_meta("FMETA1").await.unwrap();
+        assert_eq!(meta.file_id, "FMETA1");
+        assert_eq!(meta.title, "Design Doc");
+        assert!(meta.editable);
+        assert_eq!(meta.access.as_deref(), Some("write"));
+        assert!(!meta.canvas_printing_enabled);
+        assert_eq!(meta.comment_channel_id, ChannelId::from("CMETA1"));
+        assert_eq!(html, "<h1>Design Doc</h1>");
+
+        // Fallback to canvases.getContent(content_type="html") when url_private is absent.
+        Mock::given(method("POST"))
+            .and(path("/api/files.info"))
+            .and(body_string_contains("file=FMETA2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "file": {
+                    "id": "FMETA2",
+                    "title": "API Fallback Canvas",
+                    "editable": false,
+                    "access": "read"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/canvases.getContent"))
+            .and(body_string_contains("canvas_id=FMETA2"))
+            .and(body_string_contains("content_type=html"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "content": "<p>Fetched via getContent</p>"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (meta2, html2) = api.fetch_canvas_with_meta("FMETA2").await.unwrap();
+        assert_eq!(meta2.title, "API Fallback Canvas");
+        assert!(!meta2.editable);
+        assert!(meta2.canvas_printing_enabled);
+        assert_eq!(html2, "<p>Fetched via getContent</p>");
+    }
+
+    // 5. canvas_comments_list (threads + replies, and channel_not_found -> empty) & canvas_comment_post
+    {
+        let (server, api) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.history"))
+            .and(body_string_contains("channel=C0CMT1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    {
+                        "ts": "1700.1",
+                        "user": "U1",
+                        "text": "Please clarify section 2",
+                        "reply_count": 1,
+                        "document_comment": { "is_archived": false }
+                    },
+                    {
+                        "ts": "1700.2",
+                        "user": "U2",
+                        "text": "Resolved note",
+                        "is_archived": true
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.replies"))
+            .and(body_string_contains("channel=C0CMT1"))
+            .and(body_string_contains("ts=1700.1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "1700.1", "user": "U1", "text": "Please clarify section 2" },
+                    { "ts": "1700.11", "thread_ts": "1700.1", "user": "U3", "text": "Updated!" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.history"))
+            .and(body_string_contains("channel=C0EMPTY"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": "channel_not_found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat.postMessage"))
+            .and(body_string_contains("channel=C0CMT1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "channel": "C0CMT1",
+                "ts": "1700.99"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let threads = api.canvas_comments_list("F0CMT1").await.unwrap();
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].root_ts, Ts::from("1700.1"));
+        assert!(!threads[0].resolved);
+        assert_eq!(threads[0].replies.len(), 1);
+        assert_eq!(threads[0].replies[0].text, "Updated!");
+        assert!(threads[1].resolved);
+
+        let empty = api.canvas_comments_list("F0EMPTY").await.unwrap();
+        assert!(empty.is_empty());
+
+        let posted = api
+            .canvas_comment_post("F0CMT1", "Looks good", Some(&Ts::from("1700.1")))
+            .await
+            .unwrap();
+        assert_eq!(posted.ts, Ts::from("1700.99"));
+    }
+}

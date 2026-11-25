@@ -208,6 +208,7 @@ pub mod method {
     pub const QUIP_LOOKUP_THREAD_IDS: &str = "quip.lookupThreadIds";
     pub const QUIP_THREAD_ARCHIVE: &str = "quip.thread.archive";
     pub const QUIP_THREAD_ARCHIVE_ALL: &str = "quip.thread.archiveAll";
+    pub const QUIP_THREAD_UNARCHIVE: &str = "quip.thread.unarchive";
     pub const REACTIONS_ADD: &str = "reactions.add";
     pub const REACTIONS_GET: &str = "reactions.get";
     pub const REACTIONS_LIST: &str = "reactions.list";

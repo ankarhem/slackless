@@ -232,6 +232,39 @@ impl<B: Backend> Core<B> {
                 channel,
             } => self.create_canvas(title, markdown, channel),
             Command::EditCanvas { file_id, op } => self.edit_canvas(file_id, op),
+            Command::DeleteCanvas { canvas_id } => self.delete_canvas(canvas_id),
+            Command::SetCanvasAccess {
+                canvas_id,
+                access_level,
+                channel_ids,
+                user_ids,
+                post_permalink,
+            } => self.set_canvas_access(
+                canvas_id,
+                access_level,
+                channel_ids,
+                user_ids,
+                post_permalink,
+            ),
+            Command::DeleteCanvasAccess {
+                canvas_id,
+                channel_ids,
+                user_ids,
+            } => self.delete_canvas_access(canvas_id, channel_ids, user_ids),
+            Command::LoadCanvasComments { canvas_id } => self.load_canvas_comments(canvas_id),
+            Command::PostCanvasComment {
+                canvas_id,
+                text,
+                thread_ts,
+            } => self.post_canvas_comment(canvas_id, text, thread_ts),
+            Command::ResolveCanvasComment {
+                canvas_id,
+                thread_ts,
+                resolved,
+            } => self.resolve_canvas_comment(canvas_id, thread_ts, resolved),
+            Command::ResolveAllCanvasComments { canvas_id } => {
+                self.resolve_all_canvas_comments(canvas_id);
+            }
             Command::LoadList { file_id } => self.load_list(file_id),
             Command::CreateList {
                 name,

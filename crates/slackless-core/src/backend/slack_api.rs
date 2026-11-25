@@ -530,6 +530,12 @@ impl Backend for SlackApi {
     async fn fetch_canvas_html(&self, file_id: String) -> api::Result<(String, String)> {
         SlackApi::fetch_canvas_html(self, &file_id).await
     }
+    async fn fetch_canvas_with_meta(
+        &self,
+        file_id: String,
+    ) -> api::Result<(api::CanvasMeta, String)> {
+        SlackApi::fetch_canvas_with_meta(self, &file_id).await
+    }
     async fn canvases_create(
         &self,
         title: Option<String>,
@@ -546,6 +552,49 @@ impl Backend for SlackApi {
     }
     async fn canvases_edit(&self, file_id: String, op: api::CanvasEditOp) -> api::Result<()> {
         SlackApi::canvases_edit(self, &file_id, &op).await
+    }
+    async fn canvases_delete(&self, canvas_id: String) -> api::Result<()> {
+        SlackApi::canvases_delete(self, &canvas_id).await
+    }
+    async fn canvases_access_set(
+        &self,
+        canvas_id: String,
+        access_level: api::CanvasAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<()> {
+        SlackApi::canvases_access_set(self, &canvas_id, access_level, &channel_ids, &user_ids).await
+    }
+    async fn canvases_access_delete(
+        &self,
+        canvas_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<()> {
+        SlackApi::canvases_access_delete(self, &canvas_id, &channel_ids, &user_ids).await
+    }
+    async fn canvas_comments_list(
+        &self,
+        canvas_id: String,
+    ) -> api::Result<Vec<api::CanvasCommentThread>> {
+        SlackApi::canvas_comments_list(self, &canvas_id).await
+    }
+    async fn canvas_comment_post(
+        &self,
+        canvas_id: String,
+        text: String,
+        thread_ts: Option<Ts>,
+    ) -> api::Result<PostedMessage> {
+        SlackApi::canvas_comment_post(self, &canvas_id, &text, thread_ts.as_ref()).await
+    }
+    async fn quip_thread_archive(&self, channel_id: ChannelId, thread_ts: Ts) -> api::Result<()> {
+        SlackApi::quip_thread_archive(self, &channel_id, &thread_ts).await
+    }
+    async fn quip_thread_unarchive(&self, channel_id: ChannelId, thread_ts: Ts) -> api::Result<()> {
+        SlackApi::quip_thread_unarchive(self, &channel_id, &thread_ts).await
+    }
+    async fn quip_thread_archive_all(&self, channel_id: ChannelId) -> api::Result<()> {
+        SlackApi::quip_thread_archive_all(self, &channel_id).await
     }
     async fn fetch_list(&self, file_id: String) -> api::Result<api::SlackListData> {
         SlackApi::fetch_list(self, &file_id).await

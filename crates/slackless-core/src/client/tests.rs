@@ -189,6 +189,17 @@ struct FakeState {
     edge_search_calls: Vec<(TeamId, String)>,
     canvases_create_calls: Vec<(Option<String>, Option<String>, Option<ChannelId>)>,
     canvases_edit_calls: Vec<String>,
+    canvases_delete_calls: Vec<String>,
+    canvases_delete_error: Option<String>,
+    canvases_access_set_calls: Vec<(String, api::CanvasAccessLevel, Vec<ChannelId>, Vec<UserId>)>,
+    canvases_access_delete_calls: Vec<(String, Vec<ChannelId>, Vec<UserId>)>,
+    canvases_access_error: Option<String>,
+    canvas_comments: Vec<api::CanvasCommentThread>,
+    canvas_comments_error: Option<String>,
+    canvas_comment_posts: Vec<(String, String, Option<Ts>)>,
+    quip_archive_calls: Vec<(ChannelId, Ts, bool)>,
+    quip_archive_all_calls: Vec<ChannelId>,
+    quip_archive_error: Option<String>,
     fail_canvas_html: bool,
     list_data: api::SlackListData,
     list_create_item_calls: Vec<String>,
@@ -1505,6 +1516,104 @@ impl Backend for FakeBackend {
 
     async fn canvases_edit(&self, file_id: String, _op: api::CanvasEditOp) -> api::Result<()> {
         self.state.lock().unwrap().canvases_edit_calls.push(file_id);
+        Ok(())
+    }
+
+    async fn canvases_delete(&self, canvas_id: String) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.canvases_delete_calls.push(canvas_id);
+        if let Some(err) = state.canvases_delete_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn canvases_access_set(
+        &self,
+        canvas_id: String,
+        access_level: api::CanvasAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .canvases_access_set_calls
+            .push((canvas_id, access_level, channel_ids, user_ids));
+        if let Some(err) = state.canvases_access_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn canvases_access_delete(
+        &self,
+        canvas_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    ) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .canvases_access_delete_calls
+            .push((canvas_id, channel_ids, user_ids));
+        if let Some(err) = state.canvases_access_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn canvas_comments_list(
+        &self,
+        _canvas_id: String,
+    ) -> api::Result<Vec<api::CanvasCommentThread>> {
+        let state = self.state.lock().unwrap();
+        if let Some(err) = state.canvas_comments_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(state.canvas_comments.clone())
+    }
+
+    async fn canvas_comment_post(
+        &self,
+        canvas_id: String,
+        text: String,
+        thread_ts: Option<Ts>,
+    ) -> api::Result<PostedMessage> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .canvas_comment_posts
+            .push((canvas_id, text, thread_ts));
+        if let Some(err) = state.canvas_comments_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(PostedMessage::default())
+    }
+
+    async fn quip_thread_archive(&self, channel_id: ChannelId, thread_ts: Ts) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.quip_archive_calls.push((channel_id, thread_ts, true));
+        if let Some(err) = state.quip_archive_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn quip_thread_unarchive(&self, channel_id: ChannelId, thread_ts: Ts) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .quip_archive_calls
+            .push((channel_id, thread_ts, false));
+        if let Some(err) = state.quip_archive_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
+        Ok(())
+    }
+
+    async fn quip_thread_archive_all(&self, channel_id: ChannelId) -> api::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.quip_archive_all_calls.push(channel_id);
+        if let Some(err) = state.quip_archive_error.clone() {
+            return Err(ApiError::Slack(err));
+        }
         Ok(())
     }
 
@@ -4994,6 +5103,11 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
         next(&mut rx).await,
         Event::CanvasLoaded { file_id, html: Ok(_), .. } if file_id == "FC1"
     ));
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasMetaLoaded { file_id, meta }
+            if file_id == "FC1" && meta.comment_channel_id == ChannelId::from("CC1")
+    ));
     fake.state.lock().unwrap().fail_canvas_html = true;
     core.handle(Command::LoadCanvas {
         file_id: "FC_BAD".into(),
@@ -5027,6 +5141,10 @@ async fn command_groups_profile_gifs_quick_switch_canvas_lists_files_extras_and_
     assert!(matches!(
         next(&mut rx).await,
         Event::CanvasLoaded { file_id, html: Ok(_), .. } if file_id == "FCANVAS1"
+    ));
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasMetaLoaded { file_id, .. } if file_id == "FCANVAS1"
     ));
 
     // LoadList & CreateListItem.
@@ -5110,4 +5228,206 @@ async fn huddle_watcher_ignores_stale_generation_idle_and_preserves_new_session(
         Event::HuddleSessionChanged(s) if s.phase == crate::huddle::HuddlePhase::Idle
     ));
     assert!(huddle.lock().unwrap().call_id.is_none());
+}
+
+#[tokio::test]
+async fn canvas_delete_access_and_comments_command_event_round_trips() {
+    let fake = FakeBackend::default();
+    let (store, events, mut rx) = fake_core_parts();
+    let mut core = Core::new(fake.clone(), store, TeamId::from("T1"), events);
+
+    // 1. DeleteCanvas (ok + formatted Slack error)
+    core.handle(Command::DeleteCanvas {
+        canvas_id: "F0DEL".into(),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasDeleted {
+            canvas_id: "F0DEL".into(),
+            result: Ok(()),
+        }
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().canvases_delete_calls,
+        vec!["F0DEL"]
+    );
+
+    fake.state.lock().unwrap().canvases_delete_error = Some("cant_delete_file".into());
+    core.handle(Command::DeleteCanvas {
+        canvas_id: "F0LOCKED".into(),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasDeleted {
+            canvas_id: "F0LOCKED".into(),
+            result: Err(api::format_canvas_error("cant_delete_file")),
+        }
+    );
+    fake.state.lock().unwrap().canvases_delete_error = None;
+
+    // 2. SetCanvasAccess with post_permalink shares permalink into each channel
+    core.handle(Command::SetCanvasAccess {
+        canvas_id: "F0SHARE".into(),
+        access_level: api::CanvasAccessLevel::Write,
+        channel_ids: vec![ChannelId::from("C1"), ChannelId::from("C2")],
+        user_ids: vec![],
+        post_permalink: Some("https://acme.slack.com/docs/T1/F0SHARE".into()),
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasAccessUpdated { canvas_id, result: Ok(()), .. } if canvas_id == "F0SHARE"
+    ));
+    {
+        let st = fake.state.lock().unwrap();
+        assert_eq!(st.canvases_access_set_calls.len(), 1);
+        assert_eq!(
+            st.posted_messages,
+            vec![
+                (
+                    ChannelId::from("C1"),
+                    "https://acme.slack.com/docs/T1/F0SHARE".to_owned()
+                ),
+                (
+                    ChannelId::from("C2"),
+                    "https://acme.slack.com/docs/T1/F0SHARE".to_owned()
+                ),
+            ]
+        );
+    }
+
+    // 3. DeleteCanvasAccess (ok + formatted error)
+    core.handle(Command::DeleteCanvasAccess {
+        canvas_id: "F0SHARE".into(),
+        channel_ids: vec![],
+        user_ids: vec![UserId::from("U7")],
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasAccessUpdated { canvas_id, result: Ok(()), .. } if canvas_id == "F0SHARE"
+    ));
+    assert_eq!(
+        fake.state
+            .lock()
+            .unwrap()
+            .canvases_access_delete_calls
+            .len(),
+        1
+    );
+
+    fake.state.lock().unwrap().canvases_access_error = Some("restricted_action".into());
+    core.handle(Command::SetCanvasAccess {
+        canvas_id: "F0SHARE".into(),
+        access_level: api::CanvasAccessLevel::Owner,
+        channel_ids: vec![],
+        user_ids: vec![UserId::from("U8")],
+        post_permalink: None,
+    });
+    assert!(matches!(
+        next(&mut rx).await,
+        Event::CanvasAccessUpdated { canvas_id, result: Err(ref msg), .. }
+            if canvas_id == "F0SHARE" && msg == &api::format_canvas_error("restricted_action")
+    ));
+    fake.state.lock().unwrap().canvases_access_error = None;
+
+    // 4. LoadCanvasComments & PostCanvasComment
+    let sample_thread = api::CanvasCommentThread {
+        root_ts: Ts::from("1700.1"),
+        author: Some(UserId::from("U1")),
+        text: "Check numbers".into(),
+        reply_count: 1,
+        replies: vec![api::CanvasCommentReply {
+            ts: Ts::from("1700.2"),
+            author: Some(UserId::from("U2")),
+            text: "Verified".into(),
+        }],
+        resolved: false,
+    };
+    fake.state.lock().unwrap().canvas_comments = vec![sample_thread.clone()];
+    core.handle(Command::LoadCanvasComments {
+        canvas_id: "F0CMT".into(),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasCommentsLoaded {
+            canvas_id: "F0CMT".into(),
+            result: Ok(vec![sample_thread]),
+        }
+    );
+
+    core.handle(Command::PostCanvasComment {
+        canvas_id: "F0CMT".into(),
+        text: "Thanks!".into(),
+        thread_ts: Some(Ts::from("1700.1")),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasCommentPosted {
+            canvas_id: "F0CMT".into(),
+            result: Ok(()),
+        }
+    );
+    assert_eq!(
+        fake.state.lock().unwrap().canvas_comment_posts,
+        vec![(
+            "F0CMT".to_owned(),
+            "Thanks!".to_owned(),
+            Some(Ts::from("1700.1"))
+        )]
+    );
+
+    // 5. ResolveCanvasComment (resolve + reopen) & ResolveAllCanvasComments
+    core.handle(Command::ResolveCanvasComment {
+        canvas_id: "F0CMT".into(),
+        thread_ts: Ts::from("1700.1"),
+        resolved: true,
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasCommentResolved {
+            canvas_id: "F0CMT".into(),
+            thread_ts: Ts::from("1700.1"),
+            resolved: true,
+            result: Ok(()),
+        }
+    );
+
+    core.handle(Command::ResolveCanvasComment {
+        canvas_id: "F0CMT".into(),
+        thread_ts: Ts::from("1700.1"),
+        resolved: false,
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasCommentResolved {
+            canvas_id: "F0CMT".into(),
+            thread_ts: Ts::from("1700.1"),
+            resolved: false,
+            result: Ok(()),
+        }
+    );
+
+    core.handle(Command::ResolveAllCanvasComments {
+        canvas_id: "F0CMT".into(),
+    });
+    assert_eq!(
+        next(&mut rx).await,
+        Event::CanvasCommentResolved {
+            canvas_id: "F0CMT".into(),
+            thread_ts: Ts::default(),
+            resolved: true,
+            result: Ok(()),
+        }
+    );
+
+    {
+        let st = fake.state.lock().unwrap();
+        assert_eq!(
+            st.quip_archive_calls,
+            vec![
+                (ChannelId::from("C0CMT"), Ts::from("1700.1"), true),
+                (ChannelId::from("C0CMT"), Ts::from("1700.1"), false),
+            ]
+        );
+        assert_eq!(st.quip_archive_all_calls, vec![ChannelId::from("C0CMT")]);
+    }
 }

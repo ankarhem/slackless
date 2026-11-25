@@ -449,24 +449,34 @@ impl SlackApi {
         Ok(())
     }
 
-    /// Fetch a live Slack canvas's read-only HTML export (`files.info` -> `url_private` with
-    /// session cookie, `F-COLLAB-125`). Returns `(title, html)`.
-    pub async fn fetch_canvas_html(&self, file_id: &str) -> Result<(String, String)> {
+    /// Fetch a live Slack canvas's parsed metadata and HTML body (`files.info` -> `url_private`
+    /// export, falling back to `canvases.getContent(content_type="html")` if `url_private` is
+    /// absent).
+    pub async fn fetch_canvas_with_meta(&self, file_id: &str) -> Result<(CanvasMeta, String)> {
         let file = self.files_info(file_id).await?;
-        let title = file
-            .title
-            .clone()
-            .filter(|s| !s.is_empty())
-            .or_else(|| file.name.clone().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "Canvas".to_owned());
-        let url = file
+        let meta = parse_canvas_meta_from_file(&file, None);
+        let html = if let Some(url) = file
             .url_private
             .as_deref()
             .or(file.url_private_download.as_deref())
-            .ok_or_else(|| crate::ApiError::Slack("canvas_no_private_url".to_owned()))?;
-        let bytes = self.download_file(url).await?;
-        let html = String::from_utf8_lossy(&bytes).into_owned();
-        Ok((title, html))
+        {
+            let bytes = self.download_file(url).await?;
+            String::from_utf8_lossy(&bytes).into_owned()
+        } else {
+            match self.canvases_get_content(file_id, Some("html")).await {
+                Ok(html) => html,
+                Err(err) if err.is_auth_expired() => return Err(err),
+                Err(_) => return Err(crate::ApiError::Slack("canvas_no_private_url".to_owned())),
+            }
+        };
+        Ok((meta, html))
+    }
+
+    /// Fetch a live Slack canvas's read-only HTML export (`files.info` -> `url_private` with
+    /// session cookie, `F-COLLAB-125`). Returns `(title, html)`.
+    pub async fn fetch_canvas_html(&self, file_id: &str) -> Result<(String, String)> {
+        let (meta, html) = self.fetch_canvas_with_meta(file_id).await?;
+        Ok((meta.title, html))
     }
 
     /// `saved.update`: transition a saved item's state (`mark`) and/or update or clear (`Some(None)`)

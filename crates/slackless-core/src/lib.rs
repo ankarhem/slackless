@@ -382,6 +382,45 @@ pub enum Command {
         file_id: String,
         op: api::CanvasEditOp,
     },
+    /// Permanently delete a canvas (`canvases.delete`).
+    DeleteCanvas {
+        canvas_id: String,
+    },
+    /// Grant read/write/owner access on a canvas (`canvases.access.set`), optionally posting
+    /// its permalink into each shared channel after the grant succeeds.
+    SetCanvasAccess {
+        canvas_id: String,
+        access_level: api::CanvasAccessLevel,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+        post_permalink: Option<String>,
+    },
+    /// Revoke canvas access from channels or users (`canvases.access.delete`).
+    DeleteCanvasAccess {
+        canvas_id: String,
+        channel_ids: Vec<ChannelId>,
+        user_ids: Vec<UserId>,
+    },
+    /// Load threaded comments for a canvas from its derived file comment channel (`C…`).
+    LoadCanvasComments {
+        canvas_id: String,
+    },
+    /// Post a new top-level comment or reply into a canvas's comment channel (`chat.postMessage`).
+    PostCanvasComment {
+        canvas_id: String,
+        text: String,
+        thread_ts: Option<Ts>,
+    },
+    /// Resolve (`quip.thread.archive`) or reopen (`quip.thread.unarchive`) one canvas comment thread.
+    ResolveCanvasComment {
+        canvas_id: String,
+        thread_ts: Ts,
+        resolved: bool,
+    },
+    /// Resolve all open comment threads on a canvas (`quip.thread.archiveAll`).
+    ResolveAllCanvasComments {
+        canvas_id: String,
+    },
     /// Request edit (`upgrade`) or comment (`comment_upgrade`) access on a canvas/list (`F-COLLAB-129`).
     RequestFilePermission {
         file_id: String,
@@ -893,11 +932,44 @@ pub enum Event {
         title: String,
         html: Result<String, String>,
     },
+    /// Parsed Canvas metadata loaded alongside [`Event::CanvasLoaded`].
+    CanvasMetaLoaded {
+        file_id: String,
+        meta: api::CanvasMeta,
+    },
     /// A standalone canvas was created via `canvases.create` (`F-COLLAB-119`).
     CanvasCreated {
         file_id: String,
         title: String,
         channel: Option<ChannelId>,
+    },
+    /// Result of [`Command::DeleteCanvas`] (`canvases.delete`).
+    CanvasDeleted {
+        canvas_id: String,
+        result: Result<(), String>,
+    },
+    /// Result of [`Command::SetCanvasAccess`] or [`Command::DeleteCanvasAccess`].
+    CanvasAccessUpdated {
+        canvas_id: String,
+        summary: String,
+        result: Result<(), String>,
+    },
+    /// Result of [`Command::LoadCanvasComments`].
+    CanvasCommentsLoaded {
+        canvas_id: String,
+        result: Result<Vec<api::CanvasCommentThread>, String>,
+    },
+    /// Result of [`Command::PostCanvasComment`].
+    CanvasCommentPosted {
+        canvas_id: String,
+        result: Result<(), String>,
+    },
+    /// Result of [`Command::ResolveCanvasComment`] or [`Command::ResolveAllCanvasComments`].
+    CanvasCommentResolved {
+        canvas_id: String,
+        thread_ts: Ts,
+        resolved: bool,
+        result: Result<(), String>,
     },
     /// Access was requested on a canvas/list (`files.requestPermission`, `F-COLLAB-129`).
     FilePermissionRequested { file_id: String },

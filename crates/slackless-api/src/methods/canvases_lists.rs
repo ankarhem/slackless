@@ -233,6 +233,146 @@ impl SlackApi {
         Ok(())
     }
 
+    /// `canvases.access.set`: grant read/write/owner access on a canvas to channels or users (XOR).
+    pub async fn canvases_access_set(
+        &self,
+        canvas_id: &str,
+        access_level: CanvasAccessLevel,
+        channel_ids: &[ChannelId],
+        user_ids: &[UserId],
+    ) -> Result<()> {
+        if channel_ids.is_empty() == user_ids.is_empty() {
+            return Err(ApiError::Slack("invalid_parameters".to_owned()));
+        }
+        let mut params = vec![
+            ("canvas_id", canvas_id.to_owned()),
+            ("access_level", access_level.as_str().to_owned()),
+        ];
+        if !channel_ids.is_empty() {
+            let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
+            params.push(("channel_ids", serde_json::to_string(&ids)?));
+        } else {
+            let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
+            params.push(("user_ids", serde_json::to_string(&ids)?));
+        }
+        self.call::<Empty>(method::CANVASES_ACCESS_SET, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `canvases.access.delete`: revoke canvas access from channels or users (XOR).
+    pub async fn canvases_access_delete(
+        &self,
+        canvas_id: &str,
+        channel_ids: &[ChannelId],
+        user_ids: &[UserId],
+    ) -> Result<()> {
+        if channel_ids.is_empty() == user_ids.is_empty() {
+            return Err(ApiError::Slack("invalid_parameters".to_owned()));
+        }
+        let mut params = vec![("canvas_id", canvas_id.to_owned())];
+        if !channel_ids.is_empty() {
+            let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
+            params.push(("channel_ids", serde_json::to_string(&ids)?));
+        } else {
+            let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
+            params.push(("user_ids", serde_json::to_string(&ids)?));
+        }
+        self.call::<Empty>(method::CANVASES_ACCESS_DELETE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `quip.thread.archive`: resolve one canvas comment thread.
+    pub async fn quip_thread_archive(&self, channel_id: &ChannelId, thread_ts: &Ts) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel_id.to_string()),
+            ("thread_ts", thread_ts.to_string()),
+        ];
+        self.call::<Empty>(method::QUIP_THREAD_ARCHIVE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `quip.thread.unarchive`: reopen one resolved canvas comment thread.
+    pub async fn quip_thread_unarchive(
+        &self,
+        channel_id: &ChannelId,
+        thread_ts: &Ts,
+    ) -> Result<()> {
+        let params = vec![
+            ("channel_id", channel_id.to_string()),
+            ("thread_ts", thread_ts.to_string()),
+        ];
+        self.call::<Empty>(method::QUIP_THREAD_UNARCHIVE, params)
+            .await?;
+        Ok(())
+    }
+
+    /// `quip.thread.archiveAll`: resolve every open comment thread in a canvas comment channel.
+    pub async fn quip_thread_archive_all(&self, channel_id: &ChannelId) -> Result<()> {
+        let params = vec![("channel_id", channel_id.to_string())];
+        self.call::<Empty>(method::QUIP_THREAD_ARCHIVE_ALL, params)
+            .await?;
+        Ok(())
+    }
+
+    /// List comment threads on a canvas by reading its derived file comment channel (`C…`).
+    pub async fn canvas_comments_list(&self, canvas_id: &str) -> Result<Vec<CanvasCommentThread>> {
+        let comment_channel = canvas_comment_channel_id(canvas_id);
+        let history_opts = HistoryOpts {
+            limit: Some(100),
+            ..Default::default()
+        };
+        let history = match self
+            .conversations_history(&comment_channel, &history_opts, None)
+            .await
+        {
+            Ok(page) => page.items,
+            Err(ApiError::Slack(ref code)) if code == "channel_not_found" => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(err),
+        };
+
+        let reply_opts = HistoryOpts {
+            limit: Some(200),
+            ..Default::default()
+        };
+        let mut replies_by_root: HashMap<Ts, Vec<Message>> = HashMap::new();
+        for msg in &history {
+            if msg.ts.as_str().is_empty()
+                || msg.is_thread_reply()
+                || msg.reply_count.unwrap_or(0) == 0
+            {
+                continue;
+            }
+            let replies = self
+                .conversations_replies(&comment_channel, &msg.ts, &reply_opts, None)
+                .await?;
+            replies_by_root.insert(msg.ts.clone(), replies.items);
+        }
+
+        Ok(parse_canvas_comment_threads(&history, &replies_by_root))
+    }
+
+    /// Post a top-level comment or thread reply into a canvas's derived file comment channel (`C…`).
+    pub async fn canvas_comment_post(
+        &self,
+        canvas_id: &str,
+        text: &str,
+        thread_ts: Option<&Ts>,
+    ) -> Result<PostedMessage> {
+        let comment_channel = canvas_comment_channel_id(canvas_id);
+        self.chat_post_message(
+            &comment_channel,
+            &MessageContent::plain(text),
+            thread_ts,
+            false,
+        )
+        .await
+    }
+
     /// `files.requestPermission`: request edit (`upgrade`) or comment (`comment_upgrade`) access (`F-COLLAB-129`).
     pub async fn files_request_permission(&self, file_id: &str, request_type: &str) -> Result<()> {
         let params = vec![
