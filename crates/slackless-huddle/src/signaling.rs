@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
@@ -14,7 +15,9 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 
 use crate::proto::{
     SdkAudioControlFrame, SdkClientDetails, SdkClientMetricFrame, SdkDataMessageFrame,
@@ -36,6 +39,23 @@ pub struct ChimeSignalClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
+fn tls_connector() -> Result<Connector> {
+    // Ensure a process-wide default provider is registered when both `ring` and `aws-lc-rs`
+    // features are unified onto `rustls` across the workspace (e.g. `reqwest` + `slackless-huddle`).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| HuddleError::Signaling(format!("tls config failed: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
 impl ChimeSignalClient {
     /// Dial `<SignalingUrl>?X-Chime-Control-Protocol-Version=3&X-Amzn-Chime-Send-Close-On-Error=1`
     /// with subprotocol auth `["_aws_wt_session", "<JoinToken>"]`.
@@ -51,7 +71,8 @@ impl ChimeSignalClient {
         req.headers_mut()
             .insert("Origin", HeaderValue::from_static("https://app.slack.com"));
 
-        let (ws, _resp) = connect_async(req)
+        let tls = tls_connector()?;
+        let (ws, _resp) = connect_async_tls_with_config(req, None, false, Some(tls))
             .await
             .map_err(|e| HuddleError::Signaling(e.to_string()))?;
         Ok(Self { ws })
@@ -1216,5 +1237,12 @@ mod tests {
         let mut client2 = ChimeSignalClient::connect(&creds2).await.unwrap();
         assert!(client2.next_frame().await.is_err());
         server2.await.unwrap();
+    }
+
+    #[test]
+    fn tls_connector_builds_with_explicit_ring_provider() {
+        // Must succeed even when both `ring` and `aws-lc-rs` features are unified onto `rustls`.
+        let connector = tls_connector().expect("explicit rustls ring connector should build");
+        assert!(matches!(connector, Connector::Rustls(_)));
     }
 }

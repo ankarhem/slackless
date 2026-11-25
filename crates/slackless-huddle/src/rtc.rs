@@ -20,6 +20,8 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::media_engine::{
     MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_OPUS, MediaEngine,
 };
+use rtc::peer_connection::event::RTCPeerConnectionIceEvent;
+use rtc::peer_connection::transport::RTCIceCandidateType;
 use rtc::rtcp::payload_feedbacks::full_intra_request::{FirEntry, FullIntraRequest};
 use rtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use rtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
@@ -348,6 +350,7 @@ struct ChimePeerHandler {
     state_tx: mpsc::UnboundedSender<RTCPeerConnectionState>,
     connection_state: Arc<StdMutex<RTCPeerConnectionState>>,
     gather_complete_tx: watch::Sender<u64>,
+    relay_candidate_tx: watch::Sender<u64>,
     remote_tracks: Arc<StdMutex<HashMap<u32, Arc<dyn TrackRemote>>>>,
     packets_received: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
@@ -382,6 +385,13 @@ async fn resolve_track_mid(
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for ChimePeerHandler {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        if event.candidate.typ == RTCIceCandidateType::Relay {
+            self.relay_candidate_tx
+                .send_modify(|seq| *seq = seq.wrapping_add(1));
+        }
+    }
+
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         if state == RTCIceGatheringState::Complete {
             self.gather_complete_tx
@@ -582,6 +592,7 @@ pub struct ChimeRtcPeer {
     receive_video_transceivers: AsyncMutex<Vec<Arc<dyn RtpTransceiver>>>,
     connection_state: Arc<StdMutex<RTCPeerConnectionState>>,
     gather_complete_tx: watch::Sender<u64>,
+    relay_candidate_tx: watch::Sender<u64>,
     remote_tracks: Arc<StdMutex<HashMap<u32, Arc<dyn TrackRemote>>>>,
     packets_sent: Arc<AtomicU64>,
     bytes_sent: Arc<AtomicU64>,
@@ -635,6 +646,7 @@ impl ChimeRtcPeer {
         let pc_cell: Arc<OnceLock<Weak<dyn PeerConnection>>> = Arc::new(OnceLock::new());
         let connection_state = Arc::new(StdMutex::new(RTCPeerConnectionState::New));
         let (gather_complete_tx, _) = watch::channel(0u64);
+        let (relay_candidate_tx, _) = watch::channel(0u64);
         let remote_tracks: Arc<StdMutex<HashMap<u32, Arc<dyn TrackRemote>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let packets_received = Arc::new(AtomicU64::new(0));
@@ -649,6 +661,7 @@ impl ChimeRtcPeer {
             state_tx,
             connection_state: Arc::clone(&connection_state),
             gather_complete_tx: gather_complete_tx.clone(),
+            relay_candidate_tx: relay_candidate_tx.clone(),
             remote_tracks: Arc::clone(&remote_tracks),
             packets_received: Arc::clone(&packets_received),
             bytes_received: Arc::clone(&bytes_received),
@@ -748,6 +761,7 @@ impl ChimeRtcPeer {
             receive_video_transceivers: AsyncMutex::new(Vec::new()),
             connection_state,
             gather_complete_tx,
+            relay_candidate_tx,
             remote_tracks,
             packets_sent: Arc::new(AtomicU64::new(0)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
@@ -865,17 +879,41 @@ impl ChimeRtcPeer {
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
-        // Subscribe before `set_local_description` so a fast gathering completion cannot race.
+        // Subscribe before `set_local_description` so fast gathering completion cannot race.
         let mut gather_rx = self.gather_complete_tx.subscribe();
         gather_rx.borrow_and_update();
+        let mut relay_rx = self.relay_candidate_tx.subscribe();
+        relay_rx.borrow_and_update();
 
         self.pc
             .set_local_description(offer)
             .await
             .map_err(|e| HuddleError::WebRtc(e.to_string()))?;
 
-        // Wait up to 6s for TURN relay candidate gathering to complete.
-        let _ = tokio::time::timeout(Duration::from_secs(6), gather_rx.changed()).await;
+        // Fast path: on renegotiation (or if gathering finished synchronously), the local SDP
+        // already carries our TURN relay candidate.
+        let already_has_relay = self
+            .pc
+            .local_description()
+            .await
+            .is_some_and(|d| d.sdp.contains("typ relay"));
+        if !already_has_relay {
+            // Wait up to 6s for gathering to complete, or return shortly after the first TURN
+            // relay candidate arrives so dead secondary/IPv6 interfaces never stall huddle join.
+            tokio::select! {
+                _ = gather_rx.changed() => {}
+                res = relay_rx.changed() => {
+                    if res.is_ok() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(150),
+                            gather_rx.changed(),
+                        )
+                        .await;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(6)) => {}
+            }
+        }
 
         let local =
             self.pc.local_description().await.ok_or_else(|| {
