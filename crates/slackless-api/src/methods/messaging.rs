@@ -224,6 +224,8 @@ impl SlackApi {
     }
 
     /// `chat.scheduleMessage`: queue a message for delivery at unix timestamp `post_at`.
+    /// Falls back transparently to Slack's web-client `drafts.create` (`date_scheduled`) when
+    /// Slack returns `not_allowed_token_type` (standard on `xoxc-` session tokens).
     pub async fn chat_schedule_message(
         &self,
         channel: &ChannelId,
@@ -231,6 +233,11 @@ impl SlackApi {
         content: &MessageContent,
         thread_ts: Option<&Ts>,
     ) -> Result<ScheduledMessageCreated> {
+        if self.uses_drafts_schedule() {
+            return self
+                .drafts_create_scheduled(channel, post_at, content, thread_ts)
+                .await;
+        }
         let mut params = vec![
             ("channel", channel.to_string()),
             ("post_at", post_at.to_string()),
@@ -240,38 +247,69 @@ impl SlackApi {
             params.push(("thread_ts", thread_ts.to_string()));
         }
         content.push(&mut params)?;
-        Ok(self.call(method::CHAT_SCHEDULE_MESSAGE, params).await?.data)
+        match self.call(method::CHAT_SCHEDULE_MESSAGE, params).await {
+            Ok(resp) => Ok(resp.data),
+            Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
+                self.mark_drafts_schedule();
+                self.drafts_create_scheduled(channel, post_at, content, thread_ts)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `chat.scheduledMessages.list`: pending scheduled messages (all channels when `None`).
+    /// Falls back transparently to `drafts.list` (`date_scheduled > 0`) on `not_allowed_token_type`.
     pub async fn chat_scheduled_messages_list(
         &self,
         channel: Option<&ChannelId>,
     ) -> Result<Vec<ScheduledMessage>> {
+        if self.uses_drafts_schedule() {
+            return self.drafts_list_scheduled(channel).await;
+        }
         let mut params = Vec::new();
         if let Some(channel) = channel {
             params.push(("channel", channel.to_string()));
         }
-        Ok(self
+        match self
             .call::<ScheduledMessagesList>(method::CHAT_SCHEDULED_MESSAGES_LIST, params)
-            .await?
-            .data
-            .scheduled_messages)
+            .await
+        {
+            Ok(resp) => Ok(resp.data.scheduled_messages),
+            Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
+                self.mark_drafts_schedule();
+                self.drafts_list_scheduled(channel).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `chat.deleteScheduledMessage`: cancel a pending scheduled message.
+    /// Routes Slack web-client draft IDs (`Dr…`) and `not_allowed_token_type` responses to
+    /// `drafts.delete`.
     pub async fn chat_delete_scheduled_message(
         &self,
         channel: &ChannelId,
         scheduled_message_id: &str,
     ) -> Result<()> {
+        if self.uses_drafts_schedule() || scheduled_message_id.starts_with("Dr") {
+            return self.drafts_delete(scheduled_message_id).await;
+        }
         let params = vec![
             ("channel", channel.to_string()),
             ("scheduled_message_id", scheduled_message_id.to_owned()),
         ];
-        self.call::<Empty>(method::CHAT_DELETE_SCHEDULED_MESSAGE, params)
-            .await?;
-        Ok(())
+        match self
+            .call::<Empty>(method::CHAT_DELETE_SCHEDULED_MESSAGE, params)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
+                self.mark_drafts_schedule();
+                self.drafts_delete(scheduled_message_id).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// `reactions.add`. `name` may include surrounding colons and a `::skin-tone-N` suffix.

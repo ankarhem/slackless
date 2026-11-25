@@ -152,6 +152,10 @@ pub struct SlackApi {
     token: String,
     /// Prebuilt `d=<url-encoded xoxd>` header value.
     cookie: HeaderValue,
+    /// Remembered when Slack rejects `chat.scheduleMessage` / `chat.scheduledMessages.list` with
+    /// `not_allowed_token_type` (standard on `xoxc-` web-client tokens), routing subsequent
+    /// scheduled-message operations straight through `drafts.{create,list,delete}`.
+    drafts_schedule_fallback: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for SlackApi {
@@ -203,7 +207,20 @@ impl SlackApi {
             edge_base: Url::parse(endpoints::EDGE_API_BASE).expect("EDGE_API_BASE is a valid URL"),
             token: token.into(),
             cookie,
+            drafts_schedule_fallback: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         })
+    }
+
+    pub(crate) fn uses_drafts_schedule(&self) -> bool {
+        self.drafts_schedule_fallback
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_drafts_schedule(&self) {
+        self.drafts_schedule_fallback
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Overrides the Edge cache API base URL (defaults to [`endpoints::EDGE_API_BASE`]).

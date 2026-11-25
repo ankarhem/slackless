@@ -773,6 +773,112 @@ async fn dnd_snooze_and_scheduled_message_methods_match_wire_format() {
 }
 
 #[tokio::test]
+async fn scheduled_messages_fall_back_to_drafts_api_on_not_allowed_token_type() {
+    let (server, api) = setup().await;
+    // Public `chat.scheduleMessage` rejects `xoxc-` web-client tokens with `not_allowed_token_type`.
+    Mock::given(method("POST"))
+        .and(path("/api/chat.scheduleMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": false,
+            "error": "not_allowed_token_type"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.create"))
+        .and(body_string_contains("date_scheduled=1760010000"))
+        .and(body_string_contains("is_from_composer=true"))
+        .and(body_string_contains("file_ids=%5B%5D"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "draft": {
+                "id": "Dr01SCHED",
+                "date_scheduled": 1760010000,
+                "last_updated_ts": "1760000123.5"
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.list"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "drafts": [
+                {
+                    "id": "Dr01SCHED",
+                    "last_updated_ts": "1760000123.5",
+                    "date_scheduled": 1760010000,
+                    "date_created": 1760000123,
+                    "is_deleted": false,
+                    "is_sent": false,
+                    "destinations": [{"channel_id": "C1"}],
+                    "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "hello at 11:00"}]}]}]
+                },
+                {
+                    "id": "Dr02PLAIN",
+                    "last_updated_ts": "1760000100.0",
+                    "date_scheduled": 0,
+                    "destinations": [{"channel_id": "C1"}],
+                    "blocks": [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "ordinary draft"}]}]}]
+                }
+            ]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/drafts.delete"))
+        .and(body_string_contains("draft_id=Dr01SCHED"))
+        .and(body_string_contains(
+            "client_last_updated_ts=1760000123.5000000",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let channel = ChannelId::from("C1");
+    // 1st call hits `chat.scheduleMessage`, sees `not_allowed_token_type`, remembers fallback,
+    // and transparently creates a scheduled draft via `drafts.create`.
+    let created = api
+        .chat_schedule_message(
+            &channel,
+            1_760_010_000,
+            &MessageContent::plain("hello at 11:00"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.scheduled_message_id, "Dr01SCHED");
+    assert_eq!(created.post_at, 1_760_010_000);
+
+    // 2nd call skips `chat.scheduleMessage` completely (`expect(1)` above proves it!).
+    let created2 = api
+        .chat_schedule_message(
+            &channel,
+            1_760_010_000,
+            &MessageContent::plain("second scheduled"),
+            Some(&Ts::from("1760000000.000100")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created2.scheduled_message_id, "Dr01SCHED");
+
+    // Listing scheduled messages goes straight to `drafts.list` and excludes plain drafts.
+    let list = api.chat_scheduled_messages_list(None).await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, "Dr01SCHED");
+    assert_eq!(list[0].text, "hello at 11:00");
+
+    // Deleting a scheduled draft looks up and pads `client_last_updated_ts` and calls `drafts.delete`.
+    api.chat_delete_scheduled_message(&channel, "Dr01SCHED")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn channel_managers_reads_the_manager_role_on_the_channel() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))

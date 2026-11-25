@@ -309,10 +309,61 @@ fn messaging_threads_scheduled_drafts_and_gifs_edge_cases() {
     assert_eq!(tv.threads[0].latest_replies.len(), 1);
     assert!(tv.threads[0].unread_replies.is_empty());
 
-    // ScheduledMessagesList empty & defaults.
+    // ScheduledMessagesList empty & defaults + string post_at tolerance.
     let sched: ScheduledMessagesList =
         serde_json::from_value(json!({})).expect("empty scheduled list");
     assert!(sched.scheduled_messages.is_empty());
+    let created_str: ScheduledMessageCreated = serde_json::from_value(json!({
+        "scheduled_message_id": "Q9",
+        "channel": "C1",
+        "post_at": "1760010000"
+    }))
+    .expect("string post_at parses");
+    assert_eq!(created_str.post_at, 1_760_010_000);
+
+    // Draft timestamp padding & scheduled vs unsent draft separation.
+    assert_eq!(pad_draft_ts("1700000000.1"), "1700000000.1000000");
+    assert_eq!(pad_draft_ts("1700000000"), "1700000000.0000000");
+    assert_eq!(pad_draft_ts("1700000000.123456789"), "1700000000.1234567");
+    let mixed_drafts = json!({
+        "drafts": [
+            {
+                "id": "DrUNSENT",
+                "last_updated_ts": "1760000000.5",
+                "date_scheduled": 0,
+                "destinations": [{ "channel_id": "C1" }],
+                "blocks": [{ "type": "rich_text", "elements": [{ "type": "rich_text_section", "elements": [{ "type": "text", "text": "wip draft" }] }] }]
+            },
+            {
+                "id": "DrSCHED1",
+                "last_updated_ts": "1760000001.25",
+                "date_scheduled": "1760010000",
+                "date_created": 1760000001,
+                "destinations": [{ "channel_id": "C1" }],
+                "blocks": [{ "type": "rich_text", "elements": [{ "type": "rich_text_section", "elements": [{ "type": "text", "text": "send at 11:00" }] }] }]
+            },
+            {
+                "id": "DrSENT",
+                "is_sent": true,
+                "date_scheduled": 1760010000,
+                "destinations": [{ "channel_id": "C2" }],
+                "blocks": [{ "type": "rich_text", "elements": [{ "type": "rich_text_section", "elements": [{ "type": "text", "text": "already sent" }] }] }]
+            }
+        ]
+    });
+    let cloud = parse_cloud_drafts(&mixed_drafts);
+    assert_eq!(cloud.len(), 1);
+    assert_eq!(cloud[0].id, "DrUNSENT");
+    let scheduled = parse_scheduled_drafts(&mixed_drafts, None);
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].id, "DrSCHED1");
+    assert_eq!(scheduled[0].post_at, 1_760_010_000);
+    assert_eq!(scheduled[0].text, "send at 11:00");
+    assert!(parse_scheduled_drafts(&mixed_drafts, Some(&ChannelId::from("C2"))).is_empty());
+    assert_eq!(
+        find_draft_last_updated_ts(&mixed_drafts, "DrSCHED1").as_deref(),
+        Some("1760000001.2500000")
+    );
 
     // Cloud drafts with missing/null/malformed shapes never panic.
     assert!(parse_cloud_drafts(&json!({})).is_empty());

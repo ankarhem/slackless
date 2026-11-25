@@ -862,11 +862,7 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let now = now_secs() as i64;
-        let offset = crate::messages::local_offset_now();
-        let tomorrow_day = (now + offset).div_euclid(86_400) + 1;
-        let (y, m, d) = civil_from_days(tomorrow_day);
-        let default_date = format!("{y:04}-{m:02}-{d:02}");
+        let (default_date, default_time) = default_custom_datetime();
 
         let date_in = cx.new(|cx| {
             let mut s = TextareaState::new(window, cx)
@@ -879,7 +875,7 @@ impl App {
             let mut s = TextareaState::new(window, cx)
                 .placeholder("HH:MM (24-hour)")
                 .auto_grow(1, 1);
-            s.set_value("09:00", window, cx);
+            s.set_value(default_time, window, cx);
             s
         });
         let this = cx.entity().downgrade();

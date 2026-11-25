@@ -81,15 +81,86 @@ impl SlackApi {
         Ok(())
     }
 
-    /// `drafts.list`: fetch the signed-in user's cloud-synced drafts (`F-CORE-089`).
-    pub async fn drafts_list(&self) -> Result<Vec<CloudDraft>> {
+    /// Raw `drafts.list` response (`is_active=true`, `limit=100`).
+    pub(super) async fn drafts_list_raw(&self) -> Result<Value> {
         let params = vec![
             ("limit", "100".to_owned()),
             ("is_active", "true".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        let raw: Value = self.call(method::DRAFTS_LIST, params).await?.data;
+        Ok(self.call(method::DRAFTS_LIST, params).await?.data)
+    }
+
+    /// `drafts.list`: fetch the signed-in user's unsent cloud-synced drafts (`F-CORE-089`).
+    pub async fn drafts_list(&self) -> Result<Vec<CloudDraft>> {
+        let raw = self.drafts_list_raw().await?;
         Ok(parse_cloud_drafts(&raw))
+    }
+
+    /// `drafts.list`: fetch pending scheduled messages (`date_scheduled > 0`), used by Slack's
+    /// web client on `xoxc-` tokens where `chat.scheduledMessages.list` returns
+    /// `not_allowed_token_type`.
+    pub(super) async fn drafts_list_scheduled(
+        &self,
+        channel: Option<&ChannelId>,
+    ) -> Result<Vec<ScheduledMessage>> {
+        let raw = self.drafts_list_raw().await?;
+        Ok(parse_scheduled_drafts(&raw, channel))
+    }
+
+    /// `drafts.create` with `date_scheduled`: schedule a message the way Slack's web client does
+    /// on `xoxc-` sessions (where public `chat.scheduleMessage` returns `not_allowed_token_type`).
+    pub(super) async fn drafts_create_scheduled(
+        &self,
+        channel: &ChannelId,
+        post_at: u64,
+        content: &MessageContent,
+        thread_ts: Option<&Ts>,
+    ) -> Result<ScheduledMessageCreated> {
+        let blocks_json = if !content.blocks.is_empty() {
+            serde_json::to_string(&content.blocks)?
+        } else {
+            serde_json::to_string(&[Block::from(RichTextBlock::plain_text(content.text.clone()))])?
+        };
+        let mut dest = serde_json::json!({
+            "channel_id": channel.as_str(),
+            "broadcast": false,
+        });
+        if let Some(ts) = thread_ts
+            && let Some(obj) = dest.as_object_mut()
+        {
+            obj.insert("thread_ts".to_owned(), Value::String(ts.to_string()));
+        }
+        let destinations = Value::Array(vec![dest]).to_string();
+        let params = vec![
+            ("blocks", blocks_json),
+            ("destinations", destinations),
+            ("file_ids", "[]".to_owned()),
+            ("client_msg_id", uuid::Uuid::new_v4().to_string()),
+            ("is_from_composer", "true".to_owned()),
+            ("date_scheduled", post_at.to_string()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        let raw: Value = self.call(method::DRAFTS_CREATE, params).await?.data;
+        let draft = raw.get("draft").unwrap_or(&raw);
+        let id = draft
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let scheduled_at = draft
+            .get("date_scheduled")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .filter(|&ts| ts > 0)
+            .unwrap_or(post_at);
+        Ok(ScheduledMessageCreated {
+            scheduled_message_id: id,
+            channel: channel.clone(),
+            post_at: scheduled_at,
+        })
     }
 
     /// `drafts.create`: create a cloud-synced draft for `channel` and return its draft id.
@@ -105,7 +176,9 @@ impl SlackApi {
         let params = vec![
             ("blocks", blocks.to_string()),
             ("destinations", destinations.to_string()),
-            ("client_msg_id", client_token()),
+            ("file_ids", "[]".to_owned()),
+            ("client_msg_id", uuid::Uuid::new_v4().to_string()),
+            ("is_from_composer", "true".to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
         let raw: Value = self.call(method::DRAFTS_CREATE, params).await?.data;
@@ -131,22 +204,35 @@ impl SlackApi {
             }]
         }]);
         let destinations = serde_json::json!([{ "channel_id": channel.as_str() }]);
-        let params = vec![
+        let mut params = vec![
             ("draft_id", draft_id.to_owned()),
             ("blocks", blocks.to_string()),
             ("destinations", destinations.to_string()),
+            ("file_ids", "[]".to_owned()),
+            ("client_msg_id", uuid::Uuid::new_v4().to_string()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
+        if let Ok(raw) = self.drafts_list_raw().await
+            && let Some(ts) = find_draft_last_updated_ts(&raw, draft_id)
+        {
+            params.push(("client_last_updated_ts", ts));
+        }
         self.call::<Empty>(method::DRAFTS_UPDATE, params).await?;
         Ok(())
     }
 
-    /// `drafts.delete`: remove a cloud draft once sent or cleared.
+    /// `drafts.delete`: remove a cloud draft (or cancel a scheduled draft), attaching the
+    /// 7-decimal padded `client_last_updated_ts` when available in `drafts.list`.
     pub async fn drafts_delete(&self, draft_id: &str) -> Result<()> {
-        let params = vec![
+        let mut params = vec![
             ("draft_id", draft_id.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
+        if let Ok(raw) = self.drafts_list_raw().await
+            && let Some(ts) = find_draft_last_updated_ts(&raw, draft_id)
+        {
+            params.push(("client_last_updated_ts", ts));
+        }
         self.call::<Empty>(method::DRAFTS_DELETE, params).await?;
         Ok(())
     }

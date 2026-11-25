@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::client::Params;
-use crate::de::{lenient_bool, lenient_u32, lenient_vec, null_default, or_default};
+use crate::de::{lenient_bool, lenient_u32, lenient_u64, lenient_vec, null_default, or_default};
 use crate::types::{Attachment, Block, ChannelId, Message, RichTextBlock, Ts};
 
 /// Window and page size for `conversations.history` / `conversations.replies`.
@@ -91,21 +91,24 @@ pub struct PostedMessage {
     pub client_msg_id: Option<String>,
 }
 
-/// Response to `chat.scheduleMessage`.
+/// Response to `chat.scheduleMessage` (or `drafts.create` with `date_scheduled`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ScheduledMessageCreated {
     pub scheduled_message_id: String,
     pub channel: ChannelId,
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub post_at: u64,
 }
 
-/// One pending scheduled message returned by `chat.scheduledMessages.list`.
+/// One pending scheduled message returned by `chat.scheduledMessages.list` or `drafts.list`
+/// (`date_scheduled > 0`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ScheduledMessage {
     pub id: String,
     pub channel_id: ChannelId,
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub post_at: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub date_created: u64,
     #[serde(default)]
     pub text: String,
@@ -302,20 +305,52 @@ pub struct CloudDraft {
     pub updated_secs: Option<u64>,
 }
 
-pub(in crate::methods) fn parse_cloud_drafts(raw: &Value) -> Vec<CloudDraft> {
-    fn extract_text(blocks: &Value) -> String {
-        let mut out = String::new();
-        for block in blocks.as_array().into_iter().flatten() {
-            for container in block["elements"].as_array().into_iter().flatten() {
-                for el in container["elements"].as_array().into_iter().flatten() {
-                    if let Some(t) = el["text"].as_str() {
-                        out.push_str(t);
-                    }
+fn draft_extract_text(blocks: &Value) -> String {
+    let mut out = String::new();
+    for block in blocks.as_array().into_iter().flatten() {
+        for container in block["elements"].as_array().into_iter().flatten() {
+            for el in container["elements"].as_array().into_iter().flatten() {
+                if let Some(t) = el["text"].as_str() {
+                    out.push_str(t);
                 }
             }
         }
-        out
     }
+    out
+}
+
+fn value_as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
+        Value::String(s) => s.trim().split('.').next().and_then(|w| w.parse().ok()),
+        _ => None,
+    }
+}
+
+/// Pad a Slack draft timestamp (`last_updated_ts` / `date_last_updated`) to 7 fractional digits
+/// as required by `drafts.update` and `drafts.delete` (`1700000000.1` -> `1700000000.1000000`).
+pub(in crate::methods) fn pad_draft_ts(ts: &str) -> String {
+    let trimmed = ts.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match trimmed.split_once('.') {
+        Some((whole, frac)) => {
+            let mut f = frac.to_owned();
+            if f.len() < 7 {
+                f.push_str(&"0".repeat(7 - f.len()));
+            } else if f.len() > 7 {
+                f.truncate(7);
+            }
+            format!("{whole}.{f}")
+        }
+        None => format!("{trimmed}.0000000"),
+    }
+}
+
+pub(in crate::methods) fn parse_cloud_drafts(raw: &Value) -> Vec<CloudDraft> {
     raw["drafts"]
         .as_array()
         .into_iter()
@@ -325,19 +360,23 @@ pub(in crate::methods) fn parse_cloud_drafts(raw: &Value) -> Vec<CloudDraft> {
             {
                 return None;
             }
+            // Scheduled drafts (`date_scheduled > 0`) belong in the Scheduled tab, not Drafts.
+            if value_as_u64(&d["date_scheduled"]).unwrap_or(0) > 0 {
+                return None;
+            }
             let id = d["id"].as_str()?.to_owned();
             let channel = d["destinations"]
                 .as_array()
                 .and_then(|arr| arr.first())
                 .and_then(|dest| dest["channel_id"].as_str())
                 .map(ChannelId::from)?;
-            let text = extract_text(&d["blocks"]);
+            let text = draft_extract_text(&d["blocks"]);
             if text.trim().is_empty() {
                 return None;
             }
-            let updated_secs = d["date_last_updated"]
-                .as_u64()
-                .or_else(|| d["date_created"].as_u64());
+            let updated_secs = value_as_u64(&d["date_last_updated"])
+                .or_else(|| value_as_u64(&d["last_updated_ts"]))
+                .or_else(|| value_as_u64(&d["date_created"]));
             Some(CloudDraft {
                 id,
                 channel,
@@ -346,4 +385,63 @@ pub(in crate::methods) fn parse_cloud_drafts(raw: &Value) -> Vec<CloudDraft> {
             })
         })
         .collect()
+}
+
+/// Extract pending scheduled messages (`date_scheduled > 0`) from a `drafts.list` response.
+pub(in crate::methods) fn parse_scheduled_drafts(
+    raw: &Value,
+    channel: Option<&ChannelId>,
+) -> Vec<ScheduledMessage> {
+    raw["drafts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| {
+            if d["is_deleted"].as_bool().unwrap_or(false) || d["is_sent"].as_bool().unwrap_or(false)
+            {
+                return None;
+            }
+            let post_at = value_as_u64(&d["date_scheduled"]).filter(|&ts| ts > 0)?;
+            let id = d["id"].as_str()?.to_owned();
+            let channel_id = d["destinations"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|dest| dest["channel_id"].as_str())
+                .map(ChannelId::from)?;
+            if let Some(filter) = channel
+                && &channel_id != filter
+            {
+                return None;
+            }
+            let date_created = value_as_u64(&d["date_created"]).unwrap_or(0);
+            let text = draft_extract_text(&d["blocks"]);
+            Some(ScheduledMessage {
+                id,
+                channel_id,
+                post_at,
+                date_created,
+                text,
+            })
+        })
+        .collect()
+}
+
+/// Look up a draft's 7-decimal padded `client_last_updated_ts` from a `drafts.list` payload.
+pub(in crate::methods) fn find_draft_last_updated_ts(
+    raw: &Value,
+    draft_id: &str,
+) -> Option<String> {
+    raw["drafts"].as_array()?.iter().find_map(|d| {
+        if d["id"].as_str() != Some(draft_id) {
+            return None;
+        }
+        let raw_ts = d["last_updated_ts"]
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| d["last_updated_ts"].as_f64().map(|f| format!("{f:.7}")))
+            .or_else(|| d["date_last_updated"].as_u64().map(|n| n.to_string()))
+            .or_else(|| d["date_last_updated"].as_str().map(ToOwned::to_owned))?;
+        let padded = pad_draft_ts(&raw_ts);
+        (!padded.is_empty()).then_some(padded)
+    })
 }

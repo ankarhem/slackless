@@ -418,9 +418,9 @@ mod tests;
 
 use self::chrome::{corner_cap, joinable, shadow};
 use self::helpers::{
-    broadcast_kind, civil_from_days, convert_emoticons, demo, first_conversation, forget_failure,
-    is_suspicious_url, mentions_me, parse_notification_target, parse_permalink,
-    sync_launch_at_login, workspace_badge_from_counts,
+    broadcast_kind, convert_emoticons, demo, first_conversation, forget_failure, is_suspicious_url,
+    mentions_me, parse_notification_target, parse_permalink, sync_launch_at_login,
+    workspace_badge_from_counts,
 };
 pub(crate) use self::helpers::{default_custom_datetime, parse_local_schedule};
 

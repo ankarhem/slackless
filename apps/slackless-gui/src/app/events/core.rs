@@ -157,7 +157,19 @@ impl App {
             Event::MessagePosted { channel, message } => {
                 self.message_posted(channel, message, window, cx)
             }
-            Event::Error(error) => eprintln!("slackless: {error}"),
+            Event::Error(error) => {
+                tracing::warn!(error = %error, "slackless core error");
+                eprintln!("slackless: {error}");
+                if error.starts_with("chat.scheduleMessage:")
+                    || error.starts_with("chat.deleteScheduledMessage:")
+                {
+                    let workspace = self.workspace;
+                    self.drafts.update(cx, |drafts, cx| {
+                        drafts.drop_pending_scheduled(workspace, cx)
+                    });
+                    notify("Could not schedule message", error.clone(), window, cx);
+                }
+            }
             Event::BotProfileLoaded { bot_id, profile } => {
                 self.ws
                     .bots
@@ -336,6 +348,17 @@ impl App {
                     .flatten();
                 self.push_self_state(cx);
             }
+            Event::MessageScheduled { post_at, .. } => {
+                notify(
+                    "Message scheduled",
+                    format!(
+                        "Sends {}. See Drafts & sent.",
+                        crate::drafts::when_label(*post_at, now_secs())
+                    ),
+                    window,
+                    cx,
+                );
+            }
             Event::ScheduledMessagesLoaded(Ok(list)) => {
                 let workspace = self.workspace;
                 let entries: Vec<Entry> = list
@@ -352,6 +375,9 @@ impl App {
                 self.drafts.update(cx, |drafts, cx| {
                     drafts.set_remote_scheduled(workspace, entries, cx)
                 });
+            }
+            Event::ScheduledMessagesLoaded(Err(error)) => {
+                tracing::warn!(error = %error, "failed to load scheduled messages");
             }
             Event::ChannelCanvasCreated { channel, canvas_id } if *channel == self.channel => {
                 if !canvas_id.is_empty() {

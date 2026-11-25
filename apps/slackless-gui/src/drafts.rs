@@ -61,32 +61,48 @@ impl SendLater {
         }
     }
 
-    /// Delivery time in unix seconds, counted from `now`.
+    /// Delivery time in unix seconds, counted from `now` using the user's local timezone.
     pub fn at(self, now: u64) -> u64 {
-        let today = now / DAY;
-        match self {
-            SendLater::InThirtyMinutes => now + HOUR / 2,
-            SendLater::InOneHour => now + HOUR,
-            SendLater::TomorrowMorning => (today + 1) * DAY + 9 * HOUR,
+        self.at_with_offset(now, crate::messages::local_offset_now())
+    }
+
+    /// Pure local-timezone schedule calculation with an explicit UTC offset in seconds.
+    pub fn at_with_offset(self, now: u64, offset_secs: i64) -> u64 {
+        let local_now = now as i64 + offset_secs;
+        let today = local_now.div_euclid(DAY as i64);
+        let local_target = match self {
+            SendLater::InThirtyMinutes => return now + HOUR / 2,
+            SendLater::InOneHour => return now + HOUR,
+            SendLater::TomorrowMorning => (today + 1) * DAY as i64 + 9 * HOUR as i64,
             SendLater::NextMonday => {
                 // Day 0 (1970-01-01) was a Thursday; Monday = 0.
-                let weekday = (today + 3) % 7;
-                (today + 7 - weekday) * DAY + 9 * HOUR
+                let weekday = (today + 3).rem_euclid(7);
+                (today + 7 - weekday) * DAY as i64 + 9 * HOUR as i64
             }
-        }
+        };
+        (local_target - offset_secs).max(0) as u64
     }
 }
 
-/// "Today 14:05" / "Tomorrow 09:00" / "Mon 09:00" / "Yesterday 08:12" (UTC).
+/// "Today 14:05" / "Tomorrow 09:00" / "Mon 09:00" / "Yesterday 08:12" in the user's local timezone.
 pub fn when_label(at: u64, now: u64) -> String {
+    when_label_with_offset(at, now, crate::messages::local_offset_now())
+}
+
+/// Pure local-timezone label formatter with an explicit UTC offset in seconds.
+pub fn when_label_with_offset(at: u64, now: u64, offset_secs: i64) -> String {
     const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    let (day, today) = (at / DAY, now / DAY);
-    let clock = format!("{:02}:{:02}", at % DAY / HOUR, at % HOUR / 60);
-    let date = match day as i64 - today as i64 {
+    let local_at = at as i64 + offset_secs;
+    let local_now = now as i64 + offset_secs;
+    let day = local_at.div_euclid(DAY as i64);
+    let today = local_now.div_euclid(DAY as i64);
+    let secs_in_day = local_at.rem_euclid(DAY as i64) as u64;
+    let clock = format!("{:02}:{:02}", secs_in_day / HOUR, (secs_in_day % HOUR) / 60);
+    let date = match day - today {
         0 => "Today".to_owned(),
         1 => "Tomorrow".to_owned(),
         -1 => "Yesterday".to_owned(),
-        _ => WEEKDAYS[((day + 3) % 7) as usize].to_owned(),
+        _ => WEEKDAYS[(day + 3).rem_euclid(7) as usize].to_owned(),
     };
     format!("{date} {clock}")
 }
@@ -194,6 +210,17 @@ impl DraftsView {
         let index = self.scheduled.partition_point(|s| s.at <= at);
         self.scheduled.insert(index, entry);
         cx.notify();
+    }
+
+    /// Remove unconfirmed local optimistic scheduled entries (`id.is_none()`) for `workspace`
+    /// when Slack rejects `chat.scheduleMessage` / `drafts.create`.
+    pub fn drop_pending_scheduled(&mut self, workspace: usize, cx: &mut Context<Self>) {
+        let before = self.scheduled.len();
+        self.scheduled
+            .retain(|e| !(e.workspace == workspace && e.id.is_none()));
+        if self.scheduled.len() != before {
+            cx.notify();
+        }
     }
 
     /// Replace `workspace`'s scheduled list with Slack's authoritative
@@ -472,22 +499,63 @@ mod tests {
     fn send_later_and_when_label_compute_schedule_times() {
         // Day 0 = Thursday 1970-01-01; day 4 = Monday 1970-01-05.
         let thursday = 10 * HOUR + 15 * 60;
-        assert_eq!(SendLater::InThirtyMinutes.at(thursday), thursday + 1_800);
-        assert_eq!(SendLater::InOneHour.at(thursday), thursday + 3_600);
-        assert_eq!(SendLater::TomorrowMorning.at(thursday), DAY + 9 * HOUR);
-        assert_eq!(SendLater::NextMonday.at(thursday), 4 * DAY + 9 * HOUR);
+        assert_eq!(
+            SendLater::InThirtyMinutes.at_with_offset(thursday, 0),
+            thursday + 1_800
+        );
+        assert_eq!(
+            SendLater::InOneHour.at_with_offset(thursday, 0),
+            thursday + 3_600
+        );
+        assert_eq!(
+            SendLater::TomorrowMorning.at_with_offset(thursday, 0),
+            DAY + 9 * HOUR
+        );
+        assert_eq!(
+            SendLater::NextMonday.at_with_offset(thursday, 0),
+            4 * DAY + 9 * HOUR
+        );
+
+        // CET (+01:00): Tomorrow at 09:00 local = 08:00 UTC.
+        assert_eq!(
+            SendLater::TomorrowMorning.at_with_offset(thursday, 3_600),
+            DAY + 8 * HOUR
+        );
+        assert_eq!(
+            when_label_with_offset(DAY + 8 * HOUR, thursday, 3_600),
+            "Tomorrow 09:00"
+        );
+        // 10:00 UTC is 11:00 CET local.
+        assert_eq!(
+            when_label_with_offset(10 * HOUR, thursday, 3_600),
+            "Today 11:00"
+        );
+        // EST (-05:00): 02:00 UTC on day 1 is still day 0 at 21:00 local.
+        assert_eq!(
+            when_label_with_offset(DAY + 2 * HOUR, thursday, -5 * 3_600),
+            "Today 21:00"
+        );
 
         // On Monday itself, NextMonday schedules for the following Monday (+7 days).
         let monday = 4 * DAY + 8 * HOUR;
-        assert_eq!(SendLater::NextMonday.at(monday), 11 * DAY + 9 * HOUR);
-
-        assert_eq!(when_label(thursday, thursday), "Today 10:15");
-        assert_eq!(when_label(DAY + 9 * HOUR, thursday), "Tomorrow 09:00");
         assert_eq!(
-            when_label(3 * DAY + 8 * HOUR + 5 * 60, 4 * DAY + 12 * HOUR),
+            SendLater::NextMonday.at_with_offset(monday, 0),
+            11 * DAY + 9 * HOUR
+        );
+
+        assert_eq!(when_label_with_offset(thursday, thursday, 0), "Today 10:15");
+        assert_eq!(
+            when_label_with_offset(DAY + 9 * HOUR, thursday, 0),
+            "Tomorrow 09:00"
+        );
+        assert_eq!(
+            when_label_with_offset(3 * DAY + 8 * HOUR + 5 * 60, 4 * DAY + 12 * HOUR, 0),
             "Yesterday 08:05"
         );
-        assert_eq!(when_label(4 * DAY + 9 * HOUR, thursday), "Mon 09:00");
+        assert_eq!(
+            when_label_with_offset(4 * DAY + 9 * HOUR, thursday, 0),
+            "Mon 09:00"
+        );
     }
 
     #[gpui::test]
@@ -535,11 +603,19 @@ mod tests {
             assert_eq!(ats, vec![200, 300, 500]);
         });
         view.update(cx, |v, cx| {
-            v.set_remote_scheduled(0, vec![entry(0, &c1, "remote", 100)], cx);
+            let mut confirmed = entry(0, &c1, "remote", 100);
+            confirmed.id = Some("Dr1".to_owned());
+            v.set_remote_scheduled(0, vec![confirmed], cx);
+            v.schedule(entry(0, &c2, "optimistic", 150), cx);
+        });
+        view.update(cx, |v, cx| {
+            v.drop_pending_scheduled(0, cx);
         });
         view.read_with(cx, |v, _| {
+            // Only the unconfirmed workspace-0 entry was dropped; confirmed remote + ws-1 stay.
             let ats: Vec<u64> = v.scheduled.iter().map(|e| e.at).collect();
             assert_eq!(ats, vec![100, 300]);
+            assert!(v.scheduled.iter().all(|e| e.text != "optimistic"));
         });
 
         // `set_stored_sent` deduplicates within 5 seconds and sorts newest-first.

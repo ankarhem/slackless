@@ -53,6 +53,26 @@ where
     })
 }
 
+/// A unix timestamp / 64-bit count that may arrive as an integer, numeric string, or `null`.
+pub(crate) fn lenient_u64<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64))
+            .unwrap_or(0),
+        Value::String(s) => s
+            .trim()
+            .split('.')
+            .next()
+            .and_then(|whole| whole.parse().ok())
+            .unwrap_or(0),
+        _ => 0,
+    })
+}
+
 /// A flag that may arrive as a bool, `0`/`1`, `"0"`/`"1"`, or `null`.
 pub(crate) fn lenient_bool<'de, D>(d: D) -> Result<bool, D::Error>
 where

@@ -671,12 +671,16 @@ impl App {
         self.drafts
             .update(cx, |drafts, cx| drafts.schedule(entry, cx));
         self.save_draft(cx);
-        notify(
-            "Message scheduled",
-            format!("Sends {when_label}. See Drafts & sent."),
-            window,
-            cx,
-        );
+        // In live mode, wait for Slack's `Event::MessageScheduled` confirmation (or surface
+        // `Event::Error` on rejection) instead of showing a misleading success toast up front.
+        if self.fixtures.sample {
+            notify(
+                "Message scheduled",
+                format!("Sends {when_label}. See Drafts & sent."),
+                window,
+                cx,
+            );
+        }
     }
 
     /// Deliver a scheduled message now; it shows in the transcript when its workspace is the
