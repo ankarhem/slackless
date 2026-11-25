@@ -162,7 +162,7 @@ impl App {
                 });
             }
             PickerTarget::Message { channel, ts } => {
-                if self.threads_open {
+                if self.page == MainPage::Threads {
                     if self
                         .threads
                         .update(cx, |t, cx| t.add_reaction(&channel, &ts, &choice.name, cx))
@@ -176,7 +176,7 @@ impl App {
                             },
                         );
                     }
-                } else if self.unreads_open {
+                } else if self.page == MainPage::Unreads {
                     let added = self.unreads.update(cx, |u, cx| {
                         u.toggle_reaction(&channel, &ts, &choice.name, cx)
                     });
@@ -512,13 +512,13 @@ impl App {
     /// Esc: mark the open conversation read up to its newest message - or, while All Unreads or
     /// Threads is open, mark its unreads read.
     pub(super) fn mark_open_read(&mut self, cx: &mut Context<Self>) {
-        if self.unreads_open {
+        if self.page == MainPage::Unreads {
             self.unreads.update(cx, |view, cx| {
                 view.handle_key("escape", cx);
             });
             return;
         }
-        if self.threads_open {
+        if self.page == MainPage::Threads {
             self.mark_all_threads_read(cx);
             return;
         }
@@ -559,7 +559,7 @@ impl App {
             threads.clear_all_unreads(true, cx);
         });
         self.sync_counts_to_views(cx);
-        if self.unreads_open {
+        if self.page == MainPage::Unreads {
             self.refresh_unreads(cx);
         }
     }
@@ -637,20 +637,32 @@ impl App {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_draft_count(count, cx));
     }
+}
 
+pub(in crate::app) struct ScheduleSpec {
+    pub channel: ChannelId,
+    pub thread_ts: Option<Ts>,
+    pub text: String,
+    pub post_at: u64,
+    pub when_label: String,
+}
+
+impl App {
     /// Queue a message (in a channel or inside `thread_ts`) for delivery at unix timestamp
     /// `post_at`, recording it in Drafts & sent and posting `chat.scheduleMessage` live.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn schedule_at(
         &mut self,
-        channel: ChannelId,
-        thread_ts: Option<Ts>,
-        text: String,
-        post_at: u64,
-        when_label: String,
+        spec: ScheduleSpec,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let ScheduleSpec {
+            channel,
+            thread_ts,
+            text,
+            post_at,
+            when_label,
+        } = spec;
         if !self.fixtures.sample {
             let content = composer::content_of(&text, &self.fixtures);
             self.bridge.send(Command::ScheduleMessage {
@@ -764,11 +776,7 @@ impl App {
         };
         match command.kind {
             SlashKind::Shrug => {
-                let text = if invocation.args.is_empty() {
-                    SHRUG.to_owned()
-                } else {
-                    format!("{} {SHRUG}", invocation.args)
-                };
+                let text = crate::composer::format_shrug(&invocation.args);
                 self.send(MessageContent::plain(text), window, cx);
             }
             SlashKind::Away => {
@@ -821,9 +829,12 @@ impl App {
                 }
             },
             kind => {
-                eprintln!(
-                    "slackless: slash command {kind:?} /{} args={:?} in {} (fixture mode: not run)",
-                    command.name, invocation.args, self.channel
+                tracing::info!(
+                    kind = ?kind,
+                    command = %command.name,
+                    args = ?invocation.args,
+                    channel = %self.channel,
+                    "slash command not executed in fixture mode"
                 );
                 notify(
                     &format!("/{}", command.name),
@@ -1065,50 +1076,8 @@ impl App {
         content: &mut MessageContent,
         cx: &Context<Self>,
     ) {
-        if !self.preferences.read(cx).settings().strip_tracking_params {
-            return;
-        }
-        if !content.text.is_empty() {
-            let cleaned = slackless_core::strip_tracking_params_in_text(&content.text);
-            if cleaned != content.text {
-                content.text = cleaned;
-            }
-        }
-        for block in &mut content.blocks {
-            if let slackless_core::types::Block::RichText(rich) = block {
-                for container in &mut rich.elements {
-                    let elements = match container {
-                        slackless_core::types::RichTextContainer::Section(s) => &mut s.elements,
-                        slackless_core::types::RichTextContainer::Quote(q) => &mut q.elements,
-                        slackless_core::types::RichTextContainer::Preformatted(p) => {
-                            &mut p.elements
-                        }
-                        slackless_core::types::RichTextContainer::List(list) => {
-                            for item in &mut list.elements {
-                                if let slackless_core::types::RichTextContainer::Section(s) = item {
-                                    for el in &mut s.elements {
-                                        if let slackless_core::types::RichTextElement::Link(link) =
-                                            el
-                                        {
-                                            link.url =
-                                                slackless_core::strip_tracking_params(&link.url);
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        slackless_core::types::RichTextContainer::Header(_)
-                        | slackless_core::types::RichTextContainer::Divider(_)
-                        | slackless_core::types::RichTextContainer::Unknown { .. } => continue,
-                    };
-                    for el in elements {
-                        if let slackless_core::types::RichTextElement::Link(link) = el {
-                            link.url = slackless_core::strip_tracking_params(&link.url);
-                        }
-                    }
-                }
-            }
+        if self.preferences.read(cx).settings().strip_tracking_params {
+            crate::composer::strip_tracking_params_in_content(content);
         }
     }
 
@@ -1330,9 +1299,7 @@ impl App {
                 actions::copy_link(&self.fixtures, &channel, &ts, window, cx);
             }
             MessageAction::CopyText => {
-                let text = self.fixtures.plain_text(&message);
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                notify("Copied", "Message text copied.", window, cx);
+                actions::copy_message_text(&self.fixtures, &message, window, cx);
             }
             MessageAction::Forward => {
                 let link = actions::permalink(&self.fixtures, &channel, &ts);
@@ -1345,85 +1312,37 @@ impl App {
                     .saved_in(self.workspace)
                     .iter()
                     .any(|(_, s_ts)| *s_ts == ts);
-                let author = message
-                    .user
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .or_else(|| message.username.clone())
-                    .unwrap_or_else(|| "Message".to_owned());
-                let text = self.fixtures.preview(&message);
-                self.save_for_later(
-                    &SaveRequest {
-                        channel,
-                        ts,
-                        author,
-                        text,
-                        saved,
-                        due: None,
-                    },
-                    cx,
-                );
+                let request =
+                    actions::build_save_request(&self.fixtures, channel, &message, saved, None);
+                self.save_for_later(&request, cx);
                 self.sync_saved(cx);
-                notify(
-                    if saved {
-                        "Saved for later"
-                    } else {
-                        "Removed from Later"
-                    },
-                    String::new(),
-                    window,
-                    cx,
-                );
+                actions::notify_saved_toggled(saved, String::new(), window, cx);
             }
             MessageAction::RemindMe(remind) => {
-                let author = message
-                    .user
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .or_else(|| message.username.clone())
-                    .unwrap_or_else(|| "Message".to_owned());
-                let text = self.fixtures.preview(&message);
-                self.save_for_later(
-                    &SaveRequest {
-                        channel,
-                        ts,
-                        author,
-                        text,
-                        saved: true,
-                        due: Some(remind.at(crate::drafts::now_secs())),
-                    },
-                    cx,
-                );
+                let due = Some(remind.at(crate::drafts::now_secs()));
+                let request =
+                    actions::build_save_request(&self.fixtures, channel, &message, true, due);
+                self.save_for_later(&request, cx);
                 self.sync_saved(cx);
                 notify("Reminder set", remind.label().to_lowercase(), window, cx);
             }
             MessageAction::RemindCustom => {
                 let this = cx.entity().downgrade();
-                let author = message
-                    .user
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .or_else(|| message.username.clone())
-                    .unwrap_or_else(|| "Message".to_owned());
-                let text = self.fixtures.preview(&message);
-                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
-                    let _ = this.update(cx, |app, cx| {
-                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
-                        app.save_for_later(
-                            &SaveRequest {
-                                channel: channel.clone(),
-                                ts: ts.clone(),
-                                author: author.clone(),
-                                text: text.clone(),
-                                saved: true,
-                                due: Some(due),
-                            },
-                            cx,
-                        );
-                        app.sync_saved(cx);
-                        notify("Reminder set", when, window, cx);
-                    });
-                });
+                let fixtures = self.fixtures.clone();
+                actions::open_custom_remind_for_message(
+                    &fixtures,
+                    channel,
+                    &message,
+                    window,
+                    cx,
+                    move |request, when, window, cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.save_for_later(&request, cx);
+                            app.sync_saved(cx);
+                            notify("Reminder set", when, window, cx);
+                        });
+                    },
+                );
             }
             MessageAction::TogglePin => {
                 if let Some(pinned) = self
@@ -1431,16 +1350,7 @@ impl App {
                     .update(cx, |u, cx| u.toggle_pin(&channel, &ts, cx))
                 {
                     self.post_change(&channel, &MessageChange::Pin { ts, pinned });
-                    notify(
-                        if pinned {
-                            "Pinned to conversation"
-                        } else {
-                            "Unpinned from conversation"
-                        },
-                        String::new(),
-                        window,
-                        cx,
-                    );
+                    actions::notify_pin_toggled(pinned, String::new(), window, cx);
                 }
             }
             MessageAction::MarkUnread => {
@@ -1465,10 +1375,12 @@ impl App {
             }
             MessageAction::OpenProfile(user) => self.open_profile(user, cx),
             MessageAction::OpenImage(origin) => {
-                let entries = crate::image_viewer::message_images(&self.fixtures, &message);
-                if let Some(index) = entries.iter().position(|e| e.origin == origin) {
-                    #[allow(clippy::arc_with_non_send_sync)]
-                    let images = Arc::new(entries.into_iter().map(|e| e.image).collect());
+                if let Some((images, index)) = crate::image_viewer::collect_viewer_images(
+                    &self.fixtures,
+                    std::iter::once(&message),
+                    &message.ts,
+                    &origin,
+                ) {
                     self.open_image_viewer(channel, images, index, window, cx);
                 }
             }
@@ -1486,15 +1398,16 @@ impl App {
                 self.start_huddle(window, cx);
             }
             MessageAction::BlockAction { action, attachment } => {
-                if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
+                if let Some(change) = actions::dispatch_block_action(
+                    !self.fixtures.sample,
                     &message,
                     &channel,
-                    action.clone(),
+                    action,
                     attachment,
+                    window,
+                    cx,
                 ) {
-                    self.post_change(&channel, &MessageChange::BlockAction(dispatch));
-                } else {
-                    crate::blockkit::log_button(&action, window, cx);
+                    self.post_change(&channel, &change);
                 }
             }
             MessageAction::DismissEphemeral => {
@@ -1506,7 +1419,6 @@ impl App {
 
     /// Dispatch a message-level action triggered from a thread card message's hover toolbar,
     /// reaction chips, image click, Block Kit action, or context menu (`ThreadsEvent::MessageAction`).
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_threads_message_action(
         &mut self,
         channel: ChannelId,
@@ -1561,9 +1473,7 @@ impl App {
                 actions::copy_link(&self.fixtures, &channel, &ts, window, cx);
             }
             MessageAction::CopyText => {
-                let text = self.fixtures.plain_text(&message);
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                notify("Copied", "Message text copied.", window, cx);
+                actions::copy_message_text(&self.fixtures, &message, window, cx);
             }
             MessageAction::Forward => {
                 let link = actions::permalink(&self.fixtures, &channel, &ts);
@@ -1576,85 +1486,37 @@ impl App {
                     .saved_in(self.workspace)
                     .iter()
                     .any(|(_, s_ts)| *s_ts == ts);
-                let author = message
-                    .user
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .or_else(|| message.username.clone())
-                    .unwrap_or_else(|| "Message".to_owned());
-                let text = self.fixtures.preview(&message);
-                self.save_for_later(
-                    &SaveRequest {
-                        channel,
-                        ts,
-                        author,
-                        text,
-                        saved,
-                        due: None,
-                    },
-                    cx,
-                );
+                let request =
+                    actions::build_save_request(&self.fixtures, channel, &message, saved, None);
+                self.save_for_later(&request, cx);
                 self.sync_saved(cx);
-                notify(
-                    if saved {
-                        "Saved for later"
-                    } else {
-                        "Removed from Later"
-                    },
-                    String::new(),
-                    window,
-                    cx,
-                );
+                actions::notify_saved_toggled(saved, String::new(), window, cx);
             }
             MessageAction::RemindMe(remind) => {
-                let author = message
-                    .user
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .or_else(|| message.username.clone())
-                    .unwrap_or_else(|| "Message".to_owned());
-                let text = self.fixtures.preview(&message);
-                self.save_for_later(
-                    &SaveRequest {
-                        channel,
-                        ts,
-                        author,
-                        text,
-                        saved: true,
-                        due: Some(remind.at(crate::drafts::now_secs())),
-                    },
-                    cx,
-                );
+                let due = Some(remind.at(crate::drafts::now_secs()));
+                let request =
+                    actions::build_save_request(&self.fixtures, channel, &message, true, due);
+                self.save_for_later(&request, cx);
                 self.sync_saved(cx);
                 notify("Reminder set", remind.label().to_lowercase(), window, cx);
             }
             MessageAction::RemindCustom => {
                 let this = cx.entity().downgrade();
-                let author = message
-                    .user
-                    .as_ref()
-                    .map(|u| self.fixtures.user_name(u).to_owned())
-                    .or_else(|| message.username.clone())
-                    .unwrap_or_else(|| "Message".to_owned());
-                let text = self.fixtures.preview(&message);
-                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
-                    let _ = this.update(cx, |app, cx| {
-                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
-                        app.save_for_later(
-                            &SaveRequest {
-                                channel: channel.clone(),
-                                ts: ts.clone(),
-                                author: author.clone(),
-                                text: text.clone(),
-                                saved: true,
-                                due: Some(due),
-                            },
-                            cx,
-                        );
-                        app.sync_saved(cx);
-                        notify("Reminder set", when, window, cx);
-                    });
-                });
+                let fixtures = self.fixtures.clone();
+                actions::open_custom_remind_for_message(
+                    &fixtures,
+                    channel,
+                    &message,
+                    window,
+                    cx,
+                    move |request, when, window, cx| {
+                        let _ = this.update(cx, |app, cx| {
+                            app.save_for_later(&request, cx);
+                            app.sync_saved(cx);
+                            notify("Reminder set", when, window, cx);
+                        });
+                    },
+                );
             }
             MessageAction::TogglePin => {
                 if let Some(pinned) = self
@@ -1662,16 +1524,7 @@ impl App {
                     .update(cx, |t, cx| t.toggle_pin(&channel, &ts, cx))
                 {
                     self.post_change(&channel, &MessageChange::Pin { ts, pinned });
-                    notify(
-                        if pinned {
-                            "Pinned to conversation"
-                        } else {
-                            "Unpinned from conversation"
-                        },
-                        String::new(),
-                        window,
-                        cx,
-                    );
+                    actions::notify_pin_toggled(pinned, String::new(), window, cx);
                 }
             }
             MessageAction::MarkUnread => {
@@ -1705,8 +1558,7 @@ impl App {
                     .read(cx)
                     .card_images(&channel, &thread_ts, &ts, &origin);
                 if let Some((images, index)) = images_and_ix {
-                    #[allow(clippy::arc_with_non_send_sync)]
-                    self.open_image_viewer(channel, Arc::new(images), index, window, cx);
+                    self.open_image_viewer(channel, images, index, window, cx);
                 }
             }
             MessageAction::ViewHistory => {
@@ -1726,15 +1578,16 @@ impl App {
                 window.push_notification("Sent reply to channel", cx);
             }
             MessageAction::BlockAction { action, attachment } => {
-                if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
+                if let Some(change) = actions::dispatch_block_action(
+                    !self.fixtures.sample,
                     &message,
                     &channel,
-                    action.clone(),
+                    action,
                     attachment,
+                    window,
+                    cx,
                 ) {
-                    self.post_change(&channel, &MessageChange::BlockAction(dispatch));
-                } else {
-                    crate::blockkit::log_button(&action, window, cx);
+                    self.post_change(&channel, &change);
                 }
             }
             MessageAction::DismissEphemeral => {

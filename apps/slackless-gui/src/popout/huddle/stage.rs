@@ -2,6 +2,13 @@
 
 use super::*;
 
+struct ParticipantTileLayout {
+    tile_w: Pixels,
+    tile_h: Pixels,
+    avatar_px: f32,
+    full_bleed_avatar: bool,
+}
+
 impl PopoutWindow {
     pub(super) fn render_huddle_stage(
         &self,
@@ -481,17 +488,31 @@ impl PopoutWindow {
                     paint_smooth_stroke(
                         window,
                         &stroke.segments,
-                        stroke.hue,
-                        alpha,
-                        width_scale,
-                        left,
-                        top,
-                        width,
-                        height,
+                        StrokePaintParams {
+                            hue: stroke.hue,
+                            alpha,
+                            width_scale,
+                            left,
+                            top,
+                            width,
+                            height,
+                        },
                     );
                 }
                 if let Some((hue, ref live_segs)) = local_live_segments {
-                    paint_smooth_stroke(window, live_segs, hue, 1.0, 1.0, left, top, width, height);
+                    paint_smooth_stroke(
+                        window,
+                        live_segs,
+                        StrokePaintParams {
+                            hue,
+                            alpha: 1.0,
+                            width_scale: 1.0,
+                            left,
+                            top,
+                            width,
+                            height,
+                        },
+                    );
                 }
                 for (is_me, cur) in &cursors {
                     if *is_me {
@@ -744,7 +765,16 @@ impl PopoutWindow {
             .gap_4()
             .children(people.iter().map(|uid| {
                 self.render_huddle_participant_tile(
-                    state, uid, pal, tile_w, tile_h, avatar_px, solo, cx,
+                    state,
+                    uid,
+                    pal,
+                    ParticipantTileLayout {
+                        tile_w,
+                        tile_h,
+                        avatar_px,
+                        full_bleed_avatar: solo,
+                    },
+                    cx,
                 )
             }))
     }
@@ -770,42 +800,39 @@ impl PopoutWindow {
                     state,
                     uid,
                     pal,
-                    px(148.),
-                    px(96.),
-                    44.0,
-                    false,
+                    ParticipantTileLayout {
+                        tile_w: px(148.),
+                        tile_h: px(96.),
+                        avatar_px: 44.0,
+                        full_bleed_avatar: false,
+                    },
                     cx,
                 )
             }))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_huddle_participant_tile(
         &self,
         state: &crate::huddle_dock::HuddleViewState,
         uid: &slackless_core::types::UserId,
         pal: &HuddlePalette,
-        tile_w: Pixels,
-        tile_h: Pixels,
-        avatar_px: f32,
-        full_bleed_avatar: bool,
+        layout: ParticipantTileLayout,
         cx: &Context<Self>,
     ) -> gpui_kit::gpui::Div {
         use gpui_kit::component::Icon;
         use gpui_kit::gpui::ObjectFit;
         use slackless_core::huddle::VideoTileKey;
 
+        let ParticipantTileLayout {
+            tile_w,
+            tile_h,
+            avatar_px,
+            full_bleed_avatar,
+        } = layout;
         let snap = &state.session;
         let is_self = *uid == self.fixtures.self_user;
-        let speaking = if is_self {
-            !snap.muted && state.levels.local_rms > 0.03
-        } else {
-            state
-                .levels
-                .active_speakers
-                .iter()
-                .any(|(id, lvl)| id == uid && *lvl > 0.05)
-        };
+        let speaking =
+            crate::huddle_video::is_user_speaking(is_self, snap.muted, &state.levels, uid);
         let is_muted = if is_self {
             snap.muted
         } else {

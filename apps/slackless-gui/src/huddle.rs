@@ -123,31 +123,21 @@ impl HuddleBar {
 
     /// Slack's web-client huddle link for this channel.
     fn browser_url(&self) -> String {
-        if let Some(link) = self.session.as_ref().and_then(|s| s.huddle_link.as_ref()) {
-            return link.clone();
-        }
-        let team = self
-            .fixtures
-            .workspaces
-            .first()
-            .map(|team| team.id.to_string())
-            .unwrap_or_default();
-        format!(
-            "https://app.slack.com/huddle/{team}/{}",
-            self.huddle.channel
+        crate::huddle_video::huddle_browser_url(
+            &self.fixtures,
+            &self.huddle.channel,
+            self.session.as_ref().and_then(|s| s.huddle_link.as_deref()),
         )
     }
 
     fn is_speaking(&self, user: &UserId, ix: usize) -> bool {
         if self.session.is_some() {
-            if *user == self.fixtures.self_user {
-                !self.muted && self.levels.local_rms > 0.03
-            } else {
-                self.levels
-                    .active_speakers
-                    .iter()
-                    .any(|(uid, lvl)| uid == user && *lvl > 0.05)
-            }
+            crate::huddle_video::is_user_speaking(
+                *user == self.fixtures.self_user,
+                self.muted,
+                &self.levels,
+                user,
+            )
         } else {
             ix == 0
         }

@@ -299,6 +299,27 @@ fn plural(count: i64, unit: &str) -> String {
     }
 }
 
+/// Walk `messages` in display order, collecting every viewer image and locating the index of
+/// the clicked `(ts, origin)`.
+pub fn collect_viewer_images<'a>(
+    fixtures: &Fixtures,
+    messages: impl IntoIterator<Item = &'a Message>,
+    ts: &slackless_core::types::Ts,
+    origin: &ImageOrigin,
+) -> Option<(Rc<Vec<ViewerImage>>, usize)> {
+    let mut images = Vec::new();
+    let mut index = None;
+    for message in messages {
+        for entry in message_images(fixtures, message) {
+            if index.is_none() && &message.ts == ts && &entry.origin == origin {
+                index = Some(images.len());
+            }
+            images.push(entry.image);
+        }
+    }
+    index.map(|ix| (Rc::new(images), ix))
+}
+
 /// The viewer overlay: an entity so the root can mount it like the other overlays and
 /// drop it (and the large rendition it holds) on close.
 pub struct ImageViewer {
@@ -307,7 +328,7 @@ pub struct ImageViewer {
     channel: String,
     /// Every image in the conversation (transcript order); only the shown one is painted,
     /// so only it loads.
-    images: Arc<Vec<ViewerImage>>,
+    images: Rc<Vec<ViewerImage>>,
     index: usize,
     zoom_ix: usize,
     slider: Entity<SliderState>,
@@ -335,7 +356,7 @@ impl ImageViewer {
     pub fn new(
         fixtures: Arc<Fixtures>,
         channel: String,
-        images: Arc<Vec<ViewerImage>>,
+        images: Rc<Vec<ViewerImage>>,
         index: usize,
         cx: &mut App,
     ) -> Entity<Self> {

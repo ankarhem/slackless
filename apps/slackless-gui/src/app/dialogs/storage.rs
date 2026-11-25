@@ -2,6 +2,14 @@
 
 use super::super::*;
 
+pub(in crate::app) struct HuddleTranscriptOpen {
+    pub(in crate::app) call_id: String,
+    pub(in crate::app) channel: ChannelId,
+    pub(in crate::app) segments: Vec<slackless_core::store::HuddleTranscriptSegment>,
+    pub(in crate::app) highlight_segment_id: Option<i64>,
+    pub(in crate::app) highlight_query: Option<String>,
+}
+
 impl App {
     /// A `file://` URL for `path`, percent-encoded (Finder opens folder URLs).
     pub(in crate::app) fn file_url(path: &std::path::Path) -> String {
@@ -365,9 +373,15 @@ impl App {
         .detach();
     }
 
-    /// Run `PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA optimize;` on the active workspace store.
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA optimize;` on the active workspace
+    /// store off the UI thread, then refresh storage metrics and show a toast notification.
     pub(in crate::app) fn compact_storage(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((store, team)) = self.bridge.store().zip(self.bridge.team_id()) else {
+        let Some((store, team)) = self
+            .bridge
+            .store()
+            .cloned()
+            .zip(self.bridge.team_id().cloned())
+        else {
             notify(
                 "No local database",
                 "Compact is available in live workspaces.",
@@ -376,76 +390,84 @@ impl App {
             );
             return;
         };
-        let before = store
-            .lock()
-            .ok()
-            .and_then(|s| s.stats(team).ok())
-            .map(|s| s.db_bytes())
-            .unwrap_or(0);
-        let res = store.lock().ok().map(|mut s| s.vacuum());
-        match res {
-            Some(Ok(())) => {
-                let after = store
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.stats(team).ok())
-                    .map(|s| s.db_bytes())
-                    .unwrap_or(0);
-                self.refresh_storage_stats(cx);
-                let saved = before.saturating_sub(after);
-                let msg = if saved > 0 {
-                    format!("Reclaimed {} KiB and optimized FTS5 indexes.", saved / 1024)
-                } else {
-                    "Database is already compact; FTS5 statistics refreshed.".to_owned()
-                };
-                notify("Database compacted", msg, window, cx);
-            }
-            Some(Err(err)) => {
-                notify("Compact failed", err.to_string(), window, cx);
-            }
-            None => {
-                notify(
-                    "Compact failed",
-                    "Could not acquire database lock.",
-                    window,
-                    cx,
-                );
-            }
-        }
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome: Result<u64, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let before = store
+                        .lock()
+                        .ok()
+                        .and_then(|s| s.stats(&team).ok())
+                        .map(|s| s.db_bytes())
+                        .unwrap_or(0);
+                    let mut guard = store
+                        .lock()
+                        .map_err(|_| "Could not acquire database lock.".to_owned())?;
+                    guard.vacuum().map_err(|err| err.to_string())?;
+                    let after = guard.stats(&team).ok().map(|s| s.db_bytes()).unwrap_or(0);
+                    Ok(before.saturating_sub(after))
+                })
+                .await;
+            let _ = this.update_in(cx, |app, window, cx| match outcome {
+                Ok(saved) => {
+                    app.refresh_storage_stats(cx);
+                    let msg = if saved > 0 {
+                        format!("Reclaimed {} KiB and optimized FTS5 indexes.", saved / 1024)
+                    } else {
+                        "Database is already compact; FTS5 statistics refreshed.".to_owned()
+                    };
+                    notify("Database compacted", msg, window, cx);
+                }
+                Err(err) => notify("Compact failed", err, window, cx),
+            });
+        })
+        .detach();
     }
 
-    /// Prune temporary downloaded media cache files (`slackless-media` + `slackless-audio`).
+    /// Prune temporary downloaded media cache files (`slackless-media` + `slackless-audio`) off
+    /// the UI thread, then refresh storage metrics and show a toast notification.
     pub(in crate::app) fn prune_media_cache(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut removed = 0u64;
-        let mut dirs: Vec<std::path::PathBuf> = ["slackless-media", "slackless-audio"]
-            .into_iter()
-            .map(|folder| std::env::temp_dir().join(folder))
-            .collect();
-        if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
-            dirs.push(cache);
-        }
-        for dir in dirs {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata()
-                        && meta.is_file()
-                        && std::fs::remove_file(entry.path()).is_ok()
-                    {
-                        removed = removed.saturating_add(meta.len());
+        cx.spawn_in(window, async move |this, cx| {
+            let removed = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut removed = 0u64;
+                    let mut dirs: Vec<std::path::PathBuf> = ["slackless-media", "slackless-audio"]
+                        .into_iter()
+                        .map(|folder| std::env::temp_dir().join(folder))
+                        .collect();
+                    if let Some(cache) = slackless_core::Fetcher::disk_cache_dir() {
+                        dirs.push(cache);
                     }
-                }
-            }
-        }
-        self.refresh_storage_stats(cx);
-        let msg = if removed > 0 {
-            format!(
-                "Removed {} KiB of cached media files.",
-                (removed / 1024).max(1)
-            )
-        } else {
-            "Media cache was already clean.".to_owned()
-        };
-        notify("Media cache pruned", msg, window, cx);
+                    for dir in dirs {
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for entry in entries.flatten() {
+                                if let Ok(meta) = entry.metadata()
+                                    && meta.is_file()
+                                    && std::fs::remove_file(entry.path()).is_ok()
+                                {
+                                    removed = removed.saturating_add(meta.len());
+                                }
+                            }
+                        }
+                    }
+                    removed
+                })
+                .await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                app.refresh_storage_stats(cx);
+                let msg = if removed > 0 {
+                    format!(
+                        "Removed {} KiB of cached media files.",
+                        (removed / 1024).max(1)
+                    )
+                } else {
+                    "Media cache was already clean.".to_owned()
+                };
+                notify("Media cache pruned", msg, window, cx);
+            });
+        })
+        .detach();
     }
 
     /// Open a modal dialog showing every locally recorded revision of `(channel, ts)` from
@@ -458,40 +480,41 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let fixtures = self.fixtures.clone();
-        let revisions: Vec<(String, bool, String)> =
-            if let (Some(store), Some(team)) = (self.bridge.store(), self.bridge.team_id()) {
-                store
-                    .lock()
-                    .ok()
-                    .and_then(|s| s.revisions(team, &channel, &ts).ok())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|rev| {
-                        let stamp = if rev.edit_ts.is_empty() {
-                            format!("Original · {}", rev.message.ts)
-                        } else if rev.deleted {
-                            format!("Deleted · {}", rev.edit_ts)
-                        } else {
-                            format!("Edited · {}", rev.edit_ts)
-                        };
-                        let text = fixtures.plain_text(&rev.message);
-                        (stamp, rev.deleted, text)
-                    })
-                    .collect()
-            } else {
-                fixtures
-                    .messages
-                    .get(&channel)
-                    .and_then(|list| list.iter().find(|m| m.ts == ts))
-                    .map(|m| {
-                        vec![(
-                            format!("Original · {}", m.ts),
-                            false,
-                            fixtures.plain_text(m),
-                        )]
-                    })
-                    .unwrap_or_default()
-            };
+        let revisions: Vec<(String, bool, String)> = if let (Some(store), Some(team)) =
+            (self.bridge.read_store_clone(), self.bridge.team_id())
+        {
+            store
+                .lock()
+                .ok()
+                .and_then(|s| s.revisions(team, &channel, &ts).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|rev| {
+                    let stamp = if rev.edit_ts.is_empty() {
+                        format!("Original · {}", rev.message.ts)
+                    } else if rev.deleted {
+                        format!("Deleted · {}", rev.edit_ts)
+                    } else {
+                        format!("Edited · {}", rev.edit_ts)
+                    };
+                    let text = fixtures.plain_text(&rev.message);
+                    (stamp, rev.deleted, text)
+                })
+                .collect()
+        } else {
+            fixtures
+                .messages
+                .get(&channel)
+                .and_then(|list| list.iter().find(|m| m.ts == ts))
+                .map(|m| {
+                    vec![(
+                        format!("Original · {}", m.ts),
+                        false,
+                        fixtures.plain_text(m),
+                    )]
+                })
+                .unwrap_or_default()
+        };
         let subtitle = format!("{} · {}", self.label(&channel), ts);
         self.open_revision_history_with(subtitle, revisions, window, cx);
     }
@@ -683,7 +706,9 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         let segments: Vec<slackless_core::store::HuddleTranscriptSegment> =
-            if let (Some(store), Some(team)) = (self.bridge.store(), self.bridge.team_id()) {
+            if let (Some(store), Some(team)) =
+                (self.bridge.read_store_clone(), self.bridge.team_id())
+            {
                 store
                     .lock()
                     .ok()
@@ -693,27 +718,31 @@ impl App {
                 Vec::new()
             };
         self.open_huddle_transcript_with(
-            call_id,
-            channel,
-            segments,
-            highlight_segment_id,
-            highlight_query,
+            HuddleTranscriptOpen {
+                call_id,
+                channel,
+                segments,
+                highlight_segment_id,
+                highlight_query,
+            },
             window,
             cx,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::app) fn open_huddle_transcript_with(
         &self,
-        call_id: String,
-        channel: ChannelId,
-        segments: Vec<slackless_core::store::HuddleTranscriptSegment>,
-        highlight_segment_id: Option<i64>,
-        highlight_query: Option<String>,
+        params: HuddleTranscriptOpen,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let HuddleTranscriptOpen {
+            call_id,
+            channel,
+            segments,
+            highlight_segment_id,
+            highlight_query,
+        } = params;
         let fixtures = self.fixtures.clone();
         let ch_label = self.label(&channel);
 
@@ -975,7 +1004,7 @@ impl App {
                                         }
                                         window.close_dialog(cx);
                                         let _ = del_this.update(cx, |app, cx| {
-                                            if app.huddles_open {
+                                            if app.page == MainPage::Huddles {
                                                 app.show_huddles(cx);
                                             }
                                         });

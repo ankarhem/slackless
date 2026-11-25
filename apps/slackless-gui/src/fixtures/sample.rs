@@ -1,22 +1,14 @@
-//! The workspace snapshot views render: the bundled sample workspace for fixture mode (no Slack
-//! credentials, no network), or the signed-in workspace read from the local store ([`live`]).
-//! Both use the real `slackless_types` model, so views render the same either way.
+//! Bundled sample workspace ("Acme Corp" and "Side Project") used in offline / demo / test mode.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use gpui_kit::gpui::{Image, ImageSource, SharedString};
-
+use serde_json::{Value as Json, json};
 use slackless_core::NotifyLevel;
-use slackless_core::api::ConversationCounts;
-use slackless_core::auth::Session;
-use slackless_core::store::Store;
 use slackless_core::types::{
-    Attachment, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation,
-    ConversationKind, ConversationProperties, Edited, File, FileId, Message, MessageSubtype,
-    Presence, Profile, Reaction, RichTextBlock, RichTextContainer, RichTextElement, Team, TeamId,
-    TextStyle, TopicPurpose, Ts, User, UserId, Usergroup, UsergroupId,
+    Attachment, Block, ChannelId, Conversation, ConversationProperties, Edited, File, FileId,
+    Message, MessageSubtype, Presence, Profile, Reaction, RichTextBlock, RichTextContainer,
+    RichTextElement, Team, TextStyle, TopicPurpose, Ts, User, UserId, Usergroup, UsergroupId,
     message::AttachmentField,
     rich_text::{
         EmojiElement, LinkElement, ListStyle, RichTextList, RichTextPreformatted, RichTextSection,
@@ -24,8 +16,7 @@ use slackless_core::types::{
     },
 };
 
-use crate::blockkit::Json;
-use crate::blockkit::serde_json::json;
+use super::model::{BotProfileMap, EmojiImage, Fixtures, ProfileExtras, WorkspaceData};
 use crate::thumbnail;
 
 /// Seconds between sample days, so scrollbacks span several date dividers.
@@ -34,636 +25,8 @@ const DAY: u64 = 86_400;
 /// Unix seconds the sample scrollback starts at, anchored to render time: the three sample
 /// days land on "2 days ago / yesterday / today", like a live workspace's history.
 fn base_ts() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
+    let now = slackless_core::types::time::now_epoch_secs().max(0) as u64;
     (now / DAY).saturating_sub(2) * DAY + 8 * 3_600
-}
-
-/// `text` with each `:shortcode:` of a standard emoji replaced by its glyph, as Slack's
-/// previews show them; anything else between colons (times, URLs) is kept.
-fn with_glyphs(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(':') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        let emoji = after
-            .find(':')
-            .map(|end| &after[..end])
-            .filter(|name| {
-                !name.is_empty()
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-'))
-            })
-            .and_then(|name| crate::emoji::glyph(name).map(|glyph| (name.len(), glyph)));
-        match emoji {
-            Some((len, glyph)) => {
-                out.push_str(glyph);
-                rest = &after[len + 1..];
-            }
-            None => {
-                out.push(':');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Slack's one-click reactions from the user's prefs: none when turned off, the three
-/// customized emoji when set, else Slack's defaults.
-fn quick_reactions(prefs: &crate::blockkit::serde_json::Value) -> Vec<String> {
-    // `show_quick_reactions` decides, as the official client shows it on 2026-11-20: with it
-    // off (and `user_customized_quick_reactions_display_feature` 2) Slack's hover bar has no
-    // one-click reactions, in channels and DMs alike. Absent, they show.
-    let shown = prefs.get("show_quick_reactions").and_then(|v| v.as_bool()) != Some(false);
-    if !shown {
-        return Vec::new();
-    }
-    let customized = prefs
-        .get("user_customized_quick_reactions_has_customized")
-        .and_then(|v| v.as_bool())
-        == Some(true);
-    let custom: Vec<String> = (1..=3)
-        .filter_map(|i| {
-            prefs
-                .get(format!("user_customized_quick_reactions_emoji_{i}").as_str())
-                .and_then(|v| v.as_str())
-                .map(|name| name.trim_matches(':').to_owned())
-        })
-        .collect();
-    if customized && !custom.is_empty() {
-        custom
-    } else {
-        crate::actions::DEFAULT_QUICK_REACTIONS
-            .map(String::from)
-            .to_vec()
-    }
-}
-
-/// Workspace-configured status suggestions from `team.prefs.custom_status_default_suggestions`
-/// or `prefs.custom_status_presets` (`F-SHELL-015`). Returns `(emoji_shortcode, text, clear_after_ix)`.
-pub fn status_presets_from_prefs(
-    team_extra: &crate::blockkit::serde_json::Map<String, Json>,
-    user_prefs: &Json,
-) -> Vec<(String, String, usize)> {
-    fn duration_to_clear_ix(secs: Option<i64>) -> usize {
-        match secs.unwrap_or(0) {
-            s if s <= 0 => 0,
-            s if s <= 1_800 => 1,
-            s if s <= 3_600 => 2,
-            s if s <= 14_400 => 3,
-            s if s <= 86_400 => 4,
-            _ => 5,
-        }
-    }
-    fn parse_list(val: &Json) -> Vec<(String, String, usize)> {
-        let Some(items) = val.as_array() else {
-            return Vec::new();
-        };
-        items
-            .iter()
-            .filter_map(|entry| {
-                if let Some(arr) = entry.as_array() {
-                    let emoji = arr.first()?.as_str()?.trim().trim_matches(':');
-                    let text = arr.get(1)?.as_str()?.trim();
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let secs = arr.get(2).and_then(Json::as_i64);
-                    Some((
-                        if emoji.is_empty() {
-                            "speech_balloon".to_owned()
-                        } else {
-                            emoji.to_owned()
-                        },
-                        text.to_owned(),
-                        duration_to_clear_ix(secs),
-                    ))
-                } else if let Some(obj) = entry.as_object() {
-                    let emoji = obj
-                        .get("emoji")
-                        .or_else(|| obj.get("status_emoji"))
-                        .and_then(Json::as_str)
-                        .unwrap_or("speech_balloon")
-                        .trim()
-                        .trim_matches(':');
-                    let text = obj
-                        .get("text")
-                        .or_else(|| obj.get("status_text"))
-                        .and_then(Json::as_str)?
-                        .trim();
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let secs = obj
-                        .get("duration")
-                        .or_else(|| obj.get("default_duration"))
-                        .and_then(Json::as_i64);
-                    Some((
-                        if emoji.is_empty() {
-                            "speech_balloon".to_owned()
-                        } else {
-                            emoji.to_owned()
-                        },
-                        text.to_owned(),
-                        duration_to_clear_ix(secs),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-    for candidate in [
-        team_extra
-            .get("prefs")
-            .and_then(|p| p.get("custom_status_default_suggestions")),
-        user_prefs.get("custom_status_default_suggestions"),
-        user_prefs.get("custom_status_presets"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let parsed = parse_list(candidate);
-        if !parsed.is_empty() {
-            return parsed;
-        }
-    }
-    Vec::new()
-}
-
-/// Live presence per user, shared by every snapshot of a workspace: a `presence_change` lands
-/// in place and repaints, with no store reload.
-pub type PresenceMap = Arc<RwLock<HashMap<UserId, Presence>>>;
-/// Shared bot-profile cache (`bots.info`) updated in place as history resolves bot messages.
-pub type BotProfileMap = Arc<RwLock<HashMap<BotId, BotProfile>>>;
-
-pub struct Fixtures {
-    pub workspaces: Vec<Team>,
-    /// Every organization the snapshot knows: the signed-in workspace's own team first, then
-    /// the connected teams of Slack Connect channels (live: stored `team.info` records).
-    pub teams: Vec<Team>,
-    /// The signed-in user; author of locally composed messages.
-    pub self_user: UserId,
-    pub users: Vec<User>,
-    /// Active `@handle` user groups (`usergroups.list`).
-    pub usergroups: Vec<Usergroup>,
-    /// Workspace slash commands from `client.appCommands` (merged into `/` autocomplete).
-    pub app_commands: Vec<slackless_core::api::AppCommand>,
-    pub channels: Vec<Conversation>,
-    /// IMs and MPIMs.
-    pub dms: Vec<Conversation>,
-    /// Channel history, oldest first. Thread replies live in `threads`.
-    pub messages: HashMap<ChannelId, Vec<Message>>,
-    /// Each DM's latest top-level message: one store query in live mode ([`live`]), the last
-    /// history message in fixture mode. Feeds the DM list's previews, stamps and order
-    /// without loading histories.
-    pub latest: HashMap<ChannelId, Message>,
-    /// Replies keyed by `(channel, thread root ts)`, oldest first.
-    pub threads: HashMap<(ChannelId, Ts), Vec<Message>>,
-    /// Workspace channels the signed-in user has not joined (channel browser only).
-    pub directory: Vec<Conversation>,
-    /// Archived channels: never listed, only named (a shared message's "Thread in #old
-    /// (archived)").
-    pub archived: Vec<Conversation>,
-    /// Last known presence per user (`presence_change` / `users.getPresence`).
-    pub presence: PresenceMap,
-    /// Resolved bot profiles (`bots.info`) keyed by `BotId`, shared across snapshots.
-    pub bots: BotProfileMap,
-    /// Conversations whose notification level is not "All new posts" (the header bell).
-    pub notify_levels: HashMap<ChannelId, NotifyLevel>,
-    /// The message hover bar's one-click reactions (none when the user turned them off).
-    pub quick_reactions: Vec<String>,
-    /// The emoji picker's Frequently Used, most used first, from the user's `emoji_use` pref
-    /// (live mode); empty in the sample workspace, whose picker shows its defaults.
-    pub frequent_emoji: Vec<String>,
-    /// The user's emoji skin tone (`preferred_skin_tone`): 1 is the default yellow, 2..=6 the
-    /// Fitzpatrick tones.
-    pub skin_tone: u8,
-    /// Decoded image thumbnails per file (live mode: downloaded `thumb_*` bytes).
-    pub thumbnails: HashMap<FileId, Arc<Image>>,
-    /// Profile data the typed `Profile` does not model (pronouns, custom fields).
-    pub profile_extras: HashMap<UserId, ProfileExtras>,
-    /// The workspace's custom emoji by name.
-    pub custom_emoji: BTreeMap<String, EmojiImage>,
-    /// Decoded Block Kit / attachment images keyed by their `image_url`.
-    pub block_images: HashMap<String, Arc<Image>>,
-    /// The bundled sample workspace. Demo-only data (the fixture huddle, channel bookmarks) is
-    /// shown only here, never over a live workspace.
-    pub sample: bool,
-    /// Live mode: Slack's own read and unread state per conversation (`client.counts`). Empty
-    /// in the sample workspace, whose unreads come from its history.
-    pub counts: HashMap<ChannelId, ConversationCounts>,
-    /// Live mode: the signed-in user's sidebar sections in display order. Empty in the sample
-    /// workspace, which shows plain Channels / Direct messages sections.
-    pub sections: Vec<ChannelSection>,
-    /// Show people by full name (the user's `display_real_names_override`, else the team's
-    /// `display_real_names`).
-    pub real_names: bool,
-    /// @mentions show full names too (`mentions_real_names_override`, else the team's
-    /// `display_real_names_in_mentions`); otherwise they show display names.
-    pub real_names_in_mentions: bool,
-    /// Live mode: ids of the sidebar sections the user collapsed in Slack.
-    pub collapsed_sections: HashSet<String>,
-    /// The color theme Slack stores for the user, applied at launch; `None` in the sample
-    /// workspace, which keeps the reference screenshot's dark look.
-    pub palette: Option<crate::theme::Palette>,
-    /// Workspace-configured status presets (`team.prefs.custom_status_default_suggestions`).
-    pub status_presets: Vec<(String, String, usize)>,
-    /// Lazy O(1) lookup index into `users`.
-    user_index: OnceLock<HashMap<UserId, usize>>,
-    /// Lazy O(1) lookup index into `channels` / `dms` / `directory` / `archived`.
-    conv_index: OnceLock<HashMap<ChannelId, (ConvBucket, usize)>>,
-    /// Lazy O(1) lookup index into `teams`.
-    team_index: OnceLock<HashMap<TeamId, usize>>,
-}
-
-#[derive(Clone, Copy)]
-enum ConvBucket {
-    Channel,
-    Dm,
-    Directory,
-    Archived,
-}
-
-/// A custom emoji's picture: a generated sample image, or a live `emoji.list` URL that GPUI's
-/// `img` loads and caches. (`ImageSource` itself is not `Send`, so the snapshot keeps this.)
-#[derive(Clone)]
-pub enum EmojiImage {
-    Sample(Arc<Image>),
-    Url(SharedString),
-}
-
-impl EmojiImage {
-    pub fn source(&self) -> ImageSource {
-        match self {
-            EmojiImage::Sample(image) => ImageSource::Image(image.clone()),
-            EmojiImage::Url(url) => ImageSource::from(url.clone()),
-        }
-    }
-}
-
-/// Profile data outside `slackless_types::Profile`: `profile.pronouns` and the workspace's
-/// custom profile fields resolved to `(label, value)` pairs (`team.profile.get` labels).
-#[derive(Default)]
-pub struct ProfileExtras {
-    pub pronouns: Option<String>,
-    pub fields: Vec<(String, String)>,
-}
-
-impl Fixtures {
-    pub fn user_name<'a>(&'a self, id: &'a UserId) -> &'a str {
-        self.user(id).map_or(id.as_str(), |user| self.name_of(user))
-    }
-
-    /// The name `user` shows by: their full name where the workspace shows full names, else
-    /// their display name ([`Fixtures::user_name`] for a profile already at hand).
-    pub fn name_of<'a>(&self, user: &'a User) -> &'a str {
-        let real = [user.profile.real_name.as_deref(), user.real_name.as_deref()]
-            .into_iter()
-            .flatten()
-            .find(|name| !name.is_empty());
-        match real {
-            Some(real) if self.real_names => real,
-            _ => user.display_name(),
-        }
-    }
-
-    fn conv_map(&self) -> &HashMap<ChannelId, (ConvBucket, usize)> {
-        self.conv_index.get_or_init(|| {
-            let mut map = HashMap::with_capacity(
-                self.channels.len() + self.dms.len() + self.directory.len() + self.archived.len(),
-            );
-            for (ix, c) in self.channels.iter().enumerate() {
-                map.entry(c.id.clone()).or_insert((ConvBucket::Channel, ix));
-            }
-            for (ix, c) in self.dms.iter().enumerate() {
-                map.entry(c.id.clone()).or_insert((ConvBucket::Dm, ix));
-            }
-            for (ix, c) in self.directory.iter().enumerate() {
-                map.entry(c.id.clone())
-                    .or_insert((ConvBucket::Directory, ix));
-            }
-            for (ix, c) in self.archived.iter().enumerate() {
-                map.entry(c.id.clone())
-                    .or_insert((ConvBucket::Archived, ix));
-            }
-            map
-        })
-    }
-
-    fn user_map(&self) -> &HashMap<UserId, usize> {
-        self.user_index.get_or_init(|| {
-            let mut map = HashMap::with_capacity(self.users.len());
-            for (ix, u) in self.users.iter().enumerate() {
-                map.entry(u.id.clone()).or_insert(ix);
-            }
-            map
-        })
-    }
-
-    fn team_map(&self) -> &HashMap<TeamId, usize> {
-        self.team_index.get_or_init(|| {
-            let mut map = HashMap::with_capacity(self.teams.len());
-            for (ix, t) in self.teams.iter().enumerate() {
-                map.entry(t.id.clone()).or_insert(ix);
-            }
-            map
-        })
-    }
-
-    /// Cheap in-memory clone updating only `counts` and per-conversation `last_read` cursors,
-    /// avoiding a full SQLite store reload on periodic `Event::Counts` refreshes.
-    pub fn with_counts(&self, counts: HashMap<ChannelId, ConversationCounts>) -> Self {
-        let apply = |list: &[Conversation]| -> Vec<Conversation> {
-            list.iter()
-                .map(|c| {
-                    let mut next = c.clone();
-                    if let Some(read) = counts.get(&c.id).and_then(|n| n.last_read.clone()) {
-                        next.last_read = Some(read);
-                    }
-                    next
-                })
-                .collect()
-        };
-        let profile_extras = self
-            .profile_extras
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.clone(),
-                    ProfileExtras {
-                        pronouns: v.pronouns.clone(),
-                        fields: v.fields.clone(),
-                    },
-                )
-            })
-            .collect();
-        Fixtures {
-            workspaces: self.workspaces.clone(),
-            teams: self.teams.clone(),
-            self_user: self.self_user.clone(),
-            users: self.users.clone(),
-            usergroups: self.usergroups.clone(),
-            app_commands: self.app_commands.clone(),
-            channels: apply(&self.channels),
-            dms: apply(&self.dms),
-            messages: self.messages.clone(),
-            latest: self.latest.clone(),
-            threads: self.threads.clone(),
-            directory: apply(&self.directory),
-            archived: self.archived.clone(),
-            presence: self.presence.clone(),
-            bots: self.bots.clone(),
-            notify_levels: self.notify_levels.clone(),
-            quick_reactions: self.quick_reactions.clone(),
-            frequent_emoji: self.frequent_emoji.clone(),
-            skin_tone: self.skin_tone,
-            thumbnails: self.thumbnails.clone(),
-            profile_extras,
-            custom_emoji: self.custom_emoji.clone(),
-            block_images: self.block_images.clone(),
-            sample: self.sample,
-            counts,
-            sections: self.sections.clone(),
-            real_names: self.real_names,
-            real_names_in_mentions: self.real_names_in_mentions,
-            collapsed_sections: self.collapsed_sections.clone(),
-            palette: self.palette,
-            status_presets: self.status_presets.clone(),
-            user_index: OnceLock::new(),
-            conv_index: OnceLock::new(),
-            team_index: OnceLock::new(),
-        }
-    }
-
-    /// Resolved bot profile for `bot_id` (from `bots.info`), if cached.
-    pub fn bot_profile(&self, id: &BotId) -> Option<BotProfile> {
-        self.bots
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .cloned()
-    }
-
-    pub fn conversation(&self, id: &ChannelId) -> Option<&Conversation> {
-        let map = self.conv_map();
-        if let Some(&(bucket, ix)) = map.get(id) {
-            let candidate = match bucket {
-                ConvBucket::Channel => self.channels.get(ix),
-                ConvBucket::Dm => self.dms.get(ix),
-                ConvBucket::Directory => self.directory.get(ix),
-                ConvBucket::Archived => self.archived.get(ix),
-            };
-            if let Some(conv) = candidate.filter(|c| c.id == *id) {
-                return Some(conv);
-            }
-        }
-        let total =
-            self.channels.len() + self.dms.len() + self.directory.len() + self.archived.len();
-        if map.len() != total {
-            return self
-                .channels
-                .iter()
-                .chain(&self.dms)
-                .chain(&self.directory)
-                .chain(&self.archived)
-                .find(|c| c.id == *id);
-        }
-        None
-    }
-
-    pub fn user(&self, id: &UserId) -> Option<&User> {
-        let map = self.user_map();
-        if let Some(&ix) = map.get(id)
-            && let Some(user) = self.users.get(ix).filter(|u| u.id == *id)
-        {
-            return Some(user);
-        }
-        if map.len() != self.users.len() {
-            return self.users.iter().find(|u| u.id == *id);
-        }
-        None
-    }
-
-    pub fn usergroup(&self, id: &UsergroupId) -> Option<&Usergroup> {
-        self.usergroups.iter().find(|g| g.id == *id)
-    }
-
-    pub fn usergroup_handle(&self, id: &UsergroupId) -> Option<&str> {
-        self.usergroup(id)
-            .map(|g| g.handle.as_str())
-            .filter(|h| !h.is_empty())
-    }
-
-    pub fn presence(&self, user: &UserId) -> Option<Presence> {
-        self.presence
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(user)
-            .cloned()
-    }
-
-    /// The name an @mention of `id` shows (see [`Fixtures::real_names_in_mentions`]).
-    pub fn mention_name<'a>(&'a self, id: &'a UserId) -> &'a str {
-        if self.real_names_in_mentions {
-            return self.user_name(id);
-        }
-        self.user(id).map(User::display_name).unwrap_or(id.as_str())
-    }
-
-    /// The image of the workspace custom emoji `name` (no colons).
-    pub fn custom_emoji(&self, name: &str) -> Option<&EmojiImage> {
-        self.custom_emoji.get(name)
-    }
-
-    /// The other parties of a DM (the peer of an IM, the members of an MPIM minus the
-    /// signed-in user); empty for channels.
-    pub fn peers<'a>(&'a self, conversation: &'a Conversation) -> Vec<&'a UserId> {
-        match conversation.kind() {
-            ConversationKind::Im => conversation.user.iter().collect(),
-            ConversationKind::Mpim => conversation
-                .members
-                .iter()
-                .filter(|u| **u != self.self_user)
-                .collect(),
-            ConversationKind::PublicChannel | ConversationKind::PrivateChannel => Vec::new(),
-        }
-    }
-
-    /// A message's text as plain text (Slack's "Copy message"): user mentions resolved to
-    /// `@name` in a single O(len) pass, standard `:emoji:` shown as their glyph, line breaks kept.
-    pub fn plain_text(&self, message: &Message) -> String {
-        let raw = message.text.as_str();
-        if !raw.contains("<@") {
-            return with_glyphs(raw);
-        }
-        let mut out = String::with_capacity(raw.len());
-        let mut rest = raw;
-        while let Some(start) = rest.find("<@") {
-            out.push_str(&rest[..start]);
-            rest = &rest[start + 2..];
-            if let Some(end) = rest.find('>') {
-                let inner = &rest[..end];
-                let (id_str, label) = inner
-                    .split_once('|')
-                    .map_or((inner, None), |(id, lbl)| (id, Some(lbl)));
-                let uid = UserId::from(id_str);
-                if let Some(user) = self.user(&uid) {
-                    out.push('@');
-                    out.push_str(user.display_name());
-                } else if let Some(lbl) = label.filter(|l| !l.is_empty()) {
-                    out.push('@');
-                    out.push_str(lbl);
-                } else {
-                    out.push_str("<@");
-                    out.push_str(inner);
-                    out.push('>');
-                }
-                rest = &rest[end + 1..];
-            } else {
-                out.push_str("<@");
-                break;
-            }
-        }
-        out.push_str(rest);
-        with_glyphs(&out)
-    }
-
-    /// One-line plain preview of a message: [`Self::plain_text`] on one line, file-only
-    /// messages described by their first file.
-    pub fn preview(&self, message: &Message) -> String {
-        if message.text.trim().is_empty()
-            && let Some(file) = message.files.first()
-        {
-            return format!("Shared a file: {}", file.name.as_deref().unwrap_or("file"));
-        }
-        self.plain_text(message).replace('\n', " ")
-    }
-
-    /// The organization of `user` when it is not the signed-in workspace's own and its record
-    /// is known: Slack badges such people's avatars with its icon.
-    pub fn external_team(&self, user: &UserId) -> Option<&Team> {
-        let team = self.user(user)?.team_id.as_ref()?;
-        if self.workspaces.first().is_some_and(|own| own.id == *team) {
-            return None;
-        }
-        let &ix = self.team_map().get(team)?;
-        self.teams.get(ix)
-    }
-
-    /// The other organizations a Slack Connect conversation is shared with, in Slack's own
-    /// order (`shared_team_ids`), as far as their team records are known.
-    pub fn shared_teams(&self, conversation: &Conversation) -> Vec<&Team> {
-        let own = self.workspaces.first().map(|team| team.id.as_str());
-        let team_map = self.team_map();
-        conversation
-            .extra
-            .get("shared_team_ids")
-            .and_then(|ids| ids.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|id| id.as_str())
-            .filter(|id| Some(*id) != own)
-            .filter_map(|id| {
-                let &ix = team_map.get(&TeamId::from(id))?;
-                self.teams.get(ix)
-            })
-            .collect()
-    }
-
-    /// Sidebar/header label: `# name` for channels, the other parties' names for DMs.
-    pub fn conversation_label(&self, conversation: &Conversation) -> String {
-        match conversation.kind() {
-            ConversationKind::Im => conversation.user.as_ref().map_or_else(
-                || conversation.id.to_string(),
-                |u| self.user_name(u).to_owned(),
-            ),
-            // Slack names a group DM by its other people, alphabetically.
-            ConversationKind::Mpim => {
-                let mut names: Vec<&str> = conversation
-                    .members
-                    .iter()
-                    .filter(|u| **u != self.self_user)
-                    .map(|u| self.user_name(u))
-                    .collect();
-                names.sort_by_cached_key(|name| name.to_lowercase());
-                names.join(", ")
-            }
-            ConversationKind::PublicChannel | ConversationKind::PrivateChannel => format!(
-                "# {}",
-                conversation
-                    .name
-                    .as_deref()
-                    .unwrap_or(conversation.id.as_str())
-            ),
-        }
-    }
-
-    /// A message authored now by the signed-in user (optimistic local echo).
-    pub fn local_message(
-        &self,
-        channel: &ChannelId,
-        text: String,
-        thread_ts: Option<Ts>,
-    ) -> Message {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        Message {
-            ts: Ts::new(format!("{}.{:06}", now.as_secs(), now.subsec_micros())),
-            thread_ts,
-            channel: Some(channel.clone()),
-            user: Some(self.self_user.clone()),
-            text,
-            ..Default::default()
-        }
-    }
 }
 
 /// Each conversation's newest history message, the fixture-mode [`Fixtures::latest`].
@@ -875,10 +238,10 @@ pub fn load() -> Fixtures {
         "U0KLA1".into(),
         "U0KLA2".into(),
     ];
-    let mut partner_extra = crate::blockkit::serde_json::Map::new();
+    let mut partner_extra = serde_json::Map::new();
     partner_extra.insert(
         "conversation_host_id".to_owned(),
-        crate::blockkit::serde_json::Value::String("T0KLARNA".to_owned()),
+        serde_json::Value::String("T0KLARNA".to_owned()),
     );
     partner.extra = partner_extra;
     channels.push(partner);
@@ -893,10 +256,9 @@ pub fn load() -> Fixtures {
         3,
     );
     let mut archive_properties = ConversationProperties::default();
-    archive_properties.extra.insert(
-        "is_dormant".to_owned(),
-        crate::blockkit::serde_json::Value::Bool(true),
-    );
+    archive_properties
+        .extra
+        .insert("is_dormant".to_owned(), serde_json::Value::Bool(true));
     archive.properties = Some(archive_properties);
     channels.push(archive);
 
@@ -1399,227 +761,46 @@ pub fn load() -> Fixtures {
         },
     ];
 
-    Fixtures {
-        workspaces,
-        teams,
-        self_user: "U0ME".into(),
-        users,
-        usergroups,
-        app_commands: Vec::new(),
-        channels,
-        dms,
-        messages,
-        latest,
-        threads,
-        directory,
-        archived: Vec::new(),
-        presence: Arc::new(RwLock::new(presence)),
-        bots: BotProfileMap::default(),
-        notify_levels: HashMap::from([(ChannelId::from("C0DESIGN"), NotifyLevel::Muted)]),
-        quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
-            .map(String::from)
-            .to_vec(),
-        frequent_emoji: Vec::new(),
-        skin_tone: 1,
-        thumbnails,
-        profile_extras,
-        custom_emoji,
-        block_images,
-        sample: true,
-        counts: HashMap::new(),
-        sections: Vec::new(),
-        real_names: false,
-        real_names_in_mentions: false,
-        collapsed_sections: HashSet::new(),
-        palette: None,
-        status_presets: Vec::new(),
-        user_index: OnceLock::new(),
-        conv_index: OnceLock::new(),
-        team_index: OnceLock::new(),
-    }
-}
-
-/// The signed-in workspace as the local store has it (live mode): its conversations and people.
-/// History is not part of the snapshot (the message list loads it per conversation,
-/// [`crate::bridge::CoreBridge::history`]); only each DM's latest message rides along, one
-/// batched store query feeding the DM list.
-pub fn live(
-    session: &Session,
-    store: &Store,
-    counts: &HashMap<ChannelId, ConversationCounts>,
-) -> Fixtures {
-    let team = &session.team_id;
-    let conversations = store.conversations(team).unwrap_or_else(|e| {
-        eprintln!("slackless: could not read conversations from the local store ({e})");
-        Vec::new()
-    });
-    let users = store.users(team).unwrap_or_else(|e| {
-        eprintln!("slackless: could not read people from the local store ({e})");
-        Vec::new()
-    });
-    // Archived conversations never list; archived channels stay nameable.
-    let (archived, conversations): (Vec<_>, Vec<_>) =
-        conversations.into_iter().partition(|c| c.is_archived);
-    let archived: Vec<Conversation> = archived
-        .into_iter()
-        .filter(|c| !matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim))
-        .collect();
-    let (dms, rooms): (Vec<_>, Vec<_>) = conversations
-        .into_iter()
-        .map(|mut c| {
-            // `client.userBoot` omits read cursors; `client.counts` has them.
-            if let Some(read) = counts.get(&c.id).and_then(|n| n.last_read.clone()) {
-                c.last_read = Some(read);
-            }
-            c
-        })
-        .partition(|c| matches!(c.kind(), ConversationKind::Im | ConversationKind::Mpim));
-    // Sidebar membership: `client.counts` lists exactly the sidebar's conversations hosted in
-    // this workspace; until counts arrive, every stored channel is listed. Membership
-    // (`users.conversations`) also covers channels joined since, but over-reports Slack Connect
-    // channels the sidebar leaves out, so a shared channel needs counts too - unless another
-    // organization hosts it, as it then never appears in this workspace's counts.
-    let hosted_elsewhere = |c: &Conversation| {
-        c.extra
-            .get("conversation_host_id")
-            .and_then(|host| host.as_str())
-            .is_some_and(|host| host != team.as_str())
-    };
-    let (channels, directory) = rooms.into_iter().partition(|c| {
-        counts.is_empty()
-            || counts.contains_key(&c.id)
-            || (c.is_member && (!c.is_ext_shared || hosted_elsewhere(c)))
-    });
-    let dms: Vec<Conversation> = dms
-        .into_iter()
-        .filter(|c| c.kind() == ConversationKind::Mpim || c.is_open)
-        .collect();
-    // Each DM's latest top-level message in one query: the DM list's previews, stamps and
-    // order without loading any history.
-    let latest = store
-        .latest_messages(
-            team,
-            &dms.iter().map(|dm| dm.id.clone()).collect::<Vec<_>>(),
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("slackless: could not read latest DM messages from the local store ({e})");
-            HashMap::new()
-        })
-        .into_iter()
-        // Like Slack, a deleted message never previews: the store skips it for the one before.
-        .map(|(id, stored)| (id, stored.message))
-        .collect();
-    let domain = session
-        .workspace_url
-        .trim_start_matches("https://")
-        .trim_end_matches('/')
-        .trim_end_matches(".slack.com")
-        .to_owned();
-    let workspace = store
-        .team(team)
-        .ok()
-        .flatten()
-        .filter(|stored| !stored.name.is_empty())
-        .unwrap_or_else(|| Team {
-            id: team.clone(),
-            name: domain.clone(),
-            domain,
-            ..Default::default()
-        });
-    // The own team first, then the connected organizations Slack Connect channels resolved
-    // (`team.info` records stored beside it). A read failure keeps the own record alone.
-    let mut teams = store.teams(team).unwrap_or_default();
-    if !teams.iter().any(|stored| stored.id == *team) {
-        teams.insert(0, workspace.clone());
-    }
-    let sections = store.sections(team).unwrap_or_else(|e| {
-        eprintln!("slackless: could not read sidebar sections from the local store ({e})");
-        Vec::new()
-    });
-    let custom_emoji: BTreeMap<String, EmojiImage> = store
-        .custom_emoji(team)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, url)| (name, EmojiImage::Url(url.into())))
-        .collect();
-    let prefs = store.prefs(team).ok().flatten().unwrap_or_default();
-    let frequent_emoji =
-        crate::emoji::frequent_from_prefs(&prefs, |name| custom_emoji.contains_key(name));
-    // Per-section sidebar state, kept as JSON text in the `channel_sections` pref:
-    // `"c": "1"` marks a collapsed section.
-    let collapsed_sections = prefs
-        .get("channel_sections")
-        .and_then(Json::as_str)
-        .and_then(|text| crate::blockkit::serde_json::from_str::<Json>(text).ok())
-        .and_then(|sections| {
-            let sections = sections.as_object()?;
-            Some(
-                sections
-                    .iter()
-                    .filter(|(_, state)| state.get("c").and_then(Json::as_str) == Some("1"))
-                    .map(|(id, _)| id.clone())
-                    .collect(),
-            )
-        })
-        .unwrap_or_default();
-    // Slack's name settings: the user's override (1 on, -1 off), 0 follows the team's.
-    let name_setting = |user_override: &str, team_key: &str| match prefs
-        .get(user_override)
-        .and_then(Json::as_i64)
-        .unwrap_or(0)
-    {
-        1 => true,
-        -1 => false,
-        _ => workspace
-            .extra
-            .get("prefs")
-            .and_then(|prefs| prefs.get(team_key))
-            .and_then(|flag| flag.as_bool().or_else(|| flag.as_i64().map(|n| n != 0)))
-            .unwrap_or(false),
-    };
-    let real_names = name_setting("display_real_names_override", "display_real_names");
-    let real_names_in_mentions = name_setting(
-        "mentions_real_names_override",
-        "display_real_names_in_mentions",
-    );
-    let status_presets = status_presets_from_prefs(&workspace.extra, &prefs);
-    let cached_bots = store.bot_profiles(team).unwrap_or_default();
-    Fixtures {
-        workspaces: vec![workspace],
-        teams,
-        self_user: session.user_id.clone(),
-        users,
-        usergroups: Vec::new(),
-        app_commands: Vec::new(),
-        channels,
-        dms,
-        messages: HashMap::new(),
-        latest,
-        threads: HashMap::new(),
-        directory,
-        archived,
-        presence: PresenceMap::default(),
-        bots: Arc::new(RwLock::new(cached_bots)),
-        notify_levels: slackless_core::notify_levels(&prefs),
-        quick_reactions: quick_reactions(&prefs),
-        frequent_emoji,
-        skin_tone: crate::emoji::skin_tone_from_prefs(&prefs),
-        thumbnails: HashMap::new(),
-        profile_extras: HashMap::new(),
-        custom_emoji,
-        block_images: HashMap::new(),
-        sample: false,
-        counts: counts.clone(),
-        sections,
-        real_names,
-        real_names_in_mentions,
-        collapsed_sections,
-        palette: crate::theme::palette_from_prefs(&prefs),
-        status_presets,
-        user_index: OnceLock::new(),
-        conv_index: OnceLock::new(),
-        team_index: OnceLock::new(),
-    }
+    Fixtures::from_parts(
+        WorkspaceData {
+            workspaces,
+            teams,
+            self_user: "U0ME".into(),
+            users,
+            usergroups,
+            app_commands: Vec::new(),
+            channels,
+            dms,
+            messages,
+            latest,
+            threads,
+            directory,
+            archived: Vec::new(),
+            presence: Arc::new(RwLock::new(presence)),
+            bots: BotProfileMap::default(),
+            notify_levels: HashMap::from([(ChannelId::from("C0DESIGN"), NotifyLevel::Muted)]),
+            quick_reactions: crate::actions::DEFAULT_QUICK_REACTIONS
+                .map(String::from)
+                .to_vec(),
+            frequent_emoji: Vec::new(),
+            skin_tone: 1,
+            thumbnails,
+            profile_extras,
+            custom_emoji,
+            block_images,
+            sample: true,
+            sections: Vec::new(),
+            real_names: false,
+            real_names_in_mentions: false,
+            collapsed_sections: HashSet::new(),
+            palette: None,
+            status_presets: Vec::new(),
+            user_index: OnceLock::new(),
+            conv_index: OnceLock::new(),
+            team_index: OnceLock::new(),
+        },
+        HashMap::new(),
+    )
 }
 
 /// The fixtures of workspace `index` in [`Fixtures::workspaces`]: Acme Corp is [`load`], the
@@ -2049,59 +1230,4 @@ fn bullet_list(items: &[&str]) -> RichTextContainer {
         offset: None,
         border: None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn indexed_lookups_plain_text_and_with_counts_work() {
-        let fixtures = load();
-        assert_eq!(
-            fixtures
-                .user(&UserId::from("U0ALICE"))
-                .map(|u| u.name.as_str()),
-            Some("alice")
-        );
-        assert!(
-            fixtures
-                .conversation(&ChannelId::from("C0GENERAL"))
-                .is_some()
-        );
-        assert_eq!(
-            fixtures.plain_text(&msg(
-                "C0GENERAL",
-                1,
-                "U0ALICE",
-                "cc <@U0BOB> and <@U0CARA|cara> :rocket:"
-            )),
-            "cc @bob and @cara 🚀"
-        );
-        let updated = fixtures.with_counts(HashMap::from([(
-            ChannelId::from("C0GENERAL"),
-            ConversationCounts {
-                id: ChannelId::from("C0GENERAL"),
-                last_read: Some(Ts::from("1700000000.000100")),
-                has_unreads: true,
-                mention_count: 2,
-                latest: None,
-                ..Default::default()
-            },
-        )]));
-        assert_eq!(
-            updated
-                .conversation(&ChannelId::from("C0GENERAL"))
-                .and_then(|c| c.last_read.as_ref())
-                .map(Ts::as_str),
-            Some("1700000000.000100")
-        );
-        assert_eq!(
-            updated
-                .counts
-                .get(&ChannelId::from("C0GENERAL"))
-                .map(|c| c.mention_count),
-            Some(2)
-        );
-    }
 }

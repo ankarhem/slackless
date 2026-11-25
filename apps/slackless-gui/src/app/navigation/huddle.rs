@@ -5,13 +5,7 @@ use super::super::*;
 impl App {
     /// Slack's huddle link for the open conversation (its web client runs the call).
     pub(in crate::app) fn huddle_link(&self) -> String {
-        let team = self
-            .fixtures
-            .workspaces
-            .first()
-            .map(|team| team.id.to_string())
-            .unwrap_or_default();
-        format!("https://app.slack.com/huddle/{team}/{}", self.channel)
+        crate::huddle_video::huddle_browser_url(&self.fixtures, &self.channel, None)
     }
 
     /// The header's huddle button: toggles the sample huddle bar/dock in sample mode, or starts /
@@ -515,18 +509,20 @@ impl App {
         });
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Huddle {
-                source: dock.downgrade(),
-                on_jump,
-                on_open_canvas,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Huddle {
+                    source: dock.downgrade(),
+                    on_jump,
+                    on_open_canvas,
+                },
+                title,
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: None,
+                display_id,
             },
-            title,
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            None,
-            display_id,
             cx,
         );
     }
@@ -633,7 +629,7 @@ impl App {
     pub(in crate::app) fn show_huddles(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         let fixtures = self.fixtures.clone();
-        if let Some(store) = self.bridge.store().cloned() {
+        if let Some(store) = self.bridge.read_store_clone() {
             // Live mode: keep cached rows visible while refreshing from SQLite.
             self.huddles
                 .update(cx, |view, cx| view.begin_live_load(fixtures, cx));
@@ -659,7 +655,7 @@ impl App {
                 .update(cx, |view, cx| view.show_local(&fixtures, cx));
         }
         self.close_full_column_views(cx);
-        self.huddles_open = true;
+        self.page = MainPage::Huddles;
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Huddles), cx)
         });

@@ -253,18 +253,23 @@ impl PopoutWindow {
     }
 
     fn close_huddle_popovers(&mut self) {
-        self.huddle_invite_open = false;
-        self.huddle_devices_open = false;
-        self.huddle_camera_open = false;
-        self.huddle_share_open = false;
-        self.huddle_reactions_open = false;
-        self.huddle_theme_open = false;
-        self.huddle_more_open = false;
-        self.huddle_music_open = false;
+        self.huddle_popover = None;
+    }
+
+    fn toggle_huddle_popover(&mut self, popover: HuddlePopover) -> bool {
+        if self.huddle_popover == Some(popover) {
+            self.huddle_popover = None;
+            false
+        } else {
+            self.huddle_popover = Some(popover);
+            true
+        }
     }
 
     fn close_share_modal(&mut self, cx: &mut Context<Self>) {
-        self.huddle_share_open = false;
+        if self.huddle_popover == Some(HuddlePopover::Share) {
+            self.huddle_popover = None;
+        }
         for (_, img) in self.huddle_screen_thumbs.drain() {
             cx.drop_image(img, None);
         }
@@ -286,7 +291,7 @@ impl PopoutWindow {
                 .spawn(async move { capture_screen_thumbnails(monitors_only, 360, 224) })
                 .await;
             let _ = win.update(cx, |win: &mut PopoutWindow, cx| {
-                if !win.huddle_share_open {
+                if win.huddle_popover != Some(HuddlePopover::Share) {
                     return;
                 }
                 for (id, frame) in frames {
@@ -427,11 +432,11 @@ impl PopoutWindow {
             .px_5()
             .py_4()
             .gap_3()
-            .when(self.huddle_music_open, |el| {
+            .when(self.huddle_popover == Some(HuddlePopover::Music), |el| {
                 el.on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.huddle_music_open = false;
+                        this.close_huddle_popovers();
                         cx.notify();
                     }),
                 )
@@ -660,14 +665,7 @@ impl PopoutWindow {
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape"
                         && (this.huddle_topic_editing.take().is_some()
-                            || this.huddle_share_open
-                            || this.huddle_camera_open
-                            || this.huddle_reactions_open
-                            || this.huddle_theme_open
-                            || this.huddle_more_open
-                            || this.huddle_music_open
-                            || this.huddle_invite_open
-                            || this.huddle_devices_open
+                            || this.huddle_popover.is_some()
                             || this.huddle_drawer.take().is_some())
                     {
                         this.close_share_modal(cx);
@@ -713,7 +711,7 @@ impl PopoutWindow {
                         ),
                 )
             })
-            .when(self.huddle_share_open, |root| {
+            .when(self.huddle_popover == Some(HuddlePopover::Share), |root| {
                 root.child(self.render_huddle_share_modal(
                     snap.share_source_id.as_deref(),
                     &pal,

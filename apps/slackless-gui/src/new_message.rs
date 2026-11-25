@@ -30,7 +30,7 @@ use slackless_core::types::{ChannelId, UserId};
 use crate::compose_targets::{Picked, suggestion_rows, suggestions};
 use crate::composer::{Composer, ComposerEvent, PendingAttachment};
 use crate::fixtures::Fixtures;
-use crate::slash::{Invocation, SHRUG, SlashKind};
+use crate::slash::{Invocation, SlashKind};
 
 pub enum NewMessageEvent {
     Send {
@@ -122,8 +122,8 @@ impl NewMessageView {
                             // /shrug posts right away, like Slack's.
                             match invocation.command.map(|command| command.kind) {
                                 Some(SlashKind::Shrug) => {
-                                    let text = format!("{} {SHRUG}", invocation.args.trim());
-                                    this.send(MessageContent::plain(text.trim_start()), window, cx);
+                                    let text = crate::composer::format_shrug(&invocation.args);
+                                    this.send(MessageContent::plain(text), window, cx);
                                 }
                                 _ => cx.emit(NewMessageEvent::SlashCommand(invocation.clone())),
                             }

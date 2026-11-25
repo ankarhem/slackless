@@ -850,9 +850,8 @@ fn fixture_items(fixtures: &Fixtures) -> Vec<Item> {
         for message in history {
             let from_me = message.user.as_ref() == Some(me);
             if !from_me && mentions_user(message, me) {
-                let unread = conversation
-                    .last_read
-                    .as_ref()
+                let unread = fixtures
+                    .last_read(&conversation.id)
                     .is_none_or(|read| message.ts > *read);
                 items.push(Item {
                     kind: ActivityKind::Mention,

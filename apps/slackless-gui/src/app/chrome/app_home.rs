@@ -42,7 +42,7 @@ impl App {
         let Some(ts) = huddle_ts else {
             return;
         };
-        if self.thread_open
+        if self.right_pane.is_thread()
             && self.thread.read(cx).open_thread() == Some((huddle_channel.clone(), ts.clone()))
         {
             self.close_thread(cx);

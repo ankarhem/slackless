@@ -77,7 +77,9 @@ pub(super) fn subscribe_workspace(
                 SidebarEvent::OpenUnreads => this.open_unreads(window, cx),
                 SidebarEvent::OpenActivity => this.open_activity(cx),
                 SidebarEvent::LeftActivity => {
-                    this.activity_open = false;
+                    if this.page == MainPage::Activity {
+                        this.page = MainPage::Channel;
+                    }
                     cx.notify();
                 }
                 SidebarEvent::OpenFiles => this.open_files(cx),
@@ -181,7 +183,9 @@ pub(super) fn subscribe_workspace(
             window,
             |this: &mut App, _, event: &SearchEvent, window, cx| match event {
                 SearchEvent::Close => {
-                    this.searching = false;
+                    if this.page == MainPage::Search {
+                        this.page = MainPage::Channel;
+                    }
                     cx.notify();
                 }
                 SearchEvent::Open { channel, ts } => {
@@ -402,11 +406,13 @@ pub(super) fn subscribe_workspace(
                     when,
                 } => {
                     this.schedule_at(
-                        channel.clone(),
-                        Some(thread_ts.clone()),
-                        text.clone(),
-                        when.at(now_secs()),
-                        when.label().to_lowercase(),
+                        messaging::ScheduleSpec {
+                            channel: channel.clone(),
+                            thread_ts: Some(thread_ts.clone()),
+                            text: text.clone(),
+                            post_at: when.at(now_secs()),
+                            when_label: when.label().to_lowercase(),
+                        },
                         window,
                         cx,
                     );
@@ -455,15 +461,16 @@ pub(super) fn subscribe_workspace(
             |this: &mut App, _, event: &ProfileEvent, window, cx| match event {
                 // Slack's close shuts the whole pane, the thread under the profile too.
                 ProfileEvent::Close => {
-                    this.profile_open = false;
+                    this.set_right_pane(RightPane::None, cx);
                     this.close_thread(cx);
                     cx.notify();
                 }
                 ProfileEvent::Back => {
-                    this.profile_open = false;
-                    let root = this.thread.read(cx).open_thread().map(|(_, ts)| ts);
-                    this.messages
-                        .update(cx, |list, cx| list.set_open_thread(root, cx));
+                    if matches!(this.right_pane, RightPane::Profile { over_thread: true }) {
+                        this.set_right_pane(RightPane::Thread, cx);
+                    } else {
+                        this.set_right_pane(RightPane::None, cx);
+                    }
                     cx.notify();
                 }
                 ProfileEvent::Message(user) => {

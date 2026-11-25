@@ -94,15 +94,39 @@ pub(super) struct CodeBlockSpan {
     pub close_collapsed: bool,
 }
 
+/// Collect both fenced code blocks and inline code spans from a single `doc.parse()` pass
+/// so the composer backdrop does not re-parse the document twice per frame.
+pub(super) fn code_backdrop_spans(
+    doc: &Doc,
+    selection: &Range<usize>,
+    focused: bool,
+) -> (Vec<CodeBlockSpan>, Vec<Range<usize>>) {
+    let text = doc.text();
+    let parsed = doc.parse();
+    (
+        code_blocks_from_parsed(text, &parsed, selection, focused),
+        inline_code_spans_from_parsed(text, &parsed, selection, focused),
+    )
+}
+
 /// Collect all fenced code blocks in `doc` with their fence-collapse state for the current
 /// `selection` and `focused` state.
+#[cfg(test)]
 pub(super) fn code_blocks(
     doc: &Doc,
     selection: &Range<usize>,
     focused: bool,
 ) -> Vec<CodeBlockSpan> {
-    let text = doc.text();
     let parsed = doc.parse();
+    code_blocks_from_parsed(doc.text(), &parsed, selection, focused)
+}
+
+fn code_blocks_from_parsed(
+    text: &str,
+    parsed: &crate::editor::ParsedDoc,
+    selection: &Range<usize>,
+    focused: bool,
+) -> Vec<CodeBlockSpan> {
     let touches = |range: &Range<usize>| {
         focused && selection.end >= range.start && selection.start <= range.end
     };
@@ -148,13 +172,22 @@ pub(super) fn code_blocks(
 /// Visual byte ranges of inline `` `code` `` spans in `doc` for painting crisp rounded bordered
 /// pills in the composer backdrop (matching sent `.c-mrkdwn__code` pills). Uses `outer` when
 /// the caret reveals the backticks and `inner` when the backticks are collapsed.
+#[cfg(test)]
 pub(super) fn inline_code_spans(
     doc: &Doc,
     selection: &Range<usize>,
     focused: bool,
 ) -> Vec<Range<usize>> {
-    let text = doc.text();
     let parsed = doc.parse();
+    inline_code_spans_from_parsed(doc.text(), &parsed, selection, focused)
+}
+
+fn inline_code_spans_from_parsed(
+    text: &str,
+    parsed: &crate::editor::ParsedDoc,
+    selection: &Range<usize>,
+    focused: bool,
+) -> Vec<Range<usize>> {
     let touches = |range: &Range<usize>| {
         if !focused {
             return false;

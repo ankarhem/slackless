@@ -239,9 +239,7 @@ use gpui_kit::gpui::{
     actions, anchored, canvas, deferred, div, hsla, point, px, relative,
 };
 use slackless_core::api::{ChannelBookmark, ConversationCounts, FilesFilter, MessageContent};
-use slackless_core::platform::{
-    self, AttentionRequester, BadgeSetter, Notifier, SoundPlayer, StatusBarItem, StatusBarState,
-};
+use slackless_core::platform::{self, DesktopPlatform, StatusBarState};
 #[cfg(not(test))]
 use slackless_core::platform::{MouseNavDirection, StatusBarAction};
 use slackless_core::types::rich_text::BroadcastRange;
@@ -398,12 +396,9 @@ const PANEL_RADIUS: f32 = 6.;
 /// The thread / profile / pins panel, measured on Slack desktop.
 const FLEXPANE_WIDTH: Pixels = px(540.);
 
-/// The OS integration the root uses: system notifications, dock badge, attention bounce, sounds and menu-bar icon.
-trait Os: Notifier + BadgeSetter + SoundPlayer + StatusBarItem + AttentionRequester {}
-impl<T: Notifier + BadgeSetter + SoundPlayer + StatusBarItem + AttentionRequester> Os for T {}
-
 mod bootstrap;
 mod chrome;
+mod demo;
 mod dialogs;
 mod events;
 mod helpers;
@@ -417,12 +412,12 @@ use workspace::{build_workspace, subscribe_workspace};
 mod tests;
 
 use self::chrome::{corner_cap, joinable, shadow};
+use self::demo::demo;
 use self::helpers::{
-    broadcast_kind, convert_emoticons, demo, first_conversation, forget_failure, is_suspicious_url,
+    broadcast_kind, convert_emoticons, first_conversation, forget_failure, is_suspicious_url,
     mentions_me, parse_notification_target, parse_permalink, sync_launch_at_login,
     workspace_badge_from_counts,
 };
-pub(crate) use self::helpers::{default_custom_datetime, parse_local_schedule};
 
 /// The per-workspace views: rebuilt from that workspace's fixtures, parked while another
 /// workspace is shown.
@@ -549,13 +544,53 @@ pub(super) enum NavPlace {
     Tools,
 }
 
-/// Which right-hand panel was last closed by `ToggleRightPane` (`Cmd+.`) so pressing it
-/// again restores the same panel.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RightPane {
+/// Which top-level page currently owns the main column (mutually exclusive).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum MainPage {
+    #[default]
+    Channel,
+    Search,
+    Drafts,
+    Later,
+    Threads,
+    Unreads,
+    Huddles,
+    Directory,
+    Tools,
+    Compose,
+    Activity,
+    Files,
+}
+
+/// Which right-hand panel is open (mutually exclusive). `Profile { over_thread: true }`
+/// remembers an open thread underneath so clicking Back restores the thread.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum RightPane {
+    #[default]
+    None,
     Thread,
-    Profile,
+    Profile {
+        over_thread: bool,
+    },
     Pins,
+}
+
+impl RightPane {
+    pub(super) fn is_open(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub(super) fn is_thread(self) -> bool {
+        matches!(self, Self::Thread)
+    }
+
+    pub(super) fn is_profile(self) -> bool {
+        matches!(self, Self::Profile { .. })
+    }
+
+    pub(super) fn is_pins(self) -> bool {
+        matches!(self, Self::Pins)
+    }
 }
 
 pub struct App {
@@ -591,12 +626,14 @@ pub struct App {
     /// The search pill's dropdown; open while `search_menu_open`.
     search_menu: Entity<SearchMenu>,
     search_menu_open: bool,
-    /// Results of the last search; shown in place of the message column while `searching`.
+    /// Results of the last search; shown in place of the message column when `page == MainPage::Search`.
     results: Entity<SearchView>,
-    searching: bool,
     /// The channel browser, mounted in a dialog on demand.
     browser: Entity<ChannelBrowser>,
-    thread_open: bool,
+    /// Which top-level page currently owns the main column.
+    page: MainPage,
+    /// Which right-hand flexpane is currently open (thread, profile, or pins).
+    right_pane: RightPane,
     tab: ConversationTab,
     /// The fixture huddle's bar and the channel it runs in; `None` without a huddle.
     huddle: Option<(ChannelId, Entity<HuddleBar>)>,
@@ -625,10 +662,8 @@ pub struct App {
     color_mode: Option<AppearanceMode>,
     /// The full Preferences snapshot last persisted (`None` offline), avoiding redundant writes.
     saved_settings: Option<crate::preferences::Settings>,
-    /// The profile pane; shown in the right panel while `profile_open` (exclusive with the
-    /// thread panel).
+    /// The profile pane; shown in the right panel when `right_pane` is `RightPane::Profile`.
     profile: Entity<ProfilePanel>,
-    profile_open: bool,
     /// Last right-hand panel hidden by `ToggleRightPane` (`Cmd+.`), restored on the next toggle.
     last_right_pane: Option<RightPane>,
     /// The signed-in user's status, presence and notification pause.
@@ -655,43 +690,31 @@ pub struct App {
     image_viewer: Option<Entity<ImageViewer>>,
     /// Subscription for the active `image_viewer`; dropped on close/replace to avoid leaking.
     _viewer_sub: Option<Subscription>,
-    /// Drafts, scheduled and sent messages; shown in place of the message column while
-    /// `drafts_open`.
+    /// Drafts, scheduled and sent messages; shown when `page == MainPage::Drafts`.
     drafts: Entity<DraftsView>,
-    drafts_open: bool,
-    /// Saved messages and reminders; shown in place of the message column while `later_open`.
+    /// Saved messages and reminders; shown when `page == MainPage::Later`.
     later: Entity<LaterView>,
-    later_open: bool,
-    /// The Threads view; replaces the message column while `threads_open`.
+    /// The Threads view; shown when `page == MainPage::Threads`.
     threads: Entity<ThreadsView>,
-    threads_open: bool,
-    /// The All Unreads view (Slack's `p-unreads_view`); replaces the message column while
-    /// `unreads_open`.
+    /// The All Unreads view (Slack's `p-unreads_view`); shown when `page == MainPage::Unreads`.
     unreads: Entity<UnreadsView>,
-    unreads_open: bool,
     /// Channels already asked for a single-page history fetch from `refresh_unreads`, so an
     /// empty unread channel is fetched at most once per session.
     unreads_fetched: HashSet<ChannelId>,
     /// The Activity page (the rail's Activity destination): a full-width page right of the
-    /// rail - the sidebar's list column hides while the destination is active.
+    /// rail - the sidebar's list column hides while `page == MainPage::Activity`.
     activity: Entity<ActivityFeed>,
-    /// The rail's Activity destination is active (the page owns the main area).
-    activity_open: bool,
     /// The Files view (the rail's Files destination): the main-area page beside the
-    /// sidebar's Files list column, shown while that destination is active.
+    /// sidebar's Files list column, shown while `page == MainPage::Files`.
     files_page: Entity<FilesPage>,
-    /// The Huddles page; replaces the message column while `huddles_open`.
+    /// The Huddles page; shown when `page == MainPage::Huddles`.
     huddles: Entity<HuddlesView>,
-    huddles_open: bool,
-    /// The directory; replaces the message column while `directory_open`.
+    /// The directory; shown when `page == MainPage::Directory`.
     directory: Entity<DirectoryView>,
-    directory_open: bool,
-    /// Native `Agents & tools` view (Apps, Slash commands, Slack Connect).
+    /// Native `Agents & tools` view (Apps, Slash commands, Slack Connect); shown when `page == MainPage::Tools`.
     tools_page: Entity<crate::tools_page::ToolsPage>,
-    tools_open: bool,
-    /// The "New message" view; replaces the message column while `compose_open`.
+    /// The "New message" view; shown when `page == MainPage::Compose`.
     compose: Entity<NewMessageView>,
-    compose_open: bool,
     /// The channel details dialog's body, mounted in a dialog on demand.
     details: Entity<ChannelDetails>,
     /// Live: the open channel's member ids as the core last announced them
@@ -711,9 +734,6 @@ pub struct App {
     connect_orgs: Vec<channel_details::OrgLine>,
     /// A compose send waiting for its DM to open ([`Command::OpenDm`]).
     pending_dm: Option<MessageContent>,
-    /// The pinned-messages panel of the open conversation (right column, exclusive with the
-    /// thread and profile panels).
-    pins_open: bool,
     /// In-canvas Find field (`F-SHELL-266`).
     canvas_search: Entity<TextareaState>,
     /// Current in-canvas Find query.
@@ -729,7 +749,7 @@ pub struct App {
     /// Fixture mode: link bookmarks added through the add-link dialog, per channel.
     fixture_bookmarks: HashMap<ChannelId, Vec<bookmarks::Bookmark>>,
     /// Dock badge + native notifications + menu-bar status item (`slackless-platform`).
-    os: Rc<dyn Os>,
+    os: Rc<dyn DesktopPlatform>,
     /// Numeric badge count for window title ("N new items").
     badge: Option<u32>,
     /// The badge label last handed to the dock, so it is only set on change.
@@ -740,6 +760,8 @@ pub struct App {
     window_active: bool,
     /// Recently dispatched desktop notification tags (`F-SHELL-181` duplicate-notification guard).
     recent_notified_tags: Vec<(String, Instant)>,
+    /// Main window handle, used to update the OS window title on state changes outside `render`.
+    window_handle: gpui::AnyWindowHandle,
     /// The window title last set, so it is only set on change.
     window_title: String,
     /// The pending, debounced save of the window frame (replacing it cancels the last one).

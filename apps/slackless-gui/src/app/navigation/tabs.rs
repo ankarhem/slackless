@@ -56,15 +56,13 @@ impl App {
     /// column; live mode fetches the tab's data each time it opens.
     pub(in crate::app) fn select_tab(&mut self, target: ConversationTab, cx: &mut Context<Self>) {
         if target == ConversationTab::Pins && self.tab == ConversationTab::Pins {
-            self.pins_open = false;
+            self.set_right_pane(RightPane::None, cx);
             self.tab = ConversationTab::Messages;
             cx.notify();
             return;
         }
         if target == ConversationTab::Pins {
-            self.pins_open = true;
-            self.close_thread(cx);
-            self.profile_open = false;
+            self.set_right_pane(RightPane::Pins, cx);
         }
         self.load_tab_data(&target);
         self.tab = target;
@@ -248,18 +246,20 @@ impl App {
         let on_jump = self.popout_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Conversation {
-                channel,
-                source: self.messages.downgrade(),
-                on_jump,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Conversation {
+                    channel,
+                    source: self.messages.downgrade(),
+                    on_jump,
+                },
+                title,
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: Some((self.later.downgrade(), self.workspace)),
+                display_id,
             },
-            title,
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            Some((self.later.downgrade(), self.workspace)),
-            display_id,
             cx,
         );
     }
@@ -276,19 +276,21 @@ impl App {
         let on_jump = self.popout_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Thread {
-                channel,
-                thread_ts,
-                source: self.messages.downgrade(),
-                on_jump,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Thread {
+                    channel,
+                    thread_ts,
+                    source: self.messages.downgrade(),
+                    on_jump,
+                },
+                title,
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: Some((self.later.downgrade(), self.workspace)),
+                display_id,
             },
-            title,
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            Some((self.later.downgrade(), self.workspace)),
-            display_id,
             cx,
         );
     }
@@ -298,17 +300,19 @@ impl App {
         let on_jump = self.popout_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Activity {
-                source: self.activity.downgrade(),
-                on_jump,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Activity {
+                    source: self.activity.downgrade(),
+                    on_jump,
+                },
+                title: "Activity".to_owned(),
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: None,
+                display_id,
             },
-            "Activity".to_owned(),
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            None,
-            display_id,
             cx,
         );
     }
@@ -318,17 +322,19 @@ impl App {
         let on_jump = self.popout_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Later {
-                source: self.later.downgrade(),
-                on_jump,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Later {
+                    source: self.later.downgrade(),
+                    on_jump,
+                },
+                title: "Saved".to_owned(),
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: None,
+                display_id,
             },
-            "Saved".to_owned(),
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            None,
-            display_id,
             cx,
         );
     }
@@ -346,19 +352,21 @@ impl App {
         let on_jump = self.popout_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Canvas {
-                doc,
-                file_id,
-                open_browser_url,
-                on_jump,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Canvas {
+                    doc,
+                    file_id,
+                    open_browser_url,
+                    on_jump,
+                },
+                title,
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: None,
+                display_id,
             },
-            title,
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            None,
-            display_id,
             cx,
         );
     }
@@ -368,17 +376,19 @@ impl App {
         let on_jump = self.popout_jump_handler(window, cx);
         let display_id = window.display(cx).map(|d| d.id());
         crate::popout::open_popout(
-            crate::popout::PopoutKind::Files {
-                source: self.files_page.downgrade(),
-                on_jump,
+            crate::popout::PopoutRequest {
+                kind: crate::popout::PopoutKind::Files {
+                    source: self.files_page.downgrade(),
+                    on_jump,
+                },
+                title: "Files".to_owned(),
+                fixtures: self.fixtures.clone(),
+                store: self.bridge.read_store_clone(),
+                team: self.bridge.team_id().cloned(),
+                send: self.bridge.forwarder(),
+                later_sync: None,
+                display_id,
             },
-            "Files".to_owned(),
-            self.fixtures.clone(),
-            self.bridge.store().cloned(),
-            self.bridge.team_id().cloned(),
-            self.bridge.forwarder(),
-            None,
-            display_id,
             cx,
         );
     }

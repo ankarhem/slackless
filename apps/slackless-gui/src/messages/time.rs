@@ -1,9 +1,9 @@
 //! Local-time & civil-calendar formatting (zero chrono/time dependency; cached `localtime_r`).
 
 use std::cell::RefCell;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use slackless_core::types::Ts;
+use slackless_core::types::time as core_time;
 
 use super::MONTHS;
 
@@ -45,12 +45,7 @@ impl CivilTime {
     }
 
     pub(super) fn now() -> Self {
-        Self::from_unix(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs() as i64)
-                .unwrap_or(0),
-        )
+        Self::from_unix(now_secs())
     }
 }
 
@@ -85,10 +80,36 @@ pub(super) fn format_clock_with(ts: &Ts, clock_24h: bool) -> String {
 
 /// Current Unix seconds.
 pub(crate) fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0)
+    core_time::now_epoch_secs()
+}
+
+/// Default `(YYYY-MM-DD, HH:MM)` local strings ~1 hour from now for custom schedule/reminder dialogs.
+pub(crate) fn default_custom_datetime() -> (String, String) {
+    let local = now_secs() + local_offset_now() + 3_600;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    (
+        format!("{y:04}-{m:02}-{d:02}"),
+        format!("{:02}:{:02}", secs / 3_600, (secs % 3_600) / 60),
+    )
+}
+
+/// Parse a local `YYYY-MM-DD` date and `HH:MM` (24-hour) time into a future unix timestamp.
+pub(crate) fn parse_local_schedule(date_str: &str, time_str: &str) -> Option<u64> {
+    let date = slackless_core::store::Date::parse(date_str)?;
+    let (h_str, m_str) = time_str.split_once(':')?;
+    let hour: i64 = h_str.trim().parse().ok()?;
+    let min: i64 = m_str.trim().parse().ok()?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&min) {
+        return None;
+    }
+    let naive_utc = date.unix_start() + hour * 3_600 + min * 60;
+    let approx_utc = naive_utc - local_offset_now();
+    let offset = local_utc_offset(approx_utc);
+    let utc = naive_utc - offset;
+    let now = now_secs();
+    (utc > now + 30).then_some(utc as u64)
 }
 
 /// `3:42 PM` for `secs` on this machine's clock, or in the zone `utc_offset` seconds from UTC.
@@ -340,7 +361,7 @@ pub fn set_timezone_override(offset_secs: Option<i64>) {
 /// Cached per UTC hour in thread-local storage to avoid locking libc's global timezone mutex on
 /// every visible message row per frame.
 #[cfg(unix)]
-pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
+pub(crate) fn local_utc_offset(unix_secs: i64) -> i64 {
     let manual = load_timezone_override();
     if manual != i64::MIN {
         return manual;
@@ -358,50 +379,16 @@ pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
     }) {
         return cached;
     }
-    /// `struct tm` as laid out by glibc and Darwin: nine `int` fields then
-    /// `tm_gmtoff`/`tm_zone`.
-    #[repr(C)]
-    struct Tm {
-        tm_sec: i32,
-        tm_min: i32,
-        tm_hour: i32,
-        tm_mday: i32,
-        tm_mon: i32,
-        tm_year: i32,
-        tm_wday: i32,
-        tm_yday: i32,
-        tm_isdst: i32,
-        tm_gmtoff: i64,
-        tm_zone: *const i8,
-    }
-    unsafe extern "C" {
-        fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
-    }
-    let mut tm = Tm {
-        tm_sec: 0,
-        tm_min: 0,
-        tm_hour: 0,
-        tm_mday: 0,
-        tm_mon: 0,
-        tm_year: 0,
-        tm_wday: 0,
-        tm_yday: 0,
-        tm_isdst: 0,
-        tm_gmtoff: 0,
-        tm_zone: std::ptr::null(),
-    };
-    // SAFETY: `tm` is a valid, fully initialized `struct tm` owned by this call, and `unix_secs`
-    // outlives it.
-    let ok = unsafe { !localtime_r(&unix_secs, &mut tm).is_null() };
-    let offset = if ok {
-        tm.tm_gmtoff
-    } else {
-        // The rest of `struct tm` exists for the C ABI; reading it keeps every field live.
-        let _ = (
-            tm.tm_sec, tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon, tm.tm_year,
-        );
-        let _ = (tm.tm_wday, tm.tm_yday, tm.tm_isdst, tm.tm_zone);
-        0
+    let time_val: libc::time_t = unix_secs as libc::time_t;
+    // SAFETY: `libc::tm` is a C POD struct zero-initialized before passing to `localtime_r`,
+    // and `time_val` outlives the call.
+    let offset = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&raw const time_val, &raw mut tm).is_null() {
+            tm.tm_gmtoff
+        } else {
+            0
+        }
     };
     OFFSET_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -414,7 +401,7 @@ pub(super) fn local_utc_offset(unix_secs: i64) -> i64 {
 }
 
 #[cfg(not(unix))]
-pub(super) fn local_utc_offset(_unix_secs: i64) -> i64 {
+pub(crate) fn local_utc_offset(_unix_secs: i64) -> i64 {
     let manual = load_timezone_override();
     if manual != i64::MIN {
         return manual;
@@ -424,21 +411,7 @@ pub(super) fn local_utc_offset(_unix_secs: i64) -> i64 {
 
 /// (year, month, day) from days since the Unix epoch (proleptic Gregorian).
 pub(super) fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = (z - era * 146_097) as u64;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_shift = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_shift + 2) / 5 + 1) as u32;
-    let month = if month_shift < 10 {
-        month_shift + 3
-    } else {
-        month_shift - 9
-    } as u32;
-    ((year + i64::from(month <= 2)) as i32, month, day)
+    core_time::civil_from_days(days)
 }
 
 #[cfg(test)]

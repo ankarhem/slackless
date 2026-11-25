@@ -189,7 +189,7 @@ impl SelectableParagraph {
             self.link,
             cx,
         ) {
-            eprintln!("slackless: could not paint the {icon} icon ({e})");
+            tracing::warn!(icon = %icon, error = %e, "could not paint icon");
         }
     }
 
@@ -303,7 +303,6 @@ impl SelectableParagraph {
     /// The paragraph's link interactions: the pointing cursor over a link, the hover
     /// underline (with a redraw when the hovered link changes) and the click — a press and
     /// a release inside one link range, so a drag that selects never activates the link.
-    #[allow(clippy::too_many_arguments)]
     fn paint_links(
         &self,
         global_id: Option<&GlobalElementId>,

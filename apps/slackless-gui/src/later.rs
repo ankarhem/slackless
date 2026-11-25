@@ -38,14 +38,18 @@ const DAY: u64 = 86_400;
 const HOUR: u64 = 3_600;
 const MINUTE: u64 = 60;
 
-/// Open a local date/time dialog for setting a custom reminder due time (`YYYY-MM-DD`, `HH:MM`).
-pub fn open_custom_remind_dialog(
+/// Open a local date/time dialog (`YYYY-MM-DD`, `HH:MM`) shared by custom reminders and
+/// custom message scheduling.
+pub fn open_custom_datetime_dialog(
+    title: &'static str,
+    subtitle: &'static str,
+    confirm_label: &'static str,
     window: &mut Window,
     cx: &mut App,
-    on_confirm: impl Fn(u64, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(u64, String, String, &mut Window, &mut App) + 'static,
 ) {
     let on_confirm = std::rc::Rc::new(on_confirm);
-    let (default_date, default_time) = crate::app::default_custom_datetime();
+    let (default_date, default_time) = crate::messages::default_custom_datetime();
     let date_state = cx.new(|cx| {
         let mut s = TextareaState::new(window, cx)
             .placeholder("YYYY-MM-DD")
@@ -66,16 +70,11 @@ pub fn open_custom_remind_dialog(
         let (muted, bg) = (theme.muted_foreground, theme.background);
         let (date_state, time_state, on_confirm) =
             (date_state.clone(), time_state.clone(), on_confirm.clone());
-        dialog.title("Set a custom reminder").w(px(400.)).child(
+        dialog.title(title).w(px(400.)).child(
             v_flex()
                 .gap_3()
                 .p_4()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Enter a local date (YYYY-MM-DD) and 24-hour time (HH:MM)."),
-                )
+                .child(div().text_xs().text_color(muted).child(subtitle))
                 .child(
                     h_flex()
                         .gap_2()
@@ -118,7 +117,7 @@ pub fn open_custom_remind_dialog(
                         .gap_2()
                         .child(
                             crate::preferences::form_button(
-                                Button::new("remind-custom-cancel")
+                                Button::new("custom-datetime-cancel")
                                     .outline()
                                     .label("Cancel"),
                                 cx,
@@ -127,15 +126,15 @@ pub fn open_custom_remind_dialog(
                         )
                         .child(
                             crate::preferences::form_button(
-                                Button::new("remind-custom-save")
+                                Button::new("custom-datetime-save")
                                     .primary()
-                                    .label("Set reminder"),
+                                    .label(confirm_label),
                                 cx,
                             )
                             .on_click(move |_, window, cx| {
-                                let d = date_state.read(cx).value().to_string();
-                                let t = time_state.read(cx).value().to_string();
-                                let Some(at) = crate::app::parse_local_schedule(&d, &t) else {
+                                let d = date_state.read(cx).value().trim().to_owned();
+                                let t = time_state.read(cx).value().trim().to_owned();
+                                let Some(at) = crate::messages::parse_local_schedule(&d, &t) else {
                                     crate::actions::notify(
                                         "Invalid date or time",
                                         "Use YYYY-MM-DD and HH:MM in the future.",
@@ -145,12 +144,28 @@ pub fn open_custom_remind_dialog(
                                     return;
                                 };
                                 window.close_dialog(cx);
-                                on_confirm(at, window, cx);
+                                on_confirm(at, d, t, window, cx);
                             }),
                         ),
                 ),
         )
     });
+}
+
+/// Open a local date/time dialog for setting a custom reminder due time (`YYYY-MM-DD`, `HH:MM`).
+pub fn open_custom_remind_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    on_confirm: impl Fn(u64, &mut Window, &mut App) + 'static,
+) {
+    open_custom_datetime_dialog(
+        "Set a custom reminder",
+        "Enter a local date (YYYY-MM-DD) and 24-hour time (HH:MM).",
+        "Set reminder",
+        window,
+        cx,
+        move |at, _, _, window, cx| on_confirm(at, window, cx),
+    );
 }
 
 /// The "Remind me about this" presets offered on messages and Later items.
@@ -182,14 +197,22 @@ impl Remind {
         }
     }
 
-    /// Due time in unix seconds, counted from `now` (UTC in fixture mode).
+    /// Due time in unix seconds, counted from `now` at 09:00 local time for multi-day presets.
     pub fn at(self, now: u64) -> u64 {
+        let local_9am_days_ahead = |days_ahead: i64| {
+            let now_i = now as i64;
+            let off_now = crate::messages::local_utc_offset(now_i);
+            let local_day = (now_i + off_now).div_euclid(DAY as i64);
+            let target_local = (local_day + days_ahead) * (DAY as i64) + 9 * (HOUR as i64);
+            let off_target = crate::messages::local_utc_offset(target_local - off_now);
+            (target_local - off_target).max(0) as u64
+        };
         match self {
             Remind::InTwentyMinutes => now + 20 * MINUTE,
             Remind::InOneHour => now + HOUR,
             Remind::InThreeHours => now + 3 * HOUR,
-            Remind::Tomorrow => (now / DAY + 1) * DAY + 9 * HOUR,
-            Remind::NextWeek => (now / DAY + 7) * DAY + 9 * HOUR,
+            Remind::Tomorrow => local_9am_days_ahead(1),
+            Remind::NextWeek => local_9am_days_ahead(7),
         }
     }
 }
@@ -1107,8 +1130,29 @@ mod tests {
         assert_eq!(Remind::InTwentyMinutes.at(base), base + 20 * MINUTE);
         assert_eq!(Remind::InOneHour.at(base), base + HOUR);
         assert_eq!(Remind::InThreeHours.at(base), base + 3 * HOUR);
-        assert_eq!(Remind::Tomorrow.at(base), 11 * DAY + 9 * HOUR);
-        assert_eq!(Remind::NextWeek.at(base), 17 * DAY + 9 * HOUR);
+
+        let tomorrow = Remind::Tomorrow.at(base);
+        let next_week = Remind::NextWeek.at(base);
+        let t_off = crate::messages::local_utc_offset(tomorrow as i64);
+        let w_off = crate::messages::local_utc_offset(next_week as i64);
+        assert_eq!(
+            (tomorrow as i64 + t_off).rem_euclid(DAY as i64),
+            9 * HOUR as i64
+        );
+        assert_eq!(
+            (next_week as i64 + w_off).rem_euclid(DAY as i64),
+            9 * HOUR as i64
+        );
+        let base_day =
+            (base as i64 + crate::messages::local_utc_offset(base as i64)).div_euclid(DAY as i64);
+        assert_eq!(
+            (tomorrow as i64 + t_off).div_euclid(DAY as i64),
+            base_day + 1
+        );
+        assert_eq!(
+            (next_week as i64 + w_off).div_euclid(DAY as i64),
+            base_day + 7
+        );
     }
 
     #[gpui::test]
@@ -1224,5 +1268,38 @@ mod tests {
             assert_eq!(v.in_progress_count(), 0);
             assert_eq!(v.saved_in(1).len(), 1);
         });
+    }
+
+    #[test]
+    fn remind_tomorrow_and_next_week_schedule_at_local_9am() {
+        struct ResetTz;
+        impl Drop for ResetTz {
+            fn drop(&mut self) {
+                crate::messages::set_timezone_override(None);
+            }
+        }
+        let _reset = ResetTz;
+
+        // 2026-06-15 02:00:00 UTC
+        let base_utc =
+            (slackless_core::types::time::days_from_civil(2026, 6, 15) * 86_400 + 2 * 3_600) as u64;
+
+        // In UTC+02:00 (Stockholm CEST), 02:00 UTC is 04:00 local on June 15.
+        // Tomorrow 09:00 local = June 16 07:00 UTC; NextWeek = June 22 07:00 UTC.
+        crate::messages::set_timezone_override(Some(2 * 3_600));
+        let expected_tomorrow_cest =
+            (slackless_core::types::time::days_from_civil(2026, 6, 16) * 86_400 + 7 * 3_600) as u64;
+        let expected_next_week_cest =
+            (slackless_core::types::time::days_from_civil(2026, 6, 22) * 86_400 + 7 * 3_600) as u64;
+        assert_eq!(Remind::Tomorrow.at(base_utc), expected_tomorrow_cest);
+        assert_eq!(Remind::NextWeek.at(base_utc), expected_next_week_cest);
+
+        // In UTC-07:00 (PDT), 02:00 UTC on June 15 is 19:00 local on June 14.
+        // Tomorrow 09:00 local = June 15 09:00 PDT = June 15 16:00 UTC.
+        crate::messages::set_timezone_override(Some(-7 * 3_600));
+        let expected_tomorrow_pdt = (slackless_core::types::time::days_from_civil(2026, 6, 15)
+            * 86_400
+            + 16 * 3_600) as u64;
+        assert_eq!(Remind::Tomorrow.at(base_utc), expected_tomorrow_pdt);
     }
 }

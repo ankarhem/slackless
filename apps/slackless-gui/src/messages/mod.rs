@@ -42,7 +42,7 @@ use slackless_core::api::MessageContent;
 use slackless_core::types::{Block, ChannelId, Message, MessageSubtype, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
-use crate::blockkit::{self, BlockDispatch, BlockKitState, KitCx};
+use crate::blockkit::{self, BlockKitState, KitCx};
 use crate::composer::{Composer, ComposerEvent};
 use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
@@ -60,15 +60,17 @@ use render::{
     CivilTime, card_stamp, date_label, day_index, format_clock, format_clock_with, message_body,
 };
 pub(crate) use render::{
-    clock, day_and_time, day_label, file_day, hex_color, iso_date, list_stamp, local_offset_now,
-    mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs, render_block, selectable_code,
-    short_date, unescape,
+    clock, day_and_time, day_label, expand_shortcodes_in_text, file_day, hex_color, iso_date,
+    list_stamp, local_offset_now, mrkdwn, mrkdwn_preview, mrkdwn_with_verbatim, now_secs,
+    render_block, selectable_code, short_date, unescape,
 };
 use rows::transcript_row;
 pub use rows::{Jump, message_row, message_row_linked};
 pub(crate) use rows::{editing_avatar, reply_bar, same_group};
-pub(crate) use time::day_and_time_with;
 pub use time::set_timezone_override;
+pub(crate) use time::{
+    day_and_time_with, default_custom_datetime, local_utc_offset, parse_local_schedule,
+};
 #[cfg(test)]
 mod tests;
 
@@ -160,23 +162,8 @@ pub(crate) const THEME_ORDER_STRIDE: u64 = 4096;
 /// room for the paragraphs inside the message. The transcript reads top-down in
 /// chronological order, so `ts` order is reading order; the shift keeps paragraphs of
 /// adjacent messages from interleaving. See [`SelectableParagraph`].
-/// A timestamp 1 microsecond before `ts`, used as the `conversations.mark` cursor when
-/// marking the oldest loaded message unread.
-fn ts_just_before(ts: &Ts) -> Ts {
-    let Some((secs, frac)) = ts.as_str().split_once('.') else {
-        return Ts::new("0.000000");
-    };
-    let (Ok(secs), Ok(micros)) = (secs.parse::<u64>(), frac.parse::<u64>()) else {
-        return Ts::new("0.000000");
-    };
-    if micros > 0 {
-        Ts::new(format!("{secs}.{:06}", micros - 1))
-    } else if secs > 0 {
-        Ts::new(format!("{}.999999", secs - 1))
-    } else {
-        Ts::new("0.000000")
-    }
-}
+use crate::threads_cards::ts_just_before;
+pub(crate) use render::unescape_cow;
 
 pub(crate) fn message_order(ts: &Ts) -> u64 {
     /// `ts` (`secs.micros`) as milliseconds.
@@ -230,7 +217,7 @@ pub enum MessageListEvent {
     /// clicked: the root opens the image viewer over `images`, at `index`.
     OpenImage {
         channel: ChannelId,
-        images: Arc<Vec<image_viewer::ViewerImage>>,
+        images: Rc<Vec<image_viewer::ViewerImage>>,
         index: usize,
     },
     /// Forward this message (its permalink): the root opens New message with it drafted.
@@ -418,9 +405,7 @@ impl MessageList {
                     fixtures: fixtures.clone(),
                     channel: channel.clone(),
                     messages: history,
-                    last_read: fixtures
-                        .conversation(&channel)
-                        .and_then(|conversation| conversation.last_read.clone()),
+                    last_read: fixtures.last_read(&channel).cloned(),
                     first_unread_ix: None,
                     kit,
                     saved: HashSet::new(),
@@ -746,10 +731,7 @@ impl MessageList {
     fn sync(&mut self, cx: &mut Context<Self>) {
         self.requested_older = None;
         let history = history_of(&self.messages, &self.channel);
-        let last_read = self
-            .fixtures
-            .conversation(&self.channel)
-            .and_then(|conversation| conversation.last_read.clone());
+        let last_read = self.fixtures.last_read(&self.channel).cloned();
         let count = history.len();
         self.data.update(cx, |data, _| {
             let switching = data.channel != self.channel;
@@ -856,10 +838,15 @@ impl MessageList {
             }
             MessageAction::CopyLink => actions::copy_link(&self.fixtures, &channel, ts, window, cx),
             MessageAction::CopyText => {
-                let data = self.data.read(cx);
-                if let Some(message) = data.messages.iter().find(|m| &m.ts == ts) {
-                    let text = self.fixtures.plain_text(message);
-                    cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(text));
+                let message = self
+                    .data
+                    .read(cx)
+                    .messages
+                    .iter()
+                    .find(|m| &m.ts == ts)
+                    .cloned();
+                if let Some(message) = message {
+                    actions::copy_message_text(&self.fixtures, &message, window, cx);
                 }
             }
             MessageAction::Forward => cx.emit(MessageListEvent::Forward(actions::permalink(
@@ -888,21 +875,38 @@ impl MessageList {
                 );
             }
             MessageAction::RemindCustom => {
+                let Some(message) = self
+                    .data
+                    .read(cx)
+                    .messages
+                    .iter()
+                    .find(|m| &m.ts == ts)
+                    .cloned()
+                else {
+                    return;
+                };
                 let this = cx.entity().downgrade();
-                let ts = ts.clone();
-                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
-                    let _ = this.update(cx, |list, cx| {
-                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
-                        list.save_for_later(
-                            &ts,
-                            true,
-                            Some(due),
-                            &format!("Reminder set: {when}"),
-                            window,
-                            cx,
-                        );
-                    });
-                });
+                let fixtures = self.fixtures.clone();
+                actions::open_custom_remind_for_message(
+                    &fixtures,
+                    channel,
+                    &message,
+                    window,
+                    cx,
+                    move |request, when, window, cx| {
+                        let _ = this.update(cx, |list, cx| {
+                            actions::notify(
+                                &format!("Reminder set: {when}"),
+                                request.text.clone(),
+                                window,
+                                cx,
+                            );
+                            let ts = request.ts.clone();
+                            cx.emit(MessageListEvent::Later(request));
+                            list.set_saved(&ts, true, cx);
+                        });
+                    },
+                );
             }
             MessageAction::MarkUnread => self.mark_unread(ts, cx),
             MessageAction::Edit => self.begin_edit(ts, window, cx),
@@ -933,12 +937,7 @@ impl MessageList {
                         .map(|m| self.fixtures.preview(m))
                         .unwrap_or_default()
                 };
-                actions::notify(
-                    if pinned { "Pinned" } else { "Unpinned" },
-                    preview,
-                    window,
-                    cx,
-                );
+                actions::notify_pin_toggled(pinned, preview, window, cx);
                 cx.emit(MessageListEvent::Changed {
                     channel,
                     change: MessageChange::Pin {
@@ -973,18 +972,12 @@ impl MessageList {
             MessageAction::JoinHuddle => cx.emit(MessageListEvent::JoinHuddle(channel)),
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
-                let dispatch = self
-                    .current_mut(ts)
-                    .and_then(|message| {
-                        BlockDispatch::new(message, &channel, action.clone(), attachment)
-                    })
-                    .filter(|_| live);
-                match dispatch {
-                    Some(dispatch) => cx.emit(MessageListEvent::Changed {
-                        channel,
-                        change: MessageChange::BlockAction(dispatch),
-                    }),
-                    None => blockkit::log_button(&action, window, cx),
+                if let Some(message) = self.current_mut(ts).cloned()
+                    && let Some(change) = actions::dispatch_block_action(
+                        live, &message, &channel, action, attachment, window, cx,
+                    )
+                {
+                    cx.emit(MessageListEvent::Changed { channel, change });
                 }
             }
         }
@@ -1006,28 +999,14 @@ impl MessageList {
     /// A message image was clicked: walk the conversation's messages into the viewer's
     /// image list and emit it with the clicked one's index; the root opens the viewer.
     fn open_image(&mut self, ts: &Ts, origin: &ImageOrigin, cx: &mut Context<Self>) {
-        let (images, index) = {
+        let found = {
             let data = self.data.read(cx);
-            let fixtures = data.fixtures.clone();
-            let mut images = Vec::new();
-            let mut index = None;
-            for message in &data.messages {
-                for entry in image_viewer::message_images(&fixtures, message) {
-                    if index.is_none() && &message.ts == ts && &entry.origin == origin {
-                        index = Some(images.len());
-                    }
-                    images.push(entry.image);
-                }
-            }
-            (images, index)
+            image_viewer::collect_viewer_images(&data.fixtures, &data.messages, ts, origin)
         };
-        if let Some(index) = index {
+        if let Some((images, index)) = found {
             cx.emit(MessageListEvent::OpenImage {
                 channel: self.channel.clone(),
-                // The viewer is main-thread-only (GPUI): the Arc only shares the list, never
-                // crosses threads.
-                #[allow(clippy::arc_with_non_send_sync)]
-                images: Arc::new(images),
+                images,
                 index,
             });
         }

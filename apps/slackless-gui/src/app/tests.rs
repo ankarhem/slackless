@@ -547,10 +547,10 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
                 app.huddle_open,
                 "fixture huddle bar should open on #general"
             );
-            assert!(!app.thread_open);
+            assert!(!app.right_pane.is_thread());
             app.toggle_huddle_thread(cx);
             assert!(
-                app.thread_open,
+                app.right_pane.is_thread(),
                 "Huddle thread button should open the thread panel"
             );
         });
@@ -558,7 +558,7 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
         app.update(cx, |app, cx| {
             app.toggle_huddle_thread(cx);
             assert!(
-                !app.thread_open,
+                !app.right_pane.is_thread(),
                 "second click should toggle the huddle thread closed"
             );
             // Browsing another channel while the huddle bar is open must still open the huddle's own channel thread.
@@ -578,7 +578,7 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.show_huddles(cx);
-            assert!(app.huddles_open);
+            assert_eq!(app.page, MainPage::Huddles);
         });
         let _ = window.draw(cx);
         app.update(cx, |app, cx| {
@@ -591,8 +591,8 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
                 .expect("general has fixture messages");
             app.select(ChannelId::from("C0GENERAL"), cx);
             app.open_thread(ChannelId::from("C0GENERAL"), general_ts, cx);
-            assert!(!app.huddles_open);
-            assert!(app.thread_open);
+            assert_ne!(app.page, MainPage::Huddles);
+            assert!(app.right_pane.is_thread());
             app.close_thread(cx);
         });
         let _ = window.draw(cx);
@@ -659,7 +659,7 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
     let (unreads_entity, eng_thread_ts) = cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.show_unreads(window, cx);
-            assert!(app.unreads_open);
+            assert_eq!(app.page, MainPage::Unreads);
             let ts = app
                 .fixtures
                 .messages
@@ -681,12 +681,13 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
     cx.update(|window, cx| {
         let _ = window.draw(cx);
         app.read_with(cx, |app, cx| {
-            assert!(
-                app.unreads_open,
+            assert_eq!(
+                app.page,
+                MainPage::Unreads,
                 "clicking replies in Unreads must keep the Unreads panel open"
             );
             assert!(
-                app.thread_open,
+                app.right_pane.is_thread(),
                 "clicking replies in Unreads must open the right-hand thread panel"
             );
             assert_eq!(
@@ -704,14 +705,15 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
     });
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            assert!(!app.unreads_open);
+            assert_ne!(app.page, MainPage::Unreads);
             assert_eq!(
                 app.current_place(cx),
                 NavPlace::Channel(ChannelId::from("C0ENG"))
             );
             app.go_back(window, cx);
-            assert!(
-                app.unreads_open,
+            assert_eq!(
+                app.page,
+                MainPage::Unreads,
                 "Back button after navigating from Unreads must return to Unreads"
             );
             assert_eq!(app.current_place(cx), NavPlace::Unreads);
@@ -800,12 +802,9 @@ fn dm_unread_clears_when_viewed_and_stays_read(cx: &mut gpui::TestAppContext) {
                 "ws.counts must clear unread state on viewed DM"
             );
             assert_eq!(
-                app.fixtures
-                    .conversation(&dm_id)
-                    .and_then(|c| c.last_read.as_ref())
-                    .map(Ts::as_str),
+                app.fixtures.last_read(&dm_id).map(Ts::as_str),
                 Some("1700000200.000100"),
-                "fixtures.conversation.last_read must advance so re-entering clears New divider"
+                "fixtures.last_read must advance so re-entering clears New divider"
             );
 
             // 3. Switch away from the DM: it must STAY read in sidebar, badge, and All Unreads.
@@ -878,10 +877,7 @@ fn dm_unread_clears_when_viewed_and_stays_read(cx: &mut gpui::TestAppContext) {
             );
             assert_eq!(app.sidebar.read(cx).badge_count(), 0);
             assert_eq!(
-                app.fixtures
-                    .conversation(&dm_id)
-                    .and_then(|c| c.last_read.as_ref())
-                    .map(Ts::as_str),
+                app.fixtures.last_read(&dm_id).map(Ts::as_str),
                 Some("1700000300.000100")
             );
         });
@@ -1195,8 +1191,7 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             taken_at: None,
             download: None,
         };
-        #[allow(clippy::arc_with_non_send_sync)]
-        Arc::new(vec![img("one.png"), img("two.png")])
+        std::rc::Rc::new(vec![img("one.png"), img("two.png")])
     };
 
     cx.update(|window, cx| {
@@ -1850,7 +1845,7 @@ fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
                 window,
                 cx
             ));
-            assert!(app.profile_open);
+            assert!(app.right_pane.is_profile());
 
             assert!(app.handle_deep_link(
                 &format!("slack://open?team={team_id}&id=C0DESIGN"),
@@ -1865,7 +1860,7 @@ fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
                 cx
             ));
             assert_eq!(app.channel, ChannelId::from("C0ENG"));
-            assert!(app.thread_open);
+            assert!(app.right_pane.is_thread());
             app.close_thread(cx);
 
             assert!(app.handle_deep_link(
@@ -1891,7 +1886,7 @@ fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
                 cx,
             );
             assert_eq!(app.channel, ChannelId::from("C0ENG"));
-            assert!(app.thread_open);
+            assert!(app.right_pane.is_thread());
             assert_eq!(
                 app.thread.read(cx).open_thread(),
                 Some((ChannelId::from("C0ENG"), eng_thread_ts.clone()))

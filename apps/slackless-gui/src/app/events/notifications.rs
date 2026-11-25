@@ -301,7 +301,7 @@ impl App {
             .as_ref()
             .is_some_and(|ts| *ts != message.ts);
         let on_screen = if reply {
-            self.thread_open
+            self.right_pane.is_thread()
                 && self
                     .thread
                     .read(cx)
@@ -392,7 +392,7 @@ impl App {
                     app.sound = Some((choice, data));
                 });
             }
-            Err(e) => eprintln!("slackless: notification sound not loaded ({e})"),
+            Err(e) => tracing::warn!(error = %e, "notification sound not loaded"),
         });
     }
 }

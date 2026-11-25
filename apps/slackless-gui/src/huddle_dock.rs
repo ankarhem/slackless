@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -29,21 +29,16 @@ use crate::fixtures::Fixtures;
 pub use crate::huddle_video::{
     DisplayVideoFrame, DrawCursorEntry, DrawStrokeEntry, HuddlePopoutGuard, HuddleVideoStore,
     ReactionEntry, format_elapsed, frame_into_render_image, frame_to_render_image,
-    make_catmull_rom_segment,
+    huddle_browser_url, is_audio_device_selected, is_user_speaking, make_catmull_rom_segment,
+    stroke_fade_curve,
 };
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    slackless_core::types::time::now_epoch_secs().max(0) as u64
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    slackless_core::types::time::now_epoch_ms()
 }
 
 /// Snapshot consumed by `PopoutKind::Huddle` so the Pop-out Huddle Window stays in lock-step with
@@ -136,30 +131,21 @@ impl Drop for HuddleDock {
     }
 }
 
-/// Fade curve shared with the pop-out stage: active strokes stay opaque; completed strokes hold
-/// for 3.8s and ease out smoothly over 1.6s.
+/// Fade curve shared with the pop-out stage via [`crate::huddle_video::stroke_fade_curve`].
 #[cfg(target_os = "macos")]
 fn overlay_stroke_fade(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, f32) {
-    const HOLD_MS: f32 = 3_800.0;
-    const FADE_MS: f32 = 1_600.0;
-    let Some(ended_at) = ended_at_ms else {
-        return (1.0, 1.0);
-    };
-    let elapsed = now_ms.saturating_sub(ended_at) as f32;
-    if elapsed < HOLD_MS {
-        return (1.0, 1.0);
-    }
-    if elapsed >= HOLD_MS + FADE_MS {
-        return (0.0, 0.72);
-    }
-    let t = ((elapsed - HOLD_MS) / FADE_MS).clamp(0.0, 1.0);
-    let smooth = 1.0 - t * t * (3.0 - 2.0 * t);
-    (smooth, 0.72 + 0.28 * smooth)
+    let (alpha, width_scale, _) = stroke_fade_curve(ended_at_ms, now_ms);
+    (alpha, width_scale)
 }
 
 impl EventEmitter<HuddleDockEvent> for HuddleDock {}
 
 impl HuddleDock {
+    pub fn set_fixtures(&mut self, fixtures: Arc<Fixtures>, cx: &mut Context<Self>) {
+        self.fixtures = fixtures;
+        cx.notify();
+    }
+
     pub fn new(
         fixtures: Arc<Fixtures>,
         session: HuddleSessionSnapshot,
@@ -1075,18 +1061,10 @@ impl HuddleDock {
     }
 
     fn browser_url(&self) -> String {
-        if let Some(link) = &self.session.huddle_link {
-            return link.clone();
-        }
-        let team = self
-            .fixtures
-            .workspaces
-            .first()
-            .map(|t| t.id.to_string())
-            .unwrap_or_default();
-        format!(
-            "https://app.slack.com/huddle/{team}/{}",
-            self.session.channel
+        huddle_browser_url(
+            &self.fixtures,
+            &self.session.channel,
+            self.session.huddle_link.as_deref(),
         )
     }
 
@@ -1099,14 +1077,12 @@ impl HuddleDock {
     }
 
     fn is_speaking(&self, user: &UserId) -> bool {
-        if *user == self.fixtures.self_user {
-            !self.session.muted && self.levels.local_rms > 0.03
-        } else {
-            self.levels
-                .active_speakers
-                .iter()
-                .any(|(uid, lvl)| uid == user && *lvl > 0.05)
-        }
+        is_user_speaking(
+            *user == self.fixtures.self_user,
+            self.session.muted,
+            &self.levels,
+            user,
+        )
     }
 
     fn is_muted_user(&self, user: &UserId) -> bool {
@@ -1154,8 +1130,7 @@ impl HuddleDock {
                     .child("Microphone"),
             )
             .children(self.devices.inputs.iter().enumerate().map(|(ix, dev)| {
-                let selected = active_in.as_deref() == Some(dev.name.as_str())
-                    || (active_in.is_none() && dev.is_default);
+                let selected = is_audio_device_selected(active_in.as_deref(), dev);
                 let dev_name = dev.name.clone();
                 div()
                     .id(("dock-in-dev", ix))
@@ -1185,8 +1160,7 @@ impl HuddleDock {
                     .child("Speaker"),
             )
             .children(self.devices.outputs.iter().enumerate().map(|(ix, dev)| {
-                let selected = active_out.as_deref() == Some(dev.name.as_str())
-                    || (active_out.is_none() && dev.is_default);
+                let selected = is_audio_device_selected(active_out.as_deref(), dev);
                 let dev_name = dev.name.clone();
                 div()
                     .id(("dock-out-dev", ix))

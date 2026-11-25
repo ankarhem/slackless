@@ -15,12 +15,38 @@ impl App {
     pub(super) fn show_later(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
-        self.later_open = true;
+        self.page = MainPage::Later;
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Saved), cx)
         });
         self.bridge.send(Command::LoadSaved);
         cx.notify();
+    }
+
+    /// Transition the right-hand flexpane, always clearing open-thread tint when leaving
+    /// `RightPane::Thread` and resetting `ConversationTab::Pins` when leaving `RightPane::Pins`.
+    pub(super) fn set_right_pane(&mut self, next: RightPane, cx: &mut Context<Self>) {
+        let prev = self.right_pane;
+        if prev.is_thread() && !next.is_thread() {
+            self.messages
+                .update(cx, |list, cx| list.set_open_thread(None, cx));
+            self.unreads
+                .update(cx, |unreads, cx| unreads.set_open_thread(None, cx));
+        }
+        if prev.is_pins() && !next.is_pins() && self.tab == ConversationTab::Pins {
+            self.tab = ConversationTab::Messages;
+        }
+        self.right_pane = next;
+        if next.is_thread()
+            && let Some((channel, thread_ts)) = self.thread.read(cx).open_thread()
+        {
+            self.messages.update(cx, |list, cx| {
+                list.set_open_thread(Some(thread_ts.clone()), cx)
+            });
+            self.unreads.update(cx, |unreads, cx| {
+                unreads.set_open_thread(Some((channel, thread_ts)), cx)
+            });
+        }
     }
 
     pub(super) fn open_thread(
@@ -41,16 +67,8 @@ impl App {
         // Live mode: show the stored thread now, then fetch its full history from Slack
         // (fixture mode: both are no-ops and the panel keeps its fixture content).
         self.load_thread(&channel, &thread_ts, cx);
-        self.messages.update(cx, |list, cx| {
-            list.set_open_thread(Some(thread_ts.clone()), cx)
-        });
-        self.unreads.update(cx, |unreads, cx| {
-            unreads.set_open_thread(Some((channel.clone(), thread_ts.clone())), cx)
-        });
         self.bridge.send(Command::OpenThread { channel, thread_ts });
-        self.thread_open = true;
-        self.profile_open = false;
-        self.pins_open = false;
+        self.set_right_pane(RightPane::Thread, cx);
         if self.tab == ConversationTab::Pins {
             self.tab = ConversationTab::Messages;
         }
@@ -60,21 +78,22 @@ impl App {
 
     /// Hide the thread panel and drop the open-thread tint from the transcript.
     pub(super) fn close_thread(&mut self, cx: &mut Context<Self>) {
-        self.thread_open = false;
-        self.messages
-            .update(cx, |list, cx| list.set_open_thread(None, cx));
-        self.unreads
-            .update(cx, |unreads, cx| unreads.set_open_thread(None, cx));
+        if self.right_pane.is_thread() {
+            self.set_right_pane(RightPane::None, cx);
+        } else {
+            self.messages
+                .update(cx, |list, cx| list.set_open_thread(None, cx));
+            self.unreads
+                .update(cx, |unreads, cx| unreads.set_open_thread(None, cx));
+        }
     }
 
     pub(super) fn toggle_pins(&mut self, cx: &mut Context<Self>) {
-        self.pins_open = !self.pins_open;
-        if self.pins_open {
-            self.close_thread(cx);
-            self.profile_open = false;
+        if self.right_pane.is_pins() {
+            self.set_right_pane(RightPane::None, cx);
+        } else {
+            self.set_right_pane(RightPane::Pins, cx);
             self.load_tab_data(&ConversationTab::Pins);
-        } else if self.tab == ConversationTab::Pins {
-            self.tab = ConversationTab::Messages;
         }
         cx.notify();
     }
@@ -93,28 +112,22 @@ impl App {
     /// Hide the open right sidebar (thread, profile, or pins) or restore the last hidden one
     /// (`Cmd+.` / View > Toggle Right Sidebar).
     pub(super) fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
-        if self.thread_open {
-            self.last_right_pane = Some(RightPane::Thread);
-            self.thread_open = false;
-        } else if self.profile_open {
-            self.last_right_pane = Some(RightPane::Profile);
-            self.profile_open = false;
-        } else if self.pins_open {
-            self.last_right_pane = Some(RightPane::Pins);
-            self.pins_open = false;
+        if self.right_pane.is_open() {
+            self.last_right_pane = Some(self.right_pane);
+            self.set_right_pane(RightPane::None, cx);
         } else {
             match self.last_right_pane {
                 Some(RightPane::Thread) if self.thread.read(cx).open_thread().is_some() => {
-                    self.thread_open = true;
+                    self.set_right_pane(RightPane::Thread, cx);
                 }
-                Some(RightPane::Profile) => {
-                    self.profile_open = true;
+                Some(pane @ RightPane::Profile { .. }) => {
+                    self.set_right_pane(pane, cx);
                 }
                 Some(RightPane::Pins) => {
-                    self.pins_open = true;
+                    self.set_right_pane(RightPane::Pins, cx);
                 }
                 _ => {
-                    self.pins_open = true;
+                    self.set_right_pane(RightPane::Pins, cx);
                     if !self.fixtures.sample && !self.ws.pins.contains_key(&self.channel) {
                         self.bridge.send(Command::LoadPins(self.channel.clone()));
                     }
@@ -135,7 +148,6 @@ impl App {
 
     /// Return to the Home navigation tab and current conversation (`Cmd+Shift+H`).
     pub(super) fn open_home(&mut self, cx: &mut Context<Self>) {
-        self.activity_open = false;
         self.close_full_column_views(cx);
         self.sidebar.update(cx, |sidebar, cx| sidebar.show_home(cx));
         cx.notify();
@@ -218,26 +230,23 @@ impl App {
 
     /// The currently visible place for Back/Forward navigation history.
     pub(super) fn current_place(&self, cx: &gpui::App) -> NavPlace {
-        if self.threads_open {
-            NavPlace::Threads
-        } else if self.unreads_open {
-            NavPlace::Unreads
-        } else if self.huddles_open {
-            NavPlace::Huddles
-        } else if self.drafts_open {
-            NavPlace::Drafts
-        } else if self.later_open {
-            NavPlace::Saved
-        } else if self.directory_open {
-            NavPlace::Directories
-        } else if self.tools_open {
-            NavPlace::Tools
-        } else if self.activity_open {
-            NavPlace::Activity
-        } else if self.sidebar.read(cx).active_nav() == NavItem::Files {
-            NavPlace::Files
-        } else {
-            NavPlace::Channel(self.channel.clone())
+        match self.page {
+            MainPage::Threads => NavPlace::Threads,
+            MainPage::Unreads => NavPlace::Unreads,
+            MainPage::Huddles => NavPlace::Huddles,
+            MainPage::Drafts => NavPlace::Drafts,
+            MainPage::Later => NavPlace::Saved,
+            MainPage::Directory => NavPlace::Directories,
+            MainPage::Tools => NavPlace::Tools,
+            MainPage::Activity => NavPlace::Activity,
+            MainPage::Files => NavPlace::Files,
+            MainPage::Channel | MainPage::Search | MainPage::Compose => {
+                if self.sidebar.read(cx).active_nav() == NavItem::Files {
+                    NavPlace::Files
+                } else {
+                    NavPlace::Channel(self.channel.clone())
+                }
+            }
         }
     }
 
@@ -258,16 +267,7 @@ impl App {
     /// Whether the main column is currently showing `self.channel`'s transcript (as opposed to
     /// a full-column overlay such as Unreads, Threads, Activity, Search, Drafts, Later, or Files).
     pub(super) fn transcript_visible(&self, cx: &gpui::App) -> bool {
-        !self.searching
-            && !self.drafts_open
-            && !self.later_open
-            && !self.threads_open
-            && !self.unreads_open
-            && !self.huddles_open
-            && !self.directory_open
-            && !self.tools_open
-            && !self.compose_open
-            && !self.activity_open
+        self.page == MainPage::Channel
             && self.sidebar.read(cx).active_nav() != crate::sidebar::NavItem::Files
     }
 
@@ -276,7 +276,6 @@ impl App {
     pub(super) fn navigate(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
         let was_covered = !self.transcript_visible(cx);
         self.ws.chosen = true;
-        self.activity_open = false;
         self.close_full_column_views(cx);
         self.close_hover_card(cx);
         cx.notify();
@@ -367,16 +366,7 @@ impl App {
     /// "Search in #channel".
     /// Whether the main center column is currently showing the conversation transcript.
     pub(super) fn showing_transcript(&self) -> bool {
-        !self.searching
-            && !self.drafts_open
-            && !self.later_open
-            && !self.threads_open
-            && !self.unreads_open
-            && !self.huddles_open
-            && !self.directory_open
-            && !self.tools_open
-            && !self.compose_open
-            && !self.activity_open
+        self.page == MainPage::Channel
     }
 
     pub(super) fn search_in_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -408,18 +398,7 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let showing_canvas = self.tab == ConversationTab::Canvas
-            && !self.searching
-            && !self.drafts_open
-            && !self.later_open
-            && !self.threads_open
-            && !self.unreads_open
-            && !self.huddles_open
-            && !self.directory_open
-            && !self.tools_open
-            && !self.compose_open
-            && !self.activity_open
-            && self.sidebar.read(cx).active_nav() != NavItem::Files;
+        let showing_canvas = self.tab == ConversationTab::Canvas && self.transcript_visible(cx);
         if showing_canvas {
             let key = if self.fixtures.sample {
                 "fixture".to_owned()
@@ -442,7 +421,7 @@ impl App {
                 crate::canvas::cycle_canvas_focus_region(&key, forward, has_outline, window, cx);
             return;
         }
-        let has_right = self.thread_open || self.profile_open || self.pins_open;
+        let has_right = self.right_pane.is_open();
         let count = if has_right { 4 } else { 3 };
         self.pane_focus = if forward {
             (self.pane_focus + 1) % count
@@ -468,9 +447,8 @@ impl App {
         self.results.update(cx, |results, cx| {
             results.run_with_filters(query.clone(), filters, cx)
         });
-        self.searching = true;
-        self.drafts_open = false;
-        self.later_open = false;
+        self.close_full_column_views(cx);
+        self.page = MainPage::Search;
         if !query.trim().is_empty() {
             self.search_menu
                 .update(cx, |menu, cx| menu.record_search(&query, cx));
@@ -636,11 +614,12 @@ impl App {
         self.close_thread(cx);
         self.tab = ConversationTab::Messages;
         // An open pins panel follows the conversation: fetch the new one's pins.
-        if self.pins_open {
+        if self.right_pane.is_pins() {
             self.load_tab_data(&ConversationTab::Pins);
         }
         self.load_draft(cx);
         self.sync_composer_placeholder(cx);
+        self.sync_window_title(cx);
         cx.notify();
         self.update_menus(cx);
         self.show_typing(cx);
@@ -730,7 +709,7 @@ impl App {
                             .filter(|c| snap.conversation(c).is_some());
                         let chosen = restored.is_some();
                         let channel = restored.unwrap_or_else(|| first_conversation(&snap));
-                        let archive = self.bridge.store().cloned();
+                        let archive = self.bridge.read_store_clone();
                         // Restore persisted drafts for this workspace on first visit.
                         if let Some(saved_drafts) = self.bridge.drafts() {
                             let entries: Vec<Entry> = saved_drafts
@@ -788,22 +767,12 @@ impl App {
         self.channel_people = None;
         self.sync_connect_orgs(cx);
         self.load_join_people(cx);
-        self.searching = false;
-        self.drafts_open = false;
-        self.later_open = false;
-        self.threads_open = false;
-        self.unreads_open = false;
+        self.page = MainPage::Channel;
         self.unreads_fetched.clear();
         self.back.clear();
         self.forward.clear();
-        self.huddles_open = false;
-        self.directory_open = false;
-        self.tools_open = false;
-        self.compose_open = false;
         self.pending_dm = None;
-        self.close_thread(cx);
-        self.profile_open = false;
-        self.pins_open = false;
+        self.set_right_pane(RightPane::None, cx);
         let fixtures = self.fixtures.clone();
         self.threads.update(cx, |view, cx| {
             view.clear_for_workspace(fixtures.clone(), cx)
@@ -815,16 +784,9 @@ impl App {
             }
         });
         self.fold_search_menu(window, cx);
-        self.search_menu
-            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
-        // The Files view serves every workspace: its rows follow the shown one.
-        self.files_page
-            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
-        self.tools_page
-            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
-        // Before the draft is loaded: its mentions are named from this workspace.
-        self.composer
-            .update(cx, |composer, cx| composer.set_fixtures(fixtures, cx));
+        // Keep every shared view (Activity, Unreads, Huddles, Directory, Compose, Details,
+        // SearchMenu, Files, Tools, Composer, HuddleDock) synced with the active workspace.
+        self.sync_all_views_fixtures(fixtures, cx);
         self.sync_saved(cx);
         self.sync_later_count(cx);
         self.huddle_open = false;
@@ -854,6 +816,7 @@ impl App {
         // New thread panels / profile panes pick up Enter-to-send and the self state.
         self.apply_preferences(window, cx);
         self.update_menus(cx);
+        self.sync_window_title_in(window);
         cx.notify();
     }
 
@@ -865,7 +828,7 @@ impl App {
     pub(super) fn show_drafts(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
-        self.drafts_open = true;
+        self.page = MainPage::Drafts;
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Drafts), cx)
         });
@@ -912,16 +875,7 @@ impl App {
 
     /// Close every full-column view (a conversation or another view is taking the column).
     pub(super) fn close_full_column_views(&mut self, cx: &mut Context<Self>) {
-        self.searching = false;
-        self.drafts_open = false;
-        self.later_open = false;
-        self.threads_open = false;
-        self.unreads_open = false;
-        self.huddles_open = false;
-        self.directory_open = false;
-        self.tools_open = false;
-        self.compose_open = false;
-        self.activity_open = false;
+        self.page = MainPage::Channel;
         // The Activity and Files pages are sidebar destinations, so leaving the full-column
         // views returns the rail to Home.
         self.sidebar.update(cx, |sidebar, cx| {
@@ -953,7 +907,7 @@ impl App {
             self.bridge.send(Command::FetchThreads);
         }
         self.close_full_column_views(cx);
-        self.threads_open = true;
+        self.page = MainPage::Threads;
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Threads), cx)
         });
@@ -963,7 +917,7 @@ impl App {
     /// Offline / error fallback for Threads: derive cards from the local SQLite store only when
     /// `subscriptions.thread.getView` fails.
     pub(super) fn load_threads_store_fallback(&mut self, cx: &mut Context<Self>) {
-        let Some(store) = self.bridge.store().cloned() else {
+        let Some(store) = self.bridge.read_store_clone() else {
             return;
         };
         let team = self.fixtures.workspaces[self.workspace].id.clone();
@@ -997,7 +951,7 @@ impl App {
     pub(super) fn show_unreads(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
-        self.unreads_open = true;
+        self.page = MainPage::Unreads;
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Unreads), cx)
         });
@@ -1012,7 +966,7 @@ impl App {
         let order = self.sidebar.read(cx).unread_ids();
         let groups = local_groups(&self.fixtures, &order);
         let fixtures = self.fixtures.clone();
-        if let Some(store) = self.bridge.store().cloned() {
+        if let Some(store) = self.bridge.read_store_clone() {
             // Live mode: keep already-loaded store groups on screen while refreshing off-thread
             // (never flash empty `local_groups` placeholders).
             self.unreads
@@ -1065,7 +1019,7 @@ impl App {
         self.directory
             .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
         self.close_full_column_views(cx);
-        self.directory_open = true;
+        self.page = MainPage::Directory;
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Directories), cx)
         });
@@ -1087,7 +1041,7 @@ impl App {
         self.compose
             .update(cx, |view, cx| view.open(draft, window, cx));
         self.close_full_column_views(cx);
-        self.compose_open = true;
+        self.page = MainPage::Compose;
         cx.notify();
     }
 
@@ -1129,7 +1083,7 @@ impl App {
         self.tools_page
             .update(cx, |page, cx| page.set_fixtures(fixtures, cx));
         self.close_full_column_views(cx);
-        self.tools_open = true;
+        self.page = MainPage::Tools;
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.show_nav(NavItem::Agents, cx));
         cx.notify();
@@ -1170,7 +1124,7 @@ impl App {
         self.close_full_column_views(cx);
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.show_nav(NavItem::Activity, cx));
-        self.activity_open = true;
+        self.page = MainPage::Activity;
         let fixtures = self.fixtures.clone();
         self.activity
             .update(cx, |view, cx| view.set_fixtures(fixtures, cx));
@@ -1199,6 +1153,7 @@ impl App {
     pub(super) fn show_files(&mut self, cx: &mut Context<Self>) {
         self.save_draft(cx);
         self.close_full_column_views(cx);
+        self.page = MainPage::Files;
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.show_nav(NavItem::Files, cx));
         let fixtures = self.fixtures.clone();
