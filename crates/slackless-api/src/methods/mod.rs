@@ -25,6 +25,7 @@ use crate::types::endpoints::method;
 use crate::types::{
     ApiResponse, Block, BotId, BotProfile, ChannelId, ChannelSection, Conversation, DndStatus,
     File, Message, RichTextBlock, Team, TeamId, Ts, User, UserId, UserPresence, Usergroup,
+    UsergroupId,
 };
 use crate::{ApiError, Result, SlackApi};
 

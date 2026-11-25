@@ -396,6 +396,12 @@ impl<B: Backend> Core<B> {
                 handle,
                 description,
             } => self.update_usergroup(usergroup, name, handle, description),
+            WorkspaceCommand::DisableUsergroup(usergroup) => self.disable_usergroup(usergroup),
+            WorkspaceCommand::EnableUsergroup(usergroup) => self.enable_usergroup(usergroup),
+            WorkspaceCommand::LoadUsergroupUsers(usergroup) => self.load_usergroup_users(usergroup),
+            WorkspaceCommand::UpdateUsergroupUsers { usergroup, users } => {
+                self.update_usergroup_users(usergroup, users);
+            }
             WorkspaceCommand::SetDndSnooze { minutes } => self.set_dnd_snooze(minutes),
             WorkspaceCommand::EndDndSnooze => self.end_dnd_snooze(),
             WorkspaceCommand::EndDnd => self.end_dnd(),

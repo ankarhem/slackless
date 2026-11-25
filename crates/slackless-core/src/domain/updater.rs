@@ -1,11 +1,13 @@
 //! Shared GitHub Releases update checker, version comparator, checksum parser, and install-path
 //! resolver used by both CLI (`slackless update`) and GUI (`Check for Updates`).
 
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
-
-use crate::api::AssetClient;
+use sha2::{Digest, Sha256};
 
 /// GitHub repository hosting official Slackless releases.
 pub const RELEASES_REPO: &str = "ankarhem/slackless";
@@ -13,6 +15,11 @@ pub const RELEASES_REPO: &str = "ankarhem/slackless";
 /// GitHub REST endpoint for the latest official Slackless release.
 pub const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/ankarhem/slackless/releases/latest";
+
+const DEFAULT_USER_AGENT: &str = concat!("Slackless/", env!("CARGO_PKG_VERSION"));
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Metadata for an available GitHub Release.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,15 +179,266 @@ pub fn parse_github_release(payload: &[u8]) -> Result<Option<ReleaseInfo>, Strin
     }))
 }
 
-/// Query GitHub Releases over HTTPS (using [`AssetClient`] / `reqwest`, respecting workspace proxy
-/// settings and timeouts) for the latest non-draft, non-prerelease release.
-pub async fn fetch_latest_release() -> Result<Option<ReleaseInfo>, String> {
-    let client = AssetClient::new();
-    let bytes = client
-        .get(LATEST_RELEASE_API)
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Compute the lowercase hex SHA-256 digest of `bytes` in pure Rust.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    encode_lower_hex(&digest)
+}
+
+/// Compute the lowercase hex SHA-256 digest of the file at `path` in pure Rust, streaming in
+/// 64 KiB chunks so large release archives do not require full-file buffering.
+pub fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open {} for SHA-256: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("failed to read {} for SHA-256: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(encode_lower_hex(&hasher.finalize()))
+}
+
+fn build_updater_client(user_agent: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .user_agent(user_agent);
+    if let Some(proxy_str) = crate::api::proxy_url()
+        && let Ok(proxy) = reqwest::Proxy::all(&proxy_str)
+    {
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build updater HTTP client: {e}"))
+}
+
+async fn fetch_release_from_url(
+    url: &str,
+    user_agent: &str,
+) -> Result<Option<ReleaseInfo>, String> {
+    let client = build_updater_client(user_agent, METADATA_TIMEOUT)?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
         .await
         .map_err(|e| format!("GitHub Releases check failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "GitHub Releases API returned HTTP {}",
+            status.as_u16()
+        ));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("failed reading GitHub Releases response: {e}"))?;
     parse_github_release(&bytes)
+}
+
+/// Query GitHub Releases for `repo` (e.g. `"ankarhem/slackless"`) over HTTPS using `reqwest`
+/// (15s connect / 30s request timeout, `Accept: application/vnd.github+json`), returning
+/// `Ok(None)` for drafts/prereleases.
+pub async fn fetch_latest_release_for(
+    repo: &str,
+    user_agent: &str,
+) -> Result<Option<ReleaseInfo>, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    fetch_release_from_url(&url, user_agent).await
+}
+
+/// Query GitHub Releases over HTTPS (using `reqwest` with workspace proxy support and timeouts)
+/// for the latest non-draft, non-prerelease official Slackless release.
+pub async fn fetch_latest_release() -> Result<Option<ReleaseInfo>, String> {
+    fetch_latest_release_for(RELEASES_REPO, DEFAULT_USER_AGENT).await
+}
+
+/// Stream `url` directly to `dest` via `reqwest` (15s connect / 300s request timeout), returning
+/// the number of bytes written. Removes any partial file if an error occurs mid-transfer.
+pub async fn download_to_file(url: &str, dest: &Path, user_agent: &str) -> Result<u64, String> {
+    let client = build_updater_client(user_agent, DOWNLOAD_TIMEOUT)?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("download failed with HTTP {}", status.as_u16()));
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let file = std::fs::File::create(dest)
+        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    let mut writer = BufWriter::new(file);
+    let mut total = 0u64;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        let _ = std::fs::remove_file(dest);
+        format!("download stream interrupted: {e}")
+    })? {
+        writer.write_all(&chunk).map_err(|e| {
+            let _ = std::fs::remove_file(dest);
+            format!("failed writing {}: {e}", dest.display())
+        })?;
+        total = total.saturating_add(chunk.len() as u64);
+    }
+    writer.flush().map_err(|e| {
+        let _ = std::fs::remove_file(dest);
+        format!("failed flushing {}: {e}", dest.display())
+    })?;
+    Ok(total)
+}
+
+/// Download `release`'s archive and `SHA256SUMS.txt` into `staging_dir` via `reqwest`, verify the
+/// SHA-256 checksum in pure Rust via [`sha256_file`] and [`find_sha256_entry`], and return the
+/// verified tarball path. Refuses unverified updates if `sha256_url` is missing.
+pub async fn download_and_verify_release(
+    release: &ReleaseInfo,
+    staging_dir: &Path,
+    user_agent: &str,
+) -> Result<PathBuf, String> {
+    if !is_safe_asset_name(&release.asset_name) {
+        return Err(format!(
+            "invalid release asset name: {}",
+            release.asset_name
+        ));
+    }
+    let sums_url = release.sha256_url.as_deref().ok_or_else(|| {
+        "release is missing SHA256SUMS.txt; refusing unverified update".to_owned()
+    })?;
+
+    std::fs::create_dir_all(staging_dir).map_err(|e| {
+        format!(
+            "cannot create staging directory {}: {e}",
+            staging_dir.display()
+        )
+    })?;
+
+    let tarball_path = staging_dir.join(&release.asset_name);
+    download_to_file(&release.download_url, &tarball_path, user_agent).await?;
+
+    let client = build_updater_client(user_agent, METADATA_TIMEOUT)?;
+    let sums_resp = client
+        .get(sums_url)
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch SHA256SUMS.txt: {e}"))?;
+    let sums_status = sums_resp.status();
+    if !sums_status.is_success() {
+        let _ = std::fs::remove_file(&tarball_path);
+        return Err(format!(
+            "failed to fetch SHA256SUMS.txt (HTTP {})",
+            sums_status.as_u16()
+        ));
+    }
+    let sums_text = sums_resp
+        .text()
+        .await
+        .map_err(|e| format!("failed reading SHA256SUMS.txt: {e}"))?;
+    let expected = find_sha256_entry(&sums_text, &release.asset_name).ok_or_else(|| {
+        let _ = std::fs::remove_file(&tarball_path);
+        format!(
+            "SHA256SUMS.txt has no checksum entry for {}",
+            release.asset_name
+        )
+    })?;
+    let actual = sha256_file(&tarball_path)?;
+    if actual != expected {
+        let _ = std::fs::remove_file(&tarball_path);
+        return Err(format!(
+            "SHA-256 mismatch (expected {expected}, got {actual})"
+        ));
+    }
+    Ok(tarball_path)
+}
+
+/// Extract a `.tar.gz` archive into `dest_dir` via `tar -xzf`, returning clear stderr on failure.
+pub fn extract_tar_gz(tarball: &Path, dest_dir: &Path) -> Result<(), String> {
+    let tar_bin = if cfg!(target_os = "macos") {
+        "/usr/bin/tar"
+    } else {
+        "tar"
+    };
+    let out = Command::new(tar_bin)
+        .args(["-xzf"])
+        .arg(tarball)
+        .arg("-C")
+        .arg(dest_dir)
+        .output()
+        .map_err(|e| format!("failed to run tar: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!(
+                "failed to extract update archive (tar exited {})",
+                out.status
+            )
+        } else {
+            format!("failed to extract update archive: {stderr}")
+        });
+    }
+    Ok(())
+}
+
+/// Create or replace a symlink at `link` pointing to `app_bundle/Contents/MacOS/slackless`.
+#[cfg(unix)]
+pub fn install_cli_symlink_at(app_bundle: &Path, link: &Path) -> Result<PathBuf, String> {
+    let bundled = app_bundle.join("Contents/MacOS/slackless");
+    if !bundled.is_file() {
+        return Err(format!(
+            "{} does not contain a bundled CLI executable",
+            app_bundle.display()
+        ));
+    }
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    if std::fs::symlink_metadata(link).is_ok() {
+        std::fs::remove_file(link)
+            .map_err(|e| format!("cannot replace {}: {e}", link.display()))?;
+    }
+    std::os::unix::fs::symlink(&bundled, link).map_err(|e| {
+        format!(
+            "cannot link {} -> {}: {e}",
+            link.display(),
+            bundled.display()
+        )
+    })?;
+    Ok(link.to_path_buf())
+}
+
+#[cfg(not(unix))]
+pub fn install_cli_symlink_at(_app_bundle: &Path, _link: &Path) -> Result<PathBuf, String> {
+    Err("CLI symlink installation is currently supported on macOS/Unix only".to_owned())
+}
+
+/// Install or refresh the `slackless` CLI symlink in the best writable `$PATH` directory
+/// (`/usr/local/bin/slackless` when writable, else `~/.local/bin/slackless`), pointing to
+/// `app_bundle/Contents/MacOS/slackless`. Returns the created symlink path on success.
+pub fn install_cli_symlink(app_bundle: &Path) -> Option<PathBuf> {
+    let link = resolve_cli_link_path()?;
+    install_cli_symlink_at(app_bundle, &link).ok()
 }
 
 /// Returns `true` when `name` is a single safe filename component (no path separators or `..`).
@@ -430,5 +688,160 @@ mod tests {
         assert!(dir_is_writable(&dir));
         assert!(!dir_is_writable(&dir.join("nonexistent")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sha256_bytes_and_file_match_known_vectors_and_find_entry() {
+        // NIST / RFC empty and "abc" SHA-256 test vectors.
+        assert_eq!(
+            sha256_bytes(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_bytes(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("slackless-core-sha256-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Multi-chunk (>64 KiB) payload to exercise streaming read loop.
+        let payload: Vec<u8> = (0u8..=255).cycle().take(150_000).collect();
+        let file_path = dir.join("Slackless-2026.11.25-01-macos-arm64.app.tar.gz");
+        std::fs::write(&file_path, &payload).expect("write payload");
+
+        let from_bytes = sha256_bytes(&payload);
+        let from_file = sha256_file(&file_path).expect("sha256_file");
+        assert_eq!(from_file, from_bytes);
+        assert_eq!(from_file.len(), 64);
+
+        let sums = format!(
+            "{}  other.tar.gz\n{} *Slackless-2026.11.25-01-macos-arm64.app.tar.gz\n",
+            "0".repeat(64),
+            from_file.to_ascii_uppercase()
+        );
+        assert_eq!(
+            find_sha256_entry(&sums, "Slackless-2026.11.25-01-macos-arm64.app.tar.gz"),
+            Some(from_file)
+        );
+        assert!(sha256_file(&dir.join("does-not-exist")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_cli_symlink_at_creates_and_replaces_link() {
+        let dir = std::env::temp_dir().join(format!(
+            "slackless-core-symlink-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app_v1 = dir.join("v1/Slackless.app");
+        let app_v2 = dir.join("v2/Slackless.app");
+        let cli_v1 = app_v1.join("Contents/MacOS/slackless");
+        let cli_v2 = app_v2.join("Contents/MacOS/slackless");
+        std::fs::create_dir_all(cli_v1.parent().expect("parent")).expect("mkdir v1");
+        std::fs::create_dir_all(cli_v2.parent().expect("parent")).expect("mkdir v2");
+        std::fs::write(&cli_v1, b"v1").expect("write v1");
+        std::fs::write(&cli_v2, b"v2").expect("write v2");
+
+        let link = dir.join("bin/slackless");
+        let created = install_cli_symlink_at(&app_v1, &link).expect("create symlink");
+        assert_eq!(created, link);
+        assert_eq!(std::fs::read_link(&link).expect("read link v1"), cli_v1);
+
+        let updated = install_cli_symlink_at(&app_v2, &link).expect("replace symlink");
+        assert_eq!(updated, link);
+        assert_eq!(std::fs::read_link(&link).expect("read link v2"), cli_v2);
+
+        // Missing bundled CLI fails cleanly.
+        assert!(install_cli_symlink_at(&dir.join("missing.app"), &link).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn download_and_verify_release_streams_and_validates_sha256() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+
+        let asset_name = "Slackless-2026.11.25-05-macos-arm64.app.tar.gz";
+        let payload = b"fake-tar-gz-payload-bytes-for-updater-test".to_vec();
+        let good_hash = sha256_bytes(&payload);
+        let good_sums = format!("{good_hash}  {asset_name}\n").into_bytes();
+        let bad_sums = format!("{}  {asset_name}\n", "f".repeat(64)).into_bytes();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let payload_srv = payload.clone();
+        let server_thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                let path = req_line.split_whitespace().nth(1).unwrap_or("/");
+                let body: &[u8] = match path {
+                    "/asset.tar.gz" => &payload_srv,
+                    "/SHA256SUMS.txt" => &good_sums,
+                    "/BADSUMS.txt" => &bad_sums,
+                    _ => b"",
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+
+        let stage = std::env::temp_dir().join(format!(
+            "slackless-core-dl-verify-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&stage);
+
+        let release = ReleaseInfo {
+            version: "2026.11.25-05".to_owned(),
+            html_url: "https://example.com".to_owned(),
+            asset_name: asset_name.to_owned(),
+            download_url: format!("http://{addr}/asset.tar.gz"),
+            sha256_url: Some(format!("http://{addr}/SHA256SUMS.txt")),
+            notes: Vec::new(),
+        };
+
+        let verified = download_and_verify_release(&release, &stage, "Slackless-Test/1.0")
+            .await
+            .expect("verified download");
+        assert_eq!(verified, stage.join(asset_name));
+        assert_eq!(std::fs::read(&verified).expect("read archive"), payload);
+
+        // Mismatched checksum fails and cleans up the unverified tarball.
+        let mut bad_release = release.clone();
+        bad_release.sha256_url = Some(format!("http://{addr}/BADSUMS.txt"));
+        let err = download_and_verify_release(&bad_release, &stage, "Slackless-Test/1.0")
+            .await
+            .expect_err("checksum mismatch must fail");
+        assert!(err.contains("SHA-256 mismatch"), "unexpected error: {err}");
+        assert!(!stage.join(asset_name).exists());
+
+        // Missing sha256_url refuses unverified update.
+        let mut unsigned = release;
+        unsigned.sha256_url = None;
+        assert!(
+            download_and_verify_release(&unsigned, &stage, "Slackless-Test/1.0")
+                .await
+                .is_err()
+        );
+
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&stage);
     }
 }

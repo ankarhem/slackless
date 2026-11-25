@@ -136,30 +136,6 @@ impl SlackApi {
         Ok(options)
     }
 
-    /// Backwards-compatible wrapper around [`SlackApi::blocks_suggestions_for`].
-    #[allow(clippy::too_many_arguments)]
-    pub async fn blocks_suggestions(
-        &self,
-        bot: &BotId,
-        app_id: &str,
-        team: &TeamId,
-        action_id: &str,
-        block_id: &str,
-        value: &str,
-        container: &ActionContainer,
-    ) -> Result<Vec<(String, String)>> {
-        self.blocks_suggestions_for(&BlockSuggestionsRequest {
-            bot,
-            app_id,
-            team,
-            action_id,
-            block_id,
-            value,
-            container,
-        })
-        .await
-    }
-
     /// `views.submit`: submit a Block Kit modal view's `state.values` back to the app (`F-COLLAB-725`).
     pub async fn views_submit(
         &self,
@@ -571,6 +547,72 @@ impl SlackApi {
             params.push(("description", description.trim().to_owned()));
         }
         Ok(self.call::<Wire>(endpoint, params).await?.data.usergroup)
+    }
+
+    /// `usergroups.disable`: disable an existing `@handle` user group.
+    pub async fn usergroups_disable(&self, usergroup: &UsergroupId) -> Result<Usergroup> {
+        #[derive(Deserialize)]
+        struct Wire {
+            usergroup: Usergroup,
+        }
+        let params = vec![("usergroup", usergroup.to_string())];
+        Ok(self
+            .call::<Wire>("usergroups.disable", params)
+            .await?
+            .data
+            .usergroup)
+    }
+
+    /// `usergroups.enable`: re-enable a disabled `@handle` user group.
+    pub async fn usergroups_enable(&self, usergroup: &UsergroupId) -> Result<Usergroup> {
+        #[derive(Deserialize)]
+        struct Wire {
+            usergroup: Usergroup,
+        }
+        let params = vec![("usergroup", usergroup.to_string())];
+        Ok(self
+            .call::<Wire>("usergroups.enable", params)
+            .await?
+            .data
+            .usergroup)
+    }
+
+    /// `usergroups.users.list`: list member user IDs in a `@handle` user group.
+    pub async fn usergroups_users_list(&self, usergroup: &UsergroupId) -> Result<Vec<UserId>> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default, deserialize_with = "lenient_vec")]
+            users: Vec<UserId>,
+        }
+        let params = vec![("usergroup", usergroup.to_string())];
+        Ok(self
+            .call::<Wire>("usergroups.users.list", params)
+            .await?
+            .data
+            .users)
+    }
+
+    /// `usergroups.users.update`: replace the member list of a `@handle` user group.
+    pub async fn usergroups_users_update(
+        &self,
+        usergroup: &UsergroupId,
+        users: &[UserId],
+    ) -> Result<Usergroup> {
+        #[derive(Deserialize)]
+        struct Wire {
+            usergroup: Usergroup,
+        }
+        let joined = users
+            .iter()
+            .map(UserId::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        let params = vec![("usergroup", usergroup.to_string()), ("users", joined)];
+        Ok(self
+            .call::<Wire>("usergroups.users.update", params)
+            .await?
+            .data
+            .usergroup)
     }
 
     /// Every page of `users.channelSections.list`: the user's sidebar sections, in the order

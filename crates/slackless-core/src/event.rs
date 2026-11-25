@@ -9,7 +9,7 @@ use crate::api;
 use crate::huddle;
 use crate::rtm::ConnectionState;
 use crate::store::StoredMessage;
-use crate::types::{BotId, ChannelId, File, Message, Presence, Ts, UserId};
+use crate::types::{BotId, ChannelId, File, Message, Presence, Ts, UserId, UsergroupId};
 
 /// Bounded capacity of the dedicated high-frequency huddle media lane.
 pub const HUDDLE_MEDIA_CHANNEL_CAPACITY: usize = 64;
@@ -180,6 +180,11 @@ pub enum Event {
     FilesUploaded { channel: ChannelId, count: usize },
     /// Active `@handle` user groups from `usergroups.list`.
     Usergroups(Vec<crate::types::Usergroup>),
+    /// Member user IDs of a `@handle` user group (`usergroups.users.list` / `usergroups.users.update`).
+    UsergroupUsersLoaded {
+        usergroup: UsergroupId,
+        users: Vec<UserId>,
+    },
     /// Featured or searched GIFs for the composer picker.
     GifResults {
         query: String,

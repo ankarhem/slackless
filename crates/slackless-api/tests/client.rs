@@ -1142,6 +1142,92 @@ async fn usergroups_list_parses_groups() {
 }
 
 #[tokio::test]
+async fn usergroups_disable_enable_and_users_parity() {
+    use slackless_api::types::{UserId, UsergroupId};
+
+    let (server, api) = setup().await;
+    let ug_id = UsergroupId::from("S0614TZR7");
+
+    Mock::given(method("POST"))
+        .and(path("/api/usergroups.disable"))
+        .and(body_string_contains("usergroup=S0614TZR7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "usergroup": {
+                "id": "S0614TZR7",
+                "name": "Engineering",
+                "handle": "eng",
+                "date_delete": 1700000000
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/usergroups.enable"))
+        .and(body_string_contains("usergroup=S0614TZR7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "usergroup": {
+                "id": "S0614TZR7",
+                "name": "Engineering",
+                "handle": "eng",
+                "date_delete": 0
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/usergroups.users.list"))
+        .and(body_string_contains("usergroup=S0614TZR7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "users": ["U01", "U02"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/usergroups.users.update"))
+        .and(body_string_contains("usergroup=S0614TZR7"))
+        .and(body_string_contains("users=U01%2CU03"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "usergroup": {
+                "id": "S0614TZR7",
+                "name": "Engineering",
+                "handle": "eng",
+                "user_count": 2,
+                "date_delete": 0
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let disabled = api.usergroups_disable(&ug_id).await.expect("disable");
+    assert_eq!(disabled.id, ug_id);
+    assert!(disabled.is_deleted());
+
+    let enabled = api.usergroups_enable(&ug_id).await.expect("enable");
+    assert_eq!(enabled.id, ug_id);
+    assert!(!enabled.is_deleted());
+
+    let members = api.usergroups_users_list(&ug_id).await.expect("users list");
+    assert_eq!(members, vec![UserId::from("U01"), UserId::from("U02")]);
+
+    let updated = api
+        .usergroups_users_update(&ug_id, &[UserId::from("U01"), UserId::from("U03")])
+        .await
+        .expect("users update");
+    assert_eq!(updated.user_count, Some(2));
+}
+
+#[tokio::test]
 async fn upload_files_runs_get_url_raw_post_and_complete_external() {
     let (server, api) = setup().await;
     let upload_url = format!("{}/upload/v1/slot1", server.uri());
@@ -1860,17 +1946,17 @@ async fn blocks_suggestions_upload_errors_canvas_html_workflows_and_asset_client
             view_id: None,
         };
         let opts = api
-            .blocks_suggestions(
-                &BotId::from("B1"),
-                "A1",
-                &slackless_api::types::TeamId::from("T1"),
-                "act",
-                "blk",
-                "query",
-                &container,
-            )
+            .blocks_suggestions_for(&slackless_api::BlockSuggestionsRequest {
+                bot: &BotId::from("B1"),
+                app_id: "A1",
+                team: &slackless_api::types::TeamId::from("T1"),
+                action_id: "act",
+                block_id: "blk",
+                value: "query",
+                container: &container,
+            })
             .await
-            .unwrap();
+            .expect("blocks_suggestions_for");
         assert_eq!(
             opts,
             vec![

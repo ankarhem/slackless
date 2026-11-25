@@ -3,7 +3,7 @@
 use crate::api::{self, MessageContent};
 use crate::huddle;
 use crate::notify::NotifyLevel;
-use crate::types::{BotId, ChannelId, TeamId, Ts, UserId};
+use crate::types::{BotId, ChannelId, TeamId, Ts, UserId, UsergroupId};
 
 /// Commands a front-end sends into the core, grouped by domain.
 #[derive(Debug, Clone, PartialEq)]
@@ -618,6 +618,17 @@ pub enum WorkspaceCommand {
         name: String,
         handle: String,
         description: String,
+    },
+    /// Disable an existing workspace `@handle` user group (`usergroups.disable`).
+    DisableUsergroup(UsergroupId),
+    /// Re-enable a disabled workspace `@handle` user group (`usergroups.enable`).
+    EnableUsergroup(UsergroupId),
+    /// Load member user IDs of a workspace `@handle` user group (`usergroups.users.list`).
+    LoadUsergroupUsers(UsergroupId),
+    /// Replace the member list of a workspace `@handle` user group (`usergroups.users.update`).
+    UpdateUsergroupUsers {
+        usergroup: UsergroupId,
+        users: Vec<UserId>,
     },
     /// Pause the signed-in user's notifications for `minutes` (`dnd.setSnooze`).
     SetDndSnooze { minutes: u32 },
