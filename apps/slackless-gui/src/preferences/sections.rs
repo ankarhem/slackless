@@ -1205,6 +1205,30 @@ impl Preferences {
             |s| &mut s.announce_incoming,
             cx,
         );
+        let verbosity_current = self.settings.message_verbosity;
+        let theme = cx.theme();
+        let (border, ring) = (theme.border, theme.ring);
+        let verbosity = h_flex()
+            .gap_2()
+            .children(MESSAGE_VERBOSITY.iter().enumerate().map(|(ix, &label)| {
+                let level = ix as u8;
+                let on = verbosity_current == level;
+                h_flex()
+                    .id(("a11y-verbosity", ix))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if on { ring } else { border })
+                    .when(on, |el| el.font_weight(FontWeight::SEMIBOLD))
+                    .text_sm()
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.message_verbosity = level;
+                        this.changed(cx);
+                    }))
+            }));
         v_flex()
             .child(self.group(
                 "Zoom",
@@ -1225,7 +1249,19 @@ impl Preferences {
                     cx,
                 ),
             )
-            .child(self.group("Screen reader", None, announce, cx))
+            .child(
+                self.group(
+                    "Screen reader",
+                    Some(
+                        "Choose how much metadata is announced when reading or replaying messages.",
+                    ),
+                    v_flex()
+                        .gap_2()
+                        .child(announce)
+                        .child(self.labeled("Message verbosity", verbosity)),
+                    cx,
+                ),
+            )
     }
 
     fn mark_as_read(&mut self, cx: &mut Context<Self>) -> Div {

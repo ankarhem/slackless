@@ -2116,7 +2116,7 @@ impl App {
         let tag = format!("msg:{channel}:{}", message.ts);
         self.system_notification_kind(&tag, &title, &body, is_dm_or_mention, cx);
         if self.preferences.read(cx).settings().announce_incoming {
-            #[cfg(target_os = "macos")]
+            #[cfg(all(target_os = "macos", not(test)))]
             {
                 let announcement: String = format!("{title}. {body}").chars().take(160).collect();
                 if let Ok(mut child) = std::process::Command::new("say")

@@ -972,4 +972,73 @@ mod tests {
                     .is_some_and(|u| u.wavy && u.color == Some(palette.danger))
         }));
     }
+
+    #[test]
+    fn mrkdwn_rich_text_and_token_projection_roundtrip_all_constructs() {
+        use crate::editor::{from_mrkdwn, from_rich_text};
+        use slackless_core::types::{Usergroup, UsergroupId};
+
+        let mut fixtures = crate::fixtures::load();
+        fixtures.usergroups.push(Usergroup {
+            id: UsergroupId::from("S0ENG"),
+            handle: "eng-team".into(),
+            name: "Engineering".into(),
+            ..Default::default()
+        });
+
+        let input = "Hey <@U0ALICE> <!subteam^S0ENG|@eng-team> <!here> in <#C0GENERAL|general> :thumbsup::skin-tone-3:\n\
+                     See <https://en.wikipedia.org/wiki/Rust_(programming_language)?lang=en&v=2|Rust wiki> and *bold* _italic_ <u>under</u> ~strike~ `inline()` *_~combo~_*\n\
+                     - bullet one\n\
+                     - bullet two\n\
+                     1. ordered one\n\
+                     2. ordered two\n\
+                     > quoted line\n\
+                     ```\nfn main() {}\n```";
+
+        let doc = from_mrkdwn(input, &fixtures);
+        // Semantic atoms preserved for mention, usergroup, broadcast, channel, skin-tone emoji
+        assert_eq!(doc.atoms().len(), 5);
+
+        // Project onto Live Preview tokens when unfocused: semantic atoms + block prefixes + hidden delimiters
+        let palette = test_palette();
+        let (content, _decs) = project(&doc, &(0..0), false, true, palette, &[]);
+        let ids = token_ids(&content);
+        assert!(ids.iter().filter(|(id, _)| id == "mention").count() == 4);
+        assert!(
+            ids.iter()
+                .any(|(id, _)| id == "emoji:thumbsup::skin-tone-3")
+        );
+        assert!(ids.iter().any(|(id, _)| id == "bullet"));
+        assert!(ids.iter().any(|(id, _)| id == "ordered"));
+        assert!(ids.iter().any(|(id, _)| id == "quote"));
+        assert!(ids.iter().any(|(id, _)| id.starts_with("code-open:")));
+        assert!(ids.iter().any(|(id, _)| id == "code-close"));
+
+        // mrkdwn -> rich_text -> Doc round-trip keeps all constructs and URL with query/parens
+        let rt_block = doc.to_rich_text();
+        let roundtripped =
+            from_rich_text(&[rt_block.into()], &fixtures).expect("rich_text parses back");
+        let mrkdwn_out = roundtripped.to_mrkdwn();
+        assert!(mrkdwn_out.contains("<@U0ALICE>"));
+        assert!(mrkdwn_out.contains("<!subteam^S0ENG>"));
+        assert!(mrkdwn_out.contains("<!here>"));
+        assert!(mrkdwn_out.contains("<#C0GENERAL>"));
+        assert!(mrkdwn_out.contains(":thumbsup::skin-tone-3:"));
+        assert!(mrkdwn_out.contains(
+            "<https://en.wikipedia.org/wiki/Rust_(programming_language)?lang=en&amp;v=2|Rust wiki>"
+        ));
+        assert!(mrkdwn_out.contains("*bold*"));
+        assert!(mrkdwn_out.contains("_italic_"));
+        assert!(mrkdwn_out.contains("~strike~"));
+        assert!(mrkdwn_out.contains("`inline()`"));
+        assert!(mrkdwn_out.contains("bullet one"));
+        assert!(mrkdwn_out.contains("ordered two"));
+        assert!(mrkdwn_out.contains("&gt; quoted line"));
+        assert!(mrkdwn_out.contains("fn main() {}"));
+
+        // Draft serialization preserves underline (`<u>`) losslessly as well
+        assert!(doc.to_draft().contains("<u>under</u>"));
+        let draft_rt = from_mrkdwn(&doc.to_draft(), &fixtures);
+        assert!(draft_rt.to_draft().contains("<u>under</u>"));
+    }
 }

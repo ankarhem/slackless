@@ -48,8 +48,10 @@ struct ListPanelState {
     editing_cell: Option<(String, String, Entity<TextareaState>)>,
     /// Mutable local rows for fixture mode.
     fixture_rows: Option<Vec<Vec<Field>>>,
-    /// Optimistically archived record IDs (`F-COLLAB-255`).
+    /// Optimistically archived record IDs (`F-COLLAB-255`, `F-COLLAB-256`, `F-COLLAB-257`).
     archived_rows: HashSet<String>,
+    /// View-level filter showing archived items alongside active rows (`F-COLLAB-257`).
+    show_archived: bool,
     /// Inline item-comment composer input inside the detail drawer (`F-COLLAB-250`, `251`).
     comment_input: Option<Entity<TextareaState>>,
     /// Locally posted comments per `(list_id, record_id)` appended alongside server comments.
@@ -1125,14 +1127,18 @@ fn render_live_list(
     let theme = cx.theme();
     let list_key = data.file_id.clone();
     let state = panel_state(&list_key, cx);
-    let visible_indices: Vec<usize> = filter_and_sort_rows(data, fixtures, query, sort)
-        .into_iter()
-        .filter(|&ix| {
-            data.rows
-                .get(ix)
-                .is_none_or(|r| !state.archived_rows.contains(&r.id))
-        })
-        .collect();
+    let visible_indices: Vec<usize> = filter_archived_rows(
+        filter_and_sort_rows(data, fixtures, query, sort),
+        data,
+        &state.archived_rows,
+        state.show_archived,
+    );
+    let completed_to_archive = completed_row_ids(data, &state.archived_rows);
+    let archived_count = data
+        .rows
+        .iter()
+        .filter(|r| state.archived_rows.contains(&r.id))
+        .count();
     let on_sort = actions.on_sort.clone();
     let open_browser = actions.open_browser.clone();
     let can_edit = actions.on_update_cell.is_some() || actions.on_create_item.is_some();
@@ -1201,16 +1207,19 @@ fn render_live_list(
     let rows_ui = visible_indices.iter().map(|&row_ix| {
         let rec = &data.rows[row_ix];
         let is_sel = state.selected_row == Some(row_ix);
+        let is_archived = state.archived_rows.contains(&rec.id);
+        let is_subtask = is_subtask_row(rec, &data.columns);
         let key_click = list_key.clone();
         let rec_id_click = rec.id.clone();
         let load_comments_row = actions.on_load_comments.clone();
-        visible_cols.iter().fold(
+        let row_el = visible_cols.iter().fold(
             h_flex()
                 .id(("list-live-row", row_ix))
                 .border_t_1()
                 .border_color(theme.border)
                 .text_sm()
                 .cursor_pointer()
+                .when(is_archived, |r| r.opacity(0.55))
                 .when(is_sel, |r| r.bg(selected_bg))
                 .when(!is_sel, |r| r.hover(move |h| h.bg(hover_bg)))
                 .on_click(move |_, window, cx| {
@@ -1277,10 +1286,50 @@ fn render_live_list(
                         .items_center()
                         .px_3()
                         .py_2()
+                        .when(col_ix == primary_ix && is_subtask, |c| {
+                            c.pl_6().gap_1().child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child("\u{21B3}"),
+                            )
+                        })
                         .child(cell_el),
                 )
             },
-        )
+        );
+        // Inline archive button on subtask rows (`F-COLLAB-256`).
+        if is_subtask && !is_archived {
+            let key_sub = list_key.clone();
+            let sub_id = rec.id.clone();
+            let on_arch = actions.on_archive_item.clone();
+            row_el.child(
+                div().pr_2().flex_none().child(
+                    Button::new(SharedString::from(format!("list-subtask-arch-{row_ix}")))
+                        .ghost()
+                        .with_size(Size::XSmall)
+                        .icon(IconName::Archive)
+                        .tooltip("Archive subtask")
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let rid = sub_id.clone();
+                            mutate_panel(
+                                &key_sub,
+                                |s| {
+                                    s.archived_rows.insert(rid.clone());
+                                },
+                                window,
+                                cx,
+                            );
+                            if let Some(cb) = &on_arch {
+                                cb(sub_id.clone(), window, cx);
+                            }
+                        }),
+                ),
+            )
+        } else {
+            row_el
+        }
     });
 
     let body = if data.columns.is_empty() {
@@ -1847,6 +1896,74 @@ fn render_live_list(
                         .child(h_flex().w_full().items_center().text_sm().child(control)),
                 );
             }
+            let child_subtasks =
+                subtask_rows_for_parent(data, &rec.id, &state.archived_rows, state.show_archived);
+            if !child_subtasks.is_empty() {
+                let mut sub_section = v_flex()
+                    .gap_1p5()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Subtasks ({})", child_subtasks.len())),
+                    );
+                let primary_col = data.columns.get(primary_ix);
+                for sub_ix in child_subtasks {
+                    let sub_row = &data.rows[sub_ix];
+                    let sub_id = sub_row.id.clone();
+                    let sub_archived = state.archived_rows.contains(&sub_id);
+                    let key_sub = list_key.clone();
+                    let on_arch = actions.on_archive_item.clone();
+                    let sub_label = match primary_col {
+                        Some(col) => live_cell(row_cell(sub_row, col), col, fixtures, cx),
+                        None => div().child(sub_row.id.clone()),
+                    };
+                    sub_section = sub_section.child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(theme.secondary.opacity(0.35))
+                            .when(sub_archived, |r| r.opacity(0.55))
+                            .child(div().flex_1().min_w_0().text_xs().child(sub_label))
+                            .when(!sub_archived, |r| {
+                                r.child(
+                                    Button::new(SharedString::from(format!(
+                                        "list-det-subtask-arch-{sub_ix}"
+                                    )))
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .icon(IconName::Archive)
+                                    .tooltip("Archive subtask")
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            let rid = sub_id.clone();
+                                            mutate_panel(
+                                                &key_sub,
+                                                |s| {
+                                                    s.archived_rows.insert(rid.clone());
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                            if let Some(cb) = &on_arch {
+                                                cb(sub_id.clone(), window, cx);
+                                            }
+                                        },
+                                    ),
+                                )
+                            }),
+                    );
+                }
+                panel = panel.child(sub_section);
+            }
             panel = panel.child(render_record_comments_section(
                 &list_key, &rec.id, &state, fixtures, cx,
             ));
@@ -2049,6 +2166,65 @@ fn render_live_list(
                                 )
                                 .children(find_bar)
                                 .child(layout_switcher(&list_key, state.layout, cx))
+                                .child({
+                                    let key_show = list_key.clone();
+                                    let showing = state.show_archived;
+                                    let label = if showing {
+                                        "Hide archived".to_owned()
+                                    } else if archived_count > 0 {
+                                        format!("Show archived ({archived_count})")
+                                    } else {
+                                        "Show archived".to_owned()
+                                    };
+                                    Button::new("list-toggle-archived")
+                                        .when(showing, |b| b.primary())
+                                        .when(!showing, |b| b.outline())
+                                        .with_size(Size::XSmall)
+                                        .icon(IconName::Archive)
+                                        .label(label)
+                                        .tooltip("Toggle showing archived items in this view")
+                                        .on_click(move |_, window, cx| {
+                                            mutate_panel(
+                                                &key_show,
+                                                |s| s.show_archived = !s.show_archived,
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                })
+                                .when(!completed_to_archive.is_empty(), |row| {
+                                    let key_bulk = list_key.clone();
+                                    let ids = completed_to_archive.clone();
+                                    let on_arch = actions.on_archive_item.clone();
+                                    let count = ids.len();
+                                    row.child(
+                                        Button::new("list-archive-completed")
+                                            .outline()
+                                            .with_size(Size::XSmall)
+                                            .icon(IconName::Archive)
+                                            .label(format!("Archive completed ({count})"))
+                                            .tooltip("Archive all completed items in this view")
+                                            .on_click(move |_, window, cx| {
+                                                let ids_local = ids.clone();
+                                                mutate_panel(
+                                                    &key_bulk,
+                                                    |s| {
+                                                        for id in &ids_local {
+                                                            s.archived_rows.insert(id.clone());
+                                                        }
+                                                        s.selected_row = None;
+                                                    },
+                                                    window,
+                                                    cx,
+                                                );
+                                                if let Some(cb) = &on_arch {
+                                                    for id in &ids {
+                                                        cb(id.clone(), window, cx);
+                                                    }
+                                                }
+                                            }),
+                                    )
+                                })
                                 .when(!toggleable_cols.is_empty(), |row| {
                                     row.child(fields_menu(
                                         &list_key,

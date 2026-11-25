@@ -150,14 +150,53 @@ impl UserStatus {
         })
     }
 
-    /// When a status set now clears (Unix seconds); `None` for "Don't clear". "Today" ends
-    /// at local midnight, "This week" at the local midnight starting next Monday.
-    pub fn clears_at(&self) -> Option<i64> {
+    /// Whether this status's concrete expiration has passed at `now` (Unix seconds).
+    pub fn is_expired_at(&self, now: i64) -> bool {
+        self.expiration.is_some_and(|exp| exp <= now)
+    }
+
+    /// Whether this status has expired right now.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(now_secs())
+    }
+
+    /// Human-readable time remaining until expiration (`"45s"`, `"12m"`, `"2h 15m"`, `"3d 4h"`),
+    /// or `None` when the status has no expiration or has already expired.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn format_remaining(&self, now: i64) -> Option<String> {
+        let rem = self.expiration? - now;
+        if rem <= 0 {
+            return None;
+        }
+        let days = rem / 86_400;
+        let hours = (rem % 86_400) / 3_600;
+        let mins = (rem % 3_600) / 60;
+        let secs = rem % 60;
+        Some(if days > 0 {
+            if hours > 0 {
+                format!("{days}d {hours}h")
+            } else {
+                format!("{days}d")
+            }
+        } else if hours > 0 {
+            if mins > 0 {
+                format!("{hours}h {mins}m")
+            } else {
+                format!("{hours}h")
+            }
+        } else if mins > 0 {
+            format!("{mins}m")
+        } else {
+            format!("{secs}s")
+        })
+    }
+
+    /// Pure version of [`Self::clears_at`] against explicit `now` and UTC `offset` (seconds).
+    pub fn clears_at_from(&self, now: i64, offset: i64) -> Option<i64> {
         if let Some(exp) = self.expiration {
             return Some(exp);
         }
-        let now = now_secs();
-        let offset = local_offset_now();
         let day = (now + offset).div_euclid(86_400);
         let midnight = day * 86_400 - offset;
         match self.clear_after {
@@ -169,6 +208,12 @@ impl UserStatus {
             5 => Some(midnight + (7 - (day + 3).rem_euclid(7)) * 86_400),
             _ => None,
         }
+    }
+
+    /// When a status set now clears (Unix seconds); `None` for "Don't clear". "Today" ends
+    /// at local midnight, "This week" at the local midnight starting next Monday.
+    pub fn clears_at(&self) -> Option<i64> {
+        self.clears_at_from(now_secs(), local_offset_now())
     }
 }
 
@@ -248,13 +293,16 @@ impl SelfState {
         }
     }
 
-    /// Pop and activate the earliest due scheduled status whose `starts_at <= now`, if any (`F-SHELL-018`).
-    pub fn activate_due_scheduled(&mut self) -> Option<UserStatus> {
-        let now = now_secs();
+    /// Pop and activate the earliest due scheduled status whose `starts_at <= now` using
+    /// explicit `now` and UTC `offset` (`F-SHELL-018`).
+    pub fn activate_due_scheduled_at(&mut self, now: i64, offset: i64) -> Option<UserStatus> {
         let ix = self
             .scheduled_statuses
             .iter()
-            .position(|s| s.starts_at <= now)?;
+            .enumerate()
+            .filter(|(_, s)| s.starts_at <= now)
+            .min_by_key(|(_, s)| s.starts_at)
+            .map(|(ix, _)| ix)?;
         let sched = self.scheduled_statuses.remove(ix);
         let mut status = UserStatus {
             emoji: sched.emoji,
@@ -263,9 +311,14 @@ impl SelfState {
             pause: sched.pause,
             expiration: None,
         };
-        status.expiration = status.clears_at();
+        status.expiration = status.clears_at_from(now, offset);
         self.set_status(Some(status.clone()));
         Some(status)
+    }
+
+    /// Pop and activate the earliest due scheduled status whose `starts_at <= now`, if any (`F-SHELL-018`).
+    pub fn activate_due_scheduled(&mut self) -> Option<UserStatus> {
+        self.activate_due_scheduled_at(now_secs(), local_offset_now())
     }
 
     /// Turn focus mode off, clearing its automatic status (a status the user set stays).
@@ -301,13 +354,9 @@ impl SelfState {
         self.status = status;
     }
 
-    /// Clear the custom status if its expiration timestamp has passed. Returns `true` if cleared.
-    pub fn expire_status(&mut self) -> bool {
-        let expired = self
-            .status
-            .as_ref()
-            .and_then(|s| s.expiration)
-            .is_some_and(|exp| exp <= now_secs());
+    /// Clear the custom status if its expiration timestamp has passed at `now`. Returns `true` if cleared.
+    pub fn expire_status_at(&mut self, now: i64) -> bool {
+        let expired = self.status.as_ref().is_some_and(|s| s.is_expired_at(now));
         if expired {
             self.set_status(None);
             true
@@ -316,20 +365,30 @@ impl SelfState {
         }
     }
 
-    /// `Notifications paused until 4:30 PM`, or just `Notifications paused` while paused
-    /// until a status is cleared.
-    pub fn pause_label(&self) -> Option<String> {
-        let until = self.paused_until.filter(|_| self.paused())?;
+    /// Clear the custom status if its expiration timestamp has passed. Returns `true` if cleared.
+    pub fn expire_status(&mut self) -> bool {
+        self.expire_status_at(now_secs())
+    }
+
+    /// Pure version of [`Self::pause_label`] against explicit `now` and UTC `offset`.
+    pub fn pause_label_at(&self, now: i64, offset: i64) -> Option<String> {
+        let until = self.paused_until.filter(|&u| u > now)?;
         if until == i64::MAX {
             return Some("Notifications paused".to_owned());
         }
-        let day = |secs: i64| (secs + local_offset_now()).div_euclid(86_400);
-        let when = match day(until) - day(now_secs()) {
-            0 => clock(until, None),
-            1 => format!("tomorrow, {}", clock(until, None)),
-            days => format!("{}, in {days} days", clock(until, None)),
+        let day = |secs: i64| (secs + offset).div_euclid(86_400);
+        let when = match day(until) - day(now) {
+            0 => clock(until, Some(offset)),
+            1 => format!("tomorrow, {}", clock(until, Some(offset))),
+            days => format!("{}, in {days} days", clock(until, Some(offset))),
         };
         Some(format!("Notifications paused until {when}"))
+    }
+
+    /// `Notifications paused until 4:30 PM`, or just `Notifications paused` while paused
+    /// until a status is cleared.
+    pub fn pause_label(&self) -> Option<String> {
+        self.pause_label_at(now_secs(), local_offset_now())
     }
 }
 
@@ -1594,12 +1653,18 @@ impl Render for PausePicker {
 /// The next occurrence of a wall-clock time (`4:30 pm`, `16:30`) as a Unix timestamp:
 /// today if it is still ahead, otherwise tomorrow. `None` when `text` is not a time.
 fn parse_until_time(text: &str, now: i64, offset: i64) -> Option<i64> {
+    #[derive(Clone, Copy)]
+    enum Meridiem {
+        Am,
+        Pm,
+        Clock24,
+    }
     let rest = text.trim().to_lowercase();
-    let (body, pm) = match rest.strip_suffix("pm") {
-        Some(body) => (body.trim_end(), true),
+    let (body, meridiem) = match rest.strip_suffix("pm") {
+        Some(body) => (body.trim_end(), Meridiem::Pm),
         None => match rest.strip_suffix("am") {
-            Some(body) => (body.trim_end(), false),
-            None => (rest.as_str(), false),
+            Some(body) => (body.trim_end(), Meridiem::Am),
+            None => (rest.as_str(), Meridiem::Clock24),
         },
     };
     let (hour_text, minute_text) = match body.split_once(':') {
@@ -1608,6 +1673,7 @@ fn parse_until_time(text: &str, now: i64, offset: i64) -> Option<i64> {
     };
     if hour_text.is_empty()
         || !hour_text.chars().all(|c| c.is_ascii_digit())
+        || minute_text.is_empty()
         || minute_text.len() > 2
         || !minute_text.chars().all(|c| c.is_ascii_digit())
     {
@@ -1615,16 +1681,18 @@ fn parse_until_time(text: &str, now: i64, offset: i64) -> Option<i64> {
     }
     let hour: i64 = hour_text.parse().ok()?;
     let minute: i64 = minute_text.parse().ok()?;
-    let (low, high) = if pm { (1, 12) } else { (0, 23) };
+    let (low, high) = match meridiem {
+        Meridiem::Am | Meridiem::Pm => (1, 12),
+        Meridiem::Clock24 => (0, 23),
+    };
     if !(low..=high).contains(&hour) || minute > 59 {
         return None;
     }
-    // A 12-hour clock: 12 PM is noon, 12 AM is midnight, everything else shifts by twelve.
-    let hour = match (pm, hour) {
-        (true, 12) => 12,
-        (true, hour) => hour + 12,
-        (false, 12) => 0,
-        (false, hour) => hour,
+    let hour = match (meridiem, hour) {
+        (Meridiem::Pm, 12) => 12,
+        (Meridiem::Pm, hour) => hour + 12,
+        (Meridiem::Am, 12) => 0,
+        (Meridiem::Am, hour) | (Meridiem::Clock24, hour) => hour,
     };
     let midnight = (now + offset).div_euclid(86_400) * 86_400 - offset;
     let mut until = midnight + hour * 3_600 + minute * 60;
@@ -1636,11 +1704,12 @@ fn parse_until_time(text: &str, now: i64, offset: i64) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduledStatus, SelfState, parse_until_time};
+    use super::{ScheduledStatus, SelfState, UserStatus, parse_until_time};
 
     #[test]
-    fn activates_due_scheduled_statuses_in_order() {
+    fn activates_due_scheduled_statuses_in_earliest_timestamp_order() {
         let mut state = SelfState::default();
+        // Push out of chronological order; earliest due timestamp must activate first.
         state.scheduled_statuses.push(ScheduledStatus {
             emoji: "palm_tree".to_owned(),
             text: "Future PTO".to_owned(),
@@ -1649,18 +1718,148 @@ mod tests {
             pause: true,
         });
         state.scheduled_statuses.push(ScheduledStatus {
-            emoji: "spiral_calendar_pad".to_owned(),
-            text: "Standup".to_owned(),
-            starts_at: 1,
+            emoji: "coffee".to_owned(),
+            text: "Lunch".to_owned(),
+            starts_at: 2_000,
             clear_after: 1,
             pause: false,
         });
-        let active = state
-            .activate_due_scheduled()
-            .expect("past scheduled status should activate");
-        assert_eq!(active.text, "Standup");
+        state.scheduled_statuses.push(ScheduledStatus {
+            emoji: "spiral_calendar_pad".to_owned(),
+            text: "Standup".to_owned(),
+            starts_at: 1_000,
+            clear_after: 1,
+            pause: true,
+        });
+
+        let first = state
+            .activate_due_scheduled_at(5_000, 0)
+            .expect("earliest due status activates");
+        assert_eq!(first.text, "Standup");
+        assert_eq!(first.expiration, Some(6_800));
+        assert!(state.paused_until == Some(6_800));
+
+        let second = state
+            .activate_due_scheduled_at(5_000, 0)
+            .expect("second due status activates");
+        assert_eq!(second.text, "Lunch");
         assert_eq!(state.scheduled_statuses.len(), 1);
-        assert!(state.activate_due_scheduled().is_none());
+        assert!(state.activate_due_scheduled_at(5_000, 0).is_none());
+    }
+
+    #[test]
+    fn scheduled_status_clears_at_respects_timezone_boundaries() {
+        // 2024-03-07 23:00:00 UTC (Thursday):
+        // - In UTC (offset 0): Today ends at 2024-03-08 00:00:00 UTC (+3600s).
+        // - In UTC+02:00 (+7200): local time is already 2024-03-08 01:00 (Friday),
+        //   so Today ends at 2024-03-09 00:00 local = 2024-03-08 22:00 UTC (+82800s).
+        let now_utc = 1_709_852_400; // 2024-03-07 23:00:00 UTC
+        let status_today = UserStatus {
+            emoji: "bus".into(),
+            text: "Commuting".into(),
+            clear_after: 4, // Today
+            pause: false,
+            expiration: None,
+        };
+        assert_eq!(
+            status_today.clears_at_from(now_utc, 0),
+            Some(now_utc + 3_600)
+        );
+        assert_eq!(
+            status_today.clears_at_from(now_utc, 7_200),
+            Some(now_utc + 23 * 3_600)
+        );
+        // "This week" on Thursday (day 3 since Monday) -> +4 days from local midnight
+        let status_week = UserStatus {
+            clear_after: 5,
+            ..status_today.clone()
+        };
+        assert_eq!(
+            status_week.clears_at_from(now_utc, 0),
+            Some(now_utc + 3_600 + 3 * 86_400)
+        );
+        // In UTC+02:00 it is already Friday (day 4 since Monday) -> +3 days from Friday local midnight
+        assert_eq!(
+            status_week.clears_at_from(now_utc, 7_200),
+            Some(now_utc + 23 * 3_600 + 2 * 86_400)
+        );
+    }
+
+    #[test]
+    fn user_status_expiry_countdown_and_self_state_expiration() {
+        let mut s = UserStatus {
+            emoji: "coffee".into(),
+            text: "Break".into(),
+            clear_after: 0,
+            pause: true,
+            expiration: None,
+        };
+        assert!(!s.is_expired_at(1_000));
+        assert!(!s.is_expired());
+        assert_eq!(s.format_remaining(1_000), None);
+
+        s.expiration = Some(1_045);
+        assert!(!s.is_expired_at(1_000));
+        assert_eq!(s.format_remaining(1_000).as_deref(), Some("45s"));
+        assert!(s.is_expired_at(1_045));
+        assert!(s.is_expired_at(1_046));
+        assert_eq!(s.format_remaining(1_045), None);
+
+        s.expiration = Some(1_000 + 12 * 60 + 30);
+        assert_eq!(s.format_remaining(1_000).as_deref(), Some("12m"));
+        s.expiration = Some(1_000 + 2 * 3_600);
+        assert_eq!(s.format_remaining(1_000).as_deref(), Some("2h"));
+        s.expiration = Some(1_000 + 2 * 3_600 + 15 * 60);
+        assert_eq!(s.format_remaining(1_000).as_deref(), Some("2h 15m"));
+        s.expiration = Some(1_000 + 3 * 86_400);
+        assert_eq!(s.format_remaining(1_000).as_deref(), Some("3d"));
+        s.expiration = Some(1_000 + 3 * 86_400 + 4 * 3_600);
+        assert_eq!(s.format_remaining(1_000).as_deref(), Some("3d 4h"));
+
+        // SelfState expiration clears both status and pause
+        let mut state = SelfState::default();
+        s.expiration = Some(2_000);
+        state.set_status(Some(s));
+        assert_eq!(state.paused_until, Some(2_000));
+        assert!(!state.expire_status_at(1_999));
+        assert!(state.status.is_some());
+        assert!(state.expire_status_at(2_000));
+        assert!(state.status.is_none());
+        assert!(state.paused_until.is_none());
+    }
+
+    #[test]
+    fn pause_label_formats_today_tomorrow_multi_day_indefinite_and_expired() {
+        // 2024-03-07 10:00:00 UTC
+        let mut state = SelfState {
+            paused_until: Some(NOW - 1),
+            ..SelfState::default()
+        };
+        assert_eq!(state.pause_label_at(NOW, 0), None);
+
+        state.paused_until = Some(i64::MAX);
+        assert_eq!(
+            state.pause_label_at(NOW, 0).as_deref(),
+            Some("Notifications paused")
+        );
+
+        state.paused_until = Some(NOW + 23_400); // 4:30 PM today
+        assert_eq!(
+            state.pause_label_at(NOW, 0).as_deref(),
+            Some("Notifications paused until 4:30 PM")
+        );
+
+        state.paused_until = Some(NOW + 86_400); // 10:00 AM tomorrow
+        assert_eq!(
+            state.pause_label_at(NOW, 0).as_deref(),
+            Some("Notifications paused until tomorrow, 10:00 AM")
+        );
+
+        state.paused_until = Some(NOW + 3 * 86_400);
+        assert_eq!(
+            state.pause_label_at(NOW, 0).as_deref(),
+            Some("Notifications paused until 10:00 AM, in 3 days")
+        );
     }
 
     /// 2024-03-07 10:00:00 UTC (`offset` 0 in the calls below).
@@ -1675,14 +1874,28 @@ mod tests {
         // 4:30 PM today is ahead of 10:00 AM: today at 16:30.
         assert_eq!(until("4:30 pm"), Some(NOW + 23_400));
         assert_eq!(until("4:30pm"), Some(NOW + 23_400));
+        assert_eq!(until("4:30 PM"), Some(NOW + 23_400));
         assert_eq!(until("  16:30 "), Some(NOW + 23_400));
-        // Noon: 12 PM is noon, 12 AM is midnight (already past: tomorrow).
+        // Noon: 12 PM and 24-hour 12:00 are both noon today; 12 AM and 0:00 are midnight tomorrow.
         assert_eq!(until("12 pm"), Some(NOW + 7_200));
+        assert_eq!(until("12:00 PM"), Some(NOW + 7_200));
+        assert_eq!(until("12:00"), Some(NOW + 7_200));
         assert_eq!(until("12 am"), Some(NOW + 86_400 - 36_000));
-        // 9:05 AM already passed today: tomorrow at 9:05.
+        assert_eq!(until("12:00 am"), Some(NOW + 86_400 - 36_000));
+        assert_eq!(until("0:00"), Some(NOW + 86_400 - 36_000));
+        assert_eq!(until("00:00"), Some(NOW + 86_400 - 36_000));
+        // Single-digit hours and exact current time (rolls to tomorrow).
         assert_eq!(until("9:05 am"), Some(NOW + 83_100));
+        assert_eq!(until("9:05 AM"), Some(NOW + 83_100));
+        assert_eq!(until("10:00"), Some(NOW + 86_400));
+        assert_eq!(until("11"), Some(NOW + 3_600));
         // Bare hours count as 24-hour clock times.
         assert_eq!(until("23"), Some(NOW + 46_800));
+        // Timezone offset boundary: at 10:00 UTC in UTC-08:00 it is 02:00 local, so 09:00 local is +7h.
+        assert_eq!(
+            parse_until_time("9:00 am", NOW, -8 * 3_600),
+            Some(NOW + 7 * 3_600)
+        );
     }
 
     #[test]
@@ -1690,10 +1903,16 @@ mod tests {
         assert_eq!(until(""), None);
         assert_eq!(until("soon"), None);
         assert_eq!(until("13 pm"), None);
+        assert_eq!(until("13:00 pm"), None);
+        assert_eq!(until("13:00 am"), None);
         assert_eq!(until("0 pm"), None);
+        assert_eq!(until("0:00 am"), None);
         assert_eq!(until("4:65 pm"), None);
+        assert_eq!(until("12:60"), None);
+        assert_eq!(until("24:00"), None);
         assert_eq!(until("25:00"), None);
         assert_eq!(until("4:3:00 pm"), None);
         assert_eq!(until("-4 pm"), None);
+        assert_eq!(until("4:"), None);
     }
 }

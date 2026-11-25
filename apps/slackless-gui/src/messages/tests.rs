@@ -939,3 +939,58 @@ fn strip_quote_prefix_hex_color_huddle_duration_and_ts_just_before() {
     assert_eq!(ts_just_before(&Ts::from("malformed")).as_str(), "0.000000");
     assert_eq!(ts_just_before(&Ts::from("abc.def")).as_str(), "0.000000");
 }
+
+#[test]
+#[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+fn benchmark_highlight_mrkdwn_and_time_1000_messages() {
+    use std::time::Instant;
+
+    let fixtures = crate::fixtures::load();
+    let theme = test_run_theme(false);
+    let now = time::CivilTime::from_unix_with_offset(1_764_000_000, 0);
+    let code_sample = "pub fn handle(req: &Request) -> Result<Response, Error> {\n\
+                       \tlet id = req.param(\"id\")?.parse::<u64>()?;\n\
+                       \t// fast path\n\
+                       \tOk(Response::json(id + 42))\n\
+                       }";
+    let mrkdwn_sample = "Deploy *api v2.4* by <@U0ALICE> in <#C0ENG|engineering> <!here> — \
+                         see <https://grafana.example/d/1|dashboard> and `p99=12ms`.\n\
+                         ```rust\nlet ok = true;\n```\n\
+                         Visit https://status.example/inc/42 for details.";
+
+    let count = 1_000usize;
+    let start = Instant::now();
+    let mut total_tokens = 0usize;
+    let mut total_chars = 0usize;
+    for i in 0..count {
+        // 1. Syntax highlighting
+        let lang = crate::syntax::Lang::detect(Some("rust"), None, code_sample);
+        total_tokens += crate::syntax::highlight(lang, code_sample).len();
+
+        // 2. Mrkdwn fence splitting + inline parsing
+        for (is_code, segment) in mrkdwn_fences(mrkdwn_sample) {
+            if is_code {
+                total_tokens += crate::syntax::highlight(crate::syntax::Lang::Rust, segment).len();
+            } else {
+                let mut b = ParagraphBuilder::new();
+                push_mrkdwn_text(&mut b, segment, &theme, DEFAULT_FLAGS);
+                let _ = angle_token(&mut b, "<@U0ALICE>", &fixtures, &theme, DEFAULT_FLAGS);
+                total_chars += b.text.len();
+            }
+        }
+
+        // 3. Time & date formatting
+        let msg_time =
+            time::CivilTime::from_unix_with_offset(1_764_000_000 - (i as i64) * 7_200, 0);
+        total_chars += time::card_stamp_at(&msg_time, &now, i % 2 == 0).len();
+        total_chars += time::list_stamp_at(&msg_time, &now).len();
+        total_chars += time::format_clock_civil(&msg_time, false).len();
+    }
+    let elapsed = start.elapsed();
+    let ms = elapsed.as_secs_f64() * 1_000.0;
+    let per_sec = (count as f64) / elapsed.as_secs_f64().max(1e-9);
+    eprintln!(
+        "bench 1000 messages (syntax + mrkdwn + time): {ms:.2} ms ({per_sec:.0} msgs/s; tokens={total_tokens}, chars={total_chars})"
+    );
+    assert!(total_tokens > 0 && total_chars > 0);
+}

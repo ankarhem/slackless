@@ -144,6 +144,16 @@ const GROUPS: [(&str, &[Shortcut]); 5] = [
             (&["\u{2303}", "\u{2318}", "F"], "Toggle full screen", true),
             (&["\u{2318}", "+ / -"], "Zoom in / out", true),
             (&["\u{2318}", "0"], "Actual size", true),
+            (
+                &["\u{2303}", "\u{21e7}", "U"],
+                "Cross-workspace unread summary",
+                true,
+            ),
+            (
+                &["\u{2303}", "\u{21e7}", "R"],
+                "Replay focused message announcement",
+                true,
+            ),
         ],
     ),
 ];

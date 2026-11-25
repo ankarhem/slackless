@@ -137,7 +137,14 @@ impl Composer {
         let url = pasted.trim();
         let is_url = (url.starts_with("https://") || url.starts_with("http://"))
             && !url.contains(char::is_whitespace);
-        if !is_url || self.editor.selection().is_empty() {
+        if !is_url
+            || self.editor.selection().is_empty()
+            || matches!(
+                self.editor.active_block(),
+                Some(LineKind::Code | LineKind::Fence)
+            )
+            || self.editor.active_style().contains(Style::CODE)
+        {
             return false;
         }
         self.editor.set_link(url);

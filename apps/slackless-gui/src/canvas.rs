@@ -12,6 +12,7 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, Size, h_flex, v_flex,
 };
@@ -170,6 +171,54 @@ impl CanvasDoc {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Plain markdown text for a single block (`F-SHELL-265` context menu "Copy block text").
+    pub fn block_plain_text(&self, index: usize) -> Option<String> {
+        self.blocks.get(index).map(CanvasBlock::to_markdown)
+    }
+
+    /// Duplicate block at `index`, inserting the copy right after it (`F-SHELL-265`).
+    pub fn duplicate_block(&mut self, index: usize) -> bool {
+        let Some(cloned) = self.blocks.get(index).cloned() else {
+            return false;
+        };
+        self.blocks.insert(index + 1, cloned);
+        if self.section_ids.len() < self.blocks.len() - 1 {
+            self.section_ids.resize(self.blocks.len() - 1, None);
+        }
+        self.section_ids.insert(index + 1, None);
+        true
+    }
+
+    /// Move block at `index` up (`delta = -1`) or down (`delta = 1`) (`F-SHELL-265`).
+    pub fn move_block(&mut self, index: usize, delta: isize) -> bool {
+        if index >= self.blocks.len() {
+            return false;
+        }
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= self.blocks.len() {
+            return false;
+        }
+        let target = target as usize;
+        self.blocks.swap(index, target);
+        if self.section_ids.len() < self.blocks.len() {
+            self.section_ids.resize(self.blocks.len(), None);
+        }
+        self.section_ids.swap(index, target);
+        true
+    }
+
+    /// Delete block at `index` (`F-SHELL-265`).
+    pub fn delete_block(&mut self, index: usize) -> bool {
+        if index >= self.blocks.len() {
+            return false;
+        }
+        self.blocks.remove(index);
+        if index < self.section_ids.len() {
+            self.section_ids.remove(index);
+        }
+        true
     }
 }
 
@@ -570,9 +619,13 @@ fn render_canvas_doc(
             .outline()
             .with_size(Size::XSmall)
             .icon(IconName::Pin)
-            .label(if already { "Pinned tab" } else { "Pin tab" })
+            .label(if already {
+                "Pinned to tabs"
+            } else {
+                "Pin to channel tabs"
+            })
             .disabled(already)
-            .tooltip("Pin this canvas as a channel tab")
+            .tooltip("Pin this canvas to the channel header tabs")
             .on_click(move |_, window, cx| {
                 mutate_ui(&key_pin, |s| s.pinned_tab = true, window, cx);
                 pin_cb(window, cx);
@@ -779,14 +832,149 @@ fn render_canvas_doc(
                     }) as Rc<dyn Fn(usize, &mut Window, &mut App)>
                 });
                 let section_id = canvas.section_ids.get(block_ix).and_then(|s| s.as_deref());
-                doc_col.child(render_block(
-                    block_ix,
-                    block,
-                    section_id,
-                    actions.canvas_url.as_deref(),
-                    on_toggle,
-                    cx,
-                ))
+                let block_count = canvas.blocks.len();
+                let block_md = canvas.block_plain_text(block_ix).unwrap_or_default();
+                let full_md_export = canvas.to_markdown();
+                let canvas_ctx = canvas.clone();
+                let key_ctx = key.to_owned();
+                let on_edit_ctx = actions.on_edit.clone();
+                let on_pin_ctx = actions.on_pin_tab.clone();
+                let already_pinned = ui.pinned_tab;
+                doc_col.child(
+                    div()
+                        .id(SharedString::from(format!("canvas-blk-{key}-{block_ix}")))
+                        .rounded_sm()
+                        .child(render_block(
+                            block_ix,
+                            block,
+                            section_id,
+                            actions.canvas_url.as_deref(),
+                            on_toggle,
+                            cx,
+                        ))
+                        .context_menu(move |mut menu, _, _| {
+                            let copy_text = block_md.clone();
+                            menu = menu.item(PopupMenuItem::new("Copy block text").on_click(
+                                move |_, window, cx| {
+                                    cx.write_to_clipboard(
+                                        gpui_kit::gpui::ClipboardItem::new_string(
+                                            copy_text.clone(),
+                                        ),
+                                    );
+                                    crate::actions::notify(
+                                        "Copied block",
+                                        "Copied canvas block text to clipboard.",
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            ));
+                            if can_edit {
+                                let (c_dup, k_dup, e_dup) =
+                                    (canvas_ctx.clone(), key_ctx.clone(), on_edit_ctx.clone());
+                                menu = menu.item(PopupMenuItem::new("Duplicate block").on_click(
+                                    move |_, window, cx| {
+                                        let mut updated = c_dup.clone();
+                                        if updated.duplicate_block(block_ix) {
+                                            commit_block_edit(
+                                                &k_dup,
+                                                updated,
+                                                is_fixture,
+                                                e_dup.as_ref(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                ));
+                                let (c_up, k_up, e_up) =
+                                    (canvas_ctx.clone(), key_ctx.clone(), on_edit_ctx.clone());
+                                menu = menu.item(
+                                    PopupMenuItem::new("Move up")
+                                        .disabled(block_ix == 0)
+                                        .on_click(move |_, window, cx| {
+                                            let mut updated = c_up.clone();
+                                            if updated.move_block(block_ix, -1) {
+                                                commit_block_edit(
+                                                    &k_up,
+                                                    updated,
+                                                    is_fixture,
+                                                    e_up.as_ref(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                );
+                                let (c_dn, k_dn, e_dn) =
+                                    (canvas_ctx.clone(), key_ctx.clone(), on_edit_ctx.clone());
+                                menu = menu.item(
+                                    PopupMenuItem::new("Move down")
+                                        .disabled(block_ix + 1 >= block_count)
+                                        .on_click(move |_, window, cx| {
+                                            let mut updated = c_dn.clone();
+                                            if updated.move_block(block_ix, 1) {
+                                                commit_block_edit(
+                                                    &k_dn,
+                                                    updated,
+                                                    is_fixture,
+                                                    e_dn.as_ref(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                );
+                                let (c_del, k_del, e_del) =
+                                    (canvas_ctx.clone(), key_ctx.clone(), on_edit_ctx.clone());
+                                menu = menu.item(PopupMenuItem::new("Delete block").on_click(
+                                    move |_, window, cx| {
+                                        let mut updated = c_del.clone();
+                                        if updated.delete_block(block_ix) {
+                                            commit_block_edit(
+                                                &k_del,
+                                                updated,
+                                                is_fixture,
+                                                e_del.as_ref(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                ));
+                            }
+                            let export_md = full_md_export.clone();
+                            menu = menu.separator().item(
+                                PopupMenuItem::new("Export Markdown").on_click(
+                                    move |_, window, cx| {
+                                        cx.write_to_clipboard(
+                                            gpui_kit::gpui::ClipboardItem::new_string(
+                                                export_md.clone(),
+                                            ),
+                                        );
+                                        crate::actions::notify(
+                                            "Exported Markdown",
+                                            "Copied full canvas markdown to clipboard.",
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ),
+                            );
+                            if let Some(pin_cb) = on_pin_ctx.clone() {
+                                let k_pin = key_ctx.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new("Pin to channel tabs")
+                                        .disabled(already_pinned)
+                                        .on_click(move |_, window, cx| {
+                                            mutate_ui(&k_pin, |s| s.pinned_tab = true, window, cx);
+                                            pin_cb(window, cx);
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
+                )
             })
     };
 
@@ -1228,6 +1416,30 @@ fn render_comments_drawer(key: &str, ui: &CanvasUiState, cx: &App) -> Div {
         )
         .child(body)
         .children(composer)
+}
+
+fn commit_block_edit(
+    key: &str,
+    updated: CanvasDoc,
+    is_fixture: bool,
+    on_edit: Option<&CanvasEditFn>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let markdown = updated.to_markdown();
+    if is_fixture {
+        mutate_ui(key, |s| s.local_doc = Some(updated), window, cx);
+    }
+    if let Some(cb) = on_edit {
+        cb(
+            CanvasEditOp::Replace {
+                section_id: None,
+                markdown,
+            },
+            window,
+            cx,
+        );
+    }
 }
 
 /// "Read-only" pill shared by the canvas and list headers.
@@ -1860,6 +2072,7 @@ fn clean_text(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::gpui;
 
     #[test]
     fn parses_canvas_html_blocks_and_filters_by_query() {
@@ -1978,5 +2191,83 @@ mod tests {
             "First\nThird\nSecond"
         );
         assert_eq!(move_last_line("Only", -1), "Only");
+    }
+
+    #[test]
+    fn context_menu_block_operations_copy_duplicate_move_and_delete() {
+        let mut doc = CanvasDoc::from_markdown(
+            "Spec".into(),
+            "Live".into(),
+            "# Intro\n\nFirst para\n\n- item a\n- item b",
+        );
+        assert_eq!(doc.blocks.len(), 3);
+        assert_eq!(doc.block_plain_text(0).as_deref(), Some("# Intro"));
+        assert_eq!(doc.block_plain_text(99), None);
+
+        // Duplicate block 1 ("First para")
+        assert!(doc.duplicate_block(1));
+        assert_eq!(doc.blocks.len(), 4);
+        assert_eq!(doc.block_plain_text(1), doc.block_plain_text(2));
+        assert!(!doc.duplicate_block(99));
+
+        // Move block 3 (bullets) up to index 2, and reject out-of-bounds moves
+        assert!(doc.move_block(3, -1));
+        assert_eq!(
+            doc.block_plain_text(2).as_deref(),
+            Some("- item a\n- item b")
+        );
+        assert!(!doc.move_block(0, -1));
+        assert!(!doc.move_block(3, 1));
+
+        // Delete block 1
+        assert!(doc.delete_block(1));
+        assert_eq!(doc.blocks.len(), 3);
+        assert!(!doc.delete_block(99));
+
+        // Full markdown export reflects mutated block order
+        let exported = doc.to_markdown();
+        assert!(exported.starts_with("# Intro"));
+        assert!(exported.contains("- item a\n- item b"));
+    }
+
+    #[gpui::test]
+    fn canvas_renders_context_menus_and_pin_to_channel_tabs(cx: &mut gpui::TestAppContext) {
+        use gpui::{IntoElement, Render};
+        use std::cell::Cell;
+
+        struct CanvasHost {
+            pinned: Rc<Cell<bool>>,
+        }
+        impl Render for CanvasHost {
+            fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let pinned = self.pinned.clone();
+                let on_pin_tab: OpenBrowserFn = Rc::new(move |_, _| {
+                    pinned.set(true);
+                });
+                canvas_view(
+                    "",
+                    None,
+                    CanvasActions {
+                        on_pin_tab: Some(on_pin_tab),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let pinned = Rc::new(Cell::new(false));
+        let pinned_c = pinned.clone();
+        let (_root, cx) = cx.add_window_view(move |_, _| CanvasHost { pinned: pinned_c });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        assert!(!pinned.get());
     }
 }

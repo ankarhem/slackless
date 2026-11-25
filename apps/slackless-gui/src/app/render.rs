@@ -134,11 +134,21 @@ impl Render for App {
                                     app.pop_out_canvas(doc, None, window, cx);
                                 });
                             });
+                        let on_pin_tab: crate::canvas::OpenBrowserFn =
+                            Rc::new(move |window, cx| {
+                                notify(
+                                    "Pinned to channel tabs",
+                                    "Canvas pinned to channel header tabs.",
+                                    window,
+                                    cx,
+                                );
+                            });
                         canvas_view(
                             &self.canvas_query,
                             Some(&self.canvas_search),
                             crate::canvas::CanvasActions {
                                 on_pop_out: Some(on_pop_out),
+                                on_pin_tab: Some(on_pin_tab),
                                 ..Default::default()
                             },
                             cx,
@@ -199,7 +209,7 @@ impl Render for App {
                                 .and_then(|res| res.as_ref().ok())
                                 .map(|doc| doc.title.clone());
                             let this = cx.weak_entity();
-                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                            Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
                                 let _ = this.update(cx, |app, _| {
                                     app.bridge.send(Command::AddConversationTab {
                                         channel: ch.clone(),
@@ -207,6 +217,12 @@ impl Render for App {
                                         label: label.clone(),
                                     });
                                 });
+                                notify(
+                                    "Pinned to channel tabs",
+                                    "Canvas added to the channel header tabs.",
+                                    window,
+                                    cx,
+                                );
                             }) as crate::canvas::OpenBrowserFn
                         });
                         crate::canvas::live_canvas_view(
@@ -775,6 +791,12 @@ impl Render for App {
             }))
             .on_action(cx.listener(|this, _: &ToggleHuddleMute, _, cx| {
                 this.toggle_huddle_mute(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CrossWorkspaceSummary, window, cx| {
+                let _ = this.announce_cross_workspace_summary(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReplayFocusedMessage, window, cx| {
+                let _ = this.replay_focused_message(window, cx);
             }))
             .relative()
             .size_full()

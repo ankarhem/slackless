@@ -393,4 +393,93 @@ impl App {
             self.activate_tab(spec.action, cx);
         }
     }
+
+    /// Format the live cross-workspace unread & mention summary (`F-SHELL-278`).
+    pub(in crate::app) fn cross_workspace_summary_text(&self, cx: &gpui::App) -> String {
+        let ws_count = self
+            .live_teams
+            .len()
+            .max(self.fixtures.workspaces.len())
+            .max(1);
+        let mut entries = Vec::with_capacity(ws_count);
+        for ix in 0..ws_count {
+            let badge = if ix == self.workspace {
+                let sidebar = self.sidebar.read(cx);
+                WorkspaceBadge {
+                    mentions: sidebar.badge_count(),
+                    has_unreads: sidebar.has_any_unreads(),
+                }
+            } else if let Some(parked) = self.parked.get(ix).and_then(Option::as_ref) {
+                if !parked.state.counts.is_empty() {
+                    let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
+                    workspace_badge_from_counts(&parked.state.counts, activity)
+                } else {
+                    let sidebar = parked.views.sidebar.read(cx);
+                    WorkspaceBadge {
+                        mentions: sidebar.badge_count(),
+                        has_unreads: sidebar.has_any_unreads(),
+                    }
+                }
+            } else if let Some(counts) = self.bg_counts.get(ix).filter(|c| !c.is_empty()) {
+                let activity = self.bg_activity_unread.get(ix).copied().unwrap_or(0);
+                workspace_badge_from_counts(counts, activity)
+            } else {
+                WorkspaceBadge::default()
+            };
+            let name = self
+                .live_teams
+                .get(ix)
+                .or_else(|| self.fixtures.workspaces.get(ix))
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("Workspace {}", ix + 1));
+            entries.push((name, badge.mentions, badge.has_unreads));
+        }
+        crate::preferences::format_cross_workspace_summary(&entries)
+    }
+
+    /// Announce the live cross-workspace unread/mention summary (`F-SHELL-278`).
+    pub(in crate::app) fn announce_cross_workspace_summary(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let summary = self.cross_workspace_summary_text(cx);
+        notify("Workspace summary", summary.clone(), window, cx);
+        summary
+    }
+
+    /// Format and announce the currently focused transcript message according to the user's
+    /// screen-reader verbosity setting (`F-SHELL-105`, `F-SHELL-106`, `F-SHELL-279`).
+    pub(in crate::app) fn replay_focused_message(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let ts = self.messages.read(cx).focused(cx)?;
+        let msg = self
+            .messages
+            .read(cx)
+            .message_by_ts(&self.channel, &ts, cx)?;
+        let settings = self.preferences.read(cx).settings();
+        let author = msg
+            .user
+            .as_ref()
+            .map(|u| self.fixtures.user_name(u))
+            .or(msg.username.as_deref())
+            .unwrap_or("Someone");
+        let stamp = crate::messages::day_and_time_with(&msg.ts, settings.clock_24h);
+        let reactions: usize = msg.reactions.iter().map(|r| r.count as usize).sum();
+        let replies = msg.reply_count.unwrap_or(0) as usize;
+        let announcement = crate::preferences::format_accessible_message(
+            author,
+            &stamp,
+            &msg.text,
+            reactions,
+            replies,
+            msg.edited.is_some(),
+            settings.message_verbosity,
+        );
+        notify("Message replay", announcement.clone(), window, cx);
+        Some(announcement)
+    }
 }

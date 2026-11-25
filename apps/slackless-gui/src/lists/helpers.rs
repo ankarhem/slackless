@@ -118,6 +118,109 @@ pub(crate) fn filter_and_sort_rows(
     indices
 }
 
+/// Whether `row` is marked completed via a checkbox column or a "Done"/"Completed" select choice (`F-COLLAB-257`).
+pub(crate) fn is_row_completed(row: &SlackListRow, columns: &[SlackListColumn]) -> bool {
+    columns.iter().any(|col| match col.kind.as_str() {
+        "checkbox" | "todo_completed" | "completed" => {
+            matches!(row_cell(row, col), Some(SlackListCellValue::Checkbox(true)))
+        }
+        "select" | "multi_select" => match row_cell(row, col) {
+            Some(SlackListCellValue::Select(opts)) => opts.iter().any(|opt| {
+                let label = col
+                    .choices
+                    .iter()
+                    .find(|c| c.value == *opt)
+                    .map(|c| c.label.as_str())
+                    .unwrap_or(opt.as_str());
+                matches!(
+                    label.trim().to_ascii_lowercase().as_str(),
+                    "done" | "complete" | "completed"
+                )
+            }),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+/// IDs of completed, not-yet-archived rows in the current list view (`F-COLLAB-257`).
+pub(crate) fn completed_row_ids(
+    data: &SlackListData,
+    already_archived: &HashSet<String>,
+) -> Vec<String> {
+    data.rows
+        .iter()
+        .filter(|row| !already_archived.contains(&row.id) && is_row_completed(row, &data.columns))
+        .map(|row| row.id.clone())
+        .collect()
+}
+
+/// Filter `indices` according to `archived` and the view-level `show_archived` toggle (`F-COLLAB-257`).
+pub(crate) fn filter_archived_rows(
+    indices: Vec<usize>,
+    data: &SlackListData,
+    archived: &HashSet<String>,
+    show_archived: bool,
+) -> Vec<usize> {
+    if show_archived {
+        return indices;
+    }
+    indices
+        .into_iter()
+        .filter(|&ix| data.rows.get(ix).is_none_or(|r| !archived.contains(&r.id)))
+        .collect()
+}
+
+/// Parent record ID of `row` when it is a subtask row (`F-COLLAB-256`).
+pub(crate) fn subtask_parent_id(row: &SlackListRow, columns: &[SlackListColumn]) -> Option<String> {
+    for key in [
+        "parent_record_id",
+        "parent_item_id",
+        "parent_id",
+        "subtask_of",
+    ] {
+        if let Some(SlackListCellValue::Text(parent)) = row.cells.get(key)
+            && !parent.trim().is_empty()
+        {
+            return Some(parent.trim().to_owned());
+        }
+    }
+    for col in columns {
+        let k = col.key.to_ascii_lowercase();
+        let kind = col.kind.to_ascii_lowercase();
+        if (k.contains("parent") || kind.contains("subtask") || kind == "parent_record")
+            && let Some(SlackListCellValue::Text(parent)) = row_cell(row, col)
+            && !parent.trim().is_empty()
+        {
+            return Some(parent.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// Whether `row` represents a subtask in the list (`F-COLLAB-256`).
+pub(crate) fn is_subtask_row(row: &SlackListRow, columns: &[SlackListColumn]) -> bool {
+    subtask_parent_id(row, columns).is_some()
+}
+
+/// Child subtask row indices belonging to `parent_id` (respecting `archived` and `show_archived`).
+pub(crate) fn subtask_rows_for_parent(
+    data: &SlackListData,
+    parent_id: &str,
+    archived: &HashSet<String>,
+    show_archived: bool,
+) -> Vec<usize> {
+    data.rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            (show_archived || !archived.contains(&row.id))
+                && subtask_parent_id(row, &data.columns).as_deref() == Some(parent_id)
+        })
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
 pub(super) fn live_cell(
     val: Option<&SlackListCellValue>,
     column: &SlackListColumn,

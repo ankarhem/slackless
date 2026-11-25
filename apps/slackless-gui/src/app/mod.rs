@@ -355,6 +355,8 @@ actions!(
         ZoomOut,
         ActualSize,
         ToggleHuddleMute,
+        CrossWorkspaceSummary,
+        ReplayFocusedMessage,
     ]
 );
 

@@ -1587,4 +1587,562 @@ mod tests {
 
         drop(root);
     }
+
+    fn key_event(key: &str, shift: bool, alt: bool, cx: &App) -> gpui_kit::gpui::KeyDownEvent {
+        let mut modifiers = Modifiers::secondary_key(cx);
+        modifiers.shift = shift;
+        modifiers.alt = alt;
+        gpui_kit::gpui::KeyDownEvent {
+            keystroke: gpui_kit::gpui::Keystroke {
+                modifiers,
+                key: key.to_owned(),
+                key_char: None,
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    #[gpui::test]
+    fn composer_formatting_shortcuts_link_prompt_and_undo_redo(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::{Enter, Escape, Redo, Undo};
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let slot = Rc::new(RefCell::new(None));
+        let slot_c = slot.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let fixtures = Arc::new(crate::fixtures::load());
+            let composer = Composer::new("Message".into(), fixtures, window, cx);
+            *slot_c.borrow_mut() = Some(composer.clone());
+            let view = cx.new(|_| ComposerHarness { composer });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let composer = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        // Inline styles: Cmd+B, Cmd+I, Cmd+U, Cmd+Shift+X, Cmd+Shift+C, Cmd+\
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("hello world");
+                c.editor.select(0..5);
+                let ev = key_event("b", false, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "*hello* world");
+                assert_eq!(c.editor.selection(), 1..6);
+
+                let ev = key_event("i", false, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "*_hello_* world");
+
+                let ev = key_event("u", false, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "*_<u>hello</u>_* world");
+
+                let ev = key_event("x", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "*_<u>~hello~</u>_* world");
+
+                // Cmd+\ clears all inline styles
+                let ev = key_event("\\", false, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "hello world");
+
+                // Cmd+Shift+C wraps in inline code
+                c.editor.select(6..11);
+                let ev = key_event("c", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "hello `world`");
+
+                // Undo restores before inline code, redo reapplies it
+                c.on_undo(&Undo, window, cx);
+                assert_eq!(c.editor.doc().text(), "hello world");
+                c.on_redo(&Redo, window, cx);
+                assert_eq!(c.editor.doc().text(), "hello `world`");
+            });
+        });
+
+        // Link prompt (Cmd+Shift+U): open -> confirm bare domain -> unlink -> open -> Esc cancel
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("read docs");
+                c.editor.select(5..9);
+                let ev = key_event("u", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert!(c.link_open, "Cmd+Shift+U opens link prompt");
+
+                c.link_input
+                    .update(cx, |st, cx| st.set_value("slack.com/guide", window, cx));
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(!c.link_open);
+                assert_eq!(
+                    c.editor.doc().text(),
+                    "read [docs](https://slack.com/guide)"
+                );
+
+                // Cmd+Shift+U on an existing link unlinks it
+                c.editor.select(7..9);
+                let ev = key_event("u", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert!(!c.link_open);
+                assert_eq!(c.editor.doc().text(), "read docs");
+
+                // Open link prompt again and cancel with Esc
+                c.editor.select(5..9);
+                let ev = key_event("u", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert!(c.link_open);
+                c.link_input
+                    .update(cx, |st, cx| st.set_value("ignored.dev", window, cx));
+                c.on_escape(&Escape, window, cx);
+                assert!(!c.link_open);
+                assert_eq!(c.editor.doc().text(), "read docs");
+            });
+        });
+
+        // Block shortcuts: Cmd+Shift+7 (ordered), Cmd+Shift+8 (bullet), Cmd+Shift+9 (quote), Cmd+Alt+Shift+C (code block)
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("item one");
+                c.editor.select(0..8);
+                let ev = key_event("7", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "1. item one");
+
+                let ev = key_event("8", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "- item one");
+
+                let ev = key_event("9", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "> item one");
+
+                // Toggle quote off, then wrap in a fenced code block
+                let ev = key_event("9", true, false, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "item one");
+
+                let ev = key_event("c", true, true, cx);
+                c.on_key(&ev, window, cx);
+                assert_eq!(c.editor.doc().text(), "```\nitem one\n```");
+
+                // Undo steps back through block transformations
+                c.on_undo(&Undo, window, cx);
+                assert_eq!(c.editor.doc().text(), "item one");
+            });
+        });
+
+        drop(root);
+    }
+
+    #[gpui::test]
+    fn composer_multiline_list_editing_and_paste_workflows(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::Enter;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let slot = Rc::new(RefCell::new(None));
+        let slot_c = slot.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let fixtures = Arc::new(crate::fixtures::load());
+            let composer = Composer::new("Message".into(), fixtures, window, cx);
+            *slot_c.borrow_mut() = Some(composer.clone());
+            let view = cx.new(|_| ComposerHarness { composer });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let composer = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                // Start a bullet list item, Shift+Enter inserts a soft break inside the item
+                c.editor.replace_all("- first line");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(c.editor.doc().text(), "- first line\n    ");
+
+                // Type continuation text, then Enter continues with a new bullet
+                c.editor.insert_text("continued");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(c.editor.doc().text(), "- first line\n    continued\n- ");
+
+                // Enter on the empty bullet item exits the list cleanly
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(c.editor.doc().text(), "- first line\n    continued\n");
+
+                // Multi-line plain text paste returns false (delegates to textarea)
+                let multiline = ClipboardItem::new_string("alpha\nbeta\ngamma".into());
+                assert!(!c.on_paste(&multiline, window, cx));
+                c.editor.replace_all("alpha\nbeta\ngamma");
+                assert_eq!(c.editor.doc().text(), "alpha\nbeta\ngamma");
+
+                // URL pasted over selection inside fenced code block must NOT linkify (returns false)
+                let url_clip = ClipboardItem::new_string("https://docs.rs".into());
+                c.editor.replace_all("```\nlet url = foo;\n```");
+                let foo_at = c.editor.doc().text().find("foo").unwrap();
+                c.editor.select(foo_at..foo_at + 3);
+                assert!(!c.on_paste(&url_clip, window, cx));
+                assert_eq!(c.editor.doc().text(), "```\nlet url = foo;\n```");
+
+                // URL pasted over selection inside inline code must NOT linkify
+                c.editor.replace_all("see `token` ok");
+                let tok_at = c.editor.doc().text().find("token").unwrap();
+                c.editor.select(tok_at..tok_at + 5);
+                assert!(!c.on_paste(&url_clip, window, cx));
+                assert_eq!(c.editor.doc().text(), "see `token` ok");
+
+                // URL pasted at empty caret returns false
+                c.editor.replace_all("plain text");
+                c.editor.select(5..5);
+                assert!(!c.on_paste(&url_clip, window, cx));
+            });
+        });
+
+        drop(root);
+    }
+
+    #[gpui::test]
+    fn composer_autocomplete_menu_navigation_pick_escape_and_suppression(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp};
+        use slackless_core::types::{Usergroup, UsergroupId};
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let slot = Rc::new(RefCell::new(None));
+        let slot_c = slot.clone();
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let mut fixtures = crate::fixtures::load();
+            fixtures.usergroups.push(Usergroup {
+                id: UsergroupId::from("S0BACKEND"),
+                handle: "backend-team".into(),
+                name: "Backend Team".into(),
+                ..Default::default()
+            });
+            let composer = Composer::new("Message".into(), Arc::new(fixtures), window, cx);
+            *slot_c.borrow_mut() = Some(composer.clone());
+            let view = cx.new(|_| ComposerHarness { composer });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let composer = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                // @user with Down/Up wrap navigation and Tab pick preserving surrounding text & caret
+                c.editor.replace_all("hello @ world");
+                c.editor.select(7..7);
+                c.changed(cx);
+                let count = c.menu.as_ref().expect("@ menu should open").entries.len();
+                assert!(count >= 2);
+                assert_eq!(c.menu.as_ref().unwrap().selected, 0);
+                c.on_up(&MoveUp, window, cx);
+                assert_eq!(c.menu.as_ref().unwrap().selected, count - 1);
+                c.on_down(&MoveDown, window, cx);
+                assert_eq!(c.menu.as_ref().unwrap().selected, 0);
+                c.on_tab(&IndentInline, window, cx);
+                assert!(c.menu.is_none());
+                assert!(c.editor.doc().text().starts_with("hello @"));
+                assert!(c.editor.doc().text().ends_with(" world"));
+                assert_eq!(c.editor.doc().atoms().len(), 1);
+                let caret = c.editor.selection().start;
+                assert_eq!(&c.editor.doc().text()[caret..], "world");
+
+                // @usergroup trigger & Enter pick
+                c.editor.replace_all("ping @back");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(c.editor.doc().to_mrkdwn().contains("<!subteam^S0BACKEND>"));
+
+                // @here broadcast trigger & Tab pick
+                c.editor.replace_all("attn @her");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_tab(&IndentInline, window, cx);
+                assert_eq!(c.editor.doc().to_mrkdwn().trim(), "attn <!here>");
+
+                // #channel trigger & Enter pick
+                c.editor.replace_all("see #gen");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(c.editor.doc().to_mrkdwn().contains("<#C0GENERAL>"));
+
+                // :emoji: trigger & Tab pick
+                c.editor.replace_all("nice :rocke");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_tab(&IndentInline, window, cx);
+                assert!(c.editor.doc().to_mrkdwn().contains(":rocket:"));
+
+                // Esc sticky dismissal stays closed on same trigger, reopens on new trigger
+                c.editor.replace_all("hi @");
+                c.changed(cx);
+                assert!(c.menu.is_some());
+                c.on_escape(&Escape, window, cx);
+                assert!(c.menu.is_none());
+                c.editor.insert_text("a");
+                c.changed(cx);
+                assert!(c.menu.is_none(), "dismissed trigger stays closed");
+                c.editor.insert_text(" #gen");
+                c.changed(cx);
+                assert!(c.menu.is_some(), "new trigger reopens menu");
+
+                // Non-triggering inside inline code, fenced code blocks, and link URLs
+                c.editor.replace_all("`@al`");
+                c.editor.select(4..4);
+                c.changed(cx);
+                assert!(c.menu.is_none(), "no menu inside inline code");
+
+                c.editor.replace_all("```\n#gen\n```");
+                c.editor.select(8..8);
+                c.changed(cx);
+                assert!(c.menu.is_none(), "no menu inside fenced code block");
+
+                c.editor.replace_all("[docs](https://example.com/@al)");
+                c.editor.select(30..30);
+                c.changed(cx);
+                assert!(c.menu.is_none(), "no menu inside link URL");
+            });
+        });
+
+        drop(root);
+    }
+
+    #[gpui::test]
+    fn composer_edit_mode_blank_rejection_attachments_and_draft_roundtrip(cx: &mut TestAppContext) {
+        use gpui_kit::component::input::{Enter, Escape};
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+
+        type FileSubmitLog = Rc<RefCell<Vec<(Option<String>, Vec<String>)>>>;
+        let submits: Rc<RefCell<Vec<MessageContent>>> = Rc::new(RefCell::new(Vec::new()));
+        let file_submits: FileSubmitLog = Rc::new(RefCell::new(Vec::new()));
+        let cancels: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+
+        struct Host {
+            composer: Entity<Composer>,
+            edit_composer: Entity<Composer>,
+            _subs: Vec<Subscription>,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                v_flex()
+                    .size_full()
+                    .child(self.composer.clone())
+                    .child(self.edit_composer.clone())
+            }
+        }
+
+        let comp_slot = Rc::new(RefCell::new(None));
+        let edit_slot = Rc::new(RefCell::new(None));
+        let (comp_s, edit_s) = (comp_slot.clone(), edit_slot.clone());
+        let (sub_c, file_c, cancel_c) = (submits.clone(), file_submits.clone(), cancels.clone());
+
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let fixtures = Arc::new(crate::fixtures::load());
+            let composer = Composer::new("Message".into(), fixtures.clone(), window, cx);
+            let edit_composer = Composer::new_edit(fixtures, window, cx);
+            *comp_s.borrow_mut() = Some(composer.clone());
+            *edit_s.borrow_mut() = Some(edit_composer.clone());
+            let view = cx.new(|cx| {
+                let sub_c2 = sub_c.clone();
+                let cancel_c2 = cancel_c.clone();
+                let s1 = cx.subscribe(&composer, move |_, _, ev: &ComposerEvent, _| match ev {
+                    ComposerEvent::Submit(c) => sub_c.borrow_mut().push(c.clone()),
+                    ComposerEvent::SubmitWithFiles { content, files } => {
+                        file_c.borrow_mut().push((
+                            content.as_ref().map(|c| c.text.clone()),
+                            files.iter().map(|f| f.filename.clone()).collect(),
+                        ));
+                    }
+                    _ => {}
+                });
+                let s2 = cx.subscribe(
+                    &edit_composer,
+                    move |_, _, ev: &ComposerEvent, _| match ev {
+                        ComposerEvent::Submit(c) => sub_c2.borrow_mut().push(c.clone()),
+                        ComposerEvent::Cancel => *cancel_c2.borrow_mut() += 1,
+                        _ => {}
+                    },
+                );
+                Host {
+                    composer,
+                    edit_composer,
+                    _subs: vec![s1, s2],
+                }
+            });
+            gpui_kit::base::Root::new(view, window, cx)
+        });
+        let composer = comp_slot.borrow_mut().take().unwrap();
+        let edit_composer = edit_slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        // 1. Empty & whitespace-only send rejection
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.editor.replace_all("");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                c.editor.replace_all("   \n\t  ");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(submits.borrow().is_empty());
+
+        // 2. Attachment chips add / remove / submit with files
+        cx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                let img1 = Image::from_bytes(ImageFormat::Png, vec![1, 2, 3, 4]);
+                let img2 = Image::from_bytes(ImageFormat::Jpeg, vec![5, 6, 7]);
+                c.attach_clipboard_image(img1, cx);
+                c.attach_clipboard_image(img2, cx);
+                assert_eq!(c.attachments.len(), 2);
+                assert_eq!(c.attachments[0].filename, "image-1.png");
+                assert_eq!(c.attachments[1].filename, "image-2.jpg");
+
+                c.remove_attachment(0, cx);
+                assert_eq!(c.attachments.len(), 1);
+                assert_eq!(c.attachments[0].filename, "image-2.jpg");
+
+                c.editor.replace_all("caption");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(c.attachments.is_empty());
+            });
+        });
+        assert_eq!(
+            file_submits.borrow().as_slice(),
+            [(Some("caption".to_owned()), vec!["image-2.jpg".to_owned()])]
+        );
+
+        // 3. Draft save/restore round-trip preserving rich formatting & atoms
+        cx.update(|_, cx| {
+            composer.update(cx, |c, cx| {
+                let draft = "Hi <@U0ALICE> in <#C0GENERAL> <!here> :rocket:\n\
+                             *bold* _italic_ <u>under</u> ~strike~ `code` <https://example.com|docs>\n\
+                             - bullet one\n\
+                             > quoted note";
+                c.load_draft(draft, cx);
+                let saved = c.text();
+                assert!(saved.contains("<@U0ALICE>"));
+                assert!(saved.contains("<#C0GENERAL>"));
+                assert!(saved.contains("<!here>"));
+                assert!(saved.contains(":rocket:"));
+                assert!(saved.contains("*bold*"));
+                assert!(saved.contains("_italic_"));
+                assert!(saved.contains("<u>under</u>"));
+                assert!(saved.contains("~strike~"));
+                assert!(saved.contains("`code`"));
+                assert!(saved.contains("<https://example.com|docs>"));
+                assert!(saved.contains("bullet one"));
+                assert!(saved.contains("&gt; quoted note"));
+
+                // Reloading saved draft yields the exact same serialized form & atom count
+                let atom_count = c.editor.doc().atoms().len();
+                assert_eq!(atom_count, 4);
+                c.load_draft(&saved, cx);
+                assert_eq!(c.text(), saved);
+                assert_eq!(c.editor.doc().atoms().len(), atom_count);
+            });
+        });
+
+        // 4. Edit-message mode: load_message, Enter submits edit, Esc cancels
+        cx.update(|window, cx| {
+            edit_composer.update(cx, |c, cx| {
+                let msg = Message {
+                    text: "Original *bold* message".into(),
+                    ..Default::default()
+                };
+                c.load_message(&msg, window, cx);
+                assert_eq!(c.text(), "Original *bold* message");
+                c.editor.insert_text(" edited");
+                c.on_enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                // Re-load and cancel with Esc
+                c.load_message(&msg, window, cx);
+                c.on_escape(&Escape, window, cx);
+            });
+        });
+        assert_eq!(submits.borrow().len(), 1);
+        assert_eq!(submits.borrow()[0].text, "Original *bold* message edited");
+        assert_eq!(*cancels.borrow(), 1);
+
+        drop(root);
+    }
 }

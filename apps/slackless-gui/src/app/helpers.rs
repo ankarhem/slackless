@@ -500,7 +500,7 @@ pub(super) fn is_suspicious_url(raw: &str) -> bool {
 /// Enable or disable Launch at login on macOS via a standard user LaunchAgent plist
 /// (`~/Library/LaunchAgents/dev.slackless.gui.plist`). No-op on other OSes.
 pub(super) fn sync_launch_at_login(enabled: bool) {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         let Some(home) = std::env::var_os("HOME") else {
             return;
@@ -534,7 +534,7 @@ pub(super) fn sync_launch_at_login(enabled: bool) {
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(plist, xml);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(not(target_os = "macos"), test))]
     {
         let _ = enabled;
     }

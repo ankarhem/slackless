@@ -1982,3 +1982,72 @@ fn deep_links_permalinks_workspace_switch_focus_leave_and_hover_card_lifecycle(
     });
     drop(root);
 }
+
+#[gpui::test]
+fn accessibility_cross_workspace_summary_and_replay_focused_message(cx: &mut gpui::TestAppContext) {
+    use gpui_kit::base::Root;
+    use std::cell::RefCell;
+
+    cx.update(|cx| {
+        cx.set_global(crate::zoom::Zoom::default());
+        gpui_kit::init(cx);
+        theme::init(cx);
+    });
+    let mounted = Rc::new(RefCell::new(None));
+    let slot = mounted.clone();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = App::new(
+            Arc::new(fixtures::load()),
+            CoreBridge::offline(),
+            window,
+            cx,
+        );
+        *slot.borrow_mut() = Some(app.clone());
+        Root::new(app, window, cx)
+    });
+    let app = mounted.borrow_mut().take().unwrap();
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            // Cross-workspace summary names every workspace in the fixture.
+            let summary = app.announce_cross_workspace_summary(window, cx);
+            assert!(
+                summary.contains("workspace"),
+                "expected workspace summary, got: {summary:?}"
+            );
+
+            // ReplayFocusedMessage formats the focused message using verbosity setting.
+            let own_ts = app
+                .messages
+                .read(cx)
+                .own_message_ts_for_test()
+                .expect("fixture channel has a message");
+            app.messages
+                .update(cx, |list, cx| list.set_focused_for_test(&own_ts, cx));
+
+            let standard = app
+                .replay_focused_message(window, cx)
+                .expect("focused message replays");
+            assert!(
+                standard.contains("at "),
+                "standard replay includes timestamp: {standard:?}"
+            );
+
+            // Switch verbosity to Concise (1) and verify timestamp is omitted.
+            let mut concise = app.preferences.read(cx).settings().clone();
+            concise.message_verbosity = 1;
+            app.preferences
+                .update(cx, |prefs, cx| prefs.load_settings(concise, window, cx));
+            let concise_replay = app
+                .replay_focused_message(window, cx)
+                .expect("concise replay succeeds");
+            assert!(
+                concise_replay.len() < standard.len(),
+                "concise replay should omit the timestamp prefix: concise={concise_replay:?}, standard={standard:?}"
+            );
+            assert!(concise_replay.contains(": "));
+        });
+    });
+    drop(root);
+}

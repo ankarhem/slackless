@@ -121,3 +121,48 @@ fn quick_reactions_setting_normalizes_and_toggles() {
     s.show_quick_reactions = false;
     assert!(s.resolved_quick_reactions().is_empty());
 }
+
+#[test]
+fn accessible_message_verbosity_and_cross_workspace_summary_format_cleanly() {
+    // Default verbosity is 0 (Standard) and survives partial JSON deserialization.
+    let s: Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(s.message_verbosity, 0);
+    let concise: Settings = serde_json::from_str(r#"{"message_verbosity":1}"#).unwrap();
+    assert_eq!(concise.message_verbosity, 1);
+
+    // Concise (1), Standard (0), and Verbose (2) formatting
+    assert_eq!(
+        format_accessible_message("Alice", "9:05 AM", "Deploy  is\ngreen", 3, 2, true, 1),
+        "Alice: Deploy is green"
+    );
+    assert_eq!(
+        format_accessible_message("Alice", "9:05 AM", "Deploy is green", 3, 2, true, 0),
+        "Alice, 9:05 AM: Deploy is green, 2 replies"
+    );
+    assert_eq!(
+        format_accessible_message("Alice", "9:05 AM", "Deploy is green", 3, 1, true, 2),
+        "Alice at 9:05 AM: Deploy is green (edited), 3 reactions, 1 reply"
+    );
+    assert_eq!(
+        format_accessible_message("Bob", "10:00", "   ", 1, 0, false, 2),
+        "Bob at 10:00: (attachment or empty message), 1 reaction"
+    );
+
+    // Cross-workspace summary
+    assert_eq!(
+        format_cross_workspace_summary(&[]),
+        "No workspaces signed in."
+    );
+    assert_eq!(
+        format_cross_workspace_summary(&[("Acme".into(), 0, false), ("Labs".into(), 0, false),]),
+        "All caught up across 2 workspaces."
+    );
+    assert_eq!(
+        format_cross_workspace_summary(&[
+            ("Acme".into(), 3, true),
+            ("Labs".into(), 0, true),
+            ("Ops".into(), 0, false),
+        ]),
+        "3 workspaces: Acme: 3 mentions; Labs: unread messages; Ops: all read"
+    );
+}

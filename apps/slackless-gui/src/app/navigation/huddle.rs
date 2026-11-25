@@ -276,14 +276,21 @@ impl App {
         chime: slackless_core::huddle::HuddleChime,
         cx: &gpui_kit::gpui::App,
     ) {
-        let settings = self.preferences.read(cx).settings();
-        if settings.mute_sounds || !settings.huddle_sounds {
-            return;
+        #[cfg(test)]
+        {
+            let _ = (chime, cx);
         }
-        let output = settings.huddle_output_device.clone();
-        std::thread::spawn(move || {
-            let _ = slackless_core::huddle::play_huddle_chime(chime, output.as_deref());
-        });
+        #[cfg(not(test))]
+        {
+            let settings = self.preferences.read(cx).settings();
+            if settings.mute_sounds || !settings.huddle_sounds {
+                return;
+            }
+            let output = settings.huddle_output_device.clone();
+            std::thread::spawn(move || {
+                let _ = slackless_core::huddle::play_huddle_chime(chime, output.as_deref());
+            });
+        }
     }
 
     /// Arm Official Slack's 60-second solo-huddle lounge music timer (`huddles_play_music_timeout`).

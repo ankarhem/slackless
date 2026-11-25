@@ -247,6 +247,8 @@ const ZONES: [&str; 5] = [
     "(UTC+09:00) Tokyo",
 ];
 const ZOOM: [&str; 6] = ["80%", "90%", "100%", "110%", "125%", "150%"];
+/// Screen-reader message verbosity choices (`0` = Standard, `1` = Concise, `2` = Verbose; `F-SHELL-105`).
+pub const MESSAGE_VERBOSITY: [&str; 3] = ["Standard", "Concise", "Verbose"];
 const MARK_READ: [&str; 3] = [
     "Start me where I left off, and mark the channel read",
     "Start me at the newest message, and mark the channel read",
@@ -359,6 +361,8 @@ pub struct Settings {
     pub underline_links: bool,
     pub reduce_motion: bool,
     pub announce_incoming: bool,
+    /// Screen-reader message verbosity (`0` = Standard, `1` = Concise, `2` = Verbose; `F-SHELL-105`).
+    pub message_verbosity: u8,
     /// Hide extra chrome (workspace rail, decorative gradients) for a clean single-column feel (`F-SHELL-109`).
     pub simplified_layout: bool,
     /// Enable translucent macOS window vibrancy tint (`F-SHELL-110`).
@@ -659,6 +663,7 @@ impl Default for Settings {
             underline_links: false,
             reduce_motion: false,
             announce_incoming: false,
+            message_verbosity: 0,
             simplified_layout: false,
             window_transparency: false,
             mark_read: 0,
@@ -782,6 +787,86 @@ impl Settings {
             SCHEDULE_DAYS[self.schedule_days], HOURS[self.schedule_start], HOURS[self.schedule_end]
         )
     }
+}
+
+/// Format a message for screen-reader announcements according to `verbosity`
+/// (`0` = Standard, `1` = Concise, `2` = Verbose; `F-SHELL-105`, `F-SHELL-106`, `F-SHELL-279`).
+pub fn format_accessible_message(
+    author: &str,
+    timestamp: &str,
+    text: &str,
+    reaction_count: usize,
+    reply_count: usize,
+    edited: bool,
+    verbosity: u8,
+) -> String {
+    let body = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let body = if body.is_empty() {
+        "(attachment or empty message)".to_owned()
+    } else {
+        body
+    };
+    let replies = match reply_count {
+        0 => String::new(),
+        1 => ", 1 reply".to_owned(),
+        n => format!(", {n} replies"),
+    };
+    match verbosity {
+        // Concise: author + body only
+        1 => format!("{author}: {body}"),
+        // Verbose: author, timestamp, body, edited flag, reactions, replies
+        2 => {
+            let edited_part = if edited { " (edited)" } else { "" };
+            let reactions = match reaction_count {
+                0 => String::new(),
+                1 => ", 1 reaction".to_owned(),
+                n => format!(", {n} reactions"),
+            };
+            format!("{author} at {timestamp}: {body}{edited_part}{reactions}{replies}")
+        }
+        // Standard (default): author, timestamp, body, and reply count when threaded
+        _ => format!("{author}, {timestamp}: {body}{replies}"),
+    }
+}
+
+/// Format a live cross-workspace unread & mention summary for screen readers (`F-SHELL-278`).
+/// Each tuple is `(workspace_name, mention_count, has_unreads)`.
+pub fn format_cross_workspace_summary(workspaces: &[(String, u32, bool)]) -> String {
+    if workspaces.is_empty() {
+        return "No workspaces signed in.".to_owned();
+    }
+    let total_mentions: u32 = workspaces.iter().map(|(_, m, _)| *m).sum();
+    let unread_ws = workspaces.iter().filter(|(_, m, u)| *m > 0 || *u).count();
+    if total_mentions == 0 && unread_ws == 0 {
+        return format!(
+            "All caught up across {} {}.",
+            workspaces.len(),
+            if workspaces.len() == 1 {
+                "workspace"
+            } else {
+                "workspaces"
+            }
+        );
+    }
+    let parts: Vec<String> = workspaces
+        .iter()
+        .map(|(name, mentions, unread)| match (*mentions, *unread) {
+            (0, false) => format!("{name}: all read"),
+            (0, true) => format!("{name}: unread messages"),
+            (1, _) => format!("{name}: 1 mention"),
+            (n, _) => format!("{name}: {n} mentions"),
+        })
+        .collect();
+    format!(
+        "{} {}: {}",
+        workspaces.len(),
+        if workspaces.len() == 1 {
+            "workspace"
+        } else {
+            "workspaces"
+        },
+        parts.join("; ")
+    )
 }
 
 /// Accessor for a checkbox's flag.
@@ -1100,135 +1185,155 @@ impl Preferences {
 
     fn start_camera_preview(&mut self, cx: &mut Context<Self>) {
         self.stop_camera_preview(cx);
-        self.camera_preview_on = true;
-        let probe_gen = self.camera_probe_gen;
-        let device_index = self.settings.huddle_camera_device;
-        let blur = self.settings.huddle_blur_background;
-        cx.spawn(async move |this, cx| {
-            let probe = cx
-                .background_executor()
-                .spawn(async move {
-                    slackless_core::huddle::CameraPreviewProbe::start(device_index, blur).ok()
-                })
-                .await;
-
-            let started = this
-                .update(cx, |prefs, cx| {
-                    if prefs.camera_probe_gen != probe_gen || prefs.section != Section::AudioVideo {
-                        if let Some(stale) = probe {
-                            std::thread::spawn(move || drop(stale));
-                        }
-                        return false;
-                    }
-                    prefs.camera_probe = probe;
-                    if prefs.camera_probe.is_none() {
-                        prefs.camera_preview_on = false;
-                    }
-                    cx.notify();
-                    prefs.camera_probe.is_some()
-                })
-                .unwrap_or(false);
-
-            if !started {
-                return;
-            }
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(80))
+        #[cfg(test)]
+        {
+            let _ = cx;
+        }
+        #[cfg(not(test))]
+        {
+            self.camera_preview_on = true;
+            let probe_gen = self.camera_probe_gen;
+            let device_index = self.settings.huddle_camera_device;
+            let blur = self.settings.huddle_blur_background;
+            cx.spawn(async move |this, cx| {
+                let probe = cx
+                    .background_executor()
+                    .spawn(async move {
+                        slackless_core::huddle::CameraPreviewProbe::start(device_index, blur).ok()
+                    })
                     .await;
-                let keep = this
+
+                let started = this
                     .update(cx, |prefs, cx| {
-                        if prefs.camera_probe_gen != probe_gen {
+                        if prefs.camera_probe_gen != probe_gen
+                            || prefs.section != Section::AudioVideo
+                        {
+                            if let Some(stale) = probe {
+                                std::thread::spawn(move || drop(stale));
+                            }
                             return false;
                         }
-                        if let Some(probe) = &prefs.camera_probe {
-                            probe.set_blur(prefs.settings.huddle_blur_background);
-                            if let Some(frame) = probe.latest_frame()
-                                && let Some(img) = crate::huddle_dock::frame_to_render_image(&frame)
-                            {
-                                if let Some(old) = prefs.camera_frame.replace(img) {
-                                    cx.drop_image(old, None);
-                                }
-                                cx.notify();
-                            }
-                            true
-                        } else {
-                            false
+                        prefs.camera_probe = probe;
+                        if prefs.camera_probe.is_none() {
+                            prefs.camera_preview_on = false;
                         }
+                        cx.notify();
+                        prefs.camera_probe.is_some()
                     })
                     .unwrap_or(false);
-                if !keep {
-                    break;
+
+                if !started {
+                    return;
                 }
-            }
-        })
-        .detach();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(80))
+                        .await;
+                    let keep = this
+                        .update(cx, |prefs, cx| {
+                            if prefs.camera_probe_gen != probe_gen {
+                                return false;
+                            }
+                            if let Some(probe) = &prefs.camera_probe {
+                                probe.set_blur(prefs.settings.huddle_blur_background);
+                                if let Some(frame) = probe.latest_frame()
+                                    && let Some(img) =
+                                        crate::huddle_dock::frame_to_render_image(&frame)
+                                {
+                                    if let Some(old) = prefs.camera_frame.replace(img) {
+                                        cx.drop_image(old, None);
+                                    }
+                                    cx.notify();
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !keep {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     fn refresh_audio_devices_and_probe(&mut self, cx: &mut Context<Self>) {
         self.audio_probe_gen = self.audio_probe_gen.wrapping_add(1);
-        let probe_gen = self.audio_probe_gen;
-        self.audio_loading = true;
         if let Some(old) = self.mic_probe.take() {
             std::thread::spawn(move || drop(old));
         }
-        let wanted = self.settings.huddle_input_device.clone();
-        cx.spawn(async move |this, cx| {
-            let (devices, cameras, probe) = cx
-                .background_executor()
-                .spawn(async move {
-                    let devices = slackless_core::huddle::list_audio_devices();
-                    let cameras = slackless_core::huddle::list_cameras();
-                    let probe =
-                        slackless_core::huddle::MicLevelProbe::start(wanted.as_deref()).ok();
-                    (devices, cameras, probe)
-                })
-                .await;
-
-            let started = this
-                .update(cx, |prefs, cx| {
-                    if prefs.audio_probe_gen != probe_gen || prefs.section != Section::AudioVideo {
-                        if let Some(stale) = probe {
-                            std::thread::spawn(move || drop(stale));
-                        }
-                        return false;
-                    }
-                    prefs.audio_devices = devices;
-                    prefs.cameras = cameras;
-                    prefs.audio_loading = false;
-                    prefs.mic_probe = probe;
-                    cx.notify();
-                    prefs.mic_probe.is_some()
-                })
-                .unwrap_or(false);
-
-            if !started {
-                return;
-            }
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(80))
+        #[cfg(test)]
+        {
+            self.audio_loading = false;
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        {
+            let probe_gen = self.audio_probe_gen;
+            self.audio_loading = true;
+            let wanted = self.settings.huddle_input_device.clone();
+            cx.spawn(async move |this, cx| {
+                let (devices, cameras, probe) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let devices = slackless_core::huddle::list_audio_devices();
+                        let cameras = slackless_core::huddle::list_cameras();
+                        let probe =
+                            slackless_core::huddle::MicLevelProbe::start(wanted.as_deref()).ok();
+                        (devices, cameras, probe)
+                    })
                     .await;
-                let keep = this
+
+                let started = this
                     .update(cx, |prefs, cx| {
-                        if prefs.audio_probe_gen != probe_gen {
+                        if prefs.audio_probe_gen != probe_gen
+                            || prefs.section != Section::AudioVideo
+                        {
+                            if let Some(stale) = probe {
+                                std::thread::spawn(move || drop(stale));
+                            }
                             return false;
                         }
-                        if let Some(probe) = &prefs.mic_probe {
-                            prefs.mic_level = probe.level();
-                            cx.notify();
-                            true
-                        } else {
-                            false
-                        }
+                        prefs.audio_devices = devices;
+                        prefs.cameras = cameras;
+                        prefs.audio_loading = false;
+                        prefs.mic_probe = probe;
+                        cx.notify();
+                        prefs.mic_probe.is_some()
                     })
                     .unwrap_or(false);
-                if !keep {
-                    break;
+
+                if !started {
+                    return;
                 }
-            }
-        })
-        .detach();
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(80))
+                        .await;
+                    let keep = this
+                        .update(cx, |prefs, cx| {
+                            if prefs.audio_probe_gen != probe_gen {
+                                return false;
+                            }
+                            if let Some(probe) = &prefs.mic_probe {
+                                prefs.mic_level = probe.level();
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !keep {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     /// Show zoom level `level` (Cmd+= / Cmd+- / Cmd+0, or the remembered one) and apply it.

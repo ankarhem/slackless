@@ -575,9 +575,9 @@ impl PopoutWindow {
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::component::Icon;
-        use slackless_core::huddle::{
-            HuddleChime, HuddlePhase, play_huddle_chime, play_speaker_test_tone,
-        };
+        use slackless_core::huddle::{HuddleChime, HuddlePhase};
+        #[cfg(not(test))]
+        use slackless_core::huddle::{play_huddle_chime, play_speaker_test_tone};
 
         let snap = &state.session;
         let (phase_color, phase_label) = match snap.phase {
@@ -964,7 +964,10 @@ impl PopoutWindow {
                                             .text_color(pal.drawer_fg)
                                             .child("Test speaker")
                                             .on_click(move |_, _, _| {
+                                                #[cfg(not(test))]
                                                 let _ = play_speaker_test_tone(test_out.as_deref());
+                                                #[cfg(test)]
+                                                let _ = &test_out;
                                             }),
                                     )
                                     .child(
@@ -986,10 +989,13 @@ impl PopoutWindow {
                                             .text_color(pal.drawer_fg)
                                             .child("Test chime")
                                             .on_click(move |_, _, _| {
+                                                #[cfg(not(test))]
                                                 let _ = play_huddle_chime(
                                                     HuddleChime::Join,
                                                     chime_out.as_deref(),
                                                 );
+                                                #[cfg(test)]
+                                                let _ = (&chime_out, HuddleChime::Join);
                                             }),
                                     ),
                             ),

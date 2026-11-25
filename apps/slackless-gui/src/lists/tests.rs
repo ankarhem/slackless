@@ -358,3 +358,129 @@ fn group_live_rows_handles_uncategorized_unknown_options_and_no_select_column() 
     assert_eq!(lanes[1], ("custom_opt".into(), "gray".into(), vec![1]));
     assert_eq!(lanes[2], ("Uncategorized".into(), "gray".into(), vec![0]));
 }
+
+#[test]
+fn subtask_archiving_and_view_level_archive_helpers_work_cleanly() {
+    let data = SlackListData {
+        file_id: "F_ARCH".into(),
+        title: "Sprint".into(),
+        description: String::new(),
+        columns: vec![
+            SlackListColumn {
+                id: "C_TITLE".into(),
+                key: "task".into(),
+                name: "Task".into(),
+                kind: "text".into(),
+                is_primary: true,
+                choices: Vec::new(),
+            },
+            SlackListColumn {
+                id: "C_DONE".into(),
+                key: "completed".into(),
+                name: "Done".into(),
+                kind: "checkbox".into(),
+                is_primary: false,
+                choices: Vec::new(),
+            },
+            SlackListColumn {
+                id: "C_STATUS".into(),
+                key: "status".into(),
+                name: "Status".into(),
+                kind: "select".into(),
+                is_primary: false,
+                choices: vec![
+                    SlackListChoice {
+                        value: "opt_done".into(),
+                        label: "Done".into(),
+                        color: "green".into(),
+                    },
+                    SlackListChoice {
+                        value: "opt_wip".into(),
+                        label: "In progress".into(),
+                        color: "blue".into(),
+                    },
+                ],
+            },
+        ],
+        rows: vec![
+            SlackListRow {
+                id: "R_PARENT".into(),
+                cells: HashMap::from([
+                    ("C_TITLE".into(), SlackListCellValue::Text("Ship v2".into())),
+                    ("C_DONE".into(), SlackListCellValue::Checkbox(false)),
+                    (
+                        "C_STATUS".into(),
+                        SlackListCellValue::Select(vec!["opt_wip".into()]),
+                    ),
+                ]),
+            },
+            SlackListRow {
+                id: "R_SUB1".into(),
+                cells: HashMap::from([
+                    (
+                        "C_TITLE".into(),
+                        SlackListCellValue::Text("Subtask A".into()),
+                    ),
+                    (
+                        "parent_record_id".into(),
+                        SlackListCellValue::Text("R_PARENT".into()),
+                    ),
+                    ("C_DONE".into(), SlackListCellValue::Checkbox(true)),
+                ]),
+            },
+            SlackListRow {
+                id: "R_DONE_SEL".into(),
+                cells: HashMap::from([
+                    ("C_TITLE".into(), SlackListCellValue::Text("Docs".into())),
+                    (
+                        "C_STATUS".into(),
+                        SlackListCellValue::Select(vec!["opt_done".into()]),
+                    ),
+                ]),
+            },
+        ],
+    };
+
+    // Subtask detection & parent lookup (`F-COLLAB-256`)
+    assert!(!is_subtask_row(&data.rows[0], &data.columns));
+    assert!(is_subtask_row(&data.rows[1], &data.columns));
+    assert_eq!(
+        subtask_parent_id(&data.rows[1], &data.columns).as_deref(),
+        Some("R_PARENT")
+    );
+
+    let mut archived = HashSet::new();
+    assert_eq!(
+        subtask_rows_for_parent(&data, "R_PARENT", &archived, false),
+        vec![1]
+    );
+
+    // Completed rows detected by either checkbox or Done select option (`F-COLLAB-257`)
+    assert!(!is_row_completed(&data.rows[0], &data.columns));
+    assert!(is_row_completed(&data.rows[1], &data.columns));
+    assert!(is_row_completed(&data.rows[2], &data.columns));
+    assert_eq!(
+        completed_row_ids(&data, &archived),
+        vec!["R_SUB1".to_owned(), "R_DONE_SEL".to_owned()]
+    );
+
+    // Archiving a subtask removes it from active view & parent subtask list unless show_archived is true
+    archived.insert("R_SUB1".to_owned());
+    assert!(subtask_rows_for_parent(&data, "R_PARENT", &archived, false).is_empty());
+    assert_eq!(
+        subtask_rows_for_parent(&data, "R_PARENT", &archived, true),
+        vec![1]
+    );
+    assert_eq!(
+        filter_archived_rows(vec![0, 1, 2], &data, &archived, false),
+        vec![0, 2]
+    );
+    assert_eq!(
+        filter_archived_rows(vec![0, 1, 2], &data, &archived, true),
+        vec![0, 1, 2]
+    );
+    assert_eq!(
+        completed_row_ids(&data, &archived),
+        vec!["R_DONE_SEL".to_owned()]
+    );
+}

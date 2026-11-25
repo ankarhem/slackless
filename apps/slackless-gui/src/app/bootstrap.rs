@@ -248,6 +248,8 @@ impl App {
                 // (and Backspace / Right / Escape) in the composer and every text field.
                 KeyBinding::new("shift-escape", MarkAllRead, None),
                 KeyBinding::new("cmd-shift-space", ToggleHuddleMute, None),
+                KeyBinding::new("ctrl-shift-u", CrossWorkspaceSummary, None),
+                KeyBinding::new("ctrl-shift-r", ReplayFocusedMessage, None),
             ]);
             const OUTSIDE_INPUT: Option<&str> =
                 Some("App && !Input && !PopupMenu && !Dialog && !Popover && !Select");
@@ -619,12 +621,19 @@ impl App {
                         }
                         PreferencesEvent::TestSpeaker(output_device) => {
                             if this.fixtures.sample {
-                                let dev = output_device.clone();
-                                std::thread::spawn(move || {
-                                    let _ = slackless_core::huddle::play_speaker_test_tone(
-                                        dev.as_deref(),
-                                    );
-                                });
+                                #[cfg(not(test))]
+                                {
+                                    let dev = output_device.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = slackless_core::huddle::play_speaker_test_tone(
+                                            dev.as_deref(),
+                                        );
+                                    });
+                                }
+                                #[cfg(test)]
+                                {
+                                    let _ = output_device;
+                                }
                             } else {
                                 this.bridge.send(Command::TestHuddleSpeaker {
                                     output_device: output_device.clone(),

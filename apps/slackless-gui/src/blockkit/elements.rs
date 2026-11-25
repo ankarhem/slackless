@@ -224,26 +224,17 @@ pub(super) fn block_element(
         "overflow" => overflow(element, block, key, kcx).into_any_element(),
         "datepicker" => datepicker(element, block, key, kcx, cx),
         "datetimepicker" => datetimepicker(element, block, key, kcx, cx),
-        "timepicker" => {
-            let times = (0..24)
-                .flat_map(|hour| [0u32, 15, 30, 45].into_iter().map(move |min| (hour, min)))
-                .map(|(hour, min)| {
-                    let t = format!("{hour:02}:{min:02}");
-                    (t.clone(), t)
-                })
-                .collect();
-            picker(
-                element,
-                block,
-                key,
-                "initial_time",
-                "selected_time",
-                IconName::Clock,
-                times,
-                kcx,
-                cx,
-            )
-        }
+        "timepicker" => picker(
+            element,
+            block,
+            key,
+            "initial_time",
+            "selected_time",
+            IconName::Clock,
+            timepicker_slots(),
+            kcx,
+            cx,
+        ),
         "checkboxes" => checkboxes(element, block, key, kcx, cx).into_any_element(),
         "radio_buttons" => radios(element, block, key, kcx, cx).into_any_element(),
         "image" => image_element(element, kcx, 20., cx),
@@ -639,16 +630,61 @@ pub(super) fn select(
     .into_any_element()
 }
 
+pub(super) fn timepicker_slots() -> Vec<(String, String)> {
+    (0..24)
+        .flat_map(|hour| [0u32, 15, 30, 45].into_iter().map(move |min| (hour, min)))
+        .map(|(hour, min)| {
+            let t = format!("{hour:02}:{min:02}");
+            (t.clone(), t)
+        })
+        .collect()
+}
+
 pub(super) fn parse_iso_ymd(s: &str) -> Option<(i32, u32, u32)> {
     let mut parts = s.split('-');
-    let y = parts.next()?.parse::<i32>().ok()?;
-    let m = parts.next()?.parse::<u32>().ok()?;
-    let d = parts.next()?.parse::<u32>().ok()?;
-    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+    let ys = parts.next()?;
+    let ms = parts.next()?;
+    let ds = parts.next()?;
+    if parts.next().is_some()
+        || ys.len() != 4
+        || ms.len() != 2
+        || ds.len() != 2
+        || !ys.bytes().all(|b| b.is_ascii_digit())
+        || !ms.bytes().all(|b| b.is_ascii_digit())
+        || !ds.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let y = ys.parse::<i32>().ok()?;
+    let m = ms.parse::<u32>().ok()?;
+    let d = ds.parse::<u32>().ok()?;
+    if (1..=12).contains(&m) && (1..=days_in_month(y, m)).contains(&d) {
         Some((y, m, d))
     } else {
         None
     }
+}
+
+/// Step `(year, month)` by `delta_months` (handling Dec -> Jan and Jan -> Dec rollovers).
+pub(super) fn step_month(year: i32, month: u32, delta_months: i32) -> (i32, u32) {
+    let total = year * 12 + (month as i32 - 1) + delta_months;
+    let next_year = total.div_euclid(12);
+    let next_month = (total.rem_euclid(12) + 1) as u32;
+    (next_year, next_month)
+}
+
+/// Shift `(year, month, day)` by `delta_months`, clamping `day` to the target month's length
+/// (e.g. Jan 31 + 1 month -> Feb 28 / Feb 29 on leap years; Mar 31 + 1 month -> Apr 30).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn shift_date_by_months(
+    year: i32,
+    month: u32,
+    day: u32,
+    delta_months: i32,
+) -> (i32, u32, u32) {
+    let (ny, nm) = step_month(year, month, delta_months);
+    let clamped_day = day.min(days_in_month(ny, nm)).max(1);
+    (ny, nm, clamped_day)
 }
 
 pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
@@ -758,16 +794,8 @@ pub(super) fn datepicker(
 
     let first_dow = weekday_sunday0(view_y, view_m, 1) as usize;
     let total_days = days_in_month(view_y, view_m) as usize;
-    let (prev_y, prev_m) = if view_m == 1 {
-        (view_y - 1, 12)
-    } else {
-        (view_y, view_m - 1)
-    };
-    let (next_y, next_m) = if view_m == 12 {
-        (view_y + 1, 1)
-    } else {
-        (view_y, view_m + 1)
-    };
+    let (prev_y, prev_m) = step_month(view_y, view_m, -1);
+    let (next_y, next_m) = step_month(view_y, view_m, 1);
     let base = action_base(element, block);
     let mut cells: Vec<Option<u32>> = vec![None; first_dow];
     cells.extend((1..=total_days as u32).map(Some));
