@@ -8,9 +8,10 @@ impl Store {
     pub fn member_counts(&self, workspace: &TeamId, members: &[UserId]) -> Result<MemberCounts> {
         /// Slack's built-in workspace bot.
         const USLACKBOT: &str = "USLACKBOT";
+        let mut seen: HashSet<&str> = HashSet::with_capacity(members.len());
         let ask: Vec<&UserId> = members
             .iter()
-            .filter(|id| id.as_str() != USLACKBOT)
+            .filter(|id| id.as_str() != USLACKBOT && seen.insert(id.as_str()))
             .collect();
         let mut counts = MemberCounts {
             humans: ask.len() as u32,
@@ -595,7 +596,9 @@ pub(super) fn any_of(sql: &mut String, args: &mut Vec<SqlValue>, values: &[Strin
     sql.push_str(&format!(" AND ({})", parts.join(" OR ")));
 }
 
-/// Appends ` AND NOT (clause(v1) OR clause(v2) ...)`; `?1` in `clause` is the value placeholder.
+/// Appends ` AND NOT COALESCE((clause(v1) OR clause(v2) ...), 0)`; `?1` in `clause` is the value
+/// placeholder. `COALESCE(..., 0)` preserves rows where a nullable column (such as `m.user_id` on
+/// bot/webhook messages) makes the inner predicate evaluate to SQL `NULL` (UNKNOWN).
 pub(super) fn none_of(sql: &mut String, args: &mut Vec<SqlValue>, values: &[String], clause: &str) {
     if values.is_empty() {
         return;
@@ -608,7 +611,7 @@ pub(super) fn none_of(sql: &mut String, args: &mut Vec<SqlValue>, values: &[Stri
             format!("({})", clause.replace("?1", "?"))
         })
         .collect();
-    sql.push_str(&format!(" AND NOT ({})", parts.join(" OR ")));
+    sql.push_str(&format!(" AND NOT COALESCE(({}), 0)", parts.join(" OR ")));
 }
 /// Runs one membership `UPDATE ... RETURNING id`, collecting the flipped ids.
 pub(super) fn flipping(

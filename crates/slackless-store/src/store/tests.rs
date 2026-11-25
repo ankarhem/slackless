@@ -1,6 +1,10 @@
 use super::*;
-use crate::query::SearchFilters;
-use crate::types::{Edited, File, FileId, Reaction, SectionKind, UserId};
+use crate::StoreError;
+use crate::query::{SearchFilters, SearchSort};
+use crate::types::message::BotIcons;
+use crate::types::{
+    Attachment, Edited, File, FileId, Profile, Reaction, SectionKind, TopicPurpose, UserId,
+};
 
 fn ws() -> TeamId {
     TeamId::from("T1")
@@ -941,4 +945,948 @@ fn chunked_in_queries_and_batch_upserts_handle_large_sets() {
     let with_msgs = store.channels_with_messages(&ws(), &chan_ids).unwrap();
     assert_eq!(with_msgs.len(), 1);
     assert!(with_msgs.contains(&chan_ids[0]));
+}
+
+#[test]
+fn ephemeral_messages_stay_uncompressed_through_vacuum_and_drop_ephemeral_removes_small_and_large()
+{
+    let mut store = Store::open_in_memory().unwrap();
+
+    // Helper checks both first-class `is_ephemeral` field and legacy `extra["is_ephemeral"]`.
+    let mut field_eph = msg("1700000001.000100", "U1", "ephemeral field");
+    field_eph.is_ephemeral = true;
+    assert!(is_ephemeral_message(&field_eph));
+
+    let mut extra_eph = msg("1700000002.000100", "U1", "ephemeral extra");
+    extra_eph
+        .extra
+        .insert("is_ephemeral".into(), serde_json::Value::Bool(true));
+    assert!(is_ephemeral_message(&extra_eph));
+    assert!(!is_ephemeral_message(&msg(
+        "1700000003.000100",
+        "U1",
+        "normal"
+    )));
+
+    // 1. Large (>=160B) ephemeral message with an attachment (the exact case the bug broke).
+    let mut large_eph = msg(
+        "1700000010.000100",
+        "U1",
+        &"Only visible to you preview payload ".repeat(12),
+    );
+    large_eph.is_ephemeral = true;
+    large_eph.attachments.push(Attachment {
+        title: Some("Giphy preview".into()),
+        text: Some("Click Send or Shuffle ".repeat(10)),
+        from_url: Some("https://giphy.example/abc".into()),
+        ..Default::default()
+    });
+    store.upsert_message(&ws(), &general(), &large_eph).unwrap();
+
+    // 2. Small (<160B) ephemeral row stored directly as compact TEXT JSON.
+    let small_eph_json = r#"{"ts":"1700000011.000100","text":"ephemeral hi","is_ephemeral":true}"#;
+    assert!(small_eph_json.len() < 160);
+    store
+        .conn
+        .execute(
+            "INSERT INTO message_current
+             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names, deleted,
+              has_link, has_file, is_pinned, reply_count, json, updated_at)
+             VALUES
+             ('T1','C1','1700000011.000100',1700000011000100,'','U1','ephemeral hi','',0,0,0,0,NULL,?1,100)",
+            params![small_eph_json],
+        )
+        .unwrap();
+
+    // 3. Large non-ephemeral legacy TEXT row (should be compressed by vacuum()).
+    let large_normal = msg(
+        "1700000012.000100",
+        "U1",
+        &"Regular archived channel message ".repeat(16),
+    );
+    store
+        .upsert_message(&ws(), &general(), &large_normal)
+        .unwrap();
+    let legacy_normal_json = serde_json::to_string(&large_normal).unwrap();
+    assert!(legacy_normal_json.len() >= 160);
+    store
+        .conn
+        .execute(
+            "UPDATE message_current SET json = ?1 WHERE ts = '1700000012.000100'",
+            params![legacy_normal_json],
+        )
+        .unwrap();
+
+    // 4. >=160B incompressible non-ephemeral row (random high-entropy ASCII so zlib cannot beat
+    //    the 16-byte threshold; vacuum() must leave it as TEXT).
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let alphabet: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+,-./:;<=>?@[]^_`{|}~";
+    let mut entropy = String::with_capacity(140);
+    for _ in 0..140 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let idx = ((state >> 33) as usize) % alphabet.len();
+        entropy.push(alphabet[idx] as char);
+    }
+    let incompressible_json = format!(r#"{{"ts":"1700000013.000100","text":"{entropy}"}}"#);
+    assert!(incompressible_json.len() >= 160);
+    assert!(
+        matches!(
+            encode_json_value(&incompressible_json, false),
+            SqlValue::Text(_)
+        ),
+        "test fixture must be incompressible"
+    );
+    store
+        .conn
+        .execute(
+            "INSERT INTO message_current
+             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names, deleted,
+              has_link, has_file, is_pinned, reply_count, json, updated_at)
+             VALUES
+             ('T1','C1','1700000013.000100',1700000013000100,'','U1',?1,'',0,0,0,0,NULL,?2,100)",
+            params![entropy, incompressible_json],
+        )
+        .unwrap();
+
+    // 5. Ephemeral message in another workspace (must not be dropped when dropping T1).
+    let mut other_ws_eph = msg("1700000014.000100", "U1", "other workspace ephemeral");
+    other_ws_eph.is_ephemeral = true;
+    store
+        .upsert_message(&TeamId::from("T2"), &general(), &other_ws_eph)
+        .unwrap();
+
+    let json_type = |store: &Store, ts: &str| -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT typeof(json) FROM message_current WHERE ts = ?1",
+                [ts],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // Before vacuum: both ephemerals are stored as uncompressed TEXT.
+    assert_eq!(json_type(&store, "1700000010.000100"), "text");
+    assert_eq!(json_type(&store, "1700000011.000100"), "text");
+    assert_eq!(json_type(&store, "1700000012.000100"), "text");
+    assert_eq!(json_type(&store, "1700000013.000100"), "text");
+
+    // Vacuum compresses the >=160B non-ephemeral row, but leaves both ephemerals & the
+    // incompressible row as TEXT.
+    store.vacuum().unwrap();
+    assert_eq!(json_type(&store, "1700000010.000100"), "text");
+    assert_eq!(json_type(&store, "1700000011.000100"), "text");
+    assert_eq!(json_type(&store, "1700000012.000100"), "blob");
+    assert_eq!(json_type(&store, "1700000013.000100"), "text");
+
+    // drop_ephemeral removes both small and large ephemerals in T1, bumps revision, and keeps
+    // non-ephemerals and T2 ephemerals intact.
+    let rev_before = Store::message_revision();
+    let dropped = store.drop_ephemeral(&ws()).unwrap();
+    assert_eq!(dropped, 2);
+    assert!(Store::message_revision() > rev_before);
+    assert_eq!(store.drop_ephemeral(&ws()).unwrap(), 0);
+
+    assert!(
+        store
+            .message(&ws(), &general(), &Ts::from("1700000010.000100"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .message(&ws(), &general(), &Ts::from("1700000011.000100"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .message(&ws(), &general(), &Ts::from("1700000012.000100"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .message(&ws(), &general(), &Ts::from("1700000013.000100"))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .message(
+                &TeamId::from("T2"),
+                &general(),
+                &Ts::from("1700000014.000100")
+            )
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn search_sorted_relevance_exclusions_wildcards_null_user_and_modifiers() {
+    let mut store = Store::open_in_memory().unwrap();
+
+    for (id, name) in [("C1", "general"), ("C2", "alerts"), ("C3", "deploys")] {
+        store
+            .upsert_conversation(
+                &ws(),
+                &Conversation {
+                    id: ChannelId::from(id),
+                    name: Some(name.into()),
+                    is_channel: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    store
+        .upsert_user(
+            &ws(),
+            &User {
+                id: UserId::from("UALICE"),
+                name: "alice".into(),
+                real_name: Some("Alice Lovelace".into()),
+                profile: Profile {
+                    display_name: Some("ally".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_user(
+            &ws(),
+            &User {
+                id: UserId::from("UBOB"),
+                name: "bob".into(),
+                real_name: Some("Bob Builder".into()),
+                profile: Profile {
+                    display_name: Some("bobby".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    // Older message with dense "deploy" occurrences (should win BM25 Relevant sort).
+    let mut dense = msg(
+        "1704100000.000100",
+        "UALICE",
+        "deploy deploy deploy production deployment checklist",
+    );
+    dense.pinned_to = vec![ChannelId::from("C1")];
+    store
+        .upsert_message(&ws(), &ChannelId::from("C1"), &dense)
+        .unwrap();
+
+    // Newer message with a single "deploy" mention + staging exclusion test.
+    let staging = msg(
+        "1704200000.000100",
+        "UBOB",
+        "deploy to staging dry run complete",
+    );
+    store
+        .upsert_message(&ws(), &ChannelId::from("C2"), &staging)
+        .unwrap();
+
+    // Bot/webhook message with user_id = None and attachment from_url link.
+    let bot_from_url = Message {
+        ts: Ts::from("1704300000.000100"),
+        user: None,
+        bot_id: Some(BotId::from("BHOOK")),
+        text: "deploying release v2 automatically".into(),
+        attachments: vec![Attachment {
+            from_url: Some("https://ci.example/build/42".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    store
+        .upsert_message(&ws(), &ChannelId::from("C3"), &bot_from_url)
+        .unwrap();
+
+    // Another message with attachment title_link only (no URL in text).
+    let mut title_link_msg = msg("1704400000.000100", "UBOB", "quarterly notes ready");
+    title_link_msg.attachments = vec![Attachment {
+        title_link: Some("https://docs.example/q4".into()),
+        ..Default::default()
+    }];
+    store
+        .upsert_message(&ws(), &ChannelId::from("C1"), &title_link_msg)
+        .unwrap();
+
+    let run = |q: &str, sort: SearchSort| -> Vec<String> {
+        store
+            .search_sorted(&ws(), &SearchQuery::parse(q), sort, 20)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.message.ts.as_str().to_owned())
+            .collect()
+    };
+
+    // SearchSort::Recent orders newest first; SearchSort::Relevant ranks denser BM25 match first.
+    assert_eq!(
+        run("deploy", SearchSort::Recent),
+        vec!["1704200000.000100", "1704100000.000100"]
+    );
+    assert_eq!(
+        run("deploy", SearchSort::Relevant),
+        vec!["1704100000.000100", "1704200000.000100"]
+    );
+
+    // Prefix wildcard matches both "deploy" and "deploying".
+    assert_eq!(
+        run("deploy*", SearchSort::Recent),
+        vec![
+            "1704300000.000100",
+            "1704200000.000100",
+            "1704100000.000100"
+        ]
+    );
+
+    // Positive + excluded FTS term and phrase.
+    assert_eq!(
+        run("deploy* -staging", SearchSort::Recent),
+        vec!["1704300000.000100", "1704100000.000100"]
+    );
+    assert_eq!(
+        run(r#"deploy -"dry run""#, SearchSort::Recent),
+        vec!["1704100000.000100"]
+    );
+
+    // Negative-only FTS query excludes rows matching "staging" and keeps all others.
+    assert_eq!(
+        run("-staging", SearchSort::Recent),
+        vec![
+            "1704400000.000100",
+            "1704300000.000100",
+            "1704100000.000100"
+        ]
+    );
+
+    // -from:@alice excludes Alice AND preserves the bot/webhook message (user_id IS NULL)!
+    assert_eq!(
+        run("-from:@alice", SearchSort::Recent),
+        vec![
+            "1704400000.000100",
+            "1704300000.000100",
+            "1704200000.000100"
+        ]
+    );
+    // Multiple -from exclusions still preserve NULL user_id messages.
+    assert_eq!(
+        run("-from:@alice -from:@bob", SearchSort::Recent),
+        vec!["1704300000.000100"]
+    );
+
+    // -in:#alerts excludes C2 while preserving C1 and C3.
+    assert_eq!(
+        run("-in:#alerts", SearchSort::Recent),
+        vec![
+            "1704400000.000100",
+            "1704300000.000100",
+            "1704100000.000100"
+        ]
+    );
+
+    // Has::Pin matches pinned_to messages.
+    assert_eq!(
+        run("has:pin", SearchSort::Recent),
+        vec!["1704100000.000100"]
+    );
+
+    // Has::Link matches attachments[].from_url AND attachments[].title_link.
+    assert_eq!(
+        run("has:link", SearchSort::Recent),
+        vec!["1704400000.000100", "1704300000.000100"]
+    );
+
+    // Multi-value OR: in:C2 in:C3 matches either channel.
+    assert_eq!(
+        run("in:#alerts in:#deploys", SearchSort::Recent),
+        vec!["1704300000.000100", "1704200000.000100"]
+    );
+
+    // from: matches display_name and real_name (case-insensitive), including quoted values.
+    assert_eq!(
+        run("from:@ALLY", SearchSort::Recent),
+        vec!["1704100000.000100"]
+    );
+    assert_eq!(
+        run(r#"from:"Bob Builder""#, SearchSort::Recent),
+        vec!["1704400000.000100", "1704200000.000100"]
+    );
+    assert_eq!(
+        run(r#"from:"alice lovelace""#, SearchSort::Recent),
+        vec!["1704100000.000100"]
+    );
+}
+
+#[test]
+fn member_counts_deduplicates_within_chunk_and_across_chunk_boundary() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mk_user = |id: &str, is_bot: bool, deleted: bool| User {
+        id: UserId::from(id),
+        is_bot,
+        deleted,
+        ..Default::default()
+    };
+
+    // Seed 520 unique users so members straddle SQL_IN_CHUNK (500):
+    // - U0000..U0499: 450 active humans, 30 active bots, 20 deleted humans
+    // - U0500..U0519: 10 active humans, 5 active bots, 5 deleted bots
+    let mut users = Vec::new();
+    for i in 0..500 {
+        let (is_bot, deleted) = if i < 30 {
+            (true, false)
+        } else if i < 50 {
+            (false, true)
+        } else {
+            (false, false)
+        };
+        users.push(mk_user(&format!("U{i:04}"), is_bot, deleted));
+    }
+    for i in 500..520 {
+        let (is_bot, deleted) = if i < 505 {
+            (true, false)
+        } else if i < 510 {
+            (true, true)
+        } else {
+            (false, false)
+        };
+        users.push(mk_user(&format!("U{i:04}"), is_bot, deleted));
+    }
+    store.upsert_users(&ws(), &users).unwrap();
+
+    // 1. Within a single chunk: heavy duplication of human, bot, deleted, unknown, USLACKBOT.
+    let single_chunk = [
+        "U0000",
+        "U0000",
+        "U0000", // active bot x3
+        "U0030",
+        "U0030", // deleted human x2
+        "U0505",
+        "U0505", // deleted bot x2
+        "U0100",
+        "U0100", // active human x2
+        "UUNKNOWN",
+        "UUNKNOWN", // unknown human x2
+        "USLACKBOT",
+        "USLACKBOT", // built-in bot x2
+    ]
+    .map(UserId::from)
+    .to_vec();
+    assert_eq!(
+        store.member_counts(&ws(), &single_chunk).unwrap(),
+        MemberCounts { humans: 2, apps: 1 }
+    );
+
+    // 2. Across the SQL_IN_CHUNK = 500 boundary: include all 520 users + 3 unknown humans +
+    //    USLACKBOT, PLUS duplicates of bots, deleted users, humans, and unknowns repeated at the
+    //    beginning and end so the same IDs would fall into multiple chunks without deduplication.
+    // Prepend duplicates of chunk-2 users (bots & deleted) into chunk 1.
+    let mut big: Vec<UserId> = vec![
+        UserId::from("U0500"),
+        UserId::from("U0505"),
+        UserId::from("U0000"),
+        UserId::from("USLACKBOT"),
+    ];
+    for i in 0..520 {
+        big.push(UserId::from(format!("U{i:04}")));
+    }
+    for u in ["UEXT1", "UEXT2", "UEXT3", "UEXT1"] {
+        big.push(UserId::from(u));
+    }
+    // Append duplicates of chunk-1 bots/deleted/humans into chunk 2.
+    for dup in [
+        "U0000",
+        "U0001",
+        "U0030",
+        "U0031",
+        "U0100",
+        "U0500",
+        "U0505",
+        "USLACKBOT",
+    ] {
+        big.push(UserId::from(dup));
+    }
+    assert!(big.len() > SQL_IN_CHUNK);
+
+    // Expected unique totals:
+    // - active humans: 450 + 10 + 3 unknown = 463
+    // - active apps: 30 + 5 = 35
+    // - deleted (20 humans + 5 bots) and USLACKBOT excluded
+    assert_eq!(
+        store.member_counts(&ws(), &big).unwrap(),
+        MemberCounts {
+            humans: 463,
+            apps: 35,
+        }
+    );
+}
+
+#[test]
+fn record_deletion_covers_compressed_unseen_edited_and_idempotency() {
+    let mut store = Store::open_in_memory().unwrap();
+
+    // 1. Deletion on a compressed BLOB message preserves decoded content without `previous`.
+    let long_text = "Compressed body that survives deletion ".repeat(20);
+    let compressed = msg("1700000100.000100", "U1", &long_text);
+    store
+        .upsert_message(&ws(), &general(), &compressed)
+        .unwrap();
+    let stored_type: String = store
+        .conn
+        .query_row(
+            "SELECT typeof(json) FROM message_current WHERE ts = '1700000100.000100'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_type, "blob");
+
+    store
+        .record_deletion(
+            &ws(),
+            &general(),
+            &compressed.ts,
+            Some(&Ts::from("1700000100.000900")),
+            None,
+        )
+        .unwrap();
+    let cur = store
+        .message(&ws(), &general(), &compressed.ts)
+        .unwrap()
+        .unwrap();
+    assert!(cur.deleted);
+    assert_eq!(cur.message.text, long_text);
+    let revs = store.revisions(&ws(), &general(), &compressed.ts).unwrap();
+    assert_eq!(revs.len(), 2);
+    assert!(!revs[0].deleted);
+    assert_eq!(revs[0].message.text, long_text);
+    assert!(revs[1].deleted);
+    assert_eq!(revs[1].message.text, long_text);
+
+    // 2. Deletion on an unseen message with `previous: Some`.
+    let unseen_prev = msg("1700000200.000100", "U2", "never seen before delete");
+    store
+        .record_deletion(
+            &ws(),
+            &general(),
+            &unseen_prev.ts,
+            Some(&Ts::from("1700000200.000500")),
+            Some(&unseen_prev),
+        )
+        .unwrap();
+    let cur = store
+        .message(&ws(), &general(), &unseen_prev.ts)
+        .unwrap()
+        .unwrap();
+    assert!(cur.deleted);
+    assert_eq!(cur.message.text, "never seen before delete");
+    let revs = store.revisions(&ws(), &general(), &unseen_prev.ts).unwrap();
+    assert_eq!(revs.len(), 1);
+    assert!(revs[0].deleted);
+
+    // 3. Deletion on an unseen message with `previous: None`.
+    let ghost_ts = Ts::from("1700000300.000100");
+    store
+        .record_deletion(
+            &ws(),
+            &general(),
+            &ghost_ts,
+            Some(&Ts::from("1700000300.000500")),
+            None,
+        )
+        .unwrap();
+    let ghost = store
+        .message(&ws(), &general(), &ghost_ts)
+        .unwrap()
+        .unwrap();
+    assert!(ghost.deleted);
+    assert_eq!(ghost.message.ts, ghost_ts);
+    assert!(ghost.message.text.is_empty());
+    assert_eq!(
+        store.revisions(&ws(), &general(), &ghost_ts).unwrap().len(),
+        1
+    );
+
+    // 4. Deletion on an already-edited message produces 3 revisions, and duplicate deletion with
+    //    the same event_ts is idempotent.
+    let v1 = msg("1700000400.000100", "U1", "draft v1");
+    let mut v2 = msg("1700000400.000100", "U1", "edited v2");
+    v2.edited = Some(Edited {
+        user: Some(UserId::from("U1")),
+        ts: Ts::from("1700000400.000200"),
+    });
+    store.upsert_message(&ws(), &general(), &v1).unwrap();
+    store.upsert_message(&ws(), &general(), &v2).unwrap();
+    let del_ev = Ts::from("1700000400.000300");
+    store
+        .record_deletion(&ws(), &general(), &v1.ts, Some(&del_ev), None)
+        .unwrap();
+    // Duplicate deletion event is idempotent.
+    store
+        .record_deletion(&ws(), &general(), &v1.ts, Some(&del_ev), None)
+        .unwrap();
+
+    let revs = store.revisions(&ws(), &general(), &v1.ts).unwrap();
+    assert_eq!(revs.len(), 3);
+    assert_eq!(
+        revs.iter()
+            .map(|r| (r.edit_ts.as_str(), r.deleted, r.message.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("", false, "draft v1"),
+            ("1700000400.000200", false, "edited v2"),
+            ("1700000400.000300", true, "edited v2"),
+        ]
+    );
+}
+
+#[test]
+fn thread_broadcast_appears_in_channel_history_and_latest_messages() {
+    let mut store = Store::open_in_memory().unwrap();
+    let root = msg("1700001000.000100", "U1", "thread root");
+    let mut normal_reply = msg("1700001001.000100", "U2", "regular reply");
+    normal_reply.thread_ts = Some(root.ts.clone());
+    let mut broadcast_reply = msg("1700001002.000100", "U2", "also sent to channel");
+    broadcast_reply.thread_ts = Some(root.ts.clone());
+    broadcast_reply.subtype = Some(MessageSubtype::ThreadBroadcast);
+    let mut later_reply = msg("1700001003.000100", "U1", "later regular reply");
+    later_reply.thread_ts = Some(root.ts.clone());
+
+    store
+        .upsert_messages(
+            &ws(),
+            &general(),
+            &[root.clone(), normal_reply, broadcast_reply, later_reply],
+        )
+        .unwrap();
+
+    let history = store.channel_history(&ws(), &general(), None, 20).unwrap();
+    let hist_texts: Vec<&str> = history.iter().map(|m| m.message.text.as_str()).collect();
+    assert_eq!(hist_texts, ["thread root", "also sent to channel"]);
+
+    let latest = store.latest_messages(&ws(), &[general()]).unwrap();
+    assert_eq!(latest[&general()].message.text, "also sent to channel");
+
+    let thread = store.thread_replies(&ws(), &general(), &root.ts).unwrap();
+    assert_eq!(thread.len(), 4);
+}
+
+#[test]
+fn same_edit_ts_upsert_updates_reactions_reply_count_and_pinned_without_duplicate_revisions() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut m = msg("1700002000.000100", "U1", "status update");
+    m.reactions = vec![Reaction {
+        name: "thumbsup".into(),
+        count: 2,
+        users: vec![UserId::from("U1"), UserId::from("U2")],
+    }];
+    m.reply_count = Some(1);
+    m.pinned_to = vec![general()];
+    store.upsert_message(&ws(), &general(), &m).unwrap();
+
+    let rev_table_count = |store: &Store| -> i64 {
+        store
+            .conn
+            .query_row("SELECT count(*) FROM message_revision", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rev_table_count(&store), 0);
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("has:reaction"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .search(&ws(), &SearchQuery::parse("has:pin"), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Re-upsert with the same edit_ts (""): clear reactions, bump reply_count, unpin.
+    m.reactions.clear();
+    m.reply_count = Some(5);
+    m.pinned_to.clear();
+    store.upsert_message(&ws(), &general(), &m).unwrap();
+
+    assert_eq!(rev_table_count(&store), 0);
+    assert_eq!(store.revisions(&ws(), &general(), &m.ts).unwrap().len(), 1);
+    let stored = store.message(&ws(), &general(), &m.ts).unwrap().unwrap();
+    assert!(stored.message.reactions.is_empty());
+    assert_eq!(stored.message.reply_count, Some(5));
+    assert!(stored.message.pinned_to.is_empty());
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("has:reaction"), 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search(&ws(), &SearchQuery::parse("has:pin"), 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Edit once (now 2 revisions), then update metadata again with the same non-empty edit_ts.
+    m.text = "status update edited".into();
+    m.edited = Some(Edited {
+        user: Some(UserId::from("U1")),
+        ts: Ts::from("1700002000.000500"),
+    });
+    store.upsert_message(&ws(), &general(), &m).unwrap();
+    assert_eq!(rev_table_count(&store), 2);
+
+    m.reply_count = Some(9);
+    m.pinned_to = vec![general()];
+    store.upsert_message(&ws(), &general(), &m).unwrap();
+    assert_eq!(rev_table_count(&store), 2);
+    let stored = store.message(&ws(), &general(), &m.ts).unwrap().unwrap();
+    assert_eq!(stored.message.reply_count, Some(9));
+    assert_eq!(stored.message.pinned_to, vec![general()]);
+}
+
+#[test]
+fn ts_key_handles_malformed_and_utf8_fractional_parts() {
+    // Non-ASCII character straddling byte index 6 must not panic.
+    assert_eq!(
+        ts_key(&Ts::from("1700000000.12345é")),
+        1_700_000_000_000_000
+    );
+    assert_eq!(ts_key(&Ts::from("1700000000.🚀🎉")), 1_700_000_000_000_000);
+    assert_eq!(
+        ts_key(&Ts::from("1700000000.12🚀345")),
+        1_700_000_000_000_000
+    );
+    assert_eq!(
+        ts_key(&Ts::from("1700000000.123456789")),
+        1_700_000_000_123_456
+    );
+    assert_eq!(ts_key(&Ts::from("1700000000.-1")), 1_700_000_000_000_000);
+    assert_eq!(ts_key(&Ts::from("not-a-ts.abc")), 0);
+    assert_eq!(ts_key(&Ts::from("")), 0);
+}
+
+#[test]
+fn display_order_handles_cycles_self_loops_and_dangling_next_id() {
+    let sec = |id: &str, next: Option<&str>| ChannelSection {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        kind: SectionKind::Standard,
+        emoji: String::new(),
+        next_id: next.map(str::to_owned),
+        channel_ids: Vec::new(),
+    };
+    let ids = |sections: Vec<ChannelSection>| -> Vec<String> {
+        sections.into_iter().map(|s| s.id).collect()
+    };
+
+    // Full cycle (a -> b -> a): no unreferenced head -> falls back to stored order.
+    assert_eq!(
+        ids(display_order(vec![
+            sec("a", Some("b")),
+            sec("b", Some("a")),
+        ])),
+        vec!["a", "b"]
+    );
+
+    // Partial cycle (a -> b -> c -> b) with unreached leftover d: head is a, stops at cycle guard.
+    assert_eq!(
+        ids(display_order(vec![
+            sec("c", Some("b")),
+            sec("d", Some("d")),
+            sec("a", Some("b")),
+            sec("b", Some("c")),
+        ])),
+        vec!["a", "b", "c", "d"]
+    );
+
+    // Standalone self-loop (a -> a): every section is referenced -> stored order.
+    assert_eq!(ids(display_order(vec![sec("a", Some("a"))])), vec!["a"]);
+
+    // Self-loop alongside an unreferenced head (b -> None, a -> a).
+    assert_eq!(
+        ids(display_order(vec![sec("a", Some("a")), sec("b", None)])),
+        vec!["b", "a"]
+    );
+
+    // Dangling next_id (a -> missing): follows a, stops at missing, appends leftover b.
+    assert_eq!(
+        ids(display_order(vec![
+            sec("a", Some("missing")),
+            sec("b", None)
+        ])),
+        vec!["a", "b"]
+    );
+}
+
+#[test]
+fn bot_profiles_round_trip_workspace_isolation_and_corrupt_json_tolerance() {
+    let mut store = Store::open_in_memory().unwrap();
+    let bot_a = BotProfile {
+        id: BotId::from("B1"),
+        app_id: Some("A1".into()),
+        name: "DeployBot".into(),
+        icons: Some(BotIcons {
+            image_48: Some("https://img.example/bot.png".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bot_b = BotProfile {
+        id: BotId::from("B2"),
+        name: "OtherWsBot".into(),
+        ..Default::default()
+    };
+
+    store
+        .upsert_bot_profile(&ws(), &BotId::from("B1"), &bot_a)
+        .unwrap();
+    store
+        .upsert_bot_profile(&TeamId::from("T2"), &BotId::from("B2"), &bot_b)
+        .unwrap();
+
+    // Update existing profile in place.
+    let mut updated_a = bot_a.clone();
+    updated_a.name = "DeployBot v2".into();
+    store
+        .upsert_bot_profile(&ws(), &BotId::from("B1"), &updated_a)
+        .unwrap();
+
+    // Insert a corrupt JSON row directly; bot_profiles() must skip it without failing.
+    store
+        .conn
+        .execute(
+            "INSERT INTO bot_profile (workspace_id, bot_id, json, updated_at)
+             VALUES ('T1', 'BCORRUPT', '{not-valid-json', 100)",
+            [],
+        )
+        .unwrap();
+
+    let t1_bots = store.bot_profiles(&ws()).unwrap();
+    assert_eq!(t1_bots.len(), 1);
+    assert_eq!(t1_bots[&BotId::from("B1")].name, "DeployBot v2");
+
+    let t2_bots = store.bot_profiles(&TeamId::from("T2")).unwrap();
+    assert_eq!(t2_bots.len(), 1);
+    assert_eq!(t2_bots[&BotId::from("B2")].name, "OtherWsBot");
+}
+
+#[test]
+fn merge_conversation_inserts_new_and_overlays_preserving_stored_fields() {
+    let mut store = Store::open_in_memory().unwrap();
+
+    // New insert when conversation is absent.
+    let initial = Conversation {
+        id: general(),
+        name: Some("general".into()),
+        is_channel: true,
+        is_member: true,
+        unread_count: Some(7),
+        topic: Some(TopicPurpose {
+            value: "Original topic".into(),
+            ..Default::default()
+        }),
+        members: vec![UserId::from("U1"), UserId::from("U2")],
+        ..Default::default()
+    };
+    store.merge_conversation(&ws(), &initial).unwrap();
+    let stored = store.conversation(&ws(), &general()).unwrap().unwrap();
+    assert_eq!(stored, initial);
+
+    // Partial overlay from conversations.info: carries num_members + new name, omits
+    // is_member/unread_count/topic/members (which must be preserved).
+    let fresh = Conversation {
+        id: general(),
+        name: Some("general-renamed".into()),
+        num_members: Some(42),
+        purpose: Some(TopicPurpose {
+            value: "Company announcements".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store.merge_conversation(&ws(), &fresh).unwrap();
+    let merged = store.conversation(&ws(), &general()).unwrap().unwrap();
+    assert_eq!(merged.name.as_deref(), Some("general-renamed"));
+    assert_eq!(merged.num_members, Some(42));
+    assert_eq!(
+        merged.purpose.as_ref().map(|p| p.value.as_str()),
+        Some("Company announcements")
+    );
+    assert!(merged.is_member, "omitted false flag must not erase true");
+    assert_eq!(merged.unread_count, Some(7));
+    assert_eq!(
+        merged.topic.as_ref().map(|t| t.value.as_str()),
+        Some("Original topic")
+    );
+    assert_eq!(merged.members, vec![UserId::from("U1"), UserId::from("U2")]);
+}
+
+#[test]
+fn open_read_only_rejects_writes_and_open_rejects_future_schema() {
+    let dir = std::env::temp_dir().join(format!(
+        "slackless-store-ro-writes-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("readonly.sqlite");
+    let _ = std::fs::remove_file(&path);
+
+    let mut writer = Store::open(&path).unwrap();
+    writer.set_local(&ws(), "theme", "dark").unwrap();
+
+    let mut reader = Store::open_read_only(&path).unwrap();
+    assert_eq!(
+        reader.local(&ws(), "theme").unwrap().as_deref(),
+        Some("dark")
+    );
+    assert!(reader.set_local(&ws(), "theme", "light").is_err());
+    assert!(
+        reader
+            .upsert_message(&ws(), &general(), &msg("1700000001.000100", "U1", "nope"))
+            .is_err()
+    );
+    assert!(reader.enqueue_offline(&ws(), "{}").is_err());
+
+    drop(reader);
+
+    // Bump user_version past SCHEMA_VERSION and verify Store::open returns FutureSchema.
+    let future = schema::SCHEMA_VERSION + 2;
+    writer
+        .conn
+        .pragma_update(None, "user_version", future)
+        .unwrap();
+    drop(writer);
+
+    let err = match Store::open(&path) {
+        Ok(_) => panic!("expected FutureSchema error"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            err,
+            StoreError::FutureSchema {
+                found,
+                supported,
+            } if found == future && supported == schema::SCHEMA_VERSION
+        ),
+        "expected FutureSchema, got {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -373,4 +373,182 @@ mod tests {
             assert_eq!(exists, 1, "missing V8 index {idx}");
         }
     }
+
+    #[test]
+    fn future_schema_version_returns_error() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let future = SCHEMA_VERSION + 1;
+        conn.pragma_update(None, "user_version", future).unwrap();
+        let err = migrate(&mut conn).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::FutureSchema {
+                    found,
+                    supported,
+                } if found == future && supported == SCHEMA_VERSION
+            ),
+            "expected FutureSchema, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn v7_prunes_single_edited_revision_and_preserves_deleted_original() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Bootstrap up through V6 so we exercise V7 specifically.
+        for (i, sql) in MIGRATIONS[..6].iter().enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i as u32 + 1)
+                .unwrap();
+        }
+        assert_eq!(schema_version(&conn).unwrap(), 6);
+
+        let already_edited_json = r#"{"ts":"1700000010.000100","text":"arrived edited","edited":{"ts":"1700000010.000200"}}"#;
+        let del_orig_json = r#"{"ts":"1700000020.000100","text":"before delete"}"#;
+        let del_tomb_json = r#"{"ts":"1700000020.000100","text":"before delete"}"#;
+        let del_solo_json = r#"{"ts":"1700000030.000100","text":"solo deleted"}"#;
+        let multi_v1_json = r#"{"ts":"1700000040.000100","text":"v1"}"#;
+        let multi_v2_json = r#"{"ts":"1700000040.000100","text":"v2"}"#;
+
+        conn.execute(
+            "INSERT INTO message_revision
+             (workspace_id, channel_id, ts, edit_ts, user_id, text, deleted, json, recorded_at)
+             VALUES
+             ('T1','C1','1700000010.000100','1700000010.000200','U1','arrived edited',0,?1,100),
+             ('T1','C1','1700000020.000100','','U1','before delete',0,?2,100),
+             ('T1','C1','1700000020.000100','1700000020.000200','U1','before delete',1,?3,101),
+             ('T1','C1','1700000030.000100','1700000030.000200','U1','solo deleted',1,?4,102),
+             ('T1','C1','1700000040.000100','','U1','v1',0,?5,103),
+             ('T1','C1','1700000040.000100','1700000040.000200','U1','v2',0,?6,104)",
+            rusqlite::params![
+                already_edited_json,
+                del_orig_json,
+                del_tomb_json,
+                del_solo_json,
+                multi_v1_json,
+                multi_v2_json
+            ],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let mut stmt = conn
+            .prepare("SELECT ts, edit_ts, deleted FROM message_revision ORDER BY ts, edit_ts")
+            .unwrap();
+        let remaining: Vec<(String, String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            remaining,
+            vec![
+                // 1700000010.000100 (single non-deleted edited rev) was pruned.
+                // 1700000020.000100 keeps BOTH its non-deleted original AND tombstone.
+                ("1700000020.000100".to_owned(), String::new(), 0),
+                (
+                    "1700000020.000100".to_owned(),
+                    "1700000020.000200".to_owned(),
+                    1
+                ),
+                // 1700000030.000100 solo tombstone survives.
+                (
+                    "1700000030.000100".to_owned(),
+                    "1700000030.000200".to_owned(),
+                    1
+                ),
+                // 1700000040.000100 multi-revision non-deleted pair survives.
+                ("1700000040.000100".to_owned(), String::new(), 0),
+                (
+                    "1700000040.000100".to_owned(),
+                    "1700000040.000200".to_owned(),
+                    0
+                ),
+            ]
+        );
+        // Append-only DELETE trigger was restored after V7.
+        assert!(conn.execute("DELETE FROM message_revision", []).is_err());
+    }
+
+    #[test]
+    fn v6_fts_update_trigger_preserves_index_on_json_only_and_syncs_text_or_file_changes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+
+        let trigger_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'message_current_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            trigger_sql.contains("AFTER UPDATE OF text, file_names"),
+            "unexpected trigger SQL: {trigger_sql}"
+        );
+
+        conn.execute(
+            "INSERT INTO message_current
+             (workspace_id, channel_id, ts, ts_key, edit_ts, user_id, text, file_names, deleted,
+              has_link, has_file, is_pinned, reply_count, json, updated_at)
+             VALUES
+             ('T1','C1','1700000001.000100',1700000001000100,'','U1','alpha payload','spec.pdf',0,0,1,0,NULL,'{\"ts\":\"1700000001.000100\"}',100)",
+            [],
+        )
+        .unwrap();
+
+        let fts_count = |conn: &Connection, q: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM message_fts WHERE message_fts MATCH ?1",
+                [q],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let check_integrity = |conn: &Connection| {
+            conn.execute(
+                "INSERT INTO message_fts(message_fts) VALUES('integrity-check')",
+                [],
+            )
+            .unwrap();
+        };
+
+        assert_eq!(fts_count(&conn, "alpha"), 1);
+        assert_eq!(fts_count(&conn, "spec"), 1);
+
+        // Updating json alone (as vacuum() does) leaves FTS5 untouched and consistent.
+        conn.execute(
+            "UPDATE message_current SET json = X'789c' WHERE ts = '1700000001.000100'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_count(&conn, "alpha"), 1);
+        assert_eq!(fts_count(&conn, "spec"), 1);
+        check_integrity(&conn);
+
+        // Updating text fires the trigger and re-indexes text.
+        conn.execute(
+            "UPDATE message_current SET text = 'beta payload' WHERE ts = '1700000001.000100'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_count(&conn, "alpha"), 0);
+        assert_eq!(fts_count(&conn, "beta"), 1);
+        assert_eq!(fts_count(&conn, "spec"), 1);
+        check_integrity(&conn);
+
+        // Updating file_names fires the trigger and re-indexes file_names.
+        conn.execute(
+            "UPDATE message_current SET file_names = 'design.png' WHERE ts = '1700000001.000100'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_count(&conn, "spec"), 0);
+        assert_eq!(fts_count(&conn, "design"), 1);
+        assert_eq!(fts_count(&conn, "beta"), 1);
+        check_integrity(&conn);
+    }
 }

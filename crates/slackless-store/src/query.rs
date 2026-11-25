@@ -361,4 +361,39 @@ mod tests {
             Some(r#""deploy"* NOT "stag"*"#)
         );
     }
+
+    #[test]
+    fn parses_case_insensitive_modifiers_has_aliases_and_edge_tokens() {
+        let q = SearchQuery::parse(
+            "IN:#General in:C2 -IN:<#C3|ops> FROM:@Alice -FROM:<@U9> has:pins has:files has:links has:reactions - * -*",
+        );
+        assert_eq!(q.filters.in_channels, vec!["General", "C2"]);
+        assert_eq!(q.filters.exclude_channels, vec!["C3"]);
+        assert_eq!(q.filters.from_users, vec!["Alice"]);
+        assert_eq!(q.filters.exclude_users, vec!["U9"]);
+        assert_eq!(
+            q.filters.has,
+            vec![Has::Pin, Has::File, Has::Link, Has::Reaction]
+        );
+        // Standalone `-` stays a positive term; `*` stays a literal quoted term; `-*` is excluded `*`.
+        assert_eq!(q.terms, vec!["-", "*"]);
+        assert_eq!(q.excluded_terms, vec!["*"]);
+        assert_eq!(q.fts_match().as_deref(), Some(r#""-" "*" NOT "*""#));
+        assert_eq!(SearchQuery::parse("has:pinned").filters.has, vec![Has::Pin]);
+        assert_eq!(SearchQuery::parse("has:pin").filters.has, vec![Has::Pin]);
+    }
+
+    #[test]
+    fn date_parse_validates_calendar_and_leap_years() {
+        assert!(Date::parse("2000-02-29").is_some());
+        assert!(Date::parse("2024-02-29").is_some());
+        assert!(Date::parse("1900-02-29").is_none());
+        assert!(Date::parse("2023-02-29").is_none());
+        assert!(Date::parse("2024-04-31").is_none());
+        assert!(Date::parse("2024-00-10").is_none());
+        assert!(Date::parse("2024-13-10").is_none());
+        assert!(Date::parse("2024-01-00").is_none());
+        assert!(Date::parse("2024-01-32").is_none());
+        assert!(Date::parse("2024-01").is_none());
+    }
 }

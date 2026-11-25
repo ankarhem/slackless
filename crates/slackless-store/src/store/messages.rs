@@ -353,11 +353,12 @@ impl Store {
 }
 
 pub(super) fn is_ephemeral_message(message: &Message) -> bool {
-    message
-        .extra
-        .get("is_ephemeral")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    message.is_ephemeral
+        || message
+            .extra
+            .get("is_ephemeral")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
 }
 
 /// Compress JSON payloads >= 160 bytes with fast zlib when it saves space (unless `force_text`,
@@ -623,9 +624,22 @@ pub(super) fn collect(
 pub(super) fn ts_key(ts: &Ts) -> i64 {
     let (secs, frac) = ts.as_str().split_once('.').unwrap_or((ts.as_str(), ""));
     let secs: i64 = secs.parse().unwrap_or(0);
-    let micros: i64 = format!("{:0<6}", &frac[..frac.len().min(6)])
-        .parse()
-        .unwrap_or(0);
+    let mut micros: i64 = 0;
+    let mut digits = 0u32;
+    for ch in frac.chars().take(6) {
+        if let Some(d) = ch.to_digit(10) {
+            micros = micros * 10 + i64::from(d);
+            digits += 1;
+        } else {
+            micros = 0;
+            digits = 6;
+            break;
+        }
+    }
+    while digits < 6 {
+        micros *= 10;
+        digits += 1;
+    }
     secs.saturating_mul(1_000_000).saturating_add(micros)
 }
 
