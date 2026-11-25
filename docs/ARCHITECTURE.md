@@ -20,23 +20,24 @@ CLI a headless verification surface for the whole core without building the GPUI
 ## Workspace layout
 
 ```
-slackless/                      (virtual workspace root: [workspace] in /Cargo.toml)
+slackless/                      (virtual workspace root: Rust 2024 edition in /Cargo.toml)
 ├── crates/
 │   ├── slackless-types         Pure data model + serde. No I/O.
 │   ├── slackless-api           Private web-client REST (xoxc + d cookie), edge API, uploads.
 │   ├── slackless-rtm           wss-primary WebSocket client: connect, events, reconnect.
-│   ├── slackless-store         Durable local-first SQLite (rusqlite, bundled → FTS5).
-│   ├── slackless-auth          Session acquisition (embedded sign-in) + Keychain storage.
-│   ├── slackless-platform      Trait-based OS integration; macos impl via objc2.
+│   ├── slackless-store         Durable local-first zlib-compressed SQLite (rusqlite + FTS5).
+│   ├── slackless-auth          Session acquisition (embedded WebKit sign-in) + Keychain storage.
+│   ├── slackless-platform      Trait-based OS integration; macOS impl via objc2.
+│   ├── slackless-huddle        Native Amazon Chime WebRTC audio/video/screen-share & clip recorder.
 │   └── slackless-core          Orchestrator: owns the tokio thread; wires the above;
 │                               exposes a command/event API to any front-end; backfill.
 ├── apps/
-│   ├── slackless-gui           GPUI Kit desktop app (smol↔tokio bridge + views).
-│   └── slackless-cli           clap binary: search/read/send/reply/react/auth (--json).
+│   ├── slackless-gui           GPUI Kit desktop app (smol↔tokio bridge + modular views).
+│   └── slackless-cli           clap binary: search/read/send/watch/huddle/canvas/list/auth (--json).
 └── skill/                      Agent SKILL.md for the CLI (shipped, installed separately).
 ```
 
-Dependency direction (acyclic): `types` ← {`api`, `rtm`, `store`, `auth`, `platform`} ← `core`
+Dependency direction (acyclic): `types` ← {`api`, `rtm`, `store`, `auth`, `platform`, `huddle`} ← `core`
 ← {`gui`, `cli`}. Nothing depends on a front-end. No Slack logic lives in `gui` that `cli`
 cannot reach.
 
@@ -95,6 +96,14 @@ Trait per capability, selected at compile time:
 - `SecretStore` (Keychain), `DeepLinkHandler` (`slack://`, `https://app.slack.com/client`).
   Other-OS impls are stubs that compile and no-op until those ports begin.
 
+### slackless-huddle
+
+Pure-Rust Amazon Chime WebRTC (`webrtc 0.21` / `rtc 0.21`) media stack (`audio/`, `session/`,
+`rtc.rs`, `video.rs`, `av1.rs`, `clips.rs`, `content_share.rs`, `backend/`). On macOS, uses native
+`AVFoundation` + `ScreenCaptureKit` + `VideoToolbox` + CoreAudio `VoiceProcessingIO` / audio taps
+(zero `nokhwa` / legacy `block` dependency on macOS); non-macOS targets use portable
+`cpal`/`sonora`/`nokhwa`/`xcap`/`openh264` fallbacks behind backend traits.
+
 ### slackless-core
 
 Owns the tokio runtime thread. Starts `api`+`rtm`, feeds every inbound event into `store`,
@@ -105,27 +114,27 @@ returns those handles; the GUI drains them via `cx.spawn`, the CLI via its own t
 
 ### apps/slackless-gui
 
-GPUI Kit (`gpui-kit = "0.10.0"`). Holds the bridge from guide §13 and the views built on the
-components the spike proved (`MessageScroller`, `Textarea`, resizable panels, `Popover`,
-`ContextMenu`, `Notification`, `Theme`, `TitleBar`). Builds the component gaps from guide §16
-(mrkdwn→`TextRun` renderer, autocomplete, emoji picker, unread dividers, reaction chips,
-threads pane, cookie-auth image cache).
+GPUI Kit (`gpui-kit = "0.11.0"`, `gpui-pre = "0.3.14"`). Holds the bridge from guide §13 and
+modularized views (`app/{chrome,events,dialogs,navigation}`, `canvas/`, `composer/`, `emoji/`,
+`files/`, `lists/`, `messages/`, `preferences/sections/`, `sidebar/`, `popout/`, `blockkit/`).
 
 ### apps/slackless-cli
 
-`clap`. Commands: `search`, `read`, `send`, `reply`, `react`, `channels`, `dms`, `auth`
-(status/login). Every command supports `--json`. Drives `slackless-core` directly on tokio.
+`clap` binary (`cli.rs`, `commands/`, `live/`). Commands: `search`, `read`, `send`, `reply`,
+`react`, `channels`, `dms`, `unread`, `watch`, `huddle`, `canvas`, `list`, `saved`, `backfill`,
+`download`, `stats`, `vacuum`, `auth`. Every command supports `--json`. Drives `slackless-core`
+and `slackless-store` directly on tokio.
 
-## Build facts (from the verified spike)
+## Build & quality facts
 
-- `gpui-kit = "0.10.0"` → pins `gpui-pre 0.3.12`; reach `gpui` via `gpui_kit::gpui`.
-- **Required workaround:** add `pathfinder_simd = { version = "0.5", features = ["pf-no-simd"] }`
-  as a direct dep (nightly aarch64 ICE in `pathfinder_geometry`); cargo feature unification
-  applies it graph-wide.
+- `gpui-kit = "0.11.0"` → pins `gpui-pre 0.3.14`; reach `gpui` via `gpui_kit::gpui`.
+- Workspace runs on **Rust 2024 edition** with `dbg_macro`, `todo`, `unimplemented`, and non-test
+  `unwrap_used` denied via `[workspace.lints.clippy]` + `clippy.toml` (`allow-unwrap-in-tests = true`).
+- Supply-chain security is checked via `cargo deny check` (`deny.toml`, zero ignored advisories).
 - Metal shaders compile at runtime (`runtime_shaders` default) — **no full Xcode needed**;
   disabling default features would require `xcrun metal`.
-- Toolchain: fenix nightly 1.102, apple-sdk 14.4, from the repo dev shell (`direnv exec .`).
-- Build with a shared `CARGO_TARGET_DIR=<repo>/target` and `CARGO_PROFILE_DEV_DEBUG=0` (disk).
+- Common workflows live in `justfile`: `just validate`, `just test`, `just bench`, `just run`, `just install`.
+- Build with `CARGO_PROFILE_DEV_DEBUG=0` inside `nix develop` (or `direnv`) for fast, low-disk dev builds.
 
 ## Workspace-level choices
 

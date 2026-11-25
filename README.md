@@ -59,10 +59,12 @@ This builds release binaries and installs:
 - `~/Applications/Slackless.app` (with `slack://` deep-link handling and native notifications)
 - `~/.local/bin/slackless` (headless CLI)
 
-For quick local runs or an offline demo with bundled sample data:
+For quick local runs, validation, or an offline demo with bundled sample data:
 
 ```sh
-cargo run --release -p slackless-gui              # live signed-in workspace
+just run                                          # live signed-in workspace (release)
+just validate                                     # fmt, clippy, cargo-deny, tests, build
+just bench                                        # release micro-benchmarks (store, huddle, GUI)
 SLACKLESS_FIXTURES=1 cargo run -p slackless-gui   # offline sample workspace
 ```
 
@@ -94,7 +96,7 @@ See [`skill/SKILL.md`](skill/SKILL.md) for the full command reference and `--jso
 | `crates/slackless-api` / `rtm`       | Slack private web-client REST & realtime WebSocket clients                                  |
 | `crates/slackless-auth` / `platform` | Embedded WebKit sign-in, Keychain storage, macOS notifications/dock/menu bar                |
 
-Feature tracking lives in [`docs/feature-parity.md`](docs/feature-parity.md) (`509` shipped / `0` partial).
+Feature tracking lives in [`docs/feature-parity.md`](docs/feature-parity.md) (`530` shipped / `0` partial).
 
 ## Data & Privacy
 
