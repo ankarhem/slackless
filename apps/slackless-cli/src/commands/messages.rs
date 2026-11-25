@@ -152,6 +152,13 @@ pub(crate) fn cmd_search_all_workspaces(
     Ok(ExitCode::SUCCESS)
 }
 
+pub(crate) struct SearchCmdOpts<'a> {
+    pub(crate) limit: usize,
+    pub(crate) format: Option<ExportFormat>,
+    pub(crate) out: Option<&'a std::path::Path>,
+    pub(crate) include_deleted: bool,
+}
+
 pub(crate) fn cmd_search(
     ctx: &Ctx,
     workspace: Option<&TeamId>,
@@ -168,14 +175,35 @@ pub(crate) fn cmd_search(
             "searching",
         ));
     };
-    let mut parsed = SearchQuery::parse(query);
-    parsed.filters.include_deleted = include_deleted;
     let archive = open_archive_with_hint(ctx, workspace)?;
-    let (messages, names, user_names) = match archive.as_ref() {
+    cmd_search_in_archive(
+        ctx,
+        workspace,
+        archive.as_ref(),
+        query,
+        SearchCmdOpts {
+            limit,
+            format,
+            out,
+            include_deleted,
+        },
+    )
+}
+
+pub(crate) fn cmd_search_in_archive(
+    ctx: &Ctx,
+    workspace: &TeamId,
+    archive: Option<&Archive>,
+    query: &str,
+    opts: SearchCmdOpts<'_>,
+) -> Result<ExitCode> {
+    let mut parsed = SearchQuery::parse(query);
+    parsed.filters.include_deleted = opts.include_deleted;
+    let (messages, names, user_names) = match archive {
         Some(archive) => {
             let messages = archive
                 .store()
-                .search(workspace, &parsed, limit)
+                .search(workspace, &parsed, opts.limit)
                 .with_context(|| format!("searching the local archive of {workspace}"))?;
             let names = archive
                 .channel_names(workspace)
@@ -191,11 +219,11 @@ pub(crate) fn cmd_search(
         .iter()
         .map(|message| MessageRow::from_stored(message, &user_names))
         .collect();
-    if format.is_some() || out.is_some() {
+    if opts.format.is_some() || opts.out.is_some() {
         let effective = if ctx.json {
             ExportFormat::Json
         } else {
-            format.unwrap_or(ExportFormat::Md)
+            opts.format.unwrap_or(ExportFormat::Md)
         };
         let rendered = match effective {
             ExportFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
@@ -205,7 +233,7 @@ pub(crate) fn cmd_search(
             }))?,
             ExportFormat::Md => format_markdown_export(&format!("Search: {query}"), &rows),
         };
-        write_or_print_export(ctx, &rendered, out, rows.len(), "search matches")?;
+        write_or_print_export(ctx, &rendered, opts.out, rows.len(), "search matches")?;
         return Ok(ExitCode::SUCCESS);
     }
     let mut human = String::new();

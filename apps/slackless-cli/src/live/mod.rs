@@ -1,7 +1,7 @@
 //! Live REST & realtime commands added for GUI parity:
 //! - `mark-thread` (`subscriptions.thread.mark`)
 //! - `saved` (`saved.list` / `saved.add` / `saved.update` / `saved.delete`)
-//! - `files` (`files.list`) & `download` (`files.info` + private download)
+//! - `files` (`files.list`), `download` (`files.info` + private download), & `transcribe` (local STT + FTS5 index)
 //! - `canvas` (`read` / `create` / `edit` / `info` / `delete` / `share` / `unshare` / `comments` / `comment` / `resolve`)
 //! - `list` (`fetch_list` / `lists.create` / `lists.records.create` / `lists.records.delete` / `lists.addToList`)
 //! - `watch` (live RTM event stream over `wss-primary`)
@@ -26,7 +26,7 @@ pub use canvas::{
     run_canvas_info, run_canvas_read, run_canvas_resolve, run_canvas_share, run_canvas_unshare,
 };
 pub use channels::{run_backfill, run_unread};
-pub use files::{run_download, run_files};
+pub use files::{run_download, run_files, run_transcribe};
 pub use huddle::{
     HuddleJoinArgs, HuddleTranscriptsArgs, run_huddle_cameras, run_huddle_devices,
     run_huddle_invite, run_huddle_join, run_huddle_link, run_huddle_screens,
@@ -55,8 +55,9 @@ pub(crate) use channels::{
 };
 #[cfg(test)]
 pub(crate) use files::{
-    clamp_files_limit, format_files_list, resolve_download_dest, sanitize_download_name,
-    select_download_url,
+    clamp_files_limit, format_files_list, format_transcribe_result, infer_media_extension,
+    parse_transcribe_provider, resolve_download_dest, sanitize_download_name, select_download_url,
+    select_transcribe_media_url,
 };
 #[cfg(test)]
 pub(crate) use huddle::{

@@ -217,6 +217,17 @@ async fn dispatch(
         Commands::Download { file_id, out } => {
             live::run_download(ctx, flag, &file_id, out.as_deref()).await
         }
+        Commands::Transcribe(args) => {
+            live::run_transcribe(
+                ctx,
+                flag,
+                workspace,
+                &args.file_id,
+                args.file.as_deref(),
+                args.provider.as_deref(),
+            )
+            .await
+        }
         Commands::Backfill(args) => {
             live::run_backfill(ctx, flag, &args.channel, args.pages, args.page_size).await
         }

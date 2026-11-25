@@ -529,6 +529,81 @@ fn status_normalization_download_sanitization_and_mark_thread_cursor() {
     );
     assert_eq!(select_download_url(&File::default()), None);
 
+    // Transcribe media URL precedence (mp4 -> url_private -> url_private_download), extension
+    // inference, provider parsing, and output formatting.
+    let mut mp4_extra = serde_json::Map::new();
+    mp4_extra.insert(
+        "mp4".into(),
+        serde_json::json!("https://files.slack.com/clip.mp4"),
+    );
+    let video_with_mp4 = File {
+        id: FileId::from("FVID1"),
+        name: Some("clip.mov".into()),
+        url_private: Some("https://files.slack.com/private.mov".into()),
+        url_private_download: Some("https://files.slack.com/download.mov".into()),
+        extra: mp4_extra,
+        ..File::default()
+    };
+    let mp4_url = select_transcribe_media_url(&video_with_mp4).unwrap();
+    assert_eq!(mp4_url, "https://files.slack.com/clip.mp4");
+    assert_eq!(infer_media_extension(&video_with_mp4, mp4_url), "mp4");
+
+    assert_eq!(
+        select_transcribe_media_url(&both_urls),
+        Some("https://files.slack.com/private")
+    );
+    let download_only = File {
+        id: FileId::from("FAUD1"),
+        name: Some("voice.m4a".into()),
+        url_private_download: Some("https://files.slack.com/dl/voice".into()),
+        ..File::default()
+    };
+    let dl_url = select_transcribe_media_url(&download_only).unwrap();
+    assert_eq!(dl_url, "https://files.slack.com/dl/voice");
+    assert_eq!(infer_media_extension(&download_only, dl_url), "m4a");
+    assert_eq!(select_transcribe_media_url(&File::default()), None);
+
+    let filetype_only = File {
+        id: FileId::from("FAUD2"),
+        filetype: Some("webm".into()),
+        url_private: Some("https://files.slack.com/raw".into()),
+        ..File::default()
+    };
+    assert_eq!(
+        infer_media_extension(&filetype_only, "https://files.slack.com/raw"),
+        "webm"
+    );
+
+    assert_eq!(
+        parse_transcribe_provider(None),
+        Ok(slackless_core::huddle::TranscriptionProvider::ParakeetV3)
+    );
+    assert_eq!(
+        parse_transcribe_provider(Some("parakeet")),
+        Ok(slackless_core::huddle::TranscriptionProvider::ParakeetV3)
+    );
+    assert_eq!(
+        parse_transcribe_provider(Some("Whisper")),
+        Ok(slackless_core::huddle::TranscriptionProvider::WhisperTurbo)
+    );
+    assert!(parse_transcribe_provider(Some("bogus")).is_err());
+
+    let (t_json, t_human) = format_transcribe_result(
+        "FVID1",
+        slackless_core::huddle::TranscriptionProvider::ParakeetV3,
+        2,
+        "Hello from the demo video",
+    );
+    assert_eq!(t_json["ok"], true);
+    assert_eq!(t_json["file_id"], "FVID1");
+    assert_eq!(t_json["provider"], "parakeet-v3");
+    assert_eq!(t_json["indexed_messages"], 2);
+    assert_eq!(t_json["text"], "Hello from the demo video");
+    assert_eq!(
+        t_human,
+        "transcribed FVID1 (parakeet-v3, indexed 2 message(s)):\nHello from the demo video\n"
+    );
+
     // mark-thread cursor selection.
     assert_eq!(
         mark_thread_cursor("1700.001", None, false),

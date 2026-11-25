@@ -221,6 +221,18 @@ pub(crate) struct BackfillArgs {
     pub(crate) page_size: u32,
 }
 
+#[derive(Args)]
+pub(crate) struct TranscribeArgs {
+    /// Slack file ID (e.g. `F0123ABC`) to transcribe and index in the local archive.
+    pub(crate) file_id: String,
+    /// Local video or audio file path to transcribe directly (offline, skips Slack download).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) file: Option<PathBuf>,
+    /// Preferred local transcription provider (`parakeet` or `whisper`; defaults to auto-detect).
+    #[arg(long, value_name = "PROVIDER")]
+    pub(crate) provider: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// Full-text search the local archive (modifiers: in: from: has: before: after:).
@@ -376,6 +388,8 @@ pub(crate) enum Commands {
         #[arg(short, long, value_name = "PATH")]
         out: Option<std::path::PathBuf>,
     },
+    /// Transcribe a video/audio file locally (`parakeet` or `whisper`) and index it in local search.
+    Transcribe(Box<TranscribeArgs>),
     /// Backfill a conversation's historical messages into the local SQLite archive (needs a stored session).
     Backfill(Box<BackfillArgs>),
     /// Check for and install Slackless updates from GitHub Releases (updates Slackless.app + CLI).

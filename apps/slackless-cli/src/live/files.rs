@@ -1,16 +1,21 @@
-//! `files` listing and `download` live commands.
+//! `files` listing, `download`, and `transcribe` commands.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use slackless_core::api::FilesFilter;
-use slackless_core::types::File;
+use slackless_core::huddle::{TranscriptionProvider, resolve_local_file_provider};
+use slackless_core::types::{File, FileId, TeamId};
 
+use crate::archive::Archive;
 use crate::output;
 use crate::{Ctx, fail};
 
 use super::session::{api_fail, api_for, resolve_channel};
+
+static TRANSCRIBE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn clamp_files_limit(limit: u32) -> u32 {
     limit.clamp(1, 200)
@@ -155,5 +160,227 @@ pub async fn run_download(
         }),
         &format!("downloaded {} ({} bytes)\n", dest.display(), bytes.len()),
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parse `--provider` for `slackless transcribe` into a preferred local [`TranscriptionProvider`].
+pub(crate) fn parse_transcribe_provider(
+    raw: Option<&str>,
+) -> std::result::Result<TranscriptionProvider, String> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("auto") | Some("parakeet") | Some("parakeet-v3") => {
+            Ok(TranscriptionProvider::ParakeetV3)
+        }
+        Some("whisper") | Some("whisper-turbo") => Ok(TranscriptionProvider::WhisperTurbo),
+        Some(other) => Err(format!(
+            "unknown --provider '{other}' (expected parakeet or whisper)"
+        )),
+    }
+}
+
+/// Select the preferred authenticated media URL for transcribing a Slack video/audio file:
+/// `extra["mp4"]` -> `url_private` -> `url_private_download`.
+pub(crate) fn select_transcribe_media_url(file: &File) -> Option<&str> {
+    file.extra
+        .get("mp4")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            file.url_private
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            file.url_private_download
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn clean_media_ext(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches('.');
+    if !trimmed.is_empty()
+        && trimmed.len() <= 8
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Infer a safe lowercase file extension for a downloaded Slack media file so native decoders
+/// (e.g. `AVAssetReader`) recognize its container format.
+pub(crate) fn infer_media_extension(file: &File, selected_url: &str) -> String {
+    if file
+        .extra
+        .get("mp4")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        == Some(selected_url)
+    {
+        return "mp4".to_owned();
+    }
+    if let Some(ext) = file
+        .name
+        .as_deref()
+        .or(file.title.as_deref())
+        .and_then(|n| Path::new(n).extension())
+        .and_then(|e| e.to_str())
+        .and_then(clean_media_ext)
+    {
+        return ext;
+    }
+    if let Some(ext) = file.filetype.as_deref().and_then(clean_media_ext) {
+        return ext;
+    }
+    let url_path = selected_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(selected_url);
+    if let Some(ext) = Path::new(url_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(clean_media_ext)
+    {
+        return ext;
+    }
+    "mp4".to_owned()
+}
+
+/// Format JSON and human output for `slackless transcribe`.
+pub(crate) fn format_transcribe_result(
+    file_id: &str,
+    provider: TranscriptionProvider,
+    indexed_messages: usize,
+    text: &str,
+) -> (serde_json::Value, String) {
+    let provider_tag = provider.source_tag();
+    let json = serde_json::json!({
+        "ok": true,
+        "file_id": file_id,
+        "provider": provider_tag,
+        "indexed_messages": indexed_messages,
+        "text": text,
+    });
+    let human = format!(
+        "transcribed {file_id} ({provider_tag}, indexed {indexed_messages} message(s)):\n{text}\n"
+    );
+    (json, human)
+}
+
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `transcribe <FILE_ID> [--file PATH] [--provider parakeet|whisper] [--workspace TEAM_ID]`
+pub async fn run_transcribe(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    workspace: Option<&TeamId>,
+    file_id: &str,
+    local_file: Option<&Path>,
+    provider_arg: Option<&str>,
+) -> Result<ExitCode> {
+    let file_id = file_id.trim();
+    if file_id.is_empty() {
+        return Ok(fail(ctx, "invalid_args", "file_id cannot be empty"));
+    }
+    let preferred = match parse_transcribe_provider(provider_arg) {
+        Ok(p) => p,
+        Err(msg) => return Ok(fail(ctx, "invalid_args", &msg)),
+    };
+
+    let (target_workspace, media_path, _temp_guard): (TeamId, PathBuf, Option<TempFileGuard>) =
+        if let Some(local_path) = local_file {
+            if !local_path.is_file() {
+                return Ok(fail(
+                    ctx,
+                    "file_not_found",
+                    &format!("local file not found: {}", local_path.display()),
+                ));
+            }
+            let Some(ws) = workspace else {
+                return Ok(fail(
+                    ctx,
+                    "no_workspace",
+                    "no workspace known for transcribing; pass --workspace TEAM_ID (or run `slackless auth login` first)",
+                ));
+            };
+            (ws.clone(), local_path.to_path_buf(), None)
+        } else {
+            let session = match api_for(ctx, flag) {
+                Ok(s) => s,
+                Err(exit) => return Ok(exit),
+            };
+            if resolve_local_file_provider(preferred).is_none() {
+                return Ok(fail(
+                    ctx,
+                    "transcribe_failed",
+                    "No local transcription model is downloaded yet. Download Parakeet v3 or Whisper Turbo in Preferences → Audio & Video.",
+                ));
+            }
+            let file = match session.api.files_info(file_id).await {
+                Ok(f) => f,
+                Err(err) => return Ok(api_fail(ctx, &err)),
+            };
+            let Some(url) = select_transcribe_media_url(&file) else {
+                return Ok(fail(
+                    ctx,
+                    "no_media_url",
+                    "file has no downloadable video/audio URL",
+                ));
+            };
+            let bytes = match session.api.download_file(url).await {
+                Ok(b) => b,
+                Err(err) => return Ok(api_fail(ctx, &err)),
+            };
+            let ext = infer_media_extension(&file, url);
+            let safe_id: String = file_id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            let seq = TRANSCRIBE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = std::env::temp_dir().join(format!(
+                "slackless-transcribe-{}-{}-{seq}.{ext}",
+                std::process::id(),
+                if safe_id.is_empty() { "file" } else { &safe_id },
+            ));
+            if let Err(err) = std::fs::write(&tmp_path, &bytes) {
+                return Ok(fail(
+                    ctx,
+                    "write_failed",
+                    &format!("writing temporary media file {}: {err}", tmp_path.display()),
+                ));
+            }
+            (
+                session.workspace,
+                tmp_path.clone(),
+                Some(TempFileGuard(tmp_path)),
+            )
+        };
+
+    let mut archive = Archive::open_or_create_rw(&target_workspace)?;
+    let fid = FileId::from(file_id);
+    let (used_provider, text, indexed_messages) = match slackless_core::transcribe_and_index_file(
+        archive.store_mut(),
+        &target_workspace,
+        &fid,
+        &media_path,
+        preferred,
+    ) {
+        Ok(res) => res,
+        Err(err) => return Ok(fail(ctx, "transcribe_failed", &err)),
+    };
+
+    let (json, human) = format_transcribe_result(file_id, used_provider, indexed_messages, &text);
+    output::emit(ctx.json, &json, &human);
     Ok(ExitCode::SUCCESS)
 }

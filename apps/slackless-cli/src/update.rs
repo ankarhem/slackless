@@ -1,19 +1,17 @@
 //! Self-update command (`slackless update`) backed by GitHub Releases.
 //!
 //! Delegates version comparison, GitHub release fetching (filtering out drafts and prereleases),
-//! asset-name validation, SHA-256 lookup, and macOS install-path resolution to
-//! `slackless_core::domain::updater`, then verifies the downloaded `.app.tar.gz`, safely stops a
-//! running `Slackless.app` before swapping on `--restart`, performs an atomic swap with `.prev`
-//! rollback, and refreshes the CLI symlink.
+//! pure-Rust HTTPS download & SHA-256 verification, archive extraction, macOS install-path
+//! resolution, and CLI symlink refresh to `slackless_core::domain::updater`. Safely stops a
+//! running `Slackless.app` before swapping on `--restart` and performs an atomic swap with
+//! `.app.prev` rollback.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use slackless_core::domain::updater::{
-    self, ReleaseInfo, find_sha256_entry, is_newer_version, is_safe_asset_name,
-};
+use slackless_core::domain::updater::{self, ReleaseInfo, is_newer_version};
 
 use crate::output;
 use crate::{CLI_VERSION, Ctx, fail};
@@ -60,7 +58,7 @@ fn quit_running_app_and_wait() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn download_and_install(
+async fn download_and_install(
     release: &ReleaseInfo,
     restart: bool,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -83,138 +81,66 @@ fn download_and_install(
     }
     std::fs::create_dir_all(&stage_dir).context("creating update staging directory")?;
 
-    let install_result = (|| -> Result<(PathBuf, Option<PathBuf>)> {
-        if !is_safe_asset_name(&release.asset_name) {
-            anyhow::bail!("invalid release asset name: {}", release.asset_name);
-        }
-        let sums_url = release.sha256_url.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("release is missing SHA256SUMS.txt; refusing unverified update")
-        })?;
-
-        let tarball_path = stage_dir.join(&release.asset_name);
-        let dl = Command::new("curl")
-            .args(["-fsSL", "--max-time", "300", "-o"])
-            .arg(&tarball_path)
-            .arg(&release.download_url)
-            .output()
-            .context("downloading release tarball")?;
-        if !dl.status.success() {
-            anyhow::bail!(
-                "download failed: {}",
-                String::from_utf8_lossy(&dl.stderr).trim()
-            );
-        }
-
-        let sums_path = stage_dir.join("SHA256SUMS.txt");
-        let sums_dl = Command::new("curl")
-            .args(["-fsSL", "--max-time", "30", "-o"])
-            .arg(&sums_path)
-            .arg(sums_url)
-            .output()
-            .context("downloading SHA256SUMS.txt")?;
-        if !sums_dl.status.success() {
-            anyhow::bail!(
-                "failed to download SHA256SUMS.txt: {}",
-                String::from_utf8_lossy(&sums_dl.stderr).trim()
-            );
-        }
-        let sums_text = std::fs::read_to_string(&sums_path).context("reading SHA256SUMS.txt")?;
-        let expected = find_sha256_entry(&sums_text, &release.asset_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "SHA256SUMS.txt has no checksum entry for {}",
-                release.asset_name
-            )
-        })?;
-        let actual_out = Command::new("shasum")
-            .args(["-a", "256"])
-            .arg(&tarball_path)
-            .output()
-            .context("computing SHA-256 checksum")?;
-        if !actual_out.status.success() {
-            anyhow::bail!("shasum exited with {}", actual_out.status);
-        }
-        let actual = String::from_utf8_lossy(&actual_out.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if actual != expected {
-            anyhow::bail!("SHA-256 checksum mismatch (expected {expected}, got {actual})");
-        }
-
-        let unpack = Command::new("tar")
-            .args(["-xzf"])
-            .arg(&tarball_path)
-            .arg("-C")
-            .arg(&stage_dir)
-            .output()
-            .context("extracting Slackless.app")?;
-        if !unpack.status.success() {
-            anyhow::bail!(
-                "extract failed: {}",
-                String::from_utf8_lossy(&unpack.stderr).trim()
-            );
-        }
-        let new_app = stage_dir.join("Slackless.app");
-        if !new_app.is_dir() {
-            anyhow::bail!("archive did not contain Slackless.app");
-        }
-        let _ = Command::new("xattr")
-            .args(["-dr", "com.apple.quarantine"])
-            .arg(&new_app)
-            .status();
-
-        // Stop a running Slackless.app and verify process exit BEFORE swapping the bundle on disk.
-        if restart {
-            quit_running_app_and_wait()?;
-        }
-
-        // Atomic swap with `.prev` rollback.
-        swap_app_bundle(&new_app, &target_app)?;
-
-        // Refresh CLI symlink to point at the newly installed bundle.
-        let bundled_cli = target_app.join("Contents/MacOS/slackless");
-        let linked_cli = if bundled_cli.is_file() {
-            if let Some(link) = updater::resolve_cli_link_path() {
-                if let Some(parent) = link.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::remove_file(&link);
-                std::os::unix::fs::symlink(&bundled_cli, &link)
-                    .ok()
-                    .map(|()| link)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let _ = Command::new(
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-        )
-        .args(["-f"])
-        .arg(&target_app)
-        .status();
-
-        if restart {
-            let open_status = Command::new("open")
-                .arg(&target_app)
-                .status()
-                .context("relaunching Slackless.app")?;
-            if !open_status.success() {
-                anyhow::bail!(
-                    "updated {}, but relaunching failed (`open` exited with {open_status})",
-                    target_app.display()
-                );
-            }
-        }
-
-        Ok((target_app, linked_cli))
-    })();
-
+    let install_result = install_in_stage(release, &stage_dir, &target_app, restart).await;
     let _ = std::fs::remove_dir_all(&stage_dir);
     install_result
+}
+
+#[cfg(target_os = "macos")]
+async fn install_in_stage(
+    release: &ReleaseInfo,
+    stage_dir: &Path,
+    target_app: &Path,
+    restart: bool,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let user_agent = format!("Slackless/{CLI_VERSION}");
+    let tarball_path = updater::download_and_verify_release(release, stage_dir, &user_agent)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    updater::extract_tar_gz(&tarball_path, stage_dir).map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    let new_app = stage_dir.join("Slackless.app");
+    if !new_app.is_dir() {
+        anyhow::bail!("archive did not contain Slackless.app");
+    }
+    let _ = Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(&new_app)
+        .status();
+
+    // Stop a running Slackless.app and verify process exit BEFORE swapping the bundle on disk.
+    if restart {
+        quit_running_app_and_wait()?;
+    }
+
+    // Atomic swap with `.prev` rollback.
+    swap_app_bundle(&new_app, target_app)?;
+
+    // Refresh CLI symlink to point at the newly installed bundle.
+    let linked_cli = updater::install_cli_symlink(target_app);
+
+    let _ = Command::new(
+        "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+    )
+    .args(["-f"])
+    .arg(target_app)
+    .status();
+
+    if restart {
+        let open_status = Command::new("open")
+            .arg(target_app)
+            .status()
+            .context("relaunching Slackless.app")?;
+        if !open_status.success() {
+            anyhow::bail!(
+                "updated {}, but relaunching failed (`open` exited with {open_status})",
+                target_app.display()
+            );
+        }
+    }
+
+    Ok((target_app.to_path_buf(), linked_cli))
 }
 
 #[cfg(target_os = "macos")]
@@ -270,7 +196,7 @@ fn move_dir_across_fs(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn download_and_install(
+async fn download_and_install(
     _release: &ReleaseInfo,
     _restart: bool,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
@@ -338,7 +264,7 @@ pub async fn run_update(
             release.version, CLI_VERSION
         );
     }
-    let (app_path, cli_path) = match download_and_install(&release, restart) {
+    let (app_path, cli_path) = match download_and_install(&release, restart).await {
         Ok(res) => res,
         Err(err) => return Ok(fail(ctx, "update_install_failed", &format!("{err:#}"))),
     };
@@ -380,7 +306,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use slackless_core::domain::updater::{dir_is_writable, parse_version};
+    use slackless_core::domain::updater::{
+        dir_is_writable, find_sha256_entry, is_safe_asset_name, parse_version,
+    };
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 

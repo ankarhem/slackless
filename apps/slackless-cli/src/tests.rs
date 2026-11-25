@@ -7,7 +7,9 @@ use crate::cli::{
     ListCommand, ListReadFormat, READ_LIMIT, SEARCH_LIMIT, SavedCommand, StatusCommand,
 };
 use crate::commands::maintenance::{StatsSummary, format_stats_human};
-use crate::commands::messages::{format_markdown_export, read_channel_messages};
+use crate::commands::messages::{
+    SearchCmdOpts, cmd_search_in_archive, format_markdown_export, read_channel_messages,
+};
 use crate::commands::parse_since_cutoff;
 use crate::output::{MessageRow, ReactionRow};
 
@@ -527,6 +529,32 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
             restart: false
         }
     ));
+    let transcribe_cli = Cli::try_parse_from([
+        "slackless",
+        "transcribe",
+        "F0123VIDEO",
+        "--file",
+        "/tmp/demo.mp4",
+        "--provider",
+        "whisper",
+        "--workspace",
+        "T42",
+        "--json",
+    ])
+    .unwrap();
+    assert!(transcribe_cli.json);
+    assert_eq!(transcribe_cli.workspace.as_deref(), Some("T42"));
+    match transcribe_cli.command {
+        Commands::Transcribe(args) => {
+            assert_eq!(args.file_id, "F0123VIDEO");
+            assert_eq!(
+                args.file.as_deref(),
+                Some(std::path::Path::new("/tmp/demo.mp4"))
+            );
+            assert_eq!(args.provider.as_deref(), Some("whisper"));
+        }
+        _ => panic!("expected Transcribe"),
+    }
 
     // Additional simple subcommands parse cleanly.
     for argv in [
@@ -553,6 +581,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
         vec!["slackless", "watch", "--count", "3"],
         vec!["slackless", "unread"],
         vec!["slackless", "download", "F123"],
+        vec!["slackless", "transcribe", "F123"],
         vec!["slackless", "backfill", "#eng", "--pages", "2"],
         vec!["slackless", "auth", "status"],
         vec!["slackless", "auth", "logout"],
@@ -569,6 +598,7 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(Cli::try_parse_from(["slackless", "upload", "#eng"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "schedule", "#eng", "hi"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "export", "#eng", "--format", "xml"]).is_err());
+    assert!(Cli::try_parse_from(["slackless", "transcribe"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "bogus-cmd"]).is_err());
 }
 
@@ -839,4 +869,109 @@ fn read_channel_messages_does_not_starve_limit_on_deleted_or_since() {
         .map(|m| m.message.text.as_str())
         .collect();
     assert_eq!(texts, vec!["msg 7", "msg 8", "msg 9"]);
+}
+
+#[test]
+fn cmd_search_finds_message_by_spoken_word_from_video_transcript() {
+    use std::process::ExitCode;
+
+    use slackless_core::store::Store;
+    use slackless_core::types::{ChannelId, File, FileId, Message, TeamId, Ts};
+
+    use crate::archive::Archive;
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "slackless-cli-video-search-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    let db_path = tmp_dir.join("T1.sqlite");
+    let hit_out = tmp_dir.join("hit.json");
+    let miss_out = tmp_dir.join("miss.json");
+
+    let ws = TeamId::from("T1");
+    let ch = ChannelId::from("C1");
+    let file_id = FileId::from("FVIDEO42");
+    let msg_ts = Ts::from("1700002000.000100");
+
+    let mut store = Store::open(&db_path).expect("open store");
+    store
+        .upsert_messages(
+            &ws,
+            &ch,
+            &[Message {
+                ts: msg_ts.clone(),
+                text: "Sprint demo recording attached".into(),
+                files: vec![File {
+                    id: file_id.clone(),
+                    name: Some("sprint-demo.mp4".into()),
+                    mimetype: Some("video/mp4".into()),
+                    ..File::default()
+                }],
+                ..Message::default()
+            }],
+        )
+        .expect("seed video message");
+
+    let updated = store
+        .upsert_file_transcript(
+            &ws,
+            &file_id,
+            "parakeet-v3",
+            "We rolled out the zephyrgate canary deployment yesterday",
+        )
+        .expect("upsert file transcript");
+    assert_eq!(updated, 1);
+    drop(store);
+
+    let archive = Archive::open_path(&db_path)
+        .expect("open archive")
+        .expect("archive exists");
+    let ctx = crate::Ctx { json: true };
+
+    let code = cmd_search_in_archive(
+        &ctx,
+        &ws,
+        Some(&archive),
+        "zephyrgate",
+        SearchCmdOpts {
+            limit: 20,
+            format: Some(ExportFormat::Json),
+            out: Some(&hit_out),
+            include_deleted: false,
+        },
+    )
+    .expect("cmd_search hit");
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&hit_out).expect("read hit json"))
+            .expect("parse hit json");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["messages"][0]["ts"], msg_ts.as_str());
+    assert_eq!(payload["messages"][0]["files"][0], "sprint-demo.mp4");
+
+    let miss_code = cmd_search_in_archive(
+        &ctx,
+        &ws,
+        Some(&archive),
+        "unrelatedtoken",
+        SearchCmdOpts {
+            limit: 20,
+            format: Some(ExportFormat::Json),
+            out: Some(&miss_out),
+            include_deleted: false,
+        },
+    )
+    .expect("cmd_search miss");
+    assert_eq!(miss_code, ExitCode::SUCCESS);
+
+    let miss_payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&miss_out).expect("read miss json"))
+            .expect("parse miss json");
+    assert_eq!(miss_payload["count"], 0);
+
+    drop(archive);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
