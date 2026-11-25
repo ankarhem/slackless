@@ -1,6 +1,21 @@
 //! Sidebar helper types, layout metrics, tooltips, count pills, and mention matching.
 
-use super::*;
+use std::time::{Duration, Instant};
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::menu::PopupMenu;
+use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
+use gpui_kit::gpui::{
+    AnyElement, Div, Entity, FontWeight, Hsla, IntoElement, ParentElement as _, PathBuilder,
+    Pixels, ScrollHandle, SharedString, Styled as _, Subscription, canvas, div, point, px,
+    relative,
+};
+use slackless_core::types::rich_text::{Block, RichTextContainer, RichTextElement};
+use slackless_core::types::{ChannelId, ChannelSection, Message, SectionKind, Team, UserId};
+
+use crate::emoji;
+use crate::fixtures::Fixtures;
 
 /// A "More unreads" scroll in flight: Slack eases the list to its target instead of jumping.
 #[derive(Clone, Copy)]

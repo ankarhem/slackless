@@ -1,5 +1,7 @@
 use super::*;
 use gpui_kit::gpui;
+use slackless_core::types::rich_text::{Block, RichTextContainer, RichTextElement};
+use slackless_core::types::{SectionKind, UserId};
 
 #[test]
 fn nav_prefs_shows_respects_toggles() {
@@ -465,5 +467,172 @@ fn sidebar_section_prefs_round_trip_and_hidden_conversations_classify_filters(
         assert!(h.unread.contains(&unread_ch));
         assert!(h.read.contains(&ChannelId::from("C_READ")));
         assert!(!h.unread.contains(&mention_ch));
+    });
+}
+
+#[test]
+fn nav_prefs_ordered_items_deduplicates_and_recovers_invalid_indices() {
+    // Duplicates and out-of-bounds indices must not panic or drop tabs.
+    let prefs = NavPrefs {
+        order: [99, 2, 2, 0, 100],
+        ..Default::default()
+    };
+    assert_eq!(
+        prefs.ordered_items(),
+        vec![
+            NavItem::Activity,
+            NavItem::Home,
+            NavItem::Dms,
+            NavItem::Files,
+            NavItem::Todos,
+            NavItem::Agents,
+            NavItem::Admin,
+        ]
+    );
+}
+
+#[gpui::test]
+fn sidebar_custom_sections_starring_notify_and_nav_cycling(cx: &mut gpui::TestAppContext) {
+    use slackless_core::api::ConversationCounts;
+    use slackless_core::types::ConversationProperties;
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::init(cx);
+    });
+
+    let mut fx = crate::fixtures::load();
+    fx.sample = true;
+    fx.messages.clear();
+    fx.counts.clear();
+    fx.sections.clear();
+    let ch0 = fx.channels[0].id.clone();
+    let ch1 = fx.channels[1].id.clone();
+    let ch2 = fx.channels[2].id.clone();
+    fx.channels[0].is_general = true;
+    let mut general_props = ConversationProperties::default();
+    general_props.extra.insert(
+        "is_dormant".into(),
+        crate::blockkit::serde_json::json!(true),
+    );
+    fx.channels[0].properties = Some(general_props);
+    fx.counts.insert(
+        ch1.clone(),
+        ConversationCounts {
+            id: ch1.clone(),
+            has_unreads: true,
+            mention_count: 2,
+            latest: Some(slackless_core::types::Ts::from("1700000001.000100")),
+            ..Default::default()
+        },
+    );
+    let fx = Arc::new(fx);
+
+    let mounted = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = mounted.clone();
+    let init_fx = fx.clone();
+    let init_sel = ch0.clone();
+    let (_root, cx) = cx.add_window_view(move |window, cx| {
+        let entity = Sidebar::new(init_fx.clone(), init_sel.clone(), window, cx);
+        *slot.borrow_mut() = Some(entity.clone());
+        gpui_kit::component::Root::new(entity, window, cx)
+    });
+    let sidebar = mounted.borrow_mut().take().unwrap();
+
+    sidebar.update(cx, |s, cx| {
+        // #general is never considered dormant even with `is_dormant: true`.
+        let general = s.fixtures.conversation(&ch0).unwrap();
+        assert!(!s.is_dormant(general));
+
+        // Custom section CRUD: create, create-with-channel, rename, move, delete.
+        s.add_section("Alpha".into(), cx);
+        let alpha_id = s.section_set()[0].id.clone();
+        s.add_section_with_channel("Beta".into(), ch1.clone(), cx);
+        let beta_id = s.section_set()[1].id.clone();
+        assert!(s.section_set()[1].channel_ids.contains(&ch1));
+
+        s.move_channel(
+            ch1.clone(),
+            Some(beta_id.clone()),
+            Some(alpha_id.clone()),
+            cx,
+        );
+        assert!(s.section_set()[0].channel_ids.contains(&ch1));
+        assert!(!s.section_set()[1].channel_ids.contains(&ch1));
+
+        s.rename_section_local(&alpha_id, "Renamed Alpha", cx);
+        assert_eq!(s.section_set()[0].name, "Renamed Alpha");
+
+        s.delete_section_local(&beta_id, cx);
+        assert_eq!(s.section_set().len(), 1);
+
+        // Local starring toggles cleanly without a server Stars section.
+        assert!(!s.is_starred(&ch2));
+        s.toggle_star(ch2.clone(), cx);
+        assert!(s.is_starred(&ch2));
+        s.toggle_star(ch2.clone(), cx);
+        assert!(!s.is_starred(&ch2));
+
+        // Section sort defaults: Recency for DMs, Alpha for channels.
+        let ch_key = SharedString::from("channels");
+        let dm_key = SharedString::from("dms");
+        assert_eq!(s.section_sort(&ch_key, false), SectionSort::Alpha);
+        assert_eq!(s.section_sort(&dm_key, true), SectionSort::Recency);
+
+        // `active_only = false` switches default filter to `SectionFilter::All`.
+        s.active_only = false;
+        assert_eq!(s.section_filter(&ch_key), SectionFilter::All);
+
+        // `mute_section` sets muted override; `show_muted` keeps muted visible in `hidden_reason`.
+        s.mute_section(std::slice::from_ref(&ch2), cx);
+        assert_eq!(s.notify_level(&ch2), Some(NotifyLevel::Muted));
+        let ch2_conv = s.fixtures.conversation(&ch2).unwrap().clone();
+        assert!(matches!(
+            s.hidden_reason(&ch2_conv, Unread::default(), SectionFilter::All, true),
+            Some(crate::sidebar_menu::Hidden::Muted)
+        ));
+        s.set_home_prefs(
+            HomePrefs {
+                show_muted: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(
+            s.hidden_reason(&ch2_conv, Unread::default(), SectionFilter::All, true)
+                .is_none()
+        );
+
+        // `search_unread_counts`, `mark_section_read`, and `mark_unread` round-trip.
+        s.set_thread_counts(true, 3, cx);
+        let (mentions, threads) = s.search_unread_counts();
+        assert_eq!(mentions, vec![(ch1.clone(), 2)]);
+        assert_eq!(threads, (true, 3));
+        s.mark_section_read(&[ch0.clone(), ch1.clone()], cx);
+        assert!(s.unread_ids().is_empty());
+        s.mark_unread(&ch1, cx);
+        assert_eq!(s.unread_ids(), vec![ch1.clone()]);
+
+        // `cycle_nav` wraps forward & backward skipping hidden tabs.
+        s.set_nav_prefs(
+            NavPrefs {
+                show_home: true,
+                show_dms: false,
+                show_activity: true,
+                show_files: false,
+                show_later: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(s.active_nav(), NavItem::Home);
+        s.cycle_nav(true, cx);
+        assert_eq!(s.active_nav(), NavItem::Activity);
+        s.cycle_nav(true, cx);
+        assert_eq!(s.active_nav(), NavItem::Todos);
+        s.cycle_nav(true, cx);
+        assert_eq!(s.active_nav(), NavItem::Home);
+        s.cycle_nav(false, cx);
+        assert_eq!(s.active_nav(), NavItem::Todos);
     });
 }
