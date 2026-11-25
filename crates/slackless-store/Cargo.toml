@@ -8,7 +8,7 @@ license.workspace = true
 slackless-types.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 flate2 = "1.1"
 
 [lints]

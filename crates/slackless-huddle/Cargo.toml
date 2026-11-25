@@ -10,12 +10,12 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 prost = "0.14"
 flate2 = "1.1"
 bytes = "1"
-rand = "0.9"
+rand = "0.10"
 webrtc = "0.17"
 cpal = "0.16"
 opus = "0.4"

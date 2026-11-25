@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// `delay(n) = min(initial * 2^n, max)`, jittered into `[delay/2, delay]` ("equal jitter").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

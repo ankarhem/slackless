@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rand::Rng as _;
+use rand::RngExt as _;
 use slackless_types::UserId;
 use tokio::sync::mpsc;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;

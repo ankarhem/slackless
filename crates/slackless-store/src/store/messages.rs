@@ -381,7 +381,7 @@ pub(super) fn decode_json_value(val: ValueRef<'_>) -> rusqlite::Result<String> {
     match val {
         ValueRef::Text(bytes) => std::str::from_utf8(bytes)
             .map(str::to_owned)
-            .map_err(rusqlite::Error::Utf8Error),
+            .map_err(|e| rusqlite::Error::Utf8Error(0, e)),
         ValueRef::Blob(bytes) => {
             let mut dec = ZlibDecoder::new(bytes);
             let mut out = String::new();
