@@ -1106,6 +1106,7 @@ impl ThreadPanel {
             grouped.then(|| row_group.clone()),
             cx,
         );
+        let text_inset = if prefs.compact { 36. } else { TEXT_INSET };
         let card = if deleted_ghost {
             let (muted, fg) = (cx.theme().muted_foreground, cx.theme().foreground);
             let toggle_ts = ts.clone();
@@ -1114,7 +1115,7 @@ impl ThreadPanel {
                 .child(div().opacity(0.65).child(card))
                 .child(
                     h_flex()
-                        .pl(px(TEXT_INSET))
+                        .pl(px(text_inset))
                         .pt_0p5()
                         .items_center()
                         .gap_1p5()
@@ -1140,7 +1141,7 @@ impl ThreadPanel {
             card
         };
         let chips = actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
-            .map(|chips| chips.pl(px(TEXT_INSET)));
+            .map(|chips| chips.pl(px(text_inset)));
 
         // Straddling the row's top edge would cut the root's bar off at the panel's top, so
         // Slack keeps it inside the row, 3pt down.
@@ -1158,7 +1159,6 @@ impl ThreadPanel {
                 .px_2()
                 .when(!grouped, |row| row.pt_1())
                 .pb_1()
-                .rounded_md()
                 .when(revealed, |row| row.bg(hover_bg))
                 .when(saved, |row| row.child(actions::saved_banner(cx)))
                 .child(v_flex().min_w_0().child(card).children(chips))
