@@ -608,12 +608,39 @@ impl Render for PopoutWindow {
             })
             .on_key_down(
                 cx.listener(|this, event: &gpui_kit::gpui::KeyDownEvent, window, cx| {
-                    if event.keystroke.key == "escape" {
-                        if this.image_viewer.is_some() {
-                            this.close_image_viewer(window, cx);
-                        } else if this.picker.take().is_some() || this.editing.take().is_some() {
-                            cx.notify();
+                    if let Some(viewer) = this.image_viewer.clone() {
+                        match event.keystroke.key.as_str() {
+                            "escape" => {
+                                this.close_image_viewer(window, cx);
+                                cx.stop_propagation();
+                            }
+                            "left" => {
+                                viewer.update(cx, |v, cx| v.step(-1, window, cx));
+                                cx.stop_propagation();
+                            }
+                            "right" => {
+                                viewer.update(cx, |v, cx| v.step(1, window, cx));
+                                cx.stop_propagation();
+                            }
+                            "space" => {
+                                let handled = viewer.update(cx, |v, cx| {
+                                    if v.is_video() {
+                                        v.toggle_video_play(window, cx);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                                if handled {
+                                    cx.stop_propagation();
+                                }
+                            }
+                            _ => {}
                         }
+                    } else if event.keystroke.key == "escape"
+                        && (this.picker.take().is_some() || this.editing.take().is_some())
+                    {
+                        cx.notify();
                     }
                 }),
             )

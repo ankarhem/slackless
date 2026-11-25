@@ -13,7 +13,7 @@ use super::meta::{
     file_ext, file_icon_kind, file_name, fit, format_duration, human_size, inline_allowed,
     inline_clip_transcript, is_audio, is_decodable_image_url, is_snippet, is_video,
     media_duration_ms, parse_webvtt, remote_thumbnail, snippet_hidden_lines, snippet_is_truncated,
-    snippet_lines, snippet_visible_and_omitted, video_poster_url,
+    snippet_lines, snippet_visible_and_omitted, video_playback_url, video_poster_url,
 };
 use super::snippet::{SnippetCard, SnippetStore};
 use crate::blockkit::serde_json::json;
@@ -149,6 +149,28 @@ fn file_classification_naming_urls_and_icon_kinds() {
         ..Default::default()
     };
     assert_eq!(video_poster_url(&video_only_mp4_thumb), None);
+
+    // Video playback URL precedence: extra["mp4"] -> url_private -> url_private_download.
+    let mut vid_urls = File {
+        url_private_download: Some("https://files.slack.com/dl/v.mp4".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        video_playback_url(&vid_urls).as_deref(),
+        Some("https://files.slack.com/dl/v.mp4")
+    );
+    vid_urls.url_private = Some("https://files.slack.com/pri/v.mp4".into());
+    assert_eq!(
+        video_playback_url(&vid_urls).as_deref(),
+        Some("https://files.slack.com/pri/v.mp4")
+    );
+    vid_urls
+        .extra
+        .insert("mp4".into(), json!("https://files.slack.com/stream/v.mp4"));
+    assert_eq!(
+        video_playback_url(&vid_urls).as_deref(),
+        Some("https://files.slack.com/stream/v.mp4")
+    );
 
     // Audio / video detection by mimetype and filetype.
     assert!(is_audio(&File {

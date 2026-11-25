@@ -22,7 +22,7 @@ pub fn enable_downloads(fetcher: Fetcher, cx: &mut App) {
 }
 
 /// Clone the active authenticated [`Fetcher`] if signed in.
-pub(super) fn active_fetcher(cx: &App) -> Option<Fetcher> {
+pub(crate) fn active_fetcher(cx: &App) -> Option<Fetcher> {
     cx.try_global::<Downloader>().map(|d| d.0.clone())
 }
 

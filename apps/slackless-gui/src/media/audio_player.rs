@@ -1,7 +1,5 @@
-//! Inline audio playback, video clip caching/launching, and bounded LRU eviction for
-//! `$TMPDIR/slackless-media/`.
+//! Inline audio playback and bounded LRU cache eviction for `$TMPDIR/slackless-media/`.
 
-use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
@@ -10,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use gpui_kit::gpui::{App, BackgroundExecutor, Global, Window};
 use slackless_core::Fetcher;
 
-use super::downloads::{active_fetcher, open_local_file};
+use super::downloads::active_fetcher;
 
 /// Maximum cumulative bytes kept in `$TMPDIR/slackless-media/` before evicting oldest files.
 const MAX_MEDIA_CACHE_BYTES: u64 = 128 * 1024 * 1024;
@@ -40,7 +38,6 @@ struct ActiveAudio {
 #[derive(Default)]
 struct MediaPlayer {
     audio: Option<ActiveAudio>,
-    loading_videos: HashSet<String>,
 }
 
 impl Drop for MediaPlayer {
@@ -147,12 +144,6 @@ pub fn stop_audio(window: &mut Window, cx: &mut App) {
     window.refresh();
 }
 
-/// Whether `file_id` is currently buffering for video playback.
-pub fn video_loading(file_id: &str, cx: &App) -> bool {
-    cx.try_global::<MediaPlayer>()
-        .is_some_and(|p| p.loading_videos.contains(file_id))
-}
-
 fn stop_active_audio(player: &mut MediaPlayer) {
     if let Some(mut active) = player.audio.take()
         && let Some(mut child) = active.child.take()
@@ -229,7 +220,7 @@ fn prune_media_cache(dir: &Path, max_bytes: u64, max_files: usize, keep: Option<
 
 /// Fetch `url` into the bounded `$TMPDIR/slackless-media/` cache if absent, refreshing mtime on
 /// cache hit and enforcing LRU size/count limits after writes.
-async fn fetch_cached_media(
+pub(crate) async fn fetch_cached_media(
     fetcher: Fetcher,
     file_id: String,
     url: String,
@@ -404,43 +395,6 @@ pub fn toggle_audio(
                     break;
                 }
             }
-        })
-        .detach();
-}
-
-/// Fetch a Slack-hosted video clip (authenticated, cached in `$TMPDIR/slackless-media/`) and
-/// play it with native hardware-accelerated QuickLook / QuickTime playback.
-pub fn play_video(file_id: String, url: String, ext: String, window: &mut Window, cx: &mut App) {
-    let Some(fetcher) = active_fetcher(cx) else {
-        crate::actions::notify(
-            "Video playback",
-            "Playback needs a signed-in workspace.",
-            window,
-            cx,
-        );
-        return;
-    };
-    let player = cx.default_global::<MediaPlayer>();
-    if !player.loading_videos.insert(file_id.clone()) {
-        return;
-    }
-    window.refresh();
-    let cache_id = file_id.clone();
-    window
-        .spawn(cx, async move |cx| {
-            let bg = cx.background_executor().clone();
-            let path = fetch_cached_media(fetcher, cache_id, url, ext, bg).await;
-            cx.update(|window, cx| {
-                cx.default_global::<MediaPlayer>()
-                    .loading_videos
-                    .remove(&file_id);
-                match path {
-                    Ok(path) => open_local_file(&path),
-                    Err(e) => crate::actions::notify("Video playback failed", e, window, cx),
-                }
-                window.refresh();
-            })
-            .ok();
         })
         .detach();
 }

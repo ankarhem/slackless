@@ -63,7 +63,7 @@ pub(crate) fn is_decodable_image_url(url: &str) -> bool {
 }
 
 /// Static poster image URL for a video card, skipping non-image `thumb_video` `.mp4` URLs.
-pub(super) fn video_poster_url(file: &File) -> Option<String> {
+pub(crate) fn video_poster_url(file: &File) -> Option<String> {
     [
         file.thumb_video.as_deref(),
         file.thumb_480.as_deref(),
@@ -74,6 +74,17 @@ pub(super) fn video_poster_url(file: &File) -> Option<String> {
     .flatten()
     .find(|url| is_decodable_image_url(url))
     .map(str::to_owned)
+}
+
+/// Direct playback URL for a Slack video file (`extra["mp4"]` -> `url_private` -> `url_private_download`).
+pub(crate) fn video_playback_url(file: &File) -> Option<String> {
+    file.extra
+        .get("mp4")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| file.url_private.clone())
+        .or_else(|| file.url_private_download.clone())
 }
 
 /// A live image's thumbnail URL, sized for the inline preview on a 2x display; for a GIF its
@@ -113,7 +124,7 @@ pub(super) fn is_audio(file: &File) -> bool {
     )
 }
 
-pub(super) fn is_video(file: &File) -> bool {
+pub(crate) fn is_video(file: &File) -> bool {
     if file
         .mimetype
         .as_deref()
@@ -140,7 +151,7 @@ pub(super) fn is_snippet(file: &File) -> bool {
                 && !matches!(file.filetype.as_deref(), Some("quip" | "list" | "pdf"))))
 }
 
-pub(super) fn media_duration_ms(file: &File) -> Option<u64> {
+pub(crate) fn media_duration_ms(file: &File) -> Option<u64> {
     file.extra
         .get("duration_ms")
         .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
@@ -149,7 +160,7 @@ pub(super) fn media_duration_ms(file: &File) -> Option<u64> {
 
 pub(super) use slackless_core::types::time::format_duration;
 
-pub(super) fn file_ext(file: &File, default: &str) -> String {
+pub(crate) fn file_ext(file: &File, default: &str) -> String {
     if let Some(ft) = file.filetype.as_deref().filter(|s| !s.is_empty()) {
         return ft.to_owned();
     }

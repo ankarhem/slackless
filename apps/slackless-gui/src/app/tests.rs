@@ -1214,6 +1214,7 @@ fn qa_image_viewer_keyboard_zoom_step_and_zero_subscription_leak(cx: &mut gpui::
             user: None,
             taken_at: None,
             download: None,
+            video: None,
         };
         std::rc::Rc::new(vec![img("one.png"), img("two.png")])
     };

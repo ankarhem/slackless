@@ -23,10 +23,13 @@ use crate::image_viewer::ImageClick;
 use cards::{external_file_card, file_card};
 use gallery::{Gallery, GalleryImage, image_attachment, thumbnail};
 use media_cards::{audio_card, video_card};
-use meta::{inline_allowed, is_audio, is_snippet, is_video};
+use meta::{inline_allowed, is_audio, is_snippet};
 use snippet::SnippetCard;
 
-pub(crate) use meta::{download_url, file_icon, fit, human_size, is_decodable_image_url};
+pub(crate) use meta::{
+    download_url, file_ext, file_icon, fit, human_size, is_decodable_image_url, is_video,
+    media_duration_ms, video_playback_url, video_poster_url,
+};
 
 /// The message's attachments, or `None` when it has no files. `on_open` makes image
 /// attachments open the viewer on click (the transcript and thread panel provide it; static
@@ -68,7 +71,7 @@ pub fn attachments(
         column = column.child(if is_audio(file) {
             audio_card(file, cx)
         } else if is_video(file) {
-            video_card(file, cx)
+            video_card(file, ix, on_open, cx)
         } else if is_snippet(file) {
             // Reserve a disjoint selection document-order slice per file after the message body.
             let order_base =

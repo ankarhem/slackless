@@ -298,6 +298,19 @@ fn wire_window_and_input_subscriptions(
                         viewer.update(cx, |viewer, cx| viewer.reset_zoom(window, cx));
                         cx.stop_propagation();
                     }
+                    "space" => {
+                        let handled = viewer.update(cx, |viewer, cx| {
+                            if viewer.is_video() {
+                                viewer.toggle_video_play(window, cx);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if handled {
+                            cx.stop_propagation();
+                        }
+                    }
                     _ => {}
                 }
             });

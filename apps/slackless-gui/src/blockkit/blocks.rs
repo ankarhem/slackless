@@ -91,75 +91,188 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
     }
     let direct_video_url = raw["video_url"].as_str().map(str::to_owned);
     if let Some(thumb) = thumb_url {
-        let thumb_box = div()
-            .relative()
-            .w_full()
-            .h(px(180.))
-            .rounded_md()
-            .overflow_hidden()
-            .bg(theme.secondary)
-            .child(
-                crate::media::Picture::new(ImageSource::from(SharedString::from(thumb)))
-                    .fit(ObjectFit::Cover)
-                    .radius(px(6.)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .size(px(40.))
-                            .rounded_full()
-                            .bg(crate::theme::media_overlay_scrim_strong())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(IconName::Play)
-                                    .size(px(18.))
-                                    .text_color(crate::theme::media_overlay_foreground()),
-                            ),
-                    ),
-            );
-        if let Some(href) = direct_video_url.clone().or(url) {
-            let is_direct_media = {
-                let lower = href.to_ascii_lowercase();
-                lower.ends_with(".mp4")
-                    || lower.ends_with(".mov")
-                    || lower.ends_with(".webm")
-                    || lower.contains("files.slack.com")
-            };
-            let vid_id = format!("bk-video-{}-{ix}", kcx.ts.as_str());
-            let target = LinkTarget::Url(href.clone().into());
-            let links = kcx.links.clone();
+        let vid_id = format!("bk-video-{}-{ix}", kcx.ts.as_str());
+        if let Some(snap) = crate::media::inline_video_snapshot(&vid_id, cx) {
+            let fg = crate::theme::media_overlay_foreground();
+            let id_toggle = vid_id.clone();
+            let id_mute = vid_id.clone();
+            let id_close = vid_id.clone();
+            let poster = Some(ImageSource::from(SharedString::from(thumb)));
             card = card.child(
                 div()
                     .id(SharedString::from(format!(
-                        "bk-video-thumb-{}-{ix}",
+                        "bk-video-active-{}-{ix}",
                         kcx.ts.as_str()
                     )))
+                    .relative()
+                    .w_full()
+                    .h(px(220.))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(theme.secondary)
                     .cursor_pointer()
                     .on_click(move |_, window, cx| {
-                        if is_direct_media {
-                            crate::media::play_video(
-                                vid_id.clone(),
-                                href.clone(),
-                                "mp4".to_owned(),
-                                window,
-                                cx,
-                            );
-                        } else {
-                            messages::route_link(links.as_ref(), target.clone(), window, cx);
-                        }
+                        cx.stop_propagation();
+                        crate::media::toggle_inline_video_pause(&id_toggle, window, cx);
                     })
-                    .child(thumb_box),
+                    .child(crate::media::render_video_surface(
+                        snap.surface,
+                        poster,
+                        px(6.),
+                    ))
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .items_center()
+                            .justify_between()
+                            .px_2()
+                            .py_1()
+                            .bg(crate::theme::media_overlay_scrim_strong())
+                            .on_mouse_down(gpui_kit::gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation()
+                            })
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(if snap.playing {
+                                            IconName::Pause
+                                        } else {
+                                            IconName::Play
+                                        })
+                                        .size(px(14.))
+                                        .text_color(fg),
+                                    )
+                                    .child(div().text_size(px(10.)).text_color(fg).child(format!(
+                                        "{} / {}",
+                                        crate::media::format_video_time(snap.position_secs),
+                                        crate::media::format_video_time(snap.duration_secs)
+                                    ))),
+                            )
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "bk-video-mute-{}-{ix}",
+                                                kcx.ts.as_str()
+                                            )))
+                                            .p_1()
+                                            .cursor_pointer()
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                crate::media::toggle_inline_video_mute(
+                                                    &id_mute, window, cx,
+                                                );
+                                            })
+                                            .child(
+                                                Icon::new(if snap.muted {
+                                                    IconName::VolumeX
+                                                } else {
+                                                    IconName::Volume2
+                                                })
+                                                .size(px(14.))
+                                                .text_color(fg),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "bk-video-close-{}-{ix}",
+                                                kcx.ts.as_str()
+                                            )))
+                                            .p_1()
+                                            .cursor_pointer()
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                crate::media::stop_inline_video(
+                                                    &id_close, window, cx,
+                                                );
+                                            })
+                                            .child(
+                                                Icon::new(IconName::X).size(px(14.)).text_color(fg),
+                                            ),
+                                    ),
+                            ),
+                    ),
             );
         } else {
-            card = card.child(thumb_box);
+            let thumb_box = div()
+                .relative()
+                .w_full()
+                .h(px(180.))
+                .rounded_md()
+                .overflow_hidden()
+                .bg(theme.secondary)
+                .child(
+                    crate::media::Picture::new(ImageSource::from(SharedString::from(thumb)))
+                        .fit(ObjectFit::Cover)
+                        .radius(px(6.)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .size(px(40.))
+                                .rounded_full()
+                                .bg(crate::theme::media_overlay_scrim_strong())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    Icon::new(IconName::Play)
+                                        .size(px(18.))
+                                        .text_color(crate::theme::media_overlay_foreground()),
+                                ),
+                        ),
+                );
+            if let Some(href) = direct_video_url.clone().or(url) {
+                let is_direct_media = {
+                    let lower = href.to_ascii_lowercase();
+                    lower.ends_with(".mp4")
+                        || lower.ends_with(".mov")
+                        || lower.ends_with(".webm")
+                        || lower.contains("files.slack.com")
+                };
+                let target = LinkTarget::Url(href.clone().into());
+                let links = kcx.links.clone();
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "bk-video-thumb-{}-{ix}",
+                            kcx.ts.as_str()
+                        )))
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| {
+                            if is_direct_media {
+                                crate::media::play_inline_video(
+                                    vid_id.clone(),
+                                    href.clone(),
+                                    "mp4".to_owned(),
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                messages::route_link(links.as_ref(), target.clone(), window, cx);
+                            }
+                        })
+                        .child(thumb_box),
+                );
+            } else {
+                card = card.child(thumb_box);
+            }
         }
     }
     card

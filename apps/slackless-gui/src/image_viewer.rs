@@ -22,10 +22,12 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState, SliderValue}
 use gpui_kit::component::{Icon, h_flex, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, ImageSource,
-    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, relative,
+    App, AppContext as _, Context, Div, Entity, EventEmitter, FontWeight, Image, ImageFormat,
+    ImageSource, InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
+    px, relative,
 };
+use slackless_core::huddle::NativeVideoPlayer;
 use slackless_core::types::{Block, Message, UserId, time};
 
 use crate::avatars;
@@ -60,7 +62,16 @@ pub enum ImageOrigin {
 /// image elements through [`crate::blockkit::KitCx`] and [`crate::files::attachments`].
 pub type ImageClick = Rc<dyn Fn(ImageOrigin, &mut Window, &mut App)>;
 
-/// One image the viewer can show: the rendition (fixture pixels or a live url the app's
+/// Playback metadata for a video item displayed natively inside [`ImageViewer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewerVideo {
+    pub file_id: String,
+    pub url: String,
+    pub ext: String,
+    pub duration_ms: Option<u64>,
+}
+
+/// One image or video the viewer can show: the rendition (fixture pixels or a live url the app's
 /// HTTP client loads only while the viewer paints it) plus the header's metadata.
 pub struct ViewerImage {
     pub source: ImageSource,
@@ -72,6 +83,8 @@ pub struct ViewerImage {
     pub taken_at: Option<i64>,
     /// What Download saves into ~/Downloads: the url and the file name.
     pub download: Option<(String, String)>,
+    /// Present when this viewer item is a playable video rather than a static/animated image.
+    pub video: Option<ViewerVideo>,
 }
 
 /// A conversation image paired with the click identity that opened it.
@@ -112,6 +125,40 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
 
     // File uploads render under the body, indexed like `files::attachments` renders them.
     for (ix, file) in message.files.iter().enumerate() {
+        let name = file
+            .name
+            .clone()
+            .or_else(|| file.title.clone())
+            .unwrap_or_else(|| file.id.to_string());
+        if crate::files::is_video(file) {
+            let Some(video_url) = crate::files::video_playback_url(file) else {
+                continue;
+            };
+            let source = match fixtures.thumbnails.get(&file.id) {
+                Some(image) => ImageSource::Image(image.clone()),
+                None => match crate::files::video_poster_url(file) {
+                    Some(poster) => ImageSource::from(SharedString::from(poster)),
+                    None => empty_placeholder_source(),
+                },
+            };
+            entries.push(ImageEntry {
+                origin: ImageOrigin::File(ix),
+                image: ViewerImage {
+                    source,
+                    download: crate::files::download_url(file).map(|url| (url, name.clone())),
+                    name,
+                    user: file.user.clone().or_else(|| author.clone()),
+                    taken_at: file.timestamp.or(taken_at),
+                    video: Some(ViewerVideo {
+                        file_id: file.id.to_string(),
+                        url: video_url,
+                        ext: crate::files::file_ext(file, "mp4"),
+                        duration_ms: crate::files::media_duration_ms(file),
+                    }),
+                },
+            });
+            continue;
+        }
         if !file
             .mimetype
             .as_deref()
@@ -142,11 +189,6 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                 }
             }
         };
-        let name = file
-            .name
-            .clone()
-            .or_else(|| file.title.clone())
-            .unwrap_or_else(|| file.id.to_string());
         entries.push(ImageEntry {
             origin: ImageOrigin::File(ix),
             image: ViewerImage {
@@ -155,6 +197,7 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
                 name,
                 user: file.user.clone().or_else(|| author.clone()),
                 taken_at: file.timestamp.or(taken_at),
+                video: None,
             },
         });
     }
@@ -185,6 +228,17 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
     }
 
     entries
+}
+
+fn empty_placeholder_source() -> ImageSource {
+    ImageSource::Image(Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())))
+}
+
+fn poster_source_if_present(source: &ImageSource) -> Option<ImageSource> {
+    match source {
+        ImageSource::Image(img) if img.bytes.is_empty() => None,
+        other => Some(other.clone()),
+    }
 }
 
 fn url_tail(url: &str) -> String {
@@ -220,6 +274,7 @@ fn url_image(
         user,
         taken_at,
         download: Some((url.to_owned(), url_tail(url))),
+        video: None,
     })
 }
 
@@ -320,27 +375,51 @@ pub fn collect_viewer_images<'a>(
     index.map(|ix| (Rc::new(images), ix))
 }
 
+/// Number of post-pause/seek ticks before the viewer's video timer idles at 0% CPU.
+const VIEWER_SETTLE_TICKS: u32 = 15;
+
+struct ViewerVideoPlayback {
+    generation: u64,
+    loading: bool,
+    player: Option<NativeVideoPlayer>,
+    last_frame: Option<Arc<crate::media::VideoSurface>>,
+    error: Option<String>,
+    fallback_duration_secs: f64,
+}
+
 /// The viewer overlay: an entity so the root can mount it like the other overlays and
-/// drop it (and the large rendition it holds) on close.
+/// drop it (and the large rendition / video player it holds) on close.
 pub struct ImageViewer {
     fixtures: Arc<Fixtures>,
     /// The conversation label the header shows ("# design").
     channel: String,
-    /// Every image in the conversation (transcript order); only the shown one is painted,
+    /// Every image/video in the conversation (transcript order); only the shown one is painted,
     /// so only it loads.
     images: Rc<Vec<ViewerImage>>,
     index: usize,
     zoom_ix: usize,
     slider: Entity<SliderState>,
     _subscription: Subscription,
+    video_gen: u64,
+    video_playback: Option<ViewerVideoPlayback>,
+    video_load_task: Option<Task<()>>,
+    video_tick_task: Option<Task<()>>,
+}
+
+impl Drop for ImageViewer {
+    fn drop(&mut self) {
+        self.stop_video();
+    }
 }
 
 impl EventEmitter<ViewerEvent> for ImageViewer {}
 
 impl ImageViewer {
     /// Evict decoded full-resolution image textures loaded by this viewer from GPUI's window &
-    /// asset caches so closing the lightbox releases RAM and Metal atlas memory immediately.
-    pub fn evict_assets(&self, window: &mut Window, cx: &mut Context<Self>) {
+    /// asset caches and immediately stop any active video playback so audio never leaks after
+    /// close.
+    pub fn evict_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_video();
         for entry in self.images.iter() {
             if let ImageSource::Resource(ref resource) = entry.source {
                 if let Some(Ok(data)) =
@@ -358,6 +437,7 @@ impl ImageViewer {
         channel: String,
         images: Rc<Vec<ViewerImage>>,
         index: usize,
+        window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let index = index.min(images.len().saturating_sub(1));
@@ -368,7 +448,7 @@ impl ImageViewer {
                 .step(1.)
                 .default_value(FIT_INDEX as f32)
         });
-        cx.new(|cx| {
+        let viewer = cx.new(|cx| {
             let _subscription = cx.subscribe(&slider, |viewer: &mut Self, _, event, cx| {
                 if let SliderEvent::Change(SliderValue::Single(step)) = event {
                     let ix = (step.round() as usize).min(ZOOM_STEPS.len() - 1);
@@ -386,16 +466,226 @@ impl ImageViewer {
                 zoom_ix: FIT_INDEX,
                 slider,
                 _subscription,
+                video_gen: 0,
+                video_playback: None,
+                video_load_task: None,
+                video_tick_task: None,
             }
-        })
+        });
+        viewer.update(cx, |v, cx| v.sync_current_media(window, cx));
+        viewer
     }
 
-    /// The shown image.
+    /// The shown item.
     fn current(&self) -> &ViewerImage {
         &self.images[self.index]
     }
 
-    /// Step prev (-1) / next (+1) through the conversation's images; each image starts
+    /// Whether the currently shown item is a playable video.
+    pub fn is_video(&self) -> bool {
+        self.current().video.is_some()
+    }
+
+    /// Stop and drop any active video player and background tasks immediately.
+    pub fn stop_video(&mut self) {
+        self.video_gen = self.video_gen.wrapping_add(1);
+        self.video_load_task = None;
+        self.video_tick_task = None;
+        self.video_playback = None;
+    }
+
+    /// Sync video playback to `self.current()`: stops any previous video, and if the current
+    /// item is a video, hands off from inline playback, fetches/caches, opens `NativeVideoPlayer`,
+    /// and starts playback.
+    fn sync_current_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_video();
+        let Some(video) = self.current().video.clone() else {
+            return;
+        };
+        let generation = self.video_gen;
+        let carry_pos = crate::media::take_inline_handoff_for_viewer(&video.file_id, window, cx);
+        let fallback_duration_secs = video.duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0);
+
+        let Some(fetcher) = crate::media::active_fetcher(cx) else {
+            self.video_playback = Some(ViewerVideoPlayback {
+                generation,
+                loading: false,
+                player: None,
+                last_frame: None,
+                error: Some("Playback needs a signed-in workspace.".to_owned()),
+                fallback_duration_secs,
+            });
+            cx.notify();
+            return;
+        };
+
+        self.video_playback = Some(ViewerVideoPlayback {
+            generation,
+            loading: true,
+            player: None,
+            last_frame: None,
+            error: None,
+            fallback_duration_secs,
+        });
+        cx.notify();
+
+        let file_id = video.file_id;
+        let url = video.url;
+        let ext = video.ext;
+        self.video_load_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let bg = cx.background_executor().clone();
+            let path =
+                crate::media::fetch_cached_media(fetcher, file_id, url, ext, bg.clone()).await;
+            let open_res = match path {
+                Ok(path) => bg
+                    .spawn(async move { NativeVideoPlayer::open(&path) })
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(err) => Err(err),
+            };
+            let _ = weak.update_in(cx, |viewer, window, cx| {
+                if viewer.video_gen != generation {
+                    drop(open_res);
+                    return;
+                }
+                match open_res {
+                    Ok(player) => {
+                        if let Some(pos) = carry_pos
+                            && pos.is_finite()
+                            && pos > 0.05
+                        {
+                            player.seek(pos);
+                        }
+                        player.play();
+                        let initial_frame = crate::media::copy_player_surface(&player);
+                        if let Some(pb) = viewer.video_playback.as_mut() {
+                            pb.loading = false;
+                            pb.error = None;
+                            pb.last_frame = initial_frame;
+                            pb.player = Some(player);
+                        }
+                        viewer.spawn_video_tick_loop(generation, window, cx);
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        if let Some(pb) = viewer.video_playback.as_mut() {
+                            pb.loading = false;
+                            pb.error = Some(err);
+                        }
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    fn spawn_video_tick_loop(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.video_tick_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let mut idle_ticks = 0u32;
+            loop {
+                cx.background_executor()
+                    .timer(crate::media::VIDEO_FRAME_INTERVAL)
+                    .await;
+                let keep_going = weak
+                    .update(cx, |viewer, cx| {
+                        if viewer.video_gen != generation {
+                            return false;
+                        }
+                        let Some(pb) = viewer
+                            .video_playback
+                            .as_mut()
+                            .filter(|pb| pb.generation == generation)
+                        else {
+                            return false;
+                        };
+                        let Some(player) = pb.player.as_ref() else {
+                            return false;
+                        };
+                        if let Some(frame) = crate::media::copy_player_surface(player) {
+                            pb.last_frame = Some(frame);
+                        }
+                        let st = player.state();
+                        cx.notify();
+                        if st.failed {
+                            pb.error = Some("Video playback failed.".to_owned());
+                            return false;
+                        }
+                        if st.playing && !st.ended {
+                            idle_ticks = 0;
+                            true
+                        } else {
+                            idle_ticks += 1;
+                            idle_ticks < VIEWER_SETTLE_TICKS
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Toggle play/pause on the viewer's currently open video.
+    pub fn toggle_video_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pb) = self.video_playback.as_mut() else {
+            return;
+        };
+        let Some(player) = pb.player.as_ref() else {
+            return;
+        };
+        player.toggle_play();
+        if let Some(frame) = crate::media::copy_player_surface(player) {
+            pb.last_frame = Some(frame);
+        }
+        let gen_id = pb.generation;
+        self.spawn_video_tick_loop(gen_id, window, cx);
+        cx.notify();
+    }
+
+    /// Toggle mute/unmute on the viewer's currently open video.
+    pub fn toggle_video_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self
+            .video_playback
+            .as_ref()
+            .and_then(|pb| pb.player.as_ref())
+        else {
+            return;
+        };
+        let muted = !player.state().muted;
+        player.set_muted(muted);
+        cx.notify();
+    }
+
+    /// Seek the viewer's currently open video to `secs`.
+    pub fn seek_video(&mut self, secs: f64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pb) = self.video_playback.as_mut() else {
+            return;
+        };
+        let Some(player) = pb.player.as_ref() else {
+            return;
+        };
+        let duration = crate::media::sanitize_secs(player.state().duration_secs);
+        let target = if duration > 0.0 {
+            crate::media::sanitize_secs(secs).min(duration)
+        } else {
+            crate::media::sanitize_secs(secs)
+        };
+        player.seek(target);
+        if let Some(frame) = crate::media::copy_player_surface(player) {
+            pb.last_frame = Some(frame);
+        }
+        let gen_id = pb.generation;
+        self.spawn_video_tick_loop(gen_id, window, cx);
+        cx.notify();
+    }
+
+    /// Step prev (-1) / next (+1) through the conversation's images/videos; each item starts
     /// fitted again, like Slack's viewer.
     pub fn step(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
         let next = self.index as isize + direction;
@@ -404,6 +694,8 @@ impl ImageViewer {
         }
         self.index = next as usize;
         self.zoom_to(FIT_INDEX, window, cx);
+        self.sync_current_media(window, cx);
+        cx.notify();
     }
 
     /// Zoom to the step at `zoom_ix` (the slider drags set it directly), moving the
@@ -420,14 +712,20 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// Step zoom in (`+1`) or out (`-1`) through `ZOOM_STEPS`.
+    /// Step zoom in (`+1`) or out (`-1`) through `ZOOM_STEPS` (no-op while showing a video).
     pub fn zoom_step(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_video() {
+            return;
+        }
         let next = (self.zoom_ix as isize + direction).clamp(0, ZOOM_STEPS.len() as isize - 1);
         self.zoom_to(next as usize, window, cx);
     }
 
-    /// Reset zoom back to fit (`100%`).
+    /// Reset zoom back to fit (`100%`; no-op while showing a video).
     pub fn reset_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_video() {
+            return;
+        }
         self.zoom_to(FIT_INDEX, window, cx);
     }
 
@@ -566,6 +864,314 @@ impl Render for ImageViewer {
                     ),
             );
 
+        let is_video = image.video.is_some();
+        let (
+            vid_loading,
+            vid_playing,
+            vid_muted,
+            vid_ended,
+            vid_pos,
+            vid_dur,
+            vid_surface,
+            vid_err,
+        ) = if is_video {
+            if let Some(pb) = self.video_playback.as_ref() {
+                if let Some(player) = pb.player.as_ref() {
+                    let st = player.state();
+                    let surface =
+                        crate::media::copy_player_surface(player).or_else(|| pb.last_frame.clone());
+                    let dur = crate::media::sanitize_secs(st.duration_secs);
+                    let effective_dur = if dur > 0.0 {
+                        dur
+                    } else {
+                        pb.fallback_duration_secs
+                    };
+                    (
+                        pb.loading,
+                        st.playing,
+                        st.muted,
+                        st.ended,
+                        crate::media::sanitize_secs(st.position_secs),
+                        effective_dur,
+                        surface,
+                        pb.error.clone(),
+                    )
+                } else {
+                    (
+                        pb.loading,
+                        false,
+                        false,
+                        false,
+                        0.0,
+                        pb.fallback_duration_secs,
+                        pb.last_frame.clone(),
+                        pb.error.clone(),
+                    )
+                }
+            } else {
+                (false, false, false, false, 0.0, 0.0, None, None)
+            }
+        } else {
+            (false, false, false, false, 0.0, 0.0, None, None)
+        };
+
+        let stage_content = if is_video {
+            let poster = poster_source_if_present(&image.source);
+            let fg = theme::media_overlay_foreground();
+            let overlay = if vid_loading {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(theme::media_overlay_scrim_strong())
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child("Loading video\u{2026}"),
+                        ),
+                )
+            } else if let Some(err) = vid_err.clone() {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .rounded_lg()
+                                .bg(theme::media_overlay_scrim_strong())
+                                .border_1()
+                                .border_color(chrome.border)
+                                .text_xs()
+                                .text_color(fg)
+                                .child(err),
+                        ),
+                )
+            } else if !vid_playing || vid_ended {
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .size(px(56.))
+                                .rounded_full()
+                                .bg(theme::media_overlay_scrim())
+                                .border_1()
+                                .border_color(theme::media_overlay_border())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::Play).size(px(26.)).text_color(fg)),
+                        ),
+                )
+            } else {
+                None
+            };
+            div()
+                .id("viewer-video-stage")
+                .relative()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .on_click(cx.listener(|viewer, _, window, cx| {
+                    viewer.toggle_video_play(window, cx);
+                }))
+                .child(crate::media::render_video_surface(
+                    vid_surface,
+                    poster,
+                    px(8.),
+                ))
+                .children(overlay)
+                .into_any_element()
+        } else {
+            div()
+                .w(relative(zoom))
+                .h(relative(zoom))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    crate::media::Picture::new(image.source.clone())
+                        .fit(ObjectFit::Contain)
+                        .radius(px(8.)),
+                )
+                .into_any_element()
+        };
+
+        let bottom_left_controls = if is_video {
+            let progress = crate::media::progress_fraction(vid_pos, vid_dur);
+            let time_readout = if vid_dur > 0.0 {
+                format!(
+                    "{} / {}",
+                    crate::media::format_video_time(vid_pos),
+                    crate::media::format_video_time(vid_dur)
+                )
+            } else {
+                crate::media::format_video_time(vid_pos)
+            };
+            let weak = cx.weak_entity();
+            let scrub = crate::media::video_scrub_bar(
+                SharedString::from("viewer-video-scrub"),
+                progress,
+                vid_dur,
+                chrome.border,
+                chrome.text,
+                move |secs, window, cx| {
+                    let _ = weak.update(cx, |viewer, cx| {
+                        viewer.seek_video(secs, window, cx);
+                    });
+                },
+            );
+            h_flex()
+                .items_center()
+                .gap_2()
+                .px_2p5()
+                .h(px(CONTROL_BUTTON))
+                .w(px(420.))
+                .rounded_lg()
+                .bg(chrome.glass)
+                .border_1()
+                .border_color(chrome.border)
+                .child(
+                    div()
+                        .id("viewer-video-play")
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(move |b| b.bg(chrome.button_hover))
+                        .child(
+                            Icon::new(if vid_playing {
+                                IconName::Pause
+                            } else {
+                                IconName::Play
+                            })
+                            .text_color(chrome.text)
+                            .size(px(15.)),
+                        )
+                        .on_click(cx.listener(|viewer, _, window, cx| {
+                            viewer.toggle_video_play(window, cx);
+                        })),
+                )
+                .child(scrub)
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(chrome.text_muted)
+                        .child(time_readout),
+                )
+                .child(
+                    div()
+                        .id("viewer-video-mute")
+                        .flex_none()
+                        .size(px(28.))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(move |b| b.bg(chrome.button_hover))
+                        .child(
+                            Icon::new(if vid_muted {
+                                IconName::VolumeX
+                            } else {
+                                IconName::Volume2
+                            })
+                            .text_color(chrome.text)
+                            .size(px(15.)),
+                        )
+                        .on_click(cx.listener(|viewer, _, _, cx| {
+                            viewer.toggle_video_mute(cx);
+                        })),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .items_center()
+                .child(
+                    div()
+                        .id("viewer-zoom-out")
+                        .flex_none()
+                        .size(px(CONTROL_BUTTON))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .when(zoom_out_enabled, |button| {
+                            button.hover(move |button| button.bg(chrome.button))
+                        })
+                        .child(
+                            Icon::new(IconName::Minus)
+                                .text_color(if zoom_out_enabled {
+                                    chrome.text_muted
+                                } else {
+                                    chrome.text_dim
+                                })
+                                .size(px(16.)),
+                        )
+                        .on_click(cx.listener(|viewer, _, window, cx| {
+                            viewer.zoom_step(-1, window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .w(px(SLIDER_WIDTH))
+                        .mx_1()
+                        .child(Slider::new(&self.slider)),
+                )
+                .child(
+                    div()
+                        .id("viewer-zoom-in")
+                        .flex_none()
+                        .size(px(CONTROL_BUTTON))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .when(zoom_in_enabled, |button| {
+                            button.hover(move |button| button.bg(chrome.button))
+                        })
+                        .child(
+                            Icon::new(IconName::Plus)
+                                .text_color(if zoom_in_enabled {
+                                    chrome.text_muted
+                                } else {
+                                    chrome.text_dim
+                                })
+                                .size(px(16.)),
+                        )
+                        .on_click(cx.listener(|viewer, _, window, cx| {
+                            viewer.zoom_step(1, window, cx);
+                        })),
+                )
+                .into_any_element()
+        };
+
         div()
             .id("image-viewer")
             .occlude()
@@ -628,19 +1234,7 @@ impl Render for ImageViewer {
                     .px(px(ARROW_GUTTER))
                     .py(px(8.))
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .w(relative(zoom))
-                            .h(relative(zoom))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                crate::media::Picture::new(image.source.clone())
-                                    .fit(ObjectFit::Contain)
-                                    .radius(px(8.)),
-                            ),
-                    )
+                    .child(stage_content)
                     .when(multiple, |body| {
                         body.child(
                             div()
@@ -681,7 +1275,7 @@ impl Render for ImageViewer {
                         )
                     }),
             )
-            // Controls: zoom out / slider / zoom in bottom-left, Download bottom-right.
+            // Controls: zoom slider (images) or video transport bar (videos) bottom-left, Download bottom-right.
             .child(
                 h_flex()
                     .items_center()
@@ -690,68 +1284,7 @@ impl Render for ImageViewer {
                     .px(px(12.))
                     .pb(px(12.))
                     .pt(px(4.))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .id("viewer-zoom-out")
-                                    .flex_none()
-                                    .size(px(CONTROL_BUTTON))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .when(zoom_out_enabled, |button| {
-                                        button.hover(move |button| button.bg(chrome.button))
-                                    })
-                                    .child(
-                                        Icon::new(IconName::Minus)
-                                            .text_color(if zoom_out_enabled {
-                                                chrome.text_muted
-                                            } else {
-                                                chrome.text_dim
-                                            })
-                                            .size(px(16.)),
-                                    )
-                                    .on_click(cx.listener(|viewer, _, window, cx| {
-                                        viewer.zoom_step(-1, window, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .w(px(SLIDER_WIDTH))
-                                    .mx_1()
-                                    .child(Slider::new(&self.slider)),
-                            )
-                            .child(
-                                div()
-                                    .id("viewer-zoom-in")
-                                    .flex_none()
-                                    .size(px(CONTROL_BUTTON))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .when(zoom_in_enabled, |button| {
-                                        button.hover(move |button| button.bg(chrome.button))
-                                    })
-                                    .child(
-                                        Icon::new(IconName::Plus)
-                                            .text_color(if zoom_in_enabled {
-                                                chrome.text_muted
-                                            } else {
-                                                chrome.text_dim
-                                            })
-                                            .size(px(16.)),
-                                    )
-                                    .on_click(cx.listener(|viewer, _, window, cx| {
-                                        viewer.zoom_step(1, window, cx);
-                                    })),
-                            ),
-                    )
+                    .child(bottom_left_controls)
                     .child(match image.download.clone() {
                         Some((url, name)) => {
                             Self::tile_button("viewer-download", IconName::Download, chrome)
@@ -781,5 +1314,196 @@ impl Render for ImageViewer {
                         }
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockkit::serde_json::json;
+    use slackless_core::types::{File, FileId, Ts};
+
+    #[test]
+    fn message_images_collects_videos_alongside_images_in_order() {
+        let fixtures = crate::fixtures::load();
+        let mut video_file = File {
+            id: FileId::from("F_VID1"),
+            name: Some("demo.mp4".into()),
+            mimetype: Some("video/mp4".into()),
+            filetype: Some("mp4".into()),
+            thumb_480: Some("https://files.slack.com/tmb/demo_480.jpg".into()),
+            url_private: Some("https://files.slack.com/pri/demo.mp4".into()),
+            url_private_download: Some("https://files.slack.com/dl/demo.mp4".into()),
+            user: Some(UserId::from("U_ALICE")),
+            timestamp: Some(1_700_000_123),
+            ..Default::default()
+        };
+        video_file.extra.insert("duration_ms".into(), json!(18_500));
+        video_file.extra.insert(
+            "mp4".into(),
+            json!("https://files.slack.com/stream/demo.mp4"),
+        );
+
+        let image_file = File {
+            id: FileId::from("F_IMG1"),
+            name: Some("shot.png".into()),
+            mimetype: Some("image/png".into()),
+            url_private: Some("https://files.slack.com/pri/shot.png".into()),
+            ..Default::default()
+        };
+
+        let video_no_poster = File {
+            id: FileId::from("F_VID2"),
+            name: Some("clip.mov".into()),
+            filetype: Some("mov".into()),
+            thumb_video: Some("https://files.slack.com/tmb/clip.mp4".into()),
+            url_private: Some("https://files.slack.com/pri/clip.mov".into()),
+            ..Default::default()
+        };
+
+        let video_no_url = File {
+            id: FileId::from("F_VID_EMPTY"),
+            name: Some("broken.mp4".into()),
+            mimetype: Some("video/mp4".into()),
+            ..Default::default()
+        };
+
+        let msg = Message {
+            ts: Ts::from("1700000000.000100"),
+            user: Some(UserId::from("U_BOB")),
+            files: vec![image_file, video_file, video_no_poster, video_no_url],
+            ..Default::default()
+        };
+
+        let entries = message_images(&fixtures, &msg);
+        assert_eq!(entries.len(), 3, "video without playback URL is skipped");
+
+        assert_eq!(entries[0].origin, ImageOrigin::File(0));
+        assert!(entries[0].image.video.is_none());
+        assert_eq!(entries[0].image.name, "shot.png");
+
+        assert_eq!(entries[1].origin, ImageOrigin::File(1));
+        assert_eq!(entries[1].image.name, "demo.mp4");
+        assert_eq!(entries[1].image.user, Some(UserId::from("U_ALICE")));
+        assert_eq!(entries[1].image.taken_at, Some(1_700_000_123));
+        assert_eq!(
+            entries[1].image.download,
+            Some((
+                "https://files.slack.com/dl/demo.mp4".to_owned(),
+                "demo.mp4".to_owned()
+            ))
+        );
+        assert!(poster_source_if_present(&entries[1].image.source).is_some());
+        assert_eq!(
+            entries[1].image.video,
+            Some(ViewerVideo {
+                file_id: "F_VID1".to_owned(),
+                url: "https://files.slack.com/stream/demo.mp4".to_owned(),
+                ext: "mp4".to_owned(),
+                duration_ms: Some(18_500),
+            })
+        );
+
+        assert_eq!(entries[2].origin, ImageOrigin::File(2));
+        assert!(
+            poster_source_if_present(&entries[2].image.source).is_none(),
+            "video with only .mp4 thumb_video uses empty placeholder"
+        );
+        assert_eq!(
+            entries[2].image.video,
+            Some(ViewerVideo {
+                file_id: "F_VID2".to_owned(),
+                url: "https://files.slack.com/pri/clip.mov".to_owned(),
+                ext: "mov".to_owned(),
+                duration_ms: None,
+            })
+        );
+
+        // `collect_viewer_images` resolves the clicked video origin accurately.
+        let (all, ix) = collect_viewer_images(
+            &fixtures,
+            std::iter::once(&msg),
+            &msg.ts,
+            &ImageOrigin::File(1),
+        )
+        .expect("clicked video must be found");
+        assert_eq!(all.len(), 3);
+        assert_eq!(ix, 1);
+        assert_eq!(all[ix].video.as_ref().unwrap().file_id, "F_VID1");
+    }
+
+    #[gpui::test]
+    fn viewer_steps_between_image_and_video_and_cleans_up_on_close(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::init(cx);
+        });
+        let items = Rc::new(vec![
+            ViewerImage {
+                source: empty_placeholder_source(),
+                name: "photo.png".into(),
+                user: None,
+                taken_at: None,
+                download: None,
+                video: None,
+            },
+            ViewerImage {
+                source: empty_placeholder_source(),
+                name: "demo.mp4".into(),
+                user: None,
+                taken_at: None,
+                download: Some((
+                    "https://files.slack.com/dl/demo.mp4".into(),
+                    "demo.mp4".into(),
+                )),
+                video: Some(ViewerVideo {
+                    file_id: "F_DEMO".into(),
+                    url: "https://files.slack.com/pri/demo.mp4".into(),
+                    ext: "mp4".into(),
+                    duration_ms: Some(12_000),
+                }),
+            },
+        ]);
+        let (viewer, cx) = cx.add_window_view(|window, cx| {
+            let entity = ImageViewer::new(
+                Arc::new(crate::fixtures::load()),
+                "#norce".into(),
+                items,
+                0,
+                window,
+                cx,
+            );
+            // Unwrap the created entity into a host view that mounts `ImageViewer`.
+            struct Host(Entity<ImageViewer>);
+            impl Render for Host {
+                fn render(
+                    &mut self,
+                    _window: &mut Window,
+                    _cx: &mut Context<Self>,
+                ) -> impl IntoElement {
+                    self.0.clone()
+                }
+            }
+            Host(entity)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            let iv = viewer.read(cx).0.clone();
+            assert!(!iv.read(cx).is_video());
+            iv.update(cx, |v, cx| v.step(1, window, cx));
+            assert!(iv.read(cx).is_video());
+            assert!(iv.read(cx).video_playback.is_some());
+            let _ = window.draw(cx);
+            // Stepping back to an image stops and clears video playback immediately.
+            iv.update(cx, |v, cx| v.step(-1, window, cx));
+            assert!(!iv.read(cx).is_video());
+            assert!(iv.read(cx).video_playback.is_none());
+            // Stepping onto video then closing via `evict_assets` stops playback immediately.
+            iv.update(cx, |v, cx| v.step(1, window, cx));
+            assert!(iv.read(cx).video_playback.is_some());
+            iv.update(cx, |v, cx| v.evict_assets(window, cx));
+            assert!(iv.read(cx).video_playback.is_none());
+        });
+        cx.run_until_parked();
     }
 }

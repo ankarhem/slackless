@@ -614,7 +614,7 @@ impl App {
             .conversation(&channel)
             .map(|conversation| self.fixtures.conversation_label(conversation))
             .unwrap_or_default();
-        let viewer = ImageViewer::new(self.fixtures.clone(), label, images, index, cx);
+        let viewer = ImageViewer::new(self.fixtures.clone(), label, images, index, window, cx);
         let subscription = cx.subscribe_in(
             &viewer,
             window,

@@ -175,7 +175,14 @@ impl PopoutWindow {
         else {
             return;
         };
-        let viewer = ImageViewer::new(self.fixtures.clone(), self.title.clone(), images, index, cx);
+        let viewer = ImageViewer::new(
+            self.fixtures.clone(),
+            self.title.clone(),
+            images,
+            index,
+            window,
+            cx,
+        );
         self._viewer_sub = Some(cx.subscribe_in(
             &viewer,
             window,
