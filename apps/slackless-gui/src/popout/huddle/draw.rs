@@ -3,37 +3,21 @@
 use super::*;
 
 pub(super) fn current_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    slackless_core::types::time::now_epoch_ms()
 }
 
-/// Compute `(alpha, width_scale, needs_anim_frame)` for a fading huddle draw stroke.
-/// Active strokes stay bright at `1.0`; completed strokes hold for 3.8s then smoothly ease out
-/// over 1.6s at display refresh rate.
-pub(super) fn stroke_fade_curve(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, f32, bool) {
-    const HOLD_MS: f32 = 3_800.0;
-    const FADE_MS: f32 = 1_600.0;
-    let Some(ended_at) = ended_at_ms else {
-        return (1.0, 1.0, false);
-    };
-    let elapsed = now_ms.saturating_sub(ended_at) as f32;
-    if elapsed < HOLD_MS {
-        // Request animation frames once within the last 100ms of hold so the fade starts smoothly.
-        return (1.0, 1.0, elapsed >= HOLD_MS - 100.0);
-    }
-    if elapsed >= HOLD_MS + FADE_MS {
-        return (0.0, 0.72, false);
-    }
-    let t = ((elapsed - HOLD_MS) / FADE_MS).clamp(0.0, 1.0);
-    // Smooth cubic ease-out (`(1 - t)^2` * `(1 + 2t)` complement -> smoothstep).
-    let smooth = 1.0 - t * t * (3.0 - 2.0 * t);
-    let width_scale = 0.72 + 0.28 * smooth;
-    (smooth, width_scale, true)
-}
+pub(super) use crate::huddle_video::{make_catmull_rom_segment, stroke_fade_curve};
 
-pub(super) use crate::huddle_dock::make_catmull_rom_segment;
+/// Layout and visual parameters for painting one smooth cubic Bézier huddle stroke.
+pub(super) struct StrokePaintParams {
+    pub hue: i32,
+    pub alpha: f32,
+    pub width_scale: f32,
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
 
 pub(super) fn build_smooth_circle(cx: f32, cy: f32, radius: f32) -> PathBuilder {
     const N: usize = 16;
@@ -70,19 +54,22 @@ pub(super) fn build_outward_cap(cx: f32, cy: f32, dx: f32, dy: f32, radius: f32)
     pb
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_smooth_stroke(
     window: &mut Window,
     segments: &[slackless_core::huddle::HuddleDrawSegment],
-    hue: i32,
-    alpha: f32,
-    width_scale: f32,
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
+    params: StrokePaintParams,
 ) {
     use gpui_kit::gpui::{PathStyle, StrokeOptions};
+
+    let StrokePaintParams {
+        hue,
+        alpha,
+        width_scale,
+        left,
+        top,
+        width,
+        height,
+    } = params;
 
     if segments.is_empty() {
         return;

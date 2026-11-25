@@ -76,24 +76,28 @@ impl Render for Sidebar {
                 ];
                 for row in [
                     self.nav_row(
-                        "unreads",
-                        IconName::Inbox,
-                        "Unreads",
-                        total.count > 0 && !focus,
-                        self.active_home_page == Some(HomePage::Unreads),
-                        None,
+                        super::home::NavRowArgs {
+                            id: "unreads",
+                            icon: IconName::Inbox,
+                            label: "Unreads",
+                            bold: total.count > 0 && !focus,
+                            active: self.active_home_page == Some(HomePage::Unreads),
+                            trailing: None,
+                        },
                         cx,
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenUnreads))),
                     // Slack bolds Threads while followed threads have unread replies and
                     // counts the ones mentioning you in a red pill.
                     self.nav_row(
-                        "threads",
-                        IconName::MessageSquareText,
-                        "Threads",
-                        self.threads_unread.0 && !focus,
-                        self.active_home_page == Some(HomePage::Threads),
-                        None,
+                        super::home::NavRowArgs {
+                            id: "threads",
+                            icon: IconName::MessageSquareText,
+                            label: "Threads",
+                            bold: self.threads_unread.0 && !focus,
+                            active: self.active_home_page == Some(HomePage::Threads),
+                            trailing: None,
+                        },
                         cx,
                     )
                     .when(self.threads_unread.1 > 0 && !focus, |row| {
@@ -110,12 +114,14 @@ impl Render for Sidebar {
                             }
                         }
                         self.nav_row(
-                            "huddles",
-                            IconName::Headphones,
-                            "Huddles",
-                            false,
-                            self.active_home_page == Some(HomePage::Huddles),
-                            None,
+                            super::home::NavRowArgs {
+                                id: "huddles",
+                                icon: IconName::Headphones,
+                                label: "Huddles",
+                                bold: false,
+                                active: self.active_home_page == Some(HomePage::Huddles),
+                                trailing: None,
+                            },
                             cx,
                         )
                         .when(!active_people.is_empty(), |row| {
@@ -134,32 +140,38 @@ impl Render for Sidebar {
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenHuddles)))
                     },
                     self.nav_row(
-                        "drafts",
-                        IconName::Send,
-                        "Drafts & sent",
-                        false,
-                        self.active_home_page == Some(HomePage::Drafts),
-                        (self.draft_count > 0).then(|| self.draft_count.to_string()),
+                        super::home::NavRowArgs {
+                            id: "drafts",
+                            icon: IconName::Send,
+                            label: "Drafts & sent",
+                            bold: false,
+                            active: self.active_home_page == Some(HomePage::Drafts),
+                            trailing: (self.draft_count > 0).then(|| self.draft_count.to_string()),
+                        },
                         cx,
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenDrafts))),
                     self.nav_row(
-                        "saved",
-                        IconName::Bookmark,
-                        "Saved",
-                        false,
-                        self.active_home_page == Some(HomePage::Saved),
-                        (self.later_count > 0).then(|| self.later_count.to_string()),
+                        super::home::NavRowArgs {
+                            id: "saved",
+                            icon: IconName::Bookmark,
+                            label: "Saved",
+                            bold: false,
+                            active: self.active_home_page == Some(HomePage::Saved),
+                            trailing: (self.later_count > 0).then(|| self.later_count.to_string()),
+                        },
                         cx,
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenLater))),
                     self.nav_row(
-                        "directories",
-                        IconName::BookUser,
-                        "Directories",
-                        false,
-                        self.active_home_page == Some(HomePage::Directories),
-                        None,
+                        super::home::NavRowArgs {
+                            id: "directories",
+                            icon: IconName::BookUser,
+                            label: "Directories",
+                            bold: false,
+                            active: self.active_home_page == Some(HomePage::Directories),
+                            trailing: None,
+                        },
                         cx,
                     )
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenDirectories))),

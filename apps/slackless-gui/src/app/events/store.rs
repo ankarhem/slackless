@@ -56,6 +56,55 @@ impl App {
         });
     }
 
+    /// Push `fixtures` to every mounted view (shared by both `apply_snapshot` and
+    /// `switch_workspace` so no view—including Activity, Unreads, Huddles, Directory, Compose,
+    /// Details, or HuddleDock—ever retains stale workspace data).
+    pub(in crate::app) fn sync_all_views_fixtures(
+        &mut self,
+        fixtures: Arc<Fixtures>,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.messages
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.thread
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.results
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.browser
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.profile
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.switcher
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.search_menu
+            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
+        self.composer
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.threads
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.unreads
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.huddles
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.directory
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.compose
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.details
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.activity
+            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.files_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
+        self.tools_page
+            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
+        if let Some(dock) = &self.huddle_dock {
+            dock.update(cx, |dock, cx| dock.set_fixtures(fixtures, cx));
+        }
+    }
+
     /// Fast in-memory update pushing `self.ws.counts` (and updated per-conversation `last_read`
     /// cursors) into `self.fixtures` and the views that read unread state, without touching SQLite
     /// or requiring `&mut Window`.
@@ -64,24 +113,10 @@ impl App {
             return;
         }
         let fixtures = Arc::new(self.fixtures.with_counts(self.ws.counts.clone()));
-        self.sidebar
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.messages
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.unreads
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.switcher
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.search_menu
-            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
-        self.thread
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.threads
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.details
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
+        self.sync_all_views_fixtures(fixtures.clone(), cx);
         self.fixtures = fixtures;
-        if self.unreads_open {
+        self.sync_badge(cx);
+        if self.page == MainPage::Unreads {
             self.refresh_unreads(cx);
         }
         cx.notify();
@@ -143,40 +178,7 @@ impl App {
     ) {
         // Refresh the views in place, as Slack does: a status change or a new channel keeps
         // every scroll position, collapsed section and open panel.
-        self.sidebar
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.messages
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.thread
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.results
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.browser
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.profile
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.switcher
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.search_menu
-            .update(cx, |menu, cx| menu.set_fixtures(fixtures.clone(), cx));
-        self.composer
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.threads
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.unreads
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.huddles
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.directory
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.compose
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.details
-            .update(cx, |view, cx| view.set_fixtures(fixtures.clone(), cx));
-        self.files_page
-            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
-        self.tools_page
-            .update(cx, |page, cx| page.set_fixtures(fixtures.clone(), cx));
+        self.sync_all_views_fixtures(fixtures.clone(), cx);
         let keep = self.ws.chosen && fixtures.conversation(&self.channel).is_some();
         self.fixtures = fixtures;
         // Hydrate custom status from Slack's live self profile (preserving active focus mode).
@@ -195,11 +197,12 @@ impl App {
         }
         self.sync_composer_placeholder(cx);
         self.apply_preferences(window, cx);
-        if self.unreads_open {
+        if self.page == MainPage::Unreads {
             self.refresh_unreads(cx);
         }
         // Conversation names may have arrived: the History menu shows them.
         self.update_menus(cx);
+        self.sync_window_title_in(window);
         cx.notify();
     }
 
@@ -411,7 +414,7 @@ impl App {
                     app.thread.update(cx, |panel, cx| {
                         panel.set_thread(channel.clone(), thread_ts.clone(), messages, cx)
                     });
-                    if app.thread_open {
+                    if app.right_pane.is_thread() {
                         let settings = app.preferences.read(cx).settings().clone();
                         let allow_mark = settings.mark_read != 2
                             && (!settings.no_bg_mark_read || app.window_active);

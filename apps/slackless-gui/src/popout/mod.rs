@@ -31,7 +31,7 @@ use slackless_core::api::MessageContent;
 use slackless_core::types::{ChannelId, Message, TeamId, Ts};
 use slackless_core::{Command, SharedStore};
 
-use crate::actions::{self, ActionHandler, ActionSet, MenuOrigin, MessageAction};
+use crate::actions::{self, ActionHandler, ActionSet, MenuOrigin, MessageAction, MessageChange};
 use crate::activity::ActivityFeed;
 use crate::composer::{self, Composer, ComposerEvent};
 use crate::emoji::{EmojiChoice, EmojiPicker, EmojiPickerEvent, PickerTab};
@@ -136,31 +136,28 @@ fn popout_window_options(
     }
 }
 
-/// Open a new native GPUI window showing `kind`, centered (with cascade offset) on `display_id`
-/// (the main window's display) or the primary display if `None`.
-#[allow(clippy::too_many_arguments)]
-pub fn open_popout(
-    kind: PopoutKind,
-    title: String,
-    fixtures: Arc<Fixtures>,
-    store: Option<SharedStore>,
-    team: Option<TeamId>,
-    send: CommandForward,
-    later_sync: Option<(WeakEntity<LaterView>, usize)>,
-    display_id: Option<DisplayId>,
-    cx: &mut App,
-) {
+/// Parameters for opening a popped-out secondary GPUI window.
+pub struct PopoutRequest {
+    pub kind: PopoutKind,
+    pub title: String,
+    pub fixtures: Arc<Fixtures>,
+    pub store: Option<SharedStore>,
+    pub team: Option<TeamId>,
+    pub send: CommandForward,
+    pub later_sync: Option<(WeakEntity<LaterView>, usize)>,
+    pub display_id: Option<DisplayId>,
+}
+
+/// Open a new native GPUI window showing `req.kind`, centered (with cascade offset) on
+/// `req.display_id` (the main window's display) or the primary display if `None`.
+pub fn open_popout(req: PopoutRequest, cx: &mut App) {
     let slot = CASCADE_STEP.fetch_add(1, Ordering::Relaxed);
-    let is_huddle = matches!(kind, PopoutKind::Huddle { .. });
-    let options = popout_window_options(&title, is_huddle, display_id, slot, cx);
+    let is_huddle = matches!(req.kind, PopoutKind::Huddle { .. });
+    let options = popout_window_options(&req.title, is_huddle, req.display_id, slot, cx);
     let _ = open_window(options, cx, move |window, cx| {
-        window.set_window_title(&format!("{title} — slackless"));
+        window.set_window_title(&format!("{} — slackless", req.title));
         window.activate_window();
-        cx.new(|cx| {
-            PopoutWindow::new(
-                kind, title, fixtures, store, team, send, later_sync, window, cx,
-            )
-        })
+        cx.new(|cx| PopoutWindow::new(req, window, cx))
     });
 }
 
@@ -175,6 +172,19 @@ enum HuddleDrawer {
     Thread,
     Notes,
     Diagnostics,
+}
+
+/// Active popover or modal inside the Pop-out Huddle Window (mutually exclusive).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HuddlePopover {
+    Invite,
+    Devices,
+    Camera,
+    Share,
+    Reactions,
+    Theme,
+    More,
+    Music,
 }
 
 /// Active tab inside the Screen Sharing picker modal (`Share entire screen` vs `Window`).
@@ -201,17 +211,11 @@ pub struct PopoutWindow {
     huddle_video: Option<WeakEntity<crate::huddle_dock::HuddleVideoStore>>,
     _huddle_popout_guard: Option<crate::huddle_dock::HuddlePopoutGuard>,
     last_store_revision: u64,
-    huddle_invite_open: bool,
-    huddle_devices_open: bool,
-    huddle_camera_open: bool,
-    huddle_share_open: bool,
+    reload_gen: u64,
+    huddle_popover: Option<HuddlePopover>,
     huddle_share_tab: HuddleShareTab,
     huddle_share_selected: Option<String>,
     huddle_share_audio: bool,
-    huddle_reactions_open: bool,
-    huddle_theme_open: bool,
-    huddle_more_open: bool,
-    huddle_music_open: bool,
     huddle_stage_expanded: bool,
     huddle_draw_mode: bool,
     huddle_draw_hue: i32,
@@ -225,14 +229,18 @@ pub struct PopoutWindow {
     huddle_topic_editing: Option<Entity<TextareaState>>,
     huddle_drawer: Option<HuddleDrawer>,
     huddle_thread_fetched: Option<Ts>,
+    huddle_thread_root_cache: Option<Ts>,
+    huddle_thread_store_msgs: Vec<Message>,
     huddle_thread_local: Vec<Message>,
     huddle_devices: slackless_core::huddle::AudioDevices,
     huddle_cameras: Vec<slackless_core::huddle::CameraDeviceInfo>,
     huddle_selected_camera: Option<usize>,
     huddle_screens: Vec<slackless_core::huddle::ScreenSource>,
     huddle_screen_thumbs: std::collections::HashMap<String, Arc<gpui_kit::gpui::RenderImage>>,
-    composer: Entity<Composer>,
-    emoji_picker: Entity<EmojiPicker>,
+    /// Allocated only for interactive popouts (`Conversation`, `Thread`, `Huddle`).
+    composer: Option<Entity<Composer>>,
+    /// Allocated only for interactive popouts (`Conversation`, `Thread`, `Huddle`).
+    emoji_picker: Option<Entity<EmojiPicker>>,
     picker: Option<(PopoutPickerTarget, Point<Pixels>)>,
     editing: Option<(ChannelId, Ts, Entity<TextareaState>)>,
     scroll: ScrollHandle,
@@ -242,66 +250,67 @@ pub struct PopoutWindow {
 }
 
 impl PopoutWindow {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        kind: PopoutKind,
-        title: String,
-        fixtures: Arc<Fixtures>,
-        store: Option<SharedStore>,
-        team: Option<TeamId>,
-        send: CommandForward,
-        later_sync: Option<(WeakEntity<LaterView>, usize)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let placeholder = match &kind {
-            PopoutKind::Conversation { .. } => format!("Message {title}"),
-            PopoutKind::Thread { .. } => "Reply in thread…".to_owned(),
-            PopoutKind::Huddle { .. } => "Reply…".to_owned(),
-            PopoutKind::Activity { .. }
-            | PopoutKind::Later { .. }
-            | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. } => String::new(),
-        };
+    fn new(req: PopoutRequest, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let PopoutRequest {
+            kind,
+            title,
+            fixtures,
+            store,
+            team,
+            send,
+            later_sync,
+            display_id: _,
+        } = req;
         let has_composer = matches!(
             &kind,
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
         );
         let is_huddle = matches!(&kind, PopoutKind::Huddle { .. });
-        let composer = Composer::new(placeholder.into(), fixtures.clone(), window, cx);
-        let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
-        let initial = load_messages(&kind, &fixtures, store.as_ref(), team.as_ref());
-        let mut subscriptions = vec![
-            cx.subscribe_in(
+        let interactive = has_composer || is_huddle;
+        let mut subscriptions = Vec::new();
+        let (composer, emoji_picker) = if interactive {
+            let placeholder = match &kind {
+                PopoutKind::Conversation { .. } => format!("Message {title}"),
+                PopoutKind::Thread { .. } => "Reply in thread…".to_owned(),
+                PopoutKind::Huddle { .. } => "Reply…".to_owned(),
+                _ => String::new(),
+            };
+            let composer = Composer::new(placeholder.into(), fixtures.clone(), window, cx);
+            let emoji_picker = EmojiPicker::new(fixtures.clone(), window, cx);
+            subscriptions.push(cx.subscribe_in(
                 &composer,
                 window,
-                |this: &mut Self, _, event: &ComposerEvent, window, cx| match event {
-                    ComposerEvent::Submit(content) => this.send_content(content.clone(), cx),
-                    ComposerEvent::SubmitWithFiles { content, files } => {
-                        this.send_files(content.clone(), files.clone(), cx);
-                    }
-                    ComposerEvent::OpenEmojiPicker(pos) => {
-                        this.open_picker(PopoutPickerTarget::Composer, *pos, window, cx);
-                    }
-                    ComposerEvent::EditLast => {
-                        if let Some(ch) = match &this.kind {
-                            PopoutKind::Conversation { channel, .. }
-                            | PopoutKind::Thread { channel, .. } => Some(channel.clone()),
-                            _ => None,
-                        } && let Some(last_own) = this
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|m| m.user.as_ref() == Some(&this.fixtures.self_user))
-                            .cloned()
-                        {
-                            this.start_edit(ch, &last_own, window, cx);
+                |this: &mut Self, _, event: &ComposerEvent, window, cx| {
+                    match event {
+                        ComposerEvent::Submit(content) => {
+                            this.send_content_guarded(content.clone(), Some(window), cx);
                         }
+                        ComposerEvent::SubmitWithFiles { content, files } => {
+                            this.send_files(content.clone(), files.clone(), Some(window), cx);
+                        }
+                        ComposerEvent::OpenEmojiPicker(pos) => {
+                            this.open_picker(PopoutPickerTarget::Composer, *pos, window, cx);
+                        }
+                        ComposerEvent::EditLast => {
+                            if let Some(ch) = match &this.kind {
+                                PopoutKind::Conversation { channel, .. }
+                                | PopoutKind::Thread { channel, .. } => Some(channel.clone()),
+                                _ => None,
+                            } && let Some(last_own) = this
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|m| m.user.as_ref() == Some(&this.fixtures.self_user))
+                                .cloned()
+                            {
+                                this.start_edit(ch, &last_own, window, cx);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 },
-            ),
-            cx.subscribe_in(
+            ));
+            subscriptions.push(cx.subscribe_in(
                 &emoji_picker,
                 window,
                 |this: &mut Self, _, event: &EmojiPickerEvent, window, cx| {
@@ -309,8 +318,18 @@ impl PopoutWindow {
                         this.pick_emoji(choice, window, cx);
                     }
                 },
-            ),
-        ];
+            ));
+            (Some(composer), Some(emoji_picker))
+        } else {
+            (None, None)
+        };
+        // Fixture mode loads synchronously from in-memory fixtures; live mode loads asynchronously
+        // off the UI thread below so opening a popout never takes `store.lock()` on the UI thread.
+        let initial = if store.is_none() {
+            load_fixture_messages(&kind, &fixtures)
+        } else {
+            Vec::new()
+        };
         let mut saved = HashSet::new();
         let active_channel = match &kind {
             PopoutKind::Conversation { channel, .. } | PopoutKind::Thread { channel, .. } => {
@@ -389,8 +408,11 @@ impl PopoutWindow {
                 if let Some(dock) = source.upgrade() {
                     let st = dock.read(cx).view_state();
                     let video_store = dock.read(cx).video_store();
-                    let target = also_send_target(&fixtures, &st.session.channel);
-                    composer.update(cx, |c, cx| c.set_also_send(target, cx));
+                    let target =
+                        composer::AlsoSendTarget::for_channel(&fixtures, &st.session.channel);
+                    if let Some(composer) = &composer {
+                        composer.update(cx, |c, cx| c.set_also_send(target, cx));
+                    }
                     huddle_state = Some(st);
                     huddle_popout_guard = Some(video_store.read(cx).register_popout());
                     huddle_video = Some(video_store.downgrade());
@@ -404,13 +426,22 @@ impl PopoutWindow {
                             .as_ref()
                             .map(|s| s.session.channel.clone());
                         if prev_ch.as_ref() != Some(&st.session.channel) {
-                            let target = also_send_target(&this.fixtures, &st.session.channel);
-                            this.composer
-                                .update(cx, |c, cx| c.set_also_send(target, cx));
+                            let target = composer::AlsoSendTarget::for_channel(
+                                &this.fixtures,
+                                &st.session.channel,
+                            );
+                            if let Some(composer) = &this.composer {
+                                composer.update(cx, |c, cx| c.set_also_send(target, cx));
+                            }
                             this.huddle_thread_fetched = None;
+                            this.huddle_thread_root_cache = None;
+                            this.huddle_thread_store_msgs.clear();
                             this.huddle_thread_local.clear();
                         }
                         this.huddle_state = Some(st);
+                        if this.huddle_drawer == Some(HuddleDrawer::Thread) {
+                            this.refresh_huddle_thread_async(cx);
+                        }
                         this.maybe_fetch_huddle_thread();
                         cx.notify();
                     }));
@@ -451,7 +482,7 @@ impl PopoutWindow {
         if !initial.is_empty() {
             scroll.scroll_to_bottom();
         }
-        Self {
+        let mut win = Self {
             kind,
             title,
             fixtures,
@@ -468,17 +499,11 @@ impl PopoutWindow {
             huddle_video,
             _huddle_popout_guard: huddle_popout_guard,
             last_store_revision: slackless_core::store::Store::message_revision(),
-            huddle_invite_open: false,
-            huddle_devices_open: false,
-            huddle_camera_open: false,
-            huddle_share_open: false,
+            reload_gen: 0,
+            huddle_popover: None,
             huddle_share_tab: HuddleShareTab::Screen,
             huddle_share_selected: None,
             huddle_share_audio: false,
-            huddle_reactions_open: false,
-            huddle_theme_open: false,
-            huddle_more_open: false,
-            huddle_music_open: false,
             huddle_stage_expanded: false,
             huddle_draw_mode: false,
             huddle_draw_hue: 0,
@@ -492,6 +517,8 @@ impl PopoutWindow {
             huddle_topic_editing: None,
             huddle_drawer: None,
             huddle_thread_fetched: None,
+            huddle_thread_root_cache: None,
+            huddle_thread_store_msgs: Vec::new(),
             huddle_thread_local: Vec::new(),
             huddle_devices: slackless_core::huddle::AudioDevices::default(),
             huddle_cameras: Vec::new(),
@@ -506,7 +533,11 @@ impl PopoutWindow {
             image_viewer: None,
             _viewer_sub: None,
             _subscriptions: subscriptions,
+        };
+        if win.store.is_some() && has_composer {
+            win.reload_from_store(cx);
         }
+        win
     }
 
     fn open_picker(
@@ -516,7 +547,10 @@ impl PopoutWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.emoji_picker.update(cx, |picker, cx| {
+        let Some(emoji_picker) = &self.emoji_picker else {
+            return;
+        };
+        emoji_picker.update(cx, |picker, cx| {
             picker.open_tab(PickerTab::Emoji, false, window, cx);
         });
         self.picker = Some((target, position));
@@ -529,8 +563,9 @@ impl PopoutWindow {
         };
         match target {
             PopoutPickerTarget::Composer => {
-                self.composer
-                    .update(cx, |c, cx| c.insert_emoji(choice, window, cx));
+                if let Some(composer) = &self.composer {
+                    composer.update(cx, |c, cx| c.insert_emoji(choice, window, cx));
+                }
             }
             PopoutPickerTarget::Message { channel, ts } => {
                 if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts)
@@ -554,7 +589,12 @@ impl PopoutWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let initial = self.fixtures.plain_text(message);
+        // Seed with raw mrkdwn/rich_text source rather than plain_text so formatting & mentions
+        // are never stripped during inline editing.
+        let initial = crate::editor::from_rich_text(&message.blocks, &*self.fixtures)
+            .map(|doc| doc.to_mrkdwn())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| message.text.clone());
         let input = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx)
                 .placeholder("Edit message…")
@@ -641,27 +681,12 @@ impl PopoutWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut images = Vec::new();
-        let mut index = None;
-        for message in &self.messages {
-            for entry in image_viewer::message_images(&self.fixtures, message) {
-                if message.ts == *ts && entry.origin == origin && index.is_none() {
-                    index = Some(images.len());
-                }
-                images.push(entry.image);
-            }
-        }
-        let Some(index) = index else {
+        let Some((images, index)) =
+            image_viewer::collect_viewer_images(&self.fixtures, &self.messages, ts, &origin)
+        else {
             return;
         };
-        #[allow(clippy::arc_with_non_send_sync)]
-        let viewer = ImageViewer::new(
-            self.fixtures.clone(),
-            self.title.clone(),
-            Arc::new(images),
-            index,
-            cx,
-        );
+        let viewer = ImageViewer::new(self.fixtures.clone(), self.title.clone(), images, index, cx);
         self._viewer_sub = Some(cx.subscribe_in(
             &viewer,
             window,
@@ -729,9 +754,7 @@ impl PopoutWindow {
                 actions::copy_link(&self.fixtures, &channel, &ts, window, cx);
             }
             MessageAction::CopyText => {
-                let text = self.fixtures.plain_text(&message);
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                actions::notify("Copied", "Message text copied.", window, cx);
+                actions::copy_message_text(&self.fixtures, &message, window, cx);
             }
             MessageAction::Forward => {
                 let link = actions::permalink(&self.fixtures, &channel, &ts);
@@ -759,16 +782,7 @@ impl PopoutWindow {
                     });
                 }
                 self.sync_later_item(&channel, &message, saved, None, cx);
-                actions::notify(
-                    if saved {
-                        "Saved for later"
-                    } else {
-                        "Removed from Later"
-                    },
-                    String::new(),
-                    window,
-                    cx,
-                );
+                actions::notify_saved_toggled(saved, String::new(), window, cx);
                 cx.notify();
             }
             MessageAction::RemindMe(remind) => {
@@ -785,21 +799,29 @@ impl PopoutWindow {
             }
             MessageAction::RemindCustom => {
                 let this = cx.entity().downgrade();
+                let fixtures = self.fixtures.clone();
                 let msg_clone = message.clone();
-                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
-                    let _ = this.update(cx, |win, cx| {
-                        win.saved.insert(ts.clone());
-                        (win.send)(Command::SaveItem {
-                            channel: channel.clone(),
-                            ts: ts.clone(),
-                            date_due: Some(due),
+                actions::open_custom_remind_for_message(
+                    &fixtures,
+                    channel.clone(),
+                    &message,
+                    window,
+                    cx,
+                    move |request, when, window, cx| {
+                        let _ = this.update(cx, |win, cx| {
+                            let due = request.due;
+                            win.saved.insert(request.ts.clone());
+                            (win.send)(Command::SaveItem {
+                                channel: request.channel.clone(),
+                                ts: request.ts,
+                                date_due: due,
+                            });
+                            win.sync_later_item(&request.channel, &msg_clone, true, due, cx);
+                            actions::notify("Reminder set", when, window, cx);
+                            cx.notify();
                         });
-                        win.sync_later_item(&channel, &msg_clone, true, Some(due), cx);
-                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
-                        actions::notify("Reminder set", when, window, cx);
-                        cx.notify();
-                    });
-                });
+                    },
+                );
             }
             MessageAction::TogglePin => {
                 if let Some(msg) = self.messages.iter_mut().find(|m| m.ts == ts) {
@@ -809,29 +831,20 @@ impl PopoutWindow {
                         ts,
                         pinned,
                     });
-                    actions::notify(
-                        if pinned {
-                            "Pinned to conversation"
-                        } else {
-                            "Unpinned from conversation"
-                        },
-                        String::new(),
-                        window,
-                        cx,
-                    );
+                    actions::notify_pin_toggled(pinned, String::new(), window, cx);
                     cx.notify();
                 }
             }
             MessageAction::MarkUnread => {
+                let cursor = self
+                    .messages
+                    .iter()
+                    .take_while(|m| m.ts < ts)
+                    .last()
+                    .map(|m| m.ts.clone())
+                    .unwrap_or_else(|| crate::threads_cards::ts_just_before(&ts));
                 match &self.kind {
                     PopoutKind::Thread { thread_ts, .. } => {
-                        let cursor = self
-                            .messages
-                            .iter()
-                            .take_while(|m| m.ts < ts)
-                            .last()
-                            .map(|m| m.ts.clone())
-                            .unwrap_or_else(|| crate::threads_cards::ts_just_before(&ts));
                         (self.send)(Command::MarkThreadRead {
                             channel,
                             thread_ts: thread_ts.clone(),
@@ -839,7 +852,10 @@ impl PopoutWindow {
                         });
                     }
                     _ => {
-                        (self.send)(Command::MarkRead { channel, ts });
+                        (self.send)(Command::MarkRead {
+                            channel,
+                            ts: cursor,
+                        });
                     }
                 }
                 actions::notify("Marked unread", String::new(), window, cx);
@@ -873,11 +889,14 @@ impl PopoutWindow {
                 self.open_image_viewer(&ts, origin, window, cx);
             }
             MessageAction::BlockAction { action, attachment } => {
-                if let Some(dispatch) = crate::blockkit::BlockDispatch::new(
+                if let Some(MessageChange::BlockAction(dispatch)) = actions::dispatch_block_action(
+                    !self.fixtures.sample,
                     &message,
                     &channel,
-                    action.clone(),
+                    action,
                     attachment,
+                    window,
+                    cx,
                 ) {
                     (self.send)(Command::BlockAction {
                         bot: dispatch.bot,
@@ -886,8 +905,6 @@ impl PopoutWindow {
                         action: dispatch.action,
                         container: dispatch.container,
                     });
-                } else {
-                    crate::blockkit::log_button(&action, window, cx);
                 }
             }
             MessageAction::DismissEphemeral => {
@@ -940,10 +957,8 @@ impl PopoutWindow {
                 if let Some(dock) = source.upgrade() {
                     self.huddle_state = Some(dock.read(cx).view_state());
                 }
-                if let Some(st) = self.huddle_state.clone() {
-                    self.prune_echoed_huddle_locals(&st.session);
-                }
                 if self.huddle_drawer == Some(HuddleDrawer::Thread) {
+                    self.refresh_huddle_thread_async(cx);
                     self.maybe_fetch_huddle_thread();
                     cx.notify();
                 }
@@ -952,19 +967,63 @@ impl PopoutWindow {
             PopoutKind::Canvas { .. } => return,
             PopoutKind::Conversation { .. } | PopoutKind::Thread { .. } => {}
         }
-        let fresh = load_messages(
-            &self.kind,
-            &self.fixtures,
-            self.store.as_ref(),
-            self.team.as_ref(),
-        );
-        if fresh.len() != self.messages.len()
-            || fresh.last().map(|m| &m.ts) != self.messages.last().map(|m| &m.ts)
-        {
-            self.messages = fresh;
-            self.scroll.scroll_to_bottom();
-            cx.notify();
+        if let (Some(store), Some(team)) = (self.store.clone(), self.team.clone()) {
+            let query = match &self.kind {
+                PopoutKind::Conversation { channel, .. } => (channel.clone(), None),
+                PopoutKind::Thread {
+                    channel, thread_ts, ..
+                } => (channel.clone(), Some(thread_ts.clone())),
+                _ => return,
+            };
+            self.reload_gen = self.reload_gen.wrapping_add(1);
+            let generation = self.reload_gen;
+            cx.spawn(async move |this, cx| {
+                let fresh = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let Ok(guard) = store.lock() else {
+                            return None;
+                        };
+                        let rows = match query.1 {
+                            Some(thread_ts) => guard.thread_replies(&team, &query.0, &thread_ts),
+                            None => guard.channel_history(&team, &query.0, None, 200),
+                        };
+                        rows.ok().map(|list| {
+                            list.into_iter()
+                                .filter(|r| !r.deleted)
+                                .map(|r| r.message)
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .await;
+                if let Some(fresh) = fresh {
+                    let _ = this.update(cx, |win, cx| {
+                        if win.reload_gen != generation {
+                            return;
+                        }
+                        win.apply_refreshed_messages(fresh, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
         }
+        let fresh = load_fixture_messages(&self.kind, &self.fixtures);
+        self.apply_refreshed_messages(fresh, cx);
+    }
+
+    fn apply_refreshed_messages(&mut self, fresh: Vec<Message>, cx: &mut Context<Self>) {
+        // Compare full message equality so remote edits, reactions, and pins always refresh.
+        if fresh == self.messages {
+            return;
+        }
+        let appended = fresh.len() > self.messages.len()
+            || fresh.last().map(|m| &m.ts) != self.messages.last().map(|m| &m.ts);
+        self.messages = fresh;
+        if appended {
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
     }
 
     fn maybe_fetch_huddle_thread(&mut self) {
@@ -987,7 +1046,35 @@ impl PopoutWindow {
         });
     }
 
-    fn send_content(&mut self, content: MessageContent, cx: &mut Context<Self>) {
+    fn send_content_guarded(
+        &mut self,
+        mut content: MessageContent,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        composer::apply_outgoing_transforms(&mut content, &self.fixtures, cx);
+        if let Some(window) = window
+            && composer::outgoing_guard_prefs(cx).warn_before_sending_secrets
+        {
+            let matches = slackless_core::detect_secrets(&content.text);
+            if !matches.is_empty() {
+                let this = cx.entity().downgrade();
+                let pending = content;
+                composer::confirm_secret_send_dialog(matches, window, cx, move |_, cx| {
+                    let _ = this.update(cx, |win, cx| win.deliver_content(pending.clone(), cx));
+                });
+                return;
+            }
+        }
+        self.deliver_content(content, cx);
+    }
+
+    fn send_content(&mut self, mut content: MessageContent, cx: &mut Context<Self>) {
+        composer::apply_outgoing_transforms(&mut content, &self.fixtures, cx);
+        self.deliver_content(content, cx);
+    }
+
+    fn deliver_content(&mut self, content: MessageContent, cx: &mut Context<Self>) {
         if matches!(&self.kind, PopoutKind::Huddle { .. }) {
             let Some(state) = &self.huddle_state else {
                 return;
@@ -996,7 +1083,8 @@ impl PopoutWindow {
             let thread_ts = self.resolve_huddle_thread_root(&state.session);
             let broadcast = self
                 .composer
-                .update(cx, |composer, cx| composer.take_also_send(cx));
+                .as_ref()
+                .is_some_and(|c| c.update(cx, |composer, cx| composer.take_also_send(cx)));
             let mut local =
                 self.fixtures
                     .local_message(&channel, content.text.clone(), thread_ts.clone());
@@ -1041,8 +1129,9 @@ impl PopoutWindow {
 
     fn send_files(
         &mut self,
-        content: Option<MessageContent>,
+        mut content: Option<MessageContent>,
         files: Vec<crate::composer::PendingAttachment>,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let (channel, thread_ts) = match &self.kind {
@@ -1072,9 +1161,12 @@ impl PopoutWindow {
             .collect();
         if uploads.is_empty() {
             if let Some(content) = content {
-                self.send_content(content, cx);
+                self.send_content_guarded(content, window, cx);
             }
             return;
+        }
+        if let Some(ref mut c) = content {
+            composer::apply_outgoing_transforms(c, &self.fixtures, cx);
         }
         (self.send)(Command::UploadFiles {
             channel,
@@ -1086,64 +1178,7 @@ impl PopoutWindow {
     }
 }
 
-fn also_send_target(
-    fixtures: &Fixtures,
-    channel: &ChannelId,
-) -> Option<crate::composer::AlsoSendTarget> {
-    use slackless_core::types::ConversationKind;
-    fixtures
-        .conversation(channel)
-        .map(|conversation| match conversation.kind() {
-            ConversationKind::Im | ConversationKind::Mpim => {
-                crate::composer::AlsoSendTarget::DirectMessage
-            }
-            kind => crate::composer::AlsoSendTarget::Channel {
-                name: conversation.name.clone().unwrap_or_default().into(),
-                private: kind == ConversationKind::PrivateChannel,
-            },
-        })
-}
-
-fn load_messages(
-    kind: &PopoutKind,
-    fixtures: &Fixtures,
-    store: Option<&SharedStore>,
-    team: Option<&TeamId>,
-) -> Vec<Message> {
-    if matches!(
-        kind,
-        PopoutKind::Activity { .. }
-            | PopoutKind::Later { .. }
-            | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. }
-            | PopoutKind::Huddle { .. }
-    ) {
-        return Vec::new();
-    }
-    if let (Some(store), Some(team)) = (store, team)
-        && let Ok(guard) = store.lock()
-    {
-        let rows = match kind {
-            PopoutKind::Conversation { channel, .. } => {
-                guard.channel_history(team, channel, None, 200)
-            }
-            PopoutKind::Thread {
-                channel, thread_ts, ..
-            } => guard.thread_replies(team, channel, thread_ts),
-            PopoutKind::Activity { .. }
-            | PopoutKind::Later { .. }
-            | PopoutKind::Canvas { .. }
-            | PopoutKind::Files { .. }
-            | PopoutKind::Huddle { .. } => Ok(Vec::new()),
-        };
-        if let Ok(rows) = rows {
-            return rows
-                .into_iter()
-                .filter(|r| !r.deleted)
-                .map(|r| r.message)
-                .collect();
-        }
-    }
+fn load_fixture_messages(kind: &PopoutKind, fixtures: &Fixtures) -> Vec<Message> {
     match kind {
         PopoutKind::Conversation { channel, .. } => {
             fixtures.messages.get(channel).cloned().unwrap_or_default()
@@ -1163,103 +1198,81 @@ fn load_messages(
     }
 }
 
-impl Render for PopoutWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let PopoutKind::Huddle {
-            on_jump,
-            on_open_canvas,
-            ..
-        } = &self.kind
-        {
-            // Immediately free replaced Metal sprite-atlas tiles on this owning window.
-            if let Some(vs) = self.huddle_video.as_ref().and_then(WeakEntity::upgrade) {
-                let stale = vs.update(cx, |store, _| store.drain_stale_images());
-                for img in stale {
-                    cx.drop_image(img, Some(window));
-                }
-            }
-            let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);
-            let root = self
-                .render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx)
-                .on_action(|_: &crate::menu_bar::CloseWindow, window, _| {
-                    window.remove_window();
-                });
-            return root
-                .when_some(picker_pos, |root, pos| {
-                    let viewport = window.viewport_size();
-                    let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
-                        (true, true) => Anchor::BottomRight,
-                        (true, false) => Anchor::BottomLeft,
-                        (false, true) => Anchor::TopRight,
-                        (false, false) => Anchor::TopLeft,
-                    };
-                    root.child(
+impl PopoutWindow {
+    fn render_overlays(
+        &self,
+        root: gpui_kit::gpui::Stateful<gpui_kit::gpui::Div>,
+        viewer_top: Pixels,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        let picker_overlay = self
+            .picker
+            .as_ref()
+            .map(|(_, pos)| *pos)
+            .zip(self.emoji_picker.clone());
+        root.when_some(picker_overlay, |root, (pos, emoji_picker)| {
+            let viewport = window.viewport_size();
+            let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
+                (true, true) => Anchor::BottomRight,
+                (true, false) => Anchor::BottomLeft,
+                (false, true) => Anchor::TopRight,
+                (false, false) => Anchor::TopLeft,
+            };
+            root.child(
+                div()
+                    .id("popout-picker-backdrop")
+                    .occlude()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                    .absolute()
+                    .inset_0()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.picker = None;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(deferred(
+                anchored()
+                    .position(pos)
+                    .anchor(anchor)
+                    .snap_to_window_with_margin(Edges::all(px(8.)))
+                    .child(
                         div()
-                            .id("popout-picker-backdrop")
+                            .id("popout-picker-overlay")
                             .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_scroll(|_, _, cx| cx.stop_propagation())
-                            .absolute()
-                            .inset_0()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.picker = None;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(deferred(
-                        anchored()
-                            .position(pos)
-                            .anchor(anchor)
-                            .snap_to_window_with_margin(Edges::all(px(8.)))
-                            .child(
-                                div()
-                                    .id("popout-picker-overlay")
-                                    .occlude()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
-                                    })
-                                    .on_scroll(|_, _, cx| cx.stop_propagation())
-                                    .child(self.emoji_picker.clone()),
-                            ),
-                    ))
-                })
-                .when_some(self.image_viewer.clone(), |root, viewer| {
-                    root.child(
-                        div()
-                            .id("popout-image-viewer-overlay")
-                            .occlude()
-                            .on_scroll(|_, _, cx| cx.stop_propagation())
-                            .absolute()
-                            .top(px(38.))
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .child(viewer),
-                    )
-                })
-                .into_any_element();
-        }
+                            .child(emoji_picker),
+                    ),
+            ))
+        })
+        .when_some(self.image_viewer.clone(), |root, viewer| {
+            root.child(
+                div()
+                    .id("popout-image-viewer-overlay")
+                    .occlude()
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
+                    .absolute()
+                    .top(viewer_top)
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(viewer),
+            )
+        })
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let (bg, border, muted, fg, accent, hover_bg, saved_bg) = (
+        let (bg, border, muted, fg) = (
             theme.background,
             theme.border,
             theme.muted_foreground,
             theme.foreground,
-            theme.accent,
-            theme.secondary.opacity(0.5),
-            theme.warning.opacity(0.08),
         );
-        let jump_for_links = self.jump_handler();
-        let links: LinkHandler = Rc::new(move |target, _, cx| match target {
-            LinkTarget::Url(url) => cx.open_url(url.as_ref()),
-            LinkTarget::Channel(channel) => jump_for_links(channel.clone(), None, false, cx),
-            LinkTarget::Thread { channel, thread_ts } => {
-                jump_for_links(channel.clone(), Some(thread_ts.clone()), true, cx)
-            }
-            LinkTarget::Profile(_) => {}
-        });
         let kind_label = match &self.kind {
             PopoutKind::Conversation { .. } => "Conversation",
             PopoutKind::Thread { .. } => "Thread",
@@ -1269,11 +1282,7 @@ impl Render for PopoutWindow {
             PopoutKind::Files { .. } => "Files · Live",
             PopoutKind::Huddle { .. } => "Huddle · Live",
         };
-        let has_composer = matches!(
-            &self.kind,
-            PopoutKind::Conversation { .. } | PopoutKind::Thread { .. }
-        );
-        let header = TitleBar::new()
+        TitleBar::new()
             .h(px(40.))
             .bg(bg)
             .border_b_1()
@@ -1314,619 +1323,685 @@ impl Render for PopoutWindow {
                             .tooltip("Refresh")
                             .on_click(cx.listener(|this, _, _, cx| this.reload_from_store(cx))),
                     ),
+            )
+    }
+
+    fn render_messages_body(
+        &self,
+        channel: ChannelId,
+        on_jump: JumpHandler,
+        is_conversation: bool,
+        links: &LinkHandler,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        let theme = cx.theme();
+        let (bg, hover_bg, saved_bg) = (
+            theme.background,
+            theme.secondary.opacity(0.5),
+            theme.warning.opacity(0.08),
+        );
+        let view = cx.entity();
+        let mut rows: Vec<gpui_kit::gpui::AnyElement> = Vec::with_capacity(self.messages.len());
+        let mut prev_msg: Option<&Message> = None;
+        let editing = self.editing.clone();
+        for (ix, msg) in self.messages.iter().enumerate() {
+            if let Some((_, edit_ts, edit_input)) = &editing
+                && *edit_ts == msg.ts
+            {
+                let edit_row = v_flex()
+                    .id(SharedString::from(format!("popout-edit-{ix}")))
+                    .mx_4()
+                    .my_1()
+                    .p_2p5()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().ring)
+                    .bg(bg)
+                    .child(Textarea::new(edit_input).appearance(false).bordered(false))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("popout-edit-cancel")
+                                    .outline()
+                                    .with_size(Size::XSmall)
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.editing = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("popout-edit-save")
+                                    .primary()
+                                    .with_size(Size::XSmall)
+                                    .label("Save Changes")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_edit(cx);
+                                    })),
+                            ),
+                    );
+                rows.push(edit_row.into_any_element());
+                prev_msg = None;
+                continue;
+            }
+            let msg_group = SharedString::from(format!("popout-msg-{ix}"));
+            let key = format!("popout-row-{}", msg.ts.as_str());
+            let grouped = prev_msg
+                .filter(|prev| same_group(prev, msg))
+                .map(|_| msg_group.clone());
+            let is_saved = self.saved.contains(&msg.ts);
+            let view_for_action = view.clone();
+            let ch_for_action = channel.clone();
+            let msg_for_action = msg.clone();
+            let handler: ActionHandler = Rc::new(move |action, window, cx| {
+                let ch = ch_for_action.clone();
+                let m = msg_for_action.clone();
+                view_for_action.update(cx, |this, cx| {
+                    this.handle_message_action(ch, m, action, window, cx);
+                });
+            });
+            let set = ActionSet {
+                own: msg.user.as_ref() == Some(&self.fixtures.self_user),
+                reply: is_conversation,
+                saved: is_saved,
+                pinned: msg.pinned_to.contains(&channel),
+                in_thread: !is_conversation
+                    && matches!(&self.kind, PopoutKind::Thread { thread_ts, .. } if msg.ts != *thread_ts),
+            };
+            let mut display = msg.clone();
+            let reactions = std::mem::take(&mut display.reactions);
+            let chips =
+                actions::reaction_chips(&key, &reactions, &self.fixtures, Some(&handler), cx)
+                    .map(|c| c.pl(px(48.)));
+            let row_body = message_row_linked(
+                &self.fixtures,
+                &display,
+                Some(&handler),
+                Some(links),
+                grouped,
+                cx,
             );
+            let reply_bar_el = if is_conversation {
+                let jump = on_jump.clone();
+                let ch = channel.clone();
+                let ts = msg.ts.clone();
+                let reply_group = SharedString::from(format!("popout-reply-{ix}"));
+                reply_bar(
+                    &self.fixtures,
+                    msg,
+                    ("popout-thread-chip", ix),
+                    msg_group.clone(),
+                    reply_group,
+                    move |_, cx| jump(ch.clone(), Some(ts.clone()), true, cx),
+                    cx,
+                )
+                .map(|bar| div().pl(px(48.)).child(bar))
+            } else {
+                None
+            };
+            let quick =
+                crate::preferences::active_quick_reactions(&self.fixtures.quick_reactions, cx);
+            let menu_handler = handler.clone();
+            let row_key = key.clone();
+            let keep_inside = ix == 0;
+            let item = actions::HoverOverlay::new(SharedString::from(key), move |hover, _, cx| {
+                let revealed = hover.revealed(cx);
+                v_flex()
+                    .id(SharedString::from(row_key.clone()))
+                    .group(msg_group)
+                    .relative()
+                    .px_4()
+                    .py_0p5()
+                    .when(is_saved, |row| {
+                        row.bg(saved_bg).child(actions::saved_banner(cx))
+                    })
+                    .when(!is_saved && revealed, |row| row.bg(hover_bg))
+                    .child(row_body)
+                    .children(chips)
+                    .children(reply_bar_el)
+                    .when(revealed, |row| {
+                        row.child(
+                            actions::hover_toolbar(&row_key, &quick, set, &handler, &hover, cx)
+                                .when(keep_inside, |bar| bar.top(px(3.))),
+                        )
+                    })
+                    .on_hover(hover.host_on_hover())
+                    .context_menu(move |menu, window, cx| {
+                        actions::actions_menu(
+                            menu,
+                            set,
+                            &menu_handler,
+                            MenuOrigin::Context,
+                            window,
+                            cx,
+                        )
+                    })
+                    .into_any_element()
+            });
+            rows.push(item.into_any_element());
+            prev_msg = Some(msg);
+        }
+        v_flex()
+            .id("popout-messages")
+            .flex_1()
+            .min_h_0()
+            .py_3()
+            .gap_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .children(rows)
+    }
+
+    fn render_activity_body(
+        &self,
+        on_jump: JumpHandler,
+        cx: &Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        let theme = cx.theme();
+        let (bg, border, muted, accent) = (
+            theme.background,
+            theme.border,
+            theme.muted_foreground,
+            theme.accent,
+        );
+        let mut list = v_flex()
+            .id("popout-activity")
+            .flex_1()
+            .min_h_0()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .overflow_y_scroll();
+        if self.activity_rows.is_empty() {
+            list = list.child(
+                div()
+                    .py_6()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("No activity items."),
+            );
+        } else {
+            list = list.children(self.activity_rows.iter().enumerate().map(|(ix, item)| {
+                let jump = on_jump.clone();
+                let channel = item.channel.clone();
+                let thread_ts = item.thread_ts.clone();
+                let is_thread = thread_ts.is_some();
+                v_flex()
+                    .id(SharedString::from(format!("popout-act-{ix}")))
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(if item.unread { accent.opacity(0.2) } else { bg })
+                    .cursor_pointer()
+                    .hover(|el| el.bg(accent.opacity(0.28)))
+                    .on_click(move |_, _, cx| {
+                        jump(channel.clone(), thread_ts.clone(), is_thread, cx);
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(item.title.clone()),
+                    )
+                    .child(div().text_sm().child(item.body.clone()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(item.context.clone()),
+                    )
+            }));
+        }
+        list
+    }
+
+    fn render_later_body(
+        &self,
+        on_jump: JumpHandler,
+        cx: &Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        let theme = cx.theme();
+        let (border, muted, accent) = (theme.border, theme.muted_foreground, theme.accent);
+        let mut list = v_flex()
+            .id("popout-later")
+            .flex_1()
+            .min_h_0()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .overflow_y_scroll();
+        if self.later_items.is_empty() {
+            list = list.child(
+                div()
+                    .py_6()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("No saved items."),
+            );
+        } else {
+            list = list.children(self.later_items.iter().enumerate().map(|(ix, item)| {
+                let jump = on_jump.clone();
+                let channel = item.channel.clone();
+                let ts = item.ts.clone();
+                v_flex()
+                    .id(SharedString::from(format!("popout-later-{ix}")))
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(accent.opacity(0.22)))
+                    .on_click(move |_, _, cx| {
+                        jump(channel.clone(), Some(ts.clone()), false, cx);
+                    })
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(item.author.clone()),
+                            )
+                            .child(div().text_xs().text_color(muted).child(item.label.clone())),
+                    )
+                    .child(div().text_sm().child(item.text.clone()))
+            }));
+        }
+        list
+    }
+
+    fn render_canvas_body(
+        &self,
+        doc: &crate::canvas::CanvasDoc,
+        file_id: &Option<String>,
+        open_browser_url: &Option<String>,
+        on_jump: &JumpHandler,
+        cx: &App,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        let open_browser = open_browser_url.clone().map(|url| {
+            Rc::new(move |_: &mut Window, cx: &mut App| cx.open_url(&url))
+                as crate::canvas::OpenBrowserFn
+        });
+        let on_edit = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |op, _: &mut Window, _: &mut App| {
+                (send)(Command::EditCanvas {
+                    file_id: fid.clone(),
+                    op,
+                });
+            }) as crate::canvas::CanvasEditFn
+        });
+        let on_load_comments = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |_: &mut Window, _: &mut App| {
+                (send)(Command::LoadCanvasComments {
+                    canvas_id: fid.clone(),
+                });
+            }) as crate::canvas::CanvasCommentsLoadFn
+        });
+        let on_post_comment = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |text, thread_ts, _: &mut Window, _: &mut App| {
+                (send)(Command::PostCanvasComment {
+                    canvas_id: fid.clone(),
+                    text,
+                    thread_ts,
+                });
+            }) as crate::canvas::CanvasCommentPostFn
+        });
+        let on_resolve_comment = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |thread_ts, resolved, _: &mut Window, _: &mut App| {
+                (send)(Command::ResolveCanvasComment {
+                    canvas_id: fid.clone(),
+                    thread_ts,
+                    resolved,
+                });
+            }) as crate::canvas::CanvasCommentResolveFn
+        });
+        let on_resolve_all_comments = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |_: &mut Window, _: &mut App| {
+                (send)(Command::ResolveAllCanvasComments {
+                    canvas_id: fid.clone(),
+                });
+            }) as crate::canvas::CanvasCommentResolveAllFn
+        });
+        let on_set_access = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(
+                move |req: crate::canvas::ShareAccessRequest, _: &mut Window, _: &mut App| {
+                    (send)(Command::SetCanvasAccess {
+                        canvas_id: fid.clone(),
+                        access_level: req.access_level,
+                        channel_ids: req.channel_ids,
+                        user_ids: req.user_ids,
+                        post_permalink: req.post_permalink,
+                    });
+                },
+            ) as crate::canvas::CanvasAccessSetFn
+        });
+        let on_delete_access = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |channel_ids, user_ids, _: &mut Window, _: &mut App| {
+                (send)(Command::DeleteCanvasAccess {
+                    canvas_id: fid.clone(),
+                    channel_ids,
+                    user_ids,
+                });
+            }) as crate::canvas::CanvasAccessDeleteFn
+        });
+        let on_delete_canvas = file_id.clone().map(|fid| {
+            let send = self.send.clone();
+            Rc::new(move |_: &mut Window, _: &mut App| {
+                (send)(Command::DeleteCanvas {
+                    canvas_id: fid.clone(),
+                });
+            }) as crate::canvas::CanvasDeleteFn
+        });
+        let channel_lookup = crate::canvas::channel_lookup_from_fixtures(self.fixtures.clone());
+        let jump_ch = on_jump.clone();
+        let on_open_channel: crate::canvas::CanvasOpenChannelFn =
+            Rc::new(move |channel_id, _window, cx| {
+                jump_ch(channel_id, None, false, cx);
+            });
+        let on_print_canvas: crate::canvas::CanvasExportFn =
+            Rc::new(
+                move |doc, window, cx| match crate::canvas::trigger_canvas_print(&doc) {
+                    Ok(_) => actions::notify(
+                        "Print canvas",
+                        "Opened printable canvas preview.",
+                        window,
+                        cx,
+                    ),
+                    Err(err) => actions::notify("Print canvas", err, window, cx),
+                },
+            );
+        let on_save_pdf: crate::canvas::CanvasExportFn = Rc::new(move |doc, window, cx| {
+            let stem = crate::canvas::canvas_export_stem(&doc.title);
+            let target = std::env::temp_dir().join(format!("{stem}.pdf"));
+            match crate::canvas::save_canvas_pdf_to_path(&doc, &target) {
+                Ok(saved) => actions::notify(
+                    "Saved PDF",
+                    format!("Exported to {}", saved.display()),
+                    window,
+                    cx,
+                ),
+                Err(err) => actions::notify("Save as PDF", err, window, cx),
+            }
+        });
+        let on_upload_file: crate::canvas::CanvasUploadFileFn = {
+            let send = self.send.clone();
+            let upload_channel = self.fixtures.messages.keys().next().cloned();
+            let is_live = file_id.is_some();
+            Rc::new(move |on_done, window: &mut Window, cx: &mut App| {
+                let rx = cx.prompt_for_paths(gpui_kit::gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: false,
+                    prompt: Some("Upload file to canvas".into()),
+                });
+                let send_u = send.clone();
+                let ch_u = upload_channel.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        let Ok(Ok(Some(paths))) = rx.await else {
+                            return;
+                        };
+                        let Some(path) = paths.into_iter().next() else {
+                            return;
+                        };
+                        let filename = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("attachment")
+                            .to_owned();
+                        let bytes = if is_live {
+                            std::fs::read(&path).ok().filter(|b| !b.is_empty())
+                        } else {
+                            None
+                        };
+                        let url = format!("file://{}", path.display());
+                        let _ = cx.update(|window, cx| {
+                            if let (Some(ch), Some(bytes)) = (ch_u.clone(), bytes) {
+                                (send_u)(Command::UploadFiles {
+                                    channel: ch,
+                                    thread_ts: None,
+                                    content: None,
+                                    files: vec![slackless_core::api::UploadFile {
+                                        filename: filename.clone(),
+                                        bytes,
+                                    }],
+                                });
+                            }
+                            on_done(
+                                crate::canvas::UploadedCanvasFile {
+                                    filename: filename.clone(),
+                                    url,
+                                },
+                                window,
+                                cx,
+                            );
+                            actions::notify(
+                                "Inserted file",
+                                format!("Added {filename} to canvas."),
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .detach();
+            })
+        };
+        let user_lookup = crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
+        let on_open_profile: crate::canvas::CanvasOpenProfileFn = {
+            let fixtures = self.fixtures.clone();
+            let send = self.send.clone();
+            let is_live = file_id.is_some();
+            Rc::new(move |user_id, window: &mut Window, cx: &mut App| {
+                if is_live {
+                    (send)(Command::FetchUserProfile(user_id.clone()));
+                }
+                if let Some(team) = fixtures.workspaces.first().filter(|t| !t.domain.is_empty()) {
+                    cx.open_url(&format!(
+                        "https://{}.slack.com/team/{}",
+                        team.domain, user_id
+                    ));
+                } else {
+                    let name = fixtures.user_name(&user_id).to_owned();
+                    actions::notify("Profile", format!("User: {name}"), window, cx);
+                }
+            })
+        };
+        let on_open_embed: crate::canvas::CanvasOpenEmbedFn = {
+            let fixtures = self.fixtures.clone();
+            Rc::new(move |kind, fid, url, window: &mut Window, cx: &mut App| {
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    cx.open_url(&url);
+                } else if let Some(team) =
+                    fixtures.workspaces.first().filter(|t| !t.domain.is_empty())
+                    && !fid.is_empty()
+                {
+                    let seg = match kind {
+                        crate::canvas::CanvasEmbedKind::Canvas => "docs",
+                        crate::canvas::CanvasEmbedKind::List => "lists",
+                    };
+                    cx.open_url(&format!(
+                        "https://{}.slack.com/{seg}/{}/{fid}",
+                        team.domain, team.id
+                    ));
+                } else {
+                    actions::notify(
+                        "Embedded link",
+                        format!("Cannot open embedded item {fid}"),
+                        window,
+                        cx,
+                    );
+                }
+            })
+        };
+        let on_open_media: crate::canvas::CanvasOpenMediaFn =
+            Rc::new(move |url, _kind, window: &mut Window, cx: &mut App| {
+                if url.starts_with("https://") || url.starts_with("http://") {
+                    cx.open_url(&url);
+                } else {
+                    actions::notify(
+                        "Media link",
+                        format!("Cannot open unsupported media URL: {url}"),
+                        window,
+                        cx,
+                    );
+                }
+            });
+        let key = file_id.as_deref().unwrap_or("popout-canvas");
+        crate::canvas::render_popout_canvas(
+            key,
+            doc,
+            "",
+            None,
+            crate::canvas::CanvasActions {
+                open_browser,
+                on_edit,
+                on_upload_file: Some(on_upload_file),
+                canvas_url: open_browser_url.clone(),
+                on_open_media: Some(on_open_media),
+                user_lookup: Some(user_lookup),
+                channel_lookup: Some(channel_lookup),
+                on_open_profile: Some(on_open_profile),
+                on_open_channel: Some(on_open_channel),
+                on_open_embed: Some(on_open_embed),
+                on_load_comments,
+                on_post_comment,
+                on_resolve_comment,
+                on_resolve_all_comments,
+                on_set_access,
+                on_delete_access,
+                on_delete_canvas,
+                on_print_canvas: Some(on_print_canvas),
+                on_save_pdf: Some(on_save_pdf),
+                ..Default::default()
+            },
+            file_id.is_none(),
+            cx,
+        )
+    }
+
+    fn render_files_body(
+        &self,
+        cx: &Context<Self>,
+    ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
+        let theme = cx.theme();
+        let (border, muted, accent) = (theme.border, theme.muted_foreground, theme.accent);
+        let mut list = v_flex()
+            .id("popout-files")
+            .flex_1()
+            .min_h_0()
+            .px_4()
+            .py_3()
+            .gap_2()
+            .overflow_y_scroll();
+        if self.files_items.is_empty() {
+            list = list.child(
+                div()
+                    .py_6()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("No files visible."),
+            );
+        } else {
+            list = list.children(self.files_items.iter().enumerate().map(
+                |(ix, (name, meta, url))| {
+                    let url_opt = url.clone();
+                    v_flex()
+                        .id(SharedString::from(format!("popout-file-{ix}")))
+                        .gap_0p5()
+                        .p_3()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .when_some(url_opt, |card, link| {
+                            card.cursor_pointer()
+                                .hover(|el| el.bg(accent.opacity(0.22)))
+                                .on_click(move |_, _, cx| cx.open_url(&link))
+                        })
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(name.clone()),
+                        )
+                        .child(div().text_xs().text_color(muted).child(meta.clone()))
+                },
+            ));
+        }
+        list
+    }
+}
+
+impl Render for PopoutWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let PopoutKind::Huddle {
+            on_jump,
+            on_open_canvas,
+            ..
+        } = &self.kind
+        {
+            // Immediately free replaced Metal sprite-atlas tiles on this owning window.
+            if let Some(vs) = self.huddle_video.as_ref().and_then(WeakEntity::upgrade) {
+                let stale = vs.update(cx, |store, _| store.drain_stale_images());
+                for img in stale {
+                    cx.drop_image(img, Some(window));
+                }
+            }
+            let root = self
+                .render_huddle_window(on_jump.clone(), on_open_canvas.clone(), cx)
+                .on_action(|_: &crate::menu_bar::CloseWindow, window, _| {
+                    window.remove_window();
+                });
+            return self
+                .render_overlays(root, px(38.), window, cx)
+                .into_any_element();
+        }
+        let theme = cx.theme();
+        let (bg, fg) = (theme.background, theme.foreground);
+        let jump_for_links = self.jump_handler();
+        let links: LinkHandler = Rc::new(move |target, _, cx| match target {
+            LinkTarget::Url(url) => cx.open_url(url.as_ref()),
+            LinkTarget::Channel(channel) => jump_for_links(channel.clone(), None, false, cx),
+            LinkTarget::Thread { channel, thread_ts } => {
+                jump_for_links(channel.clone(), Some(thread_ts.clone()), true, cx)
+            }
+            LinkTarget::Profile(_) => {}
+        });
+        let header = self.render_header(cx);
         let body = match &self.kind {
             PopoutKind::Conversation {
                 channel, on_jump, ..
-            }
-            | PopoutKind::Thread {
+            } => self.render_messages_body(channel.clone(), on_jump.clone(), true, &links, cx),
+            PopoutKind::Thread {
                 channel, on_jump, ..
-            } => {
-                let is_conversation = matches!(self.kind, PopoutKind::Conversation { .. });
-                let channel = channel.clone();
-                let on_jump = on_jump.clone();
-                let view = cx.entity();
-                let mut rows: Vec<gpui_kit::gpui::AnyElement> =
-                    Vec::with_capacity(self.messages.len());
-                let mut prev_msg: Option<&Message> = None;
-                let editing = self.editing.clone();
-                for (ix, msg) in self.messages.iter().enumerate() {
-                    if let Some((_, edit_ts, edit_input)) = &editing
-                        && *edit_ts == msg.ts
-                    {
-                        let edit_row = v_flex()
-                            .id(SharedString::from(format!("popout-edit-{ix}")))
-                            .mx_4()
-                            .my_1()
-                            .p_2p5()
-                            .gap_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(cx.theme().ring)
-                            .bg(bg)
-                            .child(Textarea::new(edit_input).appearance(false).bordered(false))
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .justify_end()
-                                    .child(
-                                        Button::new("popout-edit-cancel")
-                                            .outline()
-                                            .with_size(Size::XSmall)
-                                            .label("Cancel")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.editing = None;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("popout-edit-save")
-                                            .primary()
-                                            .with_size(Size::XSmall)
-                                            .label("Save Changes")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.save_edit(cx);
-                                            })),
-                                    ),
-                            );
-                        rows.push(edit_row.into_any_element());
-                        prev_msg = None;
-                        continue;
-                    }
-                    let msg_group = SharedString::from(format!("popout-msg-{ix}"));
-                    let key = format!("popout-row-{}", msg.ts.as_str());
-                    let grouped = prev_msg
-                        .filter(|prev| same_group(prev, msg))
-                        .map(|_| msg_group.clone());
-                    let is_saved = self.saved.contains(&msg.ts);
-                    let view_for_action = view.clone();
-                    let ch_for_action = channel.clone();
-                    let msg_for_action = msg.clone();
-                    let handler: ActionHandler = Rc::new(move |action, window, cx| {
-                        let ch = ch_for_action.clone();
-                        let m = msg_for_action.clone();
-                        view_for_action.update(cx, |this, cx| {
-                            this.handle_message_action(ch, m, action, window, cx);
-                        });
-                    });
-                    let set = ActionSet {
-                        own: msg.user.as_ref() == Some(&self.fixtures.self_user),
-                        reply: is_conversation,
-                        saved: is_saved,
-                        pinned: msg.pinned_to.contains(&channel),
-                        in_thread: !is_conversation
-                            && matches!(&self.kind, PopoutKind::Thread { thread_ts, .. } if msg.ts != *thread_ts),
-                    };
-                    let mut display = msg.clone();
-                    let reactions = std::mem::take(&mut display.reactions);
-                    let chips = actions::reaction_chips(
-                        &key,
-                        &reactions,
-                        &self.fixtures,
-                        Some(&handler),
-                        cx,
-                    )
-                    .map(|c| c.pl(px(48.)));
-                    let row_body = message_row_linked(
-                        &self.fixtures,
-                        &display,
-                        Some(&handler),
-                        Some(&links),
-                        grouped,
-                        cx,
-                    );
-                    let reply_bar_el = if is_conversation {
-                        let jump = on_jump.clone();
-                        let ch = channel.clone();
-                        let ts = msg.ts.clone();
-                        let reply_group = SharedString::from(format!("popout-reply-{ix}"));
-                        reply_bar(
-                            &self.fixtures,
-                            msg,
-                            ("popout-thread-chip", ix),
-                            msg_group.clone(),
-                            reply_group,
-                            move |_, cx| jump(ch.clone(), Some(ts.clone()), true, cx),
-                            cx,
-                        )
-                        .map(|bar| div().pl(px(48.)).child(bar))
-                    } else {
-                        None
-                    };
-                    let quick = crate::preferences::active_quick_reactions(
-                        &self.fixtures.quick_reactions,
-                        cx,
-                    );
-                    let menu_handler = handler.clone();
-                    let row_key = key.clone();
-                    let keep_inside = ix == 0;
-                    let item =
-                        actions::HoverOverlay::new(SharedString::from(key), move |hover, _, cx| {
-                            let revealed = hover.revealed(cx);
-                            v_flex()
-                                .id(SharedString::from(row_key.clone()))
-                                .group(msg_group)
-                                .relative()
-                                .px_4()
-                                .py_0p5()
-                                .when(is_saved, |row| {
-                                    row.bg(saved_bg).child(actions::saved_banner(cx))
-                                })
-                                .when(!is_saved && revealed, |row| row.bg(hover_bg))
-                                .child(row_body)
-                                .children(chips)
-                                .children(reply_bar_el)
-                                .when(revealed, |row| {
-                                    row.child(
-                                        actions::hover_toolbar(
-                                            &row_key, &quick, set, &handler, &hover, cx,
-                                        )
-                                        .when(keep_inside, |bar| bar.top(px(3.))),
-                                    )
-                                })
-                                .on_hover(hover.host_on_hover())
-                                .context_menu(move |menu, window, cx| {
-                                    actions::actions_menu(
-                                        menu,
-                                        set,
-                                        &menu_handler,
-                                        MenuOrigin::Context,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .into_any_element()
-                        });
-                    rows.push(item.into_any_element());
-                    prev_msg = Some(msg);
-                }
-                v_flex()
-                    .id("popout-messages")
-                    .flex_1()
-                    .min_h_0()
-                    .py_3()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(rows)
-            }
-            PopoutKind::Activity { on_jump, .. } => {
-                let on_jump = on_jump.clone();
-                let mut list = v_flex()
-                    .id("popout-activity")
-                    .flex_1()
-                    .min_h_0()
-                    .px_4()
-                    .py_3()
-                    .gap_2()
-                    .overflow_y_scroll();
-                if self.activity_rows.is_empty() {
-                    list = list.child(
-                        div()
-                            .py_6()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("No activity items."),
-                    );
-                } else {
-                    list =
-                        list.children(self.activity_rows.iter().enumerate().map(|(ix, item)| {
-                            let jump = on_jump.clone();
-                            let channel = item.channel.clone();
-                            let thread_ts = item.thread_ts.clone();
-                            let is_thread = thread_ts.is_some();
-                            v_flex()
-                                .id(SharedString::from(format!("popout-act-{ix}")))
-                                .gap_1()
-                                .p_3()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(border)
-                                .bg(if item.unread { accent.opacity(0.2) } else { bg })
-                                .cursor_pointer()
-                                .hover(|el| el.bg(accent.opacity(0.28)))
-                                .on_click(move |_, _, cx| {
-                                    jump(channel.clone(), thread_ts.clone(), is_thread, cx);
-                                })
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(item.title.clone()),
-                                )
-                                .child(div().text_sm().child(item.body.clone()))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(item.context.clone()),
-                                )
-                        }));
-                }
-                list
-            }
-            PopoutKind::Later { on_jump, .. } => {
-                let on_jump = on_jump.clone();
-                let mut list = v_flex()
-                    .id("popout-later")
-                    .flex_1()
-                    .min_h_0()
-                    .px_4()
-                    .py_3()
-                    .gap_2()
-                    .overflow_y_scroll();
-                if self.later_items.is_empty() {
-                    list = list.child(
-                        div()
-                            .py_6()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("No saved items."),
-                    );
-                } else {
-                    list = list.children(self.later_items.iter().enumerate().map(|(ix, item)| {
-                        let jump = on_jump.clone();
-                        let channel = item.channel.clone();
-                        let ts = item.ts.clone();
-                        v_flex()
-                            .id(SharedString::from(format!("popout-later-{ix}")))
-                            .gap_1()
-                            .p_3()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .cursor_pointer()
-                            .hover(|el| el.bg(accent.opacity(0.22)))
-                            .on_click(move |_, _, cx| {
-                                jump(channel.clone(), Some(ts.clone()), false, cx);
-                            })
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(item.author.clone()),
-                                    )
-                                    .child(
-                                        div().text_xs().text_color(muted).child(item.label.clone()),
-                                    ),
-                            )
-                            .child(div().text_sm().child(item.text.clone()))
-                    }));
-                }
-                list
-            }
+            } => self.render_messages_body(channel.clone(), on_jump.clone(), false, &links, cx),
+            PopoutKind::Activity { on_jump, .. } => self.render_activity_body(on_jump.clone(), cx),
+            PopoutKind::Later { on_jump, .. } => self.render_later_body(on_jump.clone(), cx),
             PopoutKind::Canvas {
                 doc,
                 file_id,
                 open_browser_url,
                 on_jump,
-            } => {
-                let open_browser = open_browser_url.clone().map(|url| {
-                    Rc::new(move |_: &mut Window, cx: &mut App| cx.open_url(&url))
-                        as crate::canvas::OpenBrowserFn
-                });
-                let on_edit = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |op, _: &mut Window, _: &mut App| {
-                        (send)(Command::EditCanvas {
-                            file_id: fid.clone(),
-                            op,
-                        });
-                    }) as crate::canvas::CanvasEditFn
-                });
-                let on_load_comments = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |_: &mut Window, _: &mut App| {
-                        (send)(Command::LoadCanvasComments {
-                            canvas_id: fid.clone(),
-                        });
-                    }) as crate::canvas::CanvasCommentsLoadFn
-                });
-                let on_post_comment = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |text, thread_ts, _: &mut Window, _: &mut App| {
-                        (send)(Command::PostCanvasComment {
-                            canvas_id: fid.clone(),
-                            text,
-                            thread_ts,
-                        });
-                    }) as crate::canvas::CanvasCommentPostFn
-                });
-                let on_resolve_comment = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |thread_ts, resolved, _: &mut Window, _: &mut App| {
-                        (send)(Command::ResolveCanvasComment {
-                            canvas_id: fid.clone(),
-                            thread_ts,
-                            resolved,
-                        });
-                    }) as crate::canvas::CanvasCommentResolveFn
-                });
-                let on_resolve_all_comments = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |_: &mut Window, _: &mut App| {
-                        (send)(Command::ResolveAllCanvasComments {
-                            canvas_id: fid.clone(),
-                        });
-                    }) as crate::canvas::CanvasCommentResolveAllFn
-                });
-                let on_set_access = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(
-                        move |req: crate::canvas::ShareAccessRequest,
-                              _: &mut Window,
-                              _: &mut App| {
-                            (send)(Command::SetCanvasAccess {
-                                canvas_id: fid.clone(),
-                                access_level: req.access_level,
-                                channel_ids: req.channel_ids,
-                                user_ids: req.user_ids,
-                                post_permalink: req.post_permalink,
-                            });
-                        },
-                    ) as crate::canvas::CanvasAccessSetFn
-                });
-                let on_delete_access = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |channel_ids, user_ids, _: &mut Window, _: &mut App| {
-                        (send)(Command::DeleteCanvasAccess {
-                            canvas_id: fid.clone(),
-                            channel_ids,
-                            user_ids,
-                        });
-                    }) as crate::canvas::CanvasAccessDeleteFn
-                });
-                let on_delete_canvas = file_id.clone().map(|fid| {
-                    let send = self.send.clone();
-                    Rc::new(move |_: &mut Window, _: &mut App| {
-                        (send)(Command::DeleteCanvas {
-                            canvas_id: fid.clone(),
-                        });
-                    }) as crate::canvas::CanvasDeleteFn
-                });
-                let channel_lookup =
-                    crate::canvas::channel_lookup_from_fixtures(self.fixtures.clone());
-                let jump_ch = on_jump.clone();
-                let on_open_channel: crate::canvas::CanvasOpenChannelFn =
-                    Rc::new(move |channel_id, _window, cx| {
-                        jump_ch(channel_id, None, false, cx);
-                    });
-                let on_print_canvas: crate::canvas::CanvasExportFn =
-                    Rc::new(move |doc, window, cx| {
-                        match crate::canvas::trigger_canvas_print(&doc) {
-                            Ok(_) => actions::notify(
-                                "Print canvas",
-                                "Opened printable canvas preview.",
-                                window,
-                                cx,
-                            ),
-                            Err(err) => actions::notify("Print canvas", err, window, cx),
-                        }
-                    });
-                let on_save_pdf: crate::canvas::CanvasExportFn = Rc::new(move |doc, window, cx| {
-                    let stem = crate::canvas::canvas_export_stem(&doc.title);
-                    let target = std::env::temp_dir().join(format!("{stem}.pdf"));
-                    match crate::canvas::save_canvas_pdf_to_path(&doc, &target) {
-                        Ok(saved) => actions::notify(
-                            "Saved PDF",
-                            format!("Exported to {}", saved.display()),
-                            window,
-                            cx,
-                        ),
-                        Err(err) => actions::notify("Save as PDF", err, window, cx),
-                    }
-                });
-                let on_upload_file: crate::canvas::CanvasUploadFileFn = {
-                    let send = self.send.clone();
-                    let upload_channel = self.fixtures.messages.keys().next().cloned();
-                    let is_live = file_id.is_some();
-                    Rc::new(move |on_done, window: &mut Window, cx: &mut App| {
-                        let rx = cx.prompt_for_paths(gpui_kit::gpui::PathPromptOptions {
-                            files: true,
-                            directories: false,
-                            multiple: false,
-                            prompt: Some("Upload file to canvas".into()),
-                        });
-                        let send_u = send.clone();
-                        let ch_u = upload_channel.clone();
-                        window
-                            .spawn(cx, async move |cx| {
-                                let Ok(Ok(Some(paths))) = rx.await else {
-                                    return;
-                                };
-                                let Some(path) = paths.into_iter().next() else {
-                                    return;
-                                };
-                                let filename = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("attachment")
-                                    .to_owned();
-                                let bytes = if is_live {
-                                    std::fs::read(&path).ok().filter(|b| !b.is_empty())
-                                } else {
-                                    None
-                                };
-                                let url = format!("file://{}", path.display());
-                                let _ = cx.update(|window, cx| {
-                                    if let (Some(ch), Some(bytes)) = (ch_u.clone(), bytes) {
-                                        (send_u)(Command::UploadFiles {
-                                            channel: ch,
-                                            thread_ts: None,
-                                            content: None,
-                                            files: vec![slackless_core::api::UploadFile {
-                                                filename: filename.clone(),
-                                                bytes,
-                                            }],
-                                        });
-                                    }
-                                    on_done(
-                                        crate::canvas::UploadedCanvasFile {
-                                            filename: filename.clone(),
-                                            url,
-                                        },
-                                        window,
-                                        cx,
-                                    );
-                                    actions::notify(
-                                        "Inserted file",
-                                        format!("Added {filename} to canvas."),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            })
-                            .detach();
-                    })
-                };
-                let user_lookup = crate::canvas::user_lookup_from_fixtures(self.fixtures.clone());
-                let on_open_profile: crate::canvas::CanvasOpenProfileFn = {
-                    let fixtures = self.fixtures.clone();
-                    let send = self.send.clone();
-                    let is_live = file_id.is_some();
-                    Rc::new(move |user_id, window: &mut Window, cx: &mut App| {
-                        if is_live {
-                            (send)(Command::FetchUserProfile(user_id.clone()));
-                        }
-                        if let Some(team) =
-                            fixtures.workspaces.first().filter(|t| !t.domain.is_empty())
-                        {
-                            cx.open_url(&format!(
-                                "https://{}.slack.com/team/{}",
-                                team.domain, user_id
-                            ));
-                        } else {
-                            let name = fixtures.user_name(&user_id).to_owned();
-                            actions::notify("Profile", format!("User: {name}"), window, cx);
-                        }
-                    })
-                };
-                let on_open_embed: crate::canvas::CanvasOpenEmbedFn = {
-                    let fixtures = self.fixtures.clone();
-                    Rc::new(move |kind, fid, url, window: &mut Window, cx: &mut App| {
-                        if url.starts_with("https://") || url.starts_with("http://") {
-                            cx.open_url(&url);
-                        } else if let Some(team) =
-                            fixtures.workspaces.first().filter(|t| !t.domain.is_empty())
-                            && !fid.is_empty()
-                        {
-                            let seg = match kind {
-                                crate::canvas::CanvasEmbedKind::Canvas => "docs",
-                                crate::canvas::CanvasEmbedKind::List => "lists",
-                            };
-                            cx.open_url(&format!(
-                                "https://{}.slack.com/{seg}/{}/{fid}",
-                                team.domain, team.id
-                            ));
-                        } else {
-                            actions::notify(
-                                "Embedded link",
-                                format!("Cannot open embedded item {fid}"),
-                                window,
-                                cx,
-                            );
-                        }
-                    })
-                };
-                let on_open_media: crate::canvas::CanvasOpenMediaFn =
-                    Rc::new(move |url, _kind, window: &mut Window, cx: &mut App| {
-                        if url.starts_with("https://") || url.starts_with("http://") {
-                            cx.open_url(&url);
-                        } else {
-                            actions::notify(
-                                "Media link",
-                                format!("Cannot open unsupported media URL: {url}"),
-                                window,
-                                cx,
-                            );
-                        }
-                    });
-                let key = file_id.as_deref().unwrap_or("popout-canvas");
-                crate::canvas::render_popout_canvas(
-                    key,
-                    doc,
-                    "",
-                    None,
-                    crate::canvas::CanvasActions {
-                        open_browser,
-                        on_edit,
-                        on_upload_file: Some(on_upload_file),
-                        canvas_url: open_browser_url.clone(),
-                        on_open_media: Some(on_open_media),
-                        user_lookup: Some(user_lookup),
-                        channel_lookup: Some(channel_lookup),
-                        on_open_profile: Some(on_open_profile),
-                        on_open_channel: Some(on_open_channel),
-                        on_open_embed: Some(on_open_embed),
-                        on_load_comments,
-                        on_post_comment,
-                        on_resolve_comment,
-                        on_resolve_all_comments,
-                        on_set_access,
-                        on_delete_access,
-                        on_delete_canvas,
-                        on_print_canvas: Some(on_print_canvas),
-                        on_save_pdf: Some(on_save_pdf),
-                        ..Default::default()
-                    },
-                    file_id.is_none(),
-                    cx,
-                )
-            }
-            PopoutKind::Files { .. } => {
-                let mut list = v_flex()
-                    .id("popout-files")
-                    .flex_1()
-                    .min_h_0()
-                    .px_4()
-                    .py_3()
-                    .gap_2()
-                    .overflow_y_scroll();
-                if self.files_items.is_empty() {
-                    list = list.child(
-                        div()
-                            .py_6()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("No files visible."),
-                    );
-                } else {
-                    list = list.children(self.files_items.iter().enumerate().map(
-                        |(ix, (name, meta, url))| {
-                            let url_opt = url.clone();
-                            v_flex()
-                                .id(SharedString::from(format!("popout-file-{ix}")))
-                                .gap_0p5()
-                                .p_3()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(border)
-                                .when_some(url_opt, |card, link| {
-                                    card.cursor_pointer()
-                                        .hover(|el| el.bg(accent.opacity(0.22)))
-                                        .on_click(move |_, _, cx| cx.open_url(&link))
-                                })
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(name.clone()),
-                                )
-                                .child(div().text_xs().text_color(muted).child(meta.clone()))
-                        },
-                    ));
-                }
-                list
-            }
+            } => self.render_canvas_body(doc, file_id, open_browser_url, on_jump, cx),
+            PopoutKind::Files { .. } => self.render_files_body(cx),
             PopoutKind::Huddle { .. } => v_flex().id("popout-huddle-noop").flex_1(),
         };
 
-        let picker_pos = self.picker.as_ref().map(|(_, pos)| *pos);
-
-        let mut root = v_flex()
+        let root = v_flex()
+            .id("popout-window-root")
             .relative()
             .size_full()
             .bg(bg)
@@ -1946,63 +2021,12 @@ impl Render for PopoutWindow {
                 }),
             )
             .child(header)
-            .child(body);
-        if has_composer {
-            root = root.child(div().flex_none().p_2().child(self.composer.clone()));
-        }
-        root.when_some(picker_pos, |root, pos| {
-            let viewport = window.viewport_size();
-            let anchor = match (pos.y > viewport.height / 2., pos.x > viewport.width / 2.) {
-                (true, true) => Anchor::BottomRight,
-                (true, false) => Anchor::BottomLeft,
-                (false, true) => Anchor::TopRight,
-                (false, false) => Anchor::TopLeft,
-            };
-            root.child(
-                div()
-                    .id("popout-picker-backdrop")
-                    .occlude()
-                    .on_scroll(|_, _, cx| cx.stop_propagation())
-                    .absolute()
-                    .inset_0()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.picker = None;
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child(deferred(
-                anchored()
-                    .position(pos)
-                    .anchor(anchor)
-                    .snap_to_window_with_margin(Edges::all(px(8.)))
-                    .child(
-                        div()
-                            .id("popout-picker-overlay")
-                            .occlude()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_scroll(|_, _, cx| cx.stop_propagation())
-                            .child(self.emoji_picker.clone()),
-                    ),
-            ))
-        })
-        .when_some(self.image_viewer.clone(), |root, viewer| {
-            root.child(
-                div()
-                    .id("popout-image-viewer-overlay")
-                    .occlude()
-                    .on_scroll(|_, _, cx| cx.stop_propagation())
-                    .absolute()
-                    .top(px(40.))
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(viewer),
-            )
-        })
-        .into_any_element()
+            .child(body)
+            .when_some(self.composer.clone(), |root, composer| {
+                root.child(div().flex_none().p_2().child(composer))
+            });
+        self.render_overlays(root, px(40.), window, cx)
+            .into_any_element()
     }
 }
 

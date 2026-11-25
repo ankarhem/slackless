@@ -33,6 +33,8 @@ impl PopoutWindow {
             .child(content)
     }
 
+    /// Resolve the active huddle's thread root `ts` without blocking the UI thread: prefers
+    /// `snap.thread_root_ts`, falling back to the asynchronously cached store lookup.
     pub(in crate::popout) fn resolve_huddle_thread_root(
         &self,
         snap: &slackless_core::huddle::HuddleSessionSnapshot,
@@ -44,36 +46,85 @@ impl PopoutWindow {
         {
             return Some(root.clone());
         }
-        // If `rooms.join` didn't include `thread_root_ts` yet, look up the active live
-        // `huddle_thread` trail message for this channel in SQLite so we never post to the
-        // parent channel or leak unrelated channel history.
-        let (Some(store), Some(team)) = (&self.store, &self.team) else {
-            return None;
+        self.huddle_thread_root_cache.clone()
+    }
+
+    /// Asynchronously query SQLite off the UI thread for the huddle's active thread root and
+    /// replies, updating `huddle_thread_root_cache` / `huddle_thread_store_msgs` and pruning
+    /// echoed optimistic local replies on completion.
+    pub(in crate::popout) fn refresh_huddle_thread_async(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.huddle_state.as_ref() else {
+            return;
         };
-        let guard = store.lock().ok()?;
-        let rows = guard.channel_history(team, &snap.channel, None, 20).ok()?;
-        rows.into_iter().rev().find_map(|row| {
-            if row.deleted
-                || row.message.subtype != Some(slackless_core::types::MessageSubtype::HuddleThread)
-            {
-                return None;
-            }
-            let has_ended = row
-                .message
-                .extra
-                .get("room")
-                .and_then(|r| r.get("has_ended"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let has_participants = row
-                .message
-                .extra
-                .get("room")
-                .and_then(|r| r.get("participants"))
-                .and_then(|v| v.as_array())
-                .is_some_and(|arr| !arr.is_empty());
-            (!has_ended && has_participants).then_some(row.message.ts)
+        let (Some(store), Some(team)) = (self.store.clone(), self.team.clone()) else {
+            return;
+        };
+        let channel = state.session.channel.clone();
+        let explicit_root = state
+            .session
+            .thread_root_ts
+            .as_ref()
+            .filter(|ts| !ts.as_str().trim().is_empty())
+            .cloned();
+        self.reload_gen = self.reload_gen.wrapping_add(1);
+        let generation = self.reload_gen;
+        cx.spawn(async move |this, cx| {
+            let (root, store_msgs) = cx
+                .background_executor()
+                .spawn(async move {
+                    let Ok(guard) = store.lock() else {
+                        return (explicit_root, Vec::new());
+                    };
+                    let root = explicit_root.or_else(|| {
+                        let rows = guard.channel_history(&team, &channel, None, 20).ok()?;
+                        rows.into_iter().rev().find_map(|row| {
+                            if row.deleted
+                                || row.message.subtype
+                                    != Some(slackless_core::types::MessageSubtype::HuddleThread)
+                            {
+                                return None;
+                            }
+                            let parsed =
+                                slackless_core::domain::huddles::parse_huddle_room(&row.message)?;
+                            parsed.live.then_some(row.message.ts)
+                        })
+                    });
+                    let msgs = root
+                        .as_ref()
+                        .and_then(|r| guard.thread_replies(&team, &channel, r).ok())
+                        .map(|list| {
+                            list.into_iter()
+                                .filter(|row| {
+                                    !row.deleted
+                                        && root.as_ref() != Some(&row.message.ts)
+                                        && row.message.subtype
+                                            != Some(
+                                                slackless_core::types::MessageSubtype::HuddleThread,
+                                            )
+                                })
+                                .map(|row| row.message)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    (root, msgs)
+                })
+                .await;
+            let _ = this.update(cx, |win: &mut PopoutWindow, cx| {
+                if win.reload_gen != generation {
+                    return;
+                }
+                let changed = win.huddle_thread_root_cache != root
+                    || win.huddle_thread_store_msgs != store_msgs;
+                win.huddle_thread_root_cache = root;
+                win.huddle_thread_store_msgs = store_msgs;
+                win.prune_echoed_huddle_locals_from_cache();
+                win.maybe_fetch_huddle_thread();
+                if changed {
+                    cx.notify();
+                }
+            });
         })
+        .detach();
     }
 
     pub(in crate::popout) fn huddle_thread_messages(
@@ -83,25 +134,8 @@ impl PopoutWindow {
         let root_ts = self.resolve_huddle_thread_root(snap);
         let mut out: Vec<Message> = match root_ts.as_ref() {
             Some(root) => {
-                if let (Some(store), Some(team)) = (&self.store, &self.team) {
-                    store
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.thread_replies(team, &snap.channel, root).ok())
-                        .map(|list| {
-                            list.into_iter()
-                                .filter(|r| {
-                                    !r.deleted
-                                        && r.message.ts != *root
-                                        && r.message.subtype
-                                            != Some(
-                                                slackless_core::types::MessageSubtype::HuddleThread,
-                                            )
-                                })
-                                .map(|r| r.message)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
+                if self.store.is_some() && self.team.is_some() {
+                    self.huddle_thread_store_msgs.clone()
                 } else {
                     self.fixtures
                         .threads
@@ -157,39 +191,13 @@ impl PopoutWindow {
         out
     }
 
-    /// Drop any optimistic local huddle replies that have already been echoed into the store.
-    pub(in crate::popout) fn prune_echoed_huddle_locals(
-        &mut self,
-        snap: &slackless_core::huddle::HuddleSessionSnapshot,
-    ) {
-        if self.huddle_thread_local.is_empty() {
+    /// Drop any optimistic local huddle replies that have already been echoed into the cached
+    /// store snapshot (zero synchronous SQLite I/O on the UI thread).
+    pub(in crate::popout) fn prune_echoed_huddle_locals_from_cache(&mut self) {
+        if self.huddle_thread_local.is_empty() || self.huddle_thread_store_msgs.is_empty() {
             return;
         }
-        let Some(root) = self.resolve_huddle_thread_root(snap) else {
-            return;
-        };
-        let (Some(store), Some(team)) = (&self.store, &self.team) else {
-            return;
-        };
-        let store_msgs: Vec<Message> = store
-            .lock()
-            .ok()
-            .and_then(|guard| guard.thread_replies(team, &snap.channel, &root).ok())
-            .map(|list| {
-                list.into_iter()
-                    .filter(|r| {
-                        !r.deleted
-                            && r.message.ts != root
-                            && r.message.subtype
-                                != Some(slackless_core::types::MessageSubtype::HuddleThread)
-                    })
-                    .map(|r| r.message)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if store_msgs.is_empty() {
-            return;
-        }
+        let store_msgs = &self.huddle_thread_store_msgs;
         let mut matched = vec![false; store_msgs.len()];
         let fixtures = &self.fixtures;
         self.huddle_thread_local.retain(|local| {
@@ -407,14 +415,16 @@ impl PopoutWindow {
                     })
                     .children(rows),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .py_2()
-                    .border_t_1()
-                    .border_color(pal.drawer_border)
-                    .child(self.composer.clone()),
-            )
+            .when_some(self.composer.clone(), |col, composer| {
+                col.child(
+                    div()
+                        .flex_none()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(pal.drawer_border)
+                        .child(composer),
+                )
+            })
     }
 
     fn render_huddle_notes_drawer(

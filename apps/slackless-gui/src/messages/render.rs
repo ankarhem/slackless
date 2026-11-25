@@ -1071,25 +1071,7 @@ pub(super) fn message_body(message: &Message, kcx: &KitCx, cx: &App) -> Div {
 
 /// Format huddle duration cleanly (`"16s"`, `"12m 4s"`, `"1h 5m"`).
 pub(crate) fn format_huddle_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m {s}s")
-        }
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h {m}m")
-        }
-    }
+    slackless_core::types::time::format_huddle_duration(secs)
 }
 
 /// Render official Slack's rich `huddle_thread` card in the message transcript (`F-COLLAB-003`).
@@ -1595,11 +1577,21 @@ pub(super) fn mrkdwn_line(
     Some(render_segments(segments, theme))
 }
 
+/// `text` with Slack's three mrkdwn HTML escapes undone (zero-copy when no `&` is present).
+pub(crate) fn unescape_cow(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('&') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
 /// `text` with Slack's three mrkdwn HTML escapes undone.
 pub(crate) fn unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    unescape_cow(text).into_owned()
 }
 
 /// Plain mrkdwn text with Slack's HTML escapes undone; inline code gets its wash.
@@ -1762,8 +1754,8 @@ pub(super) fn styled_label(mut label: &str, mut run: RunFlags) -> (&str, RunFlag
     (label, run)
 }
 
-/// Expand standard unicode `:shortcode:` tokens inside a link label (`<url|:bar_chart: Panel>`).
-fn expand_shortcodes_in_text(text: &str) -> String {
+/// Expand standard unicode `:shortcode:` tokens inside text (`<url|:bar_chart: Panel>`, plain-text previews).
+pub(crate) fn expand_shortcodes_in_text(text: &str) -> String {
     if !text.contains(':') {
         return text.to_owned();
     }

@@ -11,35 +11,28 @@ impl PopoutWindow {
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
-        if self.huddle_camera_open {
-            return Some(self.render_huddle_camera_panel(
-                snap.video,
-                snap.blur_background,
-                pal,
-                cx,
-            ));
-        }
-        if self.huddle_reactions_open {
-            return Some(self.render_huddle_reactions_panel(snap, pal, cx));
-        }
-        if self.huddle_theme_open {
-            return Some(self.render_huddle_theme_panel(snap.background_id.as_deref(), pal, cx));
-        }
-        if self.huddle_invite_open {
-            return Some(self.render_huddle_invite_panel(channel, people, pal, cx));
-        }
-        if self.huddle_devices_open {
-            return Some(self.render_huddle_devices_panel(
+        match self.huddle_popover {
+            Some(HuddlePopover::Camera) => {
+                Some(self.render_huddle_camera_panel(snap.video, snap.blur_background, pal, cx))
+            }
+            Some(HuddlePopover::Reactions) => {
+                Some(self.render_huddle_reactions_panel(snap, pal, cx))
+            }
+            Some(HuddlePopover::Theme) => {
+                Some(self.render_huddle_theme_panel(snap.background_id.as_deref(), pal, cx))
+            }
+            Some(HuddlePopover::Invite) => {
+                Some(self.render_huddle_invite_panel(channel, people, pal, cx))
+            }
+            Some(HuddlePopover::Devices) => Some(self.render_huddle_devices_panel(
                 snap.input_device.clone(),
                 snap.output_device.clone(),
                 pal,
                 cx,
-            ));
+            )),
+            Some(HuddlePopover::More) => Some(self.render_huddle_more_panel(snap, pal, cx)),
+            Some(HuddlePopover::Share | HuddlePopover::Music) | None => None,
         }
-        if self.huddle_more_open {
-            return Some(self.render_huddle_more_panel(snap, pal, cx));
-        }
-        None
     }
 
     fn render_huddle_more_panel(
@@ -56,15 +49,11 @@ impl PopoutWindow {
         let music_on = snap.jukebox_song.is_some();
         let notes_open = self.huddle_drawer == Some(HuddleDrawer::Notes);
         let channel = snap.channel.clone();
-        let browser_url = snap.huddle_link.clone().unwrap_or_else(|| {
-            let team = self
-                .fixtures
-                .workspaces
-                .first()
-                .map(|t| t.id.to_string())
-                .unwrap_or_default();
-            format!("https://app.slack.com/huddle/{team}/{channel}")
-        });
+        let browser_url = crate::huddle_video::huddle_browser_url(
+            &self.fixtures,
+            &channel,
+            snap.huddle_link.as_deref(),
+        );
         let send_cc = self.send.clone();
         let send_music = self.send.clone();
         let send_copy = self.send.clone();
@@ -117,7 +106,7 @@ impl PopoutWindow {
                     notes_open,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.huddle_more_open = false;
+                    this.close_huddle_popovers();
                     this.huddle_drawer = if this.huddle_drawer == Some(HuddleDrawer::Notes) {
                         None
                     } else {
@@ -145,7 +134,7 @@ impl PopoutWindow {
                     {
                         dock.update(cx, |d, cx| d.set_captions_local(next, cx));
                     }
-                    this.huddle_more_open = false;
+                    this.close_huddle_popovers();
                     cx.notify();
                 })),
             )
@@ -168,7 +157,7 @@ impl PopoutWindow {
                     {
                         dock.update(cx, |d, cx| d.set_jukebox_local(next_song.clone(), cx));
                     }
-                    this.huddle_more_open = false;
+                    this.close_huddle_popovers();
                     cx.notify();
                 })),
             )
@@ -180,8 +169,7 @@ impl PopoutWindow {
                     false,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_huddle_popovers();
-                    this.huddle_devices_open = true;
+                    this.huddle_popover = Some(HuddlePopover::Devices);
                     cx.spawn(async move |win, cx| {
                         let devices = cx
                             .background_executor()
@@ -208,7 +196,7 @@ impl PopoutWindow {
                     (send_copy)(Command::CopyHuddleLink {
                         channel: copy_ch.clone(),
                     });
-                    this.huddle_more_open = false;
+                    this.close_huddle_popovers();
                     cx.notify();
                 })),
             )
@@ -221,7 +209,7 @@ impl PopoutWindow {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.open_url(&browser_url);
-                    this.huddle_more_open = false;
+                    this.close_huddle_popovers();
                     cx.notify();
                 })),
             )
@@ -313,7 +301,7 @@ impl PopoutWindow {
                                         blur: blur_now,
                                     });
                                 }
-                                this.huddle_camera_open = false;
+                                this.close_huddle_popovers();
                                 cx.notify();
                             }))
                     }))
@@ -357,7 +345,7 @@ impl PopoutWindow {
                         {
                             dock.update(cx, |d, cx| d.set_blur_local(next_blur, cx));
                         }
-                        this.huddle_camera_open = false;
+                        this.close_huddle_popovers();
                         cx.notify();
                     })),
             )
@@ -381,8 +369,7 @@ impl PopoutWindow {
                     )
                     .child("Video background")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.close_huddle_popovers();
-                        this.huddle_theme_open = true;
+                        this.huddle_popover = Some(HuddlePopover::Theme);
                         cx.notify();
                     })),
             )
@@ -1142,7 +1129,7 @@ impl PopoutWindow {
                                                 );
                                             });
                                         }
-                                        this.huddle_reactions_open = false;
+                                        this.close_huddle_popovers();
                                         cx.notify();
                                     }))
                             }),
@@ -1275,7 +1262,7 @@ impl PopoutWindow {
                         if let Some(dock) = this.huddle_dock_entity() {
                             dock.update(cx, |d, cx| d.set_background_local(bg_id.clone(), cx));
                         }
-                        this.huddle_theme_open = false;
+                        this.close_huddle_popovers();
                         cx.notify();
                     }))
             }))
@@ -1356,7 +1343,7 @@ impl PopoutWindow {
                                     window,
                                     cx,
                                 );
-                                this.huddle_invite_open = false;
+                                this.close_huddle_popovers();
                                 cx.notify();
                             }))
                     })),
@@ -1401,8 +1388,8 @@ impl PopoutWindow {
                         .iter()
                         .enumerate()
                         .map(|(ix, d)| {
-                            let selected = cur_in.as_deref() == Some(d.name.as_str())
-                                || (cur_in.is_none() && d.is_default);
+                            let selected =
+                                crate::huddle_video::is_audio_device_selected(cur_in.as_deref(), d);
                             let name = d.name.clone();
                             let out = cur_out.clone();
                             let send = send_in.clone();
@@ -1445,8 +1432,10 @@ impl PopoutWindow {
                         .iter()
                         .enumerate()
                         .map(|(ix, d)| {
-                            let selected = cur_out.as_deref() == Some(d.name.as_str())
-                                || (cur_out.is_none() && d.is_default);
+                            let selected = crate::huddle_video::is_audio_device_selected(
+                                cur_out.as_deref(),
+                                d,
+                            );
                             let name = d.name.clone();
                             let inp = cur_in.clone();
                             let send = send_out.clone();

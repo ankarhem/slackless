@@ -208,9 +208,7 @@ impl PopoutWindow {
                                 .text_color(muted),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let next = !this.huddle_music_open;
-                            this.close_huddle_popovers();
-                            this.huddle_music_open = next;
+                            this.toggle_huddle_popover(HuddlePopover::Music);
                             cx.notify();
                         })),
                 )
@@ -226,7 +224,7 @@ impl PopoutWindow {
                         .hover(move |el| el.bg(hover_bg))
                         .child(Icon::new(IconName::X).size(px(12.)).text_color(muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.huddle_music_open = false;
+                            this.close_huddle_popovers();
                             (send_stop)(Command::SetHuddleJukebox(None));
                             if this.fixtures.sample
                                 && let Some(dock) = this.huddle_dock_entity()
@@ -238,7 +236,7 @@ impl PopoutWindow {
                 ),
         );
 
-        if self.huddle_music_open {
+        if self.huddle_popover == Some(HuddlePopover::Music) {
             let mut menu = v_flex()
                 .w(px(200.))
                 .p_1p5()
@@ -275,7 +273,7 @@ impl PopoutWindow {
                             el.child(Icon::new(IconName::Check).size(px(12.)).text_color(primary))
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.huddle_music_open = false;
+                            this.close_huddle_popovers();
                             (send_pick)(Command::SetHuddleJukebox(Some(key_owned.clone())));
                             if this.fixtures.sample
                                 && let Some(dock) = this.huddle_dock_entity()

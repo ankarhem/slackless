@@ -409,7 +409,7 @@ fn utf16(text: &str, range: Range<usize>) -> Range<usize> {
 /// them as plain text until the next push.
 fn report(result: Result<(), InlineTokenError>) {
     if let Err(error) = result {
-        eprintln!("slackless: composer tokens not applied: {error}");
+        tracing::warn!(error = %error, "composer tokens not applied");
     }
 }
 

@@ -655,7 +655,7 @@ fn parse_double_or_single(
     }
     let double = if ch == '*' { "**" } else { "~~" };
     if text[start..end].starts_with(double) && !overlaps_atom(atoms, start..start + 2) {
-        if let Some(found) = parse_double(text, start, end, atoms, double, ch, style, in_link) {
+        if let Some(found) = parse_double(text, start..end, atoms, double, ch, style, in_link) {
             return Some(found);
         }
         // Don't fall through to single `*` on `**` — would misparse empty `*` pair.
@@ -681,17 +681,16 @@ fn skip_nested_opaque(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn parse_double(
     text: &str,
-    start: usize,
-    end: usize,
+    range: Range<usize>,
     atoms: &[Placed],
     delim: &str,
     ch: char,
     style: Style,
     in_link: bool,
 ) -> Option<InlineConstruct> {
+    let (start, end) = (range.start, range.end);
     let inner_start = start + 2;
     let first = text[inner_start..end].chars().next()?;
     if first.is_whitespace() || first == ch {

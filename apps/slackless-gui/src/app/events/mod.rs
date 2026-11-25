@@ -191,15 +191,11 @@ impl App {
         });
     }
 
-    /// Slack's window title (Window menu, Mission Control):
+    /// Compute Slack's window title (Window menu, Mission Control):
     /// "<conversation> (Channel|DM) - <workspace> - N new items - <app>".
-    pub(super) fn sync_window_title(
-        &mut self,
-        conversation: Option<&Conversation>,
-        window: &mut Window,
-    ) {
+    fn compute_window_title(&self) -> String {
         let mut parts = Vec::with_capacity(4);
-        if let Some(conversation) = conversation {
+        if let Some(conversation) = self.fixtures.conversation(&self.channel) {
             let kind = match conversation.kind() {
                 ConversationKind::Im | ConversationKind::Mpim => "DM",
                 ConversationKind::PublicChannel | ConversationKind::PrivateChannel => "Channel",
@@ -222,10 +218,30 @@ impl App {
             _ => {}
         }
         parts.push("slackless".to_owned());
-        let title = parts.join(" - ");
+        parts.join(" - ")
+    }
+
+    /// Update the OS window title immediately when a `&mut Window` is already in scope.
+    pub(super) fn sync_window_title_in(&mut self, window: &mut Window) {
+        let title = self.compute_window_title();
         if title != self.window_title {
             window.set_window_title(&title);
             self.window_title = title;
+        }
+    }
+
+    /// Update the OS window title from state-change paths without a `&mut Window` (defers the
+    /// window handle update until after the current entity update finishes, avoiding re-entrancy).
+    pub(super) fn sync_window_title(&mut self, cx: &mut Context<Self>) {
+        let title = self.compute_window_title();
+        if title != self.window_title {
+            self.window_title = title.clone();
+            let handle = self.window_handle;
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| {
+                    window.set_window_title(&title);
+                });
+            });
         }
     }
 
@@ -283,11 +299,15 @@ impl App {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_workspace_badges(badges, cx));
         let settings = self.preferences.read(cx).settings().clone();
+        let prev_badge = self.badge;
         self.badge = Some(if settings.show_dock_badge {
             total_dock
         } else {
             0
         });
+        if self.badge != prev_badge {
+            self.sync_window_title(cx);
+        }
         let next_label = if !settings.show_dock_badge {
             None
         } else if total_dock > 0 {

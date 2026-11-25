@@ -675,8 +675,7 @@ impl Composer {
     fn code_block_backdrop(&self, editor_focused: bool, cx: &App) -> Option<AnyElement> {
         let doc = self.editor.doc();
         let selection = self.editor.selection();
-        let blocks = tokens::code_blocks(doc, &selection, editor_focused);
-        let inline_spans = tokens::inline_code_spans(doc, &selection, editor_focused);
+        let (blocks, inline_spans) = tokens::code_backdrop_spans(doc, &selection, editor_focused);
         if blocks.is_empty() && inline_spans.is_empty() {
             return None;
         }

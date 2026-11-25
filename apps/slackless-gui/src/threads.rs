@@ -32,10 +32,9 @@ use gpui_kit::gpui::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::MessageContent;
-use slackless_core::types::{ChannelId, ConversationKind, Message, Ts, UserId};
+use slackless_core::types::{ChannelId, Message, Ts, UserId};
 
 use crate::actions::{self, ActionHandler, ActionSet, MessageAction, MessageChange};
-use crate::blockkit::BlockDispatch;
 use crate::composer::{
     AlsoSendTarget, Composer, ComposerEvent, ContextBar, PendingAttachment, TypingNames,
 };
@@ -43,7 +42,7 @@ use crate::emoji::EmojiChoice;
 use crate::fixtures::Fixtures;
 use crate::later::SaveRequest;
 use crate::messages::{LinkHandler, LinkTarget, editing_avatar, message_row_linked, same_group};
-use crate::slash::{Invocation, SHRUG, SlashKind};
+use crate::slash::{Invocation, SlashKind};
 
 pub enum ThreadPanelEvent {
     Close,
@@ -55,7 +54,7 @@ pub enum ThreadPanelEvent {
     /// `images`, at `index`.
     OpenImage {
         channel: ChannelId,
-        images: Arc<Vec<crate::image_viewer::ViewerImage>>,
+        images: Rc<Vec<crate::image_viewer::ViewerImage>>,
         index: usize,
     },
     /// A link in message text was clicked: profile, channel, thread or URL (permalinks
@@ -228,11 +227,8 @@ impl ThreadPanel {
                         }
                         ComposerEvent::SlashCommand(invocation) => {
                             match invocation.command.map(|command| command.kind) {
-                                Some(SlashKind::Shrug) if invocation.args.is_empty() => {
-                                    this.reply(MessageContent::plain(SHRUG), cx);
-                                }
                                 Some(SlashKind::Shrug) => {
-                                    let text = format!("{} {SHRUG}", invocation.args);
+                                    let text = crate::composer::format_shrug(&invocation.args);
                                     this.reply(MessageContent::plain(text), cx);
                                 }
                                 _ => cx.emit(ThreadPanelEvent::SlashCommand(invocation.clone())),
@@ -392,16 +388,7 @@ impl ThreadPanel {
             self.replies = self.fixtures.threads.get(&key).cloned().unwrap_or_default();
             self.loading = !self.fixtures.sample && self.replies.is_empty();
         }
-        let target =
-            self.fixtures
-                .conversation(&channel)
-                .map(|conversation| match conversation.kind() {
-                    ConversationKind::Im | ConversationKind::Mpim => AlsoSendTarget::DirectMessage,
-                    kind => AlsoSendTarget::Channel {
-                        name: conversation.name.clone().unwrap_or_default().into(),
-                        private: kind == ConversationKind::PrivateChannel,
-                    },
-                });
+        let target = AlsoSendTarget::for_channel(&self.fixtures, &channel);
         self.composer
             .update(cx, |composer, cx| composer.set_also_send(target, cx));
         self.thread = Some(key);
@@ -496,18 +483,7 @@ impl ThreadPanel {
         let Some(message) = self.message_at_mut(ts) else {
             return;
         };
-        let request = SaveRequest {
-            channel,
-            ts: ts.clone(),
-            author: message
-                .user
-                .as_ref()
-                .map(|user| fixtures.user_name(user).to_owned())
-                .unwrap_or_default(),
-            text: fixtures.preview(message),
-            saved,
-            due,
-        };
+        let request = actions::build_save_request(&fixtures, channel, message, saved, due);
         actions::notify(title, request.text.clone(), window, cx);
         cx.emit(ThreadPanelEvent::Later(request));
         self.set_saved(ts, saved, cx);
@@ -644,9 +620,8 @@ impl ThreadPanel {
                 }
             }
             MessageAction::CopyText => {
-                if let Some(message) = self.message_at_mut(ts).map(|message| message.clone()) {
-                    let text = self.fixtures.plain_text(&message);
-                    cx.write_to_clipboard(gpui_kit::gpui::ClipboardItem::new_string(text));
+                if let Some(message) = self.message_at_mut(ts).cloned() {
+                    actions::copy_message_text(&self.fixtures, &message, window, cx);
                 }
             }
             MessageAction::Forward => {
@@ -676,21 +651,34 @@ impl ThreadPanel {
                 );
             }
             MessageAction::RemindCustom => {
+                let Some((channel, _)) = self.thread.clone() else {
+                    return;
+                };
+                let Some(message) = self.message_at_mut(ts).cloned() else {
+                    return;
+                };
                 let this = cx.entity().downgrade();
-                let ts = ts.clone();
-                crate::later::open_custom_remind_dialog(window, cx, move |due, window, cx| {
-                    let _ = this.update(cx, |panel, cx| {
-                        let when = crate::drafts::when_label(due, crate::drafts::now_secs());
-                        panel.save_for_later(
-                            &ts,
-                            true,
-                            Some(due),
-                            &format!("Reminder set: {when}"),
-                            window,
-                            cx,
-                        );
-                    });
-                });
+                let fixtures = self.fixtures.clone();
+                actions::open_custom_remind_for_message(
+                    &fixtures,
+                    channel,
+                    &message,
+                    window,
+                    cx,
+                    move |request, when, window, cx| {
+                        let _ = this.update(cx, |panel, cx| {
+                            actions::notify(
+                                &format!("Reminder set: {when}"),
+                                request.text.clone(),
+                                window,
+                                cx,
+                            );
+                            let ts = request.ts.clone();
+                            cx.emit(ThreadPanelEvent::Later(request));
+                            panel.set_saved(&ts, true, cx);
+                        });
+                    },
+                );
             }
             MessageAction::MarkUnread => self.mark_unread(ts.clone(), cx),
             MessageAction::Edit => self.begin_edit(ts.clone(), window, cx),
@@ -712,12 +700,7 @@ impl ThreadPanel {
                     .find(|message| &message.ts == ts)
                     .map(|message| self.fixtures.preview(message))
                     .unwrap_or_default();
-                actions::notify(
-                    if pinned { "Pinned" } else { "Unpinned" },
-                    preview,
-                    window,
-                    cx,
-                );
+                actions::notify_pin_toggled(pinned, preview, window, cx);
                 self.post(
                     MessageChange::Pin {
                         ts: ts.clone(),
@@ -777,38 +760,28 @@ impl ThreadPanel {
                 let Some((channel, _)) = self.thread.clone() else {
                     return;
                 };
-                let mut images = Vec::new();
-                let mut index = None;
-                for message in self.root.iter().chain(&self.replies) {
-                    for entry in crate::image_viewer::message_images(&self.fixtures, message) {
-                        if index.is_none() && &message.ts == ts && entry.origin == origin {
-                            index = Some(images.len());
-                        }
-                        images.push(entry.image);
-                    }
-                }
-                if let Some(index) = index {
+                if let Some((images, index)) = crate::image_viewer::collect_viewer_images(
+                    &self.fixtures,
+                    self.root.iter().chain(&self.replies),
+                    ts,
+                    &origin,
+                ) {
                     cx.emit(ThreadPanelEvent::OpenImage {
                         channel,
-                        // Main-thread only, like the transcript's: the Arc only shares it.
-                        #[allow(clippy::arc_with_non_send_sync)]
-                        images: Arc::new(images),
+                        images,
                         index,
                     });
                 }
             }
             MessageAction::BlockAction { action, attachment } => {
                 let live = !self.fixtures.sample;
-                let channel = self.thread.as_ref().map(|(channel, _)| channel.clone());
-                let dispatch = channel
-                    .zip(self.message_at_mut(ts))
-                    .and_then(|(channel, message)| {
-                        BlockDispatch::new(message, &channel, action.clone(), attachment)
-                    })
-                    .filter(|_| live);
-                match dispatch {
-                    Some(dispatch) => self.post(MessageChange::BlockAction(dispatch), cx),
-                    None => crate::blockkit::log_button(&action, window, cx),
+                if let Some((channel, _)) = self.thread.clone()
+                    && let Some(message) = self.message_at_mut(ts).cloned()
+                    && let Some(change) = actions::dispatch_block_action(
+                        live, &message, &channel, action, attachment, window, cx,
+                    )
+                {
+                    self.post(change, cx);
                 }
             }
         }

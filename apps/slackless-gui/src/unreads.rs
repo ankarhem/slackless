@@ -667,16 +667,18 @@ impl Render for UnreadsView {
                             let show_esc_hint =
                                 focused == Some(ix) || (focused.is_none() && ix == 0);
                             card_view(
-                                &fixtures,
-                                ix,
-                                &groups[ix],
-                                collapsed.contains(&groups[ix].channel),
-                                focused == Some(ix),
-                                show_esc_hint,
-                                reply_input,
-                                open_thread.as_ref(),
-                                &saved,
-                                background,
+                                UnreadCardArgs {
+                                    fixtures: &fixtures,
+                                    ix,
+                                    group: &groups[ix],
+                                    collapsed: collapsed.contains(&groups[ix].channel),
+                                    focused: focused == Some(ix),
+                                    show_esc_hint,
+                                    reply_input,
+                                    open_thread: open_thread.as_ref(),
+                                    saved_set: &saved,
+                                    background,
+                                },
                                 cx,
                             )
                         }))
@@ -703,24 +705,36 @@ impl Render for UnreadsView {
     }
 }
 
-/// One conversation's edge-to-edge section matching official Slack's Unreads view:
-/// a tinted full-width section bar (collapse chevron, channel icon + bold name on left;
-/// message count, optional `Press [Esc] to` hint, and outline `Mark as Read` button on right)
-/// over full-width messages with date dividers, consecutive-message grouping, and reply chips.
-#[allow(clippy::too_many_arguments)]
-fn card_view(
-    fixtures: &Fixtures,
+struct UnreadCardArgs<'a> {
+    fixtures: &'a Fixtures,
     ix: usize,
-    group: &UnreadGroup,
+    group: &'a UnreadGroup,
     collapsed: bool,
     focused: bool,
     show_esc_hint: bool,
     reply_input: Option<Entity<TextareaState>>,
-    open_thread: Option<&(ChannelId, Ts)>,
-    saved_set: &HashSet<Ts>,
+    open_thread: Option<&'a (ChannelId, Ts)>,
+    saved_set: &'a HashSet<Ts>,
     background: Hsla,
-    cx: &mut Context<UnreadsView>,
-) -> AnyElement {
+}
+
+/// One conversation's edge-to-edge section matching official Slack's Unreads view:
+/// a tinted full-width section bar (collapse chevron, channel icon + bold name on left;
+/// message count, optional `Press [Esc] to` hint, and outline `Mark as Read` button on right)
+/// over full-width messages with date dividers, consecutive-message grouping, and reply chips.
+fn card_view(args: UnreadCardArgs<'_>, cx: &mut Context<UnreadsView>) -> AnyElement {
+    let UnreadCardArgs {
+        fixtures,
+        ix,
+        group,
+        collapsed,
+        focused,
+        show_esc_hint,
+        reply_input,
+        open_thread,
+        saved_set,
+        background,
+    } = args;
     let theme = cx.theme();
     let (border, muted, danger, danger_foreground, link, hover, strip_bg) = (
         theme.border,

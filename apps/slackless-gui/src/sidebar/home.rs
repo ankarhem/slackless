@@ -708,20 +708,29 @@ impl Sidebar {
             .child("Add channels")
             .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::BrowseChannels)))
     }
+}
 
+pub(super) struct NavRowArgs {
+    pub id: &'static str,
+    pub icon: IconName,
+    pub label: &'static str,
+    pub bold: bool,
+    pub active: bool,
+    pub trailing: Option<String>,
+}
+
+impl Sidebar {
     /// One of Home's shortcut rows above the sections (Unreads, Threads, …): outline icon and
     /// label, bold while it has something new, with an optional trailing count.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn nav_row(
-        &self,
-        id: &'static str,
-        icon: IconName,
-        label: &'static str,
-        bold: bool,
-        active: bool,
-        trailing: Option<String>,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
+    pub(super) fn nav_row(&self, args: NavRowArgs, cx: &Context<Self>) -> Stateful<Div> {
+        let NavRowArgs {
+            id,
+            icon,
+            label,
+            bold,
+            active,
+            trailing,
+        } = args;
         let theme = cx.theme();
         let color = if active {
             theme.sidebar_accent_foreground

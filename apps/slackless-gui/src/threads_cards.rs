@@ -298,23 +298,38 @@ fn format_name_list(names: &[String]) -> String {
     }
 }
 
-/// Render one interactive message row (root or reply) inside a thread card, with hover highlight,
-/// saved banner/tint, interactive reaction chips, floating hover toolbar, context menu, and
-/// inline edit mode.
-#[allow(clippy::too_many_arguments)]
-fn render_thread_message(
-    fixtures: &Arc<Fixtures>,
-    card: &ThreadCard,
-    msg: &Message,
+struct ThreadMsgRenderArgs<'a> {
+    fixtures: &'a Arc<Fixtures>,
+    card: &'a ThreadCard,
+    msg: &'a Message,
     key: String,
     msg_group: SharedString,
     grouped: Option<SharedString>,
     is_first_in_card: bool,
-    saved_set: &HashSet<Ts>,
-    editing: Option<&(ChannelId, Ts, Entity<TextareaState>)>,
-    links: &LinkHandler,
+    saved_set: &'a HashSet<Ts>,
+    editing: Option<&'a (ChannelId, Ts, Entity<TextareaState>)>,
+    links: &'a LinkHandler,
+}
+
+/// Render one interactive message row (root or reply) inside a thread card, with hover highlight,
+/// saved banner/tint, interactive reaction chips, floating hover toolbar, context menu, and
+/// inline edit mode.
+fn render_thread_message(
+    args: ThreadMsgRenderArgs<'_>,
     cx: &mut Context<ThreadsView>,
 ) -> AnyElement {
+    let ThreadMsgRenderArgs {
+        fixtures,
+        card,
+        msg,
+        key,
+        msg_group,
+        grouped,
+        is_first_in_card,
+        saved_set,
+        editing,
+        links,
+    } = args;
     let theme = cx.theme();
     let (bg, ring, hover_bg, saved_bg) = (
         theme.background,
@@ -422,6 +437,17 @@ fn render_thread_message(
     .into_any_element()
 }
 
+pub(super) struct ThreadCardRenderArgs<'a> {
+    pub fixtures: &'a Arc<Fixtures>,
+    pub ix: usize,
+    pub card: &'a ThreadCard,
+    pub active: bool,
+    pub expanded: bool,
+    pub saved_set: &'a HashSet<Ts>,
+    pub editing: Option<&'a (ChannelId, Ts, Entity<TextareaState>)>,
+    pub composer: &'a Entity<Composer>,
+}
+
 /// One followed thread group matching official Slack's Threads view:
 /// 1. Channel header + participants subtitle above the card (click opens thread in channel)
 /// 2. Rounded bordered card containing:
@@ -431,18 +457,20 @@ fn render_thread_message(
 ///      and full hover actions, reactions, context menu, and inline edit
 ///    - Bordered reply composer (`Composer` with `"Also send to #channel"` when active, or a
 ///      matching bordered `"Reply..."` box that activates & focuses it on click).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn card_view(
-    fixtures: &Arc<Fixtures>,
-    ix: usize,
-    card: &ThreadCard,
-    active: bool,
-    expanded: bool,
-    saved_set: &HashSet<Ts>,
-    editing: Option<&(ChannelId, Ts, Entity<TextareaState>)>,
-    composer: &Entity<Composer>,
+    args: ThreadCardRenderArgs<'_>,
     cx: &mut Context<ThreadsView>,
 ) -> AnyElement {
+    let ThreadCardRenderArgs {
+        fixtures,
+        ix,
+        card,
+        active,
+        expanded,
+        saved_set,
+        editing,
+        composer,
+    } = args;
     let theme = cx.theme();
     let (border, muted, background, link, danger, danger_foreground) = (
         theme.border,
@@ -497,16 +525,18 @@ pub(super) fn card_view(
     });
 
     let root_row = render_thread_message(
-        fixtures,
-        card,
-        &card.root,
-        format!("thread-{ix}-root-{}", card.root.ts.as_str()),
-        SharedString::from(format!("thread-{ix}-root")),
-        None,
-        true,
-        saved_set,
-        editing,
-        &links,
+        ThreadMsgRenderArgs {
+            fixtures,
+            card,
+            msg: &card.root,
+            key: format!("thread-{ix}-root-{}", card.root.ts.as_str()),
+            msg_group: SharedString::from(format!("thread-{ix}-root")),
+            grouped: None,
+            is_first_in_card: true,
+            saved_set,
+            editing,
+            links: &links,
+        },
         cx,
     );
 
@@ -543,16 +573,18 @@ pub(super) fn card_view(
             .map(|_| msg_group.clone());
         prev_reply = Some(reply);
         reply_rows.push(render_thread_message(
-            fixtures,
-            card,
-            reply,
-            format!("thread-{ix}-reply-{}-{}", r_ix, reply.ts.as_str()),
-            msg_group,
-            grouped,
-            false,
-            saved_set,
-            editing,
-            &links,
+            ThreadMsgRenderArgs {
+                fixtures,
+                card,
+                msg: reply,
+                key: format!("thread-{ix}-reply-{}-{}", r_ix, reply.ts.as_str()),
+                msg_group,
+                grouped,
+                is_first_in_card: false,
+                saved_set,
+                editing,
+                links: &links,
+            },
             cx,
         ));
     }

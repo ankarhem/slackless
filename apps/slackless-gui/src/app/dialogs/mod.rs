@@ -2,7 +2,7 @@
 
 mod channels;
 mod profile;
-mod storage;
+pub(super) mod storage;
 
 use super::*;
 
@@ -92,6 +92,11 @@ impl App {
             view.set_include_deleted(show_deleted_messages);
         });
         crate::zoom::set_strip_tracking_params(settings.strip_tracking_params);
+        crate::composer::set_outgoing_guard_prefs(
+            settings.strip_tracking_params,
+            settings.warn_before_sending_secrets,
+            cx,
+        );
         if self
             .saved_settings
             .as_ref()
@@ -399,6 +404,7 @@ impl App {
         window.refresh();
         self.push_self_state(cx);
         self.sync_badge(cx);
+        self.sync_window_title_in(window);
     }
 
     pub(super) fn user_menu_event(
@@ -498,7 +504,7 @@ impl App {
             && let Err(e) =
                 slackless_auth::SessionStore::new().and_then(|store| store.remove(&team.id))
         {
-            eprintln!("slackless: could not remove the stored session ({e})");
+            tracing::warn!(error = %e, "could not remove the stored session");
         }
         cx.quit();
     }
@@ -593,7 +599,7 @@ impl App {
     pub(super) fn open_image_viewer(
         &mut self,
         channel: ChannelId,
-        images: Arc<Vec<ViewerImage>>,
+        images: Rc<Vec<ViewerImage>>,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -902,110 +908,40 @@ impl App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (default_date, default_time) = default_custom_datetime();
-
-        let date_in = cx.new(|cx| {
-            let mut s = TextareaState::new(window, cx)
-                .placeholder("YYYY-MM-DD")
-                .auto_grow(1, 1);
-            s.set_value(default_date, window, cx);
-            s
-        });
-        let time_in = cx.new(|cx| {
-            let mut s = TextareaState::new(window, cx)
-                .placeholder("HH:MM (24-hour)")
-                .auto_grow(1, 1);
-            s.set_value(default_time, window, cx);
-            s
-        });
         let this = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let muted = cx.theme().muted_foreground;
-            let field = |label: &'static str, state: &Entity<TextareaState>| {
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(muted)
-                            .child(label),
-                    )
-                    .child(preferences::text_input_box(state, false, cx))
-            };
-            let this_save = this.clone();
-            let (d_in, t_in) = (date_in.clone(), time_in.clone());
-            let (ch, th, body) = (channel.clone(), thread_ts.clone(), text.clone());
-            dialog.title("Schedule message").w(px(400.)).child(
-                v_flex()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("Choose a local date and 24-hour time to send your message."),
-                    )
-                    .child(field("Date (YYYY-MM-DD)", &date_in))
-                    .child(field("Time (HH:MM)", &time_in))
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .pt_2()
-                            .child(
-                                preferences::form_button(
-                                    Button::new("sched-custom-cancel").outline().label("Cancel"),
-                                    cx,
-                                )
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                            )
-                            .child(
-                                preferences::form_button(
-                                    Button::new("sched-custom-ok")
-                                        .primary()
-                                        .label("Schedule message"),
-                                    cx,
-                                )
-                                .on_click(move |_, window, cx| {
-                                    let ds = d_in.read(cx).value().trim().to_owned();
-                                    let ts = t_in.read(cx).value().trim().to_owned();
-                                    let Some(post_at) = parse_local_schedule(&ds, &ts) else {
-                                        notify(
-                                            "Invalid date or time",
-                                            "Use YYYY-MM-DD and HH:MM in the future.",
-                                            window,
-                                            cx,
-                                        );
-                                        return;
-                                    };
-                                    if let Some(app) = this_save.upgrade() {
-                                        app.update(cx, |app, cx| {
-                                            if th.is_some() {
-                                                app.thread.update(cx, |panel, cx| {
-                                                    panel.clear_composer(window, cx);
-                                                });
-                                            } else {
-                                                app.composer.update(cx, |c, cx| {
-                                                    c.load_draft("", cx);
-                                                });
-                                            }
-                                            app.schedule_at(
-                                                ch.clone(),
-                                                th.clone(),
-                                                body.clone(),
-                                                post_at,
-                                                format!("on {ds} at {ts}"),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }
-                                    window.close_dialog(cx);
-                                }),
-                            ),
-                    ),
-            )
-        });
+        crate::later::open_custom_datetime_dialog(
+            "Schedule message",
+            "Choose a local date and 24-hour time to send your message.",
+            "Schedule message",
+            window,
+            cx,
+            move |post_at, ds, ts, window, cx| {
+                if let Some(app) = this.upgrade() {
+                    app.update(cx, |app, cx| {
+                        if thread_ts.is_some() {
+                            app.thread.update(cx, |panel, cx| {
+                                panel.clear_composer(window, cx);
+                            });
+                        } else {
+                            app.composer.update(cx, |c, cx| {
+                                c.load_draft("", cx);
+                            });
+                        }
+                        app.schedule_at(
+                            messaging::ScheduleSpec {
+                                channel: channel.clone(),
+                                thread_ts: thread_ts.clone(),
+                                text: text.clone(),
+                                post_at,
+                                when_label: format!("on {ds} at {ts}"),
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            },
+        );
     }
 
     /// The channel browser in a gpui-kit dialog (gpui-kit-guide section 7).

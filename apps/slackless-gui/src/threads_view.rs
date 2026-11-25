@@ -16,6 +16,7 @@
 //! / `SlashCommand(Invocation)`
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
@@ -29,14 +30,14 @@ use gpui_kit::gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
 use slackless_core::api::{MessageContent, ThreadsView as SlackThreads};
-use slackless_core::types::{ChannelId, ConversationKind, Message, Ts};
+use slackless_core::types::{ChannelId, Message, Ts};
 
 use crate::actions::{self, MessageAction};
 use crate::composer::{self, AlsoSendTarget, Composer, ComposerEvent, PendingAttachment};
 use crate::fixtures::Fixtures;
 use crate::image_viewer::{self, ImageOrigin, ViewerImage};
 use crate::messages::LinkTarget;
-use crate::slash::{Invocation, SHRUG, SlashKind};
+use crate::slash::{Invocation, SlashKind};
 use crate::threads_cards::{ThreadCard, card_view, remote_cards};
 
 pub enum ThreadsEvent {
@@ -143,11 +144,8 @@ impl ThreadsView {
                     }
                     ComposerEvent::SlashCommand(invocation) => {
                         match invocation.command.map(|command| command.kind) {
-                            Some(SlashKind::Shrug) if invocation.args.is_empty() => {
-                                this.reply(MessageContent::plain(SHRUG), cx);
-                            }
                             Some(SlashKind::Shrug) => {
-                                let text = format!("{} {SHRUG}", invocation.args);
+                                let text = crate::composer::format_shrug(&invocation.args);
                                 this.reply(MessageContent::plain(text), cx);
                             }
                             _ => cx.emit(ThreadsEvent::SlashCommand(invocation.clone())),
@@ -181,19 +179,7 @@ impl ThreadsView {
         let target = self
             .active
             .and_then(|ix| self.cards.get(ix))
-            .and_then(|card| {
-                self.fixtures
-                    .conversation(&card.channel)
-                    .map(|conversation| match conversation.kind() {
-                        ConversationKind::Im | ConversationKind::Mpim => {
-                            AlsoSendTarget::DirectMessage
-                        }
-                        kind => AlsoSendTarget::Channel {
-                            name: conversation.name.clone().unwrap_or_default().into(),
-                            private: kind == ConversationKind::PrivateChannel,
-                        },
-                    })
-            });
+            .and_then(|card| AlsoSendTarget::for_channel(&self.fixtures, &card.channel));
         self.composer
             .update(cx, |composer, cx| composer.set_also_send(target, cx));
     }
@@ -434,22 +420,17 @@ impl ThreadsView {
         thread_ts: &Ts,
         ts: &Ts,
         origin: &ImageOrigin,
-    ) -> Option<(Vec<ViewerImage>, usize)> {
+    ) -> Option<(Rc<Vec<ViewerImage>>, usize)> {
         let card = self
             .cards
             .iter()
             .find(|c| c.channel == *channel && c.thread_ts == *thread_ts)?;
-        let mut images = Vec::new();
-        let mut index = None;
-        for msg in std::iter::once(&card.root).chain(&card.replies) {
-            for entry in image_viewer::message_images(&self.fixtures, msg) {
-                if msg.ts == *ts && entry.origin == *origin && index.is_none() {
-                    index = Some(images.len());
-                }
-                images.push(entry.image);
-            }
-        }
-        index.map(|ix| (images, ix))
+        image_viewer::collect_viewer_images(
+            &self.fixtures,
+            std::iter::once(&card.root).chain(&card.replies),
+            ts,
+            origin,
+        )
     }
 
     /// Show `cards` (the store derivation fallback) unless Slack's own list already landed.
@@ -758,14 +739,16 @@ impl Render for ThreadsView {
                 .expanded
                 .contains(&(card.channel.clone(), card.thread_ts.clone()));
             inner = inner.child(card_view(
-                &self.fixtures,
-                *ix,
-                card,
-                self.active == Some(*ix),
-                expanded,
-                &self.saved,
-                editing.as_ref(),
-                &self.composer,
+                crate::threads_cards::ThreadCardRenderArgs {
+                    fixtures: &self.fixtures,
+                    ix: *ix,
+                    card,
+                    active: self.active == Some(*ix),
+                    expanded,
+                    saved_set: &self.saved,
+                    editing: editing.as_ref(),
+                    composer: &self.composer,
+                },
                 cx,
             ));
         }

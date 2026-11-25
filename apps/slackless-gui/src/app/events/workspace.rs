@@ -31,6 +31,7 @@ impl App {
                 if let Some(slot) = self.bg_counts.get_mut(ws_index) {
                     *slot = map;
                 }
+                self.sync_badge(cx);
                 cx.notify();
             }
             Event::ActivityView { feed } => {
@@ -39,6 +40,7 @@ impl App {
                     if let Some(slot) = self.bg_activity_unread.get_mut(ws_index) {
                         *slot = unread;
                     }
+                    self.sync_badge(cx);
                     cx.notify();
                 }
             }
@@ -150,6 +152,7 @@ impl App {
                 if let Some(slot) = self.bg_counts.get_mut(ws_index) {
                     apply(slot);
                 }
+                self.sync_badge(cx);
                 cx.notify();
             }
             Event::MessagePosted { channel, message } => {
@@ -214,6 +217,7 @@ impl App {
                         if let Some(slot) = self.bg_counts.get_mut(ws_index) {
                             bump(slot);
                         }
+                        self.sync_badge(cx);
                         cx.notify();
                     }
                 }

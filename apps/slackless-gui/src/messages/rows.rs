@@ -306,13 +306,15 @@ pub(super) fn transcript_row(
         None
     } else {
         let av = avatar_gutter(
-            fixtures,
-            message,
-            &author_key,
-            &author,
-            &key,
-            avatar_size,
-            Some(&handler),
+            AvatarGutterSpec {
+                fixtures,
+                message,
+                author_key: &author_key,
+                author: &author,
+                key: &key,
+                size: avatar_size,
+                handler: Some(&handler),
+            },
             cx,
         );
         Some(if deleted_ghost {
@@ -711,13 +713,15 @@ pub fn message_row_linked(
             .child(format_clock(&message.ts))
             .into_any_element(),
         None => avatar_gutter(
-            fixtures,
-            message,
-            &author_key,
-            &author,
-            &key,
-            avatar_size,
-            handler,
+            AvatarGutterSpec {
+                fixtures,
+                message,
+                author_key: &author_key,
+                author: &author,
+                key: &key,
+                size: avatar_size,
+                handler,
+            },
             cx,
         ),
     };
@@ -791,44 +795,56 @@ pub(crate) fn editing_avatar(
     let author = author_name(message, fixtures);
     let avatar_size = message_avatar_size(crate::preferences::display_prefs(cx).compact);
     avatar_gutter(
-        fixtures,
-        message,
-        &key_id,
-        &author,
-        key,
-        avatar_size,
-        None,
+        AvatarGutterSpec {
+            fixtures,
+            message,
+            author_key: &key_id,
+            author: &author,
+            key,
+            size: avatar_size,
+            handler: None,
+        },
         cx,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn avatar_gutter(
-    fixtures: &Fixtures,
-    message: &Message,
-    author_key: &str,
-    author: &str,
-    key: &str,
+struct AvatarGutterSpec<'a> {
+    fixtures: &'a Fixtures,
+    message: &'a Message,
+    author_key: &'a str,
+    author: &'a str,
+    key: &'a str,
     size: f32,
-    handler: Option<&actions::ActionHandler>,
-    cx: &App,
-) -> AnyElement {
+    handler: Option<&'a actions::ActionHandler>,
+}
+
+fn avatar_gutter(spec: AvatarGutterSpec<'_>, cx: &App) -> AnyElement {
     let avatar = crate::avatars::with_external_badge(
-        fixtures,
-        message.user.as_ref(),
-        crate::avatars::author_avatar(fixtures, message, author_key, author, size),
-        size,
+        spec.fixtures,
+        spec.message.user.as_ref(),
+        crate::avatars::author_avatar(
+            spec.fixtures,
+            spec.message,
+            spec.author_key,
+            spec.author,
+            spec.size,
+        ),
+        spec.size,
         cx.theme().background,
     );
-    let top = if size < AVATAR_SIZE { 3. } else { AVATAR_TOP };
+    let top = if spec.size < AVATAR_SIZE {
+        3.
+    } else {
+        AVATAR_TOP
+    };
     div()
         .flex_none()
         .mt(px(top))
         .child(profile_link(
             avatar,
-            format!("{key}-avatar"),
-            message.user.as_ref(),
-            handler,
+            format!("{}-avatar", spec.key),
+            spec.message.user.as_ref(),
+            spec.handler,
         ))
         .into_any_element()
 }

@@ -219,12 +219,5 @@ fn escape_into(out: &mut String, text: &str) {
 }
 
 pub(super) fn unescape(text: &str) -> Cow<'_, str> {
-    if !text.contains('&') {
-        return Cow::Borrowed(text);
-    }
-    Cow::Owned(
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&"),
-    )
+    crate::messages::unescape_cow(text)
 }

@@ -36,17 +36,20 @@ fn popout_message_actions_mutate_state_and_forward_commands(cx: &mut TestAppCont
         let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
         let win = cx.new(|cx| {
             PopoutWindow::new(
-                PopoutKind::Conversation {
-                    channel: channel.clone(),
-                    source: list.downgrade(),
-                    on_jump,
+                PopoutRequest {
+                    kind: PopoutKind::Conversation {
+                        channel: channel.clone(),
+                        source: list.downgrade(),
+                        on_jump,
+                    },
+                    title: "# general".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: None,
+                    team: None,
+                    send,
+                    later_sync: Some((later.downgrade(), 0)),
+                    display_id: None,
                 },
-                "# general".to_owned(),
-                fixtures.clone(),
-                None,
-                None,
-                send,
-                Some((later.downgrade(), 0)),
                 window,
                 cx,
             )
@@ -191,17 +194,20 @@ fn popout_emoji_picker_occludes_scroll_wheel_from_messages(cx: &mut TestAppConte
         let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
         let win = cx.new(|cx| {
             let mut w = PopoutWindow::new(
-                PopoutKind::Conversation {
-                    channel: channel.clone(),
-                    source: list.downgrade(),
-                    on_jump,
+                PopoutRequest {
+                    kind: PopoutKind::Conversation {
+                        channel: channel.clone(),
+                        source: list.downgrade(),
+                        on_jump,
+                    },
+                    title: "# general".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: None,
+                    team: None,
+                    send,
+                    later_sync: None,
+                    display_id: None,
                 },
-                "# general".to_owned(),
-                fixtures.clone(),
-                None,
-                None,
-                send,
-                None,
                 window,
                 cx,
             );
@@ -317,17 +323,20 @@ fn huddle_popout_thread_starts_empty_filters_root_and_uses_composer(cx: &mut Tes
     let win_handle = cx.add_window(|window, cx| {
         let win = cx.new(|cx| {
             PopoutWindow::new(
-                PopoutKind::Huddle {
-                    source: dock.downgrade(),
-                    on_jump,
-                    on_open_canvas,
+                PopoutRequest {
+                    kind: PopoutKind::Huddle {
+                        source: dock.downgrade(),
+                        on_jump,
+                        on_open_canvas,
+                    },
+                    title: "Huddle".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: None,
+                    team: None,
+                    send,
+                    later_sync: None,
+                    display_id: None,
                 },
-                "Huddle".to_owned(),
-                fixtures.clone(),
-                None,
-                None,
-                send,
-                None,
                 window,
                 cx,
             )
@@ -425,4 +434,136 @@ fn huddle_popout_thread_starts_empty_filters_root_and_uses_composer(cx: &mut Tes
             );
         });
     });
+}
+
+#[gpui::test]
+fn popout_mark_unread_edit_mrkdwn_refresh_edits_and_readonly_skips_composer(
+    cx: &mut TestAppContext,
+) {
+    let fixtures = Arc::new(crate::fixtures::load());
+    let channel = ChannelId::from("C0GENERAL");
+    let sent: Arc<Mutex<Vec<Command>>> = Arc::new(Mutex::new(Vec::new()));
+    let sent_cb = sent.clone();
+    let send: CommandForward = Arc::new(move |cmd| {
+        sent_cb.lock().unwrap().push(cmd);
+    });
+    let on_jump: JumpHandler = Rc::new(|_, _, _, _| {});
+
+    cx.update(gpui_kit::init);
+    let later = cx.update(LaterView::new);
+    let mut conv_slot: Option<Entity<PopoutWindow>> = None;
+    let mut readonly_slot: Option<Entity<PopoutWindow>> = None;
+    let vcx = cx.add_window(|window, cx| {
+        let list = MessageList::new(fixtures.clone(), channel.clone(), window, cx);
+        let conv = cx.new(|cx| {
+            PopoutWindow::new(
+                PopoutRequest {
+                    kind: PopoutKind::Conversation {
+                        channel: channel.clone(),
+                        source: list.downgrade(),
+                        on_jump: on_jump.clone(),
+                    },
+                    title: "# general".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: None,
+                    team: None,
+                    send: send.clone(),
+                    later_sync: None,
+                    display_id: None,
+                },
+                window,
+                cx,
+            )
+        });
+        let readonly = cx.new(|cx| {
+            PopoutWindow::new(
+                PopoutRequest {
+                    kind: PopoutKind::Later {
+                        source: later.downgrade(),
+                        on_jump,
+                    },
+                    title: "Saved".to_owned(),
+                    fixtures: fixtures.clone(),
+                    store: None,
+                    team: None,
+                    send,
+                    later_sync: None,
+                    display_id: None,
+                },
+                window,
+                cx,
+            )
+        });
+        conv_slot = Some(conv.clone());
+        readonly_slot = Some(readonly);
+        gpui_kit::component::Root::new(conv, window, cx)
+    });
+    let conv = conv_slot.unwrap();
+    let readonly = readonly_slot.unwrap();
+    let mut vcx = gpui_kit::VisualTestContext::from_window(vcx.into(), cx);
+
+    // 1. Read-only popouts do NOT allocate Composer or EmojiPicker.
+    vcx.read(|cx| {
+        let ro = readonly.read(cx);
+        assert!(ro.composer.is_none());
+        assert!(ro.emoji_picker.is_none());
+        let co = conv.read(cx);
+        assert!(co.composer.is_some());
+        assert!(co.emoji_picker.is_some());
+    });
+
+    vcx.update(|window, cx| {
+        conv.update(cx, |win, cx| {
+            // 2. MarkUnread on the first message sends ts_just_before (strictly before clicked ts).
+            let first = win.messages[0].clone();
+            win.handle_message_action(
+                channel.clone(),
+                first.clone(),
+                MessageAction::MarkUnread,
+                window,
+                cx,
+            );
+            // 3. start_edit preserves raw mrkdwn formatting & mentions rather than plain_text.
+            let formatted = Message {
+                ts: Ts::from("1700000999.000100"),
+                text: "*bold* cc <@U0BOB>".to_owned(),
+                ..Default::default()
+            };
+            win.start_edit(channel.clone(), &formatted, window, cx);
+            let edit_val = win.editing.as_ref().unwrap().2.read(cx).value().to_string();
+            assert_eq!(edit_val, "*bold* cc <@U0BOB>");
+            win.editing = None;
+
+            // 4. apply_refreshed_messages detects remote edits/reactions even when len & last ts match!
+            let mut edited_batch = win.messages.clone();
+            edited_batch[0].text = "Remotely edited!".to_owned();
+            win.apply_refreshed_messages(edited_batch, cx);
+            assert_eq!(win.messages[0].text, "Remotely edited!");
+
+            // 5. send_content strips tracking params and converts emoticons.
+            let content = crate::composer::content_of(
+                "hi :) https://example.com/?utm_source=test&keep=1",
+                &win.fixtures,
+            );
+            win.send_content(content, cx);
+        });
+    });
+
+    let cmds = sent.lock().unwrap();
+    match &cmds[0] {
+        Command::MarkRead { ts, .. } => {
+            let first_ts = vcx.read(|cx| conv.read(cx).messages[0].ts.clone());
+            assert_eq!(*ts, crate::threads_cards::ts_just_before(&first_ts));
+            assert_ne!(*ts, first_ts);
+        }
+        other => panic!("expected MarkRead for MarkUnread, got {other:?}"),
+    }
+    match cmds.last().unwrap() {
+        Command::SendMessage { content, .. } => {
+            assert!(content.text.contains(":slightly_smiling_face:"));
+            assert!(!content.text.contains("utm_source"));
+            assert!(content.text.contains("keep=1"));
+        }
+        other => panic!("expected SendMessage, got {other:?}"),
+    }
 }

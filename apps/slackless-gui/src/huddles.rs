@@ -19,38 +19,15 @@ use gpui_kit::gpui::{
     IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
     div, linear_color_stop, linear_gradient, px, rgb,
 };
+use slackless_core::domain::huddles::parse_huddle_room;
 use slackless_core::store::Store;
-use slackless_core::types::{
-    ChannelId, ConversationKind, Message, MessageSubtype, TeamId, Ts, UserId,
-};
+use slackless_core::types::time::format_huddle_duration;
+use slackless_core::types::{ChannelId, ConversationKind, MessageSubtype, TeamId, Ts, UserId};
 
 use crate::avatars::user_chip;
-use crate::blockkit::serde_json::Value;
 use crate::fixtures::Fixtures;
 use crate::huddle;
 use crate::messages::list_stamp;
-
-fn format_huddle_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        let m = secs / 60;
-        let s = secs % 60;
-        if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m {s}s")
-        }
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h {m}m")
-        }
-    }
-}
 
 /// Trail messages scanned per conversation in the live derivation.
 const SCAN_LIMIT: usize = 200;
@@ -818,11 +795,6 @@ impl Render for HuddlesView {
     }
 }
 
-/// The `room` object of a `huddle_thread` trail message.
-fn room_of(message: &Message) -> Option<&Value> {
-    message.extra.get("room")
-}
-
 /// Recent huddles from the stored `huddle_thread` trail messages, newest first.
 pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
     let Ok(conversations) = store.conversations(team) else {
@@ -841,37 +813,10 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
             if row.deleted || message.subtype != Some(MessageSubtype::HuddleThread) {
                 continue;
             }
-            let room = room_of(message);
-            let has_active_participants = room
-                .and_then(|room| room.get("participants"))
-                .and_then(Value::as_array)
-                .is_some_and(|ids| !ids.is_empty());
-            let live = room
-                .and_then(|room| room.get("has_ended"))
-                .and_then(Value::as_bool)
-                .is_some_and(|ended| !ended)
-                && has_active_participants;
-            let participants = room
-                .and_then(|room| {
-                    room.get(if live {
-                        "participants"
-                    } else {
-                        "participant_history"
-                    })
-                    .or_else(|| room.get("participants"))
-                })
-                .and_then(Value::as_array)
-                .map_or_else(Vec::new, |ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
-                        .map(UserId::from)
-                        .collect()
-                });
-            let duration_secs = room.and_then(|room| {
-                let start = room.get("date_start")?.as_u64()?;
-                let end = room.get("date_end")?.as_u64()?;
-                (end > start).then_some(end - start)
-            });
+            let (live, participants, duration_secs) = match parse_huddle_room(message) {
+                Some(room) => (room.live, room.participants, room.duration_secs),
+                None => (false, Vec::new(), None),
+            };
             let (transcript_call_id, transcript_lines) = transcript_counts
                 .get(&(conversation.id.clone(), message.ts.clone()))
                 .map_or((None, 0), |(cid, count)| (Some(cid.clone()), *count));
@@ -894,7 +839,7 @@ pub fn store_huddles(store: &Store, team: &TeamId) -> Vec<RecentHuddle> {
 #[cfg(test)]
 mod tests {
     use super::store_huddles;
-    use crate::blockkit::serde_json::json;
+    use serde_json::json;
     use slackless_core::store::Store;
     use slackless_core::types::{
         ChannelId, Conversation, Message, MessageSubtype, TeamId, Ts, UserId,

@@ -297,18 +297,16 @@ impl App {
     /// shows, and the profile's back chevron returns to the thread.
     pub(in crate::app) fn open_profile(&mut self, user: UserId, cx: &mut Context<Self>) {
         self.close_hover_card(cx);
-        let over_thread = self.thread_open;
+        let over_thread = matches!(
+            self.right_pane,
+            RightPane::Thread | RightPane::Profile { over_thread: true }
+        );
         if !self.fixtures.sample {
             self.bridge.send(Command::FetchUserProfile(user.clone()));
         }
         self.profile
             .update(cx, |profile, cx| profile.open(user, over_thread, cx));
-        self.profile_open = true;
-        if over_thread {
-            self.messages
-                .update(cx, |list, cx| list.set_open_thread(None, cx));
-        }
-        self.pins_open = false;
+        self.set_right_pane(RightPane::Profile { over_thread }, cx);
         cx.notify();
     }
 

@@ -36,13 +36,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::input::{InputEditsEvent, InputState, TextareaState};
+use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Image, Pixels,
-    Point, RenderImage, SharedString, Subscription, Task, Window,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, Focusable as _, Image,
+    ParentElement as _, Pixels, Point, RenderImage, SharedString, Styled as _, Subscription, Task,
+    Window, div, px,
 };
 use slackless_core::api::{GifItem, MessageContent};
 use slackless_core::huddle::{AudioClipRecorder, VideoClipRecorder};
-use slackless_core::types::Message;
+use slackless_core::types::{ChannelId, Message};
 
 use crate::drafts::SendLater;
 use crate::editor::{Atom, Editor, from_mrkdwn, from_rich_text};
@@ -140,6 +142,271 @@ pub enum AlsoSendTarget {
     Channel { name: SharedString, private: bool },
     /// "Also send as direct message".
     DirectMessage,
+}
+
+impl AlsoSendTarget {
+    /// Derive the "Also send" target label for `channel` from `fixtures`.
+    pub fn for_channel(fixtures: &Fixtures, channel: &ChannelId) -> Option<Self> {
+        use slackless_core::types::ConversationKind;
+        fixtures
+            .conversation(channel)
+            .map(|conversation| match conversation.kind() {
+                ConversationKind::Im | ConversationKind::Mpim => Self::DirectMessage,
+                kind => Self::Channel {
+                    name: conversation.name.clone().unwrap_or_default().into(),
+                    private: kind == ConversationKind::PrivateChannel,
+                },
+            })
+    }
+}
+
+/// Format a `/shrug` invocation body with `SHRUG`.
+pub(crate) fn format_shrug(args: &str) -> String {
+    if args.is_empty() {
+        crate::slash::SHRUG.to_owned()
+    } else {
+        format!("{args} {}", crate::slash::SHRUG)
+    }
+}
+
+/// Outgoing message privacy/safety preferences cached as a GPUI global so both the main window
+/// and popped-out conversation/thread/huddle windows enforce the same send pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutgoingGuardPrefs {
+    pub strip_tracking_params: bool,
+    pub warn_before_sending_secrets: bool,
+}
+
+impl Default for OutgoingGuardPrefs {
+    fn default() -> Self {
+        Self {
+            strip_tracking_params: true,
+            warn_before_sending_secrets: true,
+        }
+    }
+}
+
+impl gpui_kit::gpui::Global for OutgoingGuardPrefs {}
+
+pub(crate) fn outgoing_guard_prefs(cx: &App) -> OutgoingGuardPrefs {
+    cx.try_global::<OutgoingGuardPrefs>()
+        .copied()
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_outgoing_guard_prefs(
+    strip_tracking_params: bool,
+    warn_before_sending_secrets: bool,
+    cx: &mut App,
+) {
+    cx.set_global(OutgoingGuardPrefs {
+        strip_tracking_params,
+        warn_before_sending_secrets,
+    });
+}
+
+/// Convert common typed emoticons outside inline/fenced code spans into Slack `:shortcode:`
+/// emoji when Preferences > Appearance > Convert emoticons is enabled (`F-SHELL-091`).
+pub(crate) fn convert_emoticons(text: &str) -> String {
+    const MAP: [(&str, &str); 12] = [
+        (":-)", ":slightly_smiling_face:"),
+        (":)", ":slightly_smiling_face:"),
+        (":-D", ":smiley:"),
+        (":D", ":smiley:"),
+        (":-(", ":disappointed:"),
+        (":(", ":disappointed:"),
+        (";-)", ":wink:"),
+        (";)", ":wink:"),
+        (":-P", ":stuck_out_tongue:"),
+        (":P", ":stuck_out_tongue:"),
+        ("<3", ":heart:"),
+        (":/", ":confused:"),
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('`') {
+            in_code = !in_code;
+            out.push('`');
+            rest = after;
+            continue;
+        }
+        if !in_code {
+            let at_boundary = out
+                .chars()
+                .last()
+                .is_none_or(|c| c.is_whitespace() || c == '(');
+            if at_boundary
+                && let Some((pat, rep)) = MAP.iter().find(|(pat, _)| {
+                    rest.strip_prefix(*pat).is_some_and(|after| {
+                        after
+                            .chars()
+                            .next()
+                            .is_none_or(|c| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?'))
+                    })
+                })
+            {
+                out.push_str(rep);
+                rest = &rest[pat.len()..];
+                continue;
+            }
+        }
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// Strip tracking parameters (`utm_*`, `fbclid`, `gclid`, etc.) from outgoing text and
+/// rich-text link elements.
+pub(crate) fn strip_tracking_params_in_content(content: &mut MessageContent) {
+    if !content.text.is_empty() {
+        let cleaned = slackless_core::strip_tracking_params_in_text(&content.text);
+        if cleaned != content.text {
+            content.text = cleaned;
+        }
+    }
+    for block in &mut content.blocks {
+        if let slackless_core::types::Block::RichText(rich) = block {
+            for container in &mut rich.elements {
+                let elements = match container {
+                    slackless_core::types::RichTextContainer::Section(s) => &mut s.elements,
+                    slackless_core::types::RichTextContainer::Quote(q) => &mut q.elements,
+                    slackless_core::types::RichTextContainer::Preformatted(p) => &mut p.elements,
+                    slackless_core::types::RichTextContainer::List(list) => {
+                        for item in &mut list.elements {
+                            if let slackless_core::types::RichTextContainer::Section(s) = item {
+                                for el in &mut s.elements {
+                                    if let slackless_core::types::RichTextElement::Link(link) = el {
+                                        link.url = slackless_core::strip_tracking_params(&link.url);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    slackless_core::types::RichTextContainer::Header(_)
+                    | slackless_core::types::RichTextContainer::Divider(_)
+                    | slackless_core::types::RichTextContainer::Unknown { .. } => continue,
+                };
+                for el in elements {
+                    if let slackless_core::types::RichTextElement::Link(link) = el {
+                        link.url = slackless_core::strip_tracking_params(&link.url);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply shared outgoing message transforms (emoticon conversion + tracking-param stripping)
+/// respecting active display & privacy preferences.
+pub(crate) fn apply_outgoing_transforms(
+    content: &mut MessageContent,
+    fixtures: &Fixtures,
+    cx: &App,
+) {
+    if crate::preferences::display_prefs(cx).convert_emoticons {
+        let converted = convert_emoticons(&content.text);
+        if converted != content.text {
+            let attachments = std::mem::take(&mut content.attachments);
+            *content = content_of(&converted, fixtures);
+            content.attachments = attachments;
+        }
+    }
+    if outgoing_guard_prefs(cx).strip_tracking_params {
+        strip_tracking_params_in_content(content);
+    }
+}
+
+/// Open a confirmation dialog when secret-like tokens are detected in an outgoing message.
+pub(crate) fn confirm_secret_send_dialog(
+    matches: Vec<slackless_core::SecretMatch>,
+    window: &mut Window,
+    cx: &mut App,
+    on_send: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::button::{Button, ButtonVariants as _};
+    use gpui_kit::gpui::FontWeight;
+
+    let on_send = Rc::new(on_send);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let theme = cx.theme();
+        let (muted, danger, border, bg) = (
+            theme.muted_foreground,
+            theme.danger,
+            theme.border,
+            theme.secondary.opacity(0.45),
+        );
+        let on_send = on_send.clone();
+        dialog
+            .title("Possible secret detected")
+            .w(px(460.))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("This message appears to contain sensitive credentials. Sending it to Slack cannot be undone."),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1p5()
+                            .p_2p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .bg(bg)
+                            .children(matches.iter().map(|m| {
+                                h_flex()
+                                    .justify_between()
+                                    .gap_2()
+                                    .text_xs()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(danger)
+                                            .child(m.kind),
+                                    )
+                                    .child(div().text_color(muted).child(m.preview.clone()))
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_1()
+                            .child(
+                                crate::preferences::form_button(
+                                    Button::new("popout-secret-cancel")
+                                        .outline()
+                                        .label("Cancel"),
+                                    cx,
+                                )
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            )
+                            .child(
+                                crate::preferences::form_button(
+                                    Button::new("popout-secret-send")
+                                        .danger()
+                                        .label("Send anyway"),
+                                    cx,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    on_send(window, cx);
+                                }),
+                            ),
+                    ),
+            )
+    });
 }
 
 /// Builds the strip Slack draws inside the composer's frame above the formatting bar, its
@@ -550,5 +817,5 @@ impl Composer {
 }
 
 pub(crate) fn format_bytes(bytes: usize) -> String {
-    crate::preferences::format_bytes(bytes as u64)
+    slackless_core::types::time::format_bytes(bytes as u64)
 }

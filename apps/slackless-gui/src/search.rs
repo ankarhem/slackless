@@ -94,6 +94,8 @@ pub struct SearchView {
     /// Instant local FTS5 hits.
     local_results: Vec<StoredMessage>,
     local_error: Option<String>,
+    /// Monotonic counter so stale async local FTS5 queries are discarded when a newer query starts.
+    local_gen: u64,
     /// Instant local FTS5 huddle transcript hits (text-only; EN + SV diacritic-folding).
     transcript_results: Vec<HuddleTranscriptSegment>,
     /// Opt-in remote Slack message hits (`search.modules.messages`).
@@ -141,6 +143,7 @@ impl SearchView {
             remote_auto: false,
             local_results: Vec::new(),
             local_error: None,
+            local_gen: 0,
             transcript_results: Vec::new(),
             remote_messages: Vec::new(),
             remote_messages_total: 0,
@@ -208,7 +211,7 @@ impl SearchView {
             SearchSource::Local
         };
         self.clear_remote();
-        self.run_local();
+        self.run_local(cx);
         if self.source == SearchSource::Remote && !self.query.is_empty() {
             self.request_remote_messages(1, cx);
         }
@@ -230,67 +233,87 @@ impl SearchView {
         self.remote_files_error = None;
     }
 
-    fn run_local(&mut self) {
+    fn run_local(&mut self, cx: &mut Context<Self>) {
+        self.local_gen = self.local_gen.wrapping_add(1);
+        let generation = self.local_gen;
         self.local_results.clear();
         self.transcript_results.clear();
         self.local_error = None;
-        if let (Some(archive), false) = (&self.archive, self.query.is_empty()) {
-            let mut parsed = SearchQuery::parse(&self.query);
-            parsed
-                .filters
-                .in_channels
-                .extend(self.filters.in_channels.iter().cloned());
+        let (Some(archive), false) = (self.archive.clone(), self.query.is_empty()) else {
+            return;
+        };
+        let mut parsed = SearchQuery::parse(&self.query);
+        parsed
+            .filters
+            .in_channels
+            .extend(self.filters.in_channels.iter().cloned());
+        parsed
+            .filters
+            .exclude_channels
+            .extend(self.filters.exclude_channels.iter().cloned());
+        if parsed.filters.in_channels.is_empty() {
             parsed
                 .filters
                 .exclude_channels
-                .extend(self.filters.exclude_channels.iter().cloned());
-            if parsed.filters.in_channels.is_empty() {
-                parsed
-                    .filters
-                    .exclude_channels
-                    .extend(self.excluded_channels.iter().cloned());
-            }
-            parsed
-                .filters
-                .from_users
-                .extend(self.filters.from_users.iter().cloned());
-            parsed
-                .filters
-                .exclude_users
-                .extend(self.filters.exclude_users.iter().cloned());
-            parsed.filters.has.extend(self.filters.has.iter().copied());
-            if parsed.filters.includes_user.is_none() {
-                parsed.filters.includes_user = self.filters.includes_user.clone();
-            }
-            parsed.filters.threads_only |= self.filters.threads_only;
-            parsed.filters.include_deleted |= self.filters.include_deleted || self.include_deleted;
-            let (found, transcripts) = match archive.lock() {
-                Ok(store) => {
-                    let msgs = store
-                        .search_sorted(&self.workspace, &parsed, self.sort, RESULT_LIMIT)
-                        .map_err(|e| e.to_string());
-                    let trs = store
-                        .search_huddle_transcripts(
-                            &self.workspace,
-                            &self.query,
-                            None,
-                            None,
-                            RESULT_LIMIT,
-                        )
-                        .unwrap_or_default();
-                    (msgs, trs)
-                }
-                Err(_) => (
-                    Err("the local archive is unavailable".to_owned()),
-                    Vec::new(),
-                ),
-            };
-            self.transcript_results = transcripts;
-            match found {
-                Ok(results) => self.local_results = results,
-                Err(e) => self.local_error = Some(e),
-            }
+                .extend(self.excluded_channels.iter().cloned());
         }
+        parsed
+            .filters
+            .from_users
+            .extend(self.filters.from_users.iter().cloned());
+        parsed
+            .filters
+            .exclude_users
+            .extend(self.filters.exclude_users.iter().cloned());
+        parsed.filters.has.extend(self.filters.has.iter().copied());
+        if parsed.filters.includes_user.is_none() {
+            parsed.filters.includes_user = self.filters.includes_user.clone();
+        }
+        parsed.filters.threads_only |= self.filters.threads_only;
+        parsed.filters.include_deleted |= self.filters.include_deleted || self.include_deleted;
+        let workspace = self.workspace.clone();
+        let sort = self.sort;
+        let query = self.query.clone();
+        cx.spawn(async move |this, cx| {
+            let (found, transcripts) = cx
+                .background_executor()
+                .spawn(async move {
+                    match archive.lock() {
+                        Ok(store) => {
+                            let msgs = store
+                                .search_sorted(&workspace, &parsed, sort, RESULT_LIMIT)
+                                .map_err(|e| e.to_string());
+                            let trs = store
+                                .search_huddle_transcripts(
+                                    &workspace,
+                                    &query,
+                                    None,
+                                    None,
+                                    RESULT_LIMIT,
+                                )
+                                .unwrap_or_default();
+                            (msgs, trs)
+                        }
+                        Err(_) => (
+                            Err("the local archive is unavailable".to_owned()),
+                            Vec::new(),
+                        ),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.local_gen != generation {
+                    return;
+                }
+                view.transcript_results = transcripts;
+                match found {
+                    Ok(results) => view.local_results = results,
+                    Err(e) => view.local_error = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn api_sort(&self) -> ApiSearchSort {
@@ -453,7 +476,7 @@ impl SearchView {
             return;
         }
         self.sort = sort;
-        self.run_local();
+        self.run_local(cx);
         self.clear_remote();
         if self.tab == SearchTab::Files {
             self.request_remote_files(1, cx);
@@ -1602,7 +1625,7 @@ pub fn fixture_archive(fixtures: &Fixtures) -> Option<SharedStore> {
     match seed() {
         Ok(store) => Some(Arc::new(Mutex::new(store))),
         Err(e) => {
-            eprintln!("slackless: could not build the fixture search archive ({e})");
+            tracing::warn!(error = %e, "could not build the fixture search archive");
             None
         }
     }
@@ -1710,15 +1733,23 @@ mod tests {
         view.update(cx, |v, cx| {
             v.set_excluded_channels("#alerts-bot,  ");
             v.run("canary".into(), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
             assert_eq!(v.local_results.len(), 1);
             assert_eq!(v.local_results[0].channel, ChannelId::from("C0ENG"));
+        });
 
-            // Explicit `in_channels` overrides default excluded_channels.
+        // Explicit `in_channels` overrides default excluded_channels.
+        view.update(cx, |v, cx| {
             let filters = SearchFilters {
                 in_channels: vec!["alerts-bot".into()],
                 ..Default::default()
             };
             v.run_with_filters("canary".into(), filters, cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
             assert_eq!(v.local_results.len(), 1);
             assert_eq!(v.local_results[0].channel, ChannelId::from("C0NOISE"));
 
@@ -1875,6 +1906,9 @@ mod tests {
             // 5. Huddle transcripts tab searches local SQLite FTS5 with Swedish åäö diacritic folding.
             v.set_tab(SearchTab::Transcripts, cx);
             v.run("mote".into(), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| {
             assert_eq!(v.transcript_results.len(), 1);
             assert_eq!(v.transcript_results[0].call_id, "R0HUDDLE1");
             assert_eq!(v.transcript_results[0].lang.as_deref(), Some("sv"));

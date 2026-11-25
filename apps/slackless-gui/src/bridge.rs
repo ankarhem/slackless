@@ -11,12 +11,6 @@
 //! Fixture mode ([`CoreBridge::offline`]) has no core: [`CoreBridge::send`] drops commands and
 //! the views apply their changes locally, so the app renders without Slack credentials or a
 //! network connection.
-//!
-//! One deviation from the guide's drain snippet: it awaits the event stream with
-//! `futures::StreamExt::next`, but the `futures` crate is not a GUI dependency (only
-//! `slackless-core` may name its types). The drain therefore polls the receiver's inherent
-//! `try_recv` between `background_executor().timer` ticks; when the core's command receiver is
-//! gone (`sender.is_closed()`), the channel is drained and the loop ends.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
+use futures::channel::mpsc::UnboundedSender;
 use gpui_kit::gpui::{self, AppContext as _, Context, Entity, EventEmitter, Subscription, Window};
 use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
@@ -33,9 +28,6 @@ use slackless_core::{Client, Command, Event, SharedStore};
 
 use crate::fixtures::{self, Fixtures};
 use crate::media::CoreHttp;
-
-/// `serde_json` through gpui's re-export (see `crate::blockkit`).
-use crate::blockkit::serde_json;
 use crate::preferences::{AppearanceMode, Settings};
 use crate::theme;
 
@@ -119,7 +111,10 @@ const FONT: &str = "font";
 const ZOOM: &str = "zoom";
 
 /// The store's local-state key for all Preferences settings (JSON).
-const SETTINGS: &str = "preferences_settings";
+pub(crate) const SETTINGS: &str = "preferences_settings";
+
+/// The store's local-state key for cached `(members, apps)` counts per channel (JSON).
+pub(crate) const CHANNEL_COUNTS_CACHE: &str = "channel_counts_cache";
 
 /// The store's local-state key for per-conversation composer drafts (JSON).
 const DRAFTS: &str = "drafts";
@@ -141,9 +136,7 @@ impl EventEmitter<Event> for EventHub {}
 
 pub struct CoreBridge {
     /// Live mode: forwards commands into the core's command loop. Fixture mode: `None`.
-    /// The `futures::channel::mpsc::UnboundedSender` it captures is not nameable here, so it
-    /// is wrapped in a closure instead of a field.
-    command_sink: Option<Arc<dyn Fn(Command) + Send + Sync>>,
+    commands: Option<UnboundedSender<Command>>,
     /// Live mode: the core runtime thread handle, joined during graceful quit so active huddles
     /// flush Chime `LEAVE` before the process terminates.
     core_thread: Option<Arc<Mutex<Option<std::thread::JoinHandle<()>>>>>,
@@ -165,7 +158,7 @@ impl CoreBridge {
     /// A bridge with no core behind it (fixture mode).
     pub fn offline() -> Self {
         Self {
-            command_sink: None,
+            commands: None,
             core_thread: None,
             store: None,
             reader: None,
@@ -184,32 +177,25 @@ impl CoreBridge {
         let handle = match Client::start(session.clone(), store) {
             Ok(handle) => handle,
             Err(e) => {
-                eprintln!(
-                    "slackless: could not start the core ({e}); running without a core connection"
+                tracing::warn!(
+                    error = %e,
+                    "could not start the core; running without a core connection"
                 );
                 return None;
             }
         };
         let hub = cx.new(|_| EventHub);
         let fetcher = handle.fetcher();
-        let mut bridge = Self {
-            command_sink: None,
-            core_thread: None,
-            store: None,
+        let (commands, mut events, store, thread) = handle.into_parts_with_thread();
+        let bridge = Self {
+            commands: Some(commands),
+            core_thread: Some(Arc::new(Mutex::new(Some(thread)))),
+            store: Some(store),
             reader,
             session: Some(session),
             fetcher: Some(fetcher),
             hub: Some(hub.clone()),
         };
-
-        let (commands, mut events, store, thread) = handle.into_parts_with_thread();
-        bridge.store = Some(store);
-        bridge.core_thread = Some(Arc::new(Mutex::new(Some(thread))));
-        bridge.command_sink = Some(Arc::new(move |command| {
-            if let Err(e) = commands.unbounded_send(command) {
-                eprintln!("slackless: core has stopped; command dropped ({e})");
-            }
-        }));
 
         // Detached: await events directly via StreamExt (0ms wakeup, 0 idle CPU polling) and
         // drain any queued burst in the same tick.
@@ -229,10 +215,10 @@ impl CoreBridge {
     /// Return a blocking closure that sends [`Command::Shutdown`] and joins this workspace's core
     /// thread so any active huddle flushes its Chime `LEAVE` before process exit.
     pub fn shutdown_task(&self) -> Option<Box<dyn FnOnce() + Send>> {
-        let sink = self.command_sink.clone()?;
+        let commands = self.commands.clone()?;
         let thread_slot = self.core_thread.clone()?;
         Some(Box::new(move || {
-            sink(Command::Shutdown);
+            let _ = commands.unbounded_send(Command::Shutdown);
             if let Some(handle) = thread_slot.lock().ok().and_then(|mut g| g.take()) {
                 let _ = handle.join();
             }
@@ -371,7 +357,7 @@ impl CoreBridge {
             match store.channel_history(&team, &channel, before.as_ref(), HISTORY_LIMIT) {
                 Ok(rows) => rows.into_iter().map(row_to_message).collect(),
                 Err(e) => {
-                    eprintln!("slackless: could not read {channel} from the local store ({e})");
+                    tracing::warn!(%channel, error = %e, "could not read channel history from local store");
                     Vec::new()
                 }
             }
@@ -391,7 +377,7 @@ impl CoreBridge {
             match store.latest_messages(&team, std::slice::from_ref(&channel)) {
                 Ok(mut latest) => latest.remove(&channel).map(|stored| stored.message),
                 Err(e) => {
-                    eprintln!("slackless: could not read {channel}'s latest message ({e})");
+                    tracing::warn!(%channel, error = %e, "could not read channel latest message from local store");
                     None
                 }
             }
@@ -437,9 +423,7 @@ impl CoreBridge {
             match store.thread_replies(&team, &channel, &thread_ts) {
                 Ok(rows) => rows.into_iter().map(row_to_message).collect(),
                 Err(e) => {
-                    eprintln!(
-                        "slackless: could not read the thread {thread_ts} of {channel} from the local store ({e})"
-                    );
+                    tracing::warn!(%channel, %thread_ts, error = %e, "could not read thread from local store");
                     Vec::new()
                 }
             }
@@ -448,16 +432,23 @@ impl CoreBridge {
 
     /// Forward a command to the core. Offline, commands are dropped by design.
     pub fn send(&self, command: Command) {
-        if let Some(sink) = &self.command_sink {
-            sink(command);
+        if let Some(commands) = &self.commands
+            && let Err(e) = commands.unbounded_send(command)
+        {
+            tracing::warn!(error = %e, "core has stopped; command dropped");
         }
     }
 
     /// Clone a lightweight command forwarder for popped-out secondary GPUI windows.
     pub fn forwarder(&self) -> Arc<dyn Fn(Command) + Send + Sync> {
-        self.command_sink
-            .clone()
-            .unwrap_or_else(|| Arc::new(|_| {}))
+        match self.commands.clone() {
+            Some(commands) => Arc::new(move |command| {
+                if let Err(e) = commands.unbounded_send(command) {
+                    tracing::warn!(error = %e, "core has stopped; forwarded command dropped");
+                }
+            }),
+            None => Arc::new(|_| {}),
+        }
     }
 
     /// The store the core keeps current (live mode); views re-read it to render. `None` in
@@ -743,7 +734,7 @@ impl CoreBridge {
             combined.entry(ch.to_string()).or_default().1 = Some(a);
         }
         self.write_local(
-            "channel_counts_cache",
+            CHANNEL_COUNTS_CACHE,
             serde_json::to_string(&combined).ok()?,
             "channel counts cache",
         )
@@ -754,7 +745,7 @@ impl CoreBridge {
     ) -> (HashMap<ChannelId, u32>, HashMap<ChannelId, u32>) {
         let mut members = HashMap::new();
         let mut apps = HashMap::new();
-        let Some(raw) = local.get("channel_counts_cache") else {
+        let Some(raw) = local.get(CHANNEL_COUNTS_CACHE) else {
             return (members, apps);
         };
         let Ok(parsed) = serde_json::from_str::<HashMap<String, (Option<u32>, Option<u32>)>>(raw)
@@ -797,7 +788,7 @@ impl CoreBridge {
                 return;
             };
             if let Err(e) = store.set_local(&team, key, &value) {
-                eprintln!("slackless: could not remember the {what} ({e})");
+                tracing::warn!(what, error = %e, "could not persist local state");
             }
         })
     }
@@ -834,9 +825,10 @@ fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
                     Some((store, reader))
                 }
                 Err(e) => {
-                    eprintln!(
-                        "slackless: could not open the local store at {} ({e}); running without a core connection",
-                        path.display()
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not open local store; running without a core connection"
                     );
                     None
                 }
@@ -845,8 +837,9 @@ fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
         None => match Store::open_in_memory() {
             Ok(store) => Some((store, None)),
             Err(e) => {
-                eprintln!(
-                    "slackless: could not open an in-memory store ({e}); running without a core connection"
+                tracing::warn!(
+                    error = %e,
+                    "could not open an in-memory store; running without a core connection"
                 );
                 None
             }
@@ -856,21 +849,13 @@ fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
 
 /// Directory holding per-workspace SQLite stores.
 pub fn store_dir() -> Option<PathBuf> {
-    let mut path = PathBuf::from(std::env::var_os("HOME")?);
-    if cfg!(target_os = "macos") {
-        path.push("Library/Application Support/slackless");
-    } else {
-        path.push(".local/share/slackless");
-    }
-    Some(path)
+    slackless_core::platform::app_data_dir()
 }
 
 /// The durable store lives under the platform's application-data directory, one database per
 /// workspace (the store location stays a front-end decision, per slackless-core's docs).
 fn default_store_path(team_id: &TeamId) -> Option<PathBuf> {
-    let mut path = store_dir()?;
-    path.push(format!("{team_id}.sqlite"));
-    Some(path)
+    slackless_core::platform::archive_store_path(team_id.as_str())
 }
 
 #[cfg(test)]
@@ -935,7 +920,7 @@ mod tests {
             d_cookie: String::new(),
         };
         CoreBridge {
-            command_sink: None,
+            commands: None,
             core_thread: None,
             store: Some(store),
             reader: None,
@@ -1000,7 +985,7 @@ mod tests {
             (HashMap::new(), HashMap::new())
         );
         local.insert(
-            "channel_counts_cache".into(),
+            CHANNEL_COUNTS_CACHE.into(),
             r#"{"C1":[12,3],"C2":[5,null],"C3":[null,2]}"#.into(),
         );
         let (members, apps) = CoreBridge::parse_channel_counts(&local);
@@ -1010,7 +995,7 @@ mod tests {
         assert_eq!(apps.get(&ChannelId::from("C1")), Some(&3));
         assert!(!apps.contains_key(&ChannelId::from("C2")));
         assert_eq!(apps.get(&ChannelId::from("C3")), Some(&2));
-        local.insert("channel_counts_cache".into(), "{broken".into());
+        local.insert(CHANNEL_COUNTS_CACHE.into(), "{broken".into());
         assert_eq!(
             CoreBridge::parse_channel_counts(&local),
             (HashMap::new(), HashMap::new())

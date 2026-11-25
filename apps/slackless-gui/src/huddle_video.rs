@@ -6,8 +6,82 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui_kit::gpui::{App, AppContext as _, Context, Entity, RenderImage};
-use slackless_core::huddle::{HuddleDrawSegment, VideoFrame, VideoTileKey};
-use slackless_core::types::UserId;
+use slackless_core::huddle::{
+    AudioDeviceInfo, HuddleAudioLevels, HuddleDrawSegment, VideoFrame, VideoTileKey,
+};
+use slackless_core::types::{ChannelId, UserId};
+
+use crate::fixtures::Fixtures;
+
+/// Minimum local microphone RMS energy to highlight the signed-in user as speaking.
+pub const LOCAL_SPEAKING_RMS: f32 = 0.03;
+
+/// Minimum remote speaker audio level to highlight a peer as speaking.
+pub const PEER_SPEAKING_LEVEL: f32 = 0.05;
+
+/// Whether `user` is currently speaking according to shared local/peer thresholds.
+pub fn is_user_speaking(
+    is_self: bool,
+    muted: bool,
+    levels: &HuddleAudioLevels,
+    user: &UserId,
+) -> bool {
+    if is_self {
+        !muted && levels.local_rms > LOCAL_SPEAKING_RMS
+    } else {
+        levels
+            .active_speakers
+            .iter()
+            .any(|(uid, lvl)| uid == user && *lvl > PEER_SPEAKING_LEVEL)
+    }
+}
+
+/// Canonical Slack web-client huddle join URL, preferring an explicit `rooms.getLink` URL and
+/// falling back to `slackless_core::types::net::huddle_fallback_url`.
+pub fn huddle_browser_url(
+    fixtures: &Fixtures,
+    channel: &ChannelId,
+    explicit: Option<&str>,
+) -> String {
+    if let Some(link) = explicit.filter(|l| !l.is_empty()) {
+        return link.to_owned();
+    }
+    let team = fixtures
+        .workspaces
+        .first()
+        .map(|t| t.id.as_str())
+        .unwrap_or_default();
+    slackless_core::types::net::huddle_fallback_url(team, channel.as_str())
+}
+
+/// Whether `dev` matches the currently selected audio device name (or default when unset).
+pub fn is_audio_device_selected(current: Option<&str>, dev: &AudioDeviceInfo) -> bool {
+    current == Some(dev.name.as_str()) || (current.is_none() && dev.is_default)
+}
+
+/// Compute `(alpha, width_scale, needs_anim_frame)` for a fading huddle draw stroke.
+/// Active strokes stay bright at `1.0`; completed strokes hold for 3.8s then smoothly ease out
+/// over 1.6s at display refresh rate.
+pub fn stroke_fade_curve(ended_at_ms: Option<u64>, now_ms: u64) -> (f32, f32, bool) {
+    const HOLD_MS: f32 = 3_800.0;
+    const FADE_MS: f32 = 1_600.0;
+    let Some(ended_at) = ended_at_ms else {
+        return (1.0, 1.0, false);
+    };
+    let elapsed = now_ms.saturating_sub(ended_at) as f32;
+    if elapsed < HOLD_MS {
+        // Request animation frames once within the last 100ms of hold so the fade starts smoothly.
+        return (1.0, 1.0, elapsed >= HOLD_MS - 100.0);
+    }
+    if elapsed >= HOLD_MS + FADE_MS {
+        return (0.0, 0.72, false);
+    }
+    let t = ((elapsed - HOLD_MS) / FADE_MS).clamp(0.0, 1.0);
+    // Smooth cubic ease-out (`(1 - t)^2` * `(1 + 2t)` complement -> smoothstep).
+    let smooth = 1.0 - t * t * (3.0 - 2.0 * t);
+    let width_scale = 0.72 + 0.28 * smooth;
+    (smooth, width_scale, true)
+}
 
 /// Convert a [`VideoFrame`] into a GPU-ready GPUI [`RenderImage`] (uses NEON `vImage` on macOS
 /// GPU surfaces, or clones bytes for portable BGRA frames).

@@ -39,6 +39,6 @@ pub use marks::{Atom, Attrs, LineKind, Style};
 pub use mrkdwn::Directory;
 pub use mrkdwn_read::from_mrkdwn;
 pub use parse::empty_pair_at;
-pub(crate) use parse::{InlineKind, delimiter_ranges};
+pub(crate) use parse::{InlineKind, ParsedDoc, delimiter_ranges};
 pub use rich_text::from_rich_text;
 pub use state::{Editor, narrowed};

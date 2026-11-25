@@ -431,7 +431,7 @@ impl App {
                 let active = match &spec.action {
                     TabAction::Switch(target) => {
                         *target == self.tab
-                            && !(*target == ConversationTab::Pins && !self.pins_open)
+                            && !(*target == ConversationTab::Pins && !self.right_pane.is_pins())
                     }
                     _ => false,
                 };

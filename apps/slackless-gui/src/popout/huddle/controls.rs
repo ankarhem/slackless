@@ -67,7 +67,7 @@ impl PopoutWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(if self.huddle_invite_open {
+                    .bg(if self.huddle_popover == Some(HuddlePopover::Invite) {
                         ctrl_hover
                     } else {
                         ctrl_bg
@@ -79,9 +79,7 @@ impl PopoutWindow {
                             .text_color(ctrl_fg),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let next = !this.huddle_invite_open;
-                        this.close_huddle_popovers();
-                        this.huddle_invite_open = next;
+                        this.toggle_huddle_popover(HuddlePopover::Invite);
                         cx.notify();
                     })),
             );
@@ -147,10 +145,7 @@ impl PopoutWindow {
                             .text_color(if muted_now { pal.danger_fg } else { active_fg }),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let next = !this.huddle_devices_open;
-                        this.close_huddle_popovers();
-                        this.huddle_devices_open = next;
-                        if this.huddle_devices_open {
+                        if this.toggle_huddle_popover(HuddlePopover::Devices) {
                             cx.spawn(async move |win, cx| {
                                 let devices = cx
                                     .background_executor()
@@ -170,7 +165,7 @@ impl PopoutWindow {
         let send_cam = self.send.clone();
         let next_cam = !video_now;
         let selected_cam_idx = self.huddle_selected_camera;
-        let cam_open = self.huddle_camera_open;
+        let cam_open = self.huddle_popover == Some(HuddlePopover::Camera);
         let cam_btn = h_flex()
             .h(px(36.))
             .rounded_lg()
@@ -251,10 +246,7 @@ impl PopoutWindow {
                         }),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let next = !this.huddle_camera_open;
-                        this.close_huddle_popovers();
-                        this.huddle_camera_open = next;
-                        if this.huddle_camera_open {
+                        if this.toggle_huddle_popover(HuddlePopover::Camera) {
                             cx.spawn(async move |win, cx| {
                                 let cameras = cx
                                     .background_executor()
@@ -297,11 +289,11 @@ impl PopoutWindow {
                     .text_color(if sharing_now { primary_fg } else { ctrl_fg }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                let next = !this.huddle_share_open;
+                let was_open = this.huddle_popover == Some(HuddlePopover::Share);
                 this.close_share_modal(cx);
                 this.close_huddle_popovers();
-                this.huddle_share_open = next;
-                if this.huddle_share_open {
+                if !was_open {
+                    this.huddle_popover = Some(HuddlePopover::Share);
                     this.huddle_share_selected = active_share_id.clone();
                     this.huddle_share_tab = if active_share_id
                         .as_deref()
@@ -376,7 +368,7 @@ impl PopoutWindow {
             .flex()
             .items_center()
             .justify_center()
-            .bg(if self.huddle_reactions_open {
+            .bg(if self.huddle_popover == Some(HuddlePopover::Reactions) {
                 ctrl_hover
             } else {
                 ctrl_bg
@@ -388,9 +380,7 @@ impl PopoutWindow {
                     .text_color(ctrl_fg),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                let next = !this.huddle_reactions_open;
-                this.close_huddle_popovers();
-                this.huddle_reactions_open = next;
+                this.toggle_huddle_popover(HuddlePopover::Reactions);
                 cx.notify();
             }));
 
@@ -402,7 +392,7 @@ impl PopoutWindow {
             .flex()
             .items_center()
             .justify_center()
-            .bg(if self.huddle_theme_open {
+            .bg(if self.huddle_popover == Some(HuddlePopover::Theme) {
                 ctrl_hover
             } else {
                 ctrl_bg
@@ -414,9 +404,7 @@ impl PopoutWindow {
                     .text_color(ctrl_fg),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                let next = !this.huddle_theme_open;
-                this.close_huddle_popovers();
-                this.huddle_theme_open = next;
+                this.toggle_huddle_popover(HuddlePopover::Theme);
                 cx.notify();
             }));
 
@@ -441,6 +429,7 @@ impl PopoutWindow {
                 } else {
                     Some(HuddleDrawer::Thread)
                 };
+                this.refresh_huddle_thread_async(cx);
                 this.maybe_fetch_huddle_thread();
                 cx.notify();
             }));
@@ -453,7 +442,7 @@ impl PopoutWindow {
             .flex()
             .items_center()
             .justify_center()
-            .bg(if self.huddle_more_open {
+            .bg(if self.huddle_popover == Some(HuddlePopover::More) {
                 ctrl_hover
             } else {
                 ctrl_bg
@@ -465,9 +454,7 @@ impl PopoutWindow {
                     .text_color(ctrl_fg),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                let next = !this.huddle_more_open;
-                this.close_huddle_popovers();
-                this.huddle_more_open = next;
+                this.toggle_huddle_popover(HuddlePopover::More);
                 cx.notify();
             }));
 
