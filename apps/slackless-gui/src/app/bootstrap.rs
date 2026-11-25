@@ -1580,7 +1580,9 @@ impl App {
                         }
                         let _ = done_tx.send(());
                     });
-                let timeout = bg.timer(Duration::from_millis(1500));
+                // Stay inside GPUI's 200ms `SHUTDOWN_TIMEOUT` so `app_will_quit` resolves cleanly
+                // without timing out while `slackless-shutdown` flushes Chime `LEAVE`.
+                let timeout = bg.timer(Duration::from_millis(160));
                 futures::pin_mut!(done_rx);
                 futures::pin_mut!(timeout);
                 let _ = futures::future::select(done_rx, timeout).await;

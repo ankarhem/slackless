@@ -764,6 +764,42 @@ impl Render for App {
                                 });
                             }) as crate::lists::DeleteListItemFn
                         });
+                        let on_add_tab = file_id.as_ref().map(|_| {
+                            let ch = self.channel.clone();
+                            let title = loaded
+                                .and_then(|res| res.as_ref().ok())
+                                .map(|data| data.title.clone())
+                                .filter(|t| !t.is_empty())
+                                .unwrap_or_else(|| "List".to_owned());
+                            let this = cx.weak_entity();
+                            Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.bridge.send(Command::AddConversationTab {
+                                        channel: ch.clone(),
+                                        tab_type: "list".to_owned(),
+                                        label: Some(title.clone()),
+                                    });
+                                    crate::actions::notify(
+                                        "Tab added",
+                                        format!("Pinned \"{title}\" as a conversation tab."),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }) as crate::lists::ListCommandFn
+                        });
+                        let on_delete_list = file_id.as_ref().map(|id| {
+                            let fid = id.clone();
+                            let this = cx.weak_entity();
+                            Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
+                                let _ = this.update(cx, |app, cx| {
+                                    app.bridge.send(Command::DeleteFile {
+                                        file_id: fid.clone(),
+                                    });
+                                    app.select_tab(ConversationTab::Messages, cx);
+                                });
+                            }) as crate::lists::ListCommandFn
+                        });
                         crate::lists::live_list_view(
                             loaded,
                             &self.fixtures,
@@ -778,6 +814,8 @@ impl Render for App {
                                 on_archive_item,
                                 on_set_access,
                                 on_load_comments,
+                                on_add_tab,
+                                on_delete_list,
                                 open_browser,
                             },
                             cx,

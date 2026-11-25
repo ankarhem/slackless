@@ -66,7 +66,11 @@ pub fn list_screen_sources() -> Vec<ScreenSource> {
             });
         }
     }
-    if let Ok(windows) = xcap::Window::all() {
+    // On macOS, calling `xcap::Window::all()` without Screen Recording permission logs a noisy
+    // warning per window (`Screen Recording permission not granted`) and returns redacted titles.
+    // Monitors still enumerate cleanly, so skip window enumeration until permission is granted.
+    let can_list_windows = crate::has_screen_capture_permission();
+    if can_list_windows && let Ok(windows) = xcap::Window::all() {
         for w in windows {
             if w.is_minimized().unwrap_or(false) {
                 continue;
@@ -137,6 +141,9 @@ pub(crate) fn capture_screen_thumbnails_xcap(
     max_w: u32,
     max_h: u32,
 ) -> Vec<(String, VideoFrame)> {
+    if !crate::has_screen_capture_permission() {
+        return Vec::new();
+    }
     if monitors_only {
         let Ok(monitors) = xcap::Monitor::all() else {
             return Vec::new();

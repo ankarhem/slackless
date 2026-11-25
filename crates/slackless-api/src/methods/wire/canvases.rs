@@ -360,10 +360,10 @@ pub fn parse_canvas_comment_threads(
     threads
 }
 
-/// `conversations.canvases.create`: the id of the created channel canvas.
+/// `canvases.create` / `conversations.canvases.create` / `files.createCanvas`: created canvas ID.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct CanvasCreated {
-    #[serde(default, deserialize_with = "or_default")]
+    #[serde(default, alias = "file_id", deserialize_with = "or_default")]
     pub canvas_id: String,
 }
 

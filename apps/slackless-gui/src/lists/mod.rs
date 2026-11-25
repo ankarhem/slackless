@@ -117,6 +117,8 @@ pub type UpdateListCellFn = Rc<dyn Fn(String, ListCellInput, &mut Window, &mut A
 pub type DeleteListItemFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
 /// Callback invoked when updating list sharing access (`slackLists.access.set`, `F-COLLAB-243`).
 pub type SetListAccessFn = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// Callback invoked for list-level actions (`F-COLLAB-259` delete list, `F-COLLAB-261` add tab).
+pub type ListCommandFn = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// Optional interactive callbacks for a live Slack List.
 #[derive(Clone, Default)]
@@ -128,6 +130,8 @@ pub struct ListActions {
     pub on_archive_item: Option<DeleteListItemFn>,
     pub on_set_access: Option<SetListAccessFn>,
     pub on_load_comments: Option<DeleteListItemFn>,
+    pub on_add_tab: Option<ListCommandFn>,
+    pub on_delete_list: Option<ListCommandFn>,
     pub open_browser: Option<OpenBrowserFn>,
 }
 

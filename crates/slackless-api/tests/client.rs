@@ -2343,3 +2343,56 @@ async fn canvas_access_delete_quip_threads_meta_and_comments_round_trips() {
         assert_eq!(posted.ts, Ts::from("1700.99"));
     }
 }
+
+#[tokio::test]
+async fn canvas_create_and_delete_fall_back_on_not_allowed_token_type() {
+    let (server, api) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/canvases.create"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": false,
+            "error": "not_allowed_token_type"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/files.createCanvas"))
+        .and(body_string_contains("title=Roadmap"))
+        .and(body_string_contains("loosen_validation=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true,
+            "file_id": "F0PRIVCANVAS"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/canvases.delete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": false,
+            "error": "not_allowed_token_type"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/files.delete"))
+        .and(body_string_contains("file=F0PRIVCANVAS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let created = api
+        .canvases_create(Some("Roadmap"), Some("# Plan"), None)
+        .await
+        .expect("files.createCanvas fallback should succeed");
+    assert_eq!(created.canvas_id, "F0PRIVCANVAS");
+
+    api.canvases_delete("F0PRIVCANVAS")
+        .await
+        .expect("files.delete fallback should succeed");
+}

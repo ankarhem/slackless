@@ -241,6 +241,44 @@ impl App {
                 self.join_huddle_in(ch, window, cx);
                 true
             }
+            DeepLink::AppHome {
+                team_id,
+                app_id,
+                tab,
+                ..
+            } => {
+                switch_team(self, team_id.as_deref(), window, cx);
+                let target_tab = if tab.as_deref() == Some("messages") {
+                    ConversationTab::Messages
+                } else {
+                    ConversationTab::Home
+                };
+                if let Some(dm) = self.fixtures.dms.iter().find(|c| {
+                    c.user
+                        .as_ref()
+                        .is_some_and(|u| u.as_str() == app_id.as_str())
+                        || c.id.as_str() == app_id.as_str()
+                }) {
+                    let ch = dm.id.clone();
+                    self.select(ch, cx);
+                    self.select_tab(target_tab, cx);
+                    return true;
+                }
+                if !self.fixtures.sample
+                    && let Some(resolved_team) = team_id.or_else(|| {
+                        self.fixtures
+                            .workspaces
+                            .get(self.workspace)
+                            .map(|t| t.id.to_string())
+                    })
+                {
+                    self.bridge.send(Command::OpenAppHome {
+                        app_id,
+                        team_id: resolved_team,
+                    });
+                }
+                true
+            }
             DeepLink::Other { .. } => false,
         }
     }

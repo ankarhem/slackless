@@ -562,6 +562,15 @@ pub(crate) enum HuddleCommand {
         /// Optional emoji reaction to broadcast once connected (tests official `PeerMessage` `data-channel`).
         #[arg(long, value_name = "EMOJI")]
         react: Option<String>,
+        /// Enable the local webcam once connected (tests live AVFoundation/H.264 video publish).
+        #[arg(long)]
+        camera: bool,
+        /// Enable portrait background blur when `--camera` is active.
+        #[arg(long)]
+        blur: bool,
+        /// Share a monitor or window source ID once connected (e.g. `monitor:2` from `huddle screens`).
+        #[arg(long, value_name = "SOURCE_ID")]
+        screen: Option<String>,
     },
     /// Fetch the shareable huddle link for a channel (`rooms.getLink`).
     Link {

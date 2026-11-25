@@ -184,6 +184,8 @@ impl SlackApi {
     }
 
     /// `canvases.create`: create a standalone canvas or channel-tabbed canvas (`F-COLLAB-119`).
+    /// Falls back transparently to private `files.createCanvas` when `canvases.create` returns
+    /// `not_allowed_token_type` on `xoxc-` web-client tokens.
     pub async fn canvases_create(
         &self,
         title: Option<&str>,
@@ -201,7 +203,50 @@ impl SlackApi {
         if let Some(ch) = channel_id {
             params.push(("channel_id", ch.to_string()));
         }
-        Ok(self.call(method::CANVASES_CREATE, params).await?.data)
+        match self
+            .call::<CanvasCreated>(method::CANVASES_CREATE, params)
+            .await
+        {
+            Ok(resp) => Ok(resp.data),
+            Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
+                self.files_create_canvas(title, markdown, channel_id).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Private web-client fallback for canvas creation (`files.createCanvas`).
+    async fn files_create_canvas(
+        &self,
+        title: Option<&str>,
+        markdown: Option<&str>,
+        channel_id: Option<&ChannelId>,
+    ) -> Result<CanvasCreated> {
+        let mut params = vec![
+            ("loosen_validation", "true".to_owned()),
+            ("_x_mode", MODE_ONLINE.to_owned()),
+        ];
+        if let Some(t) = title.filter(|s| !s.is_empty()) {
+            params.push(("title", t.to_owned()));
+        }
+        if let Some(md) = markdown.filter(|s| !s.is_empty()) {
+            params.push(("markdown", md.to_owned()));
+        }
+        if let Some(ch) = channel_id {
+            params.push(("channel_id", ch.to_string()));
+        }
+        let raw: Value = self.call(method::FILES_CREATE_CANVAS, params).await?.data;
+        let canvas_id = raw
+            .get("file_id")
+            .or_else(|| raw.get("canvas_id"))
+            .or_else(|| raw.get("file").and_then(|f| f.get("id")))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if canvas_id.is_empty() {
+            return Err(ApiError::Slack("canvas_creation_failed".to_owned()));
+        }
+        Ok(CanvasCreated { canvas_id })
     }
 
     /// `canvases.edit`: apply one section-level edit operation to a canvas (`F-COLLAB-132`, `F-SHELL-264`, `F-SHELL-277`).
@@ -226,11 +271,17 @@ impl SlackApi {
         Ok(wire.content)
     }
 
-    /// `canvases.delete`: permanently delete a canvas.
+    /// `canvases.delete`: permanently delete a canvas, falling back to `files.delete` on
+    /// `not_allowed_token_type` for `xoxc-` sessions.
     pub async fn canvases_delete(&self, canvas_id: &str) -> Result<()> {
         let params = vec![("canvas_id", canvas_id.to_owned())];
-        self.call::<Empty>(method::CANVASES_DELETE, params).await?;
-        Ok(())
+        match self.call::<Empty>(method::CANVASES_DELETE, params).await {
+            Ok(_) => Ok(()),
+            Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
+                self.files_delete(canvas_id).await
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// `canvases.access.set`: grant read/write/owner access on a canvas to channels or users (XOR).

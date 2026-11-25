@@ -268,6 +268,9 @@ impl MediaBackend for MacOsMediaBackend {
         max_w: u32,
         max_h: u32,
     ) -> Vec<(String, VideoFrame)> {
+        if !crate::has_screen_capture_permission() {
+            return Vec::new();
+        }
         if let Some(thumbs) = capture_macos_thumbnails(monitors_only, max_w, max_h) {
             return thumbs;
         }
@@ -281,6 +284,12 @@ impl MediaBackend for MacOsMediaBackend {
         preview_tx: mpsc::UnboundedSender<VideoFrame>,
         perf: Arc<HuddlePerfCounters>,
     ) -> Result<Box<dyn ScreenShareHandle>> {
+        if !crate::has_screen_capture_permission() {
+            return Err(HuddleError::Video(
+                "Screen Recording permission not granted. Grant access in System Settings > Privacy & Security > Screen Recording."
+                    .into(),
+            ));
+        }
         match ScVtScreenCapture::start(
             &config.source_id,
             config.max_w,
@@ -293,6 +302,9 @@ impl MediaBackend for MacOsMediaBackend {
         ) {
             Ok(hw) => Ok(Box::new(hw)),
             Err(err) => {
+                if !crate::has_screen_capture_permission() {
+                    return Err(err);
+                }
                 tracing::warn!(
                     source_id = %config.source_id,
                     %err,

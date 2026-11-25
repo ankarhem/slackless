@@ -268,14 +268,51 @@ impl Render for ToolsPage {
                                         ),
                                 )
                                 .when_some(uid_opt, |row, uid| {
+                                    let team_id = self
+                                        .fixtures
+                                        .workspaces
+                                        .first()
+                                        .map(|t| t.id.as_str().to_owned())
+                                        .unwrap_or_default();
+                                    let app_link = format!(
+                                        "slack://app?team={team_id}&id={}&tab=home",
+                                        uid.as_str()
+                                    );
                                     row.child(
-                                        Button::new(("tools-app-open", ix))
-                                            .outline()
-                                            .with_size(Size::XSmall)
-                                            .label("Open")
-                                            .on_click(cx.listener(move |_, _, _, cx| {
-                                                cx.emit(ToolsPageEvent::OpenAppDm(uid.clone()));
-                                            })),
+                                        h_flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                Button::new(("tools-app-copy", ix))
+                                                    .ghost()
+                                                    .with_size(Size::XSmall)
+                                                    .icon(IconName::Link)
+                                                    .tooltip("Copy app link")
+                                                    .on_click(move |_, window, cx| {
+                                                        cx.write_to_clipboard(
+                                                            gpui_kit::gpui::ClipboardItem::new_string(
+                                                                app_link.clone(),
+                                                            ),
+                                                        );
+                                                        crate::actions::notify(
+                                                            "Link copied",
+                                                            "Copied app deep link to clipboard.",
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }),
+                                            )
+                                            .child(
+                                                Button::new(("tools-app-open", ix))
+                                                    .outline()
+                                                    .with_size(Size::XSmall)
+                                                    .label("Open")
+                                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                                        cx.emit(ToolsPageEvent::OpenAppDm(
+                                                            uid.clone(),
+                                                        ));
+                                                    })),
+                                            ),
                                     )
                                 }),
                         );

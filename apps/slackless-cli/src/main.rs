@@ -301,9 +301,15 @@ async fn dispatch(
                 input,
                 output,
                 react,
+                camera,
+                blur,
+                screen,
             } => {
-                live::run_huddle_join(ctx, flag, &channel, muted, duration, input, output, react)
-                    .await
+                live::run_huddle_join(
+                    ctx, flag, &channel, muted, duration, input, output, react, camera, blur,
+                    screen,
+                )
+                .await
             }
             HuddleCommand::Link { channel } => live::run_huddle_link(ctx, flag, &channel).await,
             HuddleCommand::Invite { channel, user } => {

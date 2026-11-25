@@ -411,6 +411,27 @@ pub(super) fn render_live_toolbar(
                     }),
             )
         })
+        .when_some(actions.on_add_tab.clone(), |row, add_tab| {
+            row.child(
+                Button::new("list-add-tab")
+                    .outline()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::Plus)
+                    .label("Pin tab")
+                    .tooltip("Add this list as a conversation tab")
+                    .on_click(move |_, window, cx| add_tab(window, cx)),
+            )
+        })
+        .when_some(actions.on_delete_list.clone(), |row, delete_list| {
+            row.child(
+                Button::new("list-delete")
+                    .outline()
+                    .with_size(Size::XSmall)
+                    .icon(IconName::Trash)
+                    .tooltip("Delete this list")
+                    .on_click(move |_, window, cx| delete_list(window, cx)),
+            )
+        })
         .when_some(actions.open_browser.clone(), |row, open| {
             row.child(
                 Button::new("list-open-browser")

@@ -221,8 +221,8 @@ pub(crate) fn format_huddle_state(
     (json, human)
 }
 
-/// `huddle join <channel> [--muted] [--duration N] [--input NAME] [--output NAME] [--react EMOJI]`:
-/// join a live native Chime audio huddle from the terminal and leave cleanly on Ctrl+C or timeout.
+/// `huddle join <channel> [--muted] [--duration N] [--input NAME] [--output NAME] [--react EMOJI] [--camera] [--blur] [--screen SOURCE_ID]`:
+/// join a live native Chime audio/video huddle from the terminal and leave cleanly on Ctrl+C or timeout.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_huddle_join(
     ctx: &Ctx,
@@ -233,6 +233,9 @@ pub async fn run_huddle_join(
     input: Option<String>,
     output_dev: Option<String>,
     react: Option<String>,
+    camera: bool,
+    blur: bool,
+    screen: Option<String>,
 ) -> Result<ExitCode> {
     let (api, workspace) = match api_for(ctx, flag) {
         Ok(pair) => pair,
@@ -249,6 +252,7 @@ pub async fn run_huddle_join(
         muted,
         input_device: input,
         output_device: output_dev,
+        blur_background: blur,
         ..Default::default()
     };
 
@@ -259,7 +263,8 @@ pub async fn run_huddle_join(
     let deadline =
         duration.map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
     let mut exit_code = ExitCode::SUCCESS;
-    let mut sent_react = false;
+    let mut sent_connected_actions = false;
+    let mut video_frames: u64 = 0;
 
     loop {
         let timer_fut = async {
@@ -283,16 +288,29 @@ pub async fn run_huddle_join(
                     Some(HuddleUpdate::State(snap)) => {
                         let (json, human) = format_huddle_state(&display, &snap, true);
                         output::emit(ctx.json, &json, &human);
-                        if snap.phase == HuddlePhase::Connected
-                            && !sent_react
-                            && let Some(emoji) = &react {
-                                sent_react = true;
+                        if snap.phase == HuddlePhase::Connected && !sent_connected_actions {
+                            sent_connected_actions = true;
+                            if let Some(emoji) = &react {
                                 handle.send(HuddleControl::SendReaction {
                                     emoji: emoji.clone(),
                                     kind: HuddleReactionKind::Standard,
                                     emoji_url: None,
                                 });
                             }
+                            if camera {
+                                handle.send(HuddleControl::SetCamera {
+                                    enabled: true,
+                                    device_index: None,
+                                    blur,
+                                });
+                            }
+                            if let Some(source_id) = &screen {
+                                handle.send(HuddleControl::SetScreenShare {
+                                    source_id: Some(source_id.clone()),
+                                    share_audio: false,
+                                });
+                            }
+                        }
                         if snap.phase == HuddlePhase::Failed {
                             exit_code = ExitCode::FAILURE;
                             break;
@@ -311,11 +329,26 @@ pub async fn run_huddle_join(
                             &format!("huddle {display}\tdata\t{ev:?}\n"),
                         );
                     }
-                    Some(
-                        HuddleUpdate::AudioLevels(_)
-                        | HuddleUpdate::VideoFrame { .. }
-                        | HuddleUpdate::VideoTileClosed(_),
-                    ) => {}
+                    Some(HuddleUpdate::VideoFrame { tile, frame }) => {
+                        video_frames += 1;
+                        if video_frames == 1 || video_frames.is_multiple_of(30) {
+                            output::emit(
+                                ctx.json,
+                                &serde_json::json!({
+                                    "event": "video_frame",
+                                    "tile": format!("{tile:?}"),
+                                    "width": frame.width,
+                                    "height": frame.height,
+                                    "frames": video_frames,
+                                }),
+                                &format!(
+                                    "huddle {display}\tvideo\t{tile:?}\t{}x{}\tframes={video_frames}\n",
+                                    frame.width, frame.height
+                                ),
+                            );
+                        }
+                    }
+                    Some(HuddleUpdate::AudioLevels(_) | HuddleUpdate::VideoTileClosed(_)) => {}
                     None => break,
                 }
             }

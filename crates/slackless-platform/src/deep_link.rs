@@ -25,6 +25,13 @@ pub enum DeepLink {
         channel_id: String,
         raw: String,
     },
+    /// `slack://app?team=<team>&id=<app>[&tab=home|messages|about]` (`F-COLLAB-628`, `F-COLLAB-629`).
+    AppHome {
+        team_id: Option<String>,
+        app_id: String,
+        tab: Option<String>,
+        raw: String,
+    },
     /// A `slack://` link kind we do not model yet, preserved verbatim.
     Other { raw: String },
 }
@@ -36,6 +43,7 @@ impl DeepLink {
             DeepLink::Slack(link) => &link.raw,
             DeepLink::WebClient(link) => &link.raw,
             DeepLink::Huddle { raw, .. } => raw,
+            DeepLink::AppHome { raw, .. } => raw,
             DeepLink::Other { raw } => raw,
         }
     }
@@ -165,6 +173,20 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
             return Ok(DeepLink::Huddle {
                 team_id: param("team").map(str::to_string),
                 channel_id,
+                raw: raw.to_string(),
+            });
+        }
+        "app" => {
+            let app_id = param("id")
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| PlatformError::BadLink(format!("{raw}: app link without ?id=")))?;
+            return Ok(DeepLink::AppHome {
+                team_id: param("team").map(str::to_string),
+                app_id,
+                tab: param("tab")
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.to_ascii_lowercase()),
                 raw: raw.to_string(),
             });
         }
@@ -592,6 +614,17 @@ mod tests {
                 team_id: Some("T02HD8VA1".into()),
                 channel_id: "C02QYDW99ML".into(),
                 raw: "slack://huddle?team=T02HD8VA1&id=C02QYDW99ML".into(),
+            }
+        );
+
+        let app_home = parse_deep_link("slack://app?team=T02HD8VA1&id=A01234567&tab=home").unwrap();
+        assert_eq!(
+            app_home,
+            DeepLink::AppHome {
+                team_id: Some("T02HD8VA1".into()),
+                app_id: "A01234567".into(),
+                tab: Some("home".into()),
+                raw: "slack://app?team=T02HD8VA1&id=A01234567&tab=home".into(),
             }
         );
     }
