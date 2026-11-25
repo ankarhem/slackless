@@ -236,9 +236,14 @@ unsafe extern "C" {
     pub(crate) fn slackless_audio_tap_stop(tap: *mut SlacklessAudioTap);
 
     pub(crate) fn slackless_video_player_open(path: *const c_char) -> *mut SlacklessVideoPlayer;
+    pub(crate) fn slackless_video_player_open_url(
+        url: *const c_char,
+        cookie_header: *const c_char,
+    ) -> *mut SlacklessVideoPlayer;
     pub(crate) fn slackless_video_player_play(player: *mut SlacklessVideoPlayer);
     pub(crate) fn slackless_video_player_pause(player: *mut SlacklessVideoPlayer);
     pub(crate) fn slackless_video_player_set_muted(player: *mut SlacklessVideoPlayer, muted: bool);
+    pub(crate) fn slackless_video_player_set_rate(player: *mut SlacklessVideoPlayer, rate: f32);
     pub(crate) fn slackless_video_player_seek(player: *mut SlacklessVideoPlayer, secs: f64);
     pub(crate) fn slackless_video_player_state(
         player: *mut SlacklessVideoPlayer,
@@ -250,6 +255,7 @@ unsafe extern "C" {
         out_w: *mut u32,
         out_h: *mut u32,
         is_failed: *mut bool,
+        out_rate: *mut f32,
     );
     pub(crate) fn slackless_video_player_copy_frame(
         player: *mut SlacklessVideoPlayer,
@@ -257,6 +263,13 @@ unsafe extern "C" {
         out_h: *mut u32,
     ) -> *mut c_void;
     pub(crate) fn slackless_video_player_destroy(player: *mut SlacklessVideoPlayer);
+
+    pub(crate) fn slackless_extract_audio_16k_mono(
+        path: *const c_char,
+        out_samples: *mut *mut f32,
+        out_len: *mut usize,
+    ) -> bool;
+    pub(crate) fn slackless_free_f32_buf(buf: *mut f32);
 }
 
 pub(crate) struct CaptureCallbackCtx {
