@@ -1,8 +1,8 @@
 use clap::Parser as _;
 
 use crate::cli::{
-    AuthCommand, CanvasCommand, Cli, Commands, ExportFormat, HuddleCommand, ListCommand,
-    ListReadFormat, READ_LIMIT, SEARCH_LIMIT, SavedCommand, StatusCommand,
+    AuthCommand, CanvasAccessArg, CanvasCommand, Cli, Commands, ExportFormat, HuddleCommand,
+    ListCommand, ListReadFormat, READ_LIMIT, SEARCH_LIMIT, SavedCommand, StatusCommand,
 };
 use crate::commands::maintenance::format_stats_human;
 use crate::commands::messages::format_markdown_export;
@@ -495,4 +495,265 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     assert!(Cli::try_parse_from(["slackless", "schedule", "#eng", "hi"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "export", "#eng", "--format", "xml"]).is_err());
     assert!(Cli::try_parse_from(["slackless", "bogus-cmd"]).is_err());
+}
+
+#[test]
+fn cli_try_parse_from_covers_all_canvas_subcommands_and_conflicts() {
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "info", "F123"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Info { ref canvas_id }
+        } if canvas_id == "F123"
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "delete", "F123", "--json"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Delete { ref canvas_id }
+        } if canvas_id == "F123"
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "share",
+            "F123",
+            "--access",
+            "write",
+            "--channel",
+            "#eng",
+            "--channel",
+            "C456",
+            "--post",
+        ])
+        .unwrap()
+        .command,
+        Commands::Canvas {
+            command: CanvasCommand::Share {
+                ref canvas_id,
+                access: CanvasAccessArg::Write,
+                ref channels,
+                ref users,
+                post: true,
+            }
+        } if canvas_id == "F123" && channels == &["#eng", "C456"] && users.is_empty()
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "share",
+            "F123",
+            "--access",
+            "owner",
+            "--user",
+            "U1",
+            "--user",
+            "U2",
+        ])
+        .unwrap()
+        .command,
+        Commands::Canvas {
+            command: CanvasCommand::Share {
+                access: CanvasAccessArg::Owner,
+                ref channels,
+                ref users,
+                post: false,
+                ..
+            }
+        } if channels.is_empty() && users == &["U1", "U2"]
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "unshare",
+            "F123",
+            "--channel",
+            "#eng",
+        ])
+        .unwrap()
+        .command,
+        Commands::Canvas {
+            command: CanvasCommand::Unshare {
+                ref canvas_id,
+                ref channels,
+                ref users,
+            }
+        } if canvas_id == "F123" && channels == &["#eng"] && users.is_empty()
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "comments", "F123"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Comments {
+                ref canvas_id,
+                resolved: false,
+                all: false,
+            }
+        } if canvas_id == "F123"
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "comments", "F123", "--resolved"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Comments {
+                resolved: true,
+                all: false,
+                ..
+            }
+        }
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "comments", "F123", "--all"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Comments {
+                resolved: false,
+                all: true,
+                ..
+            }
+        }
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "comment", "F123", "Looks great"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Comment {
+                ref canvas_id,
+                ref text,
+                thread: None,
+            }
+        } if canvas_id == "F123" && text == "Looks great"
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "comment",
+            "F123",
+            "Replying",
+            "--thread",
+            "1700.1",
+        ])
+        .unwrap()
+        .command,
+        Commands::Canvas {
+            command: CanvasCommand::Comment {
+                ref text,
+                ref thread,
+                ..
+            }
+        } if text == "Replying" && thread.as_deref() == Some("1700.1")
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "resolve", "F123", "--thread", "1700.1"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Resolve {
+                ref canvas_id,
+                ref thread,
+                all: false,
+                reopen: false,
+            }
+        } if canvas_id == "F123" && thread.as_deref() == Some("1700.1")
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "resolve",
+            "F123",
+            "--thread",
+            "1700.1",
+            "--reopen",
+        ])
+        .unwrap()
+        .command,
+        Commands::Canvas {
+            command: CanvasCommand::Resolve {
+                ref thread,
+                all: false,
+                reopen: true,
+                ..
+            }
+        } if thread.as_deref() == Some("1700.1")
+    ));
+
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "canvas", "resolve", "F123", "--all"])
+            .unwrap()
+            .command,
+        Commands::Canvas {
+            command: CanvasCommand::Resolve {
+                thread: None,
+                all: true,
+                reopen: false,
+                ..
+            }
+        }
+    ));
+
+    // Invalid invocations & mutually exclusive clap flags.
+    assert!(Cli::try_parse_from(["slackless", "canvas", "delete"]).is_err());
+    assert!(Cli::try_parse_from(["slackless", "canvas", "info"]).is_err());
+    assert!(
+        Cli::try_parse_from(["slackless", "canvas", "share", "F123", "--channel", "C1"]).is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "share",
+            "F123",
+            "--access",
+            "admin",
+            "--channel",
+            "C1",
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "comments",
+            "F123",
+            "--resolved",
+            "--all",
+        ])
+        .is_err()
+    );
+    assert!(Cli::try_parse_from(["slackless", "canvas", "comment", "F123"]).is_err());
+    assert!(
+        Cli::try_parse_from([
+            "slackless",
+            "canvas",
+            "resolve",
+            "F123",
+            "--thread",
+            "1700.1",
+            "--all",
+        ])
+        .is_err()
+    );
 }

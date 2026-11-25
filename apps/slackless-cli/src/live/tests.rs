@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use slackless_core::NotifyLevel;
 use slackless_core::api::{
-    ApiError, CanvasEditOp, ChimeAttendee, ChimeJoinData, ChimeMediaPlacement, ChimeMeeting,
-    ClientCounts, ConversationCounts, HuddleCanvasRef, RoomJoinResponse, SavedItem, SavedItemState,
+    ApiError, CanvasAccessLevel, CanvasCommentReply, CanvasCommentThread, CanvasEditOp, CanvasMeta,
+    ChimeAttendee, ChimeJoinData, ChimeMediaPlacement, ChimeMeeting, ClientCounts,
+    ConversationCounts, HuddleCanvasRef, RoomJoinResponse, SavedItem, SavedItemState,
     SlackListCellValue, SlackListColumn, SlackListData, SlackListRow, ThreadCounts,
 };
 use slackless_core::huddle::{
@@ -982,4 +983,364 @@ fn status_and_huddle_formatters_and_credential_builder_cover_all_branches() {
     );
     let (_, human_no_err) = format_huddle_state("#eng", &snap, false);
     assert_eq!(human_no_err, "huddle #eng\tFailed\ttx=10 rx=5 pongs=2\n");
+}
+
+#[test]
+fn canvas_share_target_and_post_validation_enforce_xor_dedup_and_non_empty() {
+    let resolver = |ch: &str| match ch {
+        "#eng" => ChannelId::from("C_ENG"),
+        "#ops" => ChannelId::from("C_OPS"),
+        other => ChannelId::from(other),
+    };
+
+    // Valid channels with resolution, trimming, and order-preserving deduplication.
+    let target = parse_canvas_share_target(
+        &[
+            " #eng ".into(),
+            "C_OPS".into(),
+            "#ops".into(),
+            "C_ENG".into(),
+        ],
+        &[],
+        resolver,
+    )
+    .expect("valid channel target");
+    assert_eq!(
+        target,
+        CanvasShareTarget::Channels(vec![ChannelId::from("C_ENG"), ChannelId::from("C_OPS")])
+    );
+    assert!(validate_canvas_share_post(&target, false).is_ok());
+    assert!(validate_canvas_share_post(&target, true).is_ok());
+
+    // Valid users with trimming and deduplication.
+    let user_target =
+        parse_canvas_share_target(&[], &[" U1 ".into(), "U2".into(), "U1".into()], resolver)
+            .expect("valid user target");
+    assert_eq!(
+        user_target,
+        CanvasShareTarget::Users(vec![UserId::from("U1"), UserId::from("U2")])
+    );
+    assert!(validate_canvas_share_post(&user_target, false).is_ok());
+    assert!(
+        validate_canvas_share_post(&user_target, true)
+            .expect_err("--post with users must fail")
+            .contains("--channel")
+    );
+
+    // XOR errors: neither or both specified.
+    assert!(
+        parse_canvas_share_target(&[], &[], resolver)
+            .expect_err("empty targets must fail")
+            .contains("at least one")
+    );
+    assert!(
+        parse_canvas_share_target(&["C1".into()], &["U1".into()], resolver)
+            .expect_err("both targets must fail")
+            .contains("not both")
+    );
+
+    // Blank entries rejected.
+    assert!(
+        parse_canvas_share_target(&["   ".into()], &[], resolver)
+            .expect_err("blank channel must fail")
+            .contains("empty")
+    );
+    assert!(
+        parse_canvas_share_target(&[], &[String::new()], resolver)
+            .expect_err("blank user must fail")
+            .contains("empty")
+    );
+}
+
+#[test]
+fn canvas_share_unshare_and_delete_formatters_cover_all_variants() {
+    // Delete.
+    let (json, human) = format_canvas_delete_result("F0123");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["canvas_id"], "F0123");
+    assert_eq!(json["deleted"], true);
+    assert_eq!(human, "deleted canvas F0123\n");
+
+    // Share with channels, without --post.
+    let ch_target = CanvasShareTarget::Channels(vec![ChannelId::from("C1"), ChannelId::from("C2")]);
+    let (json, human) =
+        format_canvas_share_result("F0123", CanvasAccessLevel::Write, &ch_target, &[], None);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["canvas_id"], "F0123");
+    assert_eq!(json["access"], "write");
+    assert_eq!(json["channels"], serde_json::json!(["C1", "C2"]));
+    assert_eq!(json["users"], serde_json::json!([]));
+    assert_eq!(json["posted"], false);
+    assert_eq!(json["posted_channels"], serde_json::json!([]));
+    assert_eq!(json["permalink"], serde_json::Value::Null);
+    assert_eq!(human, "shared canvas F0123 (write) with channels: C1, C2\n");
+
+    // Share with channels, WITH --post.
+    let posted = vec![ChannelId::from("C1"), ChannelId::from("C2")];
+    let (json, human) = format_canvas_share_result(
+        "F0123",
+        CanvasAccessLevel::Read,
+        &ch_target,
+        &posted,
+        Some("https://acme.slack.com/docs/T1/F0123"),
+    );
+    assert_eq!(json["posted"], true);
+    assert_eq!(json["posted_channels"], serde_json::json!(["C1", "C2"]));
+    assert_eq!(json["permalink"], "https://acme.slack.com/docs/T1/F0123");
+    assert_eq!(
+        human,
+        "shared canvas F0123 (read) with channels: C1, C2 (posted permalink to 2 channel(s))\n"
+    );
+
+    // Share with users.
+    let user_target = CanvasShareTarget::Users(vec![UserId::from("U1")]);
+    let (json, human) =
+        format_canvas_share_result("F0123", CanvasAccessLevel::Owner, &user_target, &[], None);
+    assert_eq!(json["access"], "owner");
+    assert_eq!(json["channels"], serde_json::json!([]));
+    assert_eq!(json["users"], serde_json::json!(["U1"]));
+    assert_eq!(human, "shared canvas F0123 (owner) with users: U1\n");
+
+    // Unshare channels & users.
+    let (json, human) = format_canvas_unshare_result("F0123", &ch_target);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["channels"], serde_json::json!(["C1", "C2"]));
+    assert_eq!(json["users"], serde_json::json!([]));
+    assert_eq!(human, "unshared canvas F0123 from channels: C1, C2\n");
+
+    let (json, human) = format_canvas_unshare_result("F0123", &user_target);
+    assert_eq!(json["channels"], serde_json::json!([]));
+    assert_eq!(json["users"], serde_json::json!(["U1"]));
+    assert_eq!(human, "unshared canvas F0123 from users: U1\n");
+}
+
+#[test]
+fn canvas_meta_formatter_covers_full_and_minimal_metadata() {
+    let full = CanvasMeta {
+        file_id: "F0999".into(),
+        title: "Launch Spec".into(),
+        permalink: Some("https://acme.slack.com/docs/T1/F0999".into()),
+        editable: true,
+        access: Some("write".into()),
+        org_or_workspace_access: Some("read".into()),
+        canvas_printing_enabled: false,
+        canvas_creator_id: Some(UserId::from("U1")),
+        editors: vec![UserId::from("U1"), UserId::from("U2")],
+        quip_thread_id: Some("Q_ABC".into()),
+        comment_channel_id: ChannelId::from("C0999"),
+    };
+    let (json, human) = format_canvas_meta(&full);
+    assert_eq!(json["canvas_id"], "F0999");
+    assert_eq!(json["title"], "Launch Spec");
+    assert_eq!(json["permalink"], "https://acme.slack.com/docs/T1/F0999");
+    assert_eq!(json["access"], "write");
+    assert_eq!(json["editable"], true);
+    assert_eq!(json["org_or_workspace_access"], "read");
+    assert_eq!(json["canvas_printing_enabled"], false);
+    assert_eq!(json["creator"], "U1");
+    assert_eq!(json["editors"], serde_json::json!(["U1", "U2"]));
+    assert_eq!(json["quip_thread_id"], "Q_ABC");
+    assert_eq!(json["comment_channel_id"], "C0999");
+    assert!(human.contains("Canvas:\tF0999\n"));
+    assert!(human.contains("Title:\tLaunch Spec\n"));
+    assert!(human.contains("Permalink:\thttps://acme.slack.com/docs/T1/F0999\n"));
+    assert!(human.contains("Access:\twrite\n"));
+    assert!(human.contains("Editable:\ttrue\n"));
+    assert!(human.contains("Workspace access:\tread\n"));
+    assert!(human.contains("Printing enabled:\tfalse\n"));
+    assert!(human.contains("Creator:\tU1\n"));
+    assert!(human.contains("Editors:\tU1, U2\n"));
+    assert!(human.contains("Comment channel:\tC0999\n"));
+    assert!(human.contains("Quip thread:\tQ_ABC\n"));
+
+    let minimal = CanvasMeta {
+        file_id: "F0100".into(),
+        title: "Untitled".into(),
+        comment_channel_id: ChannelId::from("C0100"),
+        ..CanvasMeta::default()
+    };
+    let (json, human) = format_canvas_meta(&minimal);
+    assert_eq!(json["permalink"], serde_json::Value::Null);
+    assert_eq!(json["access"], serde_json::Value::Null);
+    assert_eq!(json["creator"], serde_json::Value::Null);
+    assert_eq!(json["editors"], serde_json::json!([]));
+    assert_eq!(json["canvas_printing_enabled"], true);
+    assert!(human.contains("Permalink:\t-\n"));
+    assert!(human.contains("Access:\t-\n"));
+    assert!(human.contains("Workspace access:\t-\n"));
+    assert!(human.contains("Creator:\t-\n"));
+    assert!(human.contains("Editors:\t-\n"));
+    assert!(!human.contains("Quip thread:"));
+}
+
+#[test]
+fn canvas_comments_filtering_formatting_posting_and_resolve_seams() {
+    let threads = vec![
+        CanvasCommentThread {
+            root_ts: Ts::from("1700000001.000100"),
+            author: Some(UserId::from("U1")),
+            text: "First\nline\ttab".into(),
+            reply_count: 1,
+            replies: vec![CanvasCommentReply {
+                ts: Ts::from("1700000002.000200"),
+                author: None,
+                text: "On it\nnow".into(),
+            }],
+            resolved: false,
+        },
+        CanvasCommentThread {
+            root_ts: Ts::from("1700000010.000100"),
+            author: None,
+            text: "Already done".into(),
+            reply_count: 0,
+            replies: Vec::new(),
+            resolved: true,
+        },
+    ];
+
+    // Filter mode selection & filtering.
+    assert_eq!(
+        CanvasCommentFilter::from_flags(false, false),
+        CanvasCommentFilter::Open
+    );
+    assert_eq!(
+        CanvasCommentFilter::from_flags(true, false),
+        CanvasCommentFilter::Resolved
+    );
+    assert_eq!(
+        CanvasCommentFilter::from_flags(false, true),
+        CanvasCommentFilter::All
+    );
+
+    let open = filter_canvas_comments(&threads, CanvasCommentFilter::Open);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].root_ts, Ts::from("1700000001.000100"));
+
+    let resolved = filter_canvas_comments(&threads, CanvasCommentFilter::Resolved);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].root_ts, Ts::from("1700000010.000100"));
+
+    let all = filter_canvas_comments(&threads, CanvasCommentFilter::All);
+    assert_eq!(all.len(), 2);
+
+    // Comments formatting (JSON + human with replies and whitespace sanitization).
+    let (json, human) = format_canvas_comments("F0123", CanvasCommentFilter::All, &all);
+    assert_eq!(json["canvas_id"], "F0123");
+    assert_eq!(json["comment_channel_id"], "C0123");
+    assert_eq!(json["filter"], "all");
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["threads"][0]["author"], "U1");
+    assert_eq!(json["threads"][0]["resolved"], false);
+    assert_eq!(
+        json["threads"][0]["replies"][0]["author"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json["threads"][1]["resolved"], true);
+    assert_eq!(
+        human,
+        "1700000001.000100\topen\tU1\treplies=1\tFirst line tab\n  1700000002.000200\treply\tunknown\tOn it now\n1700000010.000100\tresolved\tunknown\treplies=0\tAlready done\n"
+    );
+
+    // Empty comment list.
+    let (empty_json, empty_human) = format_canvas_comments("F0123", CanvasCommentFilter::Open, &[]);
+    assert_eq!(empty_json["count"], 0);
+    assert_eq!(empty_json["threads"], serde_json::json!([]));
+    assert_eq!(empty_human, "");
+
+    // Comment argument validation & post formatting.
+    assert_eq!(validate_canvas_comment_args("Looks good", None), Ok(None));
+    assert_eq!(
+        validate_canvas_comment_args("Reply", Some(" 1700.1 ")),
+        Ok(Some(Ts::from("1700.1")))
+    );
+    assert!(validate_canvas_comment_args("   ", None).is_err());
+    assert!(validate_canvas_comment_args("ok", Some("   ")).is_err());
+
+    let cch = ChannelId::from("C0123");
+    let (json, human) = format_canvas_comment_posted("F0123", &cch, None, &Ts::from("1700.5"));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["comment_channel_id"], "C0123");
+    assert_eq!(json["thread_ts"], serde_json::Value::Null);
+    assert_eq!(json["ts"], "1700.5");
+    assert_eq!(human, "posted comment on canvas F0123 as 1700.5\n");
+
+    let (json, human) = format_canvas_comment_posted(
+        "F0123",
+        &cch,
+        Some(&Ts::from("1700.1")),
+        &Ts::from("1700.9"),
+    );
+    assert_eq!(json["thread_ts"], "1700.1");
+    assert_eq!(
+        human,
+        "replied to comment 1700.1 on canvas F0123 as 1700.9\n"
+    );
+
+    // Resolve action validation.
+    assert_eq!(
+        parse_canvas_resolve_action(Some(" 1700.1 "), false, false),
+        Ok(CanvasResolveAction::ResolveOne(Ts::from("1700.1")))
+    );
+    assert_eq!(
+        parse_canvas_resolve_action(Some("1700.1"), false, true),
+        Ok(CanvasResolveAction::ReopenOne(Ts::from("1700.1")))
+    );
+    assert_eq!(
+        parse_canvas_resolve_action(None, true, false),
+        Ok(CanvasResolveAction::ResolveAll)
+    );
+    assert!(parse_canvas_resolve_action(None, false, false).is_err());
+    assert!(parse_canvas_resolve_action(Some("1700.1"), true, false).is_err());
+    assert!(parse_canvas_resolve_action(None, true, true).is_err());
+    assert!(parse_canvas_resolve_action(Some("   "), false, false).is_err());
+
+    // Resolve result formatting.
+    let (json, human) = format_canvas_resolve_result(
+        "F0123",
+        &cch,
+        &CanvasResolveAction::ResolveOne(Ts::from("1700.1")),
+    );
+    assert_eq!(json["resolved"], true);
+    assert_eq!(json["all"], false);
+    assert_eq!(json["thread_ts"], "1700.1");
+    assert_eq!(human, "resolved comment thread 1700.1 on canvas F0123\n");
+
+    let (json, human) = format_canvas_resolve_result(
+        "F0123",
+        &cch,
+        &CanvasResolveAction::ReopenOne(Ts::from("1700.1")),
+    );
+    assert_eq!(json["resolved"], false);
+    assert_eq!(json["all"], false);
+    assert_eq!(human, "reopened comment thread 1700.1 on canvas F0123\n");
+
+    let (json, human) =
+        format_canvas_resolve_result("F0123", &cch, &CanvasResolveAction::ResolveAll);
+    assert_eq!(json["resolved"], true);
+    assert_eq!(json["all"], true);
+    assert_eq!(json["thread_ts"], serde_json::Value::Null);
+    assert_eq!(human, "resolved all comment threads on canvas F0123\n");
+}
+
+#[test]
+fn classify_canvas_api_error_translates_canvas_codes_and_preserves_auth_expiry() {
+    let auth = ApiError::from_slack_error("token_revoked");
+    let (code, msg) = classify_canvas_api_error(&auth);
+    assert_eq!(code, "session_rejected");
+    assert!(msg.contains("slackless auth login"));
+
+    let free_team = ApiError::from_slack_error("free_teams_cannot_create_standalone_canvases");
+    let (code, msg) = classify_canvas_api_error(&free_team);
+    assert_eq!(code, "request_failed");
+    assert!(msg.contains("Free Slack workspaces"));
+
+    let cant_del = ApiError::from_slack_error("cant_delete_file");
+    let (code, msg) = classify_canvas_api_error(&cant_del);
+    assert_eq!(code, "request_failed");
+    assert!(msg.contains("cannot be deleted"));
+
+    let unknown = ApiError::from_slack_error("some_other_error");
+    let (code, msg) = classify_canvas_api_error(&unknown);
+    assert_eq!(code, "request_failed");
+    assert_eq!(msg, "some_other_error");
 }

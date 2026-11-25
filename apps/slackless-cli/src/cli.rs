@@ -261,7 +261,7 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "N", default_value_t = 50)]
         limit: u32,
     },
-    /// Read, create, or edit Slack Canvases (needs a stored session).
+    /// Read, create, edit, share, inspect, delete, or comment on Slack Canvases (needs a stored session).
     Canvas {
         #[command(subcommand)]
         command: CanvasCommand,
@@ -353,6 +353,13 @@ pub(crate) enum SavedCommand {
     Delete { channel: String, ts: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum CanvasAccessArg {
+    Read,
+    Write,
+    Owner,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum CanvasCommand {
     /// Fetch a canvas's markdown (or HTML with `--html`).
@@ -377,6 +384,79 @@ pub(crate) enum CanvasCommand {
         section: Option<String>,
         #[arg(long)]
         append: bool,
+    },
+    /// Fetch and display canvas metadata (`files.info`).
+    Info {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+    },
+    /// Permanently delete a canvas (`canvases.delete`).
+    Delete {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+    },
+    /// Grant read, write, or owner access on a canvas to channels or users (`canvases.access.set`).
+    Share {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+        /// Access level to grant (`read`, `write`, or `owner`).
+        #[arg(long, value_enum)]
+        access: CanvasAccessArg,
+        /// Channel id, #name, or @handle to grant access to (repeatable; mutually exclusive with `--user`).
+        #[arg(long = "channel", value_name = "CHANNEL")]
+        channels: Vec<String>,
+        /// User id (e.g. `U0123ABC`) to grant access to (repeatable; mutually exclusive with `--channel`).
+        #[arg(long = "user", value_name = "USER_ID")]
+        users: Vec<String>,
+        /// Also post the canvas permalink to each shared channel.
+        #[arg(long)]
+        post: bool,
+    },
+    /// Revoke canvas access from channels or users (`canvases.access.delete`).
+    Unshare {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+        /// Channel id, #name, or @handle to revoke access from (repeatable; mutually exclusive with `--user`).
+        #[arg(long = "channel", value_name = "CHANNEL")]
+        channels: Vec<String>,
+        /// User id (e.g. `U0123ABC`) to revoke access from (repeatable; mutually exclusive with `--channel`).
+        #[arg(long = "user", value_name = "USER_ID")]
+        users: Vec<String>,
+    },
+    /// List threaded comments on a canvas (open threads by default).
+    Comments {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+        /// Show only resolved comment threads.
+        #[arg(long, conflicts_with = "all")]
+        resolved: bool,
+        /// Show both open and resolved comment threads.
+        #[arg(long, conflicts_with = "resolved")]
+        all: bool,
+    },
+    /// Post a new canvas comment thread or reply to an existing one.
+    Comment {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+        /// Comment text (pass `-` to read from stdin).
+        text: String,
+        /// Optional root comment thread ts to reply to.
+        #[arg(long, value_name = "TS")]
+        thread: Option<String>,
+    },
+    /// Resolve or reopen canvas comment threads (`quip.thread.archive` / `unarchive` / `archiveAll`).
+    Resolve {
+        /// Canvas file ID (e.g. `F0123ABC`).
+        canvas_id: String,
+        /// Root comment thread ts to resolve (or reopen with `--reopen`).
+        #[arg(long, value_name = "TS", conflicts_with = "all")]
+        thread: Option<String>,
+        /// Resolve every open comment thread on the canvas.
+        #[arg(long, conflicts_with = "thread")]
+        all: bool,
+        /// Reopen a resolved comment thread instead of resolving it (requires `--thread`).
+        #[arg(long)]
+        reopen: bool,
     },
 }
 

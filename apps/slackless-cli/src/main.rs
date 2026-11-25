@@ -30,7 +30,7 @@ use crate::cli::{
     AuthCommand, CanvasCommand, Cli, Commands, HuddleCommand, ListCommand, SavedCommand,
     StatusCommand,
 };
-pub(crate) use crate::cli::{CLI_VERSION, ListReadFormat};
+pub(crate) use crate::cli::{CLI_VERSION, CanvasAccessArg, ListReadFormat};
 use crate::commands::auth::{cmd_auth_login, cmd_auth_logout, cmd_auth_status};
 use crate::commands::browse::{
     cmd_channels, cmd_digest, cmd_dms, cmd_revisions, cmd_threads, cmd_users,
@@ -226,6 +226,40 @@ async fn dispatch(
                 section,
                 append,
             } => live::run_canvas_edit(ctx, flag, &file_id, markdown, section, append).await,
+            CanvasCommand::Info { canvas_id } => live::run_canvas_info(ctx, flag, &canvas_id).await,
+            CanvasCommand::Delete { canvas_id } => {
+                live::run_canvas_delete(ctx, flag, &canvas_id).await
+            }
+            CanvasCommand::Share {
+                canvas_id,
+                access,
+                channels,
+                users,
+                post,
+            } => {
+                live::run_canvas_share(ctx, flag, &canvas_id, access, &channels, &users, post).await
+            }
+            CanvasCommand::Unshare {
+                canvas_id,
+                channels,
+                users,
+            } => live::run_canvas_unshare(ctx, flag, &canvas_id, &channels, &users).await,
+            CanvasCommand::Comments {
+                canvas_id,
+                resolved,
+                all,
+            } => live::run_canvas_comments(ctx, flag, &canvas_id, resolved, all).await,
+            CanvasCommand::Comment {
+                canvas_id,
+                text,
+                thread,
+            } => live::run_canvas_comment(ctx, flag, &canvas_id, text, thread).await,
+            CanvasCommand::Resolve {
+                canvas_id,
+                thread,
+                all,
+                reopen,
+            } => live::run_canvas_resolve(ctx, flag, &canvas_id, thread, all, reopen).await,
         },
         Commands::List { command } => match command {
             ListCommand::Read { list_id, format } => {

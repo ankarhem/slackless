@@ -12,7 +12,7 @@ description: This skill should be used when an AI agent needs to search, read, s
 Two kinds of commands exist.
 
 - **Offline archive commands** (`search`, `read`, `thread`, `channels`, `dms`, `users`, `digest`, `threads`, `revisions`, `export`, `stats`, `vacuum`, `huddle devices`, `huddle cameras`, `huddle screens`, `auth status`) work offline against the local SQLite archive (or local host media devices). Archive read commands always exit 0; with no known workspace they print empty results (plus a stderr hint in human mode) instead of failing.
-- **Live Slack commands** (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-read`, `mark-thread`, `pins`, `pin`, `unpin`, `schedule`, `scheduled`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle join|link|invite`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `send`, `reply`, `edit`, and `schedule` accept `-` as `<TEXT>` to read multi-line bodies from stdin. `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
+- **Live Slack commands** (`send`, `reply`, `edit`, `delete`, `react`, `unreact`, `upload`, `thread --live`, `mark-read`, `mark-thread`, `pins`, `pin`, `unpin`, `schedule`, `scheduled`, `saved`, `files`, `download`, `canvas`, `list`, `status`, `unread`, `watch`, `backfill`, `huddle join|link|invite`) talk to Slack using a stored session (`slackless auth login` or the desktop app). Every REST command is one deterministic invocation; `send`, `reply`, `edit`, `schedule`, and `canvas comment` accept `-` as `<TEXT>` to read multi-line bodies from stdin. `watch` opens a live websocket and streams NDJSON events until interrupted (or `--count N`); `huddle join` connects natively to Amazon Chime audio until interrupted or `--duration N`. `slackless update` checks for and installs new Slackless releases from GitHub Releases (updating both `Slackless.app` and the CLI).
 
 ## Setup and auth
 
@@ -653,11 +653,25 @@ JSON output:
 slackless canvas read <FILE_ID> [--html]
 slackless canvas create <TITLE> [--markdown MD] [--channel CHANNEL]
 slackless canvas edit <FILE_ID> <MARKDOWN> [--section SECTION_ID] [--append]
+slackless canvas info <CANVAS_ID>
+slackless canvas share <CANVAS_ID> --access <read|write|owner> [--channel CHANNEL...] [--user USER_ID...] [--post]
+slackless canvas unshare <CANVAS_ID> [--channel CHANNEL...] [--user USER_ID...]
+slackless canvas delete <CANVAS_ID>
+slackless canvas comments <CANVAS_ID> [--resolved | --all]
+slackless canvas comment <CANVAS_ID> <TEXT> [--thread TS]
+slackless canvas resolve <CANVAS_ID> [--thread TS | --all] [--reopen]
 ```
 
 - `read`: fetches markdown via `canvases.getContent` (falling back to HTML export, or forcing HTML with `--html`) -> `{ "file_id", "title", "format", "content" }`.
 - `create`: creates a standalone or channel-tabbed canvas (`canvases.create`) -> `{ "ok": true, "canvas_id", "title" }`.
 - `edit`: replaces the whole canvas, replaces `--section SECTION_ID`, or appends with `--append` (`canvases.edit`) -> `{ "ok": true, "canvas_id" }`.
+- `info`: fetches canvas metadata via `files.info` -> `{ "canvas_id", "title", "permalink", "access", "editable", "org_or_workspace_access", "canvas_printing_enabled", "creator", "editors": [...], "quip_thread_id", "comment_channel_id" }`.
+- `share`: grants `read`, `write`, or `owner` access via `canvases.access.set`. `--channel` and `--user` are repeatable and mutually exclusive (XOR). Pass `--post` (channels only) to also post the canvas permalink to each shared channel -> `{ "ok": true, "canvas_id", "access", "channels": [...], "users": [...], "posted": false, "posted_channels": [...], "permalink": null }`.
+- `unshare`: revokes access via `canvases.access.delete` (`--channel` and `--user` are repeatable and mutually exclusive) -> `{ "ok": true, "canvas_id", "channels": [...], "users": [...] }`.
+- `delete`: permanently deletes a canvas (`canvases.delete`) -> `{ "ok": true, "canvas_id", "deleted": true }`.
+- `comments`: lists threaded canvas comments from the canvas's derived comment channel (`C…`). Shows open threads by default, resolved only with `--resolved`, or all with `--all` -> `{ "canvas_id", "comment_channel_id", "filter", "count", "threads": [{ "root_ts", "author", "text", "resolved", "reply_count", "replies": [{ "ts", "author", "text" }] }] }`.
+- `comment`: posts a new canvas comment thread or replies to `--thread TS`. Pass `-` as `<TEXT>` to read from stdin -> `{ "ok": true, "canvas_id", "comment_channel_id", "thread_ts", "ts" }`.
+- `resolve`: resolves one thread (`--thread TS`, `quip.thread.archive`), reopens one resolved thread (`--thread TS --reopen`, `quip.thread.unarchive`), or resolves all open threads (`--all`, `quip.thread.archiveAll`) -> `{ "ok": true, "canvas_id", "comment_channel_id", "thread_ts", "all", "resolved" }`.
 
 #### list
 
@@ -875,21 +889,21 @@ Success exits 0, and so do local archive commands that found nothing to read. An
 
 Human mode prints `slackless: <message>` on stderr instead. Error codes:
 
-| Code                    | When it happens                                                                           |
-| ----------------------- | ----------------------------------------------------------------------------------------- |
-| `not_signed_in`         | a live command ran with no stored session holding credentials                             |
-| `client_error`          | building the Slack API/RTM client failed                                                  |
-| `session_rejected`      | Slack rejected the stored session; ask the user to run `slackless auth login`, then retry |
-| `request_failed`        | the Slack API call failed for another reason                                              |
-| `invalid_args`          | malformed CLI argument (e.g. invalid `--since`, `--at`, or missing upload files)          |
-| `missing_ts`            | `mark-read` omitted `[TS]` and the local archive has no messages for the channel          |
-| `disconnected`          | `watch` websocket disconnected                                                            |
-| `no_download_url`       | `download` target file has no private download URL                                        |
-| `write_failed`          | `download` could not write destination file                                               |
-| `no_store_path`         | `backfill` could not resolve the local archive path                                       |
-| `update_check_failed`   | `update` could not query GitHub Releases                                                  |
-| `update_install_failed` | `update` download, checksum verification, or bundle swap failed                           |
-| `command_failed`        | anything else, such as an unexpected I/O or runtime error                                 |
+| Code                    | When it happens                                                                                |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| `not_signed_in`         | a live command ran with no stored session holding credentials                                  |
+| `client_error`          | building the Slack API/RTM client failed                                                       |
+| `session_rejected`      | Slack rejected the stored session; ask the user to run `slackless auth login`, then retry      |
+| `request_failed`        | the Slack API call failed for another reason                                                   |
+| `invalid_args`          | malformed CLI argument (e.g. invalid `--since`, `--at`, canvas flags, or missing upload files) |
+| `missing_ts`            | `mark-read` omitted `[TS]` and the local archive has no messages for the channel               |
+| `disconnected`          | `watch` websocket disconnected                                                                 |
+| `no_download_url`       | `download` target file has no private download URL                                             |
+| `write_failed`          | `download` could not write destination file                                                    |
+| `no_store_path`         | `backfill` could not resolve the local archive path                                            |
+| `update_check_failed`   | `update` could not query GitHub Releases                                                       |
+| `update_install_failed` | `update` download, checksum verification, or bundle swap failed                                |
+| `command_failed`        | anything else, such as an unexpected I/O or runtime error                                      |
 
 ## Worked examples
 
@@ -915,7 +929,7 @@ slackless schedule "#eng" "Standup in 5m" --at "+30m" --json
 
 - Always pass `--json` and parse the output line(s). Tab-separated mode exists for human eyes.
 - Quote arguments in the shell. Text and queries contain spaces, and a leading `#` starts a shell comment.
-- Use `-` as `<TEXT>` with `send`, `reply`, `edit`, or `schedule` to pass multi-line or shell-tricky bodies via stdin.
+- Use `-` as `<TEXT>` with `send`, `reply`, `edit`, `schedule`, or `canvas comment` to pass multi-line or shell-tricky bodies via stdin.
 - Treat `ts` values as opaque identifiers and copy them verbatim into `reply`, `edit`, `delete`, `react`, `unreact`, `pin`, `unpin`, `thread`, `revisions`, and `mark-read`.
 - Empty local results with exit 0 usually mean the archive has not synced yet; check `auth status --json` for `archive_exists` and `messages`, or run `slackless backfill <CHANNEL>`.
 - A `session_rejected` error is fixed by the user signing in again (`slackless auth login`), not by retrying.
