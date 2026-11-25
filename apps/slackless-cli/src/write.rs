@@ -620,7 +620,7 @@ pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
         ));
     };
     let num_part = chars.as_str();
-    if num_part.is_empty() {
+    if num_part.is_empty() || !num_part.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
             "invalid duration '{raw}'; expected e.g. 30m, 24h, 7d"
         ));
@@ -858,6 +858,9 @@ mod tests {
         assert!(parse_duration_secs("m").is_err());
         assert!(parse_duration_secs("abcm").is_err());
         assert!(parse_duration_secs("-5m").is_err());
+        assert!(parse_duration_secs("+5m").is_err());
+        assert!(parse_duration_secs("1.5h").is_err());
+        assert!(parse_duration_secs("10 m").is_err());
 
         // Unknown ASCII units.
         let err = parse_duration_secs("10x").unwrap_err();
@@ -880,13 +883,23 @@ mod tests {
         assert_eq!(parse_schedule_at("+1d", now), Ok(now + 86_400));
         assert_eq!(parse_schedule_at("  1700000001  ", now), Ok(now + 1));
 
-        // Relative zero offset is rejected.
+        // Relative zero offset and double signs are rejected.
         assert!(parse_schedule_at("+0s", now).is_err());
         assert!(parse_schedule_at("+0m", now).is_err());
+        assert!(parse_schedule_at("+0w", now).is_err());
+        assert!(parse_schedule_at("++15m", now).is_err());
+        assert!(parse_schedule_at("+-15m", now).is_err());
+        assert!(parse_schedule_at("+", now).is_err());
+        assert_eq!(parse_schedule_at("+2w", now), Ok(now + 1_209_600));
+        assert_eq!(parse_schedule_at("+1s", 0), Ok(1));
+        assert_eq!(parse_schedule_at("1", 0), Ok(1));
+        assert!(parse_schedule_at("0", 0).is_err());
 
         // Epoch equal to or before `now` is rejected.
         assert!(parse_schedule_at("1700000000", now).is_err());
         assert!(parse_schedule_at("1699999999", now).is_err());
+        assert!(parse_schedule_at("-1700005000", now).is_err());
+        assert!(parse_schedule_at("2026-01-01", now).is_err());
 
         // Non-numeric / malformed inputs.
         assert!(parse_schedule_at("tomorrow", now).is_err());

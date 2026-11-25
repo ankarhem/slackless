@@ -79,9 +79,21 @@ pub struct Date {
 impl Date {
     pub fn parse(s: &str) -> Option<Self> {
         let mut parts = s.splitn(3, '-');
-        let year: i32 = parts.next()?.parse().ok()?;
-        let month: u32 = parts.next()?.parse().ok()?;
-        let day: u32 = parts.next()?.parse().ok()?;
+        let y_str = parts.next()?;
+        let m_str = parts.next()?;
+        let d_str = parts.next()?;
+        if y_str.len() != 4
+            || !(1..=2).contains(&m_str.len())
+            || !(1..=2).contains(&d_str.len())
+            || !y_str.bytes().all(|b| b.is_ascii_digit())
+            || !m_str.bytes().all(|b| b.is_ascii_digit())
+            || !d_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let year: i32 = y_str.parse().ok()?;
+        let month: u32 = m_str.parse().ok()?;
+        let day: u32 = d_str.parse().ok()?;
         let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
         let days_in_month = match month {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -385,15 +397,110 @@ mod tests {
 
     #[test]
     fn date_parse_validates_calendar_and_leap_years() {
-        assert!(Date::parse("2000-02-29").is_some());
-        assert!(Date::parse("2024-02-29").is_some());
-        assert!(Date::parse("1900-02-29").is_none());
-        assert!(Date::parse("2023-02-29").is_none());
-        assert!(Date::parse("2024-04-31").is_none());
-        assert!(Date::parse("2024-00-10").is_none());
-        assert!(Date::parse("2024-13-10").is_none());
-        assert!(Date::parse("2024-01-00").is_none());
-        assert!(Date::parse("2024-01-32").is_none());
-        assert!(Date::parse("2024-01").is_none());
+        // Leap days (400-year rule and 4-year rule).
+        assert_eq!(
+            Date::parse("2000-02-29"),
+            Some(Date {
+                year: 2000,
+                month: 2,
+                day: 29
+            })
+        );
+        assert_eq!(
+            Date::parse("2024-02-29"),
+            Some(Date {
+                year: 2024,
+                month: 2,
+                day: 29
+            })
+        );
+        // Valid month ends (28, 29, 30, 31) and epoch / rollover dates.
+        for valid in [
+            "1969-12-31",
+            "1970-01-01",
+            "1970-01-02",
+            "1900-02-28",
+            "2100-02-28",
+            "2025-02-28",
+            "2025-12-31",
+            "2026-01-01",
+            "2026-01-31",
+            "2026-04-30",
+            "2026-06-30",
+            "2026-09-30",
+            "2026-11-30",
+            "2026-12-31",
+        ] {
+            assert!(Date::parse(valid).is_some(), "expected valid date {valid}");
+        }
+
+        // Exact UTC midnight unix_start values.
+        assert_eq!(Date::parse("1969-12-31").unwrap().unix_start(), -86_400);
+        assert_eq!(Date::parse("1970-01-01").unwrap().unix_start(), 0);
+        assert_eq!(Date::parse("1970-01-02").unwrap().unix_start(), 86_400);
+        assert_eq!(
+            Date::parse("2000-02-29").unwrap().unix_start() + 86_400,
+            Date::parse("2000-03-01").unwrap().unix_start()
+        );
+        assert_eq!(
+            Date::parse("2024-02-29").unwrap().unix_start() + 86_400,
+            Date::parse("2024-03-01").unwrap().unix_start()
+        );
+        assert_eq!(
+            Date::parse("1900-02-28").unwrap().unix_start() + 86_400,
+            Date::parse("1900-03-01").unwrap().unix_start()
+        );
+        assert_eq!(
+            Date::parse("2100-02-28").unwrap().unix_start() + 86_400,
+            Date::parse("2100-03-01").unwrap().unix_start()
+        );
+        assert_eq!(
+            Date::parse("2025-12-31").unwrap().unix_start() + 86_400,
+            Date::parse("2026-01-01").unwrap().unix_start()
+        );
+        assert_eq!(
+            Date::parse("2026-01-01").unwrap().unix_start(),
+            1_767_225_600
+        );
+        assert_eq!(
+            Date::parse("2026-01-02").unwrap().unix_start(),
+            1_767_312_000
+        );
+
+        // Non-leap century/regular Feb 29, out-of-range days/months, signs, and malformed shapes.
+        for bad in [
+            "1900-02-29",
+            "2100-02-29",
+            "2023-02-29",
+            "2025-02-29",
+            "2026-02-31",
+            "2024-02-30",
+            "2024-04-31",
+            "2026-06-31",
+            "2026-09-31",
+            "2026-11-31",
+            "2026-00-10",
+            "2026-13-01",
+            "2024-01-00",
+            "2024-01-32",
+            "2024-01",
+            "+2024-01-01",
+            "2024-+01-01",
+            "2024-01-+01",
+            "-2024-01-01",
+            "2024-01-01-01",
+            "24-01-01",
+            "2024-001-01",
+            "2024-01-001",
+        ] {
+            assert!(
+                Date::parse(bad).is_none(),
+                "expected None for invalid date {bad}"
+            );
+            // Invalid before:/after: dates stay literal free text rather than applying a filter.
+            let q = SearchQuery::parse(&format!("before:{bad} after:{bad}"));
+            assert_eq!(q.filters.before, None, "unexpected before filter for {bad}");
+            assert_eq!(q.filters.after, None, "unexpected after filter for {bad}");
+        }
     }
 }

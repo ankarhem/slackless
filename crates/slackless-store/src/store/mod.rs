@@ -1,9 +1,12 @@
 //! The blocking [`Store`]. Drive it from a dedicated thread or `spawn_blocking`.
 
+mod archive;
 mod messages;
 mod search;
 #[cfg(test)]
 mod tests;
+
+pub use archive::{ALL_CONVERSATION_KINDS, ConversationSummary, DigestChannel, UserSummary};
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
@@ -132,6 +135,9 @@ impl Store {
              PRAGMA cache_size = -2000;
              PRAGMA mmap_size = 8388608;",
         );
+        // Probe header/schema readability eagerly so WAL-without-shm databases fail here instead
+        // of returning a broken handle whose later queries silently fail.
+        let _ = schema::schema_version(&conn)?;
         Ok(Self { conn })
     }
 

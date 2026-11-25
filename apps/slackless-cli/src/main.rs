@@ -1220,7 +1220,7 @@ fn cmd_vacuum(ctx: &Ctx, workspace: Option<&TeamId>) -> Result<ExitCode> {
             "compacting archive",
         ));
     };
-    let Some(store) = open_archive_store(workspace) else {
+    let Some(store) = open_archive_store_rw(workspace) else {
         archive_hint(workspace);
         return Ok(ExitCode::SUCCESS);
     };
@@ -1540,9 +1540,20 @@ fn cmd_auth_logout(ctx: &Ctx, workspace: Option<&str>) -> Result<ExitCode> {
     cmd_auth_status(ctx)
 }
 
-/// The workspace's durable store for reading; `None` when no archive exists yet (creating one
-/// as a side effect of a read would be surprising).
+/// The workspace's durable store opened read-only; `None` when no archive exists yet (creating
+/// one as a side effect of a read would be surprising).
 fn open_archive_store(workspace: &TeamId) -> Option<Store> {
+    let path = archive::store_path(workspace)?;
+    if !path.is_file() {
+        return None;
+    }
+    Store::open_read_only(&path)
+        .or_else(|_| Store::open(&path))
+        .ok()
+}
+
+/// The workspace's durable store opened read-write (for `vacuum`); `None` when no archive exists.
+fn open_archive_store_rw(workspace: &TeamId) -> Option<Store> {
     let path = archive::store_path(workspace)?;
     if !path.is_file() {
         return None;
@@ -1603,6 +1614,12 @@ fn parse_since_cutoff(spec: &str, now_secs: i64) -> Result<i64, String> {
     }
     if let Some((y, rest)) = trimmed.split_once('-')
         && let Some((m, d)) = rest.split_once('-')
+        && y.len() == 4
+        && (1..=2).contains(&m.len())
+        && (1..=2).contains(&d.len())
+        && y.bytes().all(|b| b.is_ascii_digit())
+        && m.bytes().all(|b| b.is_ascii_digit())
+        && d.bytes().all(|b| b.is_ascii_digit())
         && let (Ok(year), Ok(month), Ok(day)) =
             (y.parse::<i64>(), m.parse::<u32>(), d.parse::<u32>())
     {
@@ -1863,35 +1880,66 @@ mod tests {
     fn parse_since_cutoff_validates_calendar_dates_leap_years_and_edges() {
         let now = 1_764_000_000i64;
 
-        // Civil date epoch checks and leap years (2024, 2000) vs non-leap (1900, 2025).
+        // Civil date epoch checks and leap years (2024, 2000) vs non-leap (1900, 2025, 2100).
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(2000, 2, 29), 11_016);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+        assert_eq!(days_from_civil(2024, 2, 29), 19_782);
+        assert_eq!(days_from_civil(2024, 3, 1), 19_783);
         assert_eq!(
-            parse_since_cutoff("2024-02-29", now),
-            Ok(days_from_civil(2024, 2, 29) * 86_400)
+            days_from_civil(2025, 12, 31) + 1,
+            days_from_civil(2026, 1, 1)
         );
         assert_eq!(
-            parse_since_cutoff("2000-02-29", now),
-            Ok(days_from_civil(2000, 2, 29) * 86_400)
+            days_from_civil(1900, 2, 28) + 1,
+            days_from_civil(1900, 3, 1)
         );
         assert_eq!(
-            parse_since_cutoff("1900-02-28", now),
-            Ok(days_from_civil(1900, 2, 28) * 86_400)
-        );
-        assert_eq!(
-            parse_since_cutoff("2025-02-28", now),
-            Ok(days_from_civil(2025, 2, 28) * 86_400)
-        );
-        assert_eq!(
-            parse_since_cutoff("2026-04-30", now),
-            Ok(days_from_civil(2026, 4, 30) * 86_400)
+            days_from_civil(2100, 2, 28) + 1,
+            days_from_civil(2100, 3, 1)
         );
 
-        // Invalid calendar dates must be rejected rather than rolling over into next month.
+        // Epoch, near-epoch, leap days, century non-leap years, and month ends (28/29/30/31).
+        for (date, expected_days) in [
+            ("1969-12-31", -1),
+            ("1970-01-01", 0),
+            ("1970-01-02", 1),
+            ("1900-02-28", days_from_civil(1900, 2, 28)),
+            ("2000-02-29", days_from_civil(2000, 2, 29)),
+            ("2024-02-29", days_from_civil(2024, 2, 29)),
+            ("2025-02-28", days_from_civil(2025, 2, 28)),
+            ("2100-02-28", days_from_civil(2100, 2, 28)),
+            ("2026-01-31", days_from_civil(2026, 1, 31)),
+            ("2026-03-31", days_from_civil(2026, 3, 31)),
+            ("2026-04-30", days_from_civil(2026, 4, 30)),
+            ("2026-05-31", days_from_civil(2026, 5, 31)),
+            ("2026-06-30", days_from_civil(2026, 6, 30)),
+            ("2026-07-31", days_from_civil(2026, 7, 31)),
+            ("2026-08-31", days_from_civil(2026, 8, 31)),
+            ("2026-09-30", days_from_civil(2026, 9, 30)),
+            ("2026-10-31", days_from_civil(2026, 10, 31)),
+            ("2026-11-30", days_from_civil(2026, 11, 30)),
+            ("2025-12-31", days_from_civil(2025, 12, 31)),
+            ("2026-01-01", days_from_civil(2026, 1, 1)),
+            ("2026-12-31", days_from_civil(2026, 12, 31)),
+        ] {
+            assert_eq!(
+                parse_since_cutoff(date, now),
+                Ok(expected_days * 86_400),
+                "unexpected cutoff for {date}"
+            );
+        }
+
+        // Invalid calendar dates (including century non-leap 1900/2100 & signed tokens) must fail.
         for bad in [
+            "2026-02-29",
             "2026-02-31",
             "2025-02-29",
             "1900-02-29",
+            "2100-02-29",
+            "2024-02-30",
             "2026-04-31",
             "2026-06-31",
             "2026-09-31",
@@ -1900,6 +1948,12 @@ mod tests {
             "2026-13-01",
             "2026-01-00",
             "2026-01-32",
+            "+2026-01-01",
+            "2026-+01-01",
+            "2026-01-+01",
+            "2026-01-01-01",
+            "26-01-01",
+            "2026-01",
         ] {
             assert!(
                 parse_since_cutoff(bad, now).is_err(),

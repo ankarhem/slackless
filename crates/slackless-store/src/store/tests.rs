@@ -1890,3 +1890,732 @@ fn open_read_only_rejects_writes_and_open_rejects_future_schema() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn archive_read_apis_cover_channels_dms_users_resolve_digest_and_malformed_prefs() {
+    use crate::types::Latest;
+
+    let mut store = Store::open_in_memory().unwrap();
+    let ws1 = TeamId::from("T1");
+    let ws2 = TeamId::from("T2");
+
+    let mk_user =
+        |id: &str, name: &str, display: Option<&str>, real: Option<&str>, bot: bool, del: bool| {
+            User {
+                id: UserId::from(id),
+                name: name.into(),
+                real_name: real.map(str::to_owned),
+                profile: Profile {
+                    display_name: display.map(str::to_owned),
+                    real_name: real.map(str::to_owned),
+                    ..Default::default()
+                },
+                is_bot: bot,
+                deleted: del,
+                ..Default::default()
+            }
+        };
+
+    store
+        .upsert_users(
+            &ws1,
+            &[
+                mk_user(
+                    "U1",
+                    "alice",
+                    Some("Alice Display"),
+                    Some("Alice Real"),
+                    false,
+                    false,
+                ),
+                mk_user("U2", "bob", Some(""), Some("Bob Real"), false, false),
+                mk_user("U3", "carol", Some(""), Some(""), false, false),
+                mk_user("U4", "zbot", Some("Zeta Bot"), None, true, false),
+                mk_user("U5", "former", Some("Former Member"), None, false, true),
+            ],
+        )
+        .unwrap();
+
+    store
+        .upsert_conversations(
+            &ws1,
+            &[
+                Conversation {
+                    id: ChannelId::from("C_ENG"),
+                    name: Some("Engineering".into()),
+                    is_channel: true,
+                    is_member: true,
+                    topic: Some(TopicPurpose {
+                        value: "Build".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Conversation {
+                    id: ChannelId::from("C_ALPHA"),
+                    name: Some("alpha".into()),
+                    is_channel: true,
+                    is_private: true,
+                    is_archived: true,
+                    is_member: false,
+                    ..Default::default()
+                },
+                Conversation {
+                    id: ChannelId::from("C_UNNAMED"),
+                    name: None,
+                    is_channel: true,
+                    is_member: true,
+                    ..Default::default()
+                },
+                Conversation {
+                    id: ChannelId::from("C_BOB"),
+                    name: Some("bob".into()),
+                    is_channel: true,
+                    is_member: true,
+                    ..Default::default()
+                },
+                Conversation {
+                    id: ChannelId::from("D_ALICE"),
+                    is_im: true,
+                    user: Some(UserId::from("U1")),
+                    latest: Some(Latest::Ts(Ts::from("1700000300.000000"))),
+                    ..Default::default()
+                },
+                Conversation {
+                    id: ChannelId::from("D_BOB"),
+                    is_im: true,
+                    user: Some(UserId::from("U2")),
+                    latest: None,
+                    ..Default::default()
+                },
+                Conversation {
+                    id: ChannelId::from("G_MPIM"),
+                    name: Some("mpdm-a--b".into()),
+                    is_mpim: true,
+                    latest: Some(Latest::Ts(Ts::from("1700000500.000000"))),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+    // Channels sorted case-insensitively with unnamed last.
+    let channels = store.list_channels(&ws1).unwrap();
+    let ch_ids: Vec<&str> = channels.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ch_ids, ["C_ALPHA", "C_BOB", "C_ENG", "C_UNNAMED"]);
+    assert_eq!(channels[0].label(), "#alpha");
+    assert_eq!(channels[2].topic.as_deref(), Some("Build"));
+    assert_eq!(channels[3].label(), "C_UNNAMED");
+
+    // DMs sorted by latest_secs desc with None last.
+    let dms = store.list_dms(&ws1).unwrap();
+    let dm_ids: Vec<&str> = dms.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(dm_ids, ["G_MPIM", "D_ALICE", "D_BOB"]);
+    assert_eq!(dms[0].latest_secs, Some(1_700_000_500));
+    assert_eq!(dms[2].latest_secs, None);
+
+    // channel_names omits unnamed conversations.
+    let names = store.channel_names(&ws1).unwrap();
+    assert_eq!(names.get("C_ENG").map(String::as_str), Some("Engineering"));
+    assert!(!names.contains_key("C_UNNAMED"));
+
+    // conversation_summary direct PK lookup.
+    assert_eq!(
+        store
+            .conversation_summary(&ws1, &ChannelId::from("C_ENG"))
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Engineering")
+    );
+    assert!(
+        store
+            .conversation_summary(&ws1, &ChannelId::from("C_NOPE"))
+            .unwrap()
+            .is_none()
+    );
+
+    // resolve_channel precedence: exact id -> case-insensitive name -> IM by user handle/display/real.
+    assert_eq!(
+        store.resolve_channel(&ws1, "C_ENG").unwrap().map(|c| c.id),
+        Some(ChannelId::from("C_ENG"))
+    );
+    assert_eq!(
+        store
+            .resolve_channel(&ws1, "#engineering")
+            .unwrap()
+            .map(|c| c.id),
+        Some(ChannelId::from("C_ENG"))
+    );
+    assert_eq!(
+        store.resolve_channel(&ws1, "bob").unwrap().map(|c| c.id),
+        Some(ChannelId::from("C_BOB"))
+    );
+    assert_eq!(
+        store.resolve_channel(&ws1, "@alice").unwrap().map(|c| c.id),
+        Some(ChannelId::from("D_ALICE"))
+    );
+    assert_eq!(
+        store
+            .resolve_channel(&ws1, "Bob Real")
+            .unwrap()
+            .map(|c| c.id),
+        Some(ChannelId::from("D_BOB"))
+    );
+    assert!(store.resolve_channel(&ws1, "#missing").unwrap().is_none());
+
+    // user_display & list_users.
+    assert_eq!(
+        store
+            .user_display(&ws1, &UserId::from("U1"))
+            .unwrap()
+            .as_deref(),
+        Some("Alice Display")
+    );
+    assert_eq!(
+        store
+            .user_display(&ws1, &UserId::from("U2"))
+            .unwrap()
+            .as_deref(),
+        Some("Bob Real")
+    );
+    assert_eq!(
+        store
+            .user_display(&ws1, &UserId::from("U3"))
+            .unwrap()
+            .as_deref(),
+        Some("carol")
+    );
+    assert_eq!(
+        store.user_display(&ws1, &UserId::from("U99")).unwrap(),
+        None
+    );
+
+    let active_users: Vec<String> = store
+        .list_users(&ws1, None, false)
+        .unwrap()
+        .into_iter()
+        .map(|u| u.id.as_str().to_owned())
+        .collect();
+    assert_eq!(active_users, ["U1", "U2", "U3", "U4"]);
+    let all_users: Vec<String> = store
+        .list_users(&ws1, None, true)
+        .unwrap()
+        .into_iter()
+        .map(|u| u.id.as_str().to_owned())
+        .collect();
+    assert_eq!(all_users, ["U1", "U2", "U3", "U5", "U4"]);
+    assert_eq!(
+        store.list_users(&ws1, Some("@alice"), false).unwrap().len(),
+        1
+    );
+
+    // Messages, latest_ts (skips deleted), message_count, workspace isolation, digest_since.
+    store
+        .upsert_messages(
+            &ws1,
+            &ChannelId::from("C_ENG"),
+            &[
+                msg("1700000050.000000", "U1", "before cutoff"),
+                msg("1700000100.000000", "U1", "at cutoff"),
+                msg("1700000200.000000", "U2", "second author"),
+                msg("1700000250.000000", "U1", "to be deleted"),
+            ],
+        )
+        .unwrap();
+    store
+        .record_deletion(
+            &ws1,
+            &ChannelId::from("C_ENG"),
+            &Ts::from("1700000250.000000"),
+            Some(&Ts::from("1700000251.000000")),
+            None,
+        )
+        .unwrap();
+    store
+        .upsert_messages(
+            &ws1,
+            &ChannelId::from("D_ALICE"),
+            &[
+                msg("1700000150.000000", "U1", "dm one"),
+                msg(
+                    "1700000300.000000",
+                    "U1",
+                    &format!("hi\t\n{}", "é".repeat(130)),
+                ),
+            ],
+        )
+        .unwrap();
+    store
+        .upsert_message(
+            &ws2,
+            &ChannelId::from("C_OTHER"),
+            &msg("1700000999.000000", "U1", "other"),
+        )
+        .unwrap();
+
+    assert_eq!(store.message_count(&ws1).unwrap(), 6);
+    assert_eq!(store.message_count(&ws2).unwrap(), 1);
+    assert_eq!(
+        store.latest_ts(&ws1, &ChannelId::from("C_ENG")).unwrap(),
+        Some(Ts::from("1700000200.000000"))
+    );
+    assert_eq!(
+        store.latest_ts(&ws1, &ChannelId::from("C_ALPHA")).unwrap(),
+        None
+    );
+
+    let digest = store.digest_since(&ws1, 1_700_000_100, 10).unwrap();
+    assert_eq!(digest.len(), 2);
+    assert_eq!(digest[0].channel, ChannelId::from("D_ALICE"));
+    assert_eq!(digest[0].label, "@Alice Display");
+    assert_eq!(digest[0].message_count, 2);
+    assert_eq!(digest[0].latest_text.chars().count(), 120);
+    assert!(digest[0].latest_text.ends_with('…'));
+    assert_eq!(digest[1].channel, ChannelId::from("C_ENG"));
+    assert_eq!(digest[1].label, "#Engineering");
+    assert_eq!(digest[1].author_count, 2);
+
+    // Malformed prefs JSON in SQLite returns StoreError::Json from Store::prefs.
+    store
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO prefs (workspace_id, json, updated_at) VALUES (?1, ?2, 0)",
+            params!["T_BAD", "{not valid json"],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.prefs(&TeamId::from("T_BAD")),
+        Err(StoreError::Json(_))
+    ));
+}
+
+#[test]
+fn search_date_filters_enforce_exact_utc_midnight_boundaries_leap_days_and_rollover() {
+    let mut store = Store::open_in_memory().unwrap();
+    let ch = general();
+
+    // Seed messages at exact UTC boundaries:
+    // - 2024-02-28T23:59:59Z = 1709164799
+    // - 2024-02-29T00:00:00Z = 1709164800 (leap day start)
+    // - 2024-02-29T23:59:59Z = 1709251199 (leap day end)
+    // - 2024-03-01T00:00:00Z = 1709251200
+    // - 2025-12-31T23:59:59Z = 1767225599 (year rollover before midnight)
+    // - 2026-01-01T00:00:00Z = 1767225600 (year rollover midnight)
+    // - 2026-01-01T23:59:59Z = 1767311999 (exact second before 2026-01-02)
+    // - 2026-01-02T00:00:00Z = 1767312000 (exact midnight of 2026-01-02)
+    // - 2026-01-02T23:59:59Z = 1767398399
+    // - 2026-01-03T00:00:00Z = 1767398400
+    let fixtures = [
+        ("1709164799.999999", "feb28-end"),
+        ("1709164800.000000", "leap-start"),
+        ("1709251199.999999", "leap-end"),
+        ("1709251200.000000", "mar01-start"),
+        ("1767225599.999999", "y2025-end"),
+        ("1767225600.000000", "y2026-start"),
+        ("1767311999.999999", "jan01-end"),
+        ("1767312000.000000", "jan02-start"),
+        ("1767398399.999999", "jan02-end"),
+        ("1767398400.000000", "jan03-start"),
+    ];
+    let msgs: Vec<Message> = fixtures
+        .iter()
+        .map(|(ts, tag)| msg(ts, "U1", &format!("marker {tag}")))
+        .collect();
+    store.upsert_messages(&ws(), &ch, &msgs).unwrap();
+
+    let tags = |q: &str| -> Vec<String> {
+        store
+            .search(&ws(), &SearchQuery::parse(q), 50)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.message.text.trim_start_matches("marker ").to_owned())
+            .collect()
+    };
+
+    // Exact midnight exclusivity for `before:2026-01-02`:
+    // includes 2026-01-01T23:59:59Z, excludes 2026-01-02T00:00:00Z.
+    let before_jan02 = tags("marker before:2026-01-02");
+    assert!(before_jan02.contains(&"jan01-end".to_owned()));
+    assert!(!before_jan02.contains(&"jan02-start".to_owned()));
+    assert_eq!(before_jan02.len(), 7);
+
+    // Exact midnight exclusivity for `after:2026-01-01`:
+    // excludes 2026-01-01T23:59:59Z, includes 2026-01-02T00:00:00Z.
+    let after_jan01 = tags("marker after:2026-01-01");
+    assert_eq!(after_jan01, vec!["jan03-start", "jan02-end", "jan02-start"]);
+
+    // Combined range isolating exactly one calendar day (2026-01-02).
+    assert_eq!(
+        tags("marker after:2026-01-01 before:2026-01-03"),
+        vec!["jan02-end", "jan02-start"]
+    );
+
+    // Adjacent exclusive bounds (`after:2026-01-01 before:2026-01-02`) yield empty.
+    assert!(tags("marker after:2026-01-01 before:2026-01-02").is_empty());
+
+    // Leap day isolation: strictly after 2024-02-28 and strictly before 2024-03-01.
+    assert_eq!(
+        tags("marker after:2024-02-28 before:2024-03-01"),
+        vec!["leap-end", "leap-start"]
+    );
+    // `before:2024-02-29` excludes leap-start, keeps feb28-end.
+    assert_eq!(tags("marker before:2024-02-29"), vec!["feb28-end"]);
+    // `after:2024-02-29 before:2024-03-02` includes mar01-start, excludes leap-end.
+    assert_eq!(
+        tags("marker after:2024-02-29 before:2024-03-02"),
+        vec!["mar01-start"]
+    );
+
+    // Year rollover isolation: strictly after 2025-12-31 and before 2026-01-02 => 2026-01-01 only.
+    assert_eq!(
+        tags("marker after:2025-12-31 before:2026-01-02"),
+        vec!["jan01-end", "y2026-start"]
+    );
+    // Strictly before 2026-01-01 includes 2025-12-31T23:59:59Z, excludes 2026-01-01T00:00:00Z.
+    let before_2026 = tags("marker before:2026-01-01");
+    assert_eq!(before_2026.first().map(String::as_str), Some("y2025-end"));
+    assert!(!before_2026.contains(&"y2026-start".to_owned()));
+
+    // Invalid dates (non-leap Feb 29, Feb 31, month 0/13) do not parse as filters and stay free text.
+    for bad in [
+        "2025-02-29",
+        "1900-02-29",
+        "2026-02-31",
+        "2026-13-01",
+        "2026-00-10",
+    ] {
+        let q = SearchQuery::parse(&format!("marker before:{bad}"));
+        assert_eq!(q.filters.before, None);
+        assert!(store.search(&ws(), &q, 10).unwrap().is_empty());
+    }
+}
+
+#[test]
+#[ignore = "benchmark; run with --release -- --ignored --nocapture"]
+fn bench_ingest_and_fts_10k_messages() {
+    use std::time::Instant;
+
+    let mut store = Store::open_in_memory().unwrap();
+    let workspace = TeamId::from("TBENCH");
+
+    let channel_names = [
+        ("C00", "general"),
+        ("C01", "engineering"),
+        ("C02", "ops"),
+        ("C03", "deploys"),
+        ("C04", "design"),
+        ("C05", "alerts"),
+        ("C06", "security"),
+        ("C07", "backend"),
+        ("C08", "frontend"),
+        ("C09", "random"),
+    ];
+    let conversations: Vec<Conversation> = channel_names
+        .iter()
+        .map(|(id, name)| Conversation {
+            id: ChannelId::from(*id),
+            name: Some((*name).to_owned()),
+            is_channel: true,
+            is_member: true,
+            ..Default::default()
+        })
+        .collect();
+    store
+        .upsert_conversations(&workspace, &conversations)
+        .unwrap();
+
+    let users: Vec<User> = (0..20)
+        .map(|i| User {
+            id: UserId::from(format!("U{i:02}")),
+            name: format!("user{i:02}"),
+            real_name: Some(format!("Engineer {i:02}")),
+            profile: Profile {
+                display_name: Some(format!("eng{i:02}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .collect();
+    store.upsert_users(&workspace, &users).unwrap();
+
+    let topics = [
+        "kubernetes cluster autoscaler tuned for peak latency",
+        "postgres vacuum completed on shard primary replica",
+        "sqlite fts5 index rebuild finished without regressions",
+        "canary deploy rolled out cleanly across us-east nodes",
+        "grafana dashboard updated with p99 checkout timings",
+        "webrtc audio jitter buffer calibrated for huddles",
+        "auth keychain migration verified on macos arm64",
+        "ci pipeline cache hit rate climbed to ninety percent",
+        "tls certificate rotation scheduled ahead of expiry",
+        "incident postmortem action items assigned to owners",
+    ];
+
+    // Base timestamp: 2026-01-01T00:00:00Z = 1_767_225_600.
+    // 10,000 messages spaced 300s apart (~34.7 days: 2026-01-01 through 2026-02-04).
+    const TOTAL_MESSAGES: usize = 10_000;
+    const BASE_SECS: i64 = 1_767_225_600;
+    const STEP_SECS: i64 = 300;
+    const BATCH_SIZE: usize = 200;
+
+    let mut per_channel: Vec<(ChannelId, Vec<Message>)> = channel_names
+        .iter()
+        .map(|(id, _)| {
+            (
+                ChannelId::from(*id),
+                Vec::with_capacity(TOTAL_MESSAGES / 10),
+            )
+        })
+        .collect();
+
+    let mut expected_ops_u03_postmortem = 0usize;
+    let mut expected_dense_ts = String::new();
+    let mut expected_sparse_newer_ts = String::new();
+
+    for i in 0..TOTAL_MESSAGES {
+        let ch_idx = i % channel_names.len();
+        let user_idx = (i / channel_names.len() + ch_idx) % 20;
+        let secs = BASE_SECS + (i as i64) * STEP_SECS;
+        let ts_str = format!("{secs}.{:06}", i % 1_000_000);
+        let topic = topics[i % topics.len()];
+
+        // Inject deterministic benchmark needles for exact accuracy checks:
+        // 1. Dense BM25 needle vs newer sparse needle for "hypernova".
+        let text = if i == 1_234 {
+            expected_dense_ts = ts_str.clone();
+            "hypernova hypernova hypernova cluster rollout hypernova checklist".to_owned()
+        } else if i == 9_876 {
+            expected_sparse_newer_ts = ts_str.clone();
+            "quick mention of hypernova in weekly sync".to_owned()
+        } else if ch_idx == 2 && user_idx == 3 && (i / 200) % 2 == 0 {
+            // In #ops (C02) by U03 (user03) with unique needle (25 deterministic matches).
+            expected_ops_u03_postmortem += 1;
+            format!("ops_postmortem_needle #{i}: {topic} https://status.example/{i}")
+        } else if i % 17 == 0 {
+            format!("msg #{i}: {topic} https://docs.example/runbook/{i}")
+        } else {
+            format!("msg #{i}: {topic}")
+        };
+
+        let mut m = Message {
+            ts: Ts::from(ts_str),
+            user: Some(UserId::from(format!("U{user_idx:02}"))),
+            text,
+            ..Default::default()
+        };
+        if i % 23 == 0 {
+            m.files.push(File {
+                id: FileId::from(format!("F{i:05}")),
+                name: Some(format!("report-{i}.pdf")),
+                ..Default::default()
+            });
+        }
+        if i % 37 == 0 {
+            m.reactions.push(Reaction {
+                name: "rocket".into(),
+                count: 2,
+                users: vec![UserId::from("U00"), UserId::from("U01")],
+            });
+        }
+        per_channel[ch_idx].1.push(m);
+    }
+
+    let ingest_start = Instant::now();
+    for (ch_id, msgs) in &per_channel {
+        for chunk in msgs.chunks(BATCH_SIZE) {
+            store.upsert_messages(&workspace, ch_id, chunk).unwrap();
+        }
+    }
+    let ingest_elapsed = ingest_start.elapsed();
+    let ingest_msgs_per_sec = TOTAL_MESSAGES as f64 / ingest_elapsed.as_secs_f64();
+
+    assert_eq!(
+        store.message_count(&workspace).unwrap(),
+        TOTAL_MESSAGES as u64
+    );
+    assert!(expected_ops_u03_postmortem > 0);
+
+    // Build 50 realistic FTS5 queries across Recent, BM25 Relevant, and structured modifiers.
+    let queries: Vec<(&str, SearchSort, usize)> = vec![
+        // Accuracy-checked benchmark queries first
+        ("hypernova", SearchSort::Recent, 10),
+        ("hypernova", SearchSort::Relevant, 10),
+        (
+            "ops_postmortem_needle in:#ops from:@user03",
+            SearchSort::Recent,
+            50,
+        ),
+        (
+            "ops_postmortem_needle in:#ops from:@user03 has:link",
+            SearchSort::Recent,
+            50,
+        ),
+        (
+            "kubernetes after:2026-01-05 before:2026-01-15",
+            SearchSort::Recent,
+            50,
+        ),
+        (
+            "postgres in:#backend after:2026-01-10 before:2026-01-20",
+            SearchSort::Recent,
+            50,
+        ),
+        ("sqlite fts5 has:file", SearchSort::Recent, 50),
+        (
+            "canary deploy in:#deploys has:reaction",
+            SearchSort::Recent,
+            50,
+        ),
+        ("grafana checkout", SearchSort::Relevant, 25),
+        ("webrtc huddles -staging", SearchSort::Recent, 25),
+        // Remaining 40 varied queries to reach 50 total
+        ("kubernetes", SearchSort::Recent, 20),
+        ("kubernetes", SearchSort::Relevant, 20),
+        ("postgres replica", SearchSort::Recent, 20),
+        ("postgres replica", SearchSort::Relevant, 20),
+        ("sqlite index", SearchSort::Recent, 20),
+        ("sqlite index", SearchSort::Relevant, 20),
+        ("canary deploy*", SearchSort::Recent, 20),
+        ("grafana p99", SearchSort::Recent, 20),
+        ("webrtc jitter", SearchSort::Relevant, 20),
+        ("keychain arm64", SearchSort::Recent, 20),
+        ("pipeline cache", SearchSort::Relevant, 20),
+        ("certificate rotation", SearchSort::Recent, 20),
+        ("postmortem owners", SearchSort::Relevant, 20),
+        ("in:#general kubernetes", SearchSort::Recent, 20),
+        ("in:#engineering postgres", SearchSort::Recent, 20),
+        ("in:#ops sqlite", SearchSort::Recent, 20),
+        ("in:#deploys canary", SearchSort::Recent, 20),
+        ("in:#design grafana", SearchSort::Recent, 20),
+        ("in:#alerts webrtc", SearchSort::Recent, 20),
+        ("in:#security keychain", SearchSort::Recent, 20),
+        ("in:#backend pipeline", SearchSort::Recent, 20),
+        ("in:#frontend certificate", SearchSort::Recent, 20),
+        ("in:#random postmortem", SearchSort::Recent, 20),
+        ("from:@user00 latency", SearchSort::Recent, 20),
+        ("from:@user05 vacuum", SearchSort::Recent, 20),
+        ("from:@user10 rebuild", SearchSort::Recent, 20),
+        ("from:@user15 rollout", SearchSort::Recent, 20),
+        ("from:U01 has:file", SearchSort::Recent, 20),
+        ("from:U02 has:link", SearchSort::Recent, 20),
+        ("from:U04 has:reaction", SearchSort::Recent, 20),
+        (
+            "after:2026-01-01 before:2026-01-10 kubernetes",
+            SearchSort::Recent,
+            20,
+        ),
+        (
+            "after:2026-01-10 before:2026-01-20 postgres",
+            SearchSort::Recent,
+            20,
+        ),
+        (
+            "after:2026-01-20 before:2026-01-30 sqlite",
+            SearchSort::Recent,
+            20,
+        ),
+        (
+            "after:2026-01-15 before:2026-02-01 canary",
+            SearchSort::Relevant,
+            20,
+        ),
+        (
+            "in:#general in:#engineering latency",
+            SearchSort::Recent,
+            20,
+        ),
+        ("-in:#random kubernetes", SearchSort::Recent, 20),
+        ("-from:@user00 postgres", SearchSort::Recent, 20),
+        ("report-*.pdf", SearchSort::Recent, 20),
+        ("\"cluster autoscaler\"", SearchSort::Recent, 20),
+        (
+            "latency -postgres in:#general after:2026-01-02 before:2026-02-01",
+            SearchSort::Relevant,
+            20,
+        ),
+    ];
+    assert_eq!(queries.len(), 50);
+
+    let mut latencies_us: Vec<u128> = Vec::with_capacity(queries.len());
+    let search_start = Instant::now();
+
+    for (idx, (raw_q, sort, limit)) in queries.iter().enumerate() {
+        let parsed = SearchQuery::parse(raw_q);
+        let q_start = Instant::now();
+        let hits = store
+            .search_sorted(&workspace, &parsed, *sort, *limit)
+            .unwrap();
+        latencies_us.push(q_start.elapsed().as_micros());
+
+        match idx {
+            0 => {
+                // Recent sort returns newer sparse needle first.
+                assert_eq!(hits.len(), 2);
+                assert_eq!(hits[0].message.ts.as_str(), expected_sparse_newer_ts);
+                assert_eq!(hits[1].message.ts.as_str(), expected_dense_ts);
+            }
+            1 => {
+                // BM25 Relevant sort returns denser needle first.
+                assert_eq!(hits.len(), 2);
+                assert_eq!(hits[0].message.ts.as_str(), expected_dense_ts);
+                assert_eq!(hits[1].message.ts.as_str(), expected_sparse_newer_ts);
+            }
+            2 | 3 => {
+                assert_eq!(hits.len(), expected_ops_u03_postmortem);
+                assert!(hits.iter().all(|h| {
+                    h.channel == ChannelId::from("C02")
+                        && h.message.user == Some(UserId::from("U03"))
+                }));
+            }
+            4 => {
+                assert!(!hits.is_empty());
+                let lo = crate::query::Date::parse("2026-01-05")
+                    .unwrap()
+                    .unix_start()
+                    + 86_400;
+                let hi = crate::query::Date::parse("2026-01-15")
+                    .unwrap()
+                    .unix_start();
+                assert!(hits.iter().all(|h| {
+                    let s = h.message.ts.secs().unwrap();
+                    s >= lo && s < hi
+                }));
+            }
+            6 => {
+                assert!(!hits.is_empty());
+                assert!(hits.iter().all(|h| !h.message.files.is_empty()));
+            }
+            7 => {
+                assert!(!hits.is_empty());
+                assert!(hits.iter().all(|h| {
+                    h.channel == ChannelId::from("C03") && !h.message.reactions.is_empty()
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    let search_elapsed = search_start.elapsed();
+    latencies_us.sort_unstable();
+    let avg_ms = (latencies_us.iter().sum::<u128>() as f64) / (latencies_us.len() as f64) / 1_000.0;
+    let p50_ms = latencies_us[latencies_us.len() / 2] as f64 / 1_000.0;
+    let p95_ms = latencies_us[(latencies_us.len() * 95) / 100] as f64 / 1_000.0;
+    let max_ms = *latencies_us.last().unwrap() as f64 / 1_000.0;
+    let stats = store.stats(&workspace).unwrap();
+
+    println!(
+        "bench_ingest_and_fts_10k_messages:\n  ingest: {} msgs in {:.2} ms ({:.0} msgs/sec), db_bytes={}\n  search: {} FTS5 queries in {:.2} ms (avg={:.2} ms, p50={:.2} ms, p95={:.2} ms, max={:.2} ms)",
+        TOTAL_MESSAGES,
+        ingest_elapsed.as_secs_f64() * 1_000.0,
+        ingest_msgs_per_sec,
+        stats.db_bytes(),
+        queries.len(),
+        search_elapsed.as_secs_f64() * 1_000.0,
+        avg_ms,
+        p50_ms,
+        p95_ms,
+        max_ms,
+    );
+}
