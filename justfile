@@ -17,6 +17,10 @@ validate:
 test *args:
     cargo test --workspace {{args}}
 
+# Run the release micro-benchmarks (store, huddle audio/video, GUI messages)
+bench:
+    cargo test --release -p slackless-store -p slackless-huddle -p slackless-gui -- bench --ignored --nocapture
+
 # Build and run the GUI in release mode
 run *args:
     cargo run --release -p slackless-gui -- {{args}}

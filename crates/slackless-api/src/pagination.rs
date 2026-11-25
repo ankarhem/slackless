@@ -19,8 +19,14 @@ pub struct Page<T> {
 /// `fetch` gets `None` for the first page, then each page's `next_cursor`. Stops when a page has
 /// no cursor, or when Slack hands back the cursor it was just given (a loop guard).
 ///
-/// ```ignore
+/// ```no_run
+/// # use futures::TryStreamExt;
+/// # use slackless_api::{ApiError, SlackApi, paginate};
+/// # async fn example(api: &SlackApi) -> Result<(), ApiError> {
 /// let all: Vec<_> = paginate(|c| api.users_list(Some(200), c)).try_collect().await?;
+/// # let _ = all;
+/// # Ok(())
+/// # }
 /// ```
 pub fn paginate<T, F, Fut>(fetch: F) -> impl Stream<Item = Result<T, ApiError>>
 where
