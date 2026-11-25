@@ -38,6 +38,9 @@ jobs:
           command -v cmake >/dev/null || brew install cmake
           command -v pkg-config >/dev/null || brew install pkg-config
 
+      - name: Check dependencies (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
       - name: Run workspace tests
         shell: bash
         run: |

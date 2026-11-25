@@ -276,9 +276,19 @@ impl Driver {
     }
 
     async fn dial(&mut self) -> Result<Socket, End> {
-        // A server-provided reconnect URL is tried once; a failure falls back to a fresh URL.
+        // A server-provided reconnect URL is tried once; a failure or untrusted host falls back to a fresh URL.
         let url = match self.reconnect_url.take() {
-            Some(url) => url,
+            Some(url) if is_trusted_cookie_host(&self.config.base_url, &url) => url,
+            Some(url) => {
+                let redacted = redact_url_for_log(&url);
+                tracing::warn!(
+                    url = %redacted,
+                    "rejecting untrusted reconnect_url; falling back to base_url"
+                );
+                connect_url_on(&self.config.base_url, &self.config.params)
+                    .map_err(|e| End::Stop(format!("invalid connect url: {e}")))?
+                    .into()
+            }
             None => connect_url_on(&self.config.base_url, &self.config.params)
                 .map_err(|e| End::Stop(format!("invalid connect url: {e}")))?
                 .into(),
@@ -332,8 +342,12 @@ impl Driver {
         let mut request = url.into_client_request()?;
         let headers = request.headers_mut();
         headers.insert(ORIGIN, HeaderValue::from_static(WEB_ORIGIN));
-        if let Some(d) = &self.config.d_cookie {
-            let value = HeaderValue::from_str(&format!("d={d}")).map_err(http::Error::from)?;
+        if let Some(d) = &self.config.d_cookie
+            && is_trusted_cookie_host(&self.config.base_url, url)
+        {
+            let encoded = encode_cookie(d);
+            let value =
+                HeaderValue::from_str(&format!("d={encoded}")).map_err(http::Error::from)?;
             headers.insert(COOKIE, value);
         }
         if let Some(ua) = &self.config.user_agent {
@@ -386,7 +400,17 @@ impl Driver {
                             resubscribe = self.presence_sub.clone().map(Outgoing::PresenceSub);
                         }
                         SlackEvent::Pong(_) => unanswered = 0,
-                        SlackEvent::ReconnectUrl(r) => self.reconnect_url = Some(r.url.clone()),
+                        SlackEvent::ReconnectUrl(r) => {
+                            if is_trusted_cookie_host(&self.config.base_url, &r.url) {
+                                self.reconnect_url = Some(r.url.clone());
+                            } else {
+                                let redacted = redact_url_for_log(&r.url);
+                                tracing::warn!(
+                                    url = %redacted,
+                                    "ignoring untrusted reconnect_url from server"
+                                );
+                            }
+                        }
                         SlackEvent::Goodbye(_) => end = Some(End::Lost("server said goodbye".into())),
                         SlackEvent::Error(e) => match e.error.code {
                             Some(ERROR_URL_EXPIRED) => self.reconnect_url = None,
@@ -438,6 +462,68 @@ impl Driver {
     async fn emit(&self, event: RtmEvent) -> bool {
         self.events.send(event).await.is_ok()
     }
+}
+
+/// URL-encodes the `d` cookie value exactly once. Browsers store it already encoded
+/// (`xoxd-...%2F...%3D`); double-encoding breaks auth, so a value made only of URL-safe
+/// characters and `%` escapes is kept as is.
+fn encode_cookie(value: &str) -> String {
+    let already_encoded = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b));
+    if already_encoded {
+        value.to_owned()
+    } else {
+        url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    }
+}
+
+/// Returns whether `target_url` is a trusted host for forwarding the `d` session cookie.
+///
+/// Allows `wss://slack.com` / `wss://*.slack.com`, or a WebSocket URL matching `base_url`'s
+/// host without downgrading `wss` to `ws` (preserving local mock WebSocket tests on
+/// `127.0.0.1`/`localhost`).
+/// Redact query string and fragment before logging a rejected URL so signed Slack tokens/tickets
+/// never land in log files.
+fn redact_url_for_log(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut parsed) => {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => "<invalid-url>".to_owned(),
+    }
+}
+
+fn is_trusted_cookie_host(base_url: &str, target_url: &str) -> bool {
+    let Ok(target) = url::Url::parse(target_url) else {
+        return false;
+    };
+    let Some(target_host) = target.host_str() else {
+        return false;
+    };
+    let target_scheme = target.scheme();
+    if !matches!(target_scheme, "ws" | "wss") {
+        return false;
+    }
+
+    let is_slack = target_scheme == "wss"
+        && (target_host == "slack.com" || target_host.ends_with(".slack.com"));
+    if is_slack {
+        return true;
+    }
+
+    let Ok(base) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(base_host) = base.host_str() else {
+        return false;
+    };
+    let scheme_ok = target_scheme == "wss" || base.scheme() == target_scheme;
+    scheme_ok && target_host.eq_ignore_ascii_case(base_host)
 }
 
 #[cfg(test)]
@@ -1155,5 +1241,271 @@ mod tests {
         client.close();
         let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
         server.await.unwrap();
+    }
+
+    #[test]
+    fn encode_cookie_handles_raw_and_already_encoded_values() {
+        assert_eq!(encode_cookie("xoxd-a%2Fb%2Bc%3D"), "xoxd-a%2Fb%2Bc%3D");
+        assert_eq!(encode_cookie("xoxd-a/b+c="), "xoxd-a%2Fb%2Bc%3D");
+
+        // Spaces and control characters must be encoded so HeaderValue never rejects the cookie.
+        let encoded = encode_cookie("xoxd-a b/c\r\n");
+        assert_eq!(encoded, "xoxd-a+b%2Fc%0D%0A");
+        assert!(HeaderValue::from_str(&format!("d={encoded}")).is_ok());
+    }
+
+    #[test]
+    fn is_trusted_cookie_host_allows_slack_and_base_host_and_rejects_foreign_hosts() {
+        let prod = "wss://wss-primary.slack.com/";
+        assert!(is_trusted_cookie_host(prod, "wss://slack.com/link"));
+        assert!(is_trusted_cookie_host(
+            prod,
+            "wss://wss-secondary.slack.com/link"
+        ));
+        assert!(is_trusted_cookie_host(
+            prod,
+            "wss://a.b.slack.com/link?foo=1"
+        ));
+        assert!(is_trusted_cookie_host(
+            prod,
+            "wss://WSS-SECONDARY.SLACK.COM/link"
+        ));
+
+        // Reject plaintext downgrade, non-ws schemes, lookalike domains, userinfo tricks, and foreign hosts.
+        assert!(!is_trusted_cookie_host(prod, "ws://slack.com/link"));
+        assert!(!is_trusted_cookie_host(
+            prod,
+            "ws://wss-primary.slack.com/link"
+        ));
+        assert!(!is_trusted_cookie_host(prod, "https://slack.com/link"));
+        assert!(!is_trusted_cookie_host(prod, "wss://evilslack.com/link"));
+        assert!(!is_trusted_cookie_host(
+            prod,
+            "wss://slack.com.attacker.com/link"
+        ));
+        assert!(!is_trusted_cookie_host(prod, "wss://attacker.com/link"));
+        assert!(!is_trusted_cookie_host(
+            prod,
+            "wss://slack.com@attacker.com/link"
+        ));
+        assert!(!is_trusted_cookie_host(prod, "not a valid url"));
+
+        // Local mock WebSocket base hosts: allow same host (even across ephemeral ports), reject others.
+        let local_ip = "ws://127.0.0.1:41234/link/";
+        assert!(is_trusted_cookie_host(
+            local_ip,
+            "ws://127.0.0.1:54321/custom-path"
+        ));
+        assert!(is_trusted_cookie_host(
+            local_ip,
+            "wss://127.0.0.1:54321/custom-path"
+        ));
+        assert!(is_trusted_cookie_host(
+            local_ip,
+            "wss://wss-secondary.slack.com/link"
+        ));
+        assert!(!is_trusted_cookie_host(
+            local_ip,
+            "ws://localhost:54321/custom-path"
+        ));
+        assert!(!is_trusted_cookie_host(
+            local_ip,
+            "ws://127.0.0.2:54321/custom-path"
+        ));
+        assert!(!is_trusted_cookie_host(local_ip, "ws://attacker.com/steal"));
+
+        let local_name = "ws://localhost:41234/link/";
+        assert!(is_trusted_cookie_host(
+            local_name,
+            "ws://localhost:54321/custom-path"
+        ));
+        assert!(!is_trusted_cookie_host(
+            local_name,
+            "ws://127.0.0.1:54321/custom-path"
+        ));
+    }
+
+    #[tokio::test]
+    async fn handshake_encodes_raw_d_cookie_and_preserves_already_encoded_cookie() {
+        for (input_cookie, expected_header) in [
+            (
+                "xoxd-raw/val+with=chars ",
+                "d=xoxd-raw%2Fval%2Bwith%3Dchars+",
+            ),
+            (
+                "xoxd-enc%2Fval%2Bwith%3Dchars",
+                "d=xoxd-enc%2Fval%2Bwith%3Dchars",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (s, _) = listener.accept().await.unwrap();
+                let mut seen_cookie = None;
+                #[allow(clippy::result_large_err)]
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    s,
+                    |req: &tungstenite::handshake::server::Request,
+                     resp: tungstenite::handshake::server::Response| {
+                        seen_cookie = req
+                            .headers()
+                            .get(COOKIE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        Ok(resp)
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(seen_cookie.as_deref(), Some(expected_header));
+                ws.send(Message::text(r#"{"type":"hello"}"#)).await.unwrap();
+                let _ = ws.next().await;
+            });
+
+            let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-cookie"));
+            cfg.base_url = format!("ws://{addr}/link/");
+            cfg.d_cookie = Some(input_cookie.to_owned());
+            let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+            let drv = tokio::spawn(driver);
+
+            for _ in 0..4 {
+                if matches!(
+                    next_event(&mut rx).await,
+                    RtmEvent::State(ConnectionState::Connected { .. })
+                ) {
+                    break;
+                }
+            }
+            client.close();
+            let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn untrusted_reconnect_url_is_rejected_and_never_receives_d_cookie() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Defense-in-depth check on Driver::request directly: foreign host never receives Cookie.
+        {
+            let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-test"));
+            cfg.d_cookie = Some("xoxd-secret/val=".to_owned());
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (event_tx, _event_rx) = mpsc::channel(4);
+            let driver = Driver {
+                tls: tls_connector().unwrap(),
+                config: cfg,
+                commands: cmd_rx,
+                events: event_tx,
+                next_id: 1,
+                reconnect_url: None,
+                presence_sub: None,
+            };
+            let foreign_req = driver.request("wss://attacker.com/steal").unwrap();
+            assert!(
+                foreign_req.headers().get(COOKIE).is_none(),
+                "d cookie must never be sent to an untrusted host"
+            );
+            let trusted_req = driver
+                .request("wss://wss-secondary.slack.com/link")
+                .unwrap();
+            assert_eq!(
+                trusted_req.headers().get(COOKIE).unwrap(),
+                "d=xoxd-secret%2Fval%3D"
+            );
+        }
+
+        // End-to-end mock WS check: base_url uses 127.0.0.1, untrusted reconnect_url points to a
+        // different host (`localhost` on a separate listener). The client must reject it, never
+        // dial the untrusted listener, and fall back to base_url with the d cookie.
+        let base_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_addr = base_listener.local_addr().unwrap();
+        let evil_listener = TcpListener::bind("localhost:0").await.unwrap();
+        let evil_port = evil_listener.local_addr().unwrap().port();
+        let evil_contacted = Arc::new(AtomicBool::new(false));
+        let evil_flag = evil_contacted.clone();
+
+        let evil_task = tokio::spawn(async move {
+            if evil_listener.accept().await.is_ok() {
+                evil_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let server = tokio::spawn(async move {
+            // Session 1 on base_listener: send untrusted reconnect_url, then goodbye.
+            let (s1, _) = base_listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(s1).await.unwrap();
+            ws1.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            ws1.send(Message::text(format!(
+                r#"{{"type":"reconnect_url","url":"ws://localhost:{evil_port}/steal"}}"#
+            )))
+            .await
+            .unwrap();
+            ws1.send(Message::text(r#"{"type":"goodbye"}"#))
+                .await
+                .unwrap();
+            let _ = ws1.close(None).await;
+
+            // Session 2 MUST fall back to base_listener (ignoring untrusted reconnect_url) and
+            // send the encoded d cookie.
+            let (s2, _) = base_listener.accept().await.unwrap();
+            let mut seen_cookie = None;
+            #[allow(clippy::result_large_err)]
+            let mut ws2 = tokio_tungstenite::accept_hdr_async(
+                s2,
+                |req: &tungstenite::handshake::server::Request,
+                 resp: tungstenite::handshake::server::Response| {
+                    seen_cookie = req
+                        .headers()
+                        .get(COOKIE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    Ok(resp)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(seen_cookie.as_deref(), Some("d=xoxd-secret%2Fcookie%3D"));
+            ws2.send(Message::text(r#"{"type":"hello"}"#))
+                .await
+                .unwrap();
+            let _ = ws2.next().await;
+        });
+
+        let mut cfg = RtmConfig::new(ConnectParams::new("xoxc-sec"));
+        cfg.base_url = format!("ws://{base_addr}/link/");
+        cfg.d_cookie = Some("xoxd-secret/cookie=".to_owned());
+        cfg.backoff = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(20),
+        };
+        let (client, mut rx, driver) = RtmClient::new(cfg).unwrap();
+        let drv = tokio::spawn(driver);
+
+        let mut connected = 0;
+        for _ in 0..15 {
+            if matches!(
+                next_event(&mut rx).await,
+                RtmEvent::State(ConnectionState::Connected { .. })
+            ) {
+                connected += 1;
+                if connected == 2 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(connected, 2);
+
+        client.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drv).await;
+        server.await.unwrap();
+        evil_task.abort();
+        assert!(
+            !evil_contacted.load(Ordering::SeqCst),
+            "untrusted reconnect_url host must never be dialed"
+        );
     }
 }

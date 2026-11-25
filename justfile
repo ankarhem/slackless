@@ -4,11 +4,12 @@ export MACOSX_DEPLOYMENT_TARGET := env("MACOSX_DEPLOYMENT_TARGET", "13.0")
 default:
     @just --list
 
-# Run all checks: formatting, clippy, workspace tests, and workspace build
+# Run all checks: formatting, clippy, supply-chain audit, workspace tests, and workspace build
 validate:
     cargo fmt --all -- --check
     cargo clippy --workspace -- -D warnings
     cargo clippy --workspace --tests -- -D warnings
+    cargo deny check
     cargo test --workspace
     cargo build --workspace
 

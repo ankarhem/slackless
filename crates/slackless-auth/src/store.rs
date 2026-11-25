@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use slackless_types::TeamId;
 
@@ -156,11 +157,30 @@ impl SessionStore {
         };
 
         let json = serde_json::to_vec_pretty(&on_disk)?;
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = unique_tmp_path(&self.path);
         write_private_file(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)?;
+        if let Err(err) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
         Ok(())
     }
+}
+
+/// Monotonic per-process counter for unique sibling temp filenames during atomic saves.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Builds a unique sibling temp file path (e.g. `sessions.<pid>.<seq>.tmp`) so concurrent
+/// `SessionStore::save` calls never race on a shared `.tmp` path.
+fn unique_tmp_path(target: &Path) -> PathBuf {
+    let stem = target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sessions");
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    target.with_file_name(format!("{stem}.{pid}.{seq}.tmp"))
 }
 
 /// Write `bytes` to `path` with owner-only (`0600`) permissions on Unix so plaintext session tokens
@@ -171,13 +191,14 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut f = std::fs::OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .mode(0o600)
             .open(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        if let Err(err) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            let _ = std::fs::remove_file(path);
+            return Err(err);
+        }
         Ok(())
     }
     #[cfg(not(unix))]
@@ -559,5 +580,78 @@ mod tests {
                 "expected rejection for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_saves_and_loads_leave_valid_json_and_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let store = SessionStore::with_path(&path);
+
+        std::thread::scope(|scope| {
+            for thread_id in 0..8usize {
+                let store = store.clone();
+                scope.spawn(move || {
+                    for round in 0..20usize {
+                        let session = Session::new(
+                            format!("https://team-{thread_id}.slack.com/"),
+                            format!("T{thread_id}{round:02}"),
+                            format!("xoxc-{thread_id}-{round}"),
+                            format!("xoxd-{thread_id}-{round}"),
+                            format!("U{thread_id}"),
+                        );
+                        store
+                            .save(&[session])
+                            .expect("concurrent save must succeed");
+                        let loaded = store.load().expect("concurrent load must succeed");
+                        assert_eq!(loaded.len(), 1);
+                        assert!(loaded[0].team_id.as_str().starts_with('T'));
+                    }
+                });
+            }
+        });
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["sessions.json".to_owned()],
+            "no leftover .tmp files expected, found: {entries:?}"
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<Session> = serde_json::from_str(&raw).expect("valid JSON on disk");
+        assert_eq!(parsed.len(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "session file must remain owner-only 0600");
+        }
+    }
+
+    #[test]
+    fn failed_rename_removes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Make target path a directory so renaming the temp file onto it fails.
+        let target_as_dir = dir.path().join("sessions.json");
+        std::fs::create_dir(&target_as_dir).unwrap();
+        let store = SessionStore::with_path(&target_as_dir);
+
+        let res = store.save(&[Session::new("https://a.slack.com/", "T1", "x", "y", "U1")]);
+        assert!(res.is_err(), "rename onto directory must fail");
+
+        let leftover_tmps: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "temp file must be cleaned up on failure, found: {leftover_tmps:?}"
+        );
     }
 }
