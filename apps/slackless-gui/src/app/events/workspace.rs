@@ -316,12 +316,12 @@ impl App {
                     self.play_sound(vip_sound, cx);
                 }
             }
-            Event::HuddleUpdated {
+            Event::Huddle(HuddleEvent::Updated {
                 channel,
                 participants,
                 ended,
                 ..
-            } => {
+            }) => {
                 if let Some(parked) = self.parked.get_mut(ws_index).and_then(Option::as_mut) {
                     if *ended {
                         parked.state.active_huddles.remove(channel);

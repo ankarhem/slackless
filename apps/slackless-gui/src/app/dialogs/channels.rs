@@ -184,7 +184,7 @@ impl App {
                                         let is_private = *priv_s.read(cx);
                                         window.close_dialog(cx);
                                         let _ = this_create.update(cx, |app, cx| {
-                                            app.bridge.send(Command::CreateChannel {
+                                            app.bridge.send(ChannelCommand::CreateChannel {
                                                 name: slug.clone(),
                                                 is_private,
                                                 purpose: (!purpose.is_empty()).then_some(purpose),
@@ -386,13 +386,16 @@ impl App {
                                                                 users.push(u);
                                                             }
                                                         }
-                                                        app.bridge.send(Command::OpenDm { users });
+                                                        app.bridge
+                                                            .send(ChannelCommand::OpenDm { users });
                                                     } else {
                                                         let n = chosen.len();
-                                                        app.bridge.send(Command::InviteToChannel {
-                                                            channel: ch_submit.clone(),
-                                                            users: chosen,
-                                                        });
+                                                        app.bridge.send(
+                                                            ChannelCommand::InviteToChannel {
+                                                                channel: ch_submit.clone(),
+                                                                users: chosen,
+                                                            },
+                                                        );
                                                         actions::notify(
                                                             "Added people",
                                                             format!(
@@ -456,7 +459,7 @@ impl App {
             );
             details.set_follow_all_threads(following, cx);
         });
-        self.bridge.send(Command::FetchChannelManagers {
+        self.bridge.send(ChannelCommand::FetchChannelManagers {
             channel: channel.clone(),
         });
         // Slack's title row: a private channel's lock, else the hash, beside the name in the
@@ -535,7 +538,7 @@ impl App {
                 self.leave(channel.clone(), window, cx);
             }
             ChannelDetailsEvent::Rename { channel, name } => {
-                self.bridge.send(Command::RenameChannel {
+                self.bridge.send(ChannelCommand::RenameChannel {
                     channel: channel.clone(),
                     name: name.clone(),
                 });
@@ -578,7 +581,7 @@ impl App {
                                                 window.close_dialog(cx);
                                                 let _ = this.update(cx, |app, cx| {
                                                     app.bridge
-                                                        .send(Command::ArchiveChannel(ch.clone()));
+                                                        .send(ChannelCommand::ArchiveChannel(ch.clone()));
                                                     actions::notify(
                                                         "Channel archived",
                                                         app.label(&ch),
@@ -594,7 +597,8 @@ impl App {
             }
             ChannelDetailsEvent::Unarchive(channel) => {
                 window.close_dialog(cx);
-                self.bridge.send(Command::UnarchiveChannel(channel.clone()));
+                self.bridge
+                    .send(ChannelCommand::UnarchiveChannel(channel.clone()));
                 actions::notify("Channel unarchived", self.label(channel), window, cx);
             }
             ChannelDetailsEvent::ToggleFollowThreads(channel) => {
@@ -670,7 +674,7 @@ impl App {
                                                     let _ = this.update(cx, |app, cx| {
                                                         if !app.fixtures.sample {
                                                             app.bridge.send(
-                                                                Command::DeleteChannel(ch.clone()),
+                                                                ChannelCommand::DeleteChannel(ch.clone()),
                                                             );
                                                         }
                                                         actions::notify(
@@ -729,7 +733,7 @@ impl App {
                                                     let _ = this.update(cx, |app, cx| {
                                                         if !app.fixtures.sample {
                                                             app.bridge.send(
-                                                                Command::ConvertChannelToPrivate(
+                                                                ChannelCommand::ConvertChannelToPrivate(
                                                                     ch.clone(),
                                                                 ),
                                                             );
@@ -752,20 +756,20 @@ impl App {
                 self.open_add_people(channel.clone(), window, cx);
             }
             ChannelDetailsEvent::SetTopic { channel, topic } => {
-                self.bridge.send(Command::SetChannelTopic {
+                self.bridge.send(ChannelCommand::SetChannelTopic {
                     channel: channel.clone(),
                     topic: topic.clone(),
                 });
             }
             ChannelDetailsEvent::SetPurpose { channel, purpose } => {
-                self.bridge.send(Command::SetChannelPurpose {
+                self.bridge.send(ChannelCommand::SetChannelPurpose {
                     channel: channel.clone(),
                     purpose: purpose.clone(),
                 });
             }
             ChannelDetailsEvent::StartHuddle => self.start_huddle(window, cx),
             ChannelDetailsEvent::SetNotifyLevel { channel, level } => {
-                self.bridge.send(Command::SetNotifyLevel {
+                self.bridge.send(ChannelCommand::SetNotifyLevel {
                     channel: channel.clone(),
                     level: *level,
                 });

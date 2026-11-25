@@ -1404,13 +1404,15 @@ mod tests {
         let view = cx.update(|cx| UnreadsView::new(fixtures.clone(), cx));
         let seen = events.clone();
         let recorder = cx.new(|cx| {
-            struct Recorder(#[allow(dead_code)] Subscription);
+            struct Recorder {
+                _sub: Subscription,
+            }
             let subscription = cx.subscribe(&view, move |_, _, event: &UnreadsEvent, _| {
                 if let UnreadsEvent::MarkRead { channel, ts } = event {
                     seen.borrow_mut().push((channel.clone(), ts.clone()));
                 }
             });
-            Recorder(subscription)
+            Recorder { _sub: subscription }
         });
 
         cx.update(|cx| {

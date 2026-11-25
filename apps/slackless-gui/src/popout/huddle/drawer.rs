@@ -6,7 +6,7 @@ impl PopoutWindow {
     pub(super) fn render_huddle_drawer(
         &self,
         drawer: HuddleDrawer,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         pal: &HuddlePalette,
         on_jump: JumpHandler,
         on_open_canvas: CanvasOpenHandler,
@@ -561,11 +561,14 @@ impl PopoutWindow {
                             )
                             .child("Create huddle notes canvas")
                             .on_click(move |_, window, cx| {
-                                (send_notes)(Command::CreateCanvas {
-                                    title: topic_title.clone(),
-                                    markdown: "# Huddle notes\n\n- ".to_owned(),
-                                    channel: Some(notes_ch.clone()),
-                                });
+                                (send_notes)(
+                                    CollabCommand::CreateCanvas {
+                                        title: topic_title.clone(),
+                                        markdown: "# Huddle notes\n\n- ".to_owned(),
+                                        channel: Some(notes_ch.clone()),
+                                    }
+                                    .into(),
+                                );
                                 actions::notify(
                                     "Creating huddle notes",
                                     "Opening a shared canvas for this huddle.",
@@ -580,7 +583,7 @@ impl PopoutWindow {
     /// Troubleshooting, Network Stats HUD & Self-Test drawer (`F-COLLAB-074`, `075`, `076`).
     fn render_huddle_diagnostics_drawer(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
@@ -904,9 +907,11 @@ impl PopoutWindow {
                                             .child(if audio_only { "On" } else { "Off" })
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 let next = !audio_only;
-                                                (send_ao)(Command::SetHuddleAudioOnly(next));
+                                                (send_ao)(
+                                                    HuddleControlCommand::SetAudioOnly(next).into(),
+                                                );
                                                 if this.fixtures.sample
-                                                    && let Some(dock) = this.huddle_dock_entity()
+                                                    && let Some(dock) = this.huddle_state_entity()
                                                 {
                                                     dock.update(cx, |d, cx| {
                                                         d.set_audio_only_local(next, cx)

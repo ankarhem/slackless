@@ -192,7 +192,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |op, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::EditCanvas {
+                    app.bridge.send(CollabCommand::EditCanvas {
                         file_id: fid.clone(),
                         op,
                     });
@@ -204,7 +204,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::RequestFilePermission {
+                    app.bridge.send(CollabCommand::RequestFilePermission {
                         file_id: fid.clone(),
                         request_type: "upgrade".to_owned(),
                     });
@@ -229,7 +229,7 @@ impl App {
                     return;
                 }
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::AddConversationTab {
+                    app.bridge.send(ChannelCommand::AddConversationTab {
                         channel: ch.clone(),
                         tab_type: "canvas".to_owned(),
                         label: label.clone(),
@@ -280,7 +280,7 @@ impl App {
                             let url = format!("file://{}", path.display());
                             let _ = cx.update(|window, cx| {
                                 let _ = this_u.update(cx, |app, _| {
-                                    app.bridge.send(Command::UploadFiles {
+                                    app.bridge.send(CollabCommand::UploadFiles {
                                         channel: ch_u.clone(),
                                         thread_ts: None,
                                         content: None,
@@ -327,7 +327,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::LoadCanvasComments {
+                    app.bridge.send(CollabCommand::LoadCanvasComments {
                         canvas_id: cid.clone(),
                     });
                 });
@@ -338,7 +338,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |text, thread_ts, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::PostCanvasComment {
+                    app.bridge.send(CollabCommand::PostCanvasComment {
                         canvas_id: cid.clone(),
                         text,
                         thread_ts,
@@ -352,7 +352,7 @@ impl App {
             Rc::new(
                 move |thread_ts, resolved, _: &mut Window, cx: &mut gpui::App| {
                     let _ = this.update(cx, |app, _| {
-                        app.bridge.send(Command::ResolveCanvasComment {
+                        app.bridge.send(CollabCommand::ResolveCanvasComment {
                             canvas_id: cid.clone(),
                             thread_ts,
                             resolved,
@@ -366,7 +366,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::ResolveAllCanvasComments {
+                    app.bridge.send(CollabCommand::ResolveAllCanvasComments {
                         canvas_id: cid.clone(),
                     });
                 });
@@ -380,7 +380,7 @@ impl App {
                       _: &mut Window,
                       cx: &mut gpui::App| {
                     let _ = this.update(cx, |app, _| {
-                        app.bridge.send(Command::SetCanvasAccess {
+                        app.bridge.send(CollabCommand::SetCanvasAccess {
                             canvas_id: cid.clone(),
                             access_level: req.access_level,
                             channel_ids: req.channel_ids,
@@ -397,7 +397,7 @@ impl App {
             Rc::new(
                 move |channel_ids, user_ids, _: &mut Window, cx: &mut gpui::App| {
                     let _ = this.update(cx, |app, _| {
-                        app.bridge.send(Command::DeleteCanvasAccess {
+                        app.bridge.send(CollabCommand::DeleteCanvasAccess {
                             canvas_id: cid.clone(),
                             channel_ids,
                             user_ids,
@@ -411,7 +411,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::DeleteCanvas {
+                    app.bridge.send(CollabCommand::DeleteCanvas {
                         canvas_id: cid.clone(),
                     });
                 });
@@ -423,7 +423,7 @@ impl App {
             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, cx| {
                     app.ws.canvas_updated_notes.remove(&fid);
-                    app.bridge.send(Command::LoadCanvas {
+                    app.bridge.send(CollabCommand::LoadCanvas {
                         file_id: fid.clone(),
                     });
                     cx.notify();
@@ -478,7 +478,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |initial_fields, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::CreateListItem {
+                    app.bridge.send(CollabCommand::CreateListItem {
                         list_id: lid.clone(),
                         initial_fields,
                     });
@@ -490,7 +490,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |row_id, cell, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::UpdateListCell {
+                    app.bridge.send(CollabCommand::UpdateListCell {
                         list_id: lid.clone(),
                         row_id,
                         cells: vec![cell],
@@ -503,7 +503,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |row_id, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::DeleteListItem {
+                    app.bridge.send(CollabCommand::DeleteListItem {
                         list_id: lid.clone(),
                         row_id,
                     });
@@ -515,7 +515,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |row_id, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::ArchiveListItem {
+                    app.bridge.send(CollabCommand::ArchiveListItem {
                         list_id: lid.clone(),
                         row_id,
                     });
@@ -528,7 +528,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |access_level, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::SetListAccess {
+                    app.bridge.send(CollabCommand::SetListAccess {
                         list_id: lid.clone(),
                         channel: Some(ch.clone()),
                         access_level,
@@ -541,7 +541,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |record_id, _: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, _| {
-                    app.bridge.send(Command::FetchListRecordComments {
+                    app.bridge.send(CollabCommand::FetchListRecordComments {
                         list_id: lid.clone(),
                         record_id,
                     });
@@ -558,7 +558,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, cx| {
-                    app.bridge.send(Command::AddConversationTab {
+                    app.bridge.send(ChannelCommand::AddConversationTab {
                         channel: ch.clone(),
                         tab_type: "list".to_owned(),
                         label: Some(title.clone()),
@@ -577,7 +577,7 @@ impl App {
             let this = cx.weak_entity();
             Rc::new(move |_: &mut Window, cx: &mut gpui::App| {
                 let _ = this.update(cx, |app, cx| {
-                    app.bridge.send(Command::DeleteFile {
+                    app.bridge.send(CollabCommand::DeleteFile {
                         file_id: fid.clone(),
                     });
                     app.select_tab(ConversationTab::Messages, cx);
@@ -669,12 +669,9 @@ impl App {
             .children(self.update_banner(cx))
             .children(self.connection_banner(cx))
             .children(self.failed_mutations_banner(cx))
-            .child(header);
-        let column = match (&self.huddle, self.huddle_open) {
-            (Some((_, bar)), true) => column.child(bar.clone()),
-            _ => column,
-        };
-        let column = column.child(tabs).children(bookmark_bar);
+            .child(header)
+            .child(tabs)
+            .children(bookmark_bar);
         match &self.tab {
             ConversationTab::Home => {
                 let view = self.app_home_view(window, cx);
@@ -735,7 +732,7 @@ impl App {
                         let ch_cb = ch_for_add.clone();
                         bookmarks::open_add_dialog(window, cx, move |title, url, cx| {
                             let _ = this_cb.update(cx, |app, _| {
-                                app.bridge.send(Command::AddBookmarkInFolder {
+                                app.bridge.send(MessagingCommand::AddBookmarkInFolder {
                                     channel: ch_cb.clone(),
                                     title,
                                     url,
@@ -748,7 +745,7 @@ impl App {
                     let ch_for_rm = self.channel.clone();
                     let rm_fn: tab_views::BookmarkRemoveFn = Rc::new(move |bm_id, cx| {
                         let _ = this_rm.update(cx, |app, _| {
-                            app.bridge.send(Command::RemoveBookmark {
+                            app.bridge.send(MessagingCommand::RemoveBookmark {
                                 channel: ch_for_rm.clone(),
                                 bookmark_id: bm_id,
                             });

@@ -116,11 +116,11 @@ impl PopoutWindow {
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        (send_mute)(Command::SetHuddleMuted(next_muted));
+                        (send_mute)(HuddleControlCommand::SetMuted(next_muted).into());
                         if this.fixtures.sample
-                            && let Some(dock) = this.huddle_dock_entity()
+                            && let Some(state) = this.huddle_state_entity()
                         {
-                            dock.update(cx, |d, cx| d.set_muted_local(next_muted, cx));
+                            state.update(cx, |s, cx| s.set_muted_local(next_muted, cx));
                         }
                     })),
             )
@@ -196,15 +196,18 @@ impl PopoutWindow {
                         }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        (send_cam)(Command::SetHuddleCamera {
-                            enabled: next_cam,
-                            device_index: selected_cam_idx,
-                            blur: blur_now,
-                        });
+                        (send_cam)(
+                            HuddleControlCommand::SetCamera {
+                                enabled: next_cam,
+                                device_index: selected_cam_idx,
+                                blur: blur_now,
+                            }
+                            .into(),
+                        );
                         if this.fixtures.sample
-                            && let Some(dock) = this.huddle_dock_entity()
+                            && let Some(state) = this.huddle_state_entity()
                         {
-                            dock.update(cx, |d, cx| d.set_camera_local(next_cam, cx));
+                            state.update(cx, |s, cx| s.set_camera_local(next_cam, cx));
                         }
                     })),
             )
@@ -343,9 +346,9 @@ impl PopoutWindow {
                     .text_color(if hand_now { warn_fg } else { ctrl_fg }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                (send_hand)(Command::SetHuddleHandRaised(next_hand));
+                (send_hand)(HuddleControlCommand::SetHandRaised(next_hand).into());
                 if this.fixtures.sample
-                    && let Some(dock) = this.huddle_dock_entity()
+                    && let Some(dock) = this.huddle_state_entity()
                 {
                     let me = this.fixtures.self_user.clone();
                     dock.update(cx, |d, cx| {
@@ -476,7 +479,7 @@ impl PopoutWindow {
             .text_color(pal.danger_fg)
             .child("Leave")
             .on_click(move |_, window, _| {
-                (send_leave)(Command::LeaveHuddle);
+                (send_leave)(HuddleCommand::Leave.into());
                 window.remove_window();
             });
 

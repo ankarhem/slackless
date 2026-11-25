@@ -91,7 +91,7 @@ impl Preferences {
                                 probe.set_blur(prefs.settings.huddle_blur_background);
                                 if let Some(frame) = probe.latest_frame()
                                     && let Some(img) =
-                                        crate::huddle_dock::frame_to_render_image(&frame)
+                                        crate::huddle_video::frame_to_render_image(&frame)
                                 {
                                     if let Some(old) = prefs.camera_frame.replace(img) {
                                         cx.drop_image(old, None);

@@ -74,7 +74,7 @@ impl App {
                                 return;
                             };
                             let _ = this.update(cx, |app, _| {
-                                app.bridge.send(Command::SetNotifyLevel {
+                                app.bridge.send(ChannelCommand::SetNotifyLevel {
                                     channel,
                                     level: choice,
                                 })

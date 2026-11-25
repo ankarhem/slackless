@@ -12,13 +12,13 @@ struct ParticipantTileLayout {
 impl PopoutWindow {
     pub(super) fn render_huddle_stage(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         pal: &HuddlePalette,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::gpui::Div> {
         use slackless_core::huddle::{HuddleDrawMessage, VideoTileKey};
 
-        let mut screens: Vec<(String, String, crate::huddle_dock::DisplayVideoFrame)> = Vec::new();
+        let mut screens: Vec<(String, String, crate::huddle_state::DisplayVideoFrame)> = Vec::new();
         if let Some(vs) = self.huddle_video.as_ref().and_then(WeakEntity::upgrade) {
             let frames = vs.read(cx).frames();
             for (k, v) in frames {
@@ -113,14 +113,14 @@ impl PopoutWindow {
                     this.huddle_draw_points.clear();
                     this.huddle_draw_local_segments.clear();
                     this.huddle_draw_local_item.clear();
-                    if let Some(dock) = this.huddle_dock_entity() {
+                    if let Some(dock) = this.huddle_state_entity() {
                         dock.update(cx, |d, cx| d.set_draw_mode(next, cx));
                     } else if next {
                         let msg = HuddleDrawMessage::ChangeHue {
                             item_id: item.clone(),
                             hue: draw_hue,
                         };
-                        (this.send)(Command::SendHuddleDraw(msg.clone()));
+                        (this.send)(send_huddle_draw(msg.clone()));
                         this.apply_local_draw(msg, cx);
                     }
                     cx.notify();
@@ -149,14 +149,14 @@ impl PopoutWindow {
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.huddle_draw_hue = hue;
-                            if let Some(dock) = this.huddle_dock_entity() {
+                            if let Some(dock) = this.huddle_state_entity() {
                                 dock.update(cx, |d, cx| d.set_draw_hue(hue, cx));
                             } else {
                                 let msg = HuddleDrawMessage::ChangeHue {
                                     item_id: item.clone(),
                                     hue,
                                 };
-                                (this.send)(Command::SendHuddleDraw(msg.clone()));
+                                (this.send)(send_huddle_draw(msg.clone()));
                                 this.apply_local_draw(msg, cx);
                             }
                             cx.notify();
@@ -216,7 +216,7 @@ impl PopoutWindow {
                 }))
         });
 
-        let visible_screens: Vec<(String, String, crate::huddle_dock::DisplayVideoFrame)> =
+        let visible_screens: Vec<(String, String, crate::huddle_state::DisplayVideoFrame)> =
             if let Some(ix) = focused {
                 vec![screens[ix].clone()]
             } else {
@@ -304,7 +304,7 @@ impl PopoutWindow {
                                 )
                                 .child("Controls")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(dock) = this.huddle_dock_entity() {
+                                    if let Some(dock) = this.huddle_state_entity() {
                                         dock.update(cx, |d, cx| {
                                             d.request_open_floating_panel(cx);
                                         });
@@ -343,7 +343,7 @@ impl PopoutWindow {
         message: slackless_core::huddle::HuddleDrawMessage,
         cx: &mut Context<Self>,
     ) {
-        if let Some(dock) = self.huddle_dock_entity() {
+        if let Some(dock) = self.huddle_state_entity() {
             let me = self.fixtures.self_user.clone();
             dock.update(cx, |d, cx| {
                 d.apply_data_event(
@@ -362,8 +362,8 @@ impl PopoutWindow {
         &self,
         pane_ix: usize,
         item_id: String,
-        frame: crate::huddle_dock::DisplayVideoFrame,
-        state: &crate::huddle_dock::HuddleViewState,
+        frame: crate::huddle_state::DisplayVideoFrame,
+        state: &crate::huddle_state::HuddleViewState,
         cx: &mut Context<Self>,
     ) -> gpui_kit::gpui::Stateful<gpui_kit::gpui::Div> {
         use gpui_kit::gpui::{Corners, ObjectFit};
@@ -397,7 +397,7 @@ impl PopoutWindow {
         let bounds_cell = Arc::clone(&self.huddle_stage_bounds);
         let (fw, fh) = frame.dimensions();
         #[cfg(target_os = "macos")]
-        let is_surface = matches!(frame, crate::huddle_dock::DisplayVideoFrame::Surface(_));
+        let is_surface = matches!(frame, crate::huddle_state::DisplayVideoFrame::Surface(_));
         #[cfg(not(target_os = "macos"))]
         let is_surface = false;
         // Render the video frame directly inside a full-size `canvas` with `ObjectFit::Contain`
@@ -439,7 +439,7 @@ impl PopoutWindow {
             move |bounds, image_bounds, window, _| {
                 match &frame {
                     #[cfg(target_os = "macos")]
-                    crate::huddle_dock::DisplayVideoFrame::Surface(surface) => {
+                    crate::huddle_state::DisplayVideoFrame::Surface(surface) => {
                         let ptr = surface.retain_cv_pixel_buffer_ptr()
                             as *mut objc2_core_video::CVPixelBuffer;
                         if let Some(nn) = std::ptr::NonNull::new(ptr) {
@@ -450,7 +450,7 @@ impl PopoutWindow {
                             window.paint_surface(image_bounds, cv_buf);
                         }
                     }
-                    crate::huddle_dock::DisplayVideoFrame::Image(img_frame) => {
+                    crate::huddle_state::DisplayVideoFrame::Image(img_frame) => {
                         if img_frame.frame_count() > 0 {
                             let _ = window.paint_image(
                                 bounds,
@@ -576,13 +576,13 @@ impl PopoutWindow {
                         let dot_seg = make_catmull_rom_segment(pt, pt, pt, pt);
                         this.huddle_draw_local_segments.push(dot_seg);
                         let hue = this
-                            .huddle_dock_entity()
+                            .huddle_state_entity()
                             .map_or(this.huddle_draw_hue, |d| d.read(cx).draw_hue());
                         let hue_msg = HuddleDrawMessage::ChangeHue {
                             item_id: item_down.clone(),
                             hue,
                         };
-                        (this.send)(Command::SendHuddleDraw(hue_msg));
+                        (this.send)(send_huddle_draw(hue_msg));
                         cx.notify();
                     }),
                 )
@@ -618,7 +618,7 @@ impl PopoutWindow {
                                 let seg = make_catmull_rom_segment(p0, p0, p1, p1);
                                 this.huddle_draw_local_segments.clear();
                                 this.huddle_draw_local_segments.push(seg);
-                                (this.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+                                (this.send)(send_huddle_draw(HuddleDrawMessage::New {
                                     item_id: item_move.clone(),
                                     segment: seg,
                                 }));
@@ -636,14 +636,14 @@ impl PopoutWindow {
                                 if let Some(last) = this.huddle_draw_local_segments.last_mut() {
                                     *last = refined;
                                 }
-                                (this.send)(Command::SendHuddleDraw(HuddleDrawMessage::Edit {
+                                (this.send)(send_huddle_draw(HuddleDrawMessage::Edit {
                                     item_id: item_move.clone(),
                                     segment: refined,
                                 }));
                                 let new_seg =
                                     make_catmull_rom_segment(p_prev1, p_curr, p_next, p_next);
                                 this.huddle_draw_local_segments.push(new_seg);
-                                (this.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+                                (this.send)(send_huddle_draw(HuddleDrawMessage::New {
                                     item_id: item_move.clone(),
                                     segment: new_seg,
                                 }));
@@ -659,7 +659,7 @@ impl PopoutWindow {
                                 x: raw_pt.0,
                                 y: raw_pt.1,
                             };
-                            (this.send)(Command::SendHuddleDraw(pos_msg));
+                            (this.send)(send_huddle_draw(pos_msg));
                         }
                     }
                 }))
@@ -694,7 +694,7 @@ impl PopoutWindow {
         if self.huddle_draw_points.len() == 1
             && let Some(&dot) = segs.first()
         {
-            (self.send)(Command::SendHuddleDraw(HuddleDrawMessage::New {
+            (self.send)(send_huddle_draw(HuddleDrawMessage::New {
                 item_id: item.clone(),
                 segment: dot,
             }));
@@ -703,8 +703,8 @@ impl PopoutWindow {
         let end_msg = HuddleDrawMessage::End {
             item_id: item.clone(),
         };
-        (self.send)(Command::SendHuddleDraw(end_msg));
-        if let Some(dock) = self.huddle_dock_entity() {
+        (self.send)(send_huddle_draw(end_msg));
+        if let Some(dock) = self.huddle_state_entity() {
             let hue = dock.read(cx).draw_hue();
             dock.update(cx, |d, cx| {
                 d.commit_local_draw_stroke(item, hue, segs, cx);
@@ -742,7 +742,7 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_tiles(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
         cx: &Context<Self>,
@@ -781,7 +781,7 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_filmstrip(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         people: &[slackless_core::types::UserId],
         pal: &HuddlePalette,
         cx: &Context<Self>,
@@ -813,7 +813,7 @@ impl PopoutWindow {
 
     fn render_huddle_participant_tile(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         uid: &slackless_core::types::UserId,
         pal: &HuddlePalette,
         layout: ParticipantTileLayout,
@@ -1000,7 +1000,7 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_floating_reactions(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         pal: &HuddlePalette,
     ) -> Option<gpui_kit::gpui::Div> {
         if state.reactions.is_empty() {
@@ -1052,7 +1052,7 @@ impl PopoutWindow {
 
     pub(super) fn render_huddle_floating_captions(
         &self,
-        state: &crate::huddle_dock::HuddleViewState,
+        state: &crate::huddle_state::HuddleViewState,
         pal: &HuddlePalette,
     ) -> Option<gpui_kit::gpui::Div> {
         let show_captions = state.session.captions_enabled || !state.captions.is_empty();

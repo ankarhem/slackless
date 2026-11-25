@@ -19,7 +19,7 @@ impl App {
         self.sidebar.update(cx, |s, cx| {
             s.set_home_page(Some(crate::sidebar::HomePage::Saved), cx)
         });
-        self.bridge.send(Command::LoadSaved);
+        self.bridge.send(MessagingCommand::LoadSaved);
         cx.notify();
     }
 
@@ -67,7 +67,8 @@ impl App {
         // Live mode: show the stored thread now, then fetch its full history from Slack
         // (fixture mode: both are no-ops and the panel keeps its fixture content).
         self.load_thread(&channel, &thread_ts, cx);
-        self.bridge.send(Command::OpenThread { channel, thread_ts });
+        self.bridge
+            .send(MessagingCommand::OpenThread { channel, thread_ts });
         self.set_right_pane(RightPane::Thread, cx);
         if self.tab == ConversationTab::Pins {
             self.tab = ConversationTab::Messages;
@@ -129,7 +130,8 @@ impl App {
                 _ => {
                     self.set_right_pane(RightPane::Pins, cx);
                     if !self.fixtures.sample && !self.ws.pins.contains_key(&self.channel) {
-                        self.bridge.send(Command::LoadPins(self.channel.clone()));
+                        self.bridge
+                            .send(MessagingCommand::LoadPins(self.channel.clone()));
                     }
                 }
             }
@@ -215,7 +217,7 @@ impl App {
         {
             self.select(dm, cx);
         } else if self.bridge.store().is_some() {
-            self.bridge.send(Command::OpenDm {
+            self.bridge.send(ChannelCommand::OpenDm {
                 users: vec![user.clone()],
             });
         } else {
@@ -537,7 +539,7 @@ impl App {
         cx: &mut Context<Self>,
     ) {
         self.bridge
-            .send(Command::LeaveConversation(channel.clone()));
+            .send(ChannelCommand::LeaveConversation(channel.clone()));
         self.ws.counts.remove(&channel);
         self.back
             .retain(|p| *p != NavPlace::Channel(channel.clone()));
@@ -584,8 +586,9 @@ impl App {
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.set_selected(channel.clone(), cx));
         self.bridge
-            .send(Command::CloseConversation(self.channel.clone()));
-        self.bridge.send(Command::OpenConversation(channel.clone()));
+            .send(ChannelCommand::CloseConversation(self.channel.clone()));
+        self.bridge
+            .send(ChannelCommand::OpenConversation(channel.clone()));
         self.messages
             .update(cx, |list, cx| list.set_conversation(channel.clone(), cx));
         // Seed frame 0 immediately from the read-only WAL SQLite cache (<1ms) so switching to a
@@ -664,7 +667,6 @@ impl App {
             thread: mem::replace(&mut self.thread, views.thread),
             results: mem::replace(&mut self.results, views.results),
             browser: mem::replace(&mut self.browser, views.browser),
-            huddle: mem::replace(&mut self.huddle, views.huddle),
             profile: mem::replace(&mut self.profile, views.profile),
             switcher: mem::replace(&mut self.switcher, views.switcher),
         }
@@ -684,7 +686,7 @@ impl App {
         }
         self.save_draft(cx);
         self.bridge
-            .send(Command::CloseConversation(self.channel.clone()));
+            .send(ChannelCommand::CloseConversation(self.channel.clone()));
         // Swap live bridges when target workspace has its own `CoreBridge`.
         let swapped_bridge = self.parked_bridges.get_mut(index).and_then(Option::take);
         if let Some(incoming_bridge) = swapped_bridge {
@@ -789,11 +791,11 @@ impl App {
         self.sync_all_views_fixtures(fixtures, cx);
         self.sync_saved(cx);
         self.sync_later_count(cx);
-        self.huddle_open = false;
         self.tab = ConversationTab::Messages;
         let channel = self.channel.clone();
         if !channel.as_str().is_empty() {
-            self.bridge.send(Command::OpenConversation(channel.clone()));
+            self.bridge
+                .send(ChannelCommand::OpenConversation(channel.clone()));
             self.load_history(&channel, cx);
         }
         self.load_draft(cx);
@@ -833,8 +835,8 @@ impl App {
             s.set_home_page(Some(crate::sidebar::HomePage::Drafts), cx)
         });
         if !self.fixtures.sample {
-            self.bridge.send(Command::LoadScheduledMessages);
-            self.bridge.send(Command::FetchCloudDrafts);
+            self.bridge.send(MessagingCommand::LoadScheduledMessages);
+            self.bridge.send(MessagingCommand::FetchCloudDrafts);
             if let Some(read) = self.bridge.recent_sent(self.fixtures.self_user.clone(), 50) {
                 let workspace = self.workspace;
                 let fixtures = self.fixtures.clone();
@@ -904,7 +906,7 @@ impl App {
         } else {
             self.threads
                 .update(cx, |view, cx| view.begin_remote_load(fixtures, cx));
-            self.bridge.send(Command::FetchThreads);
+            self.bridge.send(MessagingCommand::FetchThreads);
         }
         self.close_full_column_views(cx);
         self.page = MainPage::Threads;
@@ -993,7 +995,7 @@ impl App {
                             && app.unreads_fetched.insert(group.channel.clone())
                         {
                             app.bridge
-                                .send(Command::FetchLatestHistory(group.channel.clone()));
+                                .send(ChannelCommand::FetchLatestHistory(group.channel.clone()));
                         }
                     }
                     app.unreads
@@ -1052,7 +1054,7 @@ impl App {
             self.sidebar
                 .update(cx, |sidebar, cx| sidebar.add_section(name, cx));
         } else {
-            self.bridge.send(Command::CreateSection { name });
+            self.bridge.send(ChannelCommand::CreateSection { name });
         }
     }
 
@@ -1137,7 +1139,7 @@ impl App {
         if self.bridge.store().is_some() {
             self.activity.update(cx, |view, cx| view.start_loading(cx));
             self.bridge
-                .send(Command::FetchActivity { with_bodies: true });
+                .send(MessagingCommand::FetchActivity { with_bodies: true });
         }
     }
 

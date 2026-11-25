@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 slackless-core.workspace = true
+slackless-platform.workspace = true
 # `HttpClient::send`'s error type (GPUI's image loader).
 anyhow.workspace = true
 tracing.workspace = true

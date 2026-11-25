@@ -545,8 +545,8 @@ fn app_home_huddle_threads_and_list_csv_work_end_to_end(cx: &mut gpui::TestAppCo
             app.select(ChannelId::from("C0GENERAL"), cx);
             app.start_huddle(window, cx);
             assert!(
-                app.huddle_open,
-                "fixture huddle bar should open on #general"
+                app.huddle_state.is_some(),
+                "fixture huddle should mount on #general"
             );
             assert!(!app.right_pane.is_thread());
             app.toggle_huddle_thread(cx);
@@ -936,18 +936,18 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 "sidebar mini-dock must persist across channel switches"
             );
 
-            // 3. Mute toggle updates session + dock state.
+            // 3. Mute toggle updates session + shared HuddleState.
             let was_muted = app.huddle_session.as_ref().unwrap().muted;
             app.toggle_huddle_mute(cx);
             assert_eq!(app.huddle_session.as_ref().unwrap().muted, !was_muted);
             assert_eq!(
-                app.huddle_dock.as_ref().unwrap().read(cx).session().muted,
+                app.huddle_state.as_ref().unwrap().read(cx).session().muted,
                 !was_muted
             );
 
-            // 4. Live speaking / RMS audio levels render without error.
-            app.on_core_event(
-                &Event::HuddleAudioLevels(slackless_core::huddle::HuddleAudioLevels {
+            // 4. Live speaking / RMS audio levels arrive on the dedicated HuddleMediaEvent lane.
+            app.on_huddle_media_event(
+                &HuddleMediaEvent::AudioLevels(slackless_core::huddle::HuddleAudioLevels {
                     local_rms: 0.25,
                     active_speakers: vec![(inviter.clone(), 0.72)],
                     muted_peers: Vec::new(),
@@ -956,19 +956,20 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 cx,
             );
 
-            // 4b. Phase 2–4: video frames (camera & screen share) and DATA_MESSAGE events
-            // (reactions, hand raise, topic, captions) flow into HuddleDock -> HuddleViewState.
+            // 4b. Phase 2–4: video frames (camera & screen share) arrive on HuddleMediaEvent and
+            // DATA_MESSAGE events (reactions, hand raise, topic, captions) arrive on Event::Huddle
+            // -> HuddleState -> HuddleViewState.
             let frame = slackless_core::huddle::VideoFrame::from_bgra(4, 4, vec![180u8; 4 * 4 * 4]);
-            app.on_core_event(
-                &Event::HuddleVideoFrame {
+            app.on_huddle_media_event(
+                &HuddleMediaEvent::VideoFrame {
                     tile: slackless_core::huddle::VideoTileKey::LocalCamera,
                     frame: frame.clone(),
                 },
                 window,
                 cx,
             );
-            app.on_core_event(
-                &Event::HuddleVideoFrame {
+            app.on_huddle_media_event(
+                &HuddleMediaEvent::VideoFrame {
                     tile: slackless_core::huddle::VideoTileKey::RemoteScreen(inviter.clone()),
                     frame,
                 },
@@ -976,114 +977,134 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Reaction {
-                    user: inviter.clone(),
-                    emoji: "confetti".to_owned(),
-                    kind: slackless_core::huddle::HuddleReactionKind::Effect,
-                    emoji_url: None,
-                    at_ms: 0,
-                }),
-                window,
-                cx,
-            );
-            app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::HandRaise {
-                    user: inviter.clone(),
-                    raised: true,
-                }),
-                window,
-                cx,
-            );
-            app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::StickyEmoji {
-                    user: inviter.clone(),
-                    emoji: Some("coffee".to_owned()),
-                }),
-                window,
-                cx,
-            );
-            app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Draw {
-                    user: inviter.clone(),
-                    message: slackless_core::huddle::HuddleDrawMessage::ChangeHue {
-                        item_id: inviter.to_string(),
-                        hue: 135,
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Reaction {
+                        user: inviter.clone(),
+                        emoji: "confetti".to_owned(),
+                        kind: slackless_core::huddle::HuddleReactionKind::Effect,
+                        emoji_url: None,
+                        at_ms: 0,
                     },
-                    at_ms: 0,
-                }),
+                )),
                 window,
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Draw {
-                    user: inviter.clone(),
-                    message: slackless_core::huddle::HuddleDrawMessage::New {
-                        item_id: inviter.to_string(),
-                        segment: slackless_core::huddle::HuddleDrawSegment {
-                            a: [0.1, 0.2],
-                            b: [0.2, 0.3],
-                            c: [0.3, 0.4],
-                            d: [0.4, 0.5],
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::HandRaise {
+                        user: inviter.clone(),
+                        raised: true,
+                    },
+                )),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::StickyEmoji {
+                        user: inviter.clone(),
+                        emoji: Some("coffee".to_owned()),
+                    },
+                )),
+                window,
+                cx,
+            );
+            app.on_core_event(
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Draw {
+                        user: inviter.clone(),
+                        message: slackless_core::huddle::HuddleDrawMessage::ChangeHue {
+                            item_id: inviter.to_string(),
+                            hue: 135,
                         },
+                        at_ms: 0,
                     },
-                    at_ms: 0,
-                }),
+                )),
                 window,
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Draw {
-                    user: inviter.clone(),
-                    message: slackless_core::huddle::HuddleDrawMessage::Position {
-                        item_id: inviter.to_string(),
-                        x: 0.4,
-                        y: 0.5,
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Draw {
+                        user: inviter.clone(),
+                        message: slackless_core::huddle::HuddleDrawMessage::New {
+                            item_id: inviter.to_string(),
+                            segment: slackless_core::huddle::HuddleDrawSegment {
+                                a: [0.1, 0.2],
+                                b: [0.2, 0.3],
+                                c: [0.3, 0.4],
+                                d: [0.4, 0.5],
+                            },
+                        },
+                        at_ms: 0,
                     },
-                    at_ms: 0,
-                }),
+                )),
                 window,
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Jukebox {
-                    user: inviter.clone(),
-                    song_key: Some("lofi".to_owned()),
-                }),
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Draw {
+                        user: inviter.clone(),
+                        message: slackless_core::huddle::HuddleDrawMessage::Position {
+                            item_id: inviter.to_string(),
+                            x: 0.4,
+                            y: 0.5,
+                        },
+                        at_ms: 0,
+                    },
+                )),
                 window,
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Topic {
-                    user: inviter.clone(),
-                    topic: "Release readiness".to_owned(),
-                }),
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Jukebox {
+                        user: inviter.clone(),
+                        song_key: Some("lofi".to_owned()),
+                    },
+                )),
                 window,
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Caption {
-                    user: inviter.clone(),
-                    text: "Shipping full parity…".to_owned(),
-                    is_partial: true,
-                    at_ms: 0,
-                    lang: Some("en".to_owned()),
-                }),
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Topic {
+                        user: inviter.clone(),
+                        topic: "Release readiness".to_owned(),
+                    },
+                )),
                 window,
                 cx,
             );
             app.on_core_event(
-                &Event::HuddleDataEvent(slackless_core::huddle::HuddleDataEvent::Caption {
-                    user: inviter.clone(),
-                    text: "Shipping full parity today!".to_owned(),
-                    is_partial: false,
-                    at_ms: 0,
-                    lang: Some("en".to_owned()),
-                }),
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Caption {
+                        user: inviter.clone(),
+                        text: "Shipping full parity…".to_owned(),
+                        is_partial: true,
+                        at_ms: 0,
+                        lang: Some("en".to_owned()),
+                    },
+                )),
                 window,
                 cx,
             );
-            let vs = app.huddle_dock.as_ref().unwrap().read(cx).view_state();
-            let video_store = app.huddle_dock.as_ref().unwrap().read(cx).video_store();
+            app.on_core_event(
+                &Event::Huddle(HuddleEvent::Data(
+                    slackless_core::huddle::HuddleDataEvent::Caption {
+                        user: inviter.clone(),
+                        text: "Shipping full parity today!".to_owned(),
+                        is_partial: false,
+                        at_ms: 0,
+                        lang: Some("en".to_owned()),
+                    },
+                )),
+                window,
+                cx,
+            );
+            let vs = app.huddle_state.as_ref().unwrap().read(cx).view_state();
+            let video_store = app.huddle_state.as_ref().unwrap().read(cx).video_store();
             assert_eq!(video_store.read(cx).frames().len(), 2);
             assert!(vs.raised_hands.contains(&inviter));
             assert_eq!(
@@ -1101,8 +1122,10 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
             assert_eq!(vs.captions.len(), 1);
             assert_eq!(vs.captions[0].1, "Shipping full parity today!");
             assert!(!vs.captions[0].2);
-            app.on_core_event(
-                &Event::HuddleVideoTileClosed(slackless_core::huddle::VideoTileKey::LocalCamera),
+            app.on_huddle_media_event(
+                &HuddleMediaEvent::VideoTileClosed(
+                    slackless_core::huddle::VideoTileKey::LocalCamera,
+                ),
                 window,
                 cx,
             );
@@ -1110,11 +1133,11 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
 
             // 5. Incoming DM huddle invite banner mounts and cancels cleanly.
             app.on_core_event(
-                &Event::HuddleInvite {
+                &Event::Huddle(HuddleEvent::Invite {
                     channel: design.clone(),
                     inviter: inviter.clone(),
                     call_id: "R0INVITE1".to_owned(),
-                },
+                }),
                 window,
                 cx,
             );
@@ -1123,10 +1146,10 @@ fn native_huddle_dock_invite_banner_and_audio_preferences_work_end_to_end(
                 "incoming DM huddle invite should mount floating ring banner"
             );
             app.on_core_event(
-                &Event::HuddleInviteCancelled {
+                &Event::Huddle(HuddleEvent::InviteCancelled {
                     channel: Some(design.clone()),
                     call_id: None,
-                },
+                }),
                 window,
                 cx,
             );

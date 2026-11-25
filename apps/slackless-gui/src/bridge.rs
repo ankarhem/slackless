@@ -24,7 +24,7 @@ use slackless_core::api::ConversationCounts;
 use slackless_core::auth::Session;
 use slackless_core::store::Store;
 use slackless_core::types::{ChannelId, Conversation, Message, Team, TeamId, Ts, User, UserId};
-use slackless_core::{Client, Command, Event, SharedStore};
+use slackless_core::{Client, ClientHandles, Command, Event, HuddleMediaEvent, SharedStore};
 
 use crate::fixtures::{self, Fixtures};
 use crate::media::CoreHttp;
@@ -134,6 +134,13 @@ struct EventHub;
 
 impl EventEmitter<Event> for EventHub {}
 
+/// Receives high-frequency native huddle media frames (60 fps video, audio levels) on a dedicated
+/// bounded lane completely isolated from [`EventHub`] so media traffic can never delay or back up
+/// control / store-sync events.
+struct HuddleMediaHub;
+
+impl EventEmitter<HuddleMediaEvent> for HuddleMediaHub {}
+
 pub struct CoreBridge {
     /// Live mode: forwards commands into the core's command loop. Fixture mode: `None`.
     commands: Option<UnboundedSender<Command>>,
@@ -149,9 +156,12 @@ pub struct CoreBridge {
     session: Option<Session>,
     /// Live mode: authenticated HTTP fetcher for remote images and file downloads.
     fetcher: Option<slackless_core::Fetcher>,
-    /// Created by [`CoreBridge::start`], or lazily by [`CoreBridge::subscribe`] in fixture
+    /// Created by [`CoreBridge::start`], or lazily by [`CoreBridge::subscribe_in`] in fixture
     /// mode (where nothing will ever emit on it).
     hub: Option<Entity<EventHub>>,
+    /// Created by [`CoreBridge::start`], or lazily by [`CoreBridge::subscribe_huddle_media_in`]
+    /// in fixture mode.
+    media_hub: Option<Entity<HuddleMediaHub>>,
 }
 
 impl CoreBridge {
@@ -165,13 +175,16 @@ impl CoreBridge {
             session: None,
             fetcher: None,
             hub: None,
+            media_hub: None,
         }
     }
 
     /// Starts the core live for `session`: opens its durable store and starts slackless-core on
     /// its dedicated tokio thread (guide section 13). Events flow into gpui through an async
     /// stream wakeup (zero polling latency, zero idle wakeups); views receive them via
-    /// [`CoreBridge::subscribe_in`]. `None` when the store or the core cannot be started.
+    /// [`CoreBridge::subscribe_in`]. High-frequency huddle video/audio frames drain on an
+    /// independent coalescing loop via [`CoreBridge::subscribe_huddle_media_in`]. `None` when the
+    /// store or the core cannot be started.
     pub fn start(session: Session, cx: &mut gpui::App) -> Option<Self> {
         let (store, reader) = open_store(&session)?;
         let handle = match Client::start(session.clone(), store) {
@@ -185,8 +198,15 @@ impl CoreBridge {
             }
         };
         let hub = cx.new(|_| EventHub);
-        let fetcher = handle.fetcher();
-        let (commands, mut events, store, thread) = handle.into_parts_with_thread();
+        let media_hub = cx.new(|_| HuddleMediaHub);
+        let ClientHandles {
+            commands,
+            mut events,
+            mut huddle_media,
+            store,
+            fetcher,
+            thread,
+        } = handle.into_parts();
         let bridge = Self {
             commands: Some(commands),
             core_thread: Some(Arc::new(Mutex::new(Some(thread)))),
@@ -195,16 +215,56 @@ impl CoreBridge {
             session: Some(session),
             fetcher: Some(fetcher),
             hub: Some(hub.clone()),
+            media_hub: Some(media_hub.clone()),
         };
 
-        // Detached: await events directly via StreamExt (0ms wakeup, 0 idle CPU polling) and
-        // drain any queued burst in the same tick.
+        // Detached: await control/store events directly via StreamExt (0ms wakeup, 0 idle CPU
+        // polling) and drain any queued burst in the same tick.
         cx.spawn(async move |cx| {
             while let Some(event) = events.next().await {
                 cx.update_entity(&hub, |_, cx| cx.emit(event));
                 while let Ok(next_ev) = events.try_recv() {
                     cx.update_entity(&hub, |_, cx| cx.emit(next_ev));
                 }
+            }
+        })
+        .detach();
+
+        // Dedicated high-frequency huddle media lane: coalesces queued VideoFrame / AudioLevels
+        // updates within the same UI tick so 60 fps frames never lag or share the Event queue.
+        cx.spawn(async move |cx| {
+            while let Some(first) = huddle_media.next().await {
+                let mut latest_audio = None;
+                let mut video_ops: HashMap<
+                    slackless_core::huddle::VideoTileKey,
+                    Option<slackless_core::huddle::VideoFrame>,
+                > = HashMap::new();
+                let mut push = |ev: HuddleMediaEvent| match ev {
+                    HuddleMediaEvent::VideoFrame { tile, frame } => {
+                        video_ops.insert(tile, Some(frame));
+                    }
+                    HuddleMediaEvent::VideoTileClosed(tile) => {
+                        video_ops.insert(tile, None);
+                    }
+                    HuddleMediaEvent::AudioLevels(levels) => {
+                        latest_audio = Some(levels);
+                    }
+                };
+                push(first);
+                while let Ok(next_ev) = huddle_media.try_recv() {
+                    push(next_ev);
+                }
+                cx.update_entity(&media_hub, |_, cx| {
+                    for (tile, frame) in video_ops {
+                        match frame {
+                            Some(frame) => cx.emit(HuddleMediaEvent::VideoFrame { tile, frame }),
+                            None => cx.emit(HuddleMediaEvent::VideoTileClosed(tile)),
+                        }
+                    }
+                    if let Some(levels) = latest_audio {
+                        cx.emit(HuddleMediaEvent::AudioLevels(levels));
+                    }
+                });
             }
         })
         .detach();
@@ -431,9 +491,9 @@ impl CoreBridge {
     }
 
     /// Forward a command to the core. Offline, commands are dropped by design.
-    pub fn send(&self, command: Command) {
+    pub fn send(&self, command: impl Into<Command>) {
         if let Some(commands) = &self.commands
-            && let Err(e) = commands.unbounded_send(command)
+            && let Err(e) = commands.unbounded_send(command.into())
         {
             tracing::warn!(error = %e, "core has stopped; command dropped");
         }
@@ -807,6 +867,26 @@ impl CoreBridge {
             on_event(this, event, window, cx);
         })
     }
+
+    /// Subscribe to high-frequency native huddle media events (`VideoFrame`, `VideoTileClosed`,
+    /// `AudioLevels`) drained on their own coalescing lane, separate from [`Event`].
+    pub fn subscribe_huddle_media_in<T: 'static>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<T>,
+        mut on_event: impl FnMut(&mut T, &HuddleMediaEvent, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        let hub = self
+            .media_hub
+            .get_or_insert_with(|| cx.new(|_| HuddleMediaHub));
+        cx.subscribe_in(
+            hub,
+            window,
+            move |this, _, event: &HuddleMediaEvent, window, cx| {
+                on_event(this, event, window, cx);
+            },
+        )
+    }
 }
 
 /// Opens the durable store for a session plus a dedicated read-only WAL connection for lock-free
@@ -849,13 +929,13 @@ fn open_store(session: &Session) -> Option<(Store, Option<SharedStore>)> {
 
 /// Directory holding per-workspace SQLite stores.
 pub fn store_dir() -> Option<PathBuf> {
-    slackless_core::platform::app_data_dir()
+    slackless_core::paths::app_data_dir()
 }
 
 /// The durable store lives under the platform's application-data directory, one database per
 /// workspace (the store location stays a front-end decision, per slackless-core's docs).
 fn default_store_path(team_id: &TeamId) -> Option<PathBuf> {
-    slackless_core::platform::archive_store_path(team_id.as_str())
+    slackless_core::paths::archive_store_path(team_id.as_str())
 }
 
 #[cfg(test)]
@@ -898,7 +978,7 @@ mod tests {
         assert!(bridge.drafts().is_none());
         assert!(bridge.section_prefs().is_none());
         assert!(bridge.parse_color_mode(&HashMap::new()).is_none());
-        bridge.send(Command::MarkAllRead);
+        bridge.send(slackless_core::MessagingCommand::MarkAllRead);
     }
 
     fn run_ready<F: Future<Output = ()>>(fut: F) {
@@ -927,6 +1007,7 @@ mod tests {
             session: Some(session),
             fetcher: None,
             hub: None,
+            media_hub: None,
         }
     }
 

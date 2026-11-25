@@ -17,14 +17,10 @@ pub(super) fn build_workspace(
     let results = SearchView::new(fixtures.clone(), archive, cx);
     let browser = ChannelBrowser::new(fixtures.clone(), window, cx);
     let huddle_map: HashMap<ChannelId, Vec<slackless_core::types::UserId>> =
-        huddle::fixture(fixtures)
+        huddle_state::fixture_huddle(fixtures)
             .map(|h| (h.channel, h.participants))
             .into_iter()
             .collect();
-    let huddle = huddle::fixture(fixtures).map(|huddle| {
-        let channel = huddle.channel.clone();
-        (channel, HuddleBar::new(fixtures.clone(), huddle, cx))
-    });
     sidebar.update(cx, |sidebar, cx| {
         sidebar.set_huddles(huddle_map, cx);
         sidebar.set_workspace(index, cx);
@@ -37,7 +33,6 @@ pub(super) fn build_workspace(
         thread,
         results,
         browser,
-        huddle,
         profile,
         switcher,
     }
@@ -50,7 +45,7 @@ pub(super) fn subscribe_workspace(
     window: &mut Window,
     cx: &mut Context<App>,
 ) -> Vec<Subscription> {
-    let mut subscriptions = vec![
+    let subscriptions = vec![
         cx.subscribe_in(
             &views.sidebar,
             window,
@@ -99,7 +94,7 @@ pub(super) fn subscribe_workspace(
                             sidebar.add_section_with_channel(name.clone(), channel.clone(), cx)
                         });
                     } else {
-                        this.bridge.send(Command::CreateSectionWithChannel {
+                        this.bridge.send(ChannelCommand::CreateSectionWithChannel {
                             name: name.clone(),
                             channel: channel.clone(),
                         });
@@ -111,7 +106,7 @@ pub(super) fn subscribe_workspace(
                             sidebar.rename_section_local(section, name, cx)
                         });
                     } else {
-                        this.bridge.send(Command::RenameSection {
+                        this.bridge.send(ChannelCommand::RenameSection {
                             section: section.clone(),
                             name: name.clone(),
                         });
@@ -122,13 +117,13 @@ pub(super) fn subscribe_workspace(
                         this.sidebar
                             .update(cx, |sidebar, cx| sidebar.delete_section_local(section, cx));
                     } else {
-                        this.bridge.send(Command::DeleteSection {
+                        this.bridge.send(ChannelCommand::DeleteSection {
                             section: section.clone(),
                         });
                     }
                 }
                 SidebarEvent::MoveChannel { channel, from, to } => {
-                    this.bridge.send(Command::MoveChannel {
+                    this.bridge.send(ChannelCommand::MoveChannel {
                         channel: channel.clone(),
                         from: from.clone(),
                         to: to.clone(),
@@ -138,7 +133,7 @@ pub(super) fn subscribe_workspace(
                     this.mark_read(channel, ts.clone(), cx);
                 }
                 SidebarEvent::SetNotifyLevel { channel, level } => {
-                    this.bridge.send(Command::SetNotifyLevel {
+                    this.bridge.send(ChannelCommand::SetNotifyLevel {
                         channel: channel.clone(),
                         level: *level,
                     });
@@ -165,7 +160,7 @@ pub(super) fn subscribe_workspace(
                             .and_then(|(_, secs)| *secs)
                             .map(|secs| ((secs + 59) / 60).clamp(1, 1440) as u32)
                             .unwrap_or(480);
-                        this.bridge.send(Command::SetDndSnooze { minutes });
+                        this.bridge.send(WorkspaceCommand::SetDndSnooze { minutes });
                         if auto_status {
                             this.send_status_to_slack(this.self_state.status.as_ref());
                         }
@@ -214,14 +209,14 @@ pub(super) fn subscribe_workspace(
                     );
                 }
                 SearchEvent::RemoteMessages { query, sort, page } => {
-                    this.bridge.send(Command::SearchRemoteMessages {
+                    this.bridge.send(CollabCommand::SearchRemoteMessages {
                         query: query.clone(),
                         sort: *sort,
                         page: *page,
                     });
                 }
                 SearchEvent::RemoteFiles { query, sort, page } => {
-                    this.bridge.send(Command::SearchRemoteFiles {
+                    this.bridge.send(CollabCommand::SearchRemoteFiles {
                         query: query.clone(),
                         sort: *sort,
                         page: *page,
@@ -333,7 +328,7 @@ pub(super) fn subscribe_workspace(
                 ThreadPanelEvent::OpenProfile(user) => this.open_profile(user.clone(), cx),
                 ThreadPanelEvent::Typing => {
                     if let Some((channel, ts)) = this.thread.read(cx).open_thread() {
-                        this.bridge.send(Command::Typing {
+                        this.bridge.send(MessagingCommand::Typing {
                             channel,
                             thread_ts: Some(ts),
                         });
@@ -357,7 +352,7 @@ pub(super) fn subscribe_workspace(
                     thread_ts,
                     content,
                 } => {
-                    this.bridge.send(Command::SendMessage {
+                    this.bridge.send(MessagingCommand::SendMessage {
                         channel: channel.clone(),
                         content: content.clone(),
                         thread_ts: Some(thread_ts.clone()),
@@ -440,7 +435,7 @@ pub(super) fn subscribe_workspace(
                     thread_ts,
                     last_read,
                     subscribed,
-                } => this.bridge.send(Command::SetThreadSubscribed {
+                } => this.bridge.send(MessagingCommand::SetThreadSubscribed {
                     channel: channel.clone(),
                     thread_ts: thread_ts.clone(),
                     last_read: last_read.clone(),
@@ -516,50 +511,12 @@ pub(super) fn subscribe_workspace(
                     this.focus.focus(window, cx);
                 }
                 SwitcherEvent::SearchRemote(query) => {
-                    this.bridge.send(Command::QuickSwitchSearch {
+                    this.bridge.send(CollabCommand::QuickSwitchSearch {
                         query: query.clone(),
                     });
                 }
             },
         ),
     ];
-    if let Some((_, bar)) = &views.huddle {
-        subscriptions.push(cx.subscribe_in(
-            bar,
-            window,
-            |this: &mut App, _, event: &HuddleEvent, window, cx| match event {
-                HuddleEvent::Leave => {
-                    this.leave_huddle(cx);
-                }
-                HuddleEvent::OpenThread => {
-                    this.toggle_huddle_thread(cx);
-                }
-                HuddleEvent::ToggleMute => {
-                    this.toggle_huddle_mute(cx);
-                }
-                HuddleEvent::ToggleVideo => {
-                    this.toggle_huddle_camera(cx);
-                }
-                HuddleEvent::ToggleShare => {
-                    this.toggle_huddle_screen_share(window, cx);
-                }
-                HuddleEvent::PopOut => {
-                    this.pop_out_huddle(window, cx);
-                }
-                HuddleEvent::CopyLink => {
-                    let ch = this
-                        .huddle_session
-                        .as_ref()
-                        .map(|s| s.channel.clone())
-                        .or_else(|| this.huddle.as_ref().map(|(c, _)| c.clone()))
-                        .unwrap_or_else(|| this.channel.clone());
-                    this.copy_huddle_link(ch, window, cx);
-                }
-                HuddleEvent::OpenCanvas(fid) => {
-                    this.open_huddle_canvas(fid.clone(), cx);
-                }
-            },
-        ));
-    }
     subscriptions
 }

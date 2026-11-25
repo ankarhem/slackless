@@ -9726,6 +9726,7 @@ dependencies = [
  "serde_json",
  "slackless-auth",
  "slackless-core",
+ "slackless-platform",
  "smallvec",
  "tracing",
 ]

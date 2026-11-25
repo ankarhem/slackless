@@ -5,7 +5,18 @@
 //! camera, share, hand, reactions, background/theme, thread, more; right: red Leave button),
 //! luminous rounded-square participant cards on the stage, and a crisp theme-matched side drawer.
 
-use gpui_kit::gpui::{Background, ClickEvent, Hsla, linear_color_stop, linear_gradient};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::{Sizable as _, h_flex, h_resizable, resizable_panel};
+use gpui_kit::gpui::{
+    Background, ClickEvent, Focusable as _, FontWeight, Hsla, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, StatefulInteractiveElement as _, canvas, hsla,
+    linear_color_stop, linear_gradient, rgb, rgba,
+};
+use slackless_core::{CollabCommand, HuddleCommand, HuddleControlCommand};
+
+use crate::actions::{self, ActionHandler};
+use crate::messages::{message_row_linked, same_group};
 
 use super::*;
 
@@ -244,8 +255,12 @@ fn parse_ts_secs(ts: &str) -> Option<f64> {
     ts.trim().parse::<f64>().ok()
 }
 
+fn send_huddle_draw(msg: slackless_core::huddle::HuddleDrawMessage) -> Command {
+    HuddleControlCommand::SendDraw(msg).into()
+}
+
 impl PopoutWindow {
-    fn huddle_dock_entity(&self) -> Option<Entity<crate::huddle_dock::HuddleDock>> {
+    fn huddle_state_entity(&self) -> Option<Entity<crate::huddle_state::HuddleState>> {
         match &self.kind {
             PopoutKind::Huddle { source, .. } => source.upgrade(),
             _ => None,
@@ -277,8 +292,8 @@ impl PopoutWindow {
 
     fn open_audio_video_preferences(&mut self, cx: &mut Context<Self>) {
         self.close_huddle_popovers();
-        if let Some(dock) = self.huddle_dock_entity() {
-            dock.update(cx, |d, cx| d.open_audio_settings(cx));
+        if let Some(state) = self.huddle_state_entity() {
+            state.update(cx, |s, cx| s.open_audio_settings(cx));
         }
         cx.notify();
     }
@@ -295,7 +310,7 @@ impl PopoutWindow {
                     return;
                 }
                 for (id, frame) in frames {
-                    if let Some(img) = crate::huddle_dock::frame_to_render_image(&frame)
+                    if let Some(img) = crate::huddle_state::frame_to_render_image(&frame)
                         && let Some(old) = win.huddle_screen_thumbs.insert(id, img)
                     {
                         cx.drop_image(old, None);
@@ -309,14 +324,17 @@ impl PopoutWindow {
 
     fn start_selected_screen_share(&mut self, source_id: String, cx: &mut Context<Self>) {
         let share_audio = self.huddle_share_audio;
-        (self.send)(Command::SetHuddleScreenShare {
-            source_id: Some(source_id.clone()),
-            share_audio,
-        });
+        (self.send)(
+            HuddleControlCommand::SetScreenShare {
+                source_id: Some(source_id.clone()),
+                share_audio,
+            }
+            .into(),
+        );
         if self.fixtures.sample
-            && let Some(dock) = self.huddle_dock_entity()
+            && let Some(state) = self.huddle_state_entity()
         {
-            dock.update(cx, |d, cx| d.set_sharing_local(Some(source_id), cx));
+            state.update(cx, |s, cx| s.set_sharing_local(Some(source_id), cx));
         }
         self.close_share_modal(cx);
         cx.notify();
@@ -402,7 +420,7 @@ impl PopoutWindow {
             }
             HuddlePhase::Connected => (
                 pal.success,
-                crate::huddle_dock::format_elapsed(state.elapsed_secs),
+                crate::huddle_state::format_elapsed(state.elapsed_secs),
             ),
             HuddlePhase::Reconnecting => (pal.warning, "Reconnecting…".to_owned()),
             HuddlePhase::Leaving => (pal.chrome_muted, "Leaving…".to_owned()),
@@ -514,11 +532,11 @@ impl PopoutWindow {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Resume video")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                (send_resume)(Command::SetHuddleAudioOnly(false));
+                                (send_resume)(HuddleControlCommand::SetAudioOnly(false).into());
                                 if this.fixtures.sample
-                                    && let Some(dock) = this.huddle_dock_entity()
+                                    && let Some(state) = this.huddle_state_entity()
                                 {
-                                    dock.update(cx, |d, cx| d.set_audio_only_local(false, cx));
+                                    state.update(cx, |s, cx| s.set_audio_only_local(false, cx));
                                 }
                             })),
                     ),

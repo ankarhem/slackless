@@ -470,7 +470,7 @@ fn wire_feature_view_subscriptions(
                     let channel = this.channel.clone();
                     this.open_custom_schedule(channel, None, text.clone(), window, cx);
                 }
-                ComposerEvent::Typing => this.bridge.send(Command::Typing {
+                ComposerEvent::Typing => this.bridge.send(MessagingCommand::Typing {
                     channel: this.channel.clone(),
                     thread_ts: None,
                 }),
@@ -486,7 +486,7 @@ fn wire_feature_view_subscriptions(
                 EmojiPickerEvent::RunGiphy(query) => this.run_giphy(query, window, cx),
                 EmojiPickerEvent::SearchGifs(query) => {
                     if !this.fixtures.sample {
-                        this.bridge.send(Command::SearchGifs {
+                        this.bridge.send(CollabCommand::SearchGifs {
                             query: query.clone(),
                         });
                     }
@@ -496,7 +496,7 @@ fn wire_feature_view_subscriptions(
                         cx.background_executor().spawn(write).detach();
                     }
                     if !this.fixtures.sample {
-                        this.bridge.send(Command::SetUserPref {
+                        this.bridge.send(WorkspaceCommand::SetUserPref {
                             name: "preferred_skin_tone".to_owned(),
                             value: (*tone).to_string(),
                         });
@@ -548,7 +548,7 @@ fn wire_feature_view_subscriptions(
                             let _ = output_device;
                         }
                     } else {
-                        this.bridge.send(Command::TestHuddleSpeaker {
+                        this.bridge.send(HuddleCommand::TestSpeaker {
                             output_device: output_device.clone(),
                         });
                     }
@@ -581,10 +581,11 @@ fn wire_feature_view_subscriptions(
                                     })
                                     .unwrap_or(60);
                                 this.self_state.paused_until = Some(now + i64::from(mins) * 60);
-                                this.bridge.send(Command::SetDndSnooze { minutes: mins });
+                                this.bridge
+                                    .send(WorkspaceCommand::SetDndSnooze { minutes: mins });
                             } else if this.self_state.paused() {
                                 this.self_state.paused_until = None;
-                                this.bridge.send(Command::EndDndSnooze);
+                                this.bridge.send(WorkspaceCommand::EndDndSnooze);
                             }
                         }
                         this.push_self_state(cx);
@@ -641,7 +642,7 @@ fn wire_feature_view_subscriptions(
                 DraftsEvent::SendNow(entry) => this.deliver(entry.clone(), window, cx),
                 DraftsEvent::CancelScheduled(entry) => {
                     if let Some(id) = entry.id.clone() {
-                        this.bridge.send(Command::DeleteScheduledMessage {
+                        this.bridge.send(MessagingCommand::DeleteScheduledMessage {
                             channel: entry.channel.clone(),
                             scheduled_message_id: id,
                         });
@@ -696,14 +697,14 @@ fn wire_feature_view_subscriptions(
                         this.threads
                             .update(cx, |threads, cx| threads.set_saved(ts, false, cx));
                         this.sync_saved(cx);
-                        this.bridge.send(Command::DeleteSavedItem {
+                        this.bridge.send(MessagingCommand::DeleteSavedItem {
                             channel: channel.clone(),
                             ts: ts.clone(),
                         });
                     } else if let Some(bridge) =
                         this.parked_bridges.get(*workspace).and_then(Option::as_ref)
                     {
-                        bridge.send(Command::DeleteSavedItem {
+                        bridge.send(MessagingCommand::DeleteSavedItem {
                             channel: channel.clone(),
                             ts: ts.clone(),
                         });
@@ -716,7 +717,7 @@ fn wire_feature_view_subscriptions(
                     mark,
                     date_due,
                 } => {
-                    let cmd = Command::UpdateSavedItem {
+                    let cmd = MessagingCommand::UpdateSavedItem {
                         channel: channel.clone(),
                         ts: ts.clone(),
                         mark: *mark,
@@ -732,11 +733,11 @@ fn wire_feature_view_subscriptions(
                 }
                 LaterEvent::ClearCompleted { workspace } => {
                     if *workspace == this.workspace {
-                        this.bridge.send(Command::ClearCompletedSaved);
+                        this.bridge.send(MessagingCommand::ClearCompletedSaved);
                     } else if let Some(bridge) =
                         this.parked_bridges.get(*workspace).and_then(Option::as_ref)
                     {
-                        bridge.send(Command::ClearCompletedSaved);
+                        bridge.send(MessagingCommand::ClearCompletedSaved);
                     }
                 }
                 LaterEvent::Changed => this.sync_later_count(cx),
@@ -754,7 +755,7 @@ fn wire_feature_view_subscriptions(
                     this.open_link(target.clone(), window, cx);
                 }
                 ThreadsEvent::ExpandThread { channel, thread_ts } => {
-                    this.bridge.send(Command::OpenThread {
+                    this.bridge.send(MessagingCommand::OpenThread {
                         channel: channel.clone(),
                         thread_ts: thread_ts.clone(),
                     });
@@ -894,7 +895,7 @@ fn wire_feature_view_subscriptions(
                 }
                 UnreadsEvent::Reply { channel, text } => {
                     let content = slackless_core::api::MessageContent::plain(text.clone());
-                    this.bridge.send(Command::SendMessage {
+                    this.bridge.send(MessagingCommand::SendMessage {
                         channel: channel.clone(),
                         content,
                         thread_ts: None,
@@ -929,7 +930,7 @@ fn wire_feature_view_subscriptions(
                     }
                 }
                 ActivityEvent::Mark { entries, read } => {
-                    this.bridge.send(Command::MarkActivity {
+                    this.bridge.send(MessagingCommand::MarkActivity {
                         entries: entries.clone(),
                         read: *read,
                     });
@@ -951,13 +952,13 @@ fn wire_feature_view_subscriptions(
             window,
             |this: &mut App, _, event: &FilesPageEvent, window, cx| match event {
                 FilesPageEvent::Load(filter) => {
-                    this.bridge.send(Command::LoadFiles(filter.clone()));
+                    this.bridge.send(CollabCommand::LoadFiles(filter.clone()));
                 }
                 FilesPageEvent::LoadExtras => {
-                    this.bridge.send(Command::LoadFilesExtras);
+                    this.bridge.send(CollabCommand::LoadFilesExtras);
                 }
                 FilesPageEvent::SaveFile { file_id, name } => {
-                    this.bridge.send(Command::SaveFile {
+                    this.bridge.send(MessagingCommand::SaveFile {
                         file_id: file_id.clone(),
                         date_due: None,
                     });
@@ -971,27 +972,27 @@ fn wire_feature_view_subscriptions(
                     collection_id,
                     starred,
                 } => {
-                    this.bridge.send(Command::SetFileFavorite {
+                    this.bridge.send(CollabCommand::SetFileFavorite {
                         file_id: file_id.clone(),
                         collection_id: collection_id.clone(),
                         starred: *starred,
                     });
                 }
                 FilesPageEvent::CreateCollection { name } => {
-                    this.bridge.send(Command::CreateFileCollection {
+                    this.bridge.send(CollabCommand::CreateFileCollection {
                         name: name.clone(),
                         emoji: None,
                     });
                     notify("Collection created", name.clone(), window, cx);
                 }
                 FilesPageEvent::DeleteCollection { collection_id } => {
-                    this.bridge.send(Command::DeleteFileCollection {
+                    this.bridge.send(CollabCommand::DeleteFileCollection {
                         collection_id: collection_id.clone(),
                     });
                     notify("Collection deleted", "Removed file collection.", window, cx);
                 }
                 FilesPageEvent::RestoreFile { file_id, title } => {
-                    this.bridge.send(Command::RestoreDeletedFile {
+                    this.bridge.send(CollabCommand::RestoreDeletedFile {
                         file_id: file_id.clone(),
                     });
                     notify("Restoring", title.clone(), window, cx);
@@ -1003,7 +1004,7 @@ fn wire_feature_view_subscriptions(
                     this.open_live_list(file_id.clone(), cx);
                 }
                 FilesPageEvent::CreateCanvas { title } => {
-                    this.bridge.send(Command::CreateCanvas {
+                    this.bridge.send(CollabCommand::CreateCanvas {
                         title: title.clone(),
                         markdown: format!("# {title}\n\n"),
                         channel: None,
@@ -1011,7 +1012,7 @@ fn wire_feature_view_subscriptions(
                     notify("Creating canvas", title.clone(), window, cx);
                 }
                 FilesPageEvent::CreateList { name } => {
-                    this.bridge.send(Command::CreateList {
+                    this.bridge.send(CollabCommand::CreateList {
                         name: name.clone(),
                         description: None,
                         channel: None,
@@ -1047,7 +1048,6 @@ fn wire_feature_view_subscriptions(
             |this: &mut App, _, event: &HuddlesEvent, window, cx| match event {
                 HuddlesEvent::Open(channel) => {
                     this.select(channel.clone(), cx);
-                    this.huddle_open = this.huddle_here();
                     cx.notify();
                 }
                 HuddlesEvent::Join(channel) => {
@@ -1103,7 +1103,7 @@ fn wire_feature_view_subscriptions(
                     description,
                 } => {
                     if !this.fixtures.sample {
-                        this.bridge.send(Command::CreateUsergroup {
+                        this.bridge.send(WorkspaceCommand::CreateUsergroup {
                             name: name.clone(),
                             handle: handle.clone(),
                             description: description.clone(),
@@ -1142,7 +1142,7 @@ fn wire_feature_view_subscriptions(
                     if let Some(dm) = dm {
                         this.select(dm, cx);
                     } else if this.bridge.store().is_some() {
-                        this.bridge.send(Command::OpenDm {
+                        this.bridge.send(ChannelCommand::OpenDm {
                             users: vec![user.clone()],
                         });
                     } else {
@@ -1220,7 +1220,7 @@ fn wire_feature_view_subscriptions(
                     }
                     if this.bridge.store().is_some() {
                         this.pending_dm = Some(content.clone());
-                        this.bridge.send(Command::OpenDm {
+                        this.bridge.send(ChannelCommand::OpenDm {
                             users: users.clone(),
                         });
                     } else {
@@ -1383,13 +1383,14 @@ fn install_os_and_lifecycle_hooks(app: &Entity<App>, window: &mut Window, cx: &m
                                 if app.self_state.paused() {
                                     app.self_state.paused_until = None;
                                     if !app.fixtures.sample {
-                                        app.bridge.send(Command::EndDndSnooze);
+                                        app.bridge.send(WorkspaceCommand::EndDndSnooze);
                                     }
                                 } else {
                                     app.self_state.paused_until =
                                         Some(crate::messages::now_secs() + 3_600);
                                     if !app.fixtures.sample {
-                                        app.bridge.send(Command::SetDndSnooze { minutes: 60 });
+                                        app.bridge
+                                            .send(WorkspaceCommand::SetDndSnooze { minutes: 60 });
                                     }
                                 }
                                 app.push_self_state(cx);
@@ -1553,7 +1554,6 @@ impl App {
                 thread,
                 results,
                 browser,
-                huddle,
                 profile,
                 switcher,
             } = views;
@@ -1667,9 +1667,17 @@ impl App {
                     this.on_workspace_event(0, event, window, cx);
                 },
             ));
+            subscriptions.push(bridge.subscribe_huddle_media_in(
+                window,
+                cx,
+                |this: &mut App, event, window, cx| {
+                    this.on_huddle_media_event(event, window, cx);
+                },
+            ));
             subscriptions.extend(wire_feature_view_subscriptions(&feature_views, window, cx));
-            // Subscribe to every background workspace's EventHub so their unread/mention
-            // badges and team metadata stay current while parked.
+            // Subscribe to every background workspace's EventHub (and dedicated HuddleMediaHub)
+            // so unread/mention badges, team metadata, and active huddle media stay live across
+            // workspace switches.
             for (ws_ix, slot) in parked_bridges.iter_mut().enumerate().skip(1) {
                 if let Some(bg_bridge) = slot.as_mut() {
                     subscriptions.push(bg_bridge.subscribe_in(
@@ -1677,6 +1685,13 @@ impl App {
                         cx,
                         move |this: &mut App, event, window, cx| {
                             this.on_workspace_event(ws_ix, event, window, cx);
+                        },
+                    ));
+                    subscriptions.push(bg_bridge.subscribe_huddle_media_in(
+                        window,
+                        cx,
+                        |this: &mut App, event, window, cx| {
+                            this.on_huddle_media_event(event, window, cx);
                         },
                     ));
                 }
@@ -1700,7 +1715,7 @@ impl App {
 
             // A first live launch has no conversations yet; hydrate brings them (reload_live).
             if !channel.as_str().is_empty() {
-                bridge.send(Command::OpenConversation(channel.clone()));
+                bridge.send(ChannelCommand::OpenConversation(channel.clone()));
             }
             demo(&results, window, cx);
             let parked = fixtures.workspaces.iter().map(|_| None).collect();
@@ -1768,9 +1783,9 @@ impl App {
                 page: MainPage::Channel,
                 right_pane: RightPane::None,
                 tab: ConversationTab::Messages,
-                huddle,
-                huddle_open: false,
                 huddle_session: None,
+                huddle_state: None,
+                _huddle_state_sub: None,
                 huddle_dock: None,
                 huddle_floating_panel: None,
                 _huddle_dock_sub: None,

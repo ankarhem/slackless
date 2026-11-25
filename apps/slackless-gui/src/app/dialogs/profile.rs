@@ -23,7 +23,7 @@ impl App {
                 ..Default::default()
             },
         };
-        self.bridge.send(Command::UpdateProfile { update });
+        self.bridge.send(WorkspaceCommand::UpdateProfile { update });
     }
 
     /// Open Slack's "Edit your profile" dialog for the signed-in user (display name, title,
@@ -206,10 +206,12 @@ impl App {
                                             let _ = cx.update(|window, cx| {
                                                 let _ = this_u.update(cx, |app, _| {
                                                     if !app.fixtures.sample {
-                                                        app.bridge.send(Command::SetUserPhoto {
-                                                            filename: filename.clone(),
-                                                            bytes,
-                                                        });
+                                                        app.bridge.send(
+                                                            WorkspaceCommand::SetUserPhoto {
+                                                                filename: filename.clone(),
+                                                                bytes,
+                                                            },
+                                                        );
                                                     }
                                                 });
                                                 notify(
@@ -274,7 +276,9 @@ impl App {
                                                 );
                                             });
                                             if !app.fixtures.sample {
-                                                app.bridge.send(Command::UpdateProfile { update });
+                                                app.bridge.send(WorkspaceCommand::UpdateProfile {
+                                                    update,
+                                                });
                                             }
                                             notify(
                                                 "Profile updated",
@@ -302,7 +306,8 @@ impl App {
             RightPane::Thread | RightPane::Profile { over_thread: true }
         );
         if !self.fixtures.sample {
-            self.bridge.send(Command::FetchUserProfile(user.clone()));
+            self.bridge
+                .send(WorkspaceCommand::FetchUserProfile(user.clone()));
         }
         self.profile
             .update(cx, |profile, cx| profile.open(user, over_thread, cx));

@@ -163,7 +163,6 @@ pub(crate) const THEME_ORDER_STRIDE: u64 = 4096;
 /// chronological order, so `ts` order is reading order; the shift keeps paragraphs of
 /// adjacent messages from interleaving. See [`SelectableParagraph`].
 use crate::threads_cards::ts_just_before;
-pub(crate) use render::unescape_cow;
 
 pub(crate) fn message_order(ts: &Ts) -> u64 {
     /// `ts` (`secs.micros`) as milliseconds.

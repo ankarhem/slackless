@@ -415,7 +415,7 @@ impl App {
             return;
         }
         self.bridge
-            .send(Command::JoinConversation(self.channel.clone()));
+            .send(ChannelCommand::JoinConversation(self.channel.clone()));
     }
 }
 
