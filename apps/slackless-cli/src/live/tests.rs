@@ -1416,6 +1416,30 @@ fn canvas_html_fallback_never_swallows_auth_or_transport_errors() {
     assert!(!should_fallback_canvas_html(&ApiError::UntrustedUrl(
         "http://evil.example".into()
     )));
+
+    // HTML fallback renders Quip canvas HTML into markdown via `canvas_doc::CanvasDoc`.
+    let quip_html = "<html><body><h1>Release Notes</h1><p>Shipped &amp; verified.</p>\
+        <ul data-section-style=\"7\"><li data-checked=\"true\">Build</li>\
+        <li data-checked=\"false\">Announce</li></ul><hr/></body></html>";
+    let (fmt, md) = render_canvas_html_fallback("Release Notes", quip_html);
+    assert_eq!(fmt, "markdown");
+    assert_eq!(
+        md,
+        "# Release Notes\n\nShipped & verified.\n\n- [x] Build\n- [ ] Announce\n\n---"
+    );
+
+    // Blank canvas HTML still resolves as empty markdown.
+    assert_eq!(
+        render_canvas_html_fallback("Empty", "   \n"),
+        ("markdown", String::new())
+    );
+
+    // Non-empty HTML with no parseable blocks preserves raw HTML instead of dropping content.
+    let raw_only = "<script>window.__DATA__ = 1;</script>";
+    assert_eq!(
+        render_canvas_html_fallback("Opaque", raw_only),
+        ("html", raw_only.to_owned())
+    );
 }
 
 #[test]

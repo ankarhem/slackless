@@ -63,12 +63,12 @@ impl From<DigestChannel> for DigestChannelRow {
 
 /// The archive database path for one workspace.
 pub fn store_path(team_id: &TeamId) -> Option<PathBuf> {
-    slackless_core::platform::archive_store_path(team_id.as_str())
+    slackless_core::paths::archive_store_path(team_id.as_str())
 }
 
 /// Team ids with an archive on disk, sorted.
 pub fn stored_team_ids() -> Vec<TeamId> {
-    let Some(dir) = slackless_core::platform::app_data_dir() else {
+    let Some(dir) = slackless_core::paths::app_data_dir() else {
         return Vec::new();
     };
     stored_team_ids_in(&dir)

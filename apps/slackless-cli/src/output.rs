@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+use slackless_core::domain::mrkdwn::mrkdwn_to_plain;
 use slackless_core::store::StoredMessage;
 use slackless_core::types::UserId;
 
@@ -93,7 +94,7 @@ impl MessageRow {
         }
     }
 
-    /// One tab-separated line: `channel\tts\tauthor: text`.
+    /// One tab-separated line: `channel\tts\tauthor: text` with Slack `mrkdwn` rendered to plain text.
     pub fn human_line(&self, channel: Option<&str>) -> String {
         let who = self
             .user_name
@@ -103,7 +104,8 @@ impl MessageRow {
             .unwrap_or("unknown");
         let channel = channel.unwrap_or(&self.channel);
         let deleted = if self.deleted { " (deleted)" } else { "" };
-        format!("{channel}\t{}\t{who}:{deleted} {}\n", self.ts, self.text)
+        let plain = mrkdwn_to_plain(&self.text);
+        format!("{channel}\t{}\t{who}:{deleted} {plain}\n", self.ts)
     }
 }
 
@@ -452,6 +454,21 @@ mod tests {
         assert_eq!(
             unknown.human_line(None),
             "C1\t1700000001.000100\tunknown: hi\n"
+        );
+
+        // Slack mrkdwn is rendered cleanly for human output while JSON keeps raw text.
+        let formatted = MessageRow {
+            text: "Hello *world* &amp; <@U1|alice> in <#C1|eng> <https://slack.com|Slack>".into(),
+            ..unknown
+        };
+        assert_eq!(
+            formatted.human_line(Some("#eng")),
+            "#eng\t1700000001.000100\tunknown: Hello world & @alice in #eng Slack\n"
+        );
+        let json = serde_json::to_value(&formatted).expect("serialize row");
+        assert_eq!(
+            json["text"],
+            "Hello *world* &amp; <@U1|alice> in <#C1|eng> <https://slack.com|Slack>"
         );
     }
 

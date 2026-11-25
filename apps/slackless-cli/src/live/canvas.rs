@@ -13,6 +13,7 @@ use slackless_core::api::{
 use slackless_core::domain::canvas::{
     self as domain_canvas, CanvasCommentFilter, filter_comment_threads, format_canvas_api_error,
 };
+use slackless_core::domain::canvas_doc::CanvasDoc;
 use slackless_core::types::{ChannelId, Ts, UserId};
 
 use crate::archive::Archive;
@@ -51,6 +52,21 @@ fn canvas_api_fail(ctx: &Ctx, err: &ApiError) -> ExitCode {
 /// Never swallows authentication expiry, network/HTTP errors, rate limits, or untrusted URLs.
 pub(crate) fn should_fallback_canvas_html(err: &ApiError) -> bool {
     matches!(err, ApiError::Slack(_)) && !err.is_auth_expired()
+}
+
+/// Convert a Quip/Canvas HTML fallback payload into clean markdown via
+/// `slackless_core::domain::canvas_doc::CanvasDoc` when the caller asked for markdown (`!html`).
+/// Falls back to raw `"html"` only if non-empty HTML yields no parsed blocks so content is never
+/// silently dropped.
+pub(crate) fn render_canvas_html_fallback(title: &str, html: &str) -> (&'static str, String) {
+    let doc = CanvasDoc::from_html(title.to_owned(), html);
+    if !doc.blocks.is_empty() {
+        ("markdown", doc.to_markdown())
+    } else if html.trim().is_empty() {
+        ("markdown", String::new())
+    } else {
+        ("html", html.to_owned())
+    }
 }
 
 pub(crate) fn format_canvas_read(
@@ -112,7 +128,10 @@ pub async fn run_canvas_read(
             }
             Err(err) if should_fallback_canvas_html(&err) => {
                 match session.api.fetch_canvas_html(file_id).await {
-                    Ok((t, h)) => ("html", t, h),
+                    Ok((t, h)) => {
+                        let (fmt, rendered) = render_canvas_html_fallback(&t, &h);
+                        (fmt, t, rendered)
+                    }
                     Err(fallback_err) => return Ok(canvas_api_fail(ctx, &fallback_err)),
                 }
             }
