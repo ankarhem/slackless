@@ -493,7 +493,9 @@ fn convert_inline_markdown(line: &str) -> String {
             continue;
         }
         if in_code {
-            let ch = line[i..].chars().next().unwrap();
+            let Some(ch) = line[i..].chars().next() else {
+                break;
+            };
             out.push(ch);
             i += ch.len_utf8();
             continue;
@@ -531,7 +533,9 @@ fn convert_inline_markdown(line: &str) -> String {
             i += 2;
             continue;
         }
-        let ch = line[i..].chars().next().unwrap();
+        let Some(ch) = line[i..].chars().next() else {
+            break;
+        };
         out.push(ch);
         i += ch.len_utf8();
     }

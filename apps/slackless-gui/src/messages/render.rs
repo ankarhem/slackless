@@ -531,9 +531,11 @@ pub(super) fn render_segments(segments: Vec<Segment>, theme: &RunTheme) -> Div {
                 } else {
                     trim_breaks(&mut text, &mut runs, &mut links)
                 };
-                let blocks = paragraph_break_split(&text, &runs, &links);
-                if single && blocks.len() == 1 {
-                    let (text, runs, links) = blocks.into_iter().next().unwrap();
+                let mut blocks = paragraph_break_split(&text, &runs, &links);
+                if single
+                    && blocks.len() == 1
+                    && let Some((text, runs, links)) = blocks.pop()
+                {
                     return div().w_full().min_w_0().child(text_element(
                         text, runs, links, n, theme, order_base, &routed,
                     ));

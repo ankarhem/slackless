@@ -1,5 +1,7 @@
 //! End-to-end client tests against a local mock server. Never touches the real Slack network.
 
+#![allow(clippy::unwrap_used)]
+
 use futures::TryStreamExt;
 use serde_json::json;
 use slackless_api::types::{Block, ChannelId, MessageSubtype, SectionKind, Ts, UserId};

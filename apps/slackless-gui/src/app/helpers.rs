@@ -425,7 +425,9 @@ pub(super) fn convert_emoticons(text: &str) -> String {
                 continue;
             }
         }
-        let ch = rest.chars().next().unwrap();
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
         out.push(ch);
         rest = &rest[ch.len_utf8()..];
     }

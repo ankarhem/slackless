@@ -1027,14 +1027,10 @@ impl App {
                 .text_color(muted)
                 .child(format!("Could not load Home tab: {err}"))
                 .into_any_element(),
-            Some(Ok(home)) if !home.home_tab_enabled || home.home_view.is_none() => div()
-                .py_8()
-                .text_sm()
-                .text_color(muted)
-                .child(format!("{app_name} has not published a Home tab."))
-                .into_any_element(),
-            Some(Ok(home)) => {
-                let view = home.home_view.as_ref().expect("checked above");
+            Some(Ok(home))
+                if home.home_tab_enabled
+                    && let Some(view) = home.home_view.as_ref() =>
+            {
                 let view_id = view["id"].as_str().unwrap_or_default().to_owned();
                 let app_id = view["app_id"].as_str().unwrap_or_default().to_owned();
                 let bot_id = view["bot_id"]
@@ -1100,6 +1096,12 @@ impl App {
                     crate::blockkit::render_raw_blocks(&raw_blocks, &kcx, cx).into_any_element()
                 }
             }
+            Some(Ok(_)) => div()
+                .py_8()
+                .text_sm()
+                .text_color(muted)
+                .child(format!("{app_name} has not published a Home tab."))
+                .into_any_element(),
         };
 
         div()

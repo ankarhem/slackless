@@ -408,8 +408,7 @@ pub(crate) fn section_menu(
     // A user-created section's manage items: inline under their label in the ⋮ menu, in
     // the right-click menu's "Manage section" submenu, as in Slack. Other channel sections
     // carry only the section settings.
-    if custom {
-        let section = input.section.clone().expect("custom sections are stored");
+    if custom && let Some(section) = input.section.clone() {
         if more {
             menu = manage_section(
                 menu.separator().label("Manage section"),

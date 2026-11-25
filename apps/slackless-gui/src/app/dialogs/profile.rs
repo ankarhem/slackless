@@ -378,19 +378,14 @@ impl App {
         user: &UserId,
         cx: &mut Context<Self>,
     ) {
-        if !self
-            .profile_hover
-            .trigger
-            .as_ref()
-            .is_some_and(|trigger| trigger.key == *key && trigger.user == *user)
-        {
-            return; // the pointer moved on (or left) before the dwell ended
-        }
-        let trigger = self
+        let Some(trigger) = self
             .profile_hover
             .trigger
             .clone()
-            .expect("the guard above matched the trigger");
+            .filter(|trigger| trigger.key == *key && trigger.user == *user)
+        else {
+            return; // the pointer moved on (or left) before the dwell ended
+        };
         self.profile_hover.card = Some(trigger);
         self.profile_hover.grace = None;
         cx.notify();

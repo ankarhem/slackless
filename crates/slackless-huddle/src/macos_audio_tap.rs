@@ -396,7 +396,7 @@ impl SystemAudioTap {
 
             let agg_uid_str =
                 std::ffi::CString::new(format!("dev.slackless.tap.{}", std::process::id()))
-                    .unwrap_or_else(|_| std::ffi::CString::new("dev.slackless.tap").unwrap());
+                    .unwrap_or_else(|_| c"dev.slackless.tap".to_owned());
             let v_agg_uid = cf_str(&agg_uid_str);
             let v_agg_name = cf_str(c"Slackless System Audio Tap");
 

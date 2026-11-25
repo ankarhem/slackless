@@ -654,7 +654,7 @@ impl Fixtures {
     ) -> Message {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before 1970");
+            .unwrap_or_default();
         Message {
             ts: Ts::new(format!("{}.{:06}", now.as_secs(), now.subsec_micros())),
             thread_ts,

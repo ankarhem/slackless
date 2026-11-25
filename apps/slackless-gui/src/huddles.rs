@@ -496,29 +496,33 @@ impl HuddlesView {
                             .text_xs()
                             .text_color(muted)
                             .when(!meta.is_empty(), |row| row.child(meta))
-                            .when(huddle.reply_count > 0 && thread_target.is_some(), |row| {
-                                let (ch, ts) = thread_target.clone().unwrap();
-                                let replies_text = if huddle.reply_count == 1 {
-                                    "1 reply".to_owned()
-                                } else {
-                                    format!("{} replies", huddle.reply_count)
-                                };
-                                row.child("·").child(
-                                    div()
-                                        .id(("huddle-row-replies", ix))
-                                        .text_color(link)
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .hover(|el| el.underline())
-                                        .child(replies_text)
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.stop_propagation();
-                                            cx.emit(HuddlesEvent::OpenThread(
-                                                ch.clone(),
-                                                ts.clone(),
-                                            ));
-                                        })),
-                                )
-                            }),
+                            .when_some(
+                                (huddle.reply_count > 0)
+                                    .then(|| thread_target.clone())
+                                    .flatten(),
+                                |row, (ch, ts)| {
+                                    let replies_text = if huddle.reply_count == 1 {
+                                        "1 reply".to_owned()
+                                    } else {
+                                        format!("{} replies", huddle.reply_count)
+                                    };
+                                    row.child("·").child(
+                                        div()
+                                            .id(("huddle-row-replies", ix))
+                                            .text_color(link)
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .hover(|el| el.underline())
+                                            .child(replies_text)
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.stop_propagation();
+                                                cx.emit(HuddlesEvent::OpenThread(
+                                                    ch.clone(),
+                                                    ts.clone(),
+                                                ));
+                                            })),
+                                    )
+                                },
+                            ),
                     ),
             )
             .when(!visible_avatars.is_empty(), |row| {
