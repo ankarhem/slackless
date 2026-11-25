@@ -520,7 +520,7 @@ impl Render for Composer {
             .key_context("Composer")
             .relative()
             .w_full()
-            .when(!self.edit_mode, |el| el.px_4())
+            .when(!self.edit_mode, |el| el.px_4().pt_2())
             .capture_action(cx.listener(Self::on_enter))
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))

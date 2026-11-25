@@ -1347,6 +1347,7 @@ impl Render for ThreadPanel {
             .flex_1()
             .min_h_0()
             .gap_1()
+            .pb_1()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .children(rows);

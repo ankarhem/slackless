@@ -127,7 +127,6 @@ impl Preferences {
     }
 
     pub(super) fn messages(&mut self, cx: &mut Context<Self>) -> Div {
-        let density = self.radios("msg-density", &DENSITY, |s| &mut s.density, cx);
         let names = self.radios("msg-names", &NAMES, |s| &mut s.names, cx);
         let clock24 = self.checkbox(
             "msg-clock-24h",
@@ -239,7 +238,6 @@ impl Preferences {
             )
         });
         v_flex()
-            .child(self.group("Message theme", None, density, cx))
             .child(
                 self.group(
                     "One-click reactions",

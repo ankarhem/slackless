@@ -72,8 +72,18 @@ pub use time::set_timezone_override;
 #[cfg(test)]
 mod tests;
 
-/// Avatar chip size in px.
+/// Avatar chip size in px (Clean density).
 const AVATAR_SIZE: f32 = 36.;
+/// Avatar chip size in px (Compact density).
+const COMPACT_AVATAR_SIZE: f32 = 28.;
+
+pub(super) fn message_avatar_size(compact: bool) -> f32 {
+    if compact {
+        COMPACT_AVATAR_SIZE
+    } else {
+        AVATAR_SIZE
+    }
+}
 /// How far Slack sets a message's avatar below the top of its header line (px): the avatar's
 /// top sits a few px above the name's capitals, 8px into the row (measured, channel and
 /// thread alike).
@@ -1520,6 +1530,11 @@ impl Render for MessageList {
         let scroller = self.scroller.clone();
         let now = CivilTime::now();
         let background = cx.theme().background;
+        let row_gap = if crate::preferences::display_prefs(cx).compact {
+            0.
+        } else {
+            ROW_GAP
+        };
 
         MessageScroller::new("message-list", scroller, move |ix, window, cx| {
             // Block Kit text inputs need a window-created textarea before the row renders.
@@ -1544,7 +1559,7 @@ impl Render for MessageList {
         .jump_button(true)
         .with_row_style(
             StyleRefinement::default()
-                .pb(px(ROW_GAP))
+                .pb(px(row_gap))
                 .pl(px(GUTTER))
                 .pr(px(GUTTER)),
         )

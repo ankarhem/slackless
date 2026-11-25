@@ -261,6 +261,7 @@ impl Preferences {
             cx,
         );
         let font = self.select("appearance-font", &theme::FONT_LABELS, |s| &mut s.font, cx);
+        let density = self.radios("appearance-density", &DENSITY, |s| &mut s.density, cx);
         let skin = self.radios("appearance-skin", &SKIN_TONES, |s| &mut s.skin_tone, cx);
         let jumbo = self.checkbox(
             "appearance-jumbo",
@@ -278,6 +279,7 @@ impl Preferences {
         v_flex()
             .child(self.group("Font", None, font, cx))
             .child(self.group("Color Mode", Some("Choose if Slack's appearance should be light or dark, or follow your computer's settings."), modes, cx))
+            .child(self.group("Density", Some("Adjust control and message spacing across the app."), density, cx))
             .child(self.group(
                 "Slack themes",
                 Some("Single-color themes that tint your sidebar, chrome, and highlights."),

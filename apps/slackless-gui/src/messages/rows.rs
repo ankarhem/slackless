@@ -85,6 +85,8 @@ pub(super) fn transcript_row(
     };
 
     let prefs = crate::preferences::display_prefs(cx);
+    let avatar_size = message_avatar_size(prefs.compact);
+    let row_gap_x = if prefs.compact { px(8.) } else { px(12.) };
     let author = author_name_with(message, fixtures, prefs.display_names_only);
     let stamp = format_clock_with(&message.ts, prefs.clock_24h);
     let deleted_ghost = is_deleted_ghost(message);
@@ -102,7 +104,6 @@ pub(super) fn transcript_row(
         );
         let toggle_list = this.clone();
         let toggle_ts = message.ts.clone();
-        let gutter_w = if prefs.compact { 52. } else { AVATAR_SIZE };
         let collapsed = h_flex()
             .id(SharedString::from(format!(
                 "deleted-collapsed-{}",
@@ -111,16 +112,16 @@ pub(super) fn transcript_row(
             .group("deleted-row")
             .min_w_0()
             .items_center()
-            .gap_3()
+            .gap(row_gap_x)
             .ml(px(-GUTTER))
             .mr(px(-GUTTER))
             .px(px(GUTTER))
-            .py_1()
+            .py(px(if prefs.compact { 2. } else { 4. }))
             .cursor_pointer()
             .hover(move |el| el.bg(hover_bg))
             .child(
                 div()
-                    .w(px(gutter_w))
+                    .w(px(avatar_size))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -157,7 +158,11 @@ pub(super) fn transcript_row(
         return row.child(collapsed);
     }
 
-    let mut body = v_flex().flex_1().min_w_0().gap_0p5().text_sm();
+    let mut body = v_flex()
+        .flex_1()
+        .min_w_0()
+        .gap(px(if prefs.compact { 0. } else { 2. }))
+        .text_sm();
     if !grouped && !editing {
         let mut header = message_header(
             message,
@@ -296,25 +301,8 @@ pub(super) fn transcript_row(
         }
     }
 
-    let grouped_hover_stamp = (!prefs.compact && grouped && !editing).then(|| stamp.clone());
-    let static_gutter = if prefs.compact && !editing {
-        Some(
-            div()
-                .w(px(52.))
-                .flex_none()
-                .flex()
-                .items_start()
-                .justify_end()
-                .pt_0p5()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(stamp),
-                )
-                .into_any_element(),
-        )
-    } else if grouped && !editing {
+    let grouped_hover_stamp = (grouped && !editing).then(|| stamp.clone());
+    let static_gutter = if grouped && !editing {
         None
     } else {
         let av = avatar_gutter(
@@ -323,6 +311,7 @@ pub(super) fn transcript_row(
             &author_key,
             &author,
             &key,
+            avatar_size,
             Some(&handler),
             cx,
         );
@@ -360,7 +349,7 @@ pub(super) fn transcript_row(
         let gutter = match static_gutter {
             Some(gutter) => gutter,
             None => div()
-                .w(px(AVATAR_SIZE))
+                .w(px(avatar_size))
                 .flex_none()
                 .flex()
                 .items_start()
@@ -370,7 +359,9 @@ pub(super) fn transcript_row(
                 .group_hover("msg", |slot| slot.opacity(1.))
                 .child(
                     div()
-                        .text_xs()
+                        .whitespace_nowrap()
+                        .when(prefs.compact, |el| el.text_size(px(10.)))
+                        .when(!prefs.compact, |el| el.text_xs())
                         .text_color(cx.theme().muted_foreground)
                         .child(grouped_hover_stamp.unwrap_or_default()),
                 )
@@ -386,7 +377,7 @@ pub(super) fn transcript_row(
             .px(px(GUTTER))
             .when(editing, |card| card.py_2().bg(editing_bg))
             .when(!editing, |card| {
-                card.py_0p5()
+                card.py(px(if prefs.compact { 1. } else { 2. }))
                     .when(saved, |card| {
                         card.bg(saved_bg).child(actions::saved_banner(cx))
                     })
@@ -409,7 +400,7 @@ pub(super) fn transcript_row(
             .child(
                 h_flex()
                     .items_start()
-                    .gap_3()
+                    .gap(row_gap_x)
                     .min_w_0()
                     .child(gutter)
                     .child(body),
@@ -701,25 +692,38 @@ pub fn message_row_linked(
         None,
         cx,
     ));
+    let compact = crate::preferences::display_prefs(cx).compact;
+    let avatar_size = message_avatar_size(compact);
     let gutter = match grouped {
         // Slack's continuation gutter: the time, shown while the row is hovered.
         Some(group) => div()
-            .w(px(AVATAR_SIZE))
+            .w(px(avatar_size))
             .flex_none()
             .flex()
             .justify_center()
             .pt_0p5()
             .opacity(0.)
             .group_hover(group, |slot| slot.opacity(1.))
-            .text_xs()
+            .whitespace_nowrap()
+            .when(compact, |el| el.text_size(px(10.)))
+            .when(!compact, |el| el.text_xs())
             .text_color(cx.theme().muted_foreground)
             .child(format_clock(&message.ts))
             .into_any_element(),
-        None => avatar_gutter(fixtures, message, &author_key, &author, &key, handler, cx),
+        None => avatar_gutter(
+            fixtures,
+            message,
+            &author_key,
+            &author,
+            &key,
+            avatar_size,
+            handler,
+            cx,
+        ),
     };
     let row = h_flex()
         .items_start()
-        .gap_3()
+        .gap(if compact { px(8.) } else { px(12.) })
         .min_w_0()
         .child(gutter)
         .child(body);
@@ -785,28 +789,41 @@ pub(crate) fn editing_avatar(
 ) -> AnyElement {
     let key_id = author_key(message);
     let author = author_name(message, fixtures);
-    avatar_gutter(fixtures, message, &key_id, &author, key, None, cx)
+    let avatar_size = message_avatar_size(crate::preferences::display_prefs(cx).compact);
+    avatar_gutter(
+        fixtures,
+        message,
+        &key_id,
+        &author,
+        key,
+        avatar_size,
+        None,
+        cx,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn avatar_gutter(
     fixtures: &Fixtures,
     message: &Message,
     author_key: &str,
     author: &str,
     key: &str,
+    size: f32,
     handler: Option<&actions::ActionHandler>,
     cx: &App,
 ) -> AnyElement {
     let avatar = crate::avatars::with_external_badge(
         fixtures,
         message.user.as_ref(),
-        crate::avatars::author_avatar(fixtures, message, author_key, author, AVATAR_SIZE),
-        AVATAR_SIZE,
+        crate::avatars::author_avatar(fixtures, message, author_key, author, size),
+        size,
         cx.theme().background,
     );
+    let top = if size < AVATAR_SIZE { 3. } else { AVATAR_TOP };
     div()
         .flex_none()
-        .mt(px(AVATAR_TOP))
+        .mt(px(top))
         .child(profile_link(
             avatar,
             format!("{key}-avatar"),
@@ -1029,6 +1046,7 @@ fn membership_line(
         LinkTarget::Channel(store.channel.clone()),
         links,
     );
+    let avatar_size = message_avatar_size(crate::preferences::display_prefs(cx).compact);
     h_flex()
         .items_center()
         .gap_1()
@@ -1037,7 +1055,7 @@ fn membership_line(
         .text_color(muted)
         .child(
             div()
-                .w(px(AVATAR_SIZE))
+                .w(px(avatar_size))
                 .flex_none()
                 .flex()
                 .justify_center()
