@@ -16,7 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::field::{Field, Visit};
@@ -105,18 +105,7 @@ fn format_utc_epoch(total_secs: u64, millis: u32) -> String {
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
     let second = secs_of_day % 60;
-
-    // Howard Hinnant's civil_from_days algorithm (days since 1970-01-01).
-    let z = (total_secs / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
+    let (year, month, day) = slackless_types::time::civil_from_days((total_secs / 86_400) as i64);
 
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
@@ -185,20 +174,22 @@ impl RollingWriter {
     }
 
     fn write_line(&self, line: &str) {
-        let Ok(mut guard) = self.state.lock() else {
-            return;
-        };
+        // Recover from a poisoned mutex so panic-hook logs still reach disk.
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.written >= MAX_LOG_BYTES {
             let _ = guard.file.flush();
-            let _ = fs::rename(&self.path, backup_path(&self.path));
-            if let Ok(file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
+            let rotated = fs::rename(&self.path, backup_path(&self.path)).is_ok();
+            if (rotated || !self.path.exists())
+                && let Ok(file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
             {
                 guard.file = file;
-                guard.written = 0;
             }
+            // Reset the byte counter even if rotation/reopen failed so a persistent filesystem
+            // error cannot spin trying to rename+reopen on every subsequent log line.
+            guard.written = 0;
         }
         if guard.file.write_all(line.as_bytes()).is_ok() {
             guard.written = guard.written.saturating_add(line.len() as u64);
@@ -207,9 +198,8 @@ impl RollingWriter {
     }
 
     fn flush(&self) {
-        if let Ok(mut guard) = self.state.lock() {
-            let _ = guard.file.flush();
-        }
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = guard.file.flush();
     }
 }
 
@@ -604,5 +594,24 @@ mod tests {
         assert!(content.contains("[INFO ] slackless_test: only_field=v\n"));
         assert!(!content.contains("muted info"));
         assert!(content.contains("[WARN ] external_crate: kept warn\n"));
+    }
+
+    #[test]
+    fn rolling_writer_recovers_from_poisoned_mutex() {
+        let tmp = TempDir::new("poison");
+        let log_path = tmp.0.join("poison.log");
+        let writer = Arc::new(RollingWriter::open(log_path.clone()).unwrap());
+
+        let poison_writer = Arc::clone(&writer);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_writer.state.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(writer.state.is_poisoned());
+
+        writer.write_line("after-poison\n");
+        writer.flush();
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "after-poison\n");
     }
 }

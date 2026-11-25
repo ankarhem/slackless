@@ -32,8 +32,8 @@ const KEYCHAIN_SERVICE: &str = "slackless";
 #[cfg(target_os = "macos")]
 const SECURITY: &str = "/usr/bin/security";
 
-/// `security find-generic-password`'s exit status for a missing item.
-#[cfg(target_os = "macos")]
+/// `security find-generic-password` / `delete-generic-password` exit status for a missing item.
+#[cfg(any(test, target_os = "macos"))]
 const ITEM_NOT_FOUND: i32 = 44;
 
 /// Seam over the OS Keychain so [`SessionStore`] can be tested without touching the login Keychain.
@@ -134,16 +134,32 @@ impl SessionStore {
     }
 
     /// Replaces the stored set with `sessions`, writing atomically. On macOS the secrets go to
-    /// the Keychain and are blanked on disk.
+    /// the Keychain (skipping workspaces whose Keychain entry is already identical) and are
+    /// blanked on disk.
     pub fn save(&self, sessions: &[Session]) -> Result<()> {
+        if self.use_keychain {
+            for s in sessions {
+                if !s.has_secrets() {
+                    continue;
+                }
+                let unchanged = self
+                    .keychain
+                    .get(&s.team_id)?
+                    .is_some_and(|(xoxc, d)| xoxc == s.xoxc_token && d == s.d_cookie);
+                if !unchanged {
+                    self.keychain.set(&s.team_id, &s.xoxc_token, &s.d_cookie)?;
+                }
+            }
+        }
+        self.write_sessions_file(sessions)
+    }
+
+    fn write_sessions_file(&self, sessions: &[Session]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let on_disk: Vec<Session> = if self.use_keychain {
-            for s in sessions {
-                self.keychain.set(&s.team_id, &s.xoxc_token, &s.d_cookie)?;
-            }
             sessions
                 .iter()
                 .map(|s| Session {
@@ -208,14 +224,27 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 impl SessionStore {
-    /// Inserts or replaces the session for its `team_id`.
+    /// Inserts or replaces the session for its `team_id` without rewriting unrelated workspaces'
+    /// Keychain items.
     pub fn upsert(&self, session: Session) -> Result<()> {
         let mut sessions = self.load()?;
-        match sessions.iter_mut().find(|s| s.team_id == session.team_id) {
-            Some(existing) => *existing = session,
-            None => sessions.push(session),
+        let secrets_changed = match sessions.iter_mut().find(|s| s.team_id == session.team_id) {
+            Some(existing) => {
+                let changed = existing.xoxc_token != session.xoxc_token
+                    || existing.d_cookie != session.d_cookie;
+                *existing = session.clone();
+                changed
+            }
+            None => {
+                sessions.push(session.clone());
+                true
+            }
+        };
+        if self.use_keychain && secrets_changed && session.has_secrets() {
+            self.keychain
+                .set(&session.team_id, &session.xoxc_token, &session.d_cookie)?;
         }
-        self.save(&sessions)
+        self.write_sessions_file(&sessions)
     }
 
     /// The stored session for `team_id`, if any.
@@ -233,7 +262,7 @@ impl SessionStore {
             if self.use_keychain {
                 self.keychain.delete(team_id)?;
             }
-            self.save(&sessions)?;
+            self.write_sessions_file(&sessions)?;
         }
         Ok(removed)
     }
@@ -302,12 +331,30 @@ fn keychain_get(team_id: &TeamId) -> Result<Option<(String, String)>> {
 
 #[cfg(target_os = "macos")]
 fn keychain_delete(team_id: &TeamId) -> Result<()> {
-    // A missing item is already deleted.
-    Command::new(SECURITY)
+    let output = Command::new(SECURITY)
         .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a"])
         .arg(keychain_account(team_id)?)
         .output()?;
-    Ok(())
+    classify_delete_status(output.status.code(), &output.stderr)
+}
+
+/// Only exit 0 (deleted) and exit 44 (`ITEM_NOT_FOUND`, already absent) succeed; locked Keychain
+/// or permission errors surface as [`AuthError::Keychain`].
+#[cfg(any(test, target_os = "macos"))]
+fn classify_delete_status(code: Option<i32>, stderr: &[u8]) -> Result<()> {
+    match code {
+        Some(0) | Some(ITEM_NOT_FOUND) => Ok(()),
+        other => {
+            let detail = String::from_utf8_lossy(stderr).trim().to_owned();
+            if detail.is_empty() {
+                Err(AuthError::Keychain(format!(
+                    "delete-generic-password failed (exit {other:?})"
+                )))
+            } else {
+                Err(AuthError::Keychain(detail))
+            }
+        }
+    }
 }
 
 /// A team's Keychain account: its id, which must stay one bare word on a `security` command.
@@ -510,27 +557,75 @@ mod tests {
                 .contains("\"T2\"")
         );
 
-        // Re-enable delete: remove() deletes keychain entry before saving remaining sessions.
+        // Re-enable delete: remove() deletes keychain entry without rewriting remaining workspaces.
         mock.fail_delete
             .store(false, std::sync::atomic::Ordering::Relaxed);
         mock.ops.lock().unwrap().clear();
         assert!(store.remove(&TeamId::from("T2")).unwrap());
         let ops = mock.ops.lock().unwrap().clone();
-        let del_pos = ops
-            .iter()
-            .position(|o| o == "del:T2")
-            .expect("del:T2 recorded");
-        let set_pos = ops
-            .iter()
-            .position(|o| o == "set:T1")
-            .expect("set:T1 recorded");
-        assert!(del_pos < set_pos, "delete must precede save: {ops:?}");
+        assert!(
+            ops.iter().any(|o| o == "del:T2"),
+            "del:T2 recorded: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|o| o.starts_with("set:")),
+            "remove must not rewrite remaining workspaces' keychain entries: {ops:?}"
+        );
         assert!(!mock.entries.lock().unwrap().contains_key("T2"));
         assert!(
             !std::fs::read_to_string(store.path())
                 .unwrap()
                 .contains("\"T2\"")
         );
+    }
+
+    #[test]
+    fn save_and_upsert_skip_unchanged_keychain_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockKeychain::default());
+        let store = SessionStore::with_keychain(dir.path().join("sessions.json"), mock.clone());
+
+        let s1 = Session::new("https://a.slack.com/", "T1", "xoxc-1", "xoxd-1", "U1");
+        let s2 = Session::new("https://b.slack.com/", "T2", "xoxc-2", "xoxd-2", "U2");
+        store.save(&[s1.clone(), s2.clone()]).unwrap();
+
+        // Saving again with only T2 modified must not call `set` on T1.
+        mock.ops.lock().unwrap().clear();
+        let s2_updated = Session::new("https://b.slack.com/", "T2", "xoxc-2-new", "xoxd-2", "U2");
+        store.save(&[s1.clone(), s2_updated.clone()]).unwrap();
+        let save_ops = mock.ops.lock().unwrap().clone();
+        assert!(
+            save_ops.iter().any(|o| o == "set:T2"),
+            "changed T2 should be written: {save_ops:?}"
+        );
+        assert!(
+            !save_ops.iter().any(|o| o == "set:T1"),
+            "unchanged T1 must not be rewritten: {save_ops:?}"
+        );
+
+        // Upserting T2 with identical secrets (e.g. metadata update) writes zero keychain entries.
+        mock.ops.lock().unwrap().clear();
+        let s2_meta = Session::new("https://b.slack.com/", "T2", "xoxc-2-new", "xoxd-2", "U2B");
+        store.upsert(s2_meta).unwrap();
+        let upsert_ops = mock.ops.lock().unwrap().clone();
+        assert!(
+            !upsert_ops.iter().any(|o| o.starts_with("set:")),
+            "unchanged secrets on upsert must not rewrite keychain: {upsert_ops:?}"
+        );
+    }
+
+    #[test]
+    fn classify_delete_status_allows_zero_and_not_found_but_surfaces_errors() {
+        assert!(classify_delete_status(Some(0), b"").is_ok());
+        assert!(classify_delete_status(Some(ITEM_NOT_FOUND), b"item not found").is_ok());
+        assert!(matches!(
+            classify_delete_status(Some(36), b"User interaction is not allowed."),
+            Err(AuthError::Keychain(msg)) if msg == "User interaction is not allowed."
+        ));
+        assert!(matches!(
+            classify_delete_status(None, b""),
+            Err(AuthError::Keychain(msg)) if msg.contains("None")
+        ));
     }
 
     #[test]

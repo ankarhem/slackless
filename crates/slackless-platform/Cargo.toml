@@ -5,24 +5,27 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+slackless-types.workspace = true
 thiserror = { workspace = true }
 tracing.workspace = true
 log = { workspace = true, features = ["std"] }
+dirs = "7"
 # Deep-link parsing (slack://, https://app.slack.com/client) — pure, tested.
 url = "2.5.9"
 percent-encoding = "2.3.2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
-# Dock badge, app icon + bundle Info.plist URL types. GPUI has no dock-tile API
-# (gpui-kit guide §14), so the badge and icon go through objc2.
+# Dock badge, app icon, status item, spellchecker. GPUI has no dock-tile API
+# (gpui-kit guide §14), so these go through objc2.
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSButton", "NSControl", "NSDockTile", "NSEvent", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSSound", "NSSpellChecker", "NSStatusBar", "NSStatusBarButton", "NSStatusItem"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSBundle", "NSData", "NSDictionary", "NSDistributedNotificationCenter", "NSEnumerator", "NSGeometry", "NSNotification", "NSOperation", "NSRange", "NSString", "NSUserDefaults", "NSValue", "block2"] }
 block2 = "0.6.2"
-# Main-queue hop for badge calls made off the main thread.
+# Main-queue hop for AppKit calls made off the main thread.
 dispatch2 = "0.3.1"
-# Keychain generic passwords.
-security-framework = "3.7.0"
 
 [lints]
 workspace = true

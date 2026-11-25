@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::de::null_default;
+use crate::de::{is_false, null_default};
 use crate::ids::{ChannelId, FileId, TeamId, Ts, UserId, UsergroupId};
 use crate::macros::{string_enum, tagged_enum};
 
@@ -169,10 +169,6 @@ pub struct TextStyle {
     pub client_highlight: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub unlink: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

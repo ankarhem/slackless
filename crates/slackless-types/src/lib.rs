@@ -5,19 +5,21 @@
 //! (`blocks`, rich text elements, websocket events) carries an `Unknown { r#type, raw }` variant,
 //! so new Slack data never fails a parse. URLs and method names live in [`endpoints`].
 
-mod de;
 mod macros;
 
 pub mod conversation;
+pub mod de;
 pub mod endpoints;
 pub mod event;
 pub mod file;
 pub mod ids;
 pub mod message;
+pub mod net;
 pub mod reaction;
 pub mod response;
 pub mod rich_text;
 pub mod section;
+pub mod time;
 pub mod user;
 
 pub use conversation::{

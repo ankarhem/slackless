@@ -1,5 +1,7 @@
 //! The persisted session record.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use slackless_types::{TeamId, UserId};
 
@@ -9,7 +11,7 @@ use slackless_types::{TeamId, UserId};
 /// `xoxc` token and the `d` cookie, plus the identifiers needed to route API calls and show
 /// which account/workspace it is. Everything else is re-derivable from `auth.test` /
 /// `client.userBoot`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     /// Workspace URL, e.g. `https://acme.slack.com/`. The API base is this plus `api/`.
     pub workspace_url: String,
@@ -58,9 +60,37 @@ impl Session {
     }
 }
 
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("workspace_url", &self.workspace_url)
+            .field("team_id", &self.team_id)
+            .field("xoxc_token", &"[REDACTED]")
+            .field("d_cookie", &"[REDACTED]")
+            .field("user_id", &self.user_id)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let s = Session::new(
+            "https://acme.slack.com/",
+            "T1",
+            "xoxc-super-secret-token",
+            "xoxd-super-secret-cookie",
+            "U1",
+        );
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+        assert!(dbg.contains("T1"), "{dbg}");
+        assert!(!dbg.contains("xoxc-super-secret-token"), "{dbg}");
+        assert!(!dbg.contains("xoxd-super-secret-cookie"), "{dbg}");
+    }
 
     #[test]
     fn api_base_is_workspace_url_plus_api() {

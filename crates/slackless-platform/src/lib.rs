@@ -1,6 +1,7 @@
 //! OS integration behind traits; macOS first (ARCHITECTURE: slackless-platform).
 //!
-//! One trait per OS capability, selected at compile time through [`current`]:
+//! One trait per OS capability, composed under [`DesktopPlatform`] and selected at compile time
+//! through [`current`]:
 //!
 //! | trait | capability | macOS backend |
 //! |---|---|---|
@@ -10,14 +11,14 @@
 //! | [`AboutPanel`] | the app's About window | `NSApplication.orderFrontStandardAboutPanel` |
 //! | [`FullScreenItem`] | the menu bar's full-screen item | `NSFullScreenMenuItemEverywhere` registered off |
 //! | [`SoundPlayer`] | play a sound (notification sounds) | `NSSound` from the sound's bytes |
-//! | [`SecretStore`] | named secrets | Keychain generic passwords via `security-framework` |
-//! | [`DeepLinkHandler`] | `slack://` and `https://app.slack.com/client` links | bundle `Info.plist` scheme check + the pure [`DeepLink`] parser |
 //! | [`StatusBarItem`] | macOS menu-bar status item & quick menu | `NSStatusBar` / `NSStatusItem` / `NSMenu` via `objc2` |
+//! | [`AttentionRequester`] | dock / taskbar user attention bounce | `NSApplication.requestUserAttention` |
+//! | [`SpellChecker`] | native OS spellchecker | `NSSpellChecker.sharedSpellChecker` |
 //!
-//! Other platforms get a compiling, non-OS fallback backend so the crate
-//! builds everywhere; its `SecretStore` is in-process memory, its notifier,
-//! badge setter, icon setter, About panel, full-screen item, sound player and
-//! status-bar item are no-ops.
+//! Other platforms get a compiling, non-OS fallback backend whose capabilities are no-ops.
+//! Deep-link parsing lives in the pure [`parse_deep_link`] / [`DeepLink`] module.
+
+use std::path::PathBuf;
 
 mod deep_link;
 mod fallback;
@@ -27,6 +28,32 @@ mod macos;
 
 pub use deep_link::{DeepLink, SlackLink, SlackLinkKind, WebClientLink, parse_deep_link};
 pub use logging::{default_log_path, init_file_logging};
+
+/// Application data directory (`~/Library/Application Support/slackless` on macOS,
+/// `$XDG_DATA_HOME/slackless` or `~/.local/share/slackless` on Linux,
+/// `%APPDATA%\slackless` on Windows).
+pub fn app_data_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|dir| dir.join("slackless"))
+}
+
+/// Application cache directory (`~/Library/Caches/slackless` on macOS,
+/// `$XDG_CACHE_HOME/slackless` or `~/.cache/slackless` on Linux,
+/// `%LOCALAPPDATA%\slackless` on Windows).
+pub fn app_cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("slackless"))
+}
+
+/// Application configuration directory (`~/Library/Application Support/slackless` on macOS,
+/// `$XDG_CONFIG_HOME/slackless` or `~/.config/slackless` on Linux,
+/// `%APPDATA%\slackless` on Windows).
+pub fn app_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("slackless"))
+}
+
+/// Durable SQLite archive path for one workspace (`<app_data_dir>/<team_id>.sqlite`).
+pub fn archive_store_path(team_id: impl AsRef<str>) -> Option<PathBuf> {
+    app_data_dir().map(|dir| dir.join(format!("{}.sqlite", team_id.as_ref())))
+}
 
 /// Direction of a hardware mouse Back/Forward navigation gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,73 +110,77 @@ mod unix_termination {
     use std::sync::Once;
     use std::sync::atomic::{AtomicI32, Ordering};
 
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-    const F_GETFL: i32 = 3;
-    const F_SETFL: i32 = 4;
-    #[cfg(target_os = "macos")]
-    const O_NONBLOCK: i32 = 0x0004;
-    #[cfg(not(target_os = "macos"))]
-    const O_NONBLOCK: i32 = 0x0800;
-
-    type SigHandler = extern "C" fn(i32);
-
-    unsafe extern "C" {
-        fn pipe(fds: *mut i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
-        fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
-        fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
-        fn signal(sig: i32, handler: usize) -> usize;
-    }
-
     static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
     static INSTALL_ONCE: Once = Once::new();
 
-    extern "C" fn handle_signal(sig: i32) {
-        // Restore default handler immediately so a second SIGTERM/SIGINT force-terminates cleanly.
-        unsafe {
-            signal(sig, 0);
-        }
+    extern "C" fn handle_signal(sig: libc::c_int) {
+        // Async-signal-safe self-pipe write only; SA_RESETHAND already restores SIG_DFL
+        // so a second SIGTERM/SIGINT terminates cleanly.
         let fd = WRITE_FD.load(Ordering::Relaxed);
         if fd >= 0 {
             let byte: u8 = sig as u8;
+            // SAFETY: `write` is async-signal-safe, `fd` is a valid non-blocking pipe write end,
+            // and `&byte` points to 1 readable byte on the stack.
             unsafe {
-                let _ = write(fd, (&byte as *const u8).cast::<std::ffi::c_void>(), 1);
+                let _ = libc::write(fd, (&raw const byte).cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+
+    fn set_cloexec(fd: libc::c_int) {
+        // SAFETY: `fcntl(F_GETFD / F_SETFD)` on a freshly created pipe descriptor.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+
+    fn set_nonblock(fd: libc::c_int) {
+        // SAFETY: `fcntl(F_GETFL / F_SETFL)` on a freshly created pipe descriptor.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
         }
     }
 
     pub(crate) fn install(on_terminate: impl Fn() + Send + Sync + 'static) {
         INSTALL_ONCE.call_once(|| {
-            let mut fds = [-1i32; 2];
-            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+            let mut fds = [-1 as libc::c_int; 2];
+            // SAFETY: `fds` is a valid 2-element array for `pipe`.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                 return;
             }
             let read_fd = fds[0];
             let write_fd = fds[1];
-            unsafe {
-                let flags = fcntl(write_fd, F_GETFL);
-                if flags >= 0 {
-                    let _ = fcntl(write_fd, F_SETFL, flags | O_NONBLOCK);
-                }
-            }
+            set_cloexec(read_fd);
+            set_cloexec(write_fd);
+            set_nonblock(write_fd);
+
             WRITE_FD.store(write_fd, Ordering::Release);
-            let handler = handle_signal as SigHandler as usize;
+
+            // SAFETY: `sigaction` is a C POD struct zero-initialized before setting fields;
+            // `handle_signal` has the required `extern "C" fn(c_int)` ABI.
             unsafe {
-                signal(SIGTERM, handler);
-                signal(SIGINT, handler);
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = handle_signal as *const () as libc::sighandler_t;
+                sa.sa_flags = libc::SA_RESETHAND;
+                libc::sigemptyset(&raw mut sa.sa_mask);
+                libc::sigaction(libc::SIGTERM, &raw const sa, std::ptr::null_mut());
+                libc::sigaction(libc::SIGINT, &raw const sa, std::ptr::null_mut());
             }
-            let _ = std::thread::Builder::new()
+
+            let spawned = std::thread::Builder::new()
                 .name("slackless-signal".into())
                 .spawn(move || {
                     let mut buf = [0u8; 8];
                     loop {
+                        // SAFETY: `read_fd` is owned by this thread and `buf` is valid for writes.
                         let n = unsafe {
-                            read(
-                                read_fd,
-                                buf.as_mut_ptr().cast::<std::ffi::c_void>(),
-                                buf.len(),
-                            )
+                            libc::read(read_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
                         };
                         if n > 0 {
                             on_terminate();
@@ -158,8 +189,24 @@ mod unix_termination {
                         if n == 0 {
                             break;
                         }
+                        if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        break;
+                    }
+                    // SAFETY: `read_fd` is exclusively owned by this thread and no longer needed.
+                    unsafe {
+                        libc::close(read_fd);
                     }
                 });
+            if spawned.is_err() {
+                WRITE_FD.store(-1, Ordering::Release);
+                // SAFETY: thread failed to spawn so nobody else holds either pipe end.
+                unsafe {
+                    libc::close(read_fd);
+                    libc::close(write_fd);
+                }
+            }
         });
     }
 }
@@ -167,18 +214,12 @@ mod unix_termination {
 /// Error surfaced by the fallible platform capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlatformError {
-    /// The requested secret does not exist (load/delete on a fresh name).
-    #[error("no secret `{name}` under service `{service}`")]
-    SecretNotFound { service: String, name: String },
-    /// The OS secret store rejected the operation (macOS: Keychain status).
-    #[error("OS secret store error: {0}")]
-    SecretStore(String),
     /// The input is not a URL this crate handles.
     #[error("not a recognized deep link: {0}")]
     BadLink(String),
 }
 
-/// Result alias for the platform traits.
+/// Result alias for the platform crate.
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
 /// Post a system notification (title + body).
@@ -203,20 +244,18 @@ pub trait BadgeSetter {
     fn set_badge(&self, label: Option<&str>);
 }
 
-/// Set the app's dock/taskbar icon from PNG bytes. Call it on the main thread.
+/// Set the app's dock/taskbar icon from PNG bytes.
 ///
-/// macOS: `NSApplication.setApplicationIconImage`. Unbundled runs have no
-/// bundle icon, so this is where they get one; a bundle's icon is replaced
-/// the same way while the app runs.
+/// macOS: `NSApplication.setApplicationIconImage` (dispatched to the main queue when called off
+/// the main thread). Unbundled runs have no bundle icon, so this is where they get one.
 pub trait IconSetter {
     fn set_icon(&self, png: &[u8]);
 }
 
-/// Show the system About window: the app's icon, name and version. Call it on the
-/// main thread.
+/// Show the system About window: the app's icon, name and version.
 ///
-/// macOS: `NSApplication.orderFrontStandardAboutPanel`, which reads the name and
-/// version from the app's Info.plist (embedded in the binary for unbundled runs).
+/// macOS: `NSApplication.orderFrontStandardAboutPanel` (dispatched to the main queue when called
+/// off the main thread), reading name and version from the app's Info.plist.
 pub trait AboutPanel {
     fn show_about(&self);
 }
@@ -234,49 +273,6 @@ pub trait FullScreenItem {
 /// the main thread.
 pub trait SoundPlayer {
     fn play_sound(&self, data: &[u8]);
-}
-
-/// Store, load, and delete a named secret (macOS: Keychain generic password).
-///
-/// Secrets are addressed by a `service` (the app/workspace scope) plus a
-/// `name` (e.g. `"workspace:T0123"`), so several secrets can coexist.
-pub trait SecretStore {
-    /// Create or update the secret `name` under `service`.
-    fn store_secret(&self, service: &str, name: &str, secret: &[u8]) -> Result<()>;
-
-    /// Read the secret `name` under `service`.
-    ///
-    /// A missing entry is [`PlatformError::SecretNotFound`], never a panic.
-    fn load_secret(&self, service: &str, name: &str) -> Result<Vec<u8>>;
-
-    /// Remove the secret `name` under `service`.
-    ///
-    /// Deleting an absent secret is not an error (idempotent).
-    fn delete_secret(&self, service: &str, name: &str) -> Result<()>;
-}
-
-/// Register the app for deep links and surface parsed ones.
-///
-/// Two entry points are modeled (ARCHITECTURE: slackless-platform):
-/// `slack://…` (Slack app links) and `https://app.slack.com/client/…`
-/// (web-client links). Parsing is pure — see [`DeepLink`] — so front-ends can
-/// work with it directly; this trait covers OS registration and hand-off.
-pub trait DeepLinkHandler {
-    /// Register/verify deep-link support and return the URL schemes the OS
-    /// can already deliver to this app.
-    ///
-    /// macOS: reads the running bundle's `Info.plist` (`CFBundleURLTypes`).
-    /// An empty list means the bundle does not declare `slack` yet — typical
-    /// for unbundled `cargo run` dev builds — and the scheme must be added to
-    /// the app bundle before macOS will hand over `slack://` links.
-    fn register(&self) -> Result<Vec<String>>;
-
-    /// Parse a URL handed over by the OS/front-end and remember it as the
-    /// latest pending link. Returns the parsed [`DeepLink`].
-    fn handle_url(&self, url: &str) -> Result<DeepLink>;
-
-    /// Take the most recently handled link, if any (clears it).
-    fn take_link(&self) -> Option<DeepLink>;
 }
 
 /// User actions triggered from the OS menu-bar / tray status item (`F-SHELL-168`).
@@ -347,6 +343,42 @@ pub trait SpellChecker {
     fn learn_word(&self, word: &str);
 }
 
+/// Cohesive desktop OS integration supertrait combining every platform capability.
+///
+/// Front-ends can accept `impl DesktopPlatform` or `dyn DesktopPlatform` instead of listing
+/// individual capability bounds.
+pub trait DesktopPlatform:
+    Notifier
+    + BadgeSetter
+    + IconSetter
+    + AboutPanel
+    + FullScreenItem
+    + SoundPlayer
+    + StatusBarItem
+    + AttentionRequester
+    + SpellChecker
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<T> DesktopPlatform for T where
+    T: Notifier
+        + BadgeSetter
+        + IconSetter
+        + AboutPanel
+        + FullScreenItem
+        + SoundPlayer
+        + StatusBarItem
+        + AttentionRequester
+        + SpellChecker
+        + Send
+        + Sync
+        + 'static
+{
+}
+
 #[cfg(target_os = "macos")]
 type Platform = macos::MacPlatform;
 #[cfg(not(target_os = "macos"))]
@@ -357,39 +389,13 @@ type Platform = fallback::FallbackPlatform;
 /// Cheap to construct and `Send + Sync`; construct it once and share it.
 /// Nothing touches AppKit until a capability actually needs it, so this is
 /// safe on headless threads too.
-pub fn current() -> impl Notifier
-+ BadgeSetter
-+ IconSetter
-+ AboutPanel
-+ FullScreenItem
-+ SoundPlayer
-+ SecretStore
-+ DeepLinkHandler
-+ StatusBarItem
-+ AttentionRequester
-+ SpellChecker
-+ Send
-+ Sync
-+ 'static {
+pub fn current() -> impl DesktopPlatform {
     Platform::new()
 }
 
 /// An in-memory, no-op platform backend that never touches OS APIs (notifications, dock badges,
-/// AppKit, or Keychain). Intended for headless tests on all operating systems.
-pub fn noop() -> impl Notifier
-+ BadgeSetter
-+ IconSetter
-+ AboutPanel
-+ FullScreenItem
-+ SoundPlayer
-+ SecretStore
-+ DeepLinkHandler
-+ StatusBarItem
-+ AttentionRequester
-+ SpellChecker
-+ Send
-+ Sync
-+ 'static {
+/// or AppKit). Intended for headless tests on all operating systems.
+pub fn noop() -> impl DesktopPlatform {
     fallback::FallbackPlatform::new()
 }
 
@@ -397,86 +403,57 @@ pub fn noop() -> impl Notifier
 mod tests {
     use super::*;
 
-    /// `current()` must construct on every platform and the always-safe
-    /// capability calls must not panic (this path touches no OS API; `notify`
-    /// is left out because unbundled macOS runs post a real notification).
+    /// `current()` and `noop()` must construct on every platform, satisfy `DesktopPlatform`
+    /// (including object safety), and allow safe headless calls without panicking.
     #[test]
-    fn current_is_constructible_and_safe_to_call() {
-        let platform = current();
-        assert_eq!(platform.take_link(), None);
+    fn current_and_noop_satisfy_desktop_platform() {
+        let platform: Box<dyn DesktopPlatform> = Box::new(current());
         assert_eq!(platform.take_status_bar_action(), None);
+
+        let noop_platform: Box<dyn DesktopPlatform> = Box::new(noop());
+        assert_eq!(noop_platform.take_status_bar_action(), None);
+        assert!(noop_platform.check_spelling("helo", None).is_empty());
     }
 
-    /// Keychain round-trip: store → load → delete → gone.
-    ///
-    /// Ignored because headless CI has no keychain access; run it locally
-    /// with `cargo test -p slackless-platform -- --ignored`.
     #[test]
-    #[ignore = "requires macOS keychain access (CI/headless has none)"]
-    fn keychain_roundtrip() {
-        let platform = current();
-        let service = "slackless-platform-test";
-        let name = "roundtrip";
-        let secret = b"xoxd-roundtrip-payload".to_vec();
+    fn app_directories_and_archive_store_path_are_consistent() {
+        let data = app_data_dir().expect("data dir");
+        let cache = app_cache_dir().expect("cache dir");
+        let config = app_config_dir().expect("config dir");
 
-        // Start from a known state.
-        let _ = platform.delete_secret(service, name);
-        platform
-            .store_secret(service, name, &secret)
-            .expect("store");
-        assert_eq!(platform.load_secret(service, name).expect("load"), secret);
-
-        platform.delete_secret(service, name).expect("delete");
+        assert_eq!(data.file_name().and_then(|s| s.to_str()), Some("slackless"));
         assert_eq!(
-            platform.load_secret(service, name).unwrap_err(),
-            PlatformError::SecretNotFound {
-                service: service.to_string(),
-                name: name.to_string(),
-            }
+            cache.file_name().and_then(|s| s.to_str()),
+            Some("slackless")
         );
-    }
-
-    /// Deep-link hand-off through the `current()` selector itself; this path
-    /// is pure (parser + in-process state), so it runs everywhere.
-    #[test]
-    fn deep_link_roundtrip_through_current() {
-        let platform = current();
-        let url = "https://app.slack.com/client/T0123ABC/C0456DEF";
-        let link = platform.handle_url(url).expect("web client link parses");
         assert_eq!(
-            link,
-            DeepLink::WebClient(WebClientLink {
-                team_id: Some("T0123ABC".into()),
-                channel_id: Some("C0456DEF".into()),
-                thread_ts: None,
-                raw: url.into(),
-            })
+            config.file_name().and_then(|s| s.to_str()),
+            Some("slackless")
         );
-        assert_eq!(platform.take_link(), Some(link));
-        assert_eq!(platform.take_link(), None);
 
-        assert!(platform.handle_url("this is not a url").is_err());
-    }
-
-    /// The fallback secret store keeps its in-process contract exercised on
-    /// platforms without a real keychain backend.
-    #[cfg(all(test, not(target_os = "macos")))]
-    mod fallback_store {
-        use super::*;
-
-        #[test]
-        fn in_memory_secret_roundtrip() {
-            let platform = current();
-            platform.store_secret("svc", "name", b"shh").expect("store");
-            assert_eq!(platform.load_secret("svc", "name").expect("load"), b"shh");
-            platform.delete_secret("svc", "name").expect("delete");
-            assert_eq!(
-                platform.load_secret("svc", "name").unwrap_err(),
-                PlatformError::SecretNotFound {
-                    service: "svc".into(),
-                    name: "name".into(),
-                }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                data.ends_with("Library/Application Support/slackless"),
+                "unexpected macOS data dir: {data:?}"
+            );
+            assert!(
+                config.ends_with("Library/Application Support/slackless"),
+                "unexpected macOS config dir: {config:?}"
+            );
+            assert!(
+                cache.ends_with("Library/Caches/slackless"),
+                "unexpected macOS cache dir: {cache:?}"
             );
         }
+
+        let archive = archive_store_path("T0123ABC").expect("archive path");
+        assert_eq!(archive, data.join("T0123ABC.sqlite"));
+
+        let team_id = slackless_types::TeamId::from("T9999XYZ");
+        assert_eq!(
+            archive_store_path(&team_id).expect("archive path for TeamId"),
+            data.join("T9999XYZ.sqlite")
+        );
     }
 }

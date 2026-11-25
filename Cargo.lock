@@ -9669,6 +9669,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "wiremock",
  "wry",
 ]
@@ -9771,13 +9772,15 @@ name = "slackless-platform"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
+ "dirs 7.0.0",
  "dispatch2",
+ "libc",
  "log",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "percent-encoding",
- "security-framework",
+ "slackless-types",
  "thiserror 2.0.21",
  "tracing",
  "url",
@@ -9818,6 +9821,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "url",
 ]
 
 [[package]]

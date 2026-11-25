@@ -1,57 +1,72 @@
-//! macOS backend: dock badge, app icon and About panel via AppKit (`objc2`), secrets via the Keychain
-//! (`security-framework`), deep-link schemes read from the bundle's
-//! `Info.plist`. Notifications: bundled builds leave them to GPUI's
-//! `SystemNotification` (`UNUserNotificationCenter`); unbundled dev builds,
-//! where that center refuses to start, post through Notification Center via
-//! `osascript` (see [`Notifier`]).
+//! macOS backend: dock badge, app icon, About panel, status bar, spellchecker, and input/lock
+//! monitors via AppKit (`objc2`). Notifications: bundled builds leave them to GPUI's
+//! `SystemNotification` (`UNUserNotificationCenter`); unbundled dev builds, where that center
+//! refuses to start, post through Notification Center via `osascript` (see [`Notifier`]).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::ptr::NonNull;
+use std::sync::{Arc, LazyLock, Mutex, Once, PoisonError};
 
+use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly as _, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAboutPanelOptionApplicationIcon, NSApplication, NSImage, NSMenu, NSMenuItem,
-    NSRequestUserAttentionType, NSSound, NSSpellChecker, NSStatusBar, NSStatusItem,
-    NSVariableStatusItemLength,
+    NSAboutPanelOptionApplicationIcon, NSApplication, NSEvent, NSEventMask, NSEventPhase,
+    NSEventType, NSImage, NSMenu, NSMenuItem, NSRequestUserAttentionType, NSSound, NSSpellChecker,
+    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{
-    NSArray, NSBundle, NSData, NSDictionary, NSInteger, NSNotFound, NSNumber, NSObject, NSRange,
-    NSSize, NSString, NSUserDefaults,
+    NSBundle, NSData, NSDictionary, NSDistributedNotificationCenter, NSInteger, NSNotFound,
+    NSNotification, NSNumber, NSObject, NSRange, NSSize, NSString, NSUserDefaults,
 };
-use security_framework::passwords::{self, PasswordOptions};
 
-use crate::deep_link::{self, DeepLink};
 use crate::{
-    AboutPanel, AttentionRequester, BadgeSetter, DeepLinkHandler, FullScreenItem, IconSetter,
-    Misspelling, Notifier, PlatformError, Result, SecretStore, SoundPlayer, SpellChecker,
-    StatusBarAction, StatusBarItem, StatusBarState,
+    AboutPanel, AttentionRequester, BadgeSetter, FullScreenItem, IconSetter, Misspelling,
+    MouseNavDirection, Notifier, SoundPlayer, SpellChecker, StatusBarAction, StatusBarItem,
+    StatusBarState,
 };
 
-/// `errSecItemNotFound`, the documented OSStatus for a missing keychain item.
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-
-/// macOS integration. Cheap to construct; AppKit is only touched when a
-/// capability needs it, always on the main thread (dispatched there if not).
-pub struct MacPlatform {
-    pending_link: Mutex<Option<DeepLink>>,
-}
+/// macOS integration. Cheap to construct; AppKit is only touched when a capability needs it,
+/// always on the main thread (dispatched there if not).
+pub struct MacPlatform;
 
 impl MacPlatform {
     pub fn new() -> Self {
-        Self {
-            pending_link: Mutex::new(None),
-        }
+        Self
     }
 }
 
 impl Default for MacPlatform {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Runs `f` immediately when already on the main thread, otherwise dispatches it asynchronously
+/// onto the main GCD queue so AppKit calls never panic when invoked from background threads.
+fn run_on_main(f: impl FnOnce(MainThreadMarker) + Send + 'static) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        f(mtm);
+    } else {
+        DispatchQueue::main().exec_async(move || {
+            if let Some(mtm) = MainThreadMarker::new() {
+                f(mtm);
+            }
+        });
+    }
+}
+
+/// Unhides and brings the application to the foreground when called on the main thread.
+fn activate_app() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.unhide(None);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
     }
 }
 
@@ -85,65 +100,54 @@ impl Notifier for MacPlatform {
             Ok(mut child) => {
                 std::thread::spawn(move || child.wait());
             }
-            Err(error) => eprintln!("slackless-platform: notification not posted: {error}"),
+            Err(error) => tracing::warn!(%error, "notification not posted via osascript"),
         }
     }
 }
 
 impl BadgeSetter for MacPlatform {
     fn set_badge(&self, label: Option<&str>) {
-        // NSApplication/dockTile must be touched on the main thread; hop to
-        // the main queue when called from a worker thread (the GUI's tokio
-        // bridge, backfill tasks, …). The label is moved as a plain `String`
-        // so the closure stays `Send`.
         let label = label.map(str::to_string);
-        if MainThreadMarker::new().is_some() {
-            apply_dock_badge(label.as_deref().map(NSString::from_str).as_deref());
-        } else {
-            DispatchQueue::main().exec_async(move || {
-                apply_dock_badge(label.as_deref().map(NSString::from_str).as_deref())
-            });
-        }
+        run_on_main(move |mtm| {
+            let app = NSApplication::sharedApplication(mtm);
+            let ns_label = label.as_deref().map(NSString::from_str);
+            app.dockTile().setBadgeLabel(ns_label.as_deref());
+        });
     }
-}
-
-fn apply_dock_badge(label: Option<&NSString>) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        // Only reachable if the main-queue hop above never ran (no run loop);
-        // silently skip rather than misreport.
-        return;
-    };
-    // sharedApplication/dockTile take a MainThreadMarker, so they are safe to
-    // call; we are on the main thread here by construction.
-    let app = NSApplication::sharedApplication(mtm);
-    let dock_tile = app.dockTile();
-    dock_tile.setBadgeLabel(label);
 }
 
 impl IconSetter for MacPlatform {
     fn set_icon(&self, png: &[u8]) {
-        let mtm = MainThreadMarker::new().expect("the app icon is set on the main thread");
-        let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png))
-            .expect("the app icon is a PNG AppKit can read");
-        // SAFETY: a non-nil image, set on the main thread.
-        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+        let png = png.to_vec();
+        run_on_main(move |mtm| {
+            let Some(image) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&png))
+            else {
+                tracing::warn!("failed to decode application icon PNG bytes");
+                return;
+            };
+            // SAFETY: `image` is a valid non-nil `NSImage`, set on the main thread.
+            unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+        });
     }
 }
 
 impl AboutPanel for MacPlatform {
     fn show_about(&self) {
-        let mtm = MainThreadMarker::new().expect("the About panel opens on the main thread");
-        let app = NSApplication::sharedApplication(mtm);
-        // Unbundled, the standard panel shows the executable folder's icon: hand it the app's.
-        let Some(icon) = app.applicationIconImage() else {
-            return app.orderFrontStandardAboutPanel(None);
-        };
-        let icon: &AnyObject = &icon;
-        // SAFETY: an AppKit constant, read on the main thread.
-        let key = unsafe { NSAboutPanelOptionApplicationIcon };
-        let options = NSDictionary::from_slices(&[key], &[icon]);
-        // SAFETY: an About panel option key to an NSImage, the dictionary the method takes.
-        unsafe { app.orderFrontStandardAboutPanelWithOptions(&options) };
+        run_on_main(|mtm| {
+            let app = NSApplication::sharedApplication(mtm);
+            // Unbundled, the standard panel shows the executable folder's icon: hand it the app's.
+            let Some(icon) = app.applicationIconImage() else {
+                app.orderFrontStandardAboutPanel(None);
+                return;
+            };
+            let icon: &AnyObject = &icon;
+            // SAFETY: `NSAboutPanelOptionApplicationIcon` is an immutable AppKit constant read on
+            // the main thread.
+            let key = unsafe { NSAboutPanelOptionApplicationIcon };
+            let options = NSDictionary::from_slices(&[key], &[icon]);
+            // SAFETY: `options` maps the About panel icon key to an `NSImage` on the main thread.
+            unsafe { app.orderFrontStandardAboutPanelWithOptions(&options) };
+        });
     }
 }
 
@@ -153,7 +157,7 @@ impl FullScreenItem for MacPlatform {
         let off = NSNumber::numberWithBool(false);
         let off: &AnyObject = &off;
         let defaults = NSDictionary::from_slices(&[&*key], &[off]);
-        // SAFETY: NSString keys to an NSNumber, the dictionary registerDefaults: takes.
+        // SAFETY: `defaults` maps an `NSString` key to an `NSNumber`, as `registerDefaults:` expects.
         unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
     }
 }
@@ -166,102 +170,12 @@ thread_local! {
 impl SoundPlayer for MacPlatform {
     fn play_sound(&self, data: &[u8]) {
         let Some(sound) = NSSound::initWithData(NSSound::alloc(), &NSData::with_bytes(data)) else {
-            eprintln!("slackless-platform: not a playable sound");
+            tracing::warn!(len = data.len(), "not a playable sound");
             return;
         };
         sound.play();
         PLAYING.with(|playing| *playing.borrow_mut() = Some(sound));
     }
-}
-
-impl SecretStore for MacPlatform {
-    fn store_secret(&self, service: &str, name: &str, secret: &[u8]) -> Result<()> {
-        passwords::set_generic_password(service, name, secret)
-            .map_err(|e| PlatformError::SecretStore(e.to_string()))
-    }
-
-    fn load_secret(&self, service: &str, name: &str) -> Result<Vec<u8>> {
-        passwords::generic_password(PasswordOptions::new_generic_password(service, name)).map_err(
-            |e| {
-                if e.code() == ERR_SEC_ITEM_NOT_FOUND {
-                    PlatformError::SecretNotFound {
-                        service: service.to_string(),
-                        name: name.to_string(),
-                    }
-                } else {
-                    PlatformError::SecretStore(e.to_string())
-                }
-            },
-        )
-    }
-
-    fn delete_secret(&self, service: &str, name: &str) -> Result<()> {
-        match passwords::delete_generic_password(service, name) {
-            Ok(()) => Ok(()),
-            // Idempotent delete: removing an absent secret is fine.
-            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-            Err(e) => Err(PlatformError::SecretStore(e.to_string())),
-        }
-    }
-}
-
-impl DeepLinkHandler for MacPlatform {
-    fn register(&self) -> Result<Vec<String>> {
-        Ok(declared_url_schemes())
-    }
-
-    fn handle_url(&self, url: &str) -> Result<DeepLink> {
-        let link = deep_link::parse_deep_link(url)?;
-        *self
-            .pending_link
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(link.clone());
-        Ok(link)
-    }
-
-    fn take_link(&self) -> Option<DeepLink> {
-        self.pending_link
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-    }
-}
-
-/// URL schemes the running bundle declares in its `Info.plist`
-/// (`CFBundleURLTypes`). Empty for unbundled dev runs — the `slack` scheme
-/// must be declared there before macOS will deliver such links to the app.
-fn declared_url_schemes() -> Vec<String> {
-    let bundle = NSBundle::mainBundle();
-    let Some(url_types) =
-        bundle.objectForInfoDictionaryKey(&NSString::from_str("CFBundleURLTypes"))
-    else {
-        return Vec::new();
-    };
-    let Ok(url_types) = url_types.downcast::<NSArray<AnyObject>>() else {
-        // Malformed CFBundleURLTypes: treat as no declared schemes.
-        return Vec::new();
-    };
-
-    let mut schemes = Vec::new();
-    for url_type in url_types.iter() {
-        // Each entry is a dictionary of link-type metadata.
-        let Ok(url_type) = url_type.downcast::<NSDictionary<AnyObject, AnyObject>>() else {
-            continue;
-        };
-        let Some(scheme_list) = url_type
-            .objectForKey(NSString::from_str("CFBundleURLSchemes").as_ref())
-            .and_then(|list| list.downcast::<NSArray<AnyObject>>().ok())
-        else {
-            continue;
-        };
-        for scheme in scheme_list.iter() {
-            let Ok(scheme) = scheme.downcast::<NSString>() else {
-                continue;
-            };
-            schemes.push(scheme.to_string());
-        }
-    }
-    schemes
 }
 
 type StatusBarCallback = Arc<dyn Fn(StatusBarAction) + Send + Sync + 'static>;
@@ -339,12 +253,7 @@ define_class!(
         #[unsafe(method(showWindow:))]
         fn show_window(&self, _sender: Option<&AnyObject>) {
             emit_status_bar_action(StatusBarAction::ShowWindow);
-            if let Some(mtm) = MainThreadMarker::new() {
-                let app = NSApplication::sharedApplication(mtm);
-                app.unhide(None);
-                #[allow(deprecated)]
-                app.activateIgnoringOtherApps(true);
-            }
+            activate_app();
         }
 
         #[unsafe(method(switchWorkspace:))]
@@ -353,12 +262,7 @@ define_class!(
             if tag >= 0 {
                 emit_status_bar_action(StatusBarAction::SwitchWorkspace(tag as usize));
             }
-            if let Some(mtm) = MainThreadMarker::new() {
-                let app = NSApplication::sharedApplication(mtm);
-                app.unhide(None);
-                #[allow(deprecated)]
-                app.activateIgnoringOtherApps(true);
-            }
+            activate_app();
         }
 
         #[unsafe(method(toggleDnd:))]
@@ -394,13 +298,7 @@ impl StatusBarItem for MacPlatform {
     fn update_status_bar(&self, icon_png: Option<&[u8]>, state: &StatusBarState) {
         let icon = icon_png.map(|b| b.to_vec());
         let state = state.clone();
-        if MainThreadMarker::new().is_some() {
-            apply_status_bar(icon.as_deref(), &state);
-        } else {
-            DispatchQueue::main().exec_async(move || {
-                apply_status_bar(icon.as_deref(), &state);
-            });
-        }
+        run_on_main(move |mtm| apply_status_bar(mtm, icon.as_deref(), &state));
     }
 
     fn take_status_bar_action(&self) -> Option<StatusBarAction> {
@@ -408,10 +306,7 @@ impl StatusBarItem for MacPlatform {
     }
 }
 
-fn apply_status_bar(icon_png: Option<&[u8]>, state: &StatusBarState) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
+fn apply_status_bar(mtm: MainThreadMarker, icon_png: Option<&[u8]>, state: &StatusBarState) {
     let bar = NSStatusBar::systemStatusBar();
     if !state.visible {
         STATUS_ITEM.with(|slot| {
@@ -462,6 +357,8 @@ fn apply_status_bar(icon_png: Option<&[u8]>, state: &StatusBarState) {
                     &NSString::from_str(""),
                 )
             };
+            // SAFETY: `target_obj` lives inside `LiveStatusItem` for at least as long as the
+            // status item's menu holds `mi`.
             unsafe { mi.setTarget(Some(target_obj)) };
             mi.setTag(tag);
             menu.addItem(&mi);
@@ -497,10 +394,7 @@ fn apply_status_bar(icon_png: Option<&[u8]>, state: &StatusBarState) {
 
 impl AttentionRequester for MacPlatform {
     fn request_attention(&self, critical: bool) {
-        let apply = move || {
-            let Some(mtm) = MainThreadMarker::new() else {
-                return;
-            };
+        run_on_main(move |mtm| {
             let app = NSApplication::sharedApplication(mtm);
             let kind = if critical {
                 NSRequestUserAttentionType::CriticalRequest
@@ -508,28 +402,25 @@ impl AttentionRequester for MacPlatform {
                 NSRequestUserAttentionType::InformationalRequest
             };
             let _ = app.requestUserAttention(kind);
-        };
-        if MainThreadMarker::new().is_some() {
-            apply();
-        } else {
-            DispatchQueue::main().exec_async(apply);
-        }
+        });
     }
 }
 
-/// Convert a UTF-16 code-unit offset into a UTF-8 byte offset inside `text`.
-fn utf16_to_utf8_offset(text: &str, utf16_offset: usize) -> Option<usize> {
+/// Precomputes an O(N) lookup table mapping every UTF-16 code-unit offset in `text` to its
+/// corresponding UTF-8 byte offset (`None` at the trailing half of a surrogate pair).
+fn utf16_to_utf8_table(text: &str, total_u16: usize) -> Vec<Option<usize>> {
+    let mut table = vec![None; total_u16 + 1];
     let mut u16_pos = 0usize;
     for (byte_ix, ch) in text.char_indices() {
-        if u16_pos == utf16_offset {
-            return Some(byte_ix);
+        if let Some(slot) = table.get_mut(u16_pos) {
+            *slot = Some(byte_ix);
         }
         u16_pos += ch.len_utf16();
-        if u16_pos > utf16_offset {
-            return None;
-        }
     }
-    (u16_pos == utf16_offset).then_some(text.len())
+    if let Some(slot) = table.get_mut(u16_pos) {
+        *slot = Some(text.len());
+    }
+    table
 }
 
 impl SpellChecker for MacPlatform {
@@ -543,11 +434,12 @@ impl SpellChecker for MacPlatform {
         let checker = NSSpellChecker::sharedSpellChecker();
         let ns_text = NSString::from_str(text);
         let ns_lang = language.map(NSString::from_str);
-        let total_u16 = text.encode_utf16().count();
+        let total_u16 = ns_text.length();
+        let u16_to_u8 = utf16_to_utf8_table(text, total_u16);
         let mut offset: usize = 0;
         let mut out = Vec::new();
         while offset < total_u16 {
-            // SAFETY: valid NSString pointers, null wordCount out-param allowed by AppKit.
+            // SAFETY: valid `NSString` pointers; null `wordCount` out-param is allowed by AppKit.
             let found = unsafe {
                 checker.checkSpellingOfString_startingAt_language_wrap_inSpellDocumentWithTag_wordCount(
                     &ns_text,
@@ -564,8 +456,8 @@ impl SpellChecker for MacPlatform {
             }
             let end_u16 = found.location.saturating_add(found.length);
             if let (Some(start), Some(end)) = (
-                utf16_to_utf8_offset(text, found.location),
-                utf16_to_utf8_offset(text, end_u16),
+                u16_to_u8.get(found.location).copied().flatten(),
+                u16_to_u8.get(end_u16).copied().flatten(),
             ) && start < end
             {
                 out.push(Misspelling { range: start..end });
@@ -588,7 +480,7 @@ impl SpellChecker for MacPlatform {
         let checker = NSSpellChecker::sharedSpellChecker();
         let ns_word = NSString::from_str(word);
         let ns_lang = language.map(NSString::from_str);
-        let range = NSRange::new(0, word.encode_utf16().count());
+        let range = NSRange::new(0, ns_word.length());
         let Some(guesses) = checker.guessesForWordRange_inString_language_inSpellDocumentWithTag(
             range,
             &ns_word,
@@ -612,14 +504,6 @@ impl SpellChecker for MacPlatform {
     }
 }
 
-use std::ptr::NonNull;
-use std::sync::Once;
-
-use block2::RcBlock;
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase, NSEventType};
-
-use crate::MouseNavDirection;
-
 static MOUSE_NAV_MONITOR: Once = Once::new();
 
 pub(crate) fn install_mouse_nav_monitor(
@@ -630,6 +514,7 @@ pub(crate) fn install_mouse_nav_monitor(
     }
     MOUSE_NAV_MONITOR.call_once(|| {
         let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            // SAFETY: AppKit passes a valid non-null `NSEvent` pointer to the local event monitor.
             let ev = unsafe { event.as_ref() };
             // GPUI's macOS backend already turns `NSEventType::Swipe` with `NSEventPhase::Ended`
             // into `MouseButton::Navigate`, but silently drops `phase == None` swipes (which
@@ -647,7 +532,8 @@ pub(crate) fn install_mouse_nav_monitor(
             }
             event.as_ptr()
         });
-        // Keep the monitor alive for the lifetime of the process.
+        // SAFETY: Installed once on the main thread; the returned monitor token is intentionally
+        // leaked (`std::mem::forget`) so the monitor remains registered for the process lifetime.
         if let Some(monitor) = unsafe {
             NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Swipe, &block)
         } {
@@ -663,13 +549,13 @@ pub(crate) fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'st
         return;
     }
     SCREEN_LOCK_MONITOR.call_once(|| {
-        use objc2_foundation::{NSDistributedNotificationCenter, NSNotification};
-
         let center = NSDistributedNotificationCenter::defaultCenter();
         let name = NSString::from_str("com.apple.screenIsLocked");
         let block = RcBlock::new(move |_notif: NonNull<NSNotification>| {
             on_lock();
         });
+        // SAFETY: Installed once on the main thread with a valid notification name and block;
+        // the returned observer token is leaked so it stays registered for the process lifetime.
         let observer = unsafe {
             center.addObserverForName_object_queue_usingBlock(Some(&name), None, None, &block)
         };
@@ -681,39 +567,45 @@ pub(crate) fn install_screen_lock_monitor(on_lock: impl Fn() + Send + Sync + 'st
 mod tests {
     use super::*;
 
+    fn lookup(text: &str, utf16_offset: usize) -> Option<usize> {
+        let total = text.encode_utf16().count();
+        let table = utf16_to_utf8_table(text, total);
+        table.get(utf16_offset).copied().flatten()
+    }
+
     #[test]
-    fn utf16_to_utf8_offset_handles_ascii_multibyte_surrogates_and_bounds() {
+    fn utf16_to_utf8_table_handles_ascii_multibyte_surrogates_and_bounds() {
         // Empty string
-        assert_eq!(utf16_to_utf8_offset("", 0), Some(0));
-        assert_eq!(utf16_to_utf8_offset("", 1), None);
+        assert_eq!(lookup("", 0), Some(0));
+        assert_eq!(lookup("", 1), None);
 
         // Pure ASCII
-        assert_eq!(utf16_to_utf8_offset("hello", 0), Some(0));
-        assert_eq!(utf16_to_utf8_offset("hello", 3), Some(3));
-        assert_eq!(utf16_to_utf8_offset("hello", 5), Some(5));
-        assert_eq!(utf16_to_utf8_offset("hello", 6), None);
+        assert_eq!(lookup("hello", 0), Some(0));
+        assert_eq!(lookup("hello", 3), Some(3));
+        assert_eq!(lookup("hello", 5), Some(5));
+        assert_eq!(lookup("hello", 6), None);
 
         // Multi-byte BMP chars: 'é' (2 UTF-8 bytes, 1 UTF-16 unit), '中' (3 UTF-8 bytes, 1 UTF-16 unit)
         let bmp = "aé中b";
-        assert_eq!(utf16_to_utf8_offset(bmp, 0), Some(0));
-        assert_eq!(utf16_to_utf8_offset(bmp, 1), Some(1));
-        assert_eq!(utf16_to_utf8_offset(bmp, 2), Some(3));
-        assert_eq!(utf16_to_utf8_offset(bmp, 3), Some(6));
-        assert_eq!(utf16_to_utf8_offset(bmp, 4), Some(7));
-        assert_eq!(utf16_to_utf8_offset(bmp, 5), None);
+        assert_eq!(lookup(bmp, 0), Some(0));
+        assert_eq!(lookup(bmp, 1), Some(1));
+        assert_eq!(lookup(bmp, 2), Some(3));
+        assert_eq!(lookup(bmp, 3), Some(6));
+        assert_eq!(lookup(bmp, 4), Some(7));
+        assert_eq!(lookup(bmp, 5), None);
 
         // Emoji surrogate pair: '😀' is 4 UTF-8 bytes and 2 UTF-16 code units.
         let emoji = "a😀b";
-        assert_eq!(utf16_to_utf8_offset(emoji, 0), Some(0));
-        assert_eq!(utf16_to_utf8_offset(emoji, 1), Some(1));
+        assert_eq!(lookup(emoji, 0), Some(0));
+        assert_eq!(lookup(emoji, 1), Some(1));
         assert_eq!(
-            utf16_to_utf8_offset(emoji, 2),
+            lookup(emoji, 2),
             None,
             "mid-surrogate offset must return None"
         );
-        assert_eq!(utf16_to_utf8_offset(emoji, 3), Some(5));
-        assert_eq!(utf16_to_utf8_offset(emoji, 4), Some(6));
-        assert_eq!(utf16_to_utf8_offset(emoji, 5), None);
+        assert_eq!(lookup(emoji, 3), Some(5));
+        assert_eq!(lookup(emoji, 4), Some(6));
+        assert_eq!(lookup(emoji, 5), None);
     }
 
     #[test]
