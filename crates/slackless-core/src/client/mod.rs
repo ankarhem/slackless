@@ -4,6 +4,7 @@ mod commands;
 mod hydrate;
 mod rtm;
 
+use self::commands::QueuedMutation;
 use self::hydrate::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -30,83 +31,6 @@ use crate::types::{
 };
 use crate::unfurl::{Unfurls, event_messages};
 use crate::{Command, Event, FailedMutation, apply_event};
-
-/// Serializable offline mutation stored in SQLite `offline_queue` until flushed on reconnect.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-enum QueuedMutation {
-    SendMessage {
-        channel: ChannelId,
-        content: crate::api::MessageContent,
-        thread_ts: Option<Ts>,
-        broadcast: bool,
-    },
-    AddReaction {
-        channel: ChannelId,
-        ts: Ts,
-        name: String,
-    },
-    RemoveReaction {
-        channel: ChannelId,
-        ts: Ts,
-        name: String,
-    },
-    MarkRead {
-        channel: ChannelId,
-        ts: Ts,
-    },
-}
-
-impl QueuedMutation {
-    fn from_command(command: &Command) -> Option<Self> {
-        match command {
-            Command::SendMessage {
-                channel,
-                content,
-                thread_ts,
-                broadcast,
-            } => Some(Self::SendMessage {
-                channel: channel.clone(),
-                content: content.clone(),
-                thread_ts: thread_ts.clone(),
-                broadcast: *broadcast,
-            }),
-            Command::AddReaction { channel, ts, name } => Some(Self::AddReaction {
-                channel: channel.clone(),
-                ts: ts.clone(),
-                name: name.clone(),
-            }),
-            Command::RemoveReaction { channel, ts, name } => Some(Self::RemoveReaction {
-                channel: channel.clone(),
-                ts: ts.clone(),
-                name: name.clone(),
-            }),
-            Command::MarkRead { channel, ts } => Some(Self::MarkRead {
-                channel: channel.clone(),
-                ts: ts.clone(),
-            }),
-            _ => None,
-        }
-    }
-
-    fn summary(&self) -> String {
-        match self {
-            Self::SendMessage { content, .. } => {
-                let text = content.text.trim();
-                let preview: String = text.chars().take(48).collect();
-                if text.chars().count() > 48 {
-                    format!("Message \"{preview}…\"")
-                } else if preview.is_empty() {
-                    "Message".to_owned()
-                } else {
-                    format!("Message \"{preview}\"")
-                }
-            }
-            Self::AddReaction { name, .. } => format!("Reaction :{name}:"),
-            Self::RemoveReaction { name, .. } => format!("Remove reaction :{name}:"),
-            Self::MarkRead { channel, .. } => format!("Mark read ({channel})"),
-        }
-    }
-}
 
 /// The store shared between the core (writer) and front-ends (readers).
 ///
