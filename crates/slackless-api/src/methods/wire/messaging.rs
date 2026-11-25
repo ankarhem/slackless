@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use crate::Result;
 use crate::client::Params;
-use crate::de::{lenient_bool, lenient_u32, lenient_u64, lenient_vec, null_default, or_default};
+use crate::de::{
+    lenient_bool, lenient_u32, lenient_u64, lenient_vec, null_default, or_default, value_as_u64,
+};
 use crate::types::{Attachment, Block, ChannelId, Message, RichTextBlock, Ts};
 
 /// Window and page size for `conversations.history` / `conversations.replies`.
@@ -319,16 +321,6 @@ fn draft_extract_text(blocks: &Value) -> String {
     out
 }
 
-fn value_as_u64(v: &Value) -> Option<u64> {
-    match v {
-        Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_f64().filter(|f| *f >= 0.0).map(|f| f as u64)),
-        Value::String(s) => s.trim().split('.').next().and_then(|w| w.parse().ok()),
-        _ => None,
-    }
-}
-
 /// Pad a Slack draft timestamp (`last_updated_ts` / `date_last_updated`) to 7 fractional digits
 /// as required by `drafts.update` and `drafts.delete` (`1700000000.1` -> `1700000000.1000000`).
 pub(in crate::methods) fn pad_draft_ts(ts: &str) -> String {
@@ -338,11 +330,9 @@ pub(in crate::methods) fn pad_draft_ts(ts: &str) -> String {
     }
     match trimmed.split_once('.') {
         Some((whole, frac)) => {
-            let mut f = frac.to_owned();
-            if f.len() < 7 {
-                f.push_str(&"0".repeat(7 - f.len()));
-            } else if f.len() > 7 {
-                f.truncate(7);
+            let mut f: String = frac.chars().filter(char::is_ascii_digit).take(7).collect();
+            while f.len() < 7 {
+                f.push('0');
             }
             format!("{whole}.{f}")
         }

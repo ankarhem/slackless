@@ -321,10 +321,12 @@ fn messaging_threads_scheduled_drafts_and_gifs_edge_cases() {
     .expect("string post_at parses");
     assert_eq!(created_str.post_at, 1_760_010_000);
 
-    // Draft timestamp padding & scheduled vs unsent draft separation.
+    // Draft timestamp padding (including non-ASCII safety) & scheduled vs unsent draft separation.
     assert_eq!(pad_draft_ts("1700000000.1"), "1700000000.1000000");
     assert_eq!(pad_draft_ts("1700000000"), "1700000000.0000000");
     assert_eq!(pad_draft_ts("1700000000.123456789"), "1700000000.1234567");
+    assert_eq!(pad_draft_ts("1700000000.123456é89"), "1700000000.1234568");
+    assert_eq!(pad_draft_ts("1700000000.éééé"), "1700000000.0000000");
     let mixed_drafts = json!({
         "drafts": [
             {
@@ -883,17 +885,19 @@ fn lists_schema_records_cells_and_inputs_handle_missing_null_and_drifted_shapes(
         );
     }
 
-    // Record stores cell under both column_id and key, falls back to key when column_id missing.
+    // Record stores cell once under column_id (falling back to key when column_id is empty).
     let rows = parse_list_records(&[json!({
         "id": "R1",
         "fields": [
             { "column_id": "", "key": "only_key", "text": "alpha" },
             { "column_id": "Col2", "key": "second_key", "number": [7.0] },
+            { "column_id": "ColBig", "number": [1e25] },
             { "column_id": "", "key": "", "text": "ignored" },
             { "column_id": "ColEmpty", "text": "   " }
         ]
     })]);
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cells.len(), 3);
     assert_eq!(
         rows[0].cells.get("only_key"),
         Some(&SlackListCellValue::Text("alpha".into()))
@@ -902,9 +906,21 @@ fn lists_schema_records_cells_and_inputs_handle_missing_null_and_drifted_shapes(
         rows[0].cells.get("Col2"),
         Some(&SlackListCellValue::Number("7".into()))
     );
+    assert!(
+        !rows[0].cells.contains_key("second_key"),
+        "must not double-insert under both column_id and key"
+    );
     assert_eq!(
-        rows[0].cells.get("second_key"),
+        rows[0].cell(&SlackListColumn {
+            id: "Col2".into(),
+            key: "second_key".into(),
+            ..Default::default()
+        }),
         Some(&SlackListCellValue::Number("7".into()))
+    );
+    assert_eq!(
+        rows[0].cells.get("ColBig"),
+        Some(&SlackListCellValue::Number(1e25_f64.to_string()))
     );
     assert!(!rows[0].cells.contains_key("ColEmpty"));
 

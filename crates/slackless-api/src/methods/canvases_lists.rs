@@ -2,6 +2,43 @@
 
 use super::*;
 
+/// Returns whether a failed private `lists.*` call should fall back to the public
+/// `slackLists.items.*` endpoint. Only expected method/token/scope rejections qualify; auth
+/// expiry, rate limits, transport errors, and domain errors propagate immediately.
+fn should_fallback_list_method(err: &ApiError) -> bool {
+    matches!(
+        err,
+        ApiError::Slack(code)
+            if matches!(
+                code.as_str(),
+                "not_allowed_token_type" | "unknown_method" | "missing_scope"
+            )
+    )
+}
+
+fn canvases_access_params(
+    canvas_id: &str,
+    access_level: Option<CanvasAccessLevel>,
+    channel_ids: &[ChannelId],
+    user_ids: &[UserId],
+) -> Result<crate::client::Params> {
+    if channel_ids.is_empty() == user_ids.is_empty() {
+        return Err(ApiError::Slack("invalid_parameters".to_owned()));
+    }
+    let mut params = vec![("canvas_id", canvas_id.to_owned())];
+    if let Some(level) = access_level {
+        params.push(("access_level", level.as_str().to_owned()));
+    }
+    if !channel_ids.is_empty() {
+        let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
+        params.push(("channel_ids", serde_json::to_string(&ids)?));
+    } else {
+        let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
+        params.push(("user_ids", serde_json::to_string(&ids)?));
+    }
+    Ok(params)
+}
+
 impl SlackApi {
     /// Load a live Slack List (`files.info` for schema + `lists.records.list`, with public
     /// `slackLists.items.list` fallback) for read-only native table rendering.
@@ -29,7 +66,7 @@ impl SlackApi {
 
         let records_val = match private_res {
             Ok(resp) => resp.data,
-            Err(_) => {
+            Err(ref err) if should_fallback_list_method(err) => {
                 self.call::<Value>(
                     method::SLACK_LISTS_ITEMS_LIST,
                     vec![
@@ -41,6 +78,7 @@ impl SlackApi {
                 .await?
                 .data
             }
+            Err(err) => return Err(err),
         };
 
         if columns.is_empty()
@@ -106,8 +144,7 @@ impl SlackApi {
         } else {
             method::FILES_FAVORITES_REMOVE
         };
-        self.call::<Empty>(endpoint, params).await?;
-        Ok(())
+        self.call_ok(endpoint, params).await
     }
 
     /// `files.collections.list`: custom Files sidebar sections (`F-CORE-133`).
@@ -145,9 +182,7 @@ impl SlackApi {
             ("collection", collection_id.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::FILES_COLLECTIONS_DELETE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::FILES_COLLECTIONS_DELETE, params).await
     }
 
     /// `files.recentlyDeleted`: canvases & lists deleted in the last 24h (`F-CORE-133`).
@@ -179,8 +214,7 @@ impl SlackApi {
             ("file_id", file_id.to_owned()),
             ("_x_mode", MODE_ONLINE.to_owned()),
         ];
-        self.call::<Empty>(method::FILES_UNDELETE, params).await?;
-        Ok(())
+        self.call_ok(method::FILES_UNDELETE, params).await
     }
 
     /// `canvases.create`: create a standalone canvas or channel-tabbed canvas (`F-COLLAB-119`).
@@ -253,8 +287,7 @@ impl SlackApi {
     pub async fn canvases_edit(&self, canvas_id: &str, op: &CanvasEditOp) -> Result<()> {
         let changes = serde_json::Value::Array(vec![op.to_change_json()]).to_string();
         let params = vec![("canvas_id", canvas_id.to_owned()), ("changes", changes)];
-        self.call::<Empty>(method::CANVASES_EDIT, params).await?;
-        Ok(())
+        self.call_ok(method::CANVASES_EDIT, params).await
     }
 
     /// `canvases.getContent`: fetch a canvas's markdown or HTML body (`canvases.getContent`).
@@ -275,8 +308,8 @@ impl SlackApi {
     /// `not_allowed_token_type` for `xoxc-` sessions.
     pub async fn canvases_delete(&self, canvas_id: &str) -> Result<()> {
         let params = vec![("canvas_id", canvas_id.to_owned())];
-        match self.call::<Empty>(method::CANVASES_DELETE, params).await {
-            Ok(_) => Ok(()),
+        match self.call_ok(method::CANVASES_DELETE, params).await {
+            Ok(()) => Ok(()),
             Err(ApiError::Slack(ref code)) if code == "not_allowed_token_type" => {
                 self.files_delete(canvas_id).await
             }
@@ -292,23 +325,8 @@ impl SlackApi {
         channel_ids: &[ChannelId],
         user_ids: &[UserId],
     ) -> Result<()> {
-        if channel_ids.is_empty() == user_ids.is_empty() {
-            return Err(ApiError::Slack("invalid_parameters".to_owned()));
-        }
-        let mut params = vec![
-            ("canvas_id", canvas_id.to_owned()),
-            ("access_level", access_level.as_str().to_owned()),
-        ];
-        if !channel_ids.is_empty() {
-            let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
-            params.push(("channel_ids", serde_json::to_string(&ids)?));
-        } else {
-            let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
-            params.push(("user_ids", serde_json::to_string(&ids)?));
-        }
-        self.call::<Empty>(method::CANVASES_ACCESS_SET, params)
-            .await?;
-        Ok(())
+        let params = canvases_access_params(canvas_id, Some(access_level), channel_ids, user_ids)?;
+        self.call_ok(method::CANVASES_ACCESS_SET, params).await
     }
 
     /// `canvases.access.delete`: revoke canvas access from channels or users (XOR).
@@ -318,20 +336,8 @@ impl SlackApi {
         channel_ids: &[ChannelId],
         user_ids: &[UserId],
     ) -> Result<()> {
-        if channel_ids.is_empty() == user_ids.is_empty() {
-            return Err(ApiError::Slack("invalid_parameters".to_owned()));
-        }
-        let mut params = vec![("canvas_id", canvas_id.to_owned())];
-        if !channel_ids.is_empty() {
-            let ids: Vec<&str> = channel_ids.iter().map(ChannelId::as_str).collect();
-            params.push(("channel_ids", serde_json::to_string(&ids)?));
-        } else {
-            let ids: Vec<&str> = user_ids.iter().map(UserId::as_str).collect();
-            params.push(("user_ids", serde_json::to_string(&ids)?));
-        }
-        self.call::<Empty>(method::CANVASES_ACCESS_DELETE, params)
-            .await?;
-        Ok(())
+        let params = canvases_access_params(canvas_id, None, channel_ids, user_ids)?;
+        self.call_ok(method::CANVASES_ACCESS_DELETE, params).await
     }
 
     /// `quip.thread.archive`: resolve one canvas comment thread.
@@ -340,9 +346,7 @@ impl SlackApi {
             ("channel_id", channel_id.to_string()),
             ("thread_ts", thread_ts.to_string()),
         ];
-        self.call::<Empty>(method::QUIP_THREAD_ARCHIVE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::QUIP_THREAD_ARCHIVE, params).await
     }
 
     /// `quip.thread.unarchive`: reopen one resolved canvas comment thread.
@@ -355,17 +359,13 @@ impl SlackApi {
             ("channel_id", channel_id.to_string()),
             ("thread_ts", thread_ts.to_string()),
         ];
-        self.call::<Empty>(method::QUIP_THREAD_UNARCHIVE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::QUIP_THREAD_UNARCHIVE, params).await
     }
 
     /// `quip.thread.archiveAll`: resolve every open comment thread in a canvas comment channel.
     pub async fn quip_thread_archive_all(&self, channel_id: &ChannelId) -> Result<()> {
         let params = vec![("channel_id", channel_id.to_string())];
-        self.call::<Empty>(method::QUIP_THREAD_ARCHIVE_ALL, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::QUIP_THREAD_ARCHIVE_ALL, params).await
     }
 
     /// List comment threads on a canvas by reading its derived file comment channel (`C…`).
@@ -431,9 +431,7 @@ impl SlackApi {
             ("request_type", request_type.to_owned()),
             ("reason", "IndicatorRequestEditAccessButton".to_owned()),
         ];
-        self.call::<Empty>(method::FILES_REQUEST_PERMISSION, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::FILES_REQUEST_PERMISSION, params).await
     }
 
     /// `lists.create`: create a new Slack List from scratch (`F-COLLAB-213`).
@@ -483,7 +481,7 @@ impl SlackApi {
         let wire: ListRecordCreateWire = match self.call(method::LISTS_RECORDS_CREATE, params).await
         {
             Ok(resp) => resp.data,
-            Err(_) => {
+            Err(ref err) if should_fallback_list_method(err) => {
                 let mut fallback = vec![
                     ("list_id", list_id.to_owned()),
                     ("initial_fields", fields_json),
@@ -495,6 +493,7 @@ impl SlackApi {
                     .await?
                     .data
             }
+            Err(err) => return Err(err),
         };
         let raw = wire.record.or(wire.item);
         let row = raw
@@ -521,30 +520,30 @@ impl SlackApi {
             ("list_id", list_id.to_owned()),
             ("cells", cells_json.clone()),
         ];
-        if self
-            .call::<Empty>(method::LISTS_CELLS_UPDATE, params)
-            .await
-            .is_err()
-        {
-            let fallback = vec![("list_id", list_id.to_owned()), ("cells", cells_json)];
-            self.call::<Empty>(method::SLACK_LISTS_ITEMS_UPDATE, fallback)
-                .await?;
+        match self.call_ok(method::LISTS_CELLS_UPDATE, params).await {
+            Ok(()) => Ok(()),
+            Err(ref err) if should_fallback_list_method(err) => {
+                let fallback = vec![("list_id", list_id.to_owned()), ("cells", cells_json)];
+                self.call_ok(method::SLACK_LISTS_ITEMS_UPDATE, fallback)
+                    .await
+            }
+            Err(err) => Err(err),
         }
-        Ok(())
     }
 
     /// `lists.records.delete` (with `slackLists.items.delete` fallback): delete one list item (`F-COLLAB-228`).
     pub async fn lists_records_delete(&self, list_id: &str, row_id: &str) -> Result<()> {
         let params = vec![("list_id", list_id.to_owned()), ("id", row_id.to_owned())];
-        if self
-            .call::<Empty>(method::LISTS_RECORDS_DELETE, params.clone())
+        match self
+            .call_ok(method::LISTS_RECORDS_DELETE, params.clone())
             .await
-            .is_err()
         {
-            self.call::<Empty>(method::SLACK_LISTS_ITEMS_DELETE, params)
-                .await?;
+            Ok(()) => Ok(()),
+            Err(ref err) if should_fallback_list_method(err) => {
+                self.call_ok(method::SLACK_LISTS_ITEMS_DELETE, params).await
+            }
+            Err(err) => Err(err),
         }
-        Ok(())
     }
 
     /// `lists.addToList`: add a Slack message to an existing List (`F-COLLAB-231`).
@@ -578,9 +577,7 @@ impl SlackApi {
             ("record_id", row_id.to_owned()),
             ("id", row_id.to_owned()),
         ];
-        self.call::<Empty>(method::LISTS_RECORDS_ARCHIVE, params)
-            .await?;
-        Ok(())
+        self.call_ok(method::LISTS_RECORDS_ARCHIVE, params).await
     }
 
     /// `slackLists.access.set`: update list sharing/access permissions (`F-COLLAB-243`–`245`).
@@ -597,11 +594,7 @@ impl SlackApi {
         if let Some(ch) = channel {
             params.push(("channel_ids", ch.to_string()));
         }
-        let _: Value = self
-            .call(method::SLACK_LISTS_ACCESS_SET, params)
-            .await?
-            .data;
-        Ok(())
+        self.call_ok(method::SLACK_LISTS_ACCESS_SET, params).await
     }
 
     /// `lists.getThreadsForRecord`: load comment thread messages attached to a list item (`F-COLLAB-250`, `251`).

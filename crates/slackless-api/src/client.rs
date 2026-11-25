@@ -93,10 +93,12 @@ fn redact_url(url: &Url) -> String {
     let mut clean = url.clone();
     clean.set_query(None);
     clean.set_fragment(None);
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
     clean.to_string()
 }
 
-fn record_net_log(
+pub(crate) fn record_net_log(
     method: &str,
     url: &Url,
     status: Option<u16>,
@@ -132,9 +134,34 @@ pub const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Upper bound on a single `Retry-After` wait.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Default TCP/TLS connect timeout for HTTP clients.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default end-to-end request timeout for standard API and asset calls.
+pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Extended timeout for file uploads and downloads.
+const UPLOAD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Browser-like UA; the web client is a browser and Slack sees what it sends.
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
+
+pub(crate) fn build_http_client(proxy: Option<&str>, timeout: Duration) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(BROWSER_USER_AGENT)
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .timeout(timeout);
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy)?);
+    }
+    Ok(builder.build()?)
+}
+
+/// Returns whether `url` uses HTTPS on `slack.com` or any `*.slack.com` subdomain.
+pub(crate) fn is_trusted_slack_https_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|h| h == "slack.com" || h.ends_with(".slack.com"))
+}
 
 /// Form fields of one API call, `token` excluded (added by the client).
 pub(crate) type Params = Vec<(&'static str, String)>;
@@ -174,11 +201,7 @@ impl SlackApi {
     /// Honors [`set_proxy_url`] / `SLACKLESS_PROXY` (plus standard `HTTPS_PROXY` / `HTTP_PROXY`
     /// environment variables, `F-SHELL-192`).
     pub fn new(base_url: &str, token: impl Into<String>, d_cookie: &str) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().user_agent(BROWSER_USER_AGENT);
-        if let Some(proxy) = proxy_url() {
-            builder = builder.proxy(reqwest::Proxy::all(&proxy)?);
-        }
-        let http = builder.build()?;
+        let http = build_http_client(proxy_url().as_deref(), DEFAULT_REQUEST_TIMEOUT)?;
         Self::with_http_client(http, base_url, token, d_cookie)
     }
 
@@ -265,13 +288,13 @@ impl SlackApi {
         let resp = self
             .send_with_retry(|| self.build_request(method, &params))
             .await?;
-        let status = resp.status();
-        let body = resp.bytes().await?;
-        match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(value) => Ok(ApiResponse::<T>::from_value(value)?),
-            Err(_) if !status.is_success() => Err(status_error(status, &body)),
-            Err(e) => Err(ApiError::Decode(e)),
-        }
+        decode_api_response(resp).await
+    }
+
+    /// Calls a void `method` and discards the payload after verifying `ok: true`.
+    pub(crate) async fn call_ok(&self, method: &str, params: Params) -> Result<()> {
+        self.call::<crate::types::Empty>(method, params).await?;
+        Ok(())
     }
 
     /// Posts JSON to Slack's Edge cache API (`https://edgeapi.slack.com/cache/<team>/<path>`),
@@ -292,7 +315,7 @@ impl SlackApi {
                 serde_json::Value::String(self.token.clone()),
             );
         }
-        let body_bytes = serde_json::to_vec(&payload)?;
+        let body_bytes = Bytes::from(serde_json::to_vec(&payload)?);
         let resp = self
             .send_with_retry(|| {
                 Ok(self
@@ -304,13 +327,7 @@ impl SlackApi {
                     .build()?)
             })
             .await?;
-        let status = resp.status();
-        let body = resp.bytes().await?;
-        match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(value) => Ok(ApiResponse::<T>::from_value(value)?),
-            Err(_) if !status.is_success() => Err(status_error(status, &body)),
-            Err(e) => Err(ApiError::Decode(e)),
-        }
+        decode_api_response(resp).await
     }
 
     /// Downloads a Slack-hosted file (`url_private`, `url_private_download`, thumbnails).
@@ -318,19 +335,7 @@ impl SlackApi {
     /// File hosts authenticate the browser way, with the `d` cookie only. The cookie is sent only
     /// to `https` Slack hosts (or this client's own API host); anything else is refused.
     pub async fn download_file(&self, url_private: &str) -> Result<Bytes> {
-        let url = Url::parse(url_private)?;
-        if !self.is_trusted_file_url(&url) {
-            return Err(ApiError::UntrustedUrl(url_private.to_owned()));
-        }
-        let resp = self
-            .send_with_retry(|| {
-                Ok(self
-                    .http
-                    .get(url.clone())
-                    .header(COOKIE, self.cookie.clone())
-                    .build()?)
-            })
-            .await?;
+        let resp = self.fetch_trusted_file(url_private).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.bytes().await?;
@@ -356,19 +361,7 @@ impl SlackApi {
     /// the `d` cookie only to trusted Slack file hosts. Rejects Slack sign-in redirects/pages
     /// with [`ApiError::FileAuthRejected`].
     pub async fn download_html_file(&self, url_private: &str) -> Result<String> {
-        let url = Url::parse(url_private)?;
-        if !self.is_trusted_file_url(&url) {
-            return Err(ApiError::UntrustedUrl(url_private.to_owned()));
-        }
-        let resp = self
-            .send_with_retry(|| {
-                Ok(self
-                    .http
-                    .get(url.clone())
-                    .header(COOKIE, self.cookie.clone())
-                    .build()?)
-            })
-            .await?;
+        let resp = self.fetch_trusted_file(url_private).await?;
         let status = resp.status();
         let final_path = resp.url().path().to_ascii_lowercase();
         let body = resp.bytes().await?;
@@ -385,17 +378,35 @@ impl SlackApi {
         Ok(text)
     }
 
+    async fn fetch_trusted_file(&self, url_private: &str) -> Result<Response> {
+        let url = Url::parse(url_private)?;
+        if !self.is_trusted_file_url(&url) {
+            return Err(ApiError::UntrustedUrl(url_private.to_owned()));
+        }
+        self.send_with_retry(|| {
+            Ok(self
+                .http
+                .get(url.clone())
+                .header(COOKIE, self.cookie.clone())
+                .timeout(UPLOAD_DOWNLOAD_TIMEOUT)
+                .build()?)
+        })
+        .await
+    }
+
     /// Uploads raw bytes to an external upload slot returned by `files.getUploadURLExternal`.
     /// No Slack session cookie or token is sent; retries on HTTP 429.
     pub(crate) async fn post_upload_bytes(&self, upload_url: &str, bytes: &[u8]) -> Result<()> {
         let url = Url::parse(upload_url)?;
+        let payload = Bytes::copy_from_slice(bytes);
         let resp = self
             .send_with_retry(|| {
                 Ok(self
                     .http
                     .post(url.clone())
                     .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(bytes.to_vec())
+                    .timeout(UPLOAD_DOWNLOAD_TIMEOUT)
+                    .body(payload.clone())
                     .build()?)
             })
             .await?;
@@ -418,48 +429,32 @@ impl SlackApi {
         bytes: &[u8],
     ) -> Result<serde_json::Value> {
         let url = self.base.join(api_method)?;
-        let boundary = "----SlacklessMultipartBoundary7MA4YWxkTrZu0gW";
-        let mut body = Vec::with_capacity(bytes.len() + 512);
         let safe_name = filename.replace(['"', '\r', '\n'], "_");
-        body.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n{}\r\n\
-                 --{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{safe_name}\"\r\n\
-                 Content-Type: {content_type}\r\n\r\n",
-                self.token
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let ct_header = format!("multipart/form-data; boundary={boundary}");
+        let payload = Bytes::copy_from_slice(bytes);
+        let payload_len = payload.len() as u64;
         let resp = self
             .send_with_retry(|| {
+                let part =
+                    reqwest::multipart::Part::stream_with_length(payload.clone(), payload_len)
+                        .file_name(safe_name.clone())
+                        .mime_str(content_type)?;
+                let form = reqwest::multipart::Form::new()
+                    .text("token", self.token.clone())
+                    .part(field_name.to_owned(), part);
                 Ok(self
                     .http
                     .post(url.clone())
                     .header(COOKIE, self.cookie.clone())
-                    .header(CONTENT_TYPE, ct_header.clone())
-                    .body(body.clone())
+                    .timeout(UPLOAD_DOWNLOAD_TIMEOUT)
+                    .multipart(form)
                     .build()?)
             })
             .await?;
-        let status = resp.status();
-        let resp_bytes = resp.bytes().await?;
-        match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-            Ok(value) => Ok(ApiResponse::<serde_json::Value>::from_value(value)?.data),
-            Err(_) if !status.is_success() => Err(status_error(status, &resp_bytes)),
-            Err(e) => Err(ApiError::Decode(e)),
-        }
+        Ok(decode_api_response::<serde_json::Value>(resp).await?.data)
     }
 
     fn is_trusted_file_url(&self, url: &Url) -> bool {
-        let same_origin = url.origin() == self.base.origin();
-        let slack_host = url.scheme() == "https"
-            && url
-                .host_str()
-                .is_some_and(|h| h == "slack.com" || h.ends_with(".slack.com"));
-        same_origin || slack_host
+        url.origin() == self.base.origin() || is_trusted_slack_https_url(url)
     }
 
     /// Sends the request built by `build`, retrying on HTTP 429 after `Retry-After`, at most
@@ -507,6 +502,17 @@ impl SlackApi {
             attempt += 1;
             tokio::time::sleep(retry_after).await;
         }
+    }
+}
+
+/// Decodes a Slack JSON response body, falling back to [`ApiError::Status`] on non-2xx HTML/text.
+async fn decode_api_response<T: DeserializeOwned>(resp: Response) -> Result<ApiResponse<T>> {
+    let status = resp.status();
+    let body = resp.bytes().await?;
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => Ok(ApiResponse::<T>::from_value(value)?),
+        Err(_) if !status.is_success() => Err(status_error(status, &body)),
+        Err(e) => Err(ApiError::Decode(e)),
     }
 }
 
@@ -625,6 +631,26 @@ mod tests {
         assert!(!ok("http://files.slack.com/files-pri/T1-F1/a.png"));
         assert!(!ok("https://files.slack.com.evil.example/x"));
         assert!(!ok("https://example.com/x"));
+
+        assert!(is_trusted_slack_https_url(
+            &Url::parse("https://slack.com/shortcuts/Ft1").unwrap()
+        ));
+        assert!(is_trusted_slack_https_url(
+            &Url::parse("https://acme.slack.com/shortcuts/Ft1").unwrap()
+        ));
+        assert!(!is_trusted_slack_https_url(
+            &Url::parse("https://evilslack.com/shortcuts/Ft1").unwrap()
+        ));
+        assert!(!is_trusted_slack_https_url(
+            &Url::parse("https://slack.com@evil.example/shortcuts/Ft1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn redact_url_strips_userinfo_query_and_fragment() {
+        let url = Url::parse("https://alice:s3cr3t@acme.slack.com/api/auth.test?token=xoxc#frag")
+            .unwrap();
+        assert_eq!(redact_url(&url), "https://acme.slack.com/api/auth.test");
     }
 
     #[test]
