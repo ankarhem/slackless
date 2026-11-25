@@ -53,6 +53,7 @@ pub use macos_media::{
 pub use metrics::{HuddlePerfCounters, HuddlePerfSnapshot, ProcessResourceSampler};
 pub use screen::{ScreenCapture, ScreenSource, capture_screen_thumbnails, list_screen_sources};
 pub use session::spawn_huddle_session;
+pub use signaling::install_default_crypto_provider;
 pub use video::{
     CameraDeviceInfo, CameraPreviewProbe, VideoFrame, VideoFrameData, VideoTileKey, list_cameras,
 };

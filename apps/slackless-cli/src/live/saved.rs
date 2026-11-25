@@ -104,7 +104,15 @@ pub(crate) fn format_saved_list(filter: &str, items: &[SavedItem]) -> (serde_jso
     (json, human)
 }
 
-/// `saved list [--filter in_progress|completed|archived] [--limit N]`
+/// Normalize CLI filter aliases (`in_progress` -> `saved`) to Slack's `saved.list` values.
+pub(crate) fn normalize_saved_filter(filter: &str) -> &str {
+    match filter.trim() {
+        "in_progress" | "" => "saved",
+        other => other,
+    }
+}
+
+/// `saved list [--filter saved|completed|archived] [--limit N]`
 pub async fn run_saved_list(
     ctx: &Ctx,
     flag: Option<&str>,
@@ -115,6 +123,7 @@ pub async fn run_saved_list(
         Ok(pair) => pair,
         Err(exit) => return Ok(exit),
     };
+    let filter = normalize_saved_filter(filter);
     let items = match api.saved_list(filter, limit).await {
         Ok(items) => items,
         Err(err) => return Ok(api_fail(ctx, &err)),

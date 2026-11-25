@@ -61,7 +61,9 @@ pub(crate) use huddle::{
     format_huddle_screens, format_huddle_state,
 };
 #[cfg(test)]
-pub(crate) use saved::{format_mark_thread_output, format_saved_list, mark_thread_cursor};
+pub(crate) use saved::{
+    format_mark_thread_output, format_saved_list, mark_thread_cursor, normalize_saved_filter,
+};
 #[cfg(test)]
 pub(crate) use session::{classify_api_error, display_channel, resolve_channel_with};
 #[cfg(test)]

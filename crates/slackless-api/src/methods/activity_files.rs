@@ -546,8 +546,7 @@ impl SlackApi {
             .as_deref()
             .or(file.url_private_download.as_deref())
         {
-            let bytes = self.download_file(url).await?;
-            String::from_utf8_lossy(&bytes).into_owned()
+            self.download_html_file(url).await?
         } else {
             match self.canvases_get_content(file_id, Some("html")).await {
                 Ok(html) => html,

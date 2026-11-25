@@ -653,8 +653,13 @@ fn saved_mark_thread_and_files_formatters_cover_edge_cases() {
             message: None,
         },
     ];
-    let (json, human) = format_saved_list("in_progress", &saved_items);
-    assert_eq!(json["filter"], "in_progress");
+    assert_eq!(normalize_saved_filter("in_progress"), "saved");
+    assert_eq!(normalize_saved_filter(""), "saved");
+    assert_eq!(normalize_saved_filter("saved"), "saved");
+    assert_eq!(normalize_saved_filter("completed"), "completed");
+    assert_eq!(normalize_saved_filter("archived"), "archived");
+    let (json, human) = format_saved_list("saved", &saved_items);
+    assert_eq!(json["filter"], "saved");
     assert_eq!(json["count"], 2);
     assert_eq!(json["items"][0]["state"], "inprogress");
     assert_eq!(json["items"][0]["text"], "follow up");

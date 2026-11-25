@@ -11,9 +11,9 @@ use super::meta::{
     FileTileTone, INLINE_MAX_BYTES, MAX_THUMB_H, MAX_THUMB_W, SNIPPET_MAX_EXPANDED_LINES,
     audio_wave_bars, clip_vtt_url, download_url, external_provider_label, external_subtitle,
     file_ext, file_icon_kind, file_name, fit, format_duration, human_size, inline_allowed,
-    inline_clip_transcript, is_audio, is_snippet, is_video, media_duration_ms, parse_webvtt,
-    remote_thumbnail, snippet_hidden_lines, snippet_is_truncated, snippet_lines,
-    snippet_visible_and_omitted,
+    inline_clip_transcript, is_audio, is_decodable_image_url, is_snippet, is_video,
+    media_duration_ms, parse_webvtt, remote_thumbnail, snippet_hidden_lines, snippet_is_truncated,
+    snippet_lines, snippet_visible_and_omitted, video_poster_url,
 };
 use super::snippet::{SnippetCard, SnippetStore};
 use crate::blockkit::serde_json::json;
@@ -119,6 +119,36 @@ fn file_classification_naming_urls_and_icon_kinds() {
         ..Default::default()
     };
     assert_eq!(remote_thumbnail(&non_img), None);
+
+    // Non-image container URLs (e.g. `.mp4` `thumb_video`, `.heic` originals) are skipped.
+    assert!(is_decodable_image_url(
+        "https://files.slack.com/files-tmb/T1-F1/img_720.jpg"
+    ));
+    assert!(is_decodable_image_url(
+        "https://files.slack.com/files-tmb/T1-F1/img_720.png?t=123"
+    ));
+    assert!(!is_decodable_image_url(
+        "https://files.slack.com/files-tmb/T1-F1/img_2040.mp4"
+    ));
+    assert!(!is_decodable_image_url(
+        "https://files.slack.com/files-pri/T1-F1/img_1217.HEIC"
+    ));
+    let video_with_mp4_thumb = File {
+        mimetype: Some("video/mp4".into()),
+        thumb_video: Some("https://files.slack.com/files-tmb/T1-F1/clip.mp4".into()),
+        thumb_480: Some("https://files.slack.com/files-tmb/T1-F1/clip_480.jpg".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        video_poster_url(&video_with_mp4_thumb).as_deref(),
+        Some("https://files.slack.com/files-tmb/T1-F1/clip_480.jpg")
+    );
+    let video_only_mp4_thumb = File {
+        mimetype: Some("video/mp4".into()),
+        thumb_video: Some("https://files.slack.com/files-tmb/T1-F1/clip.mp4".into()),
+        ..Default::default()
+    };
+    assert_eq!(video_poster_url(&video_only_mp4_thumb), None);
 
     // Audio / video detection by mimetype and filetype.
     assert!(is_audio(&File {

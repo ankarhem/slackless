@@ -89,6 +89,7 @@ use crate::app::App;
 use crate::bridge::CoreBridge;
 
 fn main() {
+    slackless_core::huddle::install_default_crypto_provider();
     if std::env::args().any(|arg| arg == sign_in::FLAG) {
         std::process::exit(sign_in::run_helper());
     }

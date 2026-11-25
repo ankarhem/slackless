@@ -29,6 +29,53 @@ pub(crate) fn download_url(file: &File) -> Option<String> {
         .or_else(|| file.url_private.clone())
 }
 
+/// Returns `false` for media container/format URLs that GPUI's `image` + `usvg` loader cannot
+/// decode as a static or animated image (such as `.mp4` `thumb_video` clips or `.heic` originals),
+/// preventing noisy `gpui::asset_cache` decode errors and allowing clean fallback to JPEG/PNG
+/// thumbnails.
+pub(crate) fn is_decodable_image_url(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    !matches!(
+        path.rsplit_once('.').map(|(_, ext)| ext),
+        Some(
+            "mp4"
+                | "mov"
+                | "webm"
+                | "mkv"
+                | "avi"
+                | "m4v"
+                | "mp3"
+                | "m4a"
+                | "wav"
+                | "aac"
+                | "ogg"
+                | "flac"
+                | "opus"
+                | "heic"
+                | "heif"
+                | "pdf"
+        )
+    )
+}
+
+/// Static poster image URL for a video card, skipping non-image `thumb_video` `.mp4` URLs.
+pub(super) fn video_poster_url(file: &File) -> Option<String> {
+    [
+        file.thumb_video.as_deref(),
+        file.thumb_480.as_deref(),
+        file.thumb_360.as_deref(),
+        file.thumb_720.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|url| is_decodable_image_url(url))
+    .map(str::to_owned)
+}
+
 /// A live image's thumbnail URL, sized for the inline preview on a 2x display; for a GIF its
 /// animated rendition, which Slack plays inline.
 pub(super) fn remote_thumbnail(file: &File) -> Option<String> {
@@ -39,12 +86,17 @@ pub(super) fn remote_thumbnail(file: &File) -> Option<String> {
     {
         return None;
     }
-    file.thumb_480_gif
-        .clone()
-        .or_else(|| file.thumb_360_gif.clone())
-        .or_else(|| file.thumb_480.clone())
-        .or_else(|| file.thumb_360.clone())
-        .or_else(|| file.thumb_720.clone())
+    [
+        file.thumb_480_gif.as_deref(),
+        file.thumb_360_gif.as_deref(),
+        file.thumb_480.as_deref(),
+        file.thumb_360.as_deref(),
+        file.thumb_720.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|url| is_decodable_image_url(url))
+    .map(str::to_owned)
 }
 
 pub(super) fn is_audio(file: &File) -> bool {

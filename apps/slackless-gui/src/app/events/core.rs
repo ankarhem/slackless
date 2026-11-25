@@ -167,7 +167,9 @@ impl App {
                     self.drafts.update(cx, |drafts, cx| {
                         drafts.drop_pending_scheduled(workspace, cx)
                     });
-                    notify("Could not schedule message", error.clone(), window, cx);
+                }
+                if let Some(title) = user_facing_error_title(error) {
+                    notify(title, error.clone(), window, cx);
                 }
             }
             Event::BotProfileLoaded { bot_id, profile } => {
@@ -743,6 +745,100 @@ impl App {
                 cx.notify();
             }
             _ => {}
+        }
+    }
+}
+
+/// Maps user-triggered mutation error prefixes to a toast title so failures surface in the UI,
+/// while keeping background hydration/sync/presence/websocket errors log-only.
+pub(crate) fn user_facing_error_title(error: &str) -> Option<&'static str> {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("chat.scheduleMessage:", "Could not schedule message"),
+        (
+            "chat.deleteScheduledMessage:",
+            "Could not cancel scheduled message",
+        ),
+        ("chat.postMessage:", "Could not send message"),
+        ("chat.update:", "Could not edit message"),
+        ("chat.delete:", "Could not delete message"),
+        ("reactions.add:", "Could not add reaction"),
+        ("reactions.remove:", "Could not remove reaction"),
+        ("files.upload:", "Could not upload file"),
+        ("files.delete:", "Could not delete file"),
+        ("files.undelete:", "Could not restore file"),
+        ("canvases.create:", "Could not create canvas"),
+        ("conversations.canvases.create:", "Could not create canvas"),
+        ("canvases.edit:", "Could not save canvas"),
+        ("canvases.delete:", "Could not delete canvas"),
+        ("canvases.access.set:", "Could not share canvas"),
+        ("canvases.access.delete:", "Could not update canvas access"),
+        ("canvas.comment.post:", "Could not post comment"),
+        ("quip.thread.", "Could not update comment thread"),
+        ("lists.create:", "Could not create list"),
+        ("lists.records.", "Could not update list"),
+        ("lists.cells.update:", "Could not update list cell"),
+        ("lists.addToList:", "Could not add to list"),
+        ("pins.add:", "Could not pin message"),
+        ("pins.remove:", "Could not unpin message"),
+        ("bookmarks.add:", "Could not add bookmark"),
+        ("bookmarks.remove:", "Could not remove bookmark"),
+        ("saved.add", "Could not save for later"),
+        ("saved.update:", "Could not update saved item"),
+        ("saved.delete:", "Could not remove saved item"),
+        ("conversations.create:", "Could not create channel"),
+        ("conversations.rename:", "Could not rename channel"),
+        ("conversations.archive:", "Could not archive channel"),
+        ("conversations.unarchive:", "Could not unarchive channel"),
+        ("conversations.invite:", "Could not invite member"),
+        ("conversations.setTopic:", "Could not update topic"),
+        ("conversations.setPurpose:", "Could not update description"),
+        ("users.profile.set:", "Could not update profile"),
+        ("users.setPhoto:", "Could not update profile photo"),
+        ("dnd.setSnooze:", "Could not pause notifications"),
+        ("rooms.join:", "Could not join huddle"),
+    ];
+    PREFIXES
+        .iter()
+        .find_map(|(prefix, title)| error.starts_with(prefix).then_some(*title))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_facing_error_title;
+
+    #[test]
+    fn user_facing_error_title_surfaces_mutations_and_hides_background_noise() {
+        assert_eq!(
+            user_facing_error_title("chat.scheduleMessage: slack api error: invalid_arguments"),
+            Some("Could not schedule message")
+        );
+        assert_eq!(
+            user_facing_error_title("chat.postMessage: network error"),
+            Some("Could not send message")
+        );
+        assert_eq!(
+            user_facing_error_title("canvases.access.set: slack api error: not_allowed"),
+            Some("Could not share canvas")
+        );
+        assert_eq!(
+            user_facing_error_title("rooms.join: slack api error: cannot_huddle_here"),
+            Some("Could not join huddle")
+        );
+        // Background sync/hydration/presence noise must stay log-only.
+        for bg in [
+            "websocket: connection reset",
+            "bots.info: slack api error: bot_not_found",
+            "users.info: timeout",
+            "typing: socket closed",
+            "presence_sub: timeout",
+            "backfill C1: timeout",
+            "client.counts: timeout",
+        ] {
+            assert_eq!(
+                user_facing_error_title(bg),
+                None,
+                "unexpected toast for {bg}"
+            );
         }
     }
 }

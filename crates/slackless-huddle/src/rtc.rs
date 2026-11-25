@@ -1396,10 +1396,16 @@ mod tests {
             .await
             .expect("ChimeRtcPeer builds against mock TURN");
 
+        let gather_start = std::time::Instant::now();
         let offer_sdp = peer
             .create_gathered_offer()
             .await
             .expect("initial gathered relay offer succeeds");
+        assert!(
+            gather_start.elapsed() < Duration::from_secs(3),
+            "initial relay gather stalled for {:?}",
+            gather_start.elapsed()
+        );
         assert!(
             allocations.load(Ordering::SeqCst) >= 1,
             "TURN allocation must occur"
@@ -1434,10 +1440,16 @@ mod tests {
         );
 
         // Renegotiate with 2 dynamic Recvonly video transceivers (mid 2 and mid 3).
+        let reneg_start = std::time::Instant::now();
         let (reneg_sdp, mids) = peer
             .prepare_video_receive_offer(2)
             .await
             .expect("renegotiation offer with 2 recvonly video slots succeeds");
+        assert!(
+            reneg_start.elapsed() < Duration::from_secs(2),
+            "renegotiation stalled for {:?}",
+            reneg_start.elapsed()
+        );
         assert_eq!(mids, vec!["2".to_owned(), "3".to_owned()]);
         assert!(
             reneg_sdp.contains("typ relay"),

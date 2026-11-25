@@ -366,12 +366,7 @@ pub(super) fn video_card(file: &File, cx: &App) -> Div {
     let id_str = file.id.to_string();
     let loading = crate::media::video_loading(&id_str, cx);
     let (w, h) = fit(file.original_w, file.original_h);
-    let poster_url = file
-        .thumb_video
-        .clone()
-        .or_else(|| file.thumb_480.clone())
-        .or_else(|| file.thumb_360.clone())
-        .or_else(|| file.thumb_720.clone());
+    let poster_url = super::meta::video_poster_url(file);
     let video_url = file
         .extra
         .get("mp4")

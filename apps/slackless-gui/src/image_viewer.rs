@@ -158,13 +158,19 @@ pub fn message_images(fixtures: &Fixtures, message: &Message) -> Vec<ImageEntry>
             Some(image) => ImageSource::Image(image.clone()),
             None => {
                 // The large rendition (url_private) or the biggest thumbnail, loaded
-                // through the app's authenticated HTTP client only while shown.
-                let url = file
+                // through the app's authenticated HTTP client only while shown. For formats GPUI
+                // cannot decode natively (e.g. `.heic`), prefer Slack's transcoded JPEG/PNG
+                // thumbnails first.
+                let preferred_original = file
                     .url_private
-                    .clone()
+                    .as_deref()
+                    .filter(|u| crate::files::is_decodable_image_url(u))
+                    .map(str::to_owned);
+                let url = preferred_original
                     .or_else(|| file.thumb_720.clone())
                     .or_else(|| file.thumb_480.clone())
-                    .or_else(|| file.thumb_360.clone());
+                    .or_else(|| file.thumb_360.clone())
+                    .or_else(|| file.url_private.clone());
                 match url {
                     Some(url) => ImageSource::from(SharedString::from(url)),
                     None => continue,

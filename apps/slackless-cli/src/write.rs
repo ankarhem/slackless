@@ -751,6 +751,40 @@ pub async fn run_scheduled(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `unschedule <channel> <id>`: cancels a pending scheduled message (`chat.deleteScheduledMessage`
+/// or `drafts.delete`).
+pub async fn run_unschedule(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    channel_arg: &str,
+    id: &str,
+) -> Result<ExitCode> {
+    let (api, workspace) = match api_for(ctx, flag) {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
+    let (channel, label) = resolve_channel_arg(&workspace, channel_arg);
+    match api.chat_delete_scheduled_message(&channel, id).await {
+        Ok(()) => {
+            output::emit(
+                ctx.json,
+                &serde_json::json!({
+                    "ok": true,
+                    "channel": channel.as_str(),
+                    "scheduled_message_id": id,
+                }),
+                &format!(
+                    "cancelled scheduled message {} in {}\n",
+                    id,
+                    label.unwrap_or_else(|| channel.to_string()),
+                ),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => Ok(api_fail(ctx, &err)),
+    }
+}
+
 /// The API client + workspace for a write; `Err` is the already-printed failure.
 fn api_for(ctx: &Ctx, flag: Option<&str>) -> Result<(SlackApi, TeamId), ExitCode> {
     let session = match resolve_session(flag) {

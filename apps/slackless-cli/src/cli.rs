@@ -196,6 +196,13 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "CHANNEL")]
         channel: Option<String>,
     },
+    /// Cancel a pending scheduled message (`chat.deleteScheduledMessage` / `drafts.delete`, needs a stored session).
+    Unschedule {
+        /// Channel id, #name, or @handle.
+        channel: String,
+        /// Scheduled message or draft ID returned by `schedule` or `scheduled`.
+        id: String,
+    },
     /// Show local SQLite archive statistics (offline).
     Stats {
         /// Include per-table row counts and the top 10 largest channels.
@@ -334,9 +341,9 @@ pub(crate) enum Commands {
 
 #[derive(Subcommand)]
 pub(crate) enum SavedCommand {
-    /// List saved items (`in_progress`, `completed`, or `archived`).
+    /// List saved items (`saved`, `completed`, or `archived`).
     List {
-        #[arg(long, default_value = "in_progress")]
+        #[arg(long, default_value = "saved")]
         filter: String,
         #[arg(long, default_value_t = 50)]
         limit: u32,

@@ -227,6 +227,20 @@ impl App {
                 }
                 true
             }
+            DeepLink::Huddle {
+                team_id,
+                channel_id,
+                ..
+            } => {
+                switch_team(self, team_id.as_deref(), window, cx);
+                let ch = ChannelId::from(channel_id.as_str());
+                if self.fixtures.conversation(&ch).is_none() {
+                    return false;
+                }
+                self.select(ch.clone(), cx);
+                self.join_huddle_in(ch, window, cx);
+                true
+            }
             DeepLink::Other { .. } => false,
         }
     }

@@ -19,6 +19,12 @@ pub enum DeepLink {
     Slack(SlackLink),
     /// `https://app.slack.com/client/<team>/<channel>[/<thread_ts>]`.
     WebClient(WebClientLink),
+    /// `https://app.slack.com/huddle/<team>/<channel>` or `slack://huddle?team=<team>&id=<channel>`.
+    Huddle {
+        team_id: Option<String>,
+        channel_id: String,
+        raw: String,
+    },
     /// A `slack://` link kind we do not model yet, preserved verbatim.
     Other { raw: String },
 }
@@ -29,6 +35,7 @@ impl DeepLink {
         match self {
             DeepLink::Slack(link) => &link.raw,
             DeepLink::WebClient(link) => &link.raw,
+            DeepLink::Huddle { raw, .. } => raw,
             DeepLink::Other { raw } => raw,
         }
     }
@@ -147,6 +154,20 @@ fn parse_slack(url: &Url, raw: &str) -> Result<DeepLink> {
             team_id: param("team").map(str::to_string),
             target_id: param("id").map(str::to_string),
         },
+        "huddle" => {
+            let channel_id = param("id")
+                .or_else(|| param("channel"))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    PlatformError::BadLink(format!("{raw}: huddle link without ?id="))
+                })?;
+            return Ok(DeepLink::Huddle {
+                team_id: param("team").map(str::to_string),
+                channel_id,
+                raw: raw.to_string(),
+            });
+        }
         // Unmodeled slack:// kind: keep it verbatim (patchable, not fatal).
         _ => {
             return Ok(DeepLink::Other {
@@ -183,6 +204,23 @@ fn parse_web_client(url: &Url, raw: &str) -> Result<DeepLink> {
         .collect();
 
     if host == "app.slack.com" {
+        if path.first().map(String::as_str) == Some("huddle") {
+            let team_id = path.get(1).filter(|s| !s.is_empty()).cloned();
+            let channel_id = path
+                .get(2)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .ok_or_else(|| {
+                    PlatformError::BadLink(format!(
+                        "{raw}: app.slack.com huddle link missing channel id"
+                    ))
+                })?;
+            return Ok(DeepLink::Huddle {
+                team_id,
+                channel_id,
+                raw: raw.to_string(),
+            });
+        }
         if path.first().map(String::as_str) != Some("client") {
             return Err(PlatformError::BadLink(format!(
                 "{raw}: app.slack.com link outside /client/"
@@ -534,6 +572,27 @@ mod tests {
                 thread_ts: None,
                 raw: "https://acme.slack.com/archives/C0456DEF".into(),
             })
+        );
+
+        let web_huddle =
+            parse_deep_link("https://app.slack.com/huddle/T02HD8VA1/C02QYDW99ML").unwrap();
+        assert_eq!(
+            web_huddle,
+            DeepLink::Huddle {
+                team_id: Some("T02HD8VA1".into()),
+                channel_id: "C02QYDW99ML".into(),
+                raw: "https://app.slack.com/huddle/T02HD8VA1/C02QYDW99ML".into(),
+            }
+        );
+
+        let slack_huddle = parse_deep_link("slack://huddle?team=T02HD8VA1&id=C02QYDW99ML").unwrap();
+        assert_eq!(
+            slack_huddle,
+            DeepLink::Huddle {
+                team_id: Some("T02HD8VA1".into()),
+                channel_id: "C02QYDW99ML".into(),
+                raw: "slack://huddle?team=T02HD8VA1&id=C02QYDW99ML".into(),
+            }
         );
     }
 }

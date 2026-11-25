@@ -40,7 +40,7 @@ use crate::commands::messages::{
 use crate::session::resolve_workspace;
 use crate::write::{
     run_delete, run_edit, run_mark_read, run_pin, run_pins, run_react, run_reply, run_schedule,
-    run_scheduled, run_send, run_thread_live, run_unreact, run_upload,
+    run_scheduled, run_send, run_thread_live, run_unreact, run_unschedule, run_upload,
 };
 
 /// Shared output mode for one invocation.
@@ -59,6 +59,7 @@ pub(crate) fn fail(ctx: &Ctx, code: &str, message: &str) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    slackless_core::huddle::install_default_crypto_provider();
     let cli = Cli::parse();
     let ctx = Ctx { json: cli.json };
     let flag = cli.workspace.clone();
@@ -160,6 +161,7 @@ async fn dispatch(
             thread_ts,
         } => run_schedule(ctx, flag, &channel, text, &at, thread_ts.as_deref()).await,
         Commands::Scheduled { channel } => run_scheduled(ctx, flag, channel.as_deref()).await,
+        Commands::Unschedule { channel, id } => run_unschedule(ctx, flag, &channel, &id).await,
         Commands::Stats { breakdown } => cmd_stats(ctx, workspace.as_ref(), breakdown),
         Commands::Vacuum => cmd_vacuum(ctx, workspace.as_ref()),
         Commands::Threads { channel, limit } => {

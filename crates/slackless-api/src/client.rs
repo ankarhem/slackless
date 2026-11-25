@@ -352,6 +352,39 @@ impl SlackApi {
         Ok(resp.bytes().await?)
     }
 
+    /// Downloads a Slack-hosted HTML document (such as a Canvas `url_private` export), sending
+    /// the `d` cookie only to trusted Slack file hosts. Rejects Slack sign-in redirects/pages
+    /// with [`ApiError::FileAuthRejected`].
+    pub async fn download_html_file(&self, url_private: &str) -> Result<String> {
+        let url = Url::parse(url_private)?;
+        if !self.is_trusted_file_url(&url) {
+            return Err(ApiError::UntrustedUrl(url_private.to_owned()));
+        }
+        let resp = self
+            .send_with_retry(|| {
+                Ok(self
+                    .http
+                    .get(url.clone())
+                    .header(COOKIE, self.cookie.clone())
+                    .build()?)
+            })
+            .await?;
+        let status = resp.status();
+        let final_path = resp.url().path().to_ascii_lowercase();
+        let body = resp.bytes().await?;
+        if !status.is_success() {
+            return Err(status_error(status, &body));
+        }
+        let text = String::from_utf8_lossy(&body).into_owned();
+        if final_path.starts_with("/signin")
+            || final_path.contains("/workspace-signin")
+            || is_slack_signin_html(&text)
+        {
+            return Err(ApiError::FileAuthRejected);
+        }
+        Ok(text)
+    }
+
     /// Uploads raw bytes to an external upload slot returned by `files.getUploadURLExternal`.
     /// No Slack session cookie or token is sent; retries on HTTP 429.
     pub(crate) async fn post_upload_bytes(&self, upload_url: &str, bytes: &[u8]) -> Result<()> {
@@ -510,6 +543,18 @@ fn encode_cookie(value: &str) -> String {
     } else {
         url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
     }
+}
+
+/// Heuristic for Slack's HTML sign-in interstitial returned when a file-host `d` cookie is
+/// rejected on an HTML document download (such as a Canvas `url_private` export).
+fn is_slack_signin_html(html: &str) -> bool {
+    let sample = &html[..html.floor_char_boundary(html.len().min(8192))];
+    let lower = sample.to_ascii_lowercase();
+    lower.contains("id=\"signin_form\"")
+        || lower.contains("data-qa=\"signin")
+        || lower.contains("action=\"/signin")
+        || lower.contains("<title>sign in")
+        || (lower.contains("sign in to") && lower.contains("slack.com/signin"))
 }
 
 #[cfg(test)]

@@ -385,6 +385,42 @@ async fn download_file_sends_only_the_cookie() {
 }
 
 #[tokio::test]
+async fn download_html_file_accepts_canvas_html_and_rejects_signin_interstitial() {
+    let (server, api) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T1-F0CANVAS/canvas"))
+        .and(header("cookie", COOKIE_HEADER))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!DOCTYPE html><html><body><h1 id='temp:C:1'>Roadmap</h1><p>Q4</p></body></html>",
+            "text/html; charset=utf-8",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T1-F0UNAUTH/canvas"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            "<!DOCTYPE html><html><head><title>Sign in | Slack</title></head><body><form id=\"signin_form\"></form></body></html>",
+            "text/html; charset=utf-8",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let html = api
+        .download_html_file(&format!("{}/files-pri/T1-F0CANVAS/canvas", server.uri()))
+        .await
+        .expect("canvas HTML download should succeed");
+    assert!(html.contains("<h1 id='temp:C:1'>Roadmap</h1>"));
+
+    let err = api
+        .download_html_file(&format!("{}/files-pri/T1-F0UNAUTH/canvas", server.uri()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::FileAuthRejected), "{err:?}");
+}
+
+#[tokio::test]
 async fn fetches_a_users_dnd_and_presence() {
     let (server, api) = setup().await;
     Mock::given(method("POST"))

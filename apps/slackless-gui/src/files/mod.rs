@@ -26,7 +26,7 @@ use media_cards::{audio_card, video_card};
 use meta::{inline_allowed, is_audio, is_snippet, is_video};
 use snippet::SnippetCard;
 
-pub(crate) use meta::{download_url, file_icon, fit, human_size};
+pub(crate) use meta::{download_url, file_icon, fit, human_size, is_decodable_image_url};
 
 /// The message's attachments, or `None` when it has no files. `on_open` makes image
 /// attachments open the viewer on click (the transcript and thread panel provide it; static

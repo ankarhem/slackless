@@ -39,10 +39,17 @@ pub struct ChimeSignalClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
-fn tls_connector() -> Result<Connector> {
-    // Ensure a process-wide default provider is registered when both `ring` and `aws-lc-rs`
-    // features are unified onto `rustls` across the workspace (e.g. `reqwest` + `slackless-huddle`).
+/// Installs `rustls`'s `ring` `CryptoProvider` as the process-wide default.
+///
+/// Safe to call repeatedly (subsequent calls are no-ops). Call once at binary startup so any
+/// crate that uses `rustls::ClientConfig::builder()` succeeds even when both `ring` and
+/// `aws-lc-rs` features are unified across the workspace.
+pub fn install_default_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn tls_connector() -> Result<Connector> {
+    install_default_crypto_provider();
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
@@ -1244,5 +1251,40 @@ mod tests {
         // Must succeed even when both `ring` and `aws-lc-rs` features are unified onto `rustls`.
         let connector = tls_connector().expect("explicit rustls ring connector should build");
         assert!(matches!(connector, Connector::Rustls(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_wss_uses_explicit_tls_connector_without_panicking() {
+        use tokio::net::TcpListener;
+
+        // Exercise the real `wss://` code path in `ChimeSignalClient::connect` against a local
+        // TCP listener that closes immediately after accept. The TLS handshake must fail cleanly
+        // with `HuddleError::Signaling` instead of panicking in `rustls` provider selection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let creds = HuddleCredentials {
+            channel: slackless_types::ChannelId::from("C1"),
+            call_id: "R1".into(),
+            meeting_id: "M1".into(),
+            attendee_id: "A1".into(),
+            external_user_id: "T1-R1-U1".into(),
+            join_token: "tok-wss".into(),
+            signaling_url: format!("wss://{addr}/control/M1"),
+            audio_host_url: "h:3478".into(),
+            turn_control_url: String::new(),
+            thread_root_ts: None,
+            canvas_file_id: None,
+            huddle_link: None,
+        };
+        let err = match ChimeSignalClient::connect(&creds).await {
+            Ok(_) => panic!("closing TCP socket must fail the wss:// handshake"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, HuddleError::Signaling(_)), "{err:?}");
+        server.await.unwrap();
     }
 }

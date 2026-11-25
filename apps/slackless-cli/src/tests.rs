@@ -373,7 +373,11 @@ fn cli_try_parse_from_covers_major_subcommands_globals_defaults_and_errors() {
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "saved", "list"]).unwrap().command,
-        Commands::Saved { command: SavedCommand::List { ref filter, limit: 50 } } if filter == "in_progress"
+        Commands::Saved { command: SavedCommand::List { ref filter, limit: 50 } } if filter == "saved"
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["slackless", "unschedule", "#eng", "Dr01"]).unwrap().command,
+        Commands::Unschedule { ref channel, ref id } if channel == "#eng" && id == "Dr01"
     ));
     assert!(matches!(
         Cli::try_parse_from(["slackless", "canvas", "read", "F1", "--html"])
