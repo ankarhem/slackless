@@ -874,10 +874,12 @@ impl Render for FilesPage {
                 }
             }
         } else {
-            let this = cx.weak_entity();
-            let self_user = self.fixtures.self_user.clone();
-            let favorites = &self.favorites;
-            let collections = &self.collections;
+            let row_ctx = FileRowCtx {
+                self_user: &self.fixtures.self_user,
+                favorites: &self.favorites,
+                collections: &self.collections,
+                page: cx.weak_entity(),
+            };
             v_flex()
                 .rounded_lg()
                 .border_1()
@@ -885,16 +887,7 @@ impl Render for FilesPage {
                 .overflow_hidden()
                 .children(self.shown.iter().enumerate().map(|(position, &index)| {
                     let file = &rows.files[index];
-                    file_row(
-                        file,
-                        &rows.meta[index],
-                        position > 0,
-                        &self_user,
-                        favorites.contains(file.id.as_str()),
-                        collections,
-                        this.clone(),
-                        cx,
-                    )
+                    file_row(file, &rows.meta[index], position > 0, &row_ctx, cx)
                 }))
                 .into_any_element()
         };
@@ -1146,20 +1139,28 @@ fn open_new_collection_dialog(
     );
 }
 
+/// Shared page state passed to [`file_row`] for rendering each file row.
+struct FileRowCtx<'a> {
+    self_user: &'a UserId,
+    favorites: &'a HashSet<String>,
+    collections: &'a [FileCollection],
+    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+}
+
 /// One file: type tile, bold name, and the "<owner> · Created <when>" line; opens canvases and
 /// lists in their native readers (other files in the browser), offers star/collection toggles
 /// (`F-CORE-133`), "Save for later" (`F-CORE-157`), and "Delete file" on user-owned files (`F-CORE-130`).
-#[allow(clippy::too_many_arguments)]
 fn file_row(
     file: &File,
     meta: &SharedString,
     divided: bool,
-    self_user: &UserId,
-    starred: bool,
-    collections: &[FileCollection],
-    page: gpui_kit::gpui::WeakEntity<FilesPage>,
+    row_ctx: &FileRowCtx<'_>,
     cx: &App,
 ) -> Stateful<Div> {
+    let self_user = row_ctx.self_user;
+    let starred = row_ctx.favorites.contains(file.id.as_str());
+    let collections = row_ctx.collections;
+    let page = row_ctx.page.clone();
     let theme = cx.theme();
     let (icon, tile) = file_icon(file, cx);
     let file_id = file.id.to_string();

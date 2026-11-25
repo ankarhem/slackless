@@ -6,10 +6,10 @@ use std::sync::OnceLock;
 use gpui_kit::assets::IconName;
 
 /// One catalog emoji: Slack shortcode, default glyph, and whether it takes a skin tone.
-pub struct Emoji {
-    pub name: &'static str,
-    pub glyph: &'static str,
-    pub skin: bool,
+pub(super) struct Emoji {
+    pub(super) name: &'static str,
+    pub(super) glyph: &'static str,
+    pub(super) skin: bool,
 }
 
 const fn e(name: &'static str, glyph: &'static str) -> Emoji {
@@ -413,9 +413,136 @@ pub(super) fn lookup(name: &str) -> Option<&'static Emoji> {
     map.get(name).copied()
 }
 
-/// Slack-specific shortcode names that differ from the GitHub/CLDR shortcodes in `emojis`.
+/// Standalone Fitzpatrick skin-tone swatch shortcodes (`:skin-tone-2:`..`:skin-tone-6:`).
+pub(super) fn skin_tone_swatch(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "skin-tone-2" | "skin_tone_2" => "\u{1F3FB}",
+        "skin-tone-3" | "skin_tone_3" => "\u{1F3FC}",
+        "skin-tone-4" | "skin_tone_4" => "\u{1F3FD}",
+        "skin-tone-5" | "skin_tone_5" => "\u{1F3FE}",
+        "skin-tone-6" | "skin_tone_6" => "\u{1F3FF}",
+        _ => return None,
+    })
+}
+
+/// Normalize an official Unicode CLDR emoji name (e.g. `"man mage"`, `"flag: Sweden"`,
+/// `"men’s room"`) into an underscored lowercase lookup key. When `strip_punct` is true,
+/// colons and apostrophes are dropped rather than converted into separators.
+fn normalize_cldr_name(name: &str, strip_punct: bool) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = true;
+    for ch in name.chars() {
+        if strip_punct && matches!(ch, ':' | '\'' | '\u{2019}') {
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !prev_sep {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// Lazily indexed map over every default/untone emoji in `emojis::iter()`, keyed by:
+/// 1. All GitHub shortcodes (`emoji.shortcodes()`) — inserted first so GitHub shortcodes
+///    take precedence on any collision.
+/// 2. Normalized Unicode CLDR names (`emoji.name()`), both separator-normalized and with
+///    `:` / `’` / `'` stripped (e.g. `"briefs"` -> 🩲, `"man_mage"` -> 🧙‍♂️,
+///    `"woman_mage"` -> 🧙‍♀️, `"person_shrugging"` -> 🤷, `"man_gesturing_no"` -> 🙅‍♂️).
+fn unicode_index() -> &'static HashMap<String, &'static emojis::Emoji> {
+    static INDEX: OnceLock<HashMap<String, &'static emojis::Emoji>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut map = HashMap::with_capacity(4096);
+        let default_emojis = emojis::iter().filter(|emoji| {
+            emoji.skin_tone().is_none() || emoji.skin_tone() == Some(emojis::SkinTone::Default)
+        });
+        for emoji in default_emojis.clone() {
+            for shortcode in emoji.shortcodes() {
+                map.entry(shortcode.to_owned()).or_insert(emoji);
+            }
+        }
+        for emoji in default_emojis {
+            let name = emoji.name();
+            let norm = normalize_cldr_name(name, false);
+            if !norm.is_empty() {
+                map.entry(norm).or_insert(emoji);
+            }
+            let stripped = normalize_cldr_name(name, true);
+            if !stripped.is_empty() {
+                map.entry(stripped).or_insert(emoji);
+            }
+        }
+        map
+    })
+}
+
+fn lookup_unicode_map(key: &str) -> Option<&'static emojis::Emoji> {
+    emojis::get_by_shortcode(key).or_else(|| unicode_index().get(key).copied())
+}
+
+/// Slack-specific (`iamcal/emoji-data`) shortcode names that differ from both GitHub and CLDR.
 fn slack_alias(name: &str) -> Option<&'static str> {
     Some(match name {
+        "simple_smile" => "slightly_smiling_face",
+        "thumbsup" | "thumbsup_all" => "+1",
+        "thumbsdown" => "-1",
+        "sleuth_or_spy" => "detective",
+        "man_in_business_suit_levitating" => "business_suit_levitating",
+        "speaking_head_in_silhouette" => "speaking_head",
+        "female-doctor" | "female_doctor" => "woman_health_worker",
+        "male-doctor" | "male_doctor" => "man_health_worker",
+        "female-office-worker" | "female_office_worker" => "woman_office_worker",
+        "male-office-worker" | "male_office_worker" => "man_office_worker",
+        "female-scientist" | "female_scientist" => "woman_scientist",
+        "male-scientist" | "male_scientist" => "man_scientist",
+        "female-technologist" | "female_technologist" => "woman_technologist",
+        "male-technologist" | "male_technologist" => "man_technologist",
+        "female-teacher" | "female_teacher" => "woman_teacher",
+        "male-teacher" | "male_teacher" => "man_teacher",
+        "female-student" | "female_student" => "woman_student",
+        "male-student" | "male_student" => "man_student",
+        "female-cook" | "female_cook" => "woman_cook",
+        "male-cook" | "male_cook" => "man_cook",
+        "female-artist" | "female_artist" => "woman_artist",
+        "male-artist" | "male_artist" => "man_artist",
+        "female-pilot" | "female_pilot" => "woman_pilot",
+        "male-pilot" | "male_pilot" => "man_pilot",
+        "female-astronaut" | "female_astronaut" => "woman_astronaut",
+        "male-astronaut" | "male_astronaut" => "man_astronaut",
+        "female-firefighter" | "female_firefighter" => "woman_firefighter",
+        "male-firefighter" | "male_firefighter" => "man_firefighter",
+        "female-judge" | "female_judge" => "woman_judge",
+        "male-judge" | "male_judge" => "man_judge",
+        "female-mechanic" | "female_mechanic" => "woman_mechanic",
+        "male-mechanic" | "male_mechanic" => "man_mechanic",
+        "female-farmer" | "female_farmer" => "woman_farmer",
+        "male-farmer" | "male_farmer" => "man_farmer",
+        "female-factory-worker" | "female_factory_worker" => "woman_factory_worker",
+        "male-factory-worker" | "male_factory_worker" => "man_factory_worker",
+        "female-singer" | "female_singer" => "woman_singer",
+        "male-singer" | "male_singer" => "man_singer",
+        "female-guard" | "female_guard" => "woman_guard",
+        "male-guard" | "male_guard" => "man_guard",
+        "female-detective" | "female_detective" => "woman_detective",
+        "male-detective" | "male_detective" => "man_detective",
+        "female-construction-worker" | "female_construction_worker" => "woman_construction_worker",
+        "male-construction-worker" | "male_construction_worker" => "man_construction_worker",
+        "female-police-officer" | "female_police_officer" => "woman_police_officer",
+        "male-police-officer" | "male_police_officer" => "man_police_officer",
+        "female_sign" => "female_sign",
+        "male_sign" => "male_sign",
+        "heavy_plus_sign" => "heavy_plus_sign",
+        "heavy_minus_sign" => "heavy_minus_sign",
+        "heavy_division_sign" => "heavy_division_sign",
+        "heavy_multiplication_x" => "heavy_multiplication_x",
+        "black_small_square" => "black_small_square",
+        "white_small_square" => "white_small_square",
         "spiral_calendar_pad" => "spiral_calendar",
         "spiral_note_pad" => "spiral_notepad",
         "knife_fork_plate" => "plate_with_cutlery",
@@ -435,123 +562,118 @@ fn slack_alias(name: &str) -> Option<&'static str> {
         "face_with_symbols_on_mouth" => "cursing_face",
         "rolling_on_the_floor_laughing" => "rofl",
         "smiling_face_with_3_hearts" => "smiling_face_with_three_hearts",
-        "partying_face" => "partying_face",
         "face_with_cowboy_hat" => "cowboy_hat_face",
-        "clown_face" => "clown_face",
         "man-shrugging" => "man_shrugging",
         "woman-shrugging" => "woman_shrugging",
         "man-facepalming" => "man_facepalming",
         "woman-facepalming" => "woman_facepalming",
-        "thumbsup_all" => "+1",
         "hankey" | "poop" | "shit" => "poop",
         "keycap_star" => "asterisk",
         "eject" => "eject_button",
         "black_square_for_stop" => "stop_button",
         "double_vertical_bar" => "pause_button",
         "black_circle_for_record" => "record_button",
-        "barber" => "barber",
-        "studio_microphone" => "studio_microphone",
-        "level_slider" => "level_slider",
-        "control_knobs" => "control_knobs",
         "film_frames" => "film_strip",
         "admission_tickets" => "tickets",
-        "stadium" => "stadium",
         "house_buildings" => "houses",
         "derelict_house_building" => "derelict_house",
-        "cityscape" => "cityscape",
-        "desert_island" => "desert_island",
-        "national_park" => "national_park",
-        "classical_building" => "classical_building",
-        "building_construction" => "building_construction",
         "linked_paperclips" => "paperclips",
         "lower_left_ballpoint_pen" => "pen",
         "lower_left_fountain_pen" => "fountain_pen",
         "lower_left_paintbrush" => "paintbrush",
         "lower_left_crayon" => "crayon",
-        "card_index_dividers" => "card_index_dividers",
-        "card_file_box" => "card_file_box",
-        "file_cabinet" => "file_cabinet",
-        "wastebasket" => "wastebasket",
-        "old_key" => "old_key",
-        "compression" => "clamp",
+        "compression" | "compression_clamp" => "clamp",
         "dagger_knife" => "dagger",
-        "crossed_swords" => "crossed_swords",
-        "shield" => "shield",
-        "hammer_and_wrench" => "hammer_and_wrench",
-        "pick" => "pick",
-        "chains" => "chains",
-        "gear" => "gear",
-        "alembic" => "alembic",
         "scales" => "balance_scale",
-        "couch_and_lamp" => "couch_and_lamp",
         "shopping_bags" => "shopping",
-        "bellhop_bell" => "bellhop_bell",
-        "bed" => "bed",
         "frame_with_picture" => "framed_picture",
-        "world_map" => "world_map",
-        "stopwatch" => "stopwatch",
-        "timer_clock" => "timer_clock",
-        "mantelpiece_clock" => "mantelpiece_clock",
-        "thermometer" => "thermometer",
-        "candle" => "candle",
-        "desktop_computer" => "desktop_computer",
-        "printer" => "printer",
         "three_button_mouse" => "computer_mouse",
-        "trackball" => "trackball",
-        "compression_clamp" => "clamp",
-        "label" => "label",
-        "bookmark_tabs" => "bookmark_tabs",
         "rolled_up_newspaper" => "newspaper_roll",
         "ballot_box_with_ballot" => "ballot_box",
         "white_frowning_face" => "frowning_face",
-        "slightly_smiling_face" => "slightly_smiling_face",
-        "slightly_frowning_face" => "slightly_frowning_face",
-        "upside_down_face" => "upside_down_face",
-        "zipper_mouth_face" => "zipper_mouth_face",
-        "money_mouth_face" => "money_mouth_face",
-        "nerd_face" => "nerd_face",
         "thinking_face" => "thinking",
-        "face_with_head_bandage" => "face_with_head_bandage",
-        "face_with_thermometer" => "face_with_thermometer",
         "robot_face" => "robot",
         "hugging_face" => "hugs",
-        "eye-in-speech-bubble" => "eye_speech_bubble",
+        "eye-in-speech-bubble" | "eye_in_speech_bubble" => "eye_speech_bubble",
         _ => return None,
     })
 }
 
-/// Every standard emoji beyond the picker's [`CATALOG`], by the `emojis` crate's GitHub
-/// shortcodes, which match Slack's for nearly all of them. Slack hyphenates multi-person
-/// sequences (`man-woman-girl-boy`) where GitHub underscores them, families under `family_`,
-/// prefixes colored circles/squares with `large_` (`large_yellow_circle` -> `yellow_circle`),
-/// and uses `male-`/`female-` where GitHub uses `man_`/`woman_`.
+/// Resolve a 2-letter ISO country code (`flag-se` / `flag_se`) into its regional-indicator pair.
+fn regional_flag(code: &str) -> Option<&'static emojis::Emoji> {
+    let bytes = code.as_bytes();
+    if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || !bytes[1].is_ascii_alphabetic() {
+        return None;
+    }
+    let a = char::from_u32(0x1F1E6 + u32::from(bytes[0].to_ascii_lowercase() - b'a'))?;
+    let b = char::from_u32(0x1F1E6 + u32::from(bytes[1].to_ascii_lowercase() - b'a'))?;
+    let mut flag = String::with_capacity(8);
+    flag.push(a);
+    flag.push(b);
+    emojis::get(&flag)
+}
+
+/// Every standard emoji beyond the picker's [`CATALOG`], resolved through GitHub shortcodes,
+/// normalized Unicode CLDR names, Slack `iamcal/emoji-data` aliases, `flag-XX` regional
+/// indicators, and Slack's gender/prefix conventions (`male_X`, `female_X`, `large_X`,
+/// `family_X`).
 pub(super) fn unicode_emoji(name: &str) -> Option<&'static emojis::Emoji> {
-    if let Some(emoji) = emojis::get_by_shortcode(name) {
+    if let Some(emoji) = lookup_unicode_map(name) {
         return Some(emoji);
     }
     if let Some(alias) = slack_alias(name)
-        && let Some(emoji) = emojis::get_by_shortcode(alias)
+        && let Some(emoji) = lookup_unicode_map(alias)
     {
         return Some(emoji);
     }
     let underscored = name.replace('-', "_");
-    if let Some(emoji) = emojis::get_by_shortcode(&underscored) {
+    if underscored != name {
+        if let Some(emoji) = lookup_unicode_map(&underscored) {
+            return Some(emoji);
+        }
+        if let Some(alias) = slack_alias(&underscored)
+            && let Some(emoji) = lookup_unicode_map(alias)
+        {
+            return Some(emoji);
+        }
+    }
+    if let Some(code) = underscored.strip_prefix("flag_")
+        && let Some(emoji) = regional_flag(code)
+    {
         return Some(emoji);
     }
     if let Some(stripped) = underscored.strip_prefix("large_")
-        && let Some(emoji) = emojis::get_by_shortcode(stripped)
+        && let Some(emoji) = lookup_unicode_map(stripped)
     {
         return Some(emoji);
     }
     if let Some(rest) = underscored.strip_prefix("female_")
-        && let Some(emoji) = emojis::get_by_shortcode(&format!("woman_{rest}"))
+        && let Some(emoji) = lookup_unicode_map(&format!("woman_{rest}"))
+            .or_else(|| lookup_unicode_map(&format!("{rest}_woman")))
     {
         return Some(emoji);
     }
     if let Some(rest) = underscored.strip_prefix("male_")
-        && let Some(emoji) = emojis::get_by_shortcode(&format!("man_{rest}"))
+        && let Some(emoji) = lookup_unicode_map(&format!("man_{rest}"))
+            .or_else(|| lookup_unicode_map(&format!("{rest}_man")))
     {
         return Some(emoji);
     }
-    emojis::get_by_shortcode(&format!("family_{underscored}"))
+    if let Some(rest) = underscored.strip_prefix("man_")
+        && let Some(emoji) = lookup_unicode_map(&format!("{rest}_man"))
+    {
+        return Some(emoji);
+    }
+    if let Some(rest) = underscored.strip_prefix("woman_")
+        && let Some(emoji) = lookup_unicode_map(&format!("{rest}_woman"))
+    {
+        return Some(emoji);
+    }
+    if let Some(rest) = underscored.strip_prefix("person_")
+        && let Some(emoji) =
+            lookup_unicode_map(rest).or_else(|| lookup_unicode_map(&format!("{rest}_person")))
+    {
+        return Some(emoji);
+    }
+    lookup_unicode_map(&format!("family_{underscored}"))
 }

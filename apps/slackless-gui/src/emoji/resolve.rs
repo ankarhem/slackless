@@ -6,7 +6,7 @@ use gpui_kit::gpui::{
     AnyElement, ImageSource, IntoElement as _, ParentElement as _, Pixels, Styled as _, div, px,
 };
 
-use super::catalog::{CATALOG, Emoji, FREQUENT_MAX, lookup, unicode_emoji};
+use super::catalog::{CATALOG, Emoji, FREQUENT_MAX, lookup, skin_tone_swatch, unicode_emoji};
 use super::picker::EmojiChoice;
 use crate::blockkit::{Json, serde_json};
 use crate::fixtures::Fixtures;
@@ -68,6 +68,7 @@ pub(crate) fn glyph(shortcode: &str) -> Option<&'static str> {
     let name = base_name(shortcode);
     lookup(name)
         .map(|emoji| emoji.glyph)
+        .or_else(|| skin_tone_swatch(name))
         .or_else(|| unicode_emoji(name).map(emojis::Emoji::as_str))
 }
 
@@ -77,6 +78,9 @@ pub(crate) fn display_glyph(shortcode: &str) -> Option<String> {
     let tone = tone_of(shortcode);
     if let Some(emoji) = lookup(name) {
         return Some(toned(emoji, tone));
+    }
+    if let Some(swatch) = skin_tone_swatch(name) {
+        return Some(swatch.to_owned());
     }
     let emoji = unicode_emoji(name)?;
     let emoji = skin_tone(tone)

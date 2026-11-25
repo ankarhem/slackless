@@ -26,8 +26,6 @@ mod resolve;
 #[cfg(test)]
 mod tests;
 
-#[allow(unused_imports)]
-pub use catalog::Emoji;
 pub(crate) use gifs::evict_gif_asset;
 pub use picker::{EmojiChoice, EmojiPicker, EmojiPickerEvent, PickerTab};
 pub(crate) use resolve::{
