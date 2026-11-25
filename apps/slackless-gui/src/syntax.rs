@@ -2,7 +2,7 @@
 //! snippet cards. Emits exact byte-length [`TokenKind`] spans summing to the input's byte length
 //! so GPUI [`gpui_kit::gpui::TextRun`]s preserve full text selection and copy fidelity.
 
-use gpui_kit::gpui::{Hsla, rgb};
+use gpui_kit::gpui::Hsla;
 
 /// Supported syntax-highlighting languages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,29 +144,7 @@ impl Lang {
 
 /// Map `kind` to a legible foreground color in dark or light mode.
 pub fn token_color(kind: TokenKind, dark: bool, fg: Hsla) -> Hsla {
-    match (kind, dark) {
-        (TokenKind::Plain, _) => fg,
-        (TokenKind::Keyword, true) => Hsla::from(rgb(0xFF_7B_72)),
-        (TokenKind::String, true) => Hsla::from(rgb(0xA5_D6_FF)),
-        (TokenKind::Number, true) => Hsla::from(rgb(0x79_C0_FF)),
-        (TokenKind::Comment, true) => Hsla::from(rgb(0x8B_94_9E)),
-        (TokenKind::Tag, true) => Hsla::from(rgb(0x7E_E7_87)),
-        (TokenKind::Attr, true) => Hsla::from(rgb(0x79_C0_FF)),
-        (TokenKind::Type, true) => Hsla::from(rgb(0xFF_A6_57)),
-        (TokenKind::DiffAdd, true) => Hsla::from(rgb(0x7E_E7_87)),
-        (TokenKind::DiffDel, true) => Hsla::from(rgb(0xFF_A1_98)),
-        (TokenKind::DiffHunk, true) => Hsla::from(rgb(0xD2_A8_FF)),
-        (TokenKind::Keyword, false) => Hsla::from(rgb(0xCF_22_2E)),
-        (TokenKind::String, false) => Hsla::from(rgb(0x0A_30_69)),
-        (TokenKind::Number, false) => Hsla::from(rgb(0x05_50_AE)),
-        (TokenKind::Comment, false) => Hsla::from(rgb(0x6E_77_81)),
-        (TokenKind::Tag, false) => Hsla::from(rgb(0x11_63_29)),
-        (TokenKind::Attr, false) => Hsla::from(rgb(0x05_50_AE)),
-        (TokenKind::Type, false) => Hsla::from(rgb(0x95_38_00)),
-        (TokenKind::DiffAdd, false) => Hsla::from(rgb(0x11_63_29)),
-        (TokenKind::DiffDel, false) => Hsla::from(rgb(0xCF_22_2E)),
-        (TokenKind::DiffHunk, false) => Hsla::from(rgb(0x82_50_DF)),
-    }
+    crate::theme::syntax_token_color(kind, dark, fg)
 }
 
 /// Tokenize `code` for `lang`, returning merged `(byte_len, TokenKind)` spans whose lengths sum

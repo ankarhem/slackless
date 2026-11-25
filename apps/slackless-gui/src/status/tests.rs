@@ -210,3 +210,12 @@ fn rejects_non_times() {
     assert_eq!(until("-4 pm"), None);
     assert_eq!(until("4:"), None);
 }
+
+#[test]
+fn focus_preset_out_of_bounds_falls_back_safely() {
+    let mut state = SelfState::default();
+    state.start_focus_with_status(999, true);
+    assert_eq!(state.focus_preset, super::FOCUS_UNTIL_OFF);
+    assert_eq!(state.focus_until, Some(i64::MAX));
+    assert!(state.focused());
+}

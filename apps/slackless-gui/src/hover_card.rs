@@ -20,10 +20,11 @@ use gpui_kit::gpui::{
     MouseDownEvent, ParentElement as _, Pixels, Point, SharedString, Size, Stateful,
     StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, point, px,
 };
-use slackless_core::types::{Presence, UserId};
+use slackless_core::types::UserId;
 
 use crate::app::App as Root;
 use crate::fixtures::Fixtures;
+use crate::profile::{DerivedStatus, derive_user_profile};
 use crate::status::SelfState;
 
 /// How long the pointer must rest on a trigger before the card shows, so sweeping the mouse
@@ -145,77 +146,22 @@ pub(crate) struct Profile {
 }
 
 /// A custom status line: emoji shortcode (colons trimmed) and text.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Status {
-    pub emoji: String,
-    pub text: String,
-}
+pub(crate) type Status = DerivedStatus;
 
-/// Derive the card for `user_id`: the signed-in user reads their status and presence from
-/// `self_state`; anyone else from their profile (`status_expiration` respected, like the
-/// author line's emoji) and the workspace's presence map.
+/// Derive the card for `user_id` via the shared [`derive_user_profile`] helper: the signed-in
+/// user reads their status and presence from `self_state`; anyone else from their profile
+/// (`status_expiration` respected, like the author line's emoji) and the workspace's presence map.
 pub(crate) fn derive(fixtures: &Fixtures, self_state: &SelfState, user_id: &UserId) -> Profile {
-    let is_self = *user_id == fixtures.self_user;
-    let user = fixtures.user(user_id);
-    let name = user
-        .map(|user| fixtures.name_of(user).to_owned())
-        .unwrap_or_else(|| user_id.as_str().to_owned());
-    let pronouns = fixtures
-        .profile_extras
-        .get(user_id)
-        .and_then(|extras| extras.pronouns.clone());
-    let title = user
-        .and_then(|user| user.profile.title.clone())
-        .filter(|title| !title.is_empty());
-    // Slack's presence: a filled green dot when active, a hollow ring when away (an
-    // unknown presence reads as away, like the profile pane's).
-    let away = if is_self {
-        self_state.away
-    } else {
-        matches!(fixtures.presence(user_id), Some(Presence::Away) | None)
-    };
-    let active = user.filter(|user| !user.deleted).map(|_| !away);
-    let status = if is_self {
-        self_state.status.as_ref().map(|status| Status {
-            emoji: status.emoji.to_owned(),
-            text: status.text.clone(),
-        })
-    } else {
-        user.and_then(|user| {
-            let profile = &user.profile;
-            let unexpired = profile
-                .status_expiration
-                .is_none_or(|end| end == 0 || end > crate::messages::now_secs());
-            let text = profile
-                .status_text
-                .clone()
-                .filter(|text| !text.is_empty())?;
-            unexpired.then(|| Status {
-                emoji: profile
-                    .status_emoji
-                    .clone()
-                    .unwrap_or_default()
-                    .trim_matches(':')
-                    .to_owned(),
-                text,
-            })
-        })
-    };
-    let local_time = user.and_then(|user| user.tz_offset).map(|offset| {
-        format!(
-            "{} local time",
-            crate::messages::clock(crate::messages::now_secs(), Some(offset))
-        )
-    });
+    let derived = derive_user_profile(fixtures, self_state, user_id, None);
     Profile {
-        name,
-        pronouns,
-        title,
-        active,
-        status,
-        local_time,
-        is_self,
-        can_message: !is_self && user.is_some_and(|user| !user.deleted),
+        name: derived.name,
+        pronouns: derived.pronouns,
+        title: derived.title,
+        active: derived.active,
+        status: derived.status,
+        local_time: derived.local_time.map(|(time, _)| time),
+        is_self: derived.is_self,
+        can_message: derived.can_message,
     }
 }
 

@@ -1,6 +1,6 @@
 //! Preferences > Audio & video section view.
 
-use super::super::*;
+use super::*;
 
 impl Preferences {
     fn device_choice_button(

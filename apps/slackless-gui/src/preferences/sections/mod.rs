@@ -7,7 +7,24 @@ mod general;
 mod notifications;
 mod updates;
 
+use gpui_kit::assets::IconName;
+use gpui_kit::base::Disableable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Textarea;
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
+use gpui_kit::gpui::prelude::FluentBuilder as _;
+use gpui_kit::gpui::{
+    Context, Div, Edges, ElementId, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, PathPromptOptions, SharedString, Stateful, StatefulInteractiveElement as _,
+    Styled as _, anchored, deferred, div, px,
+};
+
+use super::settings::{
+    DENSITY, ENTER_OPTIONS, LANGUAGES, MARK_READ, NAMES, OPEN_LINKS, SHOW, SKIN_TONES, SORTS,
+    SOUNDS, TAB_STYLES, ZONES, ZOOM,
+};
 use super::*;
+use crate::theme::{CUSTOM_ACCENTS, CUSTOM_SIDEBARS};
 
 impl Preferences {
     pub(super) fn nav(&self, cx: &mut Context<Self>) -> Div {

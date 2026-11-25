@@ -114,14 +114,14 @@ pub(super) fn video_block(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) -> Div {
                         div()
                             .size(px(40.))
                             .rounded_full()
-                            .bg(gpui_kit::gpui::hsla(0., 0., 0., 0.68))
+                            .bg(crate::theme::media_overlay_scrim_strong())
                             .flex()
                             .items_center()
                             .justify_center()
                             .child(
                                 Icon::new(IconName::Play)
                                     .size(px(18.))
-                                    .text_color(gpui_kit::gpui::hsla(0., 0., 1., 0.95)),
+                                    .text_color(crate::theme::media_overlay_foreground()),
                             ),
                     ),
             );
@@ -1069,17 +1069,17 @@ pub(super) fn list_record_element(raw: &Json, ix: usize, kcx: &KitCx, cx: &App) 
 /// Parse `#RGB` or `#RRGGBB` hex string into GPUI `Hsla` for Block Kit `color` elements (`F-COLLAB-743`).
 pub(super) fn parse_hex_color(raw: &str) -> Option<Hsla> {
     let hex = raw.trim().trim_start_matches('#');
-    let rgb_u32 = match hex.len() {
-        6 => u32::from_str_radix(hex, 16).ok()?,
-        3 => {
-            let r = u32::from_str_radix(&hex[0..1], 16).ok()?;
-            let g = u32::from_str_radix(&hex[1..2], 16).ok()?;
-            let b = u32::from_str_radix(&hex[2..3], 16).ok()?;
-            ((r * 17) << 16) | ((g * 17) << 8) | (b * 17)
+    if hex.len() == 3 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let mut expanded = [0u8; 6];
+        for (i, b) in hex.bytes().enumerate() {
+            expanded[i * 2] = b;
+            expanded[i * 2 + 1] = b;
         }
-        _ => return None,
-    };
-    Some(gpui_kit::gpui::rgb(rgb_u32).into())
+        return std::str::from_utf8(&expanded)
+            .ok()
+            .and_then(crate::messages::hex_color);
+    }
+    crate::messages::hex_color(hex)
 }
 
 /// Block Kit `color` element (`F-COLLAB-743`): inline swatch pill with parsed color dot + hex label.

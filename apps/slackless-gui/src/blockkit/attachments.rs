@@ -317,14 +317,14 @@ fn link_unfurl(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> Div 
                             div()
                                 .size(px(32.))
                                 .rounded_full()
-                                .bg(gpui_kit::gpui::hsla(0., 0., 0., 0.62))
+                                .bg(crate::theme::media_overlay_scrim())
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .child(
                                     Icon::new(IconName::Play)
                                         .size(px(14.))
-                                        .text_color(gpui_kit::gpui::hsla(0., 0., 1., 0.95)),
+                                        .text_color(crate::theme::media_overlay_foreground()),
                                 ),
                         )
                         .when_some(target, |el, url| {
@@ -399,15 +399,7 @@ fn attachment_card(attachment: &Attachment, n: usize, kcx: &KitCx, cx: &App) -> 
         return message_unfurl(attachment, n, kcx, cx);
     }
     // A page preview (no app behind it, no colour bar): Slack's link card.
-    let is_page_preview = attachment.from_url.is_some()
-        && attachment.service_name.is_some()
-        && attachment.color.is_none()
-        && attachment
-            .extra
-            .get("is_app_unfurl")
-            .and_then(|value| value.as_bool())
-            != Some(true);
-    if is_page_preview {
+    if is_page_preview_attachment(attachment) {
         return link_unfurl(attachment, n, kcx, cx);
     }
     let theme = cx.theme();

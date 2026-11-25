@@ -1,6 +1,6 @@
 //! Preferences > Advanced section view and network diagnostics.
 
-use super::super::*;
+use super::*;
 
 impl Preferences {
     pub(super) fn advanced(&mut self, cx: &mut Context<Self>) -> Div {

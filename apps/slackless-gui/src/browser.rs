@@ -9,18 +9,17 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, TextareaState};
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::gpui::prelude::FluentBuilder as _;
 use gpui_kit::gpui::{
-    AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
+    AnyElement, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
     Styled as _, Subscription, Window, div, px,
 };
-use slackless_core::types::{ChannelId, Conversation, ConversationKind};
+use slackless_core::types::{ChannelId, Conversation};
 
+use crate::directory_rows::{ChannelRowSpec, filter_channels, render_channel_row};
 use crate::fixtures::Fixtures;
 
 pub enum ChannelBrowserEvent {
@@ -80,115 +79,33 @@ impl ChannelBrowser {
 
     /// Every channel matching the filter (name or topic, case-insensitive), by name.
     fn visible(&self, cx: &Context<Self>) -> Vec<Conversation> {
-        let needle = self.filter.read(cx).value().trim().to_lowercase();
-        let mut channels: Vec<Conversation> = self
-            .fixtures
-            .channels
-            .iter()
-            .chain(&self.fixtures.directory)
-            .filter(|c| {
-                needle.is_empty()
-                    || c.name
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .contains(&needle)
-                    || c.topic
-                        .as_ref()
-                        .is_some_and(|t| t.value.to_lowercase().contains(&needle))
-            })
-            .cloned()
-            .collect();
-        channels.sort_by(|a, b| a.name.cmp(&b.name));
-        channels
+        let needle = self.filter.read(cx).value();
+        filter_channels(&self.fixtures, &needle)
     }
 
-    fn row(&self, conversation: &Conversation, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        let (foreground, muted, success, border, hover) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.success,
-            theme.border,
-            theme.accent,
-        );
+    fn row(&self, conversation: &Conversation, cx: &mut Context<Self>) -> AnyElement {
         let id = conversation.id.clone();
-        let member = self.is_member(conversation);
-        let icon = if conversation.kind() == ConversationKind::PrivateChannel {
-            IconName::Lock
-        } else {
-            IconName::Hash
-        };
-        let members = conversation.num_members.unwrap_or(0);
-        let topic = conversation
-            .topic
-            .as_ref()
-            .map(|t| t.value.clone())
-            .unwrap_or_default();
-        let meta = if topic.is_empty() {
-            format!("{members} members")
-        } else {
-            format!("{members} members · {topic}")
-        };
-
-        let action = if member {
-            h_flex()
-                .flex_none()
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(success)
-                .child(Icon::new(IconName::Check).text_color(success).size(px(14.)))
-                .child("Joined")
-                .into_any_element()
-        } else {
-            let join_id = id.clone();
-            Button::new(SharedString::from(format!("join-{id}")))
-                .primary()
-                .label("Join")
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.joined.insert(join_id.clone());
-                    cx.emit(ChannelBrowserEvent::Join(join_id.clone()));
-                    cx.notify();
-                }))
-                .into_any_element()
-        };
-
+        let join_id = id.clone();
         let open_id = id.clone();
-        h_flex()
-            .id(SharedString::from(format!("browse-{id}")))
-            .items_center()
-            .gap_3()
-            .px_4()
-            .py_2p5()
-            .border_b_1()
-            .border_color(border)
-            .cursor_pointer()
-            .hover(|row| row.bg(hover))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .text_color(foreground)
-                            .child(Icon::new(icon).text_color(foreground).size(px(14.)))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(conversation.name.clone().unwrap_or_default()),
-                            ),
-                    )
-                    .child(div().truncate().text_xs().text_color(muted).child(meta)),
-            )
-            .child(action)
-            .on_click(cx.listener(move |_, _, _, cx| {
+        render_channel_row(
+            conversation,
+            ChannelRowSpec {
+                row_id: SharedString::from(format!("browse-{id}")).into(),
+                join_id: SharedString::from(format!("join-{id}")),
+                is_member: self.is_member(conversation),
+                inline_icon: true,
+                compact_join: false,
+            },
+            cx.listener(move |this, _, _, cx| {
+                this.joined.insert(join_id.clone());
+                cx.emit(ChannelBrowserEvent::Join(join_id.clone()));
+                cx.notify();
+            }),
+            cx.listener(move |_, _, _, cx| {
                 cx.emit(ChannelBrowserEvent::Open(open_id.clone()));
-            }))
+            }),
+            cx,
+        )
     }
 }
 
@@ -204,7 +121,7 @@ impl Render for ChannelBrowser {
             .w_full()
             .gap_2()
             .text_sm()
-            .child(crate::preferences::search_input_box(&self.filter, cx).mx_4())
+            .child(crate::ui::forms::search_input_box(&self.filter, cx).mx_4())
             .child(
                 div()
                     .px_4()

@@ -8,8 +8,9 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Size, h_flex, v_flex};
 use gpui_kit::gpui::{
-    AnyElement, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, App, ClickEvent, Context, ElementId, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 use slackless_core::types::{ChannelId, Conversation, ConversationKind, UserId, Usergroup};
 
@@ -64,8 +65,10 @@ pub(super) fn people(fixtures: &Fixtures, needle: &str) -> Vec<UserId> {
     people
 }
 
-/// Channels matching `needle` (name or topic, case-insensitive), by name.
-pub(super) fn channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversation> {
+/// Channels matching `needle` (name or topic, case-insensitive), sorted by name.
+/// Shared by both [`crate::directory::DirectoryView`] and [`crate::browser::ChannelBrowser`].
+pub(crate) fn filter_channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversation> {
+    let needle = needle.trim().to_lowercase();
     let mut channels: Vec<Conversation> = fixtures
         .channels
         .iter()
@@ -77,16 +80,138 @@ pub(super) fn channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversation> {
                     .as_deref()
                     .unwrap_or_default()
                     .to_lowercase()
-                    .contains(needle)
+                    .contains(&needle)
                 || channel
                     .topic
                     .as_ref()
-                    .is_some_and(|t| t.value.to_lowercase().contains(needle))
+                    .is_some_and(|t| t.value.to_lowercase().contains(&needle))
         })
         .cloned()
         .collect();
     channels.sort_by(|a, b| a.name.cmp(&b.name));
     channels
+}
+
+/// Channels matching `needle` (name or topic, case-insensitive), by name.
+pub(super) fn channels(fixtures: &Fixtures, needle: &str) -> Vec<Conversation> {
+    filter_channels(fixtures, needle)
+}
+
+/// Parameters and visual layout variant for [`render_channel_row`].
+pub(crate) struct ChannelRowSpec {
+    pub row_id: ElementId,
+    pub join_id: SharedString,
+    pub is_member: bool,
+    /// Place the channel icon inline next to the name (`ChannelBrowser`) instead of as a leading
+    /// column (`DirectoryView`).
+    pub inline_icon: bool,
+    /// Use `Size::Small` on the Join button (`DirectoryView`).
+    pub compact_join: bool,
+}
+
+/// Shared channel-list row renderer used by both [`crate::browser::ChannelBrowser`] and
+/// [`crate::directory::DirectoryView`].
+pub(crate) fn render_channel_row(
+    channel: &Conversation,
+    spec: ChannelRowSpec,
+    on_join: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_open: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let (border, muted, foreground, success, hover) = (
+        theme.border,
+        theme.muted_foreground,
+        theme.foreground,
+        theme.success,
+        theme.accent,
+    );
+    let icon = if channel.kind() == ConversationKind::PrivateChannel {
+        IconName::Lock
+    } else {
+        IconName::Hash
+    };
+    let members = channel.num_members.unwrap_or(0);
+    let meta = format!(
+        "{members} members{}",
+        channel
+            .topic
+            .as_ref()
+            .filter(|t| !t.value.is_empty())
+            .map_or_else(String::new, |t| format!(" \u{b7} {}", t.value))
+    );
+    let action = if spec.is_member {
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .text_color(success)
+            .child(Icon::new(IconName::Check).text_color(success).size(px(14.)))
+            .child("Joined")
+            .into_any_element()
+    } else {
+        let btn = Button::new(spec.join_id).primary().label("Join");
+        let btn = if spec.compact_join {
+            btn.with_size(Size::Small)
+        } else {
+            btn
+        };
+        btn.on_click(on_join).into_any_element()
+    };
+
+    let name = channel.name.clone().unwrap_or_default();
+    let mut row = h_flex()
+        .id(spec.row_id)
+        .items_center()
+        .gap_3()
+        .px_4()
+        .py(if spec.inline_icon { px(10.) } else { px(8.) })
+        .border_b_1()
+        .border_color(border)
+        .cursor_pointer()
+        .hover(move |row| row.bg(hover));
+
+    if spec.inline_icon {
+        row = row.child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(foreground)
+                        .child(Icon::new(icon).text_color(foreground).size(px(14.)))
+                        .child(div().truncate().font_weight(FontWeight::BOLD).child(name)),
+                )
+                .child(div().truncate().text_xs().text_color(muted).child(meta)),
+        );
+    } else {
+        row = row
+            .child(
+                Icon::new(icon)
+                    .text_color(foreground)
+                    .size(px(16.))
+                    .flex_none(),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(foreground)
+                            .child(name),
+                    )
+                    .child(div().truncate().text_xs().text_color(muted).child(meta)),
+            );
+    }
+
+    row.child(action).on_click(on_open).into_any_element()
 }
 
 /// Active user groups matching `needle` (handle, name, or description), by handle.
@@ -170,83 +295,24 @@ pub(super) fn channel_row(
     joined: &HashSet<ChannelId>,
     cx: &mut Context<DirectoryView>,
 ) -> AnyElement {
-    let theme = cx.theme();
-    let (border, muted, foreground, success, hover) = (
-        theme.border,
-        theme.muted_foreground,
-        theme.foreground,
-        theme.success,
-        theme.accent,
-    );
     let id = channel.id.clone();
     let join_id = channel.id.clone();
     let member = channel.is_member || joined.contains(&channel.id);
-    let icon = if channel.kind() == ConversationKind::PrivateChannel {
-        IconName::Lock
-    } else {
-        IconName::Hash
-    };
-    let members = channel.num_members.unwrap_or(0);
-    let meta = format!(
-        "{members} members{}",
-        channel
-            .topic
-            .as_ref()
-            .filter(|t| !t.value.is_empty())
-            .map_or_else(String::new, |t| format!(" · {}", t.value))
-    );
-    let action = if member {
-        h_flex()
-            .flex_none()
-            .gap_1()
-            .items_center()
-            .text_xs()
-            .text_color(success)
-            .child(Icon::new(IconName::Check).text_color(success).size(px(14.)))
-            .child("Joined")
-            .into_any_element()
-    } else {
-        Button::new(SharedString::from(format!("directory-join-{id}")))
-            .primary()
-            .with_size(Size::Small)
-            .label("Join")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.join(join_id.clone(), cx);
-            }))
-            .into_any_element()
-    };
-    h_flex()
-        .id(("directory-channel", ix))
-        .items_center()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(border)
-        .cursor_pointer()
-        .hover(|row| row.bg(hover))
-        .child(
-            Icon::new(icon)
-                .text_color(foreground)
-                .size(px(16.))
-                .flex_none(),
-        )
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    div()
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(foreground)
-                        .child(channel.name.clone().unwrap_or_default()),
-                )
-                .child(div().truncate().text_xs().text_color(muted).child(meta)),
-        )
-        .child(action)
-        .on_click(cx.listener(move |_, _, _, cx| cx.emit(DirectoryEvent::Open(id.clone()))))
-        .into_any_element()
+    render_channel_row(
+        channel,
+        ChannelRowSpec {
+            row_id: ("directory-channel", ix).into(),
+            join_id: SharedString::from(format!("directory-join-{id}")),
+            is_member: member,
+            inline_icon: false,
+            compact_join: true,
+        },
+        cx.listener(move |this, _, _, cx| {
+            this.join(join_id.clone(), cx);
+        }),
+        cx.listener(move |_, _, _, cx| cx.emit(DirectoryEvent::Open(id.clone()))),
+        cx,
+    )
 }
 
 /// One user group row: `@handle`, name, member count, description, and member names preview.

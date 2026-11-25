@@ -1,5 +1,7 @@
 use super::*;
-use crate::blockkit::serde_json;
+use crate::theme::SlackTheme;
+use gpui_kit::component::Size;
+use gpui_kit::gpui::{WindowAppearance, px};
 
 #[test]
 fn format_bytes_scales_across_units() {
@@ -180,4 +182,45 @@ fn control_metrics_switches_between_clean_and_compact() {
     assert_eq!(compact.height, px(28.));
     assert_eq!(compact.button_size, Size::Small);
     assert_eq!(compact.input_size, Size::Small);
+}
+
+#[test]
+fn corrupted_out_of_bounds_settings_indices_never_panic() {
+    let corrupted: Settings = serde_json::from_str(
+        r#"{
+            "schedule_enabled": true,
+            "schedule_days": 999,
+            "schedule_start": 42,
+            "schedule_end": 1234,
+            "notify_level": 77,
+            "mobile_different": true,
+            "mobile_notify_level": 88,
+            "mobile_handoff": 99,
+            "language": 500,
+            "timezone_auto": false,
+            "timezone": 600,
+            "zoom": 99,
+            "font": 99,
+            "huddle_transcription_provider": 99
+        }"#,
+    )
+    .expect("corrupted indices still deserialize");
+
+    assert_eq!(
+        corrupted.schedule_summary(),
+        "Weekdays, 9:00 AM \u{2013} 6:00 PM"
+    );
+    assert_eq!(corrupted.spellcheck_language(), None);
+    assert_eq!(corrupted.timezone_offset_secs(), Some(0));
+    assert_eq!(corrupted.mobile_handoff_secs(), 0);
+    assert_eq!(corrupted.notify_level_wire(), "mentions_dms");
+    assert_eq!(corrupted.mobile_notify_level_wire(), "mentions_dms");
+    assert_eq!(corrupted.schedule_days_wire(), "weekdays");
+    assert_eq!(crate::zoom::factor_for_level(corrupted.zoom), 1.0);
+    assert_eq!(
+        crate::theme::font_family_for(corrupted.font),
+        crate::theme::FONT_FAMILIES[crate::theme::DEFAULT_FONT]
+    );
+    let _ = corrupted.notifications_allowed_now();
+    let _ = corrupted.transcription_provider();
 }

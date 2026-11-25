@@ -1,13 +1,13 @@
 //! In-memory image thumbnails for fixture files (gpui-kit-guide section 9).
 //!
-//! Live mode will download Slack's cookie-authenticated `thumb_*` URLs and hand the bytes to
+//! Live mode downloads Slack's cookie-authenticated `thumb_*` URLs and hands the bytes to
 //! [`gpui::Image::from_bytes`]; fixture mode has no network, so it paints small mockup images
-//! in memory and encodes them as PNG through the very same bytes path. The encoder writes
-//! uncompressed (stored) deflate blocks, which keeps it dependency-free.
+//! in memory and encodes them as PNG via the `image` crate through the very same bytes path.
 
 use std::sync::Arc;
 
 use gpui_kit::gpui::{Image, ImageFormat};
+use image::{ExtendedColorType, ImageEncoder as _, codecs::png::PngEncoder};
 
 /// A `width` x `height` "app screenshot" mockup: dark canvas, a sidebar column tinted with
 /// `accent`, a header bar, a few text lines, and an accent bar chart.
@@ -34,7 +34,7 @@ pub fn mockup(width: u32, height: u32, accent: u32) -> Arc<Image> {
     }
     Arc::new(Image::from_bytes(
         ImageFormat::Png,
-        png(width, height, &pixels),
+        encode_png(width, height, &pixels),
     ))
 }
 
@@ -61,7 +61,7 @@ pub fn emblem(size: u32, accent: u32, inner: u32) -> Arc<Image> {
     }
     Arc::new(Image::from_bytes(
         ImageFormat::Png,
-        png(size, size, &pixels),
+        encode_png(size, size, &pixels),
     ))
 }
 
@@ -94,68 +94,33 @@ fn shade(color: [u8; 3], factor: f32) -> [u8; 3] {
     color.map(|channel| (f32::from(channel) * factor) as u8)
 }
 
-/// Encodes 8-bit RGB `pixels` (row-major, no padding) as a PNG file.
-fn png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
-    let stride = width as usize * 3;
-    let mut raw = Vec::with_capacity((stride + 1) * height as usize);
-    for row in pixels.chunks(stride) {
-        raw.push(0); // filter: none
-        raw.extend_from_slice(row);
+/// Encodes 8-bit RGB `pixels` (row-major, no padding) as a PNG byte stream.
+fn encode_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Err(err) =
+        PngEncoder::new(&mut out).write_image(pixels, width, height, ExtendedColorType::Rgb8)
+    {
+        tracing::warn!("could not encode fixture thumbnail PNG ({width}x{height}): {err}");
     }
-
-    // zlib stream of stored deflate blocks (max 65,535 bytes each).
-    let mut zlib = vec![0x78, 0x01];
-    let mut blocks = raw.chunks(usize::from(u16::MAX)).peekable();
-    while let Some(block) = blocks.next() {
-        zlib.push(u8::from(blocks.peek().is_none()));
-        let len = block.len() as u16;
-        zlib.extend_from_slice(&len.to_le_bytes());
-        zlib.extend_from_slice(&(!len).to_le_bytes());
-        zlib.extend_from_slice(block);
-    }
-    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
-
-    let mut header = Vec::with_capacity(13);
-    header.extend_from_slice(&width.to_be_bytes());
-    header.extend_from_slice(&height.to_be_bytes());
-    header.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit depth, RGB, deflate, no filter/interlace
-
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    chunk(&mut out, b"IHDR", &header);
-    chunk(&mut out, b"IDAT", &zlib);
-    chunk(&mut out, b"IEND", &[]);
     out
 }
 
-fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    let start = out.len();
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    let crc = crc32(&out[start..]);
-    out.extend_from_slice(&crc.to_be_bytes());
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
+    #[test]
+    fn encode_png_produces_valid_decodable_png_bytes() {
+        let img = mockup(40, 30, 0x11_64_A3);
+        assert!(img.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoded = image::load_from_memory_with_format(&img.bytes, image::ImageFormat::Png)
+            .expect("mockup PNG decodes cleanly");
+        assert_eq!((decoded.width(), decoded.height()), (40, 30));
 
-fn adler32(bytes: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in bytes {
-        a = (a + u32::from(byte)) % 65_521;
-        b = (b + a) % 65_521;
+        let badge = emblem(24, 0x2B_AC_76, 0xFF_FF_FF);
+        assert!(badge.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoded = image::load_from_memory_with_format(&badge.bytes, image::ImageFormat::Png)
+            .expect("emblem PNG decodes cleanly");
+        assert_eq!((decoded.width(), decoded.height()), (24, 24));
     }
-    (b << 16) | a
 }

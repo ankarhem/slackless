@@ -23,9 +23,9 @@ fn human_size_fit_and_inline_limits() {
     assert_eq!(human_size(-50), "0 B");
     assert_eq!(human_size(0), "0 B");
     assert_eq!(human_size(512), "512 B");
-    assert_eq!(human_size(1024), "1 KB");
-    assert_eq!(human_size(52 * 1024), "52 KB");
-    assert_eq!(human_size(2 * 1024 * 1024 + 300 * 1024), "2.3 MB");
+    assert_eq!(human_size(1024), "1.0 KiB");
+    assert_eq!(human_size(52 * 1024), "52.0 KiB");
+    assert_eq!(human_size(2 * 1024 * 1024 + 300 * 1024), "2.3 MiB");
 
     // `fit` preserves aspect ratio, never upscales small images, and falls back on missing/invalid dims.
     assert_eq!(fit(Some(200), Some(100)), (200., 100.));

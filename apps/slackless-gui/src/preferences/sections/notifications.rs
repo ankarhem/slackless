@@ -1,6 +1,6 @@
 //! Preferences > Notifications section view.
 
-use super::super::*;
+use super::*;
 
 impl Preferences {
     pub(super) fn notifications(&mut self, cx: &mut Context<Self>) -> Div {
